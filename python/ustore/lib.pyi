@@ -754,6 +754,10 @@ class Capabilities:
     def snapshots(self) -> bool:
         """Whether the engine pins point-in-time states."""
 
+    @property
+    def saves_snapshots(self) -> bool:
+        """Whether the engine writes a snapshot out as a database of its own."""
+
 @final
 class Changes:
     """The changes one pull of a ChangesCursor answers, oldest first."""

@@ -8,28 +8,39 @@
  *  in a range-for, and folds the loops into one @c row_t. Setup above the range-for stays untimed.
  *  Every call lands in its thread's latency histogram, so p50, p99 and p99.9 cost no shared writes.
  *
- *  Every benchmark takes these flags beside its own, and echoes them all as "- Name: value" before its rows:
+ *  Every benchmark takes these settings beside its own, each a <tt>--flag</tt> overriding its
+ *  <tt>USTORE_</tt> variable, and echoes them all as "- Name: value" before its rows:
  *
- *  Flag            Default  Meaning
- *  `--warmup`      `1s`     Untimed calls ahead of each sampled row, like `200ms`
- *  `--time-limit`  `10s`    Timed calls of each sampled row, like `10s`
- *  `--seed`        `42`     Seed of generated data and key streams, or `random`
- *  `--filter`      none     Rows to run, by ECMAScript regex, or else by substring
+ *  @verbatim
+ *  Setting       Default  Meaning
+ *  --warmup      1s       Untimed calls ahead of each sampled row, like 200ms
+ *  --time-limit  10s      Timed calls of each sampled row, like 10s
+ *  --seed        42       Seed of generated data and key streams, or random
+ *  --filter      none     Rows to run, by ECMAScript regex, or else by substring
+ *  @endverbatim
  */
 #pragma once
 
-#include <cmath>   // `std::ceil`
+#include <cmath>   // `std::ceil`, `std::isfinite`
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
-#include <cstdlib> // `std::exit`
+#include <cstdio>  // `std::fprintf`, `std::snprintf`
+#include <cstdlib> // `std::exit`, `std::getenv`, `std::strtod`
+#include <cstring> // `std::strcmp`, `std::strncmp`
 
-#include <array>       // `std::array`
-#include <bit>         // `std::bit_width`
-#include <chrono>      // `std::chrono::steady_clock`
-#include <limits>      // `std::numeric_limits`
-#include <span>        // `std::span`
-#include <string>      // `std::string`
-#include <string_view> // `std::string_view`
+#include <array>        // `std::array`
+#include <bit>          // `std::bit_width`
+#include <charconv>     // `std::from_chars`
+#include <chrono>       // `std::chrono::steady_clock`
+#include <limits>       // `std::numeric_limits`
+#include <optional>     // `std::optional`
+#include <random>       // `std::random_device`
+#include <regex>        // `std::regex`
+#include <span>         // `std::span`
+#include <string>       // `std::string`
+#include <string_view>  // `std::string_view`
+#include <system_error> // `std::errc`
+#include <thread>       // `std::thread::hardware_concurrency`
 
 #include <fmt/format.h>
 
@@ -47,93 +58,218 @@ using namespace utilities;
 using steady_clock_t = std::chrono::steady_clock;
 using time_point_t = steady_clock_t::time_point;
 
+#pragma region Shared Settings
+
+/** Exits with one line naming a setting that does not parse, so a bad value never runs anything. */
+[[noreturn]] inline void exit_unparsed(char const* variable, char const* text, char const* expected) noexcept {
+    std::fprintf(stderr, "%s=\"%s\" does not parse, expected %s\n", variable, text, expected);
+    std::exit(1);
+}
+
+/** The text of a setting: its @p flag when given, else its environment @p variable , else null. */
+inline char const* setting_text(int argc, char** argv, char const* variable, std::string_view flag) noexcept {
+    for (int index = 1; index < argc; ++index) {
+        std::string_view const argument {argv[index]};
+        if (argument == flag)
+            return index + 1 < argc && std::strncmp(argv[index + 1], "--", 2) != 0 ? argv[index + 1] : "1";
+        if (argument.size() > flag.size() && argument.starts_with(flag) && argument[flag.size()] == '=')
+            return argv[index] + flag.size() + 1;
+    }
+    char const* text = std::getenv(variable);
+    return text && *text ? text : nullptr;
+}
+
+/** A switch, @p fallback when unset: 0, false, off and no turn it off, anything else on. */
+inline bool read_flag_setting(int argc, char** argv, char const* variable, std::string_view flag,
+                              bool fallback = false) noexcept {
+    char const* text = setting_text(argc, argv, variable, flag);
+    if (!text) return fallback;
+    for (char const* off : {"0", "false", "off", "no"})
+        if (std::strcmp(text, off) == 0) return false;
+    return true;
+}
+
+/** A whole number, @p fallback when unset. */
+inline std::size_t read_count_setting(int argc, char** argv, char const* variable, std::string_view flag,
+                                      std::size_t fallback) noexcept {
+    char const* text = setting_text(argc, argv, variable, flag);
+    if (!text) return fallback;
+    std::string_view const spelled {text};
+    std::size_t count = 0;
+    auto const [end, error] = std::from_chars(spelled.data(), spelled.data() + spelled.size(), count);
+    if (error != std::errc {} || end != spelled.data() + spelled.size())
+        exit_unparsed(variable, text, "a whole number");
+    return count;
+}
+
+/** A positive real, @p fallback when unset. */
+inline double read_real_setting(int argc, char** argv, char const* variable, std::string_view flag,
+                                double fallback) noexcept {
+    char const* text = setting_text(argc, argv, variable, flag);
+    if (!text) return fallback;
+    char* end = nullptr;
+    double const value = std::strtod(text, &end);
+    if (*end != '\0' || !(value > 0) || !std::isfinite(value))
+        exit_unparsed(variable, text, "a positive number like 0.1 or 10");
+    return value;
+}
+
+/** A positive duration such as 200ms, 10s or 2m, @p fallback when unset. */
+inline std::chrono::milliseconds read_duration_setting(int argc, char** argv, char const* variable,
+                                                       std::string_view flag,
+                                                       std::chrono::milliseconds fallback) noexcept {
+    char const* text = setting_text(argc, argv, variable, flag);
+    if (!text) return fallback;
+    std::string_view const spelled {text};
+    std::uint32_t count = 0;
+    auto const [end, error] = std::from_chars(spelled.data(), spelled.data() + spelled.size(), count);
+    std::string_view const unit = spelled.substr(static_cast<std::size_t>(end - spelled.data()));
+    if (error == std::errc {} && count != 0) {
+        if (unit == "ms") return std::chrono::milliseconds(count);
+        if (unit == "s") return std::chrono::seconds(count);
+        if (unit == "m") return std::chrono::minutes(count);
+    }
+    exit_unparsed(variable, text, "a duration like 200ms, 10s or 2m");
+}
+
+/** The run's seed: 42 when unset, drawn afresh for @c random , else any unsigned 64-bit value. */
+inline std::uint64_t read_seed_setting(int argc, char** argv, char const* variable, std::string_view flag) noexcept {
+    char const* text = setting_text(argc, argv, variable, flag);
+    if (!text) return 42;
+    std::string_view const spelled {text};
+    if (spelled == "random") {
+        std::random_device device;
+        return (static_cast<std::uint64_t>(device()) << 32) ^ device();
+    }
+    std::uint64_t seed = 0;
+    auto const [end, error] = std::from_chars(spelled.data(), spelled.data() + spelled.size(), seed);
+    if (error != std::errc {} || end != spelled.data() + spelled.size())
+        exit_unparsed(variable, text, "an unsigned integer or random");
+    return seed;
+}
+
+/** Which labels a run selects: a regex search when the pattern compiles, else a substring. */
+struct filter_t {
+    std::string pattern;
+    std::optional<std::regex> regex;
+
+    bool selects(std::string_view label) const noexcept {
+        if (pattern.empty()) return true;
+        if (regex) return std::regex_search(label.begin(), label.end(), *regex);
+        return label.find(pattern) != std::string_view::npos;
+    }
+};
+
+/** The filter a setting spells, compiled once; empty, selecting everything, when unset. */
+inline filter_t read_filter_setting(int argc, char** argv, char const* variable, std::string_view flag) noexcept {
+    filter_t filter;
+    char const* text = setting_text(argc, argv, variable, flag);
+    if (!text) return filter;
+    filter.pattern = text;
+#if defined(__cpp_exceptions) && __cpp_exceptions
+    try {
+        filter.regex.emplace(filter.pattern);
+    }
+    catch (std::regex_error const&) {
+    }
+#else
+    filter.regex.emplace(filter.pattern);
+#endif
+    return filter;
+}
+
+/** What every suite and bench reads before its own settings; @c program starts the rerun lines. */
+struct common_settings_t {
+    std::uint64_t seed = 42;
+    filter_t filter;
+    char const* program = "";
+};
+
+/** SplitMix64's finalizer, a bijection that spreads every input bit over all 64 output bits. */
+constexpr std::uint64_t split_mix_bits(std::uint64_t value) noexcept {
+    value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ull;
+    value = (value ^ (value >> 27)) * 0x94D049BB133111EBull;
+    return value ^ (value >> 31);
+}
+
+/** The @p index -th stream of the family @p name under @p seed , identical in every language. */
+constexpr std::uint64_t stream_key(std::uint64_t seed, std::string_view name, std::uint64_t index = 0) noexcept {
+    std::uint64_t hashed = 0xCBF29CE484222325ull;
+    for (char const character : name) hashed = (hashed ^ static_cast<std::uint8_t>(character)) * 0x100000001B3ull;
+    return split_mix_bits(split_mix_bits(seed ^ hashed) + index);
+}
+
+/**
+ *  @brief SplitMix64 over one 64-bit state, seeded by a @ref stream_key , bit-identical to the
+ *      JavaScript generator NumKong ships.
+ *
+ *  Distributions are not specified to draw the same sequence on every standard library, so a
+ *  failure would stop reproducing from its seed when the toolchain changed; @ref below is the
+ *  portable bounded draw.
+ */
+struct split_mix_generator_t {
+    using result_type = std::uint64_t;
+    std::uint64_t state = 0;
+
+    explicit split_mix_generator_t(std::uint64_t key) noexcept : state(key) {}
+    static constexpr result_type(min)() noexcept { return 0; }
+    static constexpr result_type(max)() noexcept { return ~result_type {0}; }
+    result_type operator()() noexcept { return split_mix_bits(state += 0x9E3779B97F4A7C15ull); }
+
+    /** A uniform draw below @p bound , zero for an empty bound, without the bias of a modulo. */
+    std::uint64_t below(std::uint64_t bound) noexcept {
+        if (bound == 0) return 0;
+        std::uint64_t const rejection_floor = (0u - bound) % bound;
+        std::uint64_t draw = (*this)();
+        while (draw < rejection_floor) draw = (*this)();
+        return draw % bound;
+    }
+};
+
+#pragma endregion Shared Settings
+
 #pragma region Settings
 
-/** The settings every benchmark shares, which each benchmark's @c settings_t extends with its own. */
-struct shared_settings_t {
+/** The settings every benchmark shares, which each benchmark's own settings extend. */
+struct bench_settings_t : common_settings_t {
 
     /** Untimed calls ahead of each sampled row. */
     std::chrono::milliseconds warmup = std::chrono::seconds {1};
 
     /** Timed calls of each sampled row. */
     std::chrono::milliseconds time_limit = std::chrono::seconds {10};
-
-    /** Seed every generated input and key stream derives from. */
-    std::uint32_t seed = 42;
-
-    /** Rows to run. */
-    filter_t filter;
-
-    /** Whether the row named @p name runs. */
-    [[nodiscard]] bool selects(std::string_view name) const noexcept { return filter.selects(name); }
 };
 
-/** Most flags one benchmark adds to the shared ones. */
-inline constexpr std::size_t bench_flags_capacity_k = 24;
-
 /**
- *  @brief Parses @p flags and the shared ones from @p argv into @p settings, then echoes every one.
+ *  @brief Prints the version line, then reads the shared settings into @p settings and every one
+ *      of @p flags from its flag or the environment variable @p variables names beside it, and
+ *      echoes them all.
  *
- *  Every flag defaults to its @c USTORE_<FLAG> variable. Exits with status 0 after printing the
- *  usage on @c --help, and with status 1 after one failure line.
+ *  A value that does not parse prints one line naming its variable and exits with status 1.
  */
-inline void read_settings(int argc, char const* const* argv, shared_settings_t& settings,
-                          std::span<flag_t const> flags) {
-    std::array<flag_t, bench_flags_capacity_k + 4> every_flag;
-    std::size_t count = 0;
-    for (flag_t const& flag : flags) every_flag[count++] = flag;
-    every_flag[count++] = {"--warmup", "duration", "untimed calls ahead of each sampled row, like 1s",
-                           &settings.warmup};
-    every_flag[count++] = {"--time-limit", "duration", "timed calls of each sampled row, like 10s",
-                           &settings.time_limit};
-    every_flag[count++] = {"--seed", "number", "seed of every generated input and key stream, or random",
-                           &settings.seed};
-    every_flag[count++] = {"--filter", "regex", "runs only the rows whose name it matches, like '^docs_sample'",
-                           &settings.filter};
-
-    std::span<flag_t const> const parsed_flags {every_flag.data(), count};
-    parse_or_exit(argc, argv, argv[0], parsed_flags);
-    print_flags(parsed_flags);
+template <std::size_t count_>
+void read_bench_settings(int argc, char** argv, bench_settings_t& settings, std::array<flag_t, count_> const& flags,
+                         std::array<char const*, count_> const& variables) {
+    fmt::println("UStore {}.{}.{}", USTORE_VERSION_MAJOR, USTORE_VERSION_MINOR, USTORE_VERSION_PATCH);
+    fmt::println("- This machine: {} threads", std::thread::hardware_concurrency());
+    settings.seed = read_seed_setting(argc, argv, "USTORE_SEED", "--seed");
+    settings.filter = read_filter_setting(argc, argv, "USTORE_FILTER", "--filter");
+    settings.program = argc != 0 ? argv[0] : "";
+    settings.warmup = read_duration_setting(argc, argv, "USTORE_WARMUP", "--warmup", settings.warmup);
+    settings.time_limit = read_duration_setting(argc, argv, "USTORE_TIME_LIMIT", "--time-limit", settings.time_limit);
+    for (std::size_t index = 0; index != count_; ++index) {
+        char const* text = setting_text(argc, argv, variables[index], flags[index].name);
+        if (text && assign_variable_(flags[index], text) != argument_status_t::parsed_k)
+            exit_unparsed(variables[index], text, grammar(flags[index]).data());
+    }
+    print_flags(flags);
+    fmt::println("- Warmup: {}ms", settings.warmup.count());
+    fmt::println("- Time limit: {}ms", settings.time_limit.count());
+    fmt::println("- Seed: {}", settings.seed);
+    fmt::println("- Filter: {}", settings.filter.pattern.empty() ? "none" : settings.filter.pattern.c_str());
 }
 
 #pragma endregion Settings
-
-#pragma region Random Streams
-
-/** SplitMix64's finalizer, which spreads every bit of @p value over the whole result. */
-[[nodiscard]] constexpr std::uint64_t mix(std::uint64_t value) noexcept {
-    value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ull;
-    value = (value ^ (value >> 27)) * 0x94D049BB133111EBull;
-    return value ^ (value >> 31);
-}
-
-/** The key of stream @p index of @p name, two mixes away from @p seed, so neighboring seeds and indices never meet. */
-[[nodiscard]] constexpr std::uint64_t stream_key(std::uint32_t seed, std::string_view name,
-                                                 std::size_t index) noexcept {
-    std::uint64_t hash = 0xCBF29CE484222325ull;
-    for (char const character : name) hash = (hash ^ static_cast<unsigned char>(character)) * 0x100000001B3ull;
-    return mix(mix(seed ^ hash) + index);
-}
-
-/** A SplitMix64 stream seeded with a @c stream_key. */
-struct splitmix64_t {
-    std::uint64_t state = 0;
-
-    /** The next 64 random bits. */
-    [[nodiscard]] std::uint64_t next() noexcept { return mix(state += 0x9E3779B97F4A7C15ull); }
-
-    /** A draw below @p bound: the high half of a draw times @p bound, with a bias of at most @p bound over 2^64. */
-    [[nodiscard]] std::uint64_t below(std::uint64_t bound) noexcept {
-        std::uint64_t const drawn = next();
-        std::uint64_t const drawn_low = drawn & 0xFFFFFFFFull, drawn_high = drawn >> 32;
-        std::uint64_t const bound_low = bound & 0xFFFFFFFFull, bound_high = bound >> 32;
-        std::uint64_t const cross = (drawn_low * bound_low >> 32) + (drawn_high * bound_low & 0xFFFFFFFFull) +
-                                    drawn_low * bound_high;
-        return drawn_high * bound_high + (drawn_high * bound_low >> 32) + (cross >> 32);
-    }
-};
-
-#pragma endregion Random Streams
 
 #pragma region Loops
 
@@ -283,7 +419,7 @@ class loop_t {
  *  @param[in] body Called as `body(loop, thread)` on each thread; setup above its loop stays untimed.
  */
 template <typename body_type_>
-[[nodiscard]] row_t run_threads(executor_t& executor, shared_settings_t const& settings, std::string_view name,
+[[nodiscard]] row_t run_threads(executor_t& executor, bench_settings_t const& settings, std::string_view name,
                                 body_type_&& body) noexcept {
     st::vector<loop_t> loops;
     if (st::failed(loops.resize(executor.threads_count()))) return {.name = name, .skipped = "no memory for loops"};

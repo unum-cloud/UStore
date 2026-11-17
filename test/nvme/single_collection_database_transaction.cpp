@@ -196,13 +196,12 @@ struct model_t {
     }
 };
 
-/** Plans a value for every key of the population, every key missing, in the widths @p store admits. */
+/** Plans a value for every key of the population, every key missing, in the widths @p store admits,
+ *  answering whether the model fit. */
 template <typename layout_type_, typename database_type_>
-[[nodiscard]] std::size_t plan_model(database_type_ const& store, model_t& model) {
-    std::size_t failures = 0;
-    failures += expect(model.planned.resize(population_k) == st::status_t::success_k);
-    failures += expect(model.states.resize(population_k) == st::status_t::success_k);
-    if (failures != 0) return failures;
+bool plan_model(database_type_ const& store, model_t& model) {
+    if (!expect_true(model.planned.resize(population_k) == st::status_t::success_k)) return false;
+    if (!expect_true(model.states.resize(population_k) == st::status_t::success_k)) return false;
     stored_value_size_t const widest = store.value_max_size();
     for (std::size_t index = 0; index != population_k; ++index) {
         expectation_t entry;
@@ -216,47 +215,38 @@ template <typename layout_type_, typename database_type_>
         model.planned[index] = entry;
         model.states[index] = lookup_result_t::missing_k;
     }
-    return failures;
+    return true;
 }
 
 /** Inserts the planned value of every key between @p first and @p last through @p writer under @p schedule_. */
 template <watch_schedule_t schedule_ = watch_schedule_t::default_k, typename writer_type_>
-[[nodiscard]] std::size_t insert_range(writer_type_& writer, model_t const& model, std::size_t first,
-                                       std::size_t last) {
-    std::size_t failures = 0;
+void insert_range(writer_type_& writer, model_t const& model, std::size_t first, std::size_t last) {
     st::vector<byte_t> value;
     for (std::size_t index = first; index != last; ++index) {
         expectation_t const& entry = model.planned[index];
-        failures += expect(value.resize(static_cast<std::size_t>(entry.bytes)) == st::status_t::success_k);
+        expect_true(value.resize(static_cast<std::size_t>(entry.bytes)) == st::status_t::success_k);
         paint_into(entry, std::span<byte_t> {value});
-        failures += expect(
-            writer.template insert<schedule_>(entry.stored_key, std::span<byte_t const> {value}).succeeded());
+        expect_true(writer.template insert<schedule_>(entry.stored_key, std::span<byte_t const> {value}).succeeded());
     }
-    return failures;
 }
 
 /** Inserts the planned value of every key between @p first and @p last straight into the database @p store. */
 template <typename database_type_>
-[[nodiscard]] std::size_t preload_range(database_type_& store, model_t const& model, std::size_t first,
-                                        std::size_t last) {
-    std::size_t failures = 0;
+void preload_range(database_type_& store, model_t const& model, std::size_t first, std::size_t last) {
     st::vector<byte_t> value;
     for (std::size_t index = first; index != last; ++index) {
         expectation_t const& entry = model.planned[index];
-        failures += expect(value.resize(static_cast<std::size_t>(entry.bytes)) == st::status_t::success_k);
+        expect_true(value.resize(static_cast<std::size_t>(entry.bytes)) == st::status_t::success_k);
         paint_into(entry, std::span<byte_t> {value});
-        failures += expect(store.insert(entry.stored_key, std::span<byte_t const> {value}).succeeded());
+        expect_true(store.insert(entry.stored_key, std::span<byte_t const> {value}).succeeded());
     }
-    return failures;
 }
 
 /** Removes every key between @p first and @p last through the transaction @p writer. */
 template <typename writer_type_>
-[[nodiscard]] std::size_t remove_range(writer_type_& writer, std::size_t first, std::size_t last) {
-    std::size_t failures = 0;
+void remove_range(writer_type_& writer, std::size_t first, std::size_t last) {
     for (std::size_t index = first; index != last; ++index)
-        failures += expect(writer.remove(static_cast<stored_key_t>(index)).succeeded());
-    return failures;
+        expect_true(writer.remove(static_cast<stored_key_t>(index)).succeeded());
 }
 
 /** Reads one key of the database @p source, which takes no watch. */
@@ -296,15 +286,13 @@ status_t read_batch(single_collection_database_transaction<key_type_, store_type
  *  a database and of a transaction answer the same model.
  */
 template <watch_schedule_t schedule_ = watch_schedule_t::default_k, typename source_type_>
-[[nodiscard]] std::size_t check_model(source_type_& source, io_channel_t& channel, model_t const& model) {
-    std::size_t failures = 0;
+void check_model(source_type_& source, io_channel_t& channel, model_t const& model) {
     st::vector<stored_key_t> keys;
     st::vector<lookup_result_t> results;
     st::vector<std::uint64_t> seen;
-    failures += expect(keys.resize(population_k) == st::status_t::success_k);
-    failures += expect(results.resize(population_k) == st::status_t::success_k);
-    failures += expect(seen.resize(population_k) == st::status_t::success_k);
-    if (failures != 0) return failures;
+    expect_true(keys.resize(population_k) == st::status_t::success_k);
+    expect_true(results.resize(population_k) == st::status_t::success_k);
+    if (!expect_true(seen.resize(population_k) == st::status_t::success_k)) return;
     for (std::size_t index = 0; index != population_k; ++index) {
         keys[index] = model.planned[index].stored_key;
         results[index] = lookup_result_t::missing_k;
@@ -317,10 +305,10 @@ template <watch_schedule_t schedule_ = watch_schedule_t::default_k, typename sou
         for (std::size_t index = 0; index != bytes.size(); ++index)
             if (bytes[index] != painted(model.planned[request].seed, offset + index)) ++mismatches;
     };
-    failures += expect(read_batch<schedule_>(source, channel, std::span<stored_key_t const> {keys},
-                                             std::span<lookup_result_t> {results}, sink)
-                           .succeeded());
-    failures += expect_eq(mismatches, std::size_t {0});
+    expect_true(read_batch<schedule_>(source, channel, std::span<stored_key_t const> {keys},
+                                      std::span<lookup_result_t> {results}, sink)
+                    .succeeded());
+    expect_equal(mismatches, std::size_t {0});
 
     st::vector<byte_t> value;
     std::size_t wrong_states = 0;
@@ -330,7 +318,7 @@ template <watch_schedule_t schedule_ = watch_schedule_t::default_k, typename sou
         if (model.states[index] != lookup_result_t::written_k) continue;
         expectation_t const& entry = model.planned[index];
         if (seen[index] != entry.bytes) ++wrong_values;
-        failures += expect(value.resize(static_cast<std::size_t>(entry.bytes) + 1) == st::status_t::success_k);
+        expect_true(value.resize(static_cast<std::size_t>(entry.bytes) + 1) == st::status_t::success_k);
         stored_value_size_t size = 0;
         if (read_one<schedule_>(source, channel, entry.stored_key, std::span<byte_t> {value}, size).failed() ||
             size != entry.bytes) {
@@ -343,9 +331,8 @@ template <watch_schedule_t schedule_ = watch_schedule_t::default_k, typename sou
                 break;
             }
     }
-    failures += expect_eq(wrong_states, std::size_t {0});
-    failures += expect_eq(wrong_values, std::size_t {0});
-    return failures;
+    expect_equal(wrong_states, std::size_t {0});
+    expect_equal(wrong_values, std::size_t {0});
 }
 
 #pragma endregion Model
@@ -354,314 +341,285 @@ template <watch_schedule_t schedule_ = watch_schedule_t::default_k, typename sou
 
 /** A transaction commits and rolls back with nothing in it, and pins its start stamp only while it lives. */
 template <typename layout_type_, typename mount_type_>
-std::size_t create_transaction(mount_type_ const& mount) {
+void test_create_transaction(mount_type_ const& mount) {
     using types_t = transactions_types<layout_type_, typename mount_type_::fixture_t>;
-    std::size_t failures = 0;
     expected<std::unique_ptr<typename types_t::stack_t>> stack = make_stack<layout_type_>(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
+    expect_status(stack, status_code_t::success_k);
+    if (!stack) return;
     auto& store = *(*stack)->store;
 
     expected<typename types_t::transaction_pointer_t> first = store.create_transaction();
-    failures += expect(first.has_value());
-    if (!first) return failures;
+    expect_true(first.has_value());
+    if (!first) return;
     (*first)->rollback();
-    failures += expect((*first)->commit().succeeded());
-    failures += expect((*first)->commit().succeeded());
+    expect_true((*first)->commit().succeeded());
+    expect_true((*first)->commit().succeeded());
     (*first)->rollback();
 
     // A live transaction pins the stamp it started at, and gives it back when it dies.
     expected<typename types_t::transaction_pointer_t> second = store.create_transaction();
-    failures += expect(second.has_value());
-    failures += expect_eq(store.ledger().newest_reader(), store.ledger().published());
+    expect_true(second.has_value());
+    expect_equal(store.ledger().newest_reader(), store.ledger().published());
     if (first) first->reset();
     if (second) second->reset();
-    failures += expect_eq(store.ledger().newest_reader(), unwritten_stamp_k);
+    expect_equal(store.ledger().newest_reader(), unwritten_stamp_k);
     expected<typename types_t::transaction_pointer_t> reborn = store.create_transaction();
-    failures += expect(reborn.has_value());
-    return failures;
+    expect_true(reborn.has_value());
 }
 
 /** Two transactions live side by side, and either commits empty as often as it is asked to. */
 template <typename layout_type_, typename mount_type_>
-std::size_t create_transactions(mount_type_ const& mount) {
+void test_create_transactions(mount_type_ const& mount) {
     using types_t = transactions_types<layout_type_, typename mount_type_::fixture_t>;
-    std::size_t failures = 0;
     expected<std::unique_ptr<typename types_t::stack_t>> stack = make_stack<layout_type_>(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
+    expect_status(stack, status_code_t::success_k);
+    if (!stack) return;
     auto& store = *(*stack)->store;
 
     expected<typename types_t::transaction_pointer_t> first = store.create_transaction();
     expected<typename types_t::transaction_pointer_t> second = store.create_transaction();
-    failures += expect(first.has_value());
-    failures += expect(second.has_value());
-    if (!first || !second) return failures;
+    expect_true(first.has_value());
+    expect_true(second.has_value());
+    if (!first || !second) return;
     for (std::size_t round = 0; round != 2; ++round) {
-        failures += expect((*first)->commit().succeeded());
-        failures += expect((*second)->commit().succeeded());
+        expect_true((*first)->commit().succeeded());
+        expect_true((*second)->commit().succeeded());
     }
-    return failures;
 }
 
 /** One transaction's inserts land only at its commit, and a rollback drops the ones it had not committed. */
 template <typename layout_type_, typename mount_type_>
-std::size_t insert_by_one_transaction(mount_type_ const& mount) {
+void test_insert_by_one_transaction(mount_type_ const& mount) {
     using types_t = transactions_types<layout_type_, typename mount_type_::fixture_t>;
-    std::size_t failures = 0;
     expected<std::unique_ptr<typename types_t::stack_t>> stack = make_stack<layout_type_>(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
+    expect_status(stack, status_code_t::success_k);
+    if (!stack) return;
     auto& store = *(*stack)->store;
     io_channel_t& channel = (*stack)->channel();
     model_t model;
-    failures += plan_model<layout_type_>(store, model);
+    plan_model<layout_type_>(store, model);
     expected<typename types_t::transaction_pointer_t> changing = store.create_transaction();
-    failures += expect(changing.has_value());
-    if (failures != 0) return failures;
+    if (!expect_true(changing.has_value())) return;
     constexpr std::size_t half_k = population_k / 2;
 
-    failures += insert_range(**changing, model, 0, half_k);
-    failures += check_model(store, channel, model);
-    failures += expect((*changing)->commit().succeeded());
+    insert_range(**changing, model, 0, half_k);
+    check_model(store, channel, model);
+    expect_true((*changing)->commit().succeeded());
     model.present(0, half_k);
-    failures += check_model(store, channel, model);
+    check_model(store, channel, model);
 
-    failures += insert_range(**changing, model, half_k, population_k);
+    insert_range(**changing, model, half_k, population_k);
     (*changing)->rollback();
-    failures += check_model(store, channel, model);
+    check_model(store, channel, model);
 
-    failures += insert_range(**changing, model, half_k, population_k);
-    failures += expect((*changing)->commit().succeeded());
+    insert_range(**changing, model, half_k, population_k);
+    expect_true((*changing)->commit().succeeded());
     model.present(half_k, population_k);
-    failures += check_model(store, channel, model);
-    return failures;
+    check_model(store, channel, model);
 }
 
 /** Two transactions inserting disjoint halves land one after the other, each at its own commit. */
 template <typename layout_type_, typename mount_type_>
-std::size_t insert_by_two_transactions(mount_type_ const& mount) {
+void test_insert_by_two_transactions(mount_type_ const& mount) {
     using types_t = transactions_types<layout_type_, typename mount_type_::fixture_t>;
-    std::size_t failures = 0;
     expected<std::unique_ptr<typename types_t::stack_t>> stack = make_stack<layout_type_>(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
+    expect_status(stack, status_code_t::success_k);
+    if (!stack) return;
     auto& store = *(*stack)->store;
     io_channel_t& channel = (*stack)->channel();
     model_t model;
-    failures += plan_model<layout_type_>(store, model);
+    plan_model<layout_type_>(store, model);
     expected<typename types_t::transaction_pointer_t> first = store.create_transaction();
     expected<typename types_t::transaction_pointer_t> second = store.create_transaction();
-    failures += expect(first.has_value() && second.has_value());
-    if (failures != 0) return failures;
+    if (!expect_true(first.has_value() && second.has_value())) return;
     constexpr std::size_t half_k = population_k / 2;
 
-    failures += insert_range(**first, model, 0, half_k);
-    failures += insert_range(**second, model, half_k, population_k);
-    failures += check_model(store, channel, model);
-    failures += expect((*first)->commit().succeeded());
+    insert_range(**first, model, 0, half_k);
+    insert_range(**second, model, half_k, population_k);
+    check_model(store, channel, model);
+    expect_true((*first)->commit().succeeded());
     model.present(0, half_k);
-    failures += check_model(store, channel, model);
-    failures += expect((*second)->commit().succeeded());
+    check_model(store, channel, model);
+    expect_true((*second)->commit().succeeded());
     model.present(half_k, population_k);
-    failures += check_model(store, channel, model);
-    return failures;
+    check_model(store, channel, model);
 }
 
 /** Two transactions writing one shared key: the second to commit is refused, and so is one that read it. */
 template <typename layout_type_, typename mount_type_>
-std::size_t insert_by_two_intersected_transactions(mount_type_ const& mount) {
+void test_insert_by_two_intersected_transactions(mount_type_ const& mount) {
     using types_t = transactions_types<layout_type_, typename mount_type_::fixture_t>;
-    std::size_t failures = 0;
     expected<std::unique_ptr<typename types_t::stack_t>> stack = make_stack<layout_type_>(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
+    expect_status(stack, status_code_t::success_k);
+    if (!stack) return;
     auto& store = *(*stack)->store;
     io_channel_t& channel = (*stack)->channel();
     model_t model;
-    failures += plan_model<layout_type_>(store, model);
+    plan_model<layout_type_>(store, model);
     expected<typename types_t::transaction_pointer_t> first = store.create_transaction();
     expected<typename types_t::transaction_pointer_t> second = store.create_transaction();
-    failures += expect(first.has_value() && second.has_value());
-    if (failures != 0) return failures;
+    if (!expect_true(first.has_value() && second.has_value())) return;
     constexpr std::size_t half_k = population_k / 2;
 
-    failures += insert_range(**first, model, 0, half_k);
-    failures += insert_range(**second, model, half_k - 1, population_k);
-    failures += check_model(store, channel, model);
-    failures += expect((*first)->commit().succeeded());
+    insert_range(**first, model, 0, half_k);
+    insert_range(**second, model, half_k - 1, population_k);
+    check_model(store, channel, model);
+    expect_true((*first)->commit().succeeded());
     model.present(0, half_k);
-    failures += check_model(store, channel, model);
-    failures += expect_status((*second)->commit(), status_code_t::write_conflict_k);
-    failures += check_model(store, channel, model);
+    check_model(store, channel, model);
+    expect_status((*second)->commit(), status_code_t::write_conflict_k);
+    check_model(store, channel, model);
     (*second)->rollback();
 
     // A read is watched just as a write is, so rewriting what the second one read refuses its commit.
     st::vector<byte_t> value;
-    failures += expect(value.resize(8192) == st::status_t::success_k);
+    expect_true(value.resize(8192) == st::status_t::success_k);
     for (std::size_t index = half_k - 1; index != population_k; ++index) {
         stored_value_size_t size = 0;
         [[maybe_unused]] status_t const read = (*second)->select(channel, static_cast<stored_key_t>(index),
                                                                  std::span<byte_t> {value}, size);
     }
-    failures += insert_range(**first, model, 0, half_k);
-    failures += expect((*first)->commit().succeeded());
-    failures += expect_status((*second)->commit(), status_code_t::write_conflict_k);
-    return failures;
+    insert_range(**first, model, 0, half_k);
+    expect_true((*first)->commit().succeeded());
+    expect_status((*second)->commit(), status_code_t::write_conflict_k);
 }
 
 /** One transaction's removals land only at its commit, and a rollback drops the ones it had not committed. */
 template <typename layout_type_, typename mount_type_>
-std::size_t remove_by_one_transaction(mount_type_ const& mount) {
+void test_remove_by_one_transaction(mount_type_ const& mount) {
     using types_t = transactions_types<layout_type_, typename mount_type_::fixture_t>;
-    std::size_t failures = 0;
     expected<std::unique_ptr<typename types_t::stack_t>> stack = make_stack<layout_type_>(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
+    expect_status(stack, status_code_t::success_k);
+    if (!stack) return;
     auto& store = *(*stack)->store;
     io_channel_t& channel = (*stack)->channel();
     model_t model;
-    failures += plan_model<layout_type_>(store, model);
-    failures += preload_range(store, model, 0, population_k);
+    plan_model<layout_type_>(store, model);
+    preload_range(store, model, 0, population_k);
     model.present(0, population_k);
     expected<typename types_t::transaction_pointer_t> changing = store.create_transaction();
-    failures += expect(changing.has_value());
-    if (failures != 0) return failures;
+    if (!expect_true(changing.has_value())) return;
     constexpr std::size_t half_k = population_k / 2;
 
-    failures += remove_range(**changing, half_k, population_k);
-    failures += check_model(store, channel, model);
-    failures += expect((*changing)->commit().succeeded());
+    remove_range(**changing, half_k, population_k);
+    check_model(store, channel, model);
+    expect_true((*changing)->commit().succeeded());
     model.removed(half_k, population_k);
-    failures += check_model(store, channel, model);
+    check_model(store, channel, model);
 
-    failures += remove_range(**changing, 0, half_k);
+    remove_range(**changing, 0, half_k);
     (*changing)->rollback();
-    failures += check_model(store, channel, model);
+    check_model(store, channel, model);
 
-    failures += remove_range(**changing, 0, half_k);
-    failures += expect((*changing)->commit().succeeded());
+    remove_range(**changing, 0, half_k);
+    expect_true((*changing)->commit().succeeded());
     model.removed(0, half_k);
-    failures += check_model(store, channel, model);
-    return failures;
+    check_model(store, channel, model);
 }
 
 /** Two transactions removing disjoint halves land one after the other, each at its own commit. */
 template <typename layout_type_, typename mount_type_>
-std::size_t remove_by_two_transactions(mount_type_ const& mount) {
+void test_remove_by_two_transactions(mount_type_ const& mount) {
     using types_t = transactions_types<layout_type_, typename mount_type_::fixture_t>;
-    std::size_t failures = 0;
     expected<std::unique_ptr<typename types_t::stack_t>> stack = make_stack<layout_type_>(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
+    expect_status(stack, status_code_t::success_k);
+    if (!stack) return;
     auto& store = *(*stack)->store;
     io_channel_t& channel = (*stack)->channel();
     model_t model;
-    failures += plan_model<layout_type_>(store, model);
-    failures += preload_range(store, model, 0, population_k);
+    plan_model<layout_type_>(store, model);
+    preload_range(store, model, 0, population_k);
     model.present(0, population_k);
     expected<typename types_t::transaction_pointer_t> first = store.create_transaction();
     expected<typename types_t::transaction_pointer_t> second = store.create_transaction();
-    failures += expect(first.has_value() && second.has_value());
-    if (failures != 0) return failures;
+    if (!expect_true(first.has_value() && second.has_value())) return;
     constexpr std::size_t half_k = population_k / 2;
 
-    failures += remove_range(**first, 0, half_k);
-    failures += remove_range(**second, half_k, population_k);
-    failures += check_model(store, channel, model);
-    failures += expect((*first)->commit().succeeded());
+    remove_range(**first, 0, half_k);
+    remove_range(**second, half_k, population_k);
+    check_model(store, channel, model);
+    expect_true((*first)->commit().succeeded());
     model.removed(0, half_k);
-    failures += check_model(store, channel, model);
-    failures += expect((*second)->commit().succeeded());
+    check_model(store, channel, model);
+    expect_true((*second)->commit().succeeded());
     model.removed(half_k, population_k);
-    failures += check_model(store, channel, model);
-    return failures;
+    check_model(store, channel, model);
 }
 
 /** Two transactions removing one shared key: the second to commit is refused and removes nothing. */
 template <typename layout_type_, typename mount_type_>
-std::size_t remove_by_two_intersected_transactions(mount_type_ const& mount) {
+void test_remove_by_two_intersected_transactions(mount_type_ const& mount) {
     using types_t = transactions_types<layout_type_, typename mount_type_::fixture_t>;
-    std::size_t failures = 0;
     expected<std::unique_ptr<typename types_t::stack_t>> stack = make_stack<layout_type_>(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
+    expect_status(stack, status_code_t::success_k);
+    if (!stack) return;
     auto& store = *(*stack)->store;
     io_channel_t& channel = (*stack)->channel();
     model_t model;
-    failures += plan_model<layout_type_>(store, model);
-    failures += preload_range(store, model, 0, population_k);
+    plan_model<layout_type_>(store, model);
+    preload_range(store, model, 0, population_k);
     model.present(0, population_k);
     expected<typename types_t::transaction_pointer_t> first = store.create_transaction();
     expected<typename types_t::transaction_pointer_t> second = store.create_transaction();
-    failures += expect(first.has_value() && second.has_value());
-    if (failures != 0) return failures;
+    if (!expect_true(first.has_value() && second.has_value())) return;
     constexpr std::size_t half_k = population_k / 2;
 
-    failures += remove_range(**first, 0, half_k + 1);
-    failures += remove_range(**second, half_k, population_k);
-    failures += check_model(store, channel, model);
-    failures += expect((*second)->commit().succeeded());
+    remove_range(**first, 0, half_k + 1);
+    remove_range(**second, half_k, population_k);
+    check_model(store, channel, model);
+    expect_true((*second)->commit().succeeded());
     model.removed(half_k, population_k);
-    failures += check_model(store, channel, model);
-    failures += expect_status((*first)->commit(), status_code_t::write_conflict_k);
-    failures += check_model(store, channel, model);
-    return failures;
+    check_model(store, channel, model);
+    expect_status((*first)->commit(), status_code_t::write_conflict_k);
+    check_model(store, channel, model);
 }
 
 /** Two transactions inserting disjoint halves from two threads at once both land. */
 template <typename layout_type_, typename mount_type_>
-std::size_t insert_by_two_concurrent_transactions(mount_type_ const& mount) {
+void test_insert_by_two_concurrent_transactions(mount_type_ const& mount) {
     using types_t = transactions_types<layout_type_, typename mount_type_::fixture_t>;
-    std::size_t failures = 0;
     expected<std::unique_ptr<typename types_t::stack_t>> stack = make_stack<layout_type_>(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
+    expect_status(stack, status_code_t::success_k);
+    if (!stack) return;
     auto& store = *(*stack)->store;
     io_channel_t& channel = (*stack)->channel();
     model_t model;
-    failures += plan_model<layout_type_>(store, model);
-    if (failures != 0) return failures;
+    if (!plan_model<layout_type_>(store, model)) return;
     constexpr std::size_t half_k = population_k / 2;
 
-    std::size_t worker_failures[2] = {0, 0};
     auto work = [&](std::size_t worker) noexcept {
         expected<typename types_t::transaction_pointer_t> changing = store.create_transaction();
-        worker_failures[worker] += expect(changing.has_value());
+        expect_true(changing.has_value());
         if (!changing) return;
         std::size_t const first = worker == 0 ? 0 : half_k;
-        worker_failures[worker] += insert_range(**changing, model, first, first + half_k);
-        worker_failures[worker] += expect((*changing)->commit().succeeded());
+        insert_range(**changing, model, first, first + half_k);
+        expect_true((*changing)->commit().succeeded());
     };
     std::thread first_worker {work, std::size_t {0}};
     std::thread second_worker {work, std::size_t {1}};
     first_worker.join();
     second_worker.join();
-    failures += worker_failures[0] + worker_failures[1];
 
     model.present(0, population_k);
-    failures += check_model(store, channel, model);
-    return failures;
+    check_model(store, channel, model);
 }
 
 /** Writes and reads are watched on every schedule, refused when watched and admitted when not. */
 template <typename layout_type_, typename mount_type_>
-std::size_t watch_transactions(mount_type_ const& mount) {
+void test_watch_transactions(mount_type_ const& mount) {
     using types_t = transactions_types<layout_type_, typename mount_type_::fixture_t>;
-    std::size_t failures = 0;
     expected<std::unique_ptr<typename types_t::stack_t>> stack = make_stack<layout_type_>(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
+    expect_status(stack, status_code_t::success_k);
+    if (!stack) return;
     auto& store = *(*stack)->store;
     io_channel_t& channel = (*stack)->channel();
     model_t model;
-    failures += plan_model<layout_type_>(store, model);
-    failures += preload_range(store, model, 0, population_k);
+    plan_model<layout_type_>(store, model);
+    preload_range(store, model, 0, population_k);
     model.present(0, population_k);
     expected<typename types_t::transaction_pointer_t> first = store.create_transaction();
     expected<typename types_t::transaction_pointer_t> second = store.create_transaction();
-    failures += expect(first.has_value() && second.has_value());
-    if (failures != 0) return failures;
+    if (!expect_true(first.has_value() && second.has_value())) return;
     auto& first_transaction = **first;
     auto& other = **second;
     constexpr std::size_t half_k = population_k / 2;
@@ -669,79 +627,75 @@ std::size_t watch_transactions(mount_type_ const& mount) {
     std::span<stored_key_t const> const watched {first_key};
 
     // Writes are watched, so the second writer of the shared key is refused.
-    failures += insert_range(first_transaction, model, 0, half_k + 1);
-    failures += insert_range(other, model, half_k, population_k);
-    failures += expect(first_transaction.commit().succeeded());
-    failures += expect_status(other.commit(), status_code_t::write_conflict_k);
+    insert_range(first_transaction, model, 0, half_k + 1);
+    insert_range(other, model, half_k, population_k);
+    expect_true(first_transaction.commit().succeeded());
+    expect_status(other.commit(), status_code_t::write_conflict_k);
     other.rollback();
 
     // Reads are watched too, so a commit over what the second one read refuses it.
-    failures += insert_range(first_transaction, model, 0, 1);
-    failures += check_model(other, channel, model);
-    failures += expect(first_transaction.commit().succeeded());
-    failures += expect_status(other.commit(), status_code_t::write_conflict_k);
+    insert_range(first_transaction, model, 0, 1);
+    check_model(other, channel, model);
+    expect_true(first_transaction.commit().succeeded());
+    expect_status(other.commit(), status_code_t::write_conflict_k);
     other.rollback();
 
     // Writes taken under the never schedule collide without a word.
-    failures += insert_range<watch_schedule_t::never_k>(first_transaction, model, 0, half_k + 1);
-    failures += insert_range<watch_schedule_t::never_k>(other, model, half_k, population_k);
-    failures += expect(first_transaction.commit().succeeded());
-    failures += expect(other.commit().succeeded());
+    insert_range<watch_schedule_t::never_k>(first_transaction, model, 0, half_k + 1);
+    insert_range<watch_schedule_t::never_k>(other, model, half_k, population_k);
+    expect_true(first_transaction.commit().succeeded());
+    expect_true(other.commit().succeeded());
 
     // And so do reads taken under it.
-    failures += insert_range<watch_schedule_t::never_k>(first_transaction, model, 0, 1);
-    failures += check_model<watch_schedule_t::never_k>(other, channel, model);
-    failures += expect(first_transaction.commit().succeeded());
-    failures += expect(other.commit().succeeded());
+    insert_range<watch_schedule_t::never_k>(first_transaction, model, 0, 1);
+    check_model<watch_schedule_t::never_k>(other, channel, model);
+    expect_true(first_transaction.commit().succeeded());
+    expect_true(other.commit().succeeded());
 
     // A watch added later checks at once, at the commit from the start, or at the commit from the call.
-    failures += insert_range(first_transaction, model, 0, 1);
-    failures += expect(first_transaction.commit().succeeded());
-    failures += expect(other.template watch_more<watch_schedule_t::now_k>(watched).failed());
-    failures += expect(other.template watch_more<watch_schedule_t::on_commit_k>(watched).succeeded());
-    failures += expect_status(other.commit(), status_code_t::write_conflict_k);
+    insert_range(first_transaction, model, 0, 1);
+    expect_true(first_transaction.commit().succeeded());
+    expect_true(other.template watch_more<watch_schedule_t::now_k>(watched).failed());
+    expect_true(other.template watch_more<watch_schedule_t::on_commit_k>(watched).succeeded());
+    expect_status(other.commit(), status_code_t::write_conflict_k);
     other.rollback();
-    failures += insert_range(first_transaction, model, 0, 1);
-    failures += expect(first_transaction.commit().succeeded());
-    failures += expect(other.template watch_more<watch_schedule_t::on_commit_since_operation_k>(watched).succeeded());
-    failures += expect(other.commit().succeeded());
-    return failures;
+    insert_range(first_transaction, model, 0, 1);
+    expect_true(first_transaction.commit().succeeded());
+    expect_true(other.template watch_more<watch_schedule_t::on_commit_since_operation_k>(watched).succeeded());
+    expect_true(other.commit().succeeded());
 }
 
 /** A staged transaction lands at its commit, and nothing of it lands after a rollback or after it dies. */
 template <typename layout_type_, typename mount_type_>
-std::size_t stage_and_commit(mount_type_ const& mount) {
+void test_stage_and_commit(mount_type_ const& mount) {
     using types_t = transactions_types<layout_type_, typename mount_type_::fixture_t>;
-    std::size_t failures = 0;
     expected<std::unique_ptr<typename types_t::stack_t>> stack = make_stack<layout_type_>(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
+    expect_status(stack, status_code_t::success_k);
+    if (!stack) return;
     auto& store = *(*stack)->store;
     io_channel_t& channel = (*stack)->channel();
     model_t model;
-    failures += plan_model<layout_type_>(store, model);
+    plan_model<layout_type_>(store, model);
     expected<typename types_t::transaction_pointer_t> changing = store.create_transaction();
-    failures += expect(changing.has_value());
-    if (failures != 0) return failures;
+    if (!expect_true(changing.has_value())) return;
     constexpr std::size_t half_k = population_k / 2;
 
-    failures += insert_range(**changing, model, 0, half_k);
-    failures += expect((*changing)->stage().succeeded());
-    failures += expect((*changing)->commit().succeeded());
+    insert_range(**changing, model, 0, half_k);
+    expect_true((*changing)->stage().succeeded());
+    expect_true((*changing)->commit().succeeded());
     model.present(0, half_k);
-    failures += check_model(store, channel, model);
+    check_model(store, channel, model);
 
-    failures += insert_range(**changing, model, half_k, population_k);
-    failures += expect((*changing)->stage().succeeded());
+    insert_range(**changing, model, half_k, population_k);
+    expect_true((*changing)->stage().succeeded());
     (*changing)->rollback();
-    failures += check_model(store, channel, model);
+    check_model(store, channel, model);
 
     // A staged transaction that dies hands the write path back and lands nothing.
-    failures += insert_range(**changing, model, half_k, population_k);
-    failures += expect((*changing)->stage().succeeded());
+    insert_range(**changing, model, half_k, population_k);
+    expect_true((*changing)->stage().succeeded());
     changing->reset();
-    failures += check_model(store, channel, model);
-    return failures;
+    check_model(store, channel, model);
 }
 
 #pragma endregion Cases
@@ -760,60 +714,56 @@ struct layout_case_name_t {
 
 /** Runs every case on @p mount for one layout named @p layout_name. */
 template <typename layout_type_, typename mount_type_>
-void run_layout(suite_totals_t& totals, mount_type_ const& mount, std::string_view layout_name) {
-    report(totals, mount, layout_case_name_t {layout_name, "create_transaction"}.text,
-           create_transaction<layout_type_, mount_type_>);
-    report(totals, mount, layout_case_name_t {layout_name, "create_transactions"}.text,
-           create_transactions<layout_type_, mount_type_>);
-    report(totals, mount, layout_case_name_t {layout_name, "insert"}.text,
-           insert_by_one_transaction<layout_type_, mount_type_>);
-    report(totals, mount, layout_case_name_t {layout_name, "insert_by_two"}.text,
-           insert_by_two_transactions<layout_type_, mount_type_>);
-    report(totals, mount, layout_case_name_t {layout_name, "insert_by_two_intersected"}.text,
-           insert_by_two_intersected_transactions<layout_type_, mount_type_>);
-    report(totals, mount, layout_case_name_t {layout_name, "remove"}.text,
-           remove_by_one_transaction<layout_type_, mount_type_>);
-    report(totals, mount, layout_case_name_t {layout_name, "remove_by_two"}.text,
-           remove_by_two_transactions<layout_type_, mount_type_>);
-    report(totals, mount, layout_case_name_t {layout_name, "remove_by_two_intersected"}.text,
-           remove_by_two_intersected_transactions<layout_type_, mount_type_>);
-    report(totals, mount, layout_case_name_t {layout_name, "insert_by_two_concurrent"}.text,
-           insert_by_two_concurrent_transactions<layout_type_, mount_type_>);
-    report(totals, mount, layout_case_name_t {layout_name, "watch"}.text,
-           watch_transactions<layout_type_, mount_type_>);
-    report(totals, mount, layout_case_name_t {layout_name, "stage_and_commit"}.text,
-           stage_and_commit<layout_type_, mount_type_>);
+void run_layout(mount_type_ const& mount, std::string_view layout_name) {
+    report_on_mount(mount, layout_case_name_t {layout_name, "create_transaction"}.text,
+                    test_create_transaction<layout_type_, mount_type_>);
+    report_on_mount(mount, layout_case_name_t {layout_name, "create_transactions"}.text,
+                    test_create_transactions<layout_type_, mount_type_>);
+    report_on_mount(mount, layout_case_name_t {layout_name, "insert"}.text,
+                    test_insert_by_one_transaction<layout_type_, mount_type_>);
+    report_on_mount(mount, layout_case_name_t {layout_name, "insert_by_two"}.text,
+                    test_insert_by_two_transactions<layout_type_, mount_type_>);
+    report_on_mount(mount, layout_case_name_t {layout_name, "insert_by_two_intersected"}.text,
+                    test_insert_by_two_intersected_transactions<layout_type_, mount_type_>);
+    report_on_mount(mount, layout_case_name_t {layout_name, "remove"}.text,
+                    test_remove_by_one_transaction<layout_type_, mount_type_>);
+    report_on_mount(mount, layout_case_name_t {layout_name, "remove_by_two"}.text,
+                    test_remove_by_two_transactions<layout_type_, mount_type_>);
+    report_on_mount(mount, layout_case_name_t {layout_name, "remove_by_two_intersected"}.text,
+                    test_remove_by_two_intersected_transactions<layout_type_, mount_type_>);
+    report_on_mount(mount, layout_case_name_t {layout_name, "insert_by_two_concurrent"}.text,
+                    test_insert_by_two_concurrent_transactions<layout_type_, mount_type_>);
+    report_on_mount(mount, layout_case_name_t {layout_name, "watch"}.text,
+                    test_watch_transactions<layout_type_, mount_type_>);
+    report_on_mount(mount, layout_case_name_t {layout_name, "stage_and_commit"}.text,
+                    test_stage_and_commit<layout_type_, mount_type_>);
 }
 
 #pragma endregion Driver
 
 } // namespace unum::ustore::test
 
-int main(int argc, char const* argv[]) {
+int main(int argc, char** argv) {
     using namespace unum::ustore;
     using namespace unum::ustore::test;
 
-    suite_options_t options;
-    if (argument_status_t const status = parse_suite_options(argc, argv, options);
-        status != argument_status_t::parsed_k)
-        return status == argument_status_t::help_k ? 0 : 1;
-    suite_totals_t totals = options.totals();
+    start_test_run(argc, argv);
 
-    st::expected<directory_t> const directory = directory_t::make(options.directory);
+    st::expected<scratch_directory_t> const directory = scratch_directory_t::make(test_run.settings.directory);
     if (!directory) {
         fmt::println(stderr, "  the working directory would not open");
         return 1;
     }
-    test_environment_t const environment = test_environment_t::of(options, *directory);
 
     auto const cases = [&](auto const& mount) {
-        run_layout<inline_12_bytes_layout_t>(totals, mount, "inline_12_bytes");
-        run_layout<inline_44_bytes_layout_t>(totals, mount, "inline_44_bytes");
-        run_layout<fixed_width_layout_t>(totals, mount, "fixed_width");
-        run_layout<variable_width_layout_t>(totals, mount, "variable_width");
+        run_layout<inline_12_bytes_layout_t>(mount, "inline_12_bytes");
+        run_layout<inline_44_bytes_layout_t>(mount, "inline_44_bytes");
+        run_layout<fixed_width_layout_t>(mount, "fixed_width");
+        run_layout<variable_width_layout_t>(mount, "variable_width");
     };
     for (transport_t const transport : every_transport_k)
-        run_on_transport(totals, transport, environment, transactions_config_k, 1, "scdb_transactions", cases);
+        run_on_transport(transport, directory->path(), transactions_config_k, 1,
+                         "single_collection_database_transaction", cases);
 
-    return suite_exit_code(totals);
+    return finish_test_run();
 }

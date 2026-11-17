@@ -274,6 +274,7 @@ endforeach ()
 # The graph fold calls no StringZilla kernel, so its suite builds against the header target alone
 add_executable(ustore_test_graph_adjacency_fold graph/adjacency_fold.cpp)
 target_link_libraries(ustore_test_graph_adjacency_fold PRIVATE ustore::header fmt::fmt ustore_warnings)
+target_include_directories(ustore_test_graph_adjacency_fold PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME ustore_test_graph_adjacency_fold COMMAND ustore_test_graph_adjacency_fold)
 
 # The runs of strings build against the header target alone
@@ -281,11 +282,13 @@ add_executable(ustore_test_strings_nvme_memory_run strings/nvme_memory_run.cpp)
 target_link_libraries(
     ustore_test_strings_nvme_memory_run PRIVATE ustore::header forkunion::static fmt::fmt ustore_warnings
 )
+target_include_directories(ustore_test_strings_nvme_memory_run PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME ustore_test_strings_nvme_memory_run COMMAND ustore_test_strings_nvme_memory_run)
 
 # Memory runs and their views call no StringZilla kernel either, and need only SmashTable's headers
 add_executable(ustore_test_blobs_nvme_memory_run blobs/nvme_memory_run.cpp)
 target_link_libraries(ustore_test_blobs_nvme_memory_run PRIVATE ustore::header fmt::fmt ustore_warnings)
+target_include_directories(ustore_test_blobs_nvme_memory_run PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME ustore_test_blobs_nvme_memory_run COMMAND ustore_test_blobs_nvme_memory_run)
 
 # The docs fold is checked against `ustore_docs_write` on every engine, so its suite links them all

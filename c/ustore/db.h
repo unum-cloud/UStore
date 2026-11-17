@@ -234,6 +234,10 @@ typedef enum ustore_capabilities_t {
     /** The engine supports snapshots. */
     ustore_capabilities_snapshots_k = 4,
 
+    /** The engine writes a snapshot out as a database of its own, through @c
+     *  ustore_snapshot_save. */
+    ustore_capabilities_saves_snapshots_k = 8,
+
 } ustore_capabilities_t;
 
 /** The key that stands for no key, every bit of it set. */

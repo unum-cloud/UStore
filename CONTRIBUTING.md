@@ -164,6 +164,7 @@ Non-owning `std::span` and `std::string_view` are welcome.
 The RocksDB and LevelDB engines hand their libraries the strings and vectors those libraries take, inside the one `try` of each exported call.
 Tests, benchmarks and tools may hold a `std::string` where an API hands one over, as `std::filesystem::path::string` and `fmt::format` do, or where a case needs owned text to feed the library.
 No mutable global state: no namespace-scope mutable variables, no function-local `static`, and never `static thread_local`.
+The one exception is a test harness's `test_run`, which [Test Suites](#test-suites) describes.
 Per-thread scratch belongs to the executor that owns the threads.
 
 ### Threads and Placement
@@ -406,34 +407,129 @@ A class unit reads its class from its own `USTORE_TARGET_<VENDOR>_<CLASS>` and w
 It scans with its generation's kit: `ampere_scan_t` for every NVIDIA class, `cdna3_scan_t` for CDNA3 and CDNA4, and `cdna5_scan_t`.
 A future NVIDIA GPU takes the newest class whose PTX its driver compiles, and a device no class serves lists `unknown` and refuses executors with `ustore_status_unsupported_k`.
 
-## Tests and Benchmarks
+## Test Suites
 
-Tests use `test/harness.hpp`, not a framework: every check returns a failure count, and counts roll up to `main`.
+### Principles
 
-```cpp
-std::size_t lsm_tree_insert_then_find() {
-    std::size_t failures = 0;
-    failures += expect(inserted);
-    failures += expect_eq(found_count, 3u);
-    return failures;
-}
+Suites carry no framework.
+The C++ suites share `test/harness.hpp`, every C test file opens with the `Shared C Checks` region, the Python suites share `test/base.py` and `test/conftest.py`, the Rust tests share `rust/testing.rs`, and `mojo/test.mojo` carries its own helpers at its top.
+Each of those holds a pinned region, `Shared Settings`, `Shared Run`, `Shared C Checks`, `Shared Pytest` or `Shared Testing`, whose tokens are identical across the Second Decade libraries and which the pre-commit hook keeps identical, so a fix lands in all of them.
+The pinned C++ regions print with `std::printf`, the one exception to `fmt::println`, so every library's suites print the same bytes.
 
-int main(int argc, char** argv) {
-    suite_options_t options;
-    if (argument_status_t const status = parse_suite_options(argc, argv, options); status != argument_status_t::parsed_k)
-        return status == argument_status_t::help_k ? 0 : 1;
-    suite_totals_t totals = options.totals();
-    report(totals, "lsm_tree.insert_then_find", lsm_tree_insert_then_find);
-    return suite_exit_code(totals);
-}
+Tests reach the library through its public surface: the C ABI in `c/ustore/`, the C++ wrappers in `cpp/ustore/`, the Python, Rust and Mojo bindings, and the templates of `include/ustore/` that the component suites check below the C ABI.
+The calls past that surface are listed under [Private Surface Waivers](#private-surface-waivers), each with what the public surface lacks.
+Oracles never compile out: a test checks with `expect_true` and its siblings, never `assert`, and every C and C++ test unit opens with `#undef NDEBUG // ! A test's oracle must stay live in every build`.
+Benchmarks never include `test/`, and each tree keeps its own harness.
+
+A harness holds one mutable global, `test_run`, the documented exception to [Errors and Memory](#errors-and-memory)'s rule against mutable globals.
+Checks fire on worker threads and inside helpers as well as in a case's own body, so the run counts failed checks in one place and `run_test_case` diffs that count around each case, rather than threading a tally through every call.
+After a crash, `p test_run` in a core dump names the case in progress and the last failed check, and the crash handlers print the case before the backtrace.
+
+Settings are read once, and a value that does not parse prints one line naming it and exits with 1.
+Skips are honest: a skipped case names its reason, a filter that selects no case fails the run, and `USTORE_NO_SKIPS=1` turns any skip into exit code 3.
+Every reason takes one of four forms, and a reason used twice is a constant, such as `needs_directory_k` or `needs_transactions_k`:
+
+- `needs <symbol>`, like `needs ustore_capabilities_transactions_k` or `needs USTORE_DIRECTORY`;
+- `built without <SWITCH>`, like `built without USTORE_WITH_ROCKSDB`;
+- `<symbol> is refused on this machine`, like `ucall_io_backend_linux_uring618_k is refused on this machine`;
+- `no <device>`, like `no GPU device`.
+
+Every engine suite runs on every engine and isolation the build carries, and a case needing a capability skips on the engines that lack it.
+Inputs come from `stream_key(seed, name, index)`, identical in C, C++, Python, Rust and Mojo, with each case keyed by its own label, so a case draws the same inputs whichever cases ran before it, and `USTORE_SEED` with `USTORE_FILTER` reproduces any one of them.
+
+### Running
+
+The `dev` preset builds every suite, benchmark and tool, and CTest runs each engine suite once per engine:
+
+```sh
+cmake --preset dev -DUSTORE_WITH_ROCKSDB=1 -DUSTORE_WITH_LEVELDB=1
+cmake --build --preset dev
+ctest --preset dev
 ```
 
-`expect_eq` prints both values, so it needs types `fmt` can format; compare anything else through `expect(a == b)`.
-Waits on a peer thread use `spin_until`, and checks inside worker threads add into an atomic counter folded in after the threads finish.
+Executables land in `build_dev/build/bin/`, and any of them runs alone:
 
-### Flags and Constants
+```sh
+build_dev/build/bin/ustore_test_abi_blobs --engine rocksdb --directory /dev/shm/ustore
+USTORE_ENGINE=rocksdb USTORE_DIRECTORY=/dev/shm/ustore build_dev/build/bin/ustore_test_abi_blobs
+```
 
-Binaries read no environment variables and no hard-coded directories; every input is a flag parsed by `tools/arguments.hpp`.
+A suite prints the library and the machine, then the settings it read, one verdict per case and a summary.
+A failed check prints where it failed and the operands, and the case goes on, so one run lists every mismatch it reaches; the failing case then prints the line that reruns it alone:
+
+```text
+UStore 1.0.0
+- Compiled for: …
+- This machine: …
+- Seed: 42, scale: 1, filter: none
+- test_ring_holds_a_medium_in_flight(transport_t::memory_k) ... ok (0.12 s)
+  check failed at test/nvme/ring.cpp:120
+    expected 4, got 3
+- test_ring_wraps_its_slots(transport_t::memory_k) ... FAILED: 1 failed check(s)
+  rerun: build_dev/build/bin/ustore_test_nvme_ring --seed 42 --filter '^test_ring_wraps_its_slots\(transport_t::memory_k\)$'
+- test_ring_holds_a_medium_in_flight(transport_t::device_k) ... skipped: needs USTORE_DEVICE
+2 passed, 1 failed, 1 skipped, seed 42
+```
+
+Verdicts and the summary go to standard output, and failures and reruns to standard error.
+The exit code is 1 when a case or a check failed or no case ran, 3 when `USTORE_NO_SKIPS` refused a skip, and 0 otherwise.
+`USTORE_TRAP_ON_FAILURE=1` raises `SIGTRAP` at the first failed check instead, which stops a debugger there, or dumps a core without one:
+
+```sh
+USTORE_TRAP_ON_FAILURE=1 USTORE_FILTER='^test_ring_wraps_its_slots\(transport_t::memory_k\)$' gdb -ex run --args build_dev/build/bin/ustore_test_nvme_ring
+```
+
+The bindings run their suites as CI does:
+
+```sh
+pip install --group test . && python -X faulthandler -m pytest -x   # Python, once per engine the extension carries
+cargo test --features serde                                         # Rust, over RAM, RocksDB and LevelDB
+pixi run test                                                       # Mojo, against the library on the loader path
+```
+
+pytest prints `UStore <version> from <path>`, the capabilities of each engine and the same `- Seed: …, scale: …, filter: …` line in its header.
+
+### Environment
+
+Every setting is a variable, and a flag of the same name overrides it in every suite and benchmark: `USTORE_ENGINE_TRANSPORT` is `--engine-transport`.
+A flag takes its value as `--name value` or `--name=value`, and a switch given alone, like `--no-skips`, is on.
+
+| Variable                     | Flag                    | Default               | Meaning                                                                       |
+| :--------------------------- | :---------------------- | :-------------------- | :---------------------------------------------------------------------------- |
+| `USTORE_SEED`                | `--seed`                | `42`                  | Seed every stream descends from, or `random` to draw one, which a run prints  |
+| `USTORE_FILTER`              | `--filter`              | unset                 | ECMAScript regex over case labels or pytest node ids, else a substring        |
+| `USTORE_SCALE`               | `--scale`               | `1`                   | Multiplier of every baseline iteration count, like `0.1` or `10`              |
+| `USTORE_NO_SKIPS`            | `--no-skips`            | off                   | Exits with 3 when any case skipped                                            |
+| `USTORE_TRAP_ON_FAILURE`     | `--trap-on-failure`     | off                   | Raises `SIGTRAP` at the first failed check                                    |
+| `USTORE_DIRECTORY`           | `--directory`           | unset                 | Parent of the unique directory a suite works in                               |
+| `USTORE_DEVICE`              | `--device`              | unset                 | Block device the `device` transport opens                                     |
+| `USTORE_SPDK_ADDRESS`        | `--spdk-address`        | unset                 | PCIe address of the device SPDK binds                                         |
+| `USTORE_TRANSPORTS`          | `--transports`          | every transport       | Transports to mount, like `memory,linux-uring`                                |
+| `USTORE_ENGINE`              | `--engine`              | `ram`                 | Engine to open: `ram`, `rocksdb`, `leveldb` or `nvme`                         |
+| `USTORE_ISOLATION`           | `--isolation`           | `strict-serializable` | Isolation of `ram` transactions, or `snapshot`                                |
+| `USTORE_ENGINE_TRANSPORT`    | `--engine-transport`    | `automatic`           | Transport of `nvme`, like `linux-uring`                                       |
+| `USTORE_THREADS`             | `--threads`             | every core            | Threads the concurrent cases fan out over, or a list in the stress suites     |
+| `USTORE_CLI`                 | `--cli`                 | unset                 | `tools.cpp`: the CLI executable its round trip drives                         |
+| `USTORE_SPDK_ROOT`           | `--spdk-root`           | unset                 | `nvme/linux_spdk_disk.cpp`: SPDK tree with a finished build                   |
+| `USTORE_SPDK_SERIAL`         | `--spdk-serial`         | the rig's             | `nvme/linux_spdk_disk.cpp`: serial the controller must identify as            |
+| `USTORE_LARGE_UNIVERSE`      | `--large-universe`      | `600000`              | `nvme/compaction.cu`: random keys of the cases that cross the GPU threshold   |
+| `USTORE_TIME_LIMIT`          | `--time-limit`          | `10s`                 | Stress: bound of the whole run, shared evenly by every configuration          |
+| `USTORE_CHECKPOINTS`         | `--checkpoints`         | `1000`                | Stress: most rounds one configuration runs                                    |
+| `USTORE_BATCH_SIZES`         | `--batch-sizes`         | `10,100,150`          | Atomicity: consecutive keys one transaction changes                           |
+| `USTORE_KEYS`                | `--keys`                | `100000`              | Atomicity: keys one round writes, split into batches                          |
+| `USTORE_DELETES_PERIODICITY` | `--deletes-periodicity` | `3`                   | Atomicity: one batch in this many is erased by the deleting case              |
+| `USTORE_TRANSACTIONS`        | `--transactions`        | `1,2,…,10,20,50,100`  | Linearizability: transactions every thread commits between two checkpoints    |
+| `USTORE_WRITES_PER_KEY`      | `--writes-per-key`      | `4`                   | Linearizability: mean writes one key receives per round, sizing the key range |
+
+The Python suites read `USTORE_SEED`, `USTORE_FILTER` and `USTORE_SCALE`, the Rust tests read `USTORE_SEED`, and the Mojo suite reads none.
+A filter that does not compile as a regex matches as a substring, the C suites match substrings alone, and pytest matches node ids, alongside `-k`.
+
+With a directory, a suite creates a unique `ustore-XXXXXX` directory under it, runs every case inside it, and removes it at exit, so parallel runs never share a database; without one, the cases that need persistence or files skip, naming the setting they need.
+CTest passes `test_data` inside the build directory as the directory, the engine suites get their engine, and the tools suite also gets the CLI it drives on that engine.
+
+Flags are long kebab-case words with no short forms or aliases, sizes carry IEC suffixes, durations carry `ms`, `s` or `m`, and lists are comma-separated.
+A namespace-scope `_k` constant names an invariant — a format, an alignment, an ABI limit — while workload sizes, thread counts and paths are settings with defaults.
+No binary hard-codes a directory, and the CLI and the tools take flags alone, parsed by `tools/arguments.hpp`:
 
 ```sh
 # Rejected
@@ -441,10 +537,79 @@ USTORE_TEST_PATH=/tmp/db ./twitter -tw 1000 --max_input_files 4 --mlimit 1048576
 
 # Accepted
 ./ustore_bench_twitter --directory /tmp/db --dataset data/twitter --max-tweets 1000 --max-input-files-total 4 --time-limit 10s
+USTORE_DIRECTORY=/tmp/db ./ustore_bench_twitter --dataset data/twitter --max-tweets 1000 --time-limit 10s
 ```
 
-Flags are long kebab-case words with no short forms or aliases, sizes carry IEC suffixes, durations carry `ms` or `s`, and lists are comma-separated.
-A namespace-scope `_k` constant names an invariant — a format, an alignment, an ABI limit — while workload sizes, thread counts and paths are option fields with defaults.
+### Writing a Test
+
+A C++ case is `void test_<behaviour>(arguments…)`, or returns `case_result_t` when it may skip, and takes no settings or context: the run is global.
+`main` prints the machine, starts the run, registers every case under its label and answers the run's verdict:
+
+```cpp
+int main(int argc, char** argv) {
+    print(probe_machine());
+    start_test_run(argc, argv);
+    run_test_case("test_ring_holds_a_medium_in_flight<memory_disk_t>", test_ring_holds_a_medium_in_flight<memory_disk_t>, *disk);
+    return finish_test_run();
+}
+```
+
+A label is `<area>.<case>[.<variant>…]`, every segment lowercase snake, where the area is the file's stem and the case is the function's name without `test_`.
+Each check counts a failure at the caller's line, lets the case go on, and returns whether it held:
+
+- `expect_true(held)`, for any condition;
+- `expect_equal(actual, wanted)`, which prints both;
+- `expect_near(actual, wanted, tolerance)`, which holds within `tolerance · max(1, |actual|, |wanted|)`;
+- `expect_status(outcome, wanted)` and its shorthand `expect_success(outcome)`, which print the statuses by name;
+- `expect_throws<std::out_of_range>(callable)`, whose subject is the failure.
+
+A message is always the trailing `format_at_t` and its arguments, as in `expect_true(found, "key {}", key)`.
+Where the step after a failed check would index or dereference past what it checked, the case stops on the check's answer: `if (!expect_equal(found.size(), wanted.size())) return;`.
+A case that cannot run returns `case_result_t::skipped(reason)`, and generators draw from `split_mix_generator_t {case_stream_key(index)}`.
+Waits go through `spin_until`, bounded by `wait_limit_k`, and loop counts through `scaled_iterations(baseline)`.
+
+A C case is bracketed by `start_test_case(label)`, which the filter may refuse, and `finish_test_case(skip_reason)`, and checks through the file-local `expect_`, `#undef`'d at the end of the file:
+
+```c
+if (start_test_case("test_init_ram_starts_empty")) test_init_ram_starts_empty(), finish_test_case(NULL);
+```
+
+A Python test is `test_<subject>_<behaviour>`, a sentence with a one-line docstring, and asks for what it opens by fixture: `database`, `view` (the database or a transaction over it), `later` (a deferred view), `arena`, the `blobs`, `docs` and `graph` collections, `seed`, `rng` and `unraisable`.
+A case taking `engine` runs once per engine and isolation; `@pytest.mark.needs("transactions")` skips it on the engines without, and `@pytest.mark.any_engine` runs it on the first engine alone, for a case whose engine sits below what it checks, like the conversions of `blobs.py::test_batch_round_trip`.
+A missing dependency is a decorator, as in `@pytest.mark.skipif(not pyarrow_available, reason="PyArrow is not installed")`, and only a fixture skips from its body.
+Matrices are named in upper snake case, like `BATCH_SIZES`, and `MAX_CASES_PER_TEST` in `test/base.py` refuses a test whose cases outgrow it beside its engines.
+
+A Rust test is named as a behaviour sentence with no prefix, returns `()` and unwraps, so a failure names its line; only `readme_quickstart` returns the `Result` of the README's own `main`.
+It skips through `return skipped("built without the nvme feature")` and the like, which says so on standard error, takes its directories from `ScratchDirectory::new(name)`, its random streams from `case_stream_key(index)`, and polls futures with `block_on`.
+A test that needs a cargo feature is compiled under `#[cfg(feature = "…")]`, never branched on `cfg!` in its body.
+
+A Mojo test is `test_<behaviour>`, registered in `main` in the order it is defined, and opens with `if not _library_is_present(): _skipped(library_missing_k)`, as Mojo has no discovery; its private helpers and types take a leading underscore.
+
+One concept carries one stem in every language: the Rust name is the stem, and C, C++, Python and Mojo call it `test_<stem>`, as in `readme_quickstart`, `snapshots_save_a_database_of_their_own`, `databases_open_at_a_directory_and_keep_what_they_held`, `a_held_executor_refuses_the_next_call`, `compact_plans_stay_live_until_finished` and `progress_reports_and_cancels`.
+`test/readme.py` runs the README Quickstarts verbatim, as `test_readme_quickstart` and `test_readme_mojo_mirror`.
+
+### Benchmarks
+
+The benchmarks of `bench/` share `bench/harness.hpp`, which carries the same pinned `Shared Settings` region, so `USTORE_SEED`, `USTORE_FILTER`, `USTORE_WARMUP`, `USTORE_TIME_LIMIT` and every other benchmark flag read as the suites' settings do.
+Rows follow the suites' label grammar, every number comes from the `release` preset, and [`bench/README.md`](bench/README.md) describes the suite, its flags and its datasets.
+The evaluation harnesses outside this repository read `USTORE_LIBRARY_DIR` and `USTORE_CUDA_ARCH`, which keep their names.
+
+### Devices
+
+The GPU suites of `test/vram/` build into the `cuda`, `rocm` and `metal` presets, and on a machine without a device every GPU case reports `skipped: no GPU device`.
+The NVMe suites mount every transport the machine offers: without `USTORE_DEVICE` they skip the `device` transport, and `scripts/rigs/nvmet_loop.sh up` hands out a RAM-backed NVMe namespace to pass to it, while SPDK needs `USTORE_SPDK_ADDRESS`.
+
+### Private Surface Waivers
+
+These tests reach past the public surface, each because the surface lacks what it checks:
+
+- `test/abi/fixture.hpp` and `test/abi/executors.cpp` take `engine_t`, `view_t`, `ustore_database_handle_t` and the verb tables from `src/engine.hpp`, which the C ABI keeps behind opaque handles, and `executors.cpp` also takes `tasks_per_word_k` from `src/utilities/slices.hpp`.
+- `test/vram/towers.cpp`, `test/nvme/tree.cpp` and the compaction suites of `test/nvme/` take the GPU class tables of `src/vram/classes.hpp`, which no public header exports.
+- `test/vram/fake_amd_bundles.cpp` compiles `src/vram/bundles.cpp` itself, so the bundle loader runs over a fake HIP runtime.
+- `test/tools/*.cpp` take `tools/arrow_ipc.hpp` and `tools/dataset.h`, which the CLI keeps to itself.
+- `rust/db.rs`'s `a_call_without_an_arena_is_refused` calls `ffi::ustore_collection_list` with a null arena, which the safe API cannot express.
+- `rust/db.rs`'s `statuses_map_spell_and_tolerate_newer_libraries` builds raw `ffi::ustore_outcome_t` values and calls the crate-private `check` and `Status::from_raw`, as a status from a newer library reaches Rust no other way.
+- `rust/db.rs`'s `a_forgotten_deferred_call_holds_its_database_open` reads the private `lent` field of `Deferred`, which no public accessor exposes.
 
 ## Bindings
 
@@ -513,8 +678,7 @@ CMAKE_ARGS="-DUSTORE_WITH_ROCKSDB=OFF" pip install .  # RAM and LevelDB
 pip install --group test . && python -X faulthandler -m pytest -x
 ```
 
-`USTORE_SEED` pins the seed the suites draw from, `42` by default or `random` for a fresh one, and `USTORE_FILTER` keeps the cases whose node id matches it, as a regex or else as a substring.
-pytest prints both in its header as `- Seed:` and `- Filter:`, so a failing run reruns with the same values.
+The suites read `USTORE_SEED`, `USTORE_FILTER` and `USTORE_SCALE` as [Environment](#environment) lists, and pytest prints them in its header, so a failing run reruns with the same values.
 
 An engine is left out through `CMAKE_ARGS` or `--config-settings=cmake.define.USTORE_WITH_<ENGINE>=OFF`, while NVMe stays out until its sources build; the build reads no environment variable of its own.
 

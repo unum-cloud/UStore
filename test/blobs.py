@@ -8,13 +8,12 @@ Date: September 18, 2026
 import asyncio
 import contextlib
 import gc
-import sys
 import weakref
 from uuid import UUID
 
 import numpy as np
 import pytest
-from capabilities import BATCH_SIZES, key, keys, location
+from base import BATCH_SIZES, key, keys, location, pyarrow_available
 
 import ustore
 
@@ -89,18 +88,22 @@ def test_keys_span_128_bits(view, blobs, boundary: int | UUID):
     assert view.get(boundary, collection=blobs) == b"edge"
 
 
+@pytest.mark.any_engine
 @pytest.mark.parametrize("boundary", [2**128, -1])
 def test_rejects_an_integer_outside_128_bits(view, blobs, boundary: int):
+    """An integer key past 128 bits, or a negative one, raises OverflowError."""
     with pytest.raises(OverflowError):
         view.get(boundary, collection=blobs)
 
 
+@pytest.mark.any_engine
 @pytest.mark.parametrize(
     "spelling",
     [5, np.uint64(5), key(5), str(key(5)), key(5).bytes],
     ids=["integer", "numpy", "uuid", "text", "bytes"],
 )
 def test_every_spelling_of_a_key_addresses_one_value(view, blobs, arena, spelling):
+    """An integer, a NumPy scalar, a UUID, its text and its bytes all address one key."""
     view.set(spelling, b"v", collection=blobs)
     assert view.get(5, collection=blobs) == b"v"
     assert view.scan(0, 2, arena, collection=blobs)[0] == (key(5),)
@@ -111,6 +114,7 @@ def test_every_spelling_of_a_key_addresses_one_value(view, blobs, arena, spellin
 # region Batches
 
 
+@pytest.mark.any_engine
 @pytest.mark.parametrize("count", BATCH_SIZES)
 @pytest.mark.parametrize("container", KEY_CONTAINERS)
 def test_batch_round_trip(view, blobs, arena, count: int, container: str):
@@ -136,18 +140,21 @@ def test_batch_reports_missing_keys(view, blobs, arena, missing: list[int]):
 
 @pytest.mark.parametrize("count", BATCH_SIZES)
 def test_batch_broadcasts_one_value(view, blobs, arena, count: int):
+    """One value written to a batch of keys reads back under every key."""
     view.write(list(range(count)), b"same", collection=blobs)
     assert [bytes(value) for value in view.read(list(range(count)), arena, collection=blobs)] == [b"same"] * count
 
 
 @pytest.mark.parametrize("count", BATCH_SIZES)
 def test_batch_removes_every_key(view, blobs, arena, count: int):
+    """A batch removal leaves every key of the batch absent."""
     keys = list(range(count))
     view.write(keys, b"value", collection=blobs)
     view.remove(keys, collection=blobs)
     assert all(value is None for value in view.read(keys, arena, collection=blobs))
 
 
+@pytest.mark.any_engine
 @pytest.mark.parametrize("values", [[None, b"kept"], [b"kept", None], None], ids=["first", "second", "whole"])
 def test_none_in_a_batch_is_refused(view, blobs, arena, values):
     """A None inside a written batch is refused before anything is written, rather than read as a removal."""
@@ -159,20 +166,24 @@ def test_none_in_a_batch_is_refused(view, blobs, arena, values):
 
 @pytest.mark.parametrize("keys", [[40], [40, 41], np.array([40, 41], dtype=np.int64)], ids=["one", "two", "numpy"])
 def test_batch_remove(view, blobs, keys):
+    """A removal takes one key, several, or a NumPy array of them."""
     view.write([40, 41], [b"a", b"b"], collection=blobs)
     view.remove(keys, collection=blobs)
     assert not any(view.contains(int(key), collection=blobs) for key in keys)
 
 
 def test_remove_takes_a_bare_key(view, blobs):
+    """A removal takes a bare key as well as a batch."""
     view.set(40, b"a", collection=blobs)
     view.remove(40, collection=blobs)
     assert not view.contains(40, collection=blobs)
 
 
+@pytest.mark.any_engine
 @pytest.mark.parametrize("values", [[b"a", b"b"], [b"a", b"b", b"c", b"d"]], ids=["short", "long"])
 def test_rejects_mismatched_batch_widths(view, blobs, values: list[bytes]):
-    with pytest.raises(ValueError):
+    """A batch of values longer or shorter than its keys raises ValueError."""
+    with pytest.raises(ValueError, match="values for 3 keys"):
         view.write([1, 2, 3], values, collection=blobs)
 
 
@@ -181,7 +192,9 @@ def test_rejects_mismatched_batch_widths(view, blobs, values: list[bytes]):
 # region Tapes and Arenas
 
 
+@pytest.mark.any_engine
 def test_values_are_borrowed_not_copied(view, blobs, arena):
+    """A read answers read-only memoryviews into the arena rather than copies."""
     view.set(1, b"borrowed", collection=blobs)
     found = view.read([1], arena, collection=blobs)[0]
     assert isinstance(found, memoryview)
@@ -189,7 +202,9 @@ def test_values_are_borrowed_not_copied(view, blobs, arena):
     assert bytes(found) == b"borrowed"
 
 
+@pytest.mark.any_engine
 def test_a_view_outlives_the_tape_that_exported_it(view, blobs, arena):
+    """A value's memoryview stays readable after its tape is collected."""
     view.set(1, b"borrowed", collection=blobs)
     held = view.read([1], arena, collection=blobs)[0]
     gc.collect()
@@ -214,8 +229,10 @@ def test_an_exported_buffer_outlives_calls_on_other_arenas(view, blobs, arena):
     assert bytes(held) == b"first"
 
 
+@pytest.mark.any_engine
 @pytest.mark.parametrize("refused", [None, b"bytes", 42], ids=["none", "bytes", "integer"])
 def test_a_verb_takes_an_arena(view, blobs, refused):
+    """A batch verb given anything but an Arena raises TypeError naming it."""
     with pytest.raises(TypeError, match="Arena"):
         view.read([1], refused, collection=blobs)
 
@@ -224,11 +241,14 @@ def test_a_verb_takes_an_arena(view, blobs, refused):
     "tape_type", [ustore.Values, ustore.Keys, ustore.Columns, ustore.Neighborhoods, ustore.Deferred]
 )
 def test_tape_types_are_named_but_not_constructible(tape_type: type):
+    """The output types are exported for annotations, yet none constructs from Python."""
     with pytest.raises(TypeError):
         tape_type()
 
 
+@pytest.mark.any_engine
 def test_whole_tape_exports_a_buffer(view, blobs, arena):
+    """A read's values export as one contiguous buffer, through the buffer protocol and DLPack."""
     view.write([1, 2], [b"ab", b"cd"], collection=blobs)
     assert bytes(memoryview(view.read([1, 2], arena, collection=blobs))) == b"abcd"
     found = view.read([1, 2], arena, collection=blobs)
@@ -236,7 +256,17 @@ def test_whole_tape_exports_a_buffer(view, blobs, arena):
     assert np.from_dlpack(found).tobytes() == b"abcd"
 
 
-@pytest.mark.parametrize("spelling", ["binary", "large_binary", "string", "large_string", "u32", "u64"])
+@pytest.mark.parametrize(
+    "spelling",
+    [
+        *(
+            pytest.param(spelling, marks=pytest.mark.skipif(not pyarrow_available, reason="PyArrow is not installed"))
+            for spelling in ("binary", "large_binary", "string", "large_string")
+        ),
+        "u32",
+        "u64",
+    ],
+)
 def test_a_tape_writes_as_it_is(view, blobs, arena, spelling: str):
     """An Arrow array or a pair of NumPy buffers reaches the ABI as the u32 or u64 tape it already is."""
     values = [b"a", b"", b"ccc"]
@@ -244,7 +274,8 @@ def test_a_tape_writes_as_it_is(view, blobs, arena, spelling: str):
         offsets = np.cumsum([0, *map(len, values)], dtype=np.uint32 if spelling == "u32" else np.uint64)
         tape = (np.frombuffer(b"".join(values), dtype=np.uint8), offsets)
     else:
-        pyarrow = pytest.importorskip("pyarrow")
+        import pyarrow
+
         texts = [value.decode() for value in values] if "string" in spelling else values
         tape = pyarrow.array(texts, type=getattr(pyarrow, spelling)())
     view.write([1, 2, 3], tape, collection=blobs)
@@ -252,6 +283,7 @@ def test_a_tape_writes_as_it_is(view, blobs, arena, spelling: str):
 
 
 def test_values_write_back_as_the_tape_they_are(view, blobs, arena):
+    """The values one read answers write back as they are, empty ones included."""
     view.write([1, 2], [b"first", b""], collection=blobs)
     view.write([3, 4], view.read([1, 2], arena, collection=blobs), collection=blobs)
     assert [bytes(value) for value in view.read([3, 4], arena, collection=blobs)] == [b"first", b""]
@@ -267,18 +299,23 @@ def test_values_write_back_as_the_tape_they_are(view, blobs, arena):
     ids=["one-value", "falling", "past-the-data"],
 )
 def test_a_malformed_tape_is_refused(view, blobs, tape):
+    """Offsets that miss a value, fall, or run past the data are refused."""
     with pytest.raises(ustore.InvalidArgumentError):
         view.write([1, 2], tape, collection=blobs)
 
 
+@pytest.mark.skipif(not pyarrow_available, reason="PyArrow is not installed")
 def test_an_arrow_null_is_refused(view, blobs):
     """A null has no bytes to write, and removing keys takes a verb of its own."""
-    pyarrow = pytest.importorskip("pyarrow")
+    import pyarrow
+
     with pytest.raises(ustore.InvalidArgumentError, match="null"):
         view.write([1, 2], pyarrow.array([b"a", None]), collection=blobs)
 
 
+@pytest.mark.any_engine
 def test_keys_export_as_16_byte_records(view, blobs, arena):
+    """Scanned keys export as a two-dimensional buffer of 16-byte rows."""
     view.write([5, 6], b"v", collection=blobs)
     found = view.scan(0, 2, arena, collection=blobs)
     assert found[0] == (key(5), key(6))
@@ -287,8 +324,10 @@ def test_keys_export_as_16_byte_records(view, blobs, arena):
     assert exported.tobytes() == key(5).bytes + key(6).bytes
 
 
+@pytest.mark.any_engine
 @pytest.mark.parametrize("index", [1, -2, 5])
 def test_rejects_an_index_past_the_batch(view, blobs, arena, index: int):
+    """Indexing a read past either end of its batch raises IndexError."""
     view.set(1, b"a", collection=blobs)
     with pytest.raises(IndexError):
         view.read([1], arena, collection=blobs)[index]
@@ -304,6 +343,7 @@ def test_rejects_an_index_past_the_batch(view, blobs, arena, index: int):
     [(10, 6, [10, 20, 30, 40, 50, 60]), (20, 5, [20, 30, 40, 50, 60]), (30, 1, [30]), (40, 2, [40, 50]), (61, 5, [])],
 )
 def test_scan(view, blobs, arena, start: int, count: int, expected: list[int]):
+    """A scan answers at most `count` keys from `start` on, in ascending order."""
     view.write([10, 20, 30, 40, 50, 60], b"v", collection=blobs)
     page = view.scan(start, count, arena, collection=blobs)
     assert list(page[0]) == keys(expected)
@@ -312,6 +352,7 @@ def test_scan(view, blobs, arena, start: int, count: int, expected: list[int]):
 
 @pytest.mark.parametrize("page_size", [1, 2, 3, 7, 8])
 def test_scan_paginates_from_the_last_key(view, blobs, arena, page_size: int):
+    """Scans restarted past the last key walk every key once, whatever the page size."""
     view.write(list(range(1, 8)), b"v", collection=blobs)
     walked: list[UUID] = []
     start = 0
@@ -323,6 +364,7 @@ def test_scan_paginates_from_the_last_key(view, blobs, arena, page_size: int):
 
 @pytest.mark.parametrize("count", [0, 1, 3, 9, 20])
 def test_sample(view, blobs, arena, count: int):
+    """A sample draws distinct stored keys, as many as asked or as the collection holds."""
     view.write(list(range(1, 10)), b"v", collection=blobs)
     drawn = list(view.sample(count, arena, collection=blobs)[0])
     assert len(drawn) == len(set(drawn)) == min(count, 9)
@@ -330,6 +372,7 @@ def test_sample(view, blobs, arena, count: int):
 
 
 def test_measure(view, blobs, arena):
+    """A measurement bounds the cardinality and value bytes of a range, each lower bound below its upper."""
     view.write([1, 2, 3], [b"a", b"bb", b"ccc"], collection=blobs)
     bounds = view.measure(0, 100, arena, collection=blobs)
     assert isinstance(bounds, ustore.Measurement)
@@ -338,6 +381,7 @@ def test_measure(view, blobs, arena):
 
 
 def test_scan_bounds_and_directions(view, blobs, arena):
+    """A scan or a cursor stops before its end key, in either direction."""
     view.write([10, 20, 30, 40], b"v", collection=blobs)
     descending = ustore.ScanDirection.DESCENDING
     assert list(view.scan(10, 8, arena, collection=blobs, end=30)[0]) == keys([10, 20])
@@ -348,6 +392,7 @@ def test_scan_bounds_and_directions(view, blobs, arena):
 
 
 def test_ranges_remove_and_values_read_in_slices(view, blobs, arena):
+    """A read slices each value by offset and limit, and a ranged removal stops before its end."""
     view.write([1, 2, 3], [b"alpha", b"beta", b"gamma"], collection=blobs)
     sliced = view.read([1, 3], arena, collection=blobs, offset=1, limit=2)
     assert [bytes(value) for value in sliced] == [b"lp", b"am"]
@@ -356,6 +401,7 @@ def test_ranges_remove_and_values_read_in_slices(view, blobs, arena):
 
 
 def test_change_feeds_yield_writes_then_removals(engine, database, blobs, arena):
+    """A change feed yields a write then its removal in stamp order, where LevelDB refuses one."""
     if engine == "leveldb":
         with pytest.raises(ustore.UnsupportedError):
             database.changes_cursor(collection=blobs)
@@ -373,7 +419,7 @@ def test_change_feeds_yield_writes_then_removals(engine, database, blobs, arena)
         assert not feed.next(8, arena).keys
 
 
-def test_scan_patterns_predicates_and_scores(view, blobs, arena):
+def test_scan_patterns_predicates_and_scores(view, blobs, arena, unraisable):
     """Patterns narrow a scan by value, weighted substrings score BM25, and a predicate admits keys page by page."""
     view.write([1, 2, 3, 4], [b"Apple", b"banana", b"cherry", b"avocado"], collection=blobs)
     matched = view.scan(0, 8, arena, collection=blobs, patterns=["^a"], sensitivity=ustore.CaseSensitivity.UNCASED)
@@ -394,11 +440,10 @@ def test_scan_patterns_predicates_and_scores(view, blobs, arena):
     )
     assert list(admitted[0]) == keys([2, 4])
     assert asked == [2, 2]
-    reported: list[type[BaseException]] = []
-    with pytest.MonkeyPatch.context() as patch:
-        patch.setattr(sys, "unraisablehook", lambda unraisable: reported.append(unraisable.exc_type))
-        refused = view.scan(0, 8, arena, collection=blobs, predicate=lambda page: 1 / 0)
-    assert list(refused[0]) == [] and reported and set(reported) == {ZeroDivisionError}
+    refused = view.scan(0, 8, arena, collection=blobs, predicate=lambda page: 1 / 0)
+    assert list(refused[0]) == []
+    assert unraisable
+    assert {report.exc_type for report in unraisable} == {ZeroDivisionError}
     with pytest.raises(ustore.InvalidArgumentError):
         view.scan(0, 8, arena, collection=blobs, patterns=["("])
 
@@ -434,6 +479,7 @@ def test_a_cursor_resumes_past_its_last_key(database, blobs, arena):
 
 
 def test_a_page_exports_its_keys(database, blobs, arena):
+    """A cursor page exports its keys as 16-byte rows, carrying no values unless asked."""
     database.write([5, 6], b"v", collection=blobs)
     with database.cursor(collection=blobs) as cursor:
         page = cursor.next(2, arena)
@@ -480,6 +526,7 @@ def outcomes_of(calls: list[ustore.Deferred]) -> list[ustore.Status]:
 
 
 def test_a_deferred_read_answers_once_waited(database, blobs):
+    """A deferred read answers a Deferred that turns successful with the values once waited."""
     database.write([1, 2], [b"a", b"bb"], collection=blobs)
     with ustore.Executor.for_ram(2) as executor:
         reading = database.deferred(executor).read([1, 2, 3], ustore.Arena(executor), collection=blobs)
@@ -643,6 +690,7 @@ def test_the_collector_frees_a_cycle_through_a_finished_deferred(database, blobs
 
 
 def test_a_deferred_contains_answers_a_bool_once_waited(view, blobs, later):
+    """A deferred contains answers True or False once waited."""
     view.set(1, b"a", collection=blobs)
     assert later.contains(1, collection=blobs).wait() is True
     assert later.contains(2, collection=blobs).wait() is False
@@ -671,6 +719,7 @@ def test_a_deferred_view_names_the_verb_it_takes_instead(database, blobs, docs):
 # region Refusals
 
 
+@pytest.mark.any_engine
 @pytest.mark.parametrize(
     ("call", "failure"),
     [
@@ -701,11 +750,13 @@ def test_a_deferred_view_names_the_verb_it_takes_instead(database, blobs, docs):
     ],
 )
 def test_rejects_malformed_arguments(view, blobs, call, failure: type):
+    """Misspelled keywords, wrong value types, malformed keys and negative counts raise."""
     with pytest.raises(failure):
         call(view)
 
 
 def test_refuses_a_closed_database(open_database):
+    """A closed database raises UninitializedError on the next call."""
     closed = open_database()
     blobs = closed.collection_create("blobs", modality=ustore.Modality.BLOBS)
     closed.close()
@@ -714,6 +765,7 @@ def test_refuses_a_closed_database(open_database):
 
 
 def test_closing_twice_is_safe(open_database):
+    """Closing a database a second time does nothing."""
     database = open_database()
     database.close()
     database.close()

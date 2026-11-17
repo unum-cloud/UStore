@@ -64,7 +64,7 @@ namespace unum::ustore::bench {
 }
 
 /** Command-line options of the benchmark, each field set by the flag of the same name. */
-struct settings_t : shared_settings_t {
+struct twitter_settings_t : bench_settings_t {
 
     /** Directory of NDJSON tweet files; tweets are generated without it. */
     std::string_view dataset;
@@ -253,16 +253,16 @@ constexpr std::string_view tweet_template_k =
 }
 
 /** Generates @c max_tweets tweets from @c tweet_template_k, one per line, and indexes them. */
-[[nodiscard]] bool generate_dataset(settings_t const& settings, twitter_t& twitter) noexcept {
+[[nodiscard]] bool generate_dataset(twitter_settings_t const& settings, twitter_t& twitter) noexcept {
     fmt::println("Will generate tweets...");
     std::size_t const tweets_count = settings.max_tweets.value;
-    splitmix64_t random {stream_key(settings.seed, "tweets", 0)};
+    split_mix_generator_t random {stream_key(settings.seed, "tweets", 0)};
     st::vector<std::int64_t> user_ids;
     st::vector<std::int64_t> mentioned_user_ids;
     if (st::failed(user_ids.reserve(tweets_count))) return false;
     for (std::size_t tweet = 0; tweet != tweets_count; ++tweet) {
-        std::int64_t const tweet_id = static_cast<std::int64_t>(random.next() >> 1);
-        std::int64_t const user_id = static_cast<std::int64_t>(random.next() >> 1);
+        std::int64_t const tweet_id = static_cast<std::int64_t>(random() >> 1);
+        std::int64_t const user_id = static_cast<std::int64_t>(random() >> 1);
         std::size_t const text_length = 1 + random.below(280);
         std::size_t const mentions_count = fu::min_of<std::size_t>(random.below(2 * settings.connectivity.value + 1),
                                                                    user_ids.size());
@@ -283,7 +283,7 @@ constexpr std::string_view tweet_template_k =
 }
 
 /** Maps up to @c max_input_files_total NDJSON files from the dataset directory and indexes them on @p executor. */
-[[nodiscard]] bool load_dataset(settings_t const& settings, executor_t& executor, twitter_t& twitter) noexcept {
+[[nodiscard]] bool load_dataset(twitter_settings_t const& settings, executor_t& executor, twitter_t& twitter) noexcept {
     fmt::println("Will search for .ndjson files...");
     std::error_code error;
     std::filesystem::directory_iterator listing {std::filesystem::path {settings.dataset}, error};
@@ -335,11 +335,11 @@ constexpr std::string_view tweet_template_k =
 
 /** Upserts the documents into @p collection in transactional batches of @p batch_size committed as
  *  @p durability asks, each thread over its own share of batches. */
-void construct_docs(executor_t& executor, settings_t const& settings, twitter_t const& twitter,
+void construct_docs(executor_t& executor, twitter_settings_t const& settings, twitter_t const& twitter,
                     ustore_collection_id_t collection, std::size_t batch_size, ustore_durability_t durability) {
     std::string const name = fmt::format("construct_docs{}/{}",
                                          durability == ustore_durability_flushed_k ? "_flushed" : "", batch_size);
-    if (!settings.selects(name)) return;
+    if (!settings.filter.selects(name)) return;
     st::vector<keyed_document_t> documents;
     if (!flatten(twitter.documents, documents)) return print(row_t {.name = name, .skipped = "no memory for batches"});
     std::span<keyed_document_t const> const staged {documents.begin(), documents.end()};
@@ -356,10 +356,10 @@ void construct_docs(executor_t& executor, settings_t const& settings, twitter_t 
 
 /** Writes the documents' JSON bodies as blobs at the head in batches of @p batch_size, each thread
  *  over its own share of batches. */
-void construct_blobs(executor_t& executor, settings_t const& settings, twitter_t const& twitter,
+void construct_blobs(executor_t& executor, twitter_settings_t const& settings, twitter_t const& twitter,
                      std::size_t batch_size) {
     std::string const name = fmt::format("construct_blobs/{}", batch_size);
-    if (!settings.selects(name)) return;
+    if (!settings.filter.selects(name)) return;
     st::vector<keyed_document_t> documents;
     if (!flatten(twitter.documents, documents)) return print(row_t {.name = name, .skipped = "no memory for batches"});
     std::span<keyed_document_t const> const staged {documents.begin(), documents.end()};
@@ -383,10 +383,10 @@ void construct_blobs(executor_t& executor, settings_t const& settings, twitter_t
 }
 
 /** Upserts the edges in transactional batches of @p batch_size, each thread over its own share of batches. */
-void construct_graph(executor_t& executor, settings_t const& settings, twitter_t const& twitter,
+void construct_graph(executor_t& executor, twitter_settings_t const& settings, twitter_t const& twitter,
                      std::size_t batch_size) {
     std::string const name = fmt::format("construct_graph/{}", batch_size);
-    if (!settings.selects(name)) return;
+    if (!settings.filter.selects(name)) return;
     st::vector<edge_t> edges;
     if (!flatten(twitter.edges, edges)) return print(row_t {.name = name, .skipped = "no memory for batches"});
     std::span<edge_t const> const staged {edges.begin(), edges.end()};
@@ -460,7 +460,7 @@ struct tweet_batches_t {
             if (failed()) return false;
         }
         if (st::failed(keys.resize(batches_count_k * size))) return false;
-        splitmix64_t random {stream};
+        split_mix_generator_t random {stream};
         for (ustore_key_t& key : keys) {
             std::size_t part = random.below(twitter.documents.size());
             while (twitter.documents[part].size() == 0) part = (part + 1) % twitter.documents.size();
@@ -487,11 +487,11 @@ struct tweet_batches_t {
 using sample_read_t = void (*)(twitter_t const&, tweet_batches_t&, loop_t&, std::size_t) noexcept;
 
 /** Samples @p read on every thread once per batch size, each thread drawing its own keys above its loop. */
-void sample(executor_t& executor, settings_t const& settings, twitter_t const& twitter, std::string_view stem,
+void sample(executor_t& executor, twitter_settings_t const& settings, twitter_t const& twitter, std::string_view stem,
             sample_read_t read, std::span<std::size_t const> batch_sizes) {
     for (std::size_t const batch_size : batch_sizes) {
         std::string const name = fmt::format("{}/{}", stem, batch_size);
-        if (!settings.selects(name)) continue;
+        if (!settings.filter.selects(name)) continue;
         print(run_threads(executor, settings, name, [&](loop_t& loop, std::size_t thread) noexcept {
             tweet_batches_t batches;
             if (!batches.draw(twitter, batch_size, stream_key(settings.seed, name, thread)))
@@ -721,7 +721,7 @@ int main(int argc, char** argv) {
     using namespace unum::ustore;
     using namespace unum::ustore::bench;
 
-    settings_t settings;
+    twitter_settings_t settings;
     std::array<flag_t, 11> const flags {{
         {"--dataset", "path", "directory of .ndjson tweet files; tweets are generated without it", &settings.dataset},
         {"--directory", "path", "database directory, required", &settings.directory},
@@ -736,7 +736,12 @@ int main(int argc, char** argv) {
         {"--connectivity", "count", "average mentions per generated tweet", &settings.connectivity},
         {"--batch-sizes", "counts", "sampling batch sizes, the last also for construction", &settings.batch_sizes},
     }};
-    read_settings(argc, argv, settings, flags);
+    std::array<char const*, 11> const variables {
+        "USTORE_DATASET",      "USTORE_DIRECTORY",        "USTORE_ENGINE",
+        "USTORE_ISOLATION",    "USTORE_ENGINE_TRANSPORT", "USTORE_DIRECTORIES",
+        "USTORE_THREADS",      "USTORE_MAX_TWEETS",       "USTORE_MAX_INPUT_FILES_TOTAL",
+        "USTORE_CONNECTIVITY", "USTORE_BATCH_SIZES"};
+    read_bench_settings(argc, argv, settings, flags, variables);
     if (settings.directory.empty()) {
         fmt::println(stderr, "--directory is required");
         return 1;

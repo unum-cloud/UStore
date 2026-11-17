@@ -30,7 +30,7 @@
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <type_traits> // `std::is_same_v`
-#include <utility>     // `std::exchange`, `std::move`
+#include <utility>     // `std::move`
 
 #include <forkunion/atomics.hpp>       // `fu::standard_atomic_ref`
 #include <forkunion/types.hpp>         // `fu::standard_yield_t`
@@ -47,7 +47,7 @@
 #include "ustore/utilities/nvme_manifest.hpp"  // `manifest_t`, `manifest_file_t`
 #include "ustore/utilities/nvme_volume.hpp"    // `basic_directory_volume`, `volume_config_t`, `data_address_t`
 
-#include "harness.hpp" // `expect_status`, `suite_totals_t`
+#include "harness.hpp" // `expect_status`, `run_test_case`, `test_run`
 
 namespace unum::ustore::test::nvme {
 
@@ -122,7 +122,8 @@ constexpr std::array<transport_t, 6> every_transport_k {transport_t::memory_k,  
                                                         transport_t::linux_uring_k, transport_t::linux_aio_k,
                                                         transport_t::device_k,      transport_t::linux_spdk_k};
 
-/** The name @c --transports selects @p transport by, which is also the middle of every result line. */
+/** The name @c --transports selects @p transport by, which is also the middle of
+ *  every case label. */
 [[nodiscard]] constexpr char const* name_of(transport_t transport) noexcept {
     switch (transport) {
     case transport_t::memory_k: return "memory";
@@ -135,19 +136,28 @@ constexpr std::array<transport_t, 6> every_transport_k {transport_t::memory_k,  
     return "unknown";
 }
 
-/** The result line's name: the suite, the transport and the case it ran, or the suite and the transport alone. */
+/** The exact constant spelling @p transport , which a case label names. */
+[[nodiscard]] constexpr char const* constant_of(transport_t transport) noexcept {
+    switch (transport) {
+    case transport_t::memory_k: return "transport_t::memory_k";
+    case transport_t::blocking_k: return "transport_t::blocking_k";
+    case transport_t::linux_uring_k: return "transport_t::linux_uring_k";
+    case transport_t::linux_aio_k: return "transport_t::linux_aio_k";
+    case transport_t::device_k: return "transport_t::device_k";
+    case transport_t::linux_spdk_k: return "transport_t::linux_spdk_k";
+    }
+    return "transport_t {}";
+}
+
+/** The case label in call notation: the case @p function called with the exact constant of its
+ *  transport, as <tt>test_flush_lands_on_level_zero(transport_t::memory_k)</tt>. */
 struct case_label_t {
 
     /** The null-terminated label. */
-    char text[96] {};
+    char text[160] {};
 
-    case_label_t(char const* suite, char const* transport, char const* name) noexcept {
-        auto const written = fmt::format_to_n(text, sizeof(text) - 1, "{}.{}.{}", suite, transport, name);
-        *written.out = '\0';
-    }
-
-    case_label_t(char const* suite, char const* transport) noexcept {
-        auto const written = fmt::format_to_n(text, sizeof(text) - 1, "{}.{}", suite, transport);
+    case_label_t(char const* function, transport_t transport) noexcept {
+        auto const written = fmt::format_to_n(text, sizeof(text) - 1, "{}({})", function, constant_of(transport));
         *written.out = '\0';
     }
 
@@ -194,55 +204,30 @@ enum class capacity_behavior_t : std::uint8_t {
 }
 
 /** The reason the device transport reports when the suite ran without @c --device. */
-constexpr char const* needs_device_k = "needs --device";
+constexpr char const* needs_device_k = "needs USTORE_DEVICE";
 
 /** The reason the SPDK transport reports when the suite ran without @c --spdk-address. */
-constexpr char const* needs_spdk_address_k = "needs --spdk-address";
+constexpr char const* needs_spdk_address_k = "needs USTORE_SPDK_ADDRESS";
 
 /** The reason a case of several volumes reports on a transport that offers one medium. */
-constexpr char const* one_volume_per_device_k = "a block device holds one volume";
+constexpr char const* one_volume_per_device_k = "needs a transport that holds several volumes";
+
+/** The reason a transport of unbuffered files reports on a filesystem that ignores alignment. */
+constexpr char const* needs_direct_filesystem_k = "needs a filesystem that enforces O_DIRECT, not tmpfs";
 
 /** The reason a case that remounts a volume reports on memory, whose run media die
  *  with the volume. */
-constexpr char const* memory_volumes_vanish_k = "memory volumes do not outlive their mount";
+constexpr char const* memory_volumes_vanish_k = "needs volumes that outlive their mount";
 
-/** What the machine and the flags offer a driver: the paths, the transports selected, and the seed. */
-struct test_environment_t {
-
-    /** The unique directory the file transports place their volumes in, or null without @c --directory. */
-    char const* directory = nullptr;
-
-    /** The block device the device transport opens, empty without @c --device. */
-    std::string_view device;
-
-    /** The PCIe address the SPDK transport binds, empty without @c --spdk-address. */
-    std::string_view spdk_address;
-
-    /** The transports @c --transports named, every one when empty. */
-    texts_t transports;
-
-    /** The seed every fixture's generator descends from. */
-    std::uint64_t seed = 0;
-
-    /** The medium @p options and the unique @p directory describe. */
-    [[nodiscard]] static test_environment_t of(suite_options_t const& options, directory_t const& directory) noexcept {
-        test_environment_t environment;
-        environment.directory = directory.path();
-        environment.device = options.device;
-        environment.spdk_address = options.spdk_address;
-        environment.transports = options.transports;
-        environment.seed = options.seed;
-        return environment;
-    }
-
-    /** Whether @c --transports named @p transport, which an absent flag does for every one. */
-    [[nodiscard]] bool selects(transport_t transport) const noexcept {
-        if (transports.size == 0) return true;
-        for (std::string_view const name : transports.view())
-            if (name == name_of(transport)) return true;
-        return false;
-    }
-};
+/** Whether the transports setting names @p transport, which an absent setting does
+ *  for every one. */
+[[nodiscard]] inline bool transport_selected(transport_t transport) noexcept {
+    texts_t const& transports = test_run.settings.transports;
+    if (transports.size == 0) return true;
+    for (std::string_view const name : transports.view())
+        if (name == name_of(transport)) return true;
+    return false;
+}
 
 /** The magic @c statfs answers for a volume that lives in memory and enforces no alignment. */
 constexpr std::uint64_t memory_filesystem_magic_k = 0x01021994ull;
@@ -274,22 +259,21 @@ constexpr std::uint64_t memory_filesystem_magic_k = 0x01021994ull;
                                                                              : "Linux AIO is refused on this machine";
 }
 
-/** Why @p transport cannot be mounted on @p environment, or null when it can; a path the flags claim is never a
- *  reason. */
-[[nodiscard]] inline char const* transport_refusal(transport_t transport,
-                                                   test_environment_t const& environment) noexcept {
+/** Why @p transport cannot be mounted in @p directory, the suite's unique one or null, or null when
+ *  it can; a path the settings claim is never a reason. */
+[[nodiscard]] inline char const* transport_refusal(transport_t transport, char const* directory) noexcept {
     switch (transport) {
     case transport_t::memory_k: return nullptr;
-    case transport_t::blocking_k: return environment.directory ? nullptr : needs_directory_k;
+    case transport_t::blocking_k: return directory ? nullptr : needs_directory_k;
     case transport_t::linux_uring_k:
     case transport_t::linux_aio_k:
         if (char const* const reason = transport == transport_t::linux_uring_k ? uring_refusal() : aio_refusal())
             return reason;
-        if (!environment.directory) return needs_directory_k;
-        if (on_memory_filesystem(environment.directory)) return "needs a filesystem that enforces O_DIRECT, not tmpfs";
+        if (!directory) return needs_directory_k;
+        if (on_memory_filesystem(directory)) return needs_direct_filesystem_k;
         return nullptr;
-    case transport_t::device_k: return environment.device.empty() ? needs_device_k : uring_refusal();
-    case transport_t::linux_spdk_k: return environment.spdk_address.empty() ? needs_spdk_address_k : nullptr;
+    case transport_t::device_k: return test_run.settings.device.empty() ? needs_device_k : uring_refusal();
+    case transport_t::linux_spdk_k: return test_run.settings.spdk_address.empty() ? needs_spdk_address_k : nullptr;
     }
     return nullptr;
 }
@@ -421,13 +405,14 @@ struct basic_fixture {
     transport_t transport;
 
     /** The generator every random draw of a case descends from. */
-    random_t random;
+    split_mix_generator_t random;
 
     /** Bytes the budgets held once the mount finished, which a case hands back before its fixture dies. */
     std::size_t mounted_bytes = 0;
 
-    /** Where a fixture dying with bytes still charged counts the leak, or null to count nowhere. */
-    std::size_t* leaks = nullptr;
+    /** Whether the mount finished, so a fixture dying with bytes still charged fails the
+     *  case in progress. */
+    bool counts_leaks = false;
 
     /** The directory every volume of the fixture keeps its data directories in, or null
      *  without @c --directory. */
@@ -446,12 +431,10 @@ struct basic_fixture {
 
     ~basic_fixture() noexcept {
         // Only the last owner can tell a leak from a budget a case still holds on purpose.
-        if (leaks && resources.use_count() == 1)
-            if (std::size_t const held = resources->memory_constraint.used(); held != mounted_bytes) {
-                fmt::println(stderr, "  check failed: the budgets hold {} bytes past the mount's {}", held,
-                             mounted_bytes);
-                ++*leaks;
-            }
+        if (counts_leaks && resources.use_count() == 1) {
+            std::size_t const held = resources->memory_constraint.used();
+            expect_true(held == mounted_bytes, "the budgets hold {} bytes past the mount's {}", held, mounted_bytes);
+        }
         [[maybe_unused]] status_t const parked = channels.release_all();
         [[maybe_unused]] status_t const unpinned = arena.unregister(disk);
         for (std::size_t index = 0; index != media.size(); ++index)
@@ -465,7 +448,7 @@ struct basic_fixture {
         if (!directory) return status_t {status_code_t::unsupported_k, needs_directory_k};
         if (data_directories == 0 || data_directories > fixture_volumes_capacity_k)
             return status_t {status_code_t::invalid_argument_k, "A fixture's volume spans fewer directories"};
-        st::vector<path_t> paths;
+        st::vector<std::string> paths;
         std::array<data_address_t, fixture_volumes_capacity_k> addresses {};
         if (paths.reserve(data_directories) != st::status_t::success_k)
             return status_t {status_code_t::out_of_memory_k, "No room for a volume's paths"};
@@ -482,11 +465,11 @@ struct basic_fixture {
     }
 
     /** The path of data directory @p index of every volume of this fixture. */
-    [[nodiscard]] path_t data_directory_path(std::size_t index) const noexcept {
+    [[nodiscard]] std::string data_directory_path(std::size_t index) const noexcept {
         std::array<char, 96> name {};
         auto const written = fmt::format_to_n(name.data(), name.size() - 1, "{}.volume-{}", suite, index);
         *written.out = '\0';
-        return path_t {directory ? directory : ".", name.data()};
+        return fmt::format("{}/{}", directory ? directory : ".", name.data());
     }
 
     /** Whether a volume remounted on this fixture finds the runs its predecessor wrote, which
@@ -553,8 +536,8 @@ struct basic_mount {
     using fixture_t = basic_fixture<disk_type_>;
     using fixture_unique_ptr_t = std::unique_ptr<fixture_t>;
 
-    /** The paths and the seed every fixture mounts with. */
-    test_environment_t environment;
+    /** The suite's unique directory the file media live in, or null without one. */
+    char const* directory = nullptr;
 
     /** The numbers every fixture mounts with unless a case hands its own. */
     fixture_config_t config;
@@ -562,14 +545,11 @@ struct basic_mount {
     /** The ring every fixture mounts. */
     transport_t transport = transport_t::memory_k;
 
-    /** The suite's name, which every file medium and every result line carries. */
+    /** The suite's name, which every file medium carries. */
     char const* suite = "";
 
     /** Volumes a fixture holds unless a case asks for its own capacities. */
     std::size_t volumes = 1;
-
-    /** Where every fixture of this mount counts a leak, which the mount's @c report charges to the case. */
-    std::size_t* leaks = nullptr;
 
     /** A fixture of @c volumes volumes of the suite's config. */
     expected<fixture_unique_ptr_t> operator()() const noexcept { return (*this)(config); }
@@ -597,15 +577,15 @@ struct basic_mount {
         expected<disk_type_> mounted = open_disk<disk_type_>(reshaped, capacities.size(), resources->memory_constraint);
         if (!mounted) return mounted.status();
         auto fixture = fixture_unique_ptr_t {new (std::nothrow) fixture_t {std::move(resources), std::move(*mounted),
-                                                                           reshaped, transport, environment.seed}};
+                                                                           reshaped, transport, case_stream_key()}};
         if (!fixture) return status_t {status_code_t::out_of_memory_k, "The fixture did not fit"};
-        fixture->directory = environment.directory;
+        fixture->directory = directory;
         fixture->suite = suite;
         // Every case starts on empty data directories, so no volume inherits its
         // predecessor's manifest.
-        if (environment.directory)
+        if (directory)
             for (std::size_t index = 0; index != fixture_volumes_capacity_k; ++index)
-                if (!recreate_directory(fixture->data_directory_path(index).c_str()))
+                if (!scratch_directory_t::recreate(fixture->data_directory_path(index).c_str()))
                     return status_t {status_code_t::io_k, "A fixture's data directory would not be emptied"};
 
         io_channel_config_t const channels = reshaped.channels();
@@ -638,7 +618,7 @@ struct basic_mount {
                 return blanked;
         }
         fixture->mounted_bytes = fixture->resources->memory_constraint.used();
-        fixture->leaks = leaks;
+        fixture->counts_leaks = true;
         return fixture;
     }
 
@@ -647,13 +627,8 @@ struct basic_mount {
         return transport == transport_t::device_k && count > 1 ? one_volume_per_device_k : nullptr;
     }
 
-    /** The result line of the case @p name on this transport. */
-    [[nodiscard]] case_label_t label(char const* name) const noexcept {
-        return case_label_t {suite, name_of(transport), name};
-    }
-
-    /** Failures the fixtures of this mount counted as leaks since the last call, which it hands over and forgets. */
-    [[nodiscard]] std::size_t take_leaks() const noexcept { return leaks ? std::exchange(*leaks, std::size_t {0}) : 0; }
+    /** The label of the case @p name on this transport. */
+    [[nodiscard]] case_label_t label(char const* name) const noexcept { return case_label_t {name, transport}; }
 
   private:
 
@@ -664,7 +639,7 @@ struct basic_mount {
         request.length = capacity;
         request.access = medium_access_t::create_read_write_k;
         if (transport == transport_t::device_k) {
-            request.name = environment.device.data();
+            request.name = test_run.settings.device.data();
             request.length = 0;
             request.access = medium_access_t::read_write_k;
             return disk.register_medium(request);
@@ -676,7 +651,7 @@ struct basic_mount {
         std::array<char, 64> name {};
         auto const written = fmt::format_to_n(name.data(), name.size() - 1, "{}-{}.bin", suite, index);
         *written.out = '\0';
-        path_t const path {environment.directory, name.data()};
+        std::string const path = fmt::format("{}/{}", directory, name.data());
         [[maybe_unused]] int const removed = std::remove(path.c_str());
         request.name = path.c_str();
         return disk.register_medium(request);
@@ -725,7 +700,7 @@ template <typename fixture_type_>
     std::array<char, 96> name {};
     auto const written = fmt::format_to_n(name.data(), name.size() - 1, "{}.ustore.json", fixture.suite);
     *written.out = '\0';
-    path_t const path {fixture.data_directory_path(0).c_str(), name.data()};
+    std::string const path = fmt::format("{}/{}", fixture.data_directory_path(0).c_str(), name.data());
     st::vector<char> text;
     if (read_file(path.c_str(), text).succeeded()) [[maybe_unused]]
         status_t const parsed = manifest.parse(text, volume_allocator_t {fixture.resources->memory_constraint});
@@ -770,18 +745,18 @@ template <typename fixture_type_>
 
 /** The path a crash copy of the data directory of @p fixture is kept at. */
 template <typename fixture_type_>
-[[nodiscard]] path_t crash_copy_path(fixture_type_ const& fixture) noexcept {
+[[nodiscard]] std::string crash_copy_path(fixture_type_ const& fixture) noexcept {
     std::array<char, 96> name {};
     auto const written = fmt::format_to_n(name.data(), name.size() - 1, "{}.crash", fixture.suite);
     *written.out = '\0';
-    return path_t {fixture.directory, name.data()};
+    return fmt::format("{}/{}", fixture.directory, name.data());
 }
 
 /** Copies the data directory of @p fixture aside, which is what a crash would leave on it
  *  at this moment. */
 template <typename fixture_type_>
 status_t capture_data_directory(fixture_type_ const& fixture) noexcept {
-    path_t const live = fixture.data_directory_path(0), aside = crash_copy_path(fixture);
+    std::string const live = fixture.data_directory_path(0), aside = crash_copy_path(fixture);
     std::error_code error;
     std::filesystem::remove_all(aside.c_str(), error);
     std::filesystem::copy(live.c_str(), aside.c_str(), std::filesystem::copy_options::recursive, error);
@@ -792,7 +767,7 @@ status_t capture_data_directory(fixture_type_ const& fixture) noexcept {
  *  after a crash finds it. */
 template <typename fixture_type_>
 status_t restore_data_directory(fixture_type_ const& fixture) noexcept {
-    path_t const live = fixture.data_directory_path(0), aside = crash_copy_path(fixture);
+    std::string const live = fixture.data_directory_path(0), aside = crash_copy_path(fixture);
     std::error_code error;
     std::filesystem::remove_all(live.c_str(), error);
     if (!error) std::filesystem::rename(aside.c_str(), live.c_str(), error);
@@ -803,92 +778,71 @@ status_t restore_data_directory(fixture_type_ const& fixture) noexcept {
 
 #pragma region Driver
 
-/** Runs @p case_function on @p mount as @c report does, failing it when a fixture it mounted died with bytes still
- *  charged to its budgets. */
-template <typename disk_type_, typename result_type_>
-std::size_t report_on_mount(suite_totals_t& totals, basic_mount<disk_type_> const& mount, char const* name,
-                            result_type_ (*case_function)(basic_mount<disk_type_> const&)) {
+/** Runs @p case_function on @p mount as the case @p name of the mount's transport; a fixture it
+ *  mounted that dies with bytes still charged to its budgets fails the case. */
+template <typename disk_type_>
+void report_on_mount(basic_mount<disk_type_> const& mount, char const* name,
+                     void (*case_function)(basic_mount<disk_type_> const&)) {
     case_label_t const label = mount.label(name);
-    if (!totals.selects(label.c_str())) return 0;
-    case_result_t result(case_function(mount));
-    result.failures += mount.take_leaks();
-    return report(totals, label.c_str(), result);
+    run_test_case(label.c_str(), case_function, mount);
 }
 
-/** A case of @p mount counting its failures, named without its template arguments. */
+/** The same for a case that may skip. */
 template <typename disk_type_>
-std::size_t report(suite_totals_t& totals, basic_mount<disk_type_> const& mount, char const* name,
-                   std::size_t (*case_function)(basic_mount<disk_type_> const&)) {
-    return report_on_mount(totals, mount, name, case_function);
-}
-
-/** A case of @p mount that may skip, named without its template arguments. */
-template <typename disk_type_>
-std::size_t report(suite_totals_t& totals, basic_mount<disk_type_> const& mount, char const* name,
-                   case_result_t (*case_function)(basic_mount<disk_type_> const&)) {
-    return report_on_mount(totals, mount, name, case_function);
+void report_on_mount(basic_mount<disk_type_> const& mount, char const* name,
+                     case_result_t (*case_function)(basic_mount<disk_type_> const&)) {
+    case_label_t const label = mount.label(name);
+    run_test_case(label.c_str(), case_function, mount);
 }
 
 /** Mounts one fixture and lets it go, which is the first case of every transport. */
 template <typename disk_type_>
-std::size_t mounts_a_fixture(basic_mount<disk_type_> const& mount) {
+void test_mounts_a_fixture(basic_mount<disk_type_> const& mount) {
     expected<typename basic_mount<disk_type_>::fixture_unique_ptr_t> const probe = mount();
-    return expect_status(probe, status_code_t::success_k);
+    expect_status(probe, status_code_t::success_k);
 }
 
-/** Mounts one probe fixture, reports it as the transport's @c mount case, and hands @p cases the mount when it held. */
+/** Runs the transport's @c mount case, and hands @p cases the mount when it held. */
 template <typename disk_type_, typename cases_type_>
-std::size_t run_on_mount(suite_totals_t& totals, basic_mount<disk_type_> const& mount, cases_type_&& cases) {
-    std::size_t const failures = report(totals, mount, "mount", mounts_a_fixture);
-    if (failures != 0) return failures;
-    cases(mount);
-    return 0;
+void run_on_mount(basic_mount<disk_type_> const& mount, cases_type_&& cases) {
+    std::size_t const failed_before = test_run.failed_cases;
+    report_on_mount(mount, "test_mounts_a_fixture", test_mounts_a_fixture<disk_type_>);
+    if (test_run.failed_cases == failed_before) cases(mount);
 }
 
 /**
- *  @brief Runs @p cases on @p transport, or reports through @p totals why they did not run.
- *  @param[in,out] totals Where the transport's mount and every case report.
- *  @param[in] transport The ring to mount, skipped when @c --transports names others.
- *  @param[in] environment The paths, the selection and the seed the flags gave.
+ *  @brief Runs @p cases on @p transport, or skips the transport with the reason it cannot mount.
+ *  @param[in] transport The ring to mount, left out when the transports setting names others.
+ *  @param[in] directory The suite's unique directory, or null without one.
  *  @param[in] config The numbers every fixture of the suite mounts with.
  *  @param[in] volumes Volumes every fixture holds, which a block device bounds at one.
- *  @param[in] suite The suite's name, which leads every result line.
- *  @param[in] cases Called with the mount, and reports each case it runs against it.
- *  @return The failures of the transport's own mount, which is zero when the cases ran or were skipped.
+ *  @param[in] suite The suite's name, which names every file medium.
+ *  @param[in] cases Called with the mount, and runs each case against it.
  */
 template <typename cases_type_>
-std::size_t run_on_transport(suite_totals_t& totals, transport_t transport, test_environment_t const& environment,
-                             fixture_config_t const& config, std::size_t volumes, char const* suite,
-                             cases_type_&& cases) {
-    if (!environment.selects(transport)) return 0;
-    case_label_t const label {suite, name_of(transport)};
-    if (char const* const reason = transport_refusal(transport, environment))
-        return report(totals, label.c_str(), case_result_t::skipped(reason));
-    if (transport == transport_t::device_k && volumes > 1)
-        return report(totals, label.c_str(), case_result_t::skipped(one_volume_per_device_k));
+void run_on_transport(transport_t transport, char const* directory, fixture_config_t const& config, std::size_t volumes,
+                      char const* suite, cases_type_&& cases) {
+    if (!transport_selected(transport)) return;
+    case_label_t const label {"test_mounts_a_fixture", transport};
+    char const* reason = transport_refusal(transport, directory);
+    if (!reason && transport == transport_t::device_k && volumes > 1) reason = one_volume_per_device_k;
+    // The driver mounts no SPDK disk: the transport skips even when the SPDK address names one.
+    if (!reason && transport == transport_t::linux_spdk_k) reason = "needs a driver that mounts an SPDK disk";
+    if (reason) return run_test_case(label.c_str(), [reason] { return case_result_t::skipped(reason); });
 
-    std::size_t leaks = 0;
     switch (transport) {
     case transport_t::memory_k:
-        return run_on_mount(totals, basic_mount<memory_disk_t> {environment, config, transport, suite, volumes, &leaks},
-                            cases);
+        return run_on_mount(basic_mount<memory_disk_t> {directory, config, transport, suite, volumes}, cases);
     case transport_t::blocking_k:
-        return run_on_mount(
-            totals, basic_mount<blocking_files_disk_t> {environment, config, transport, suite, volumes, &leaks}, cases);
+        return run_on_mount(basic_mount<blocking_files_disk_t> {directory, config, transport, suite, volumes}, cases);
     case transport_t::linux_uring_k:
     case transport_t::device_k:
-        return run_on_mount(
-            totals, basic_mount<linux_uring_files_disk_t> {environment, config, transport, suite, volumes, &leaks},
-            cases);
+        return run_on_mount(basic_mount<linux_uring_files_disk_t> {directory, config, transport, suite, volumes},
+                            cases);
     case transport_t::linux_aio_k:
-        return run_on_mount(
-            totals, basic_mount<linux_aio_files_disk_t> {environment, config, transport, suite, volumes, &leaks},
-            cases);
-    case transport_t::linux_spdk_k:
-        // The driver mounts no SPDK disk: the transport skips even when `--spdk-address` names one.
-        return report(totals, label.c_str(), case_result_t::skipped("the driver mounts no SPDK disk"));
+        return run_on_mount(basic_mount<linux_aio_files_disk_t> {directory, config, transport, suite, volumes}, cases);
+    case transport_t::linux_spdk_k: return;
     }
-    return 0;
 }
 
 #pragma endregion Driver

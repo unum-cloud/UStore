@@ -50,7 +50,7 @@ namespace unum::ustore::bench {
 #pragma region Settings
 
 /** Command-line options of the benchmark, each field set by the flag of the same name. */
-struct settings_t : shared_settings_t {
+struct nvme_pubchem_settings_t : bench_settings_t {
     std::string_view input;
     std::string_view open;
     texts_t directories;
@@ -273,7 +273,7 @@ void retried(std::atomic<std::uint64_t>& retries, call_type_&& call, ustore_outc
 }
 
 /** Opens the NVMe database @p settings name, answering a reason when it cannot. */
-[[nodiscard]] char const* open_database(settings_t const& settings, ustore_database_t& database) {
+[[nodiscard]] char const* open_database(nvme_pubchem_settings_t const& settings, ustore_database_t& database) {
     std::array<ustore_data_directory_t, texts_t::capacity_k> directories {};
     for (std::size_t index = 0; index != settings.directories.size; ++index) {
         std::string_view const path = settings.directories.values[index];
@@ -308,11 +308,11 @@ void retried(std::atomic<std::uint64_t>& retries, call_type_&& call, ustore_outc
 
 } // namespace unum::ustore::bench
 
-int main(int argc, char const* argv[]) {
+int main(int argc, char** argv) {
     using namespace unum::ustore;
     using namespace unum::ustore::bench;
 
-    settings_t settings;
+    nvme_pubchem_settings_t settings;
     std::array<flag_t, 7> const flags {{
         {"--input", "path", "the Arrow IPC stream of rows", &settings.input},
         {"--open", "path", "what the NVMe open takes as its directory", &settings.open},
@@ -322,7 +322,10 @@ int main(int argc, char const* argv[]) {
         {"--batch-size", "count", "rows per write call", &settings.batch_size},
         {"--threads", "count", "threads ingesting and reading", &settings.threads},
     }};
-    read_settings(argc, argv, settings, flags);
+    std::array<char const*, 7> const variables {"USTORE_INPUT",   "USTORE_OPEN", "USTORE_DIRECTORIES",
+                                                "USTORE_DEVICES", "USTORE_ROWS", "USTORE_BATCH_SIZE",
+                                                "USTORE_THREADS"};
+    read_bench_settings(argc, argv, settings, flags, variables);
     if (settings.input.empty() || settings.open.empty()) {
         fmt::println(stderr, "Both --input and --open are required");
         return 1;
@@ -472,7 +475,7 @@ int main(int argc, char const* argv[]) {
 
     // Point reads of random keys of the ingest, while a sampler reads the depth the drives see.
     auto blobs_reads = [&](executor_t& readers, std::string const& name, std::size_t batch) {
-        if (!settings.selects(name)) return;
+        if (!settings.filter.selects(name)) return;
         std::atomic<bool> reading {true}, reported {false};
         std::uint64_t depth_sum = 0, depth_samples = 0, depth_peak = 0;
         std::thread depths([&] {
@@ -489,9 +492,9 @@ int main(int argc, char const* argv[]) {
             ustore_arena_init(&init);
             st::vector<ustore_key_t> keys;
             if (st::failed(keys.resize(batch))) return loop.skip("no room for keys");
-            splitmix64_t random {stream_key(settings.seed, name, thread)};
+            split_mix_generator_t random {stream_key(settings.seed, name, thread)};
             for ([[maybe_unused]] std::size_t call : loop) {
-                for (ustore_key_t& key : keys) key = molecules.keys[random.next() % rows];
+                for (ustore_key_t& key : keys) key = molecules.keys[random.below(rows)];
                 ustore_strings_view_t values {};
                 ustore_blobs_read_t read {.database = database,
                                           .outcome = &local,
@@ -519,7 +522,7 @@ int main(int argc, char const* argv[]) {
     if (maybe_readers) blobs_reads(*maybe_readers, "pubchem_blobs_read_single_32_threads", 1);
     for (std::size_t const depth : {std::size_t {32}, std::size_t {1024}}) {
         std::string const strings_name = fmt::format("pubchem_strings_read_batch{}", depth);
-        if (settings.selects(strings_name))
+        if (settings.filter.selects(strings_name))
             print(run_threads(executor, settings, strings_name, [&](loop_t& loop, std::size_t thread) noexcept {
                 ustore_arena_t arena = nullptr;
                 ustore_outcome_t local {};
@@ -528,11 +531,11 @@ int main(int argc, char const* argv[]) {
                 st::vector<std::uint32_t> offsets;
                 st::vector<std::uint8_t> tape;
                 if (st::failed(offsets.resize(depth + 1))) return loop.skip("no room for strings");
-                splitmix64_t random {stream_key(settings.seed, strings_name, thread)};
+                split_mix_generator_t random {stream_key(settings.seed, strings_name, thread)};
                 for ([[maybe_unused]] std::size_t call : loop) {
                     tape.clear();
                     for (std::size_t index = 0; index != depth; ++index) {
-                        std::string_view const smiles = molecules.smiles[random.next() % rows];
+                        std::string_view const smiles = molecules.smiles[random.below(rows)];
                         offsets[index] = static_cast<std::uint32_t>(tape.size());
                         std::size_t const at = tape.size();
                         if (st::failed(tape.resize(at + smiles.size()))) return loop.skip("no room for strings");

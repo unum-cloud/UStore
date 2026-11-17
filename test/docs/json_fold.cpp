@@ -34,7 +34,7 @@
 #include "ustore/ustore.hpp"                // `database_t`, `arena_t`, `strided_strings`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocator`
 
-#include "harness.hpp" // `suite_exit_code`, `expect`, `expect_eq`, `random_t`, `directory_t`
+#include "harness.hpp" // `run_test_case`, `expect_true`, `expect_status`, `split_mix_generator_t`, `scratch_directory_t`
 
 using namespace unum::ustore;
 using namespace unum::ustore::test;
@@ -127,7 +127,7 @@ class reference_t {
 
 /** Writes random JSON over a few keys, so that fields and patches often meet what is there. */
 class value_writer_t {
-    random_t& random_;
+    split_mix_generator_t& random_;
 
     static constexpr std::string_view keys_k[] = {"a", "b", "c", "0", "1", "x/y", "t~"};
     static constexpr std::string_view scalars_k[] = {
@@ -135,7 +135,7 @@ class value_writer_t {
     };
 
   public:
-    explicit value_writer_t(random_t& random) noexcept : random_(random) {}
+    explicit value_writer_t(split_mix_generator_t& random) noexcept : random_(random) {}
 
     std::string_view pick(std::span<std::string_view const> pool) noexcept { return pool[random_.below(pool.size())]; }
 
@@ -266,7 +266,7 @@ enum class typed_upserts_t : std::uint8_t {
 };
 
 /** Draws a modification: whole documents a quarter of the time, a typed value a sixth, an odd value a twelfth. */
-operation_t random_operation(random_t& random, value_writer_t& writer, typed_upserts_t typed_upserts) {
+operation_t random_operation(split_mix_generator_t& random, value_writer_t& writer, typed_upserts_t typed_upserts) {
     operation_t operation;
     std::uint64_t const roll = random.below(100);
     operation.modification = roll < 22   ? delta_modification_t::upsert_k
@@ -343,28 +343,28 @@ std::span<byte_t const> base_of(std::optional<std::string> const& base) noexcept
     return {reinterpret_cast<byte_t const*>(base->data()), base->size()};
 }
 
-/** Encodes @p deltas into one change delta, counting a failure into @p failures. */
-pending_t change_of(std::span<json_delta_t const> deltas, ustore_arena_t arena, std::size_t& failures) {
+/** Encodes @p deltas into one change delta, failing a check when it cannot. */
+pending_t change_of(std::span<json_delta_t const> deltas, ustore_arena_t arena) {
     auto [chain, status] = encode_deltas(deltas, arena);
-    failures += expect(status.succeeded());
+    expect_true(status.succeeded());
     return {delta_kind_t::change_k, std::string(string_of(chain))};
 }
 
 /** The store delta @p delta becomes, as the glue logs it: writes and removals as deltas of their own. */
-pending_t pending_of(json_delta_t const& delta, ustore_arena_t arena, std::size_t& failures) {
+pending_t pending_of(json_delta_t const& delta, ustore_arena_t arena) {
     if (delta.modification == delta_modification_t::write_k) return {delta_kind_t::write_k, std::string(delta.value)};
     if (delta.modification == delta_modification_t::remove_k) return {delta_kind_t::remove_k, {}};
-    return change_of(std::span<json_delta_t const>(&delta, 1), arena, failures);
+    return change_of(std::span<json_delta_t const>(&delta, 1), arena);
 }
 
-/** The records the encoded @p chain holds, counting a malformed chain into @p failures. */
-std::size_t count_records(std::span<byte_t const> chain, std::size_t& failures) {
+/** The records the encoded @p chain holds, failing a check on a malformed chain. */
+std::size_t count_records(std::span<byte_t const> chain) {
     std::size_t count = 0;
     status_t const status = for_each_delta(chain, [&](json_delta_t const&) noexcept {
         ++count;
         return status_t {};
     });
-    failures += expect(status.succeeded());
+    expect_true(status.succeeded());
     return count;
 }
 
@@ -381,12 +381,11 @@ outcome_t outcome_of(expected<std::span<byte_t const>> const& result) {
     return {status_code_t::success_k, std::string(string_of(*result))};
 }
 
-/** Counts a failure when @p actual differs from @p wanted, printing both and the @p context. */
-std::size_t expect_outcome(outcome_t const& actual, outcome_t const& wanted, std::string_view context) {
-    if (actual == wanted) return 0;
-    fmt::println(stderr, "  {}: wanted {} `{}`, got {} `{}`", context, describe(wanted.code), wanted.bytes,
-                 describe(actual.code), actual.bytes);
-    return 1;
+/** Holds when @p actual matches @p wanted ; otherwise fails a check, printing both and
+ *  the @p context. */
+bool expect_outcome(outcome_t const& actual, outcome_t const& wanted, std::string_view context) {
+    return expect_true(actual == wanted, "{}: wanted {} `{}`, got {} `{}`", context, status_name(wanted.code),
+                       wanted.bytes, status_name(actual.code), actual.bytes);
 }
 
 #pragma endregion Chains
@@ -394,10 +393,9 @@ std::size_t expect_outcome(outcome_t const& actual, outcome_t const& wanted, std
 #pragma region Cases
 
 /** Deltas encode and decode in chains, refuse truncations and unknown modifications, and close as documented. */
-std::size_t json_fold_codec() {
-    std::size_t failures = 0;
+void test_json_fold_codec() {
     auto [arena, arena_status] = arena_t::make();
-    failures += expect(arena_status.succeeded());
+    expect_true(arena_status.succeeded());
     json_delta_t const deltas[] = {
         {1, delta_modification_t::merge_k, "/a/b", "{\"x\":null}"},
         {2, delta_modification_t::upsert_k, "", "[1]"},
@@ -405,42 +403,40 @@ std::size_t json_fold_codec() {
         {~std::uint64_t(0), delta_modification_t::remove_k, "", ""},
     };
     auto [chain, status] = encode_deltas(deltas, arena);
-    failures += expect(status.succeeded());
+    expect_true(status.succeeded());
     std::size_t index = 0;
-    failures += expect(for_each_delta(chain, [&](json_delta_t const& delta) noexcept -> status_t {
-                           json_delta_t const& wanted = deltas[index++];
-                           bool const same = delta.stamp == wanted.stamp && delta.modification == wanted.modification &&
-                                             delta.field == wanted.field && delta.value == wanted.value;
-                           return same ? status_t {} : status_t {status_code_t::internal_k, "differs"};
-                       }).succeeded());
-    failures += expect_eq(index, std::size_t(4));
+    expect_true(for_each_delta(chain, [&](json_delta_t const& delta) noexcept -> status_t {
+                    json_delta_t const& wanted = deltas[index++];
+                    bool const same = delta.stamp == wanted.stamp && delta.modification == wanted.modification &&
+                                      delta.field == wanted.field && delta.value == wanted.value;
+                    return same ? status_t {} : status_t {status_code_t::internal_k, "differs"};
+                }).succeeded());
+    expect_equal(index, std::size_t(4));
     for (std::size_t prefix_length = 1; prefix_length != chain.size(); ++prefix_length) {
         std::size_t boundaries = 0, offset = 0;
         for (json_delta_t const& delta : deltas) boundaries += (offset += encoded_size(delta)) == prefix_length;
         status_t const truncated = for_each_delta(chain.first(prefix_length),
                                                   [](json_delta_t const&) noexcept { return status_t {}; });
-        failures += expect(truncated.succeeded() == (boundaries == 1));
+        expect_true(truncated.succeeded() == (boundaries == 1));
     }
     std::string unknown(string_of(chain.first(encoded_size(deltas[0]))));
     unknown[sizeof(std::uint64_t)] = 9;
-    failures += expect_status(
-        for_each_delta(bytes_of_text(unknown), [](json_delta_t const&) noexcept { return status_t {}; }),
-        status_code_t::malformed_k);
+    expect_status(for_each_delta(bytes_of_text(unknown), [](json_delta_t const&) noexcept { return status_t {}; }),
+                  status_code_t::malformed_k);
 
     json_fold_t const fold;
     auto const closes_chain = [&](json_delta_t const& delta) {
         auto [encoded, encoded_status] = encode_deltas(std::span<json_delta_t const>(&delta, 1), arena);
         return encoded_status.succeeded() && fold.closes({delta_kind_t::change_k, encoded});
     };
-    failures += expect(closes_chain({0, delta_modification_t::upsert_k, "", "1"}));
-    failures += expect(closes_chain({0, delta_modification_t::write_k, "", "1"}));
-    failures += expect(closes_chain({0, delta_modification_t::remove_k, "", ""}));
-    failures += expect(!closes_chain({0, delta_modification_t::upsert_k, "a", "1"}));
-    failures += expect(!closes_chain({0, delta_modification_t::insert_k, "", "1"}));
-    failures += expect(!closes_chain({0, delta_modification_t::merge_k, "", "1"}));
-    failures += expect(fold.closes({delta_kind_t::write_k, {}}) && fold.closes({delta_kind_t::remove_k, {}}));
-    failures += expect(!fold.closes({delta_kind_t::change_k, bytes_of_text(unknown)}));
-    return failures;
+    expect_true(closes_chain({0, delta_modification_t::upsert_k, "", "1"}));
+    expect_true(closes_chain({0, delta_modification_t::write_k, "", "1"}));
+    expect_true(closes_chain({0, delta_modification_t::remove_k, "", ""}));
+    expect_true(!closes_chain({0, delta_modification_t::upsert_k, "a", "1"}));
+    expect_true(!closes_chain({0, delta_modification_t::insert_k, "", "1"}));
+    expect_true(!closes_chain({0, delta_modification_t::merge_k, "", "1"}));
+    expect_true(fold.closes({delta_kind_t::write_k, {}}) && fold.closes({delta_kind_t::remove_k, {}}));
+    expect_true(!fold.closes({delta_kind_t::change_k, bytes_of_text(unknown)}));
 }
 
 /** The fold of @p deltas over @p base composed, and the count of records the composition left. */
@@ -448,30 +444,28 @@ struct composed_t {
     outcome_t applied;
     outcome_t sequential;
     std::size_t records = 0;
-    std::size_t failures = 0;
 };
 
 composed_t compose_and_apply(std::optional<std::string> const& base, std::span<json_delta_t const> deltas) {
     composed_t result;
     auto [arena, arena_status] = arena_t::make();
-    result.failures += expect(arena_status.succeeded());
+    expect_true(arena_status.succeeded());
     arena_allocator<byte_t> allocator {arena};
     json_fold_t const fold;
     std::vector<pending_t> pending;
-    for (json_delta_t const& delta : deltas) pending.push_back(pending_of(delta, arena, result.failures));
+    for (json_delta_t const& delta : deltas) pending.push_back(pending_of(delta, arena));
     std::vector<delta_view_t> const views = views_of(pending);
     result.sequential = outcome_of(fold.apply(base_of(base), views, allocator));
     auto [chain, status] = fold.compose(views, allocator);
-    result.failures += expect(status.succeeded());
-    result.records = count_records(chain, result.failures);
+    expect_true(status.succeeded());
+    result.records = count_records(chain);
     delta_view_t const composed {delta_kind_t::change_k, chain};
     result.applied = outcome_of(fold.apply(base_of(base), std::span<delta_view_t const>(&composed, 1), allocator));
     return result;
 }
 
 /** Each shape composition merges or keeps, on a base where the difference shows. */
-std::size_t json_fold_shapes() {
-    std::size_t failures = 0;
+void test_json_fold_shapes() {
     std::optional<std::string> const base = R"({"a":{"b":1,"c":[1,2]},"b":2,"c":{"d":3}})";
     struct shape_t {
         char const* name;
@@ -547,47 +541,40 @@ std::size_t json_fold_shapes() {
     };
     for (shape_t const& shape : shapes) {
         composed_t const result = compose_and_apply(base, shape.deltas);
-        std::size_t const before = failures;
-        failures += result.failures;
-        failures += expect_outcome(result.sequential, shape.wanted, shape.name);
-        failures += expect_outcome(result.applied, shape.wanted, shape.name);
-        failures += expect_eq(result.records, shape.records);
-        if (failures != before) fmt::println(stderr, "  in shape `{}`", shape.name);
+        expect_outcome(result.sequential, shape.wanted, shape.name);
+        expect_outcome(result.applied, shape.wanted, shape.name);
+        expect_equal(result.records, shape.records, "in shape `{}`", shape.name);
     }
-    return failures;
 }
 
 /** Random streams through the engine and through the fold, with compositions and folded bases at random points. */
-std::size_t json_fold_reference(config_t const& config, std::uint64_t seed) {
-    std::size_t failures = 0;
+void test_json_fold_reference(config_t const& config) {
     constexpr std::size_t streams_k = 60, steps_k = 160;
-    random_t random {seed};
+    split_mix_generator_t random {case_stream_key()};
     value_writer_t writer {random};
     json_fold_t const fold;
     std::size_t checked = 0, refused = 0, compositions = 0, records_before = 0, records_after = 0;
     std::map<status_code_t, std::size_t> refusals;
     auto [database, open_status] = open_database<database_t>(config);
-    failures += expect(open_status.succeeded());
-    if (failures) return failures;
+    if (!expect_true(open_status.succeeded())) return;
 
-    for (std::size_t stream = 0; stream != streams_k && failures == 0; ++stream) {
+    for (std::size_t stream = 0; stream != streams_k; ++stream) {
         auto [collection, create_status] = create_docs_collection(database, fmt::format("stream-{}", stream));
-        failures += expect(create_status.succeeded());
-        if (failures) return failures;
+        if (!expect_true(create_status.succeeded())) return;
         reference_t reference {database, collection};
 
         std::optional<std::string> base;
         // Only the docs verbs reach a docs collection, so the engine's bases are documents or none, while empty and
         // malformed bases stay with the composition rounds below
         if (random.below(6) > 2) base = writer.document();
-        failures += expect(reference.reset(base).succeeded());
+        if (!expect_true(reference.reset(base).succeeded())) return;
         std::vector<pending_t> pending;
         std::vector<json_delta_t> history;
         std::vector<std::string> texts;
 
-        for (std::size_t step = 0; step != steps_k && failures == 0; ++step) {
+        for (std::size_t step = 0; step != steps_k; ++step) {
             auto [arena, arena_status] = arena_t::make();
-            failures += expect(arena_status.succeeded());
+            if (!expect_true(arena_status.succeeded())) return;
             arena_allocator<byte_t> allocator {arena};
 
             // A closing upsert ignores the base the engine still parses, so none lands on a malformed document
@@ -612,16 +599,16 @@ std::size_t json_fold_reference(config_t const& config, std::uint64_t seed) {
             // A whole JSON upsert is checked as it is written, and a malformed one never becomes a delta
             if (operation.modification == delta_modification_t::write_k &&
                 json_parse(std::string_view(operation.value), arena).status().failed()) {
-                failures += expect_status(wanted, status_code_t::malformed_k);
+                expect_status(wanted, status_code_t::malformed_k);
                 ++refused;
                 continue;
             }
             auto [text, text_status] = modifier_text(std::string_view(operation.value), operation.type, arena);
-            failures += expect(text_status.succeeded());
+            if (!expect_true(text_status.succeeded())) return;
             json_delta_t const delta {stream * steps_k + step, operation.modification, operation.field, text};
 
             std::vector<pending_t> candidate = pending;
-            candidate.push_back(pending_of(delta, arena, failures));
+            candidate.push_back(pending_of(delta, arena));
             outcome_t const folded = outcome_of(fold.apply(base_of(base), views_of(candidate), allocator));
             std::optional<std::string> const stored = reference.read();
             outcome_t expected_outcome {wanted.code, {}};
@@ -630,11 +617,11 @@ std::size_t json_fold_reference(config_t const& config, std::uint64_t seed) {
                 else expected_outcome.code = status_code_t::not_found_k;
             }
             ++checked;
-            if (expect_outcome(folded, expected_outcome, "fold against the engine")) {
-                fmt::println(stderr, "  stream {} step {}: {} `{}` of `{}` over `{}`", stream, step,
+            if (!expect_outcome(folded, expected_outcome, "fold against the engine")) {
+                fmt::println(stderr, "    stream {} step {}: {} `{}` of `{}` over `{}`", stream, step,
                              int(operation.modification), operation.field, operation.value,
                              current.value_or("missing"));
-                return failures + 1;
+                return;
             }
             if (wanted.failed()) {
                 ++refused, ++refusals[wanted.code];
@@ -645,16 +632,15 @@ std::size_t json_fold_reference(config_t const& config, std::uint64_t seed) {
             if (random.below(10) == 0) {
                 std::vector<delta_view_t> const views = views_of(pending);
                 auto [chain, compose_status] = fold.compose(views, allocator);
-                failures += expect(compose_status.succeeded());
+                if (!expect_true(compose_status.succeeded())) return;
                 delta_view_t const composed {delta_kind_t::change_k, chain};
                 outcome_t const applied = outcome_of(
                     fold.apply(base_of(base), std::span<delta_view_t const>(&composed, 1), allocator));
-                failures += expect_outcome(applied, expected_outcome, "composed chain against the engine");
+                if (!expect_outcome(applied, expected_outcome, "composed chain against the engine")) return;
                 for (pending_t const& delta : pending)
-                    records_before += delta.kind != delta_kind_t::change_k
-                                          ? 1
-                                          : count_records(bytes_of_text(delta.bytes), failures);
-                records_after += count_records(chain, failures);
+                    records_before += delta.kind != delta_kind_t::change_k ? 1
+                                                                           : count_records(bytes_of_text(delta.bytes));
+                records_after += count_records(chain);
                 pending.assign(1, {delta_kind_t::change_k, std::string(string_of(chain))});
                 ++compositions;
             }
@@ -663,25 +649,23 @@ std::size_t json_fold_reference(config_t const& config, std::uint64_t seed) {
     }
     fmt::println("  {} modifications checked, {} refused, {} compositions took {} records to {}", checked, refused,
                  compositions, records_before, records_after);
-    for (auto const& [code, count] : refusals) fmt::println("  {} refused with {}", count, describe(code));
-    failures += expect(refusals.size() == 4);
-    failures += expect(refused * 20 > checked && refused * 10 < checked * 7);
-    failures += expect(records_after * 3 < records_before * 2);
-    return failures;
+    for (auto const& [code, count] : refusals) fmt::println("  {} refused with {}", count, status_name(code));
+    expect_true(refusals.size() == 4);
+    expect_true(refused * 20 > checked && refused * 10 < checked * 7);
+    expect_true(records_after * 3 < records_before * 2);
 }
 
 /** Composed random chains apply like the chains themselves on random bases, whole and composed in parts. */
-std::size_t json_fold_compose(std::uint64_t seed) {
-    std::size_t failures = 0;
-    random_t random {seed ^ 0x5eed};
+void test_json_fold_compose() {
+    split_mix_generator_t random {case_stream_key()};
     value_writer_t writer {random};
     json_fold_t const fold;
     constexpr std::string_view few_fields_k[] = {"", "a", "/a", "/a/b", "/a/c", "/b", "/a/0", "/a/1", "/c/a"};
     std::size_t records_before = 0, records_after = 0, failing = 0, rounds = 0;
 
-    for (std::size_t round = 0; round != 3000 && failures == 0; ++round, ++rounds) {
+    for (std::size_t round = 0; round != 3000; ++round, ++rounds) {
         auto [arena, arena_status] = arena_t::make();
-        failures += expect(arena_status.succeeded());
+        if (!expect_true(arena_status.succeeded())) return;
         arena_allocator<byte_t> allocator {arena};
 
         // Wild rounds draw anything, and clean ones upsert and merge valid values into an object so more chains
@@ -722,7 +706,7 @@ std::size_t json_fold_compose(std::uint64_t seed) {
                 operation.value = writer.merge_patch(), operation.type = ustore_docs_field_type_json_k;
             if (operation.type != ustore_docs_field_type_json_k) {
                 auto [text, text_status] = modifier_text(std::string_view(operation.value), operation.type, arena);
-                failures += expect(text_status.succeeded());
+                if (!expect_true(text_status.succeeded())) return;
                 operation.value = std::string(text), operation.type = ustore_docs_field_type_json_k;
             }
             if (!operation.field.empty() && random.below(3)) operation.field = std::string(writer.pick(few_fields_k));
@@ -743,8 +727,8 @@ std::size_t json_fold_compose(std::uint64_t seed) {
         for (std::size_t index = 0; index != deltas.size();) {
             std::size_t const length = fu::min_of<std::size_t>(1 + random.below(4), deltas.size() - index);
             std::span<json_delta_t const> const run(deltas.data() + index, length);
-            if (length == 1) pending.push_back(pending_of(run.front(), arena, failures));
-            else pending.push_back(change_of(run, arena, failures));
+            if (length == 1) pending.push_back(pending_of(run.front(), arena));
+            else pending.push_back(change_of(run, arena));
             index += length;
         }
         std::vector<delta_view_t> const views = views_of(pending);
@@ -752,82 +736,77 @@ std::size_t json_fold_compose(std::uint64_t seed) {
         failing += sequential.code != status_code_t::success_k;
 
         auto [chain, status] = fold.compose(views, allocator);
-        failures += expect(status.succeeded());
+        if (!expect_true(status.succeeded())) return;
         delta_view_t const composed {delta_kind_t::change_k, chain};
         outcome_t const applied = outcome_of(
             fold.apply(base_of(base), std::span<delta_view_t const>(&composed, 1), allocator));
         records_before += deltas.size();
-        records_after += count_records(chain, failures);
-        if (expect_outcome(applied, sequential, "composed chain against the chain")) {
-            fmt::println(stderr, "  round {} on base `{}`:", round, base ? *base : std::string("missing"));
+        records_after += count_records(chain);
+        if (!expect_outcome(applied, sequential, "composed chain against the chain")) {
+            fmt::println(stderr, "    round {} on base `{}`:", round, base ? *base : std::string("missing"));
             for (json_delta_t const& delta : deltas)
-                fmt::println(stderr, "    {} `{}` `{}`", int(delta.modification), delta.field, delta.value);
-            return failures + 1;
+                fmt::println(stderr, "      {} `{}` `{}`", int(delta.modification), delta.field, delta.value);
+            return;
         }
 
         // Composing a composed prefix with the rest answers the same again
         std::size_t const split = random.below(views.size() + 1);
         if (split == 0 || split == views.size()) continue;
         auto [prefix, prefix_status] = fold.compose(std::span<delta_view_t const>(views.data(), split), allocator);
-        failures += expect(prefix_status.succeeded());
+        if (!expect_true(prefix_status.succeeded())) return;
         std::vector<delta_view_t> resumed {{delta_kind_t::change_k, prefix}};
         resumed.insert(resumed.end(), views.begin() + std::ptrdiff_t(split), views.end());
         auto [again, again_status] = fold.compose(resumed, allocator);
-        failures += expect(again_status.succeeded());
+        if (!expect_true(again_status.succeeded())) return;
         delta_view_t const recomposed {delta_kind_t::change_k, again};
-        failures += expect_outcome(
-            outcome_of(fold.apply(base_of(base), std::span<delta_view_t const>(&recomposed, 1), allocator)), sequential,
-            "chain composed in parts against the chain");
+        if (!expect_outcome(
+                outcome_of(fold.apply(base_of(base), std::span<delta_view_t const>(&recomposed, 1), allocator)),
+                sequential, "chain composed in parts against the chain"))
+            return;
     }
     fmt::println("  {} chains of {} records composed to {}, {} failing", rounds, records_before, records_after,
                  failing);
-    failures += expect(records_after * 4 < records_before * 3);
-    failures += expect(failing * 10 > rounds && failing * 10 < rounds * 9);
-    return failures;
+    expect_true(records_after * 4 < records_before * 3);
+    expect_true(failing * 10 > rounds && failing * 10 < rounds * 9);
 }
 
-/** Counts a failure when @p reference reads other than @p wanted, printing both and the @p context. */
-std::size_t expect_document(reference_t& reference, std::optional<std::string> const& wanted,
-                            std::string_view context) {
+/** Holds when @p reference reads @p wanted ; otherwise fails a check, printing both and
+ *  the @p context. */
+bool expect_document(reference_t& reference, std::optional<std::string> const& wanted, std::string_view context) {
     std::optional<std::string> const actual = reference.read();
-    if (actual == wanted) return 0;
-    fmt::println(stderr, "  {}: wanted `{}`, got `{}`", context, wanted.value_or("missing"),
-                 actual.value_or("missing"));
-    return 1;
+    return expect_true(actual == wanted, "{}: wanted `{}`, got `{}`", context, wanted.value_or("missing"),
+                       actual.value_or("missing"));
 }
 
 /** Modifications in a transaction read back folded over the document before it commits, a failing one leaves it as
  *  it was, and the commit lands the rest. */
-std::size_t json_fold_own_changes(config_t const& config) {
-    std::size_t failures = 0;
+case_result_t test_json_fold_own_changes(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    failures += expect(open_status.succeeded());
-    if (failures || !database.on().supports_transactions()) return failures;
+    if (!expect_true(open_status.succeeded())) return {};
+    if (!database.on().supports_transactions()) return case_result_t::skipped(needs_transactions_k);
     auto [collection, create_status] = create_docs_collection(database, "own");
-    failures += expect(create_status.succeeded());
-    if (failures) return failures;
+    if (!expect_true(create_status.succeeded())) return {};
     reference_t head {database, collection};
-    failures += expect(head.reset(R"({"a":1})").succeeded());
+    expect_true(head.reset(R"({"a":1})").succeeded());
 
     auto [transaction, transaction_status] = database.on().transaction();
-    failures += expect(transaction_status.succeeded());
-    if (failures) return failures;
+    if (!expect_true(transaction_status.succeeded())) return {};
     reference_t uncommitted {database, collection};
     uncommitted.transaction = transaction.transaction();
     constexpr ustore_docs_field_type_t json_k = ustore_docs_field_type_json_k;
-    failures += expect(uncommitted.modify(ustore_docs_modify_upsert_k, "b", "2", json_k).succeeded());
-    failures += expect_document(uncommitted, R"({"a":1,"b":2})", "an upsert of a field");
-    failures += expect(uncommitted.modify(ustore_docs_modify_merge_k, {}, R"({"c":3})", json_k).succeeded());
-    failures += expect(
+    expect_true(uncommitted.modify(ustore_docs_modify_upsert_k, "b", "2", json_k).succeeded());
+    expect_document(uncommitted, R"({"a":1,"b":2})", "an upsert of a field");
+    expect_true(uncommitted.modify(ustore_docs_modify_merge_k, {}, R"({"c":3})", json_k).succeeded());
+    expect_true(
         uncommitted.modify(ustore_docs_modify_patch_k, {}, R"([{"op":"remove","path":"/a"}])", json_k).succeeded());
-    failures += expect_status(
+    expect_status(
         uncommitted.modify(ustore_docs_modify_patch_k, {}, R"([{"op":"test","path":"/a","value":1}])", json_k),
         status_code_t::invalid_argument_k);
-    failures += expect_document(uncommitted, R"({"b":2,"c":3})", "a merge and a patch over it");
-    failures += expect_document(head, R"({"a":1})", "the head before the commit");
-    failures += expect(transaction.on().commit().has_value());
-    failures += expect_document(head, R"({"b":2,"c":3})", "the head after the commit");
-    return failures;
+    expect_document(uncommitted, R"({"b":2,"c":3})", "a merge and a patch over it");
+    expect_document(head, R"({"a":1})", "the head before the commit");
+    expect_true(transaction.on().commit().has_value());
+    expect_document(head, R"({"b":2,"c":3})", "the head after the commit");
+    return {};
 }
 
 /** Opens the NVMe engine over a manifest in @p directory, every collection flushing past 64 KiB,
@@ -839,7 +818,7 @@ expected<database_t> open_small_nvme(char const* directory) noexcept {
     ustore_database_open_nvme_t open {};
     open.database = &database;
     open.outcome = &outcome;
-    path_t const manifest {directory, "docs.ustore.json"};
+    std::string const manifest = fmt::format("{}/{}", directory, "docs.ustore.json");
     open.directory = {reinterpret_cast<ustore_byte_t const*>(manifest.c_str()), std::strlen(manifest.c_str())};
     open.collection_memory_runs_max_bytes = memory_runs_bytes_k;
     open.collection_value_max_size = memory_runs_bytes_k / 4;
@@ -853,22 +832,19 @@ expected<database_t> open_small_nvme(char const* directory) noexcept {
 /** Random modifications of a few documents on NVMe, flushed every hundred calls into small levels that merge often,
  *  agree with the in-memory engine call by call, and read the same as the change deltas reach flushed runs, after a
  *  compaction folds them to the bottom, and after a reopen. */
-case_result_t json_fold_maintenance(config_t const& config, std::uint64_t seed) {
+case_result_t test_json_fold_maintenance(config_t const& config) {
     if (config.engine() != "nvme" || !config.directory())
         return case_result_t::skipped("needs the NVMe engine and --directory");
     constexpr std::size_t documents_k = 16, calls_k = 3000, checkpoint_k = 500, flush_k = 100;
-    std::size_t failures = 0;
-    path_t const home {config.directory(), "maintenance"};
-    if (!recreate_directory(home.c_str())) return failures + 1;
-    random_t random {seed ^ 0xf01d};
+    std::string const home = fmt::format("{}/{}", config.directory(), "maintenance");
+    if (!expect_true(scratch_directory_t::recreate(home.c_str()))) return {};
+    split_mix_generator_t random {case_stream_key()};
     value_writer_t writer {random};
 
     auto [memory, memory_status] = open_database<database_t>(config_t {engine_options_t {}, nullptr});
-    failures += expect(memory_status.succeeded());
-    if (failures) return failures;
+    if (!expect_true(memory_status.succeeded())) return {};
     auto [memory_collection, memory_create_status] = create_docs_collection(memory, "maintenance");
-    failures += expect(memory_create_status.succeeded());
-    if (failures) return failures;
+    if (!expect_true(memory_create_status.succeeded())) return {};
     auto const references_of = [&](ustore_database_t database, ustore_collection_id_t collection) {
         std::vector<reference_t> references;
         for (std::size_t index = 0; index != documents_k; ++index)
@@ -879,26 +855,24 @@ case_result_t json_fold_maintenance(config_t const& config, std::uint64_t seed) 
     std::vector<reference_t> stored_documents;
     std::size_t landed = 0;
     auto const compare_all = [&](std::string_view context) {
-        std::size_t differing = 0;
+        bool same = true;
         for (std::size_t index = 0; index != documents_k; ++index)
-            differing += expect_document(stored_documents[index], expected_documents[index].read(), context);
-        return differing;
+            same = expect_document(stored_documents[index], expected_documents[index].read(), context) && same;
+        return same;
     };
 
     ustore_collection_id_t drive_collection {};
     {
         auto [drive, drive_status] = open_small_nvme(home.c_str());
-        failures += expect(drive_status.succeeded());
-        if (failures) return failures;
+        if (!expect_true(drive_status.succeeded())) return {};
         auto [created, drive_create_status] = create_docs_collection(drive, "maintenance");
-        failures += expect(drive_create_status.succeeded());
-        if (failures) return failures;
+        if (!expect_true(drive_create_status.succeeded())) return {};
         drive_collection = created;
         stored_documents = references_of(drive, drive_collection);
-        for (std::size_t call = 0; call != calls_k && failures == 0; ++call) {
+        for (std::size_t call = 0; call != calls_k; ++call) {
             std::size_t const index = random.below(documents_k);
             auto [arena, arena_status] = arena_t::make();
-            failures += expect(arena_status.succeeded());
+            if (!expect_true(arena_status.succeeded())) return {};
             std::optional<std::string> const current = expected_documents[index].read();
             bool const parses = !current || json_parse(std::string_view(*current), arena).status().succeeded();
             operation_t const operation = random_operation(
@@ -913,29 +887,26 @@ case_result_t json_fold_maintenance(config_t const& config, std::uint64_t seed) 
             };
             status_t const wanted = apply(expected_documents[index]);
             status_t const answered = apply(stored_documents[index]);
-            if (answered.code != wanted.code) {
-                fmt::println(stderr, "  call {}: wanted {}, got {} for {} `{}` of `{}` over `{}`", call,
-                             describe(wanted.code), describe(answered.code), int(operation.modification),
-                             operation.field, operation.value, current.value_or("missing"));
-                ++failures;
-            }
+            if (!expect_true(answered.code == wanted.code, "call {}: wanted {}, got {} for {} `{}` of `{}` over `{}`",
+                             call, status_name(wanted.code), status_name(answered.code), int(operation.modification),
+                             operation.field, operation.value, current.value_or("missing")))
+                return {};
             landed += wanted.succeeded();
             // A compaction flushes the memory runs first, so the records land in runs over bases in older ones
-            if (call % flush_k == 0) failures += expect(drive.on().compact().succeeded());
-            if (call % checkpoint_k == 0) failures += compare_all("after a checkpoint");
+            if (call % flush_k == 0 && !expect_true(drive.on().compact().succeeded())) return {};
+            if (call % checkpoint_k == 0 && !compare_all("after a checkpoint")) return {};
         }
         fmt::println("  {} of {} modifications landed", landed, calls_k);
-        failures += expect(landed * 3 > calls_k);
-        failures += compare_all("after every call");
-        failures += expect(drive.on().compact().succeeded());
-        failures += compare_all("after a compaction");
+        expect_true(landed * 3 > calls_k);
+        compare_all("after every call");
+        expect_true(drive.on().compact().succeeded());
+        compare_all("after a compaction");
     }
     auto [reopened, reopen_status] = open_small_nvme(home.c_str());
-    failures += expect(reopen_status.succeeded());
-    if (failures) return failures;
+    if (!expect_true(reopen_status.succeeded())) return {};
     stored_documents = references_of(reopened, drive_collection);
-    failures += compare_all("after a reopen");
-    return failures;
+    compare_all("after a reopen");
+    return {};
 }
 
 #pragma endregion Cases
@@ -943,24 +914,20 @@ case_result_t json_fold_maintenance(config_t const& config, std::uint64_t seed) 
 } // namespace unum::ustore::test
 
 int main(int argc, char** argv) {
-    suite_options_t options;
-    if (argument_status_t const status = parse_suite_options(argc, argv, options);
-        status != argument_status_t::parsed_k)
-        return status == argument_status_t::help_k ? 0 : 1;
-    suite_totals_t totals = options.totals();
-    st::expected<directory_t> const directory = directory_t::make(options.directory);
+    start_test_run(argc, argv);
+    st::expected<scratch_directory_t> const directory = scratch_directory_t::make(test_run.settings.directory);
     if (!directory) {
         fmt::println(stderr, "  the working directory would not open");
         return 1;
     }
-    config_t const config {options.engine, directory->path()};
+    config_t const config {test_run.settings.engine, directory->path()};
 
-    report(totals, "json_fold.codec", json_fold_codec);
-    report(totals, "json_fold.shapes", json_fold_shapes);
-    report(totals, "json_fold.reference", json_fold_reference, config, std::uint64_t {options.seed});
-    report(totals, "json_fold.compose", json_fold_compose, std::uint64_t {options.seed});
-    report(totals, "json_fold.own_changes", json_fold_own_changes, config);
-    report(totals, "json_fold.maintenance", json_fold_maintenance, config, std::uint64_t {options.seed});
+    run_test_case("test_json_fold_codec", test_json_fold_codec);
+    run_test_case("test_json_fold_shapes", test_json_fold_shapes);
+    run_test_case(engine_label_t {"test_json_fold_reference"}.c_str(), test_json_fold_reference, config);
+    run_test_case("test_json_fold_compose", test_json_fold_compose);
+    run_test_case(engine_label_t {"test_json_fold_own_changes"}.c_str(), test_json_fold_own_changes, config);
+    run_test_case(engine_label_t {"test_json_fold_maintenance"}.c_str(), test_json_fold_maintenance, config);
 
-    return suite_exit_code(totals);
+    return finish_test_run();
 }

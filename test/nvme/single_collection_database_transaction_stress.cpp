@@ -45,9 +45,6 @@ constexpr std::size_t worker_threads_k = 4;
 /** The numbers every case mounts with: three channels for the stack and one for every worker thread. */
 constexpr fixture_config_t stress_config_k {.shared_io_channels = 3 + worker_threads_k + 1};
 
-/** The seed every worker's generator is forked from. */
-constexpr std::uint64_t seed_k = 42;
-
 /** Bytes every value takes: one counter, which names the commit that wrote it. */
 constexpr std::size_t value_bytes_k = 8;
 
@@ -192,39 +189,36 @@ status_t read_counters(reader_type_& reader, io_channel_t& channel, std::span<st
  *  write path, so a chunk read whole must carry one counter, whichever commit landed last.
  */
 template <typename mount_type_>
-std::size_t chunks_land_whole(mount_type_ const& mount) {
+void test_chunks_land_whole(mount_type_ const& mount) {
     using stack_t = stress_stack<typename mount_type_::fixture_t>;
     using guard_t = typename stack_t::guard_t;
     using database_t = typename stack_t::database_t;
-    std::size_t failures = 0;
     constexpr std::size_t chunks_k = 10;
     constexpr std::size_t keys_per_chunk_k = 100;
     constexpr std::size_t attempts_k = 1024;
 
     expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
+    expect_status(stack, status_code_t::success_k);
+    if (!stack) return;
     expected<typename database_t::database_unique_ptr_t> store = open_over(**stack);
-    failures += expect(store.has_value());
-    if (!store) return failures;
+    expect_true(store.has_value());
+    if (!store) return;
 
-    std::array<std::size_t, worker_threads_k> worker_failures {};
     std::array<std::thread, worker_threads_k> workers;
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker)
         workers[worker] = std::thread {[&, worker]() noexcept {
             expected<guard_t> guard = (*stack)->fixture->channels.acquire();
-            worker_failures[worker] += expect(guard.has_value());
+            expect_true(guard.has_value());
             if (!guard) return;
             expected<typename database_t::transaction_unique_ptr_t> changing = (*store)->create_transaction();
-            worker_failures[worker] += expect(changing.has_value());
+            expect_true(changing.has_value());
             if (!changing) return;
 
             std::array<byte_t, value_bytes_k> value {};
             st::vector<stored_key_t> keys;
             st::vector<bool> present;
             st::vector<std::uint64_t> counters;
-            worker_failures[worker] += expect(keys.resize(keys_per_chunk_k) == st::status_t::success_k);
-            if (worker_failures[worker] != 0) return;
+            if (!expect_true(keys.resize(keys_per_chunk_k) == st::status_t::success_k)) return;
             for (std::size_t chunk = 0; chunk != chunks_k; ++chunk) {
                 write_counter(chunk * worker_threads_k + worker, std::span<byte_t> {value});
                 for (std::size_t index = 0; index != keys_per_chunk_k; ++index)
@@ -233,45 +227,40 @@ std::size_t chunks_land_whole(mount_type_ const& mount) {
                 for (std::size_t attempt = 0; attempt != attempts_k && !committed; ++attempt) {
                     // A refused attempt is rolled back and written again, so its watches start from now.
                     for (std::size_t index = 0; index != keys_per_chunk_k; ++index)
-                        worker_failures[worker] += expect(
-                            (*changing)->insert(keys[index], std::span<byte_t const> {value}).succeeded());
+                        expect_true((*changing)->insert(keys[index], std::span<byte_t const> {value}).succeeded());
                     status_t const landed = (*changing)->commit();
                     committed = landed.succeeded();
                     if (committed) break;
-                    worker_failures[worker] += expect(landed == status_code_t::write_conflict_k);
+                    expect_true(landed == status_code_t::write_conflict_k);
                     (*changing)->rollback();
                 }
-                worker_failures[worker] += expect(committed);
+                expect_true(committed);
 
-                worker_failures[worker] += expect(
+                expect_true(
                     read_counters(**store, guard->channel(), std::span<stored_key_t const> {keys}, present, counters)
                         .succeeded());
                 for (std::size_t index = 0; index != present.size(); ++index) {
-                    worker_failures[worker] += expect(present[index]);
-                    worker_failures[worker] += expect_eq(counters[index], counters[0]);
+                    expect_true(present[index]);
+                    expect_equal(counters[index], counters[0]);
                 }
             }
         }};
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker) workers[worker].join();
-    for (std::size_t worker = 0; worker != worker_threads_k; ++worker) failures += worker_failures[worker];
 
     st::vector<stored_key_t> keys;
     st::vector<bool> present;
     st::vector<std::uint64_t> counters;
-    failures += expect(keys.resize(chunks_k * keys_per_chunk_k) == st::status_t::success_k);
-    if (failures != 0) return failures;
+    if (!expect_true(keys.resize(chunks_k * keys_per_chunk_k) == st::status_t::success_k)) return;
     for (std::size_t index = 0; index != keys.size(); ++index) keys[index] = static_cast<stored_key_t>(index);
-    failures += expect((*store)->flush().succeeded());
-    failures += expect(
-        read_counters(**store, (*stack)->channel(), std::span<stored_key_t const> {keys}, present, counters)
-            .succeeded());
+    expect_true((*store)->flush().succeeded());
+    expect_true(read_counters(**store, (*stack)->channel(), std::span<stored_key_t const> {keys}, present, counters)
+                    .succeeded());
     for (std::size_t index = 0; index != keys.size(); ++index) {
         std::size_t const chunk = index / keys_per_chunk_k;
-        failures += expect(present[index]);
-        failures += expect_eq(counters[index], counters[chunk * keys_per_chunk_k]);
-        failures += expect_eq(counters[index] / worker_threads_k, std::uint64_t {chunk});
+        expect_true(present[index]);
+        expect_equal(counters[index], counters[chunk * keys_per_chunk_k]);
+        expect_equal(counters[index] / worker_threads_k, std::uint64_t {chunk});
     }
-    return failures;
 }
 
 #pragma endregion Atomicity Cases
@@ -314,11 +303,10 @@ struct record_order_t {
  *  state every commit stamped before it left. A read a conflict refused is rolled back and recorded nowhere.
  */
 template <typename mount_type_>
-std::size_t transactions_replay_in_commit_order(mount_type_ const& mount) {
+void test_transactions_replay_in_commit_order(mount_type_ const& mount) {
     using stack_t = stress_stack<typename mount_type_::fixture_t>;
     using guard_t = typename stack_t::guard_t;
     using database_t = typename stack_t::database_t;
-    std::size_t failures = 0;
     constexpr std::size_t keys_k = 512;
     constexpr std::size_t transactions_k = 100;
     constexpr std::size_t operations_max_k = 32;
@@ -326,25 +314,24 @@ std::size_t transactions_replay_in_commit_order(mount_type_ const& mount) {
     constexpr std::size_t removers_k = 1;
 
     expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
+    expect_status(stack, status_code_t::success_k);
+    if (!stack) return;
     expected<typename database_t::database_unique_ptr_t> store = open_over(**stack);
-    failures += expect(store.has_value());
-    if (!store) return failures;
+    expect_true(store.has_value());
+    if (!store) return;
 
     std::array<st::vector<record_t>, worker_threads_k> records;
-    std::array<std::size_t, worker_threads_k> worker_failures {};
     std::array<std::thread, worker_threads_k> workers;
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker)
         workers[worker] = std::thread {[&, worker]() noexcept {
             expected<guard_t> guard = (*stack)->fixture->channels.acquire();
-            worker_failures[worker] += expect(guard.has_value());
+            expect_true(guard.has_value());
             if (!guard) return;
             expected<typename database_t::transaction_unique_ptr_t> changing = (*store)->create_transaction();
-            worker_failures[worker] += expect(changing.has_value());
+            expect_true(changing.has_value());
             if (!changing) return;
 
-            random_t random = random_t {seed_k}.fork(worker);
+            split_mix_generator_t random {case_stream_key(worker)};
             record_t::kind_t const kind = worker < inserters_k                ? record_t::kind_t::insert_k
                                           : worker < inserters_k + removers_k ? record_t::kind_t::remove_k
                                                                               : record_t::kind_t::read_k;
@@ -353,21 +340,18 @@ std::size_t transactions_replay_in_commit_order(mount_type_ const& mount) {
                 record_t record;
                 record.kind = kind;
                 std::size_t const operations = 1 + random.below(operations_max_k);
-                if (record.keys.resize(operations) != st::status_t::success_k ||
-                    record.counters.resize(operations) != st::status_t::success_k) {
-                    ++worker_failures[worker];
+                if (!expect_true(record.keys.resize(operations) == st::status_t::success_k &&
+                                 record.counters.resize(operations) == st::status_t::success_k))
                     return;
-                }
                 for (std::size_t index = 0; index != operations; ++index) {
                     record.keys[index] = random.below(keys_k);
                     record.counters[index] = (worker + 1) * 1'000'000ull + round * operations_max_k + index;
                 }
 
                 if (kind == record_t::kind_t::read_k) {
-                    worker_failures[worker] += expect(read_counters(**changing, guard->channel(),
-                                                                    std::span<stored_key_t const> {record.keys},
-                                                                    record.present, record.counters)
-                                                          .succeeded());
+                    expect_true(read_counters(**changing, guard->channel(), std::span<stored_key_t const> {record.keys},
+                                              record.present, record.counters)
+                                    .succeeded());
                 }
                 else
                     for (std::size_t index = 0; index != operations; ++index) {
@@ -376,33 +360,32 @@ std::size_t transactions_replay_in_commit_order(mount_type_ const& mount) {
                                                      ? (*changing)->insert(record.keys[index],
                                                                            std::span<byte_t const> {value})
                                                      : (*changing)->remove(record.keys[index]);
-                        worker_failures[worker] += expect(written.succeeded());
+                        expect_true(written.succeeded());
                     }
 
                 status_t const committed = (*changing)->commit();
                 if (committed.failed()) {
-                    worker_failures[worker] += expect(committed == status_code_t::write_conflict_k);
+                    expect_true(committed == status_code_t::write_conflict_k);
                     (*changing)->rollback();
                     continue;
                 }
                 record.stamp = (*changing)->last_commit_stamp();
-                if (records[worker].push_back(std::move(record)) != st::status_t::success_k) ++worker_failures[worker];
+                expect_true(records[worker].push_back(std::move(record)) == st::status_t::success_k);
             }
         }};
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker) workers[worker].join();
-    for (std::size_t worker = 0; worker != worker_threads_k; ++worker) failures += worker_failures[worker];
 
     st::vector<record_t const*> ordered;
     std::size_t reads = 0;
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker)
         for (record_t const& record : records[worker]) {
-            failures += expect(ordered.push_back(&record) == st::status_t::success_k);
+            expect_true(ordered.push_back(&record) == st::status_t::success_k);
             reads += record.kind == record_t::kind_t::read_k;
         }
     std::sort(ordered.begin(), ordered.end(), record_order_t {});
-    failures += expect(reads != 0);
+    expect_true(reads != 0);
     for (std::size_t index = 1; index < ordered.size(); ++index)
-        failures += expect(ordered[index - 1]->stamp < ordered[index]->stamp);
+        expect_true(ordered[index - 1]->stamp < ordered[index]->stamp);
 
     std::array<bool, keys_k> model_present {};
     std::array<std::uint64_t, keys_k> model_counters {};
@@ -416,8 +399,8 @@ std::size_t transactions_replay_in_commit_order(mount_type_ const& mount) {
                 break;
             case record_t::kind_t::remove_k: model_present[key] = false; break;
             case record_t::kind_t::read_k:
-                failures += expect_eq(record->present[index], model_present[key]);
-                if (model_present[key]) failures += expect_eq(record->counters[index], model_counters[key]);
+                expect_equal(record->present[index], model_present[key]);
+                if (model_present[key]) expect_equal(record->counters[index], model_counters[key]);
                 break;
             }
         }
@@ -425,47 +408,40 @@ std::size_t transactions_replay_in_commit_order(mount_type_ const& mount) {
     st::vector<stored_key_t> keys;
     st::vector<bool> present;
     st::vector<std::uint64_t> counters;
-    failures += expect(keys.resize(keys_k) == st::status_t::success_k);
-    if (failures != 0) return failures;
+    if (!expect_true(keys.resize(keys_k) == st::status_t::success_k)) return;
     for (std::size_t index = 0; index != keys_k; ++index) keys[index] = static_cast<stored_key_t>(index);
-    failures += expect((*store)->flush().succeeded());
-    failures += expect(
-        read_counters(**store, (*stack)->channel(), std::span<stored_key_t const> {keys}, present, counters)
-            .succeeded());
+    expect_true((*store)->flush().succeeded());
+    expect_true(read_counters(**store, (*stack)->channel(), std::span<stored_key_t const> {keys}, present, counters)
+                    .succeeded());
     for (std::size_t index = 0; index != keys_k; ++index) {
-        failures += expect_eq(present[index], model_present[index]);
-        if (model_present[index]) failures += expect_eq(counters[index], model_counters[index]);
+        expect_equal(present[index], model_present[index]);
+        if (model_present[index]) expect_equal(counters[index], model_counters[index]);
     }
-    return failures;
 }
 
 #pragma endregion Replay Cases
 
 } // namespace unum::ustore::test
 
-int main(int argc, char const* argv[]) {
+int main(int argc, char** argv) {
     using namespace unum::ustore;
     using namespace unum::ustore::test;
 
-    suite_options_t options;
-    if (argument_status_t const status = parse_suite_options(argc, argv, options);
-        status != argument_status_t::parsed_k)
-        return status == argument_status_t::help_k ? 0 : 1;
-    suite_totals_t totals = options.totals();
+    start_test_run(argc, argv);
 
-    st::expected<directory_t> const directory = directory_t::make(options.directory);
+    st::expected<scratch_directory_t> const directory = scratch_directory_t::make(test_run.settings.directory);
     if (!directory) {
         fmt::println(stderr, "  the working directory would not open");
         return 1;
     }
-    test_environment_t const environment = test_environment_t::of(options, *directory);
 
     auto const cases = [&](auto const& mount) {
-        report(totals, mount, "chunks_land_whole", chunks_land_whole);
-        report(totals, mount, "replay_in_commit_order", transactions_replay_in_commit_order);
+        report_on_mount(mount, "test_chunks_land_whole", test_chunks_land_whole);
+        report_on_mount(mount, "test_transactions_replay_in_commit_order", test_transactions_replay_in_commit_order);
     };
     for (transport_t const transport : every_transport_k)
-        run_on_transport(totals, transport, environment, stress_config_k, 1, "scdb_transaction_stress", cases);
+        run_on_transport(transport, directory->path(), stress_config_k, 1,
+                         "single_collection_database_transaction_stress", cases);
 
-    return suite_exit_code(totals);
+    return finish_test_run();
 }

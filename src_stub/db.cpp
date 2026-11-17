@@ -477,8 +477,8 @@ void ustore_database_describe(ustore_database_describe_t* arguments) {
     if (!call.hold_executor(arguments->executor)) return;
     ustore_database_handle_t& database = *arguments->database;
     ustore_database_description_t description {};
-    description.capabilities = static_cast<ustore_capabilities_t>(ustore_capabilities_transactions_k |
-                                                                  ustore_capabilities_snapshots_k);
+    description.capabilities = static_cast<ustore_capabilities_t>(
+        ustore_capabilities_transactions_k | ustore_capabilities_snapshots_k | ustore_capabilities_saves_snapshots_k);
     description.engine = ustore_engine_ram_k;
     description.isolation = database.isolation;
     // Serial is the one class the stand-in carries, so every ceiling picks it

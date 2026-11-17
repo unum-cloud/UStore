@@ -2774,6 +2774,9 @@ static PyGetSetDef Capabilities_getset[] = {
      (void*)(uintptr_t)ustore_capabilities_transactions_k},
     {"snapshots", (getter)Capabilities_get_flag, NULL, "Whether the engine pins point-in-time states.",
      (void*)(uintptr_t)ustore_capabilities_snapshots_k},
+    {"saves_snapshots", (getter)Capabilities_get_flag, NULL,
+     "Whether the engine writes a snapshot out as a database of its own.",
+     (void*)(uintptr_t)ustore_capabilities_saves_snapshots_k},
     {NULL, NULL, NULL, NULL, NULL},
 };
 

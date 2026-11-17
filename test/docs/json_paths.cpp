@@ -38,7 +38,7 @@
 #include "ustore/docs/json_values.hpp"      // `json_parse`, `json_lookup`, `gather_scalar`, `json_to_string`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_free`, `arena_allocator`, `strings_ladder`
 
-#include "harness.hpp" // `suite_exit_code`, `expect`, `expect_eq`, `random_t`
+#include "harness.hpp" // `run_test_case`, `expect_true`, `expect_equal`, `split_mix_generator_t`
 
 using namespace unum::ustore;
 using namespace unum::ustore::test;
@@ -102,7 +102,7 @@ enum class json_dialect_t : bool { strict_k, lenient_k };
 /** Writes random JSON of a dialect: nested containers, duplicate and escaped keys, numbers of every
  *  shape and strings. */
 class document_writer_t {
-    random_t& random_;
+    split_mix_generator_t& random_;
     json_dialect_t dialect_;
 
     static constexpr std::string_view keys_k[] = {
@@ -185,7 +185,8 @@ class document_writer_t {
     }
 
   public:
-    document_writer_t(random_t& random, json_dialect_t dialect) noexcept : random_(random), dialect_(dialect) {}
+    document_writer_t(split_mix_generator_t& random, json_dialect_t dialect) noexcept
+        : random_(random), dialect_(dialect) {}
 
     void value(std::string& text, std::size_t depth) {
         std::uint64_t const kind = depth >= 3 ? 2 : random_.below(4);
@@ -274,20 +275,16 @@ json_cell_t cell_of_parsed(yyjson_val* value) noexcept {
     return cell;
 }
 
-/** Counts the differences between @p oracle and @p candidate in every conversion a gather or a read makes. */
-std::size_t compare_values(yyjson_val* oracle, json_cell_t const& candidate, ustore_arena_t arena,
-                           std::string_view context) {
-    std::size_t failures = 0;
-    auto const report_difference = [&](char const* what) {
-        fmt::println(stderr, "  {} differs for {}", what, context);
-        ++failures;
-    };
+/** Fails a check for every difference between @p oracle and @p candidate in every conversion a
+ *  gather or a read makes. */
+void compare_values(yyjson_val* oracle, json_cell_t const& candidate, ustore_arena_t arena, std::string_view context) {
+    auto const report_difference = [&](char const* what) { expect_true(false, "{} differs for {}", what, context); };
     json_cell_t const expected = cell_of_parsed(oracle);
     if (expected.token != candidate.token) {
         report_difference("token");
-        return failures;
+        return;
     }
-    if (!oracle) return failures;
+    if (!oracle) return;
 
     // A container prints with its strings and numbers as written, so yyjson reads it back before the texts compare
     auto [oracle_text, oracle_status] = json_dump({oracle, nullptr}, arena);
@@ -333,7 +330,6 @@ std::size_t compare_values(yyjson_val* oracle, json_cell_t const& candidate, ust
             json_to_string(candidate, candidate_buffer, candidate_string) ||
         oracle_string != candidate_string)
         report_difference("string");
-    return failures;
 }
 
 /** Rows the device steps converted and rows they left to the host, over all the suite's batches. */
@@ -407,13 +403,12 @@ conversion_t print_on_host(cell_text_t text, json_cell_t const& value, ustore_ar
 /** Runs the device gather's row steps host-compiled over @p documents, on a page laid out from one
  *  subdocuments pass as a device walk stores it, and compares every row they convert with @p cells,
  *  which the host extracted for @p fields, the host's @p status refusing the batch. */
-std::size_t compare_device_rows(json_documents_t const& documents, std::span<std::string_view const> fields,
-                                json_cells_t const& cells, status_t const& status, ustore_arena_t arena) {
-    std::size_t failures = 0;
+void compare_device_rows(json_documents_t const& documents, std::span<std::string_view const> fields,
+                         json_cells_t const& cells, status_t const& status, ustore_arena_t arena) {
     std::uint32_t const rows = static_cast<std::uint32_t>(documents.count);
     auto [compiled, compiled_status] = compile_field_paths(fields, arena);
-    failures += expect(compiled_status.succeeded());
-    if (compiled_status.failed()) return failures;
+    expect_true(compiled_status.succeeded());
+    if (compiled_status.failed()) return;
     std::size_t const paths_count = compiled.paths.size();
 
     // The page as a walk leaves it: the documents back to back, each document's nodes in its slots
@@ -422,9 +417,9 @@ std::size_t compare_device_rows(json_documents_t const& documents, std::span<std
     auto [matches, matches_status] = arena_allocate<sz_match_t>(arena, std::size_t {rows} * paths_count + 1);
     auto [walked, walked_status] = arena_allocate<sz_string_view_t>(arena, rows);
     auto [walked_rows, walked_rows_status] = arena_allocate<std::size_t>(arena, rows);
-    failures += expect(offsets_status.succeeded() && found_status.succeeded() && matches_status.succeeded() &&
-                       walked_status.succeeded() && walked_rows_status.succeeded());
-    if (failures) return failures;
+    if (!expect_true(offsets_status.succeeded() && found_status.succeeded() && matches_status.succeeded() &&
+                     walked_status.succeeded() && walked_rows_status.succeeded()))
+        return;
     offsets[0] = 0;
     std::size_t walked_count = 0;
     for (std::uint32_t row = 0; row != rows; ++row) {
@@ -435,8 +430,7 @@ std::size_t compare_device_rows(json_documents_t const& documents, std::span<std
         walked_rows[walked_count++] = row;
     }
     auto [bytes, bytes_status] = arena_allocate<char>(arena, static_cast<std::size_t>(offsets[rows]));
-    failures += expect(bytes_status.succeeded());
-    if (failures) return failures;
+    if (!expect_true(bytes_status.succeeded())) return;
     for (std::uint32_t row = 0; row != rows; ++row)
         if (!documents[row].empty())
             std::memcpy(bytes.data() + offsets[row], documents[row].data(), documents[row].size());
@@ -447,11 +441,10 @@ std::size_t compare_device_rows(json_documents_t const& documents, std::span<std
         sz_strings_from_string_views(compiled.paths.data(), paths_count, &paths_view);
         sz_allocator_t allocator = stringzilla_allocator(arena);
         subdocuments_engine_t engine;
-        failures += expect(engine.compile(paths_view, allocator, strings_capabilities()) == sz_success_k);
+        expect_true(engine.compile(paths_view, allocator, strings_capabilities()) == sz_success_k);
         auto [walk_matches, walk_matches_status] = arena_allocate<sz_match_t>(arena, walked_count * paths_count + 1);
         auto [walk_offsets, walk_offsets_status] = arena_allocate<sz_size_t>(arena, walked_count + 1);
-        failures += expect(walk_matches_status.succeeded() && walk_offsets_status.succeeded());
-        if (failures) return failures;
+        if (!expect_true(walk_matches_status.succeeded() && walk_offsets_status.succeeded())) return;
         sz_strings_view_t walked_view {};
         sz_strings_from_string_views(walked.data(), walked_count, &walked_view);
         // A walk failing on a malformed document leaves the call to the host
@@ -482,16 +475,15 @@ std::size_t compare_device_rows(json_documents_t const& documents, std::span<std
     auto [scalars, scalars_status] = arena_allocate<ustore_byte_t>(arena, std::size_t {rows} * uuid_bytes_k);
     auto [measured, measured_status] = arena_allocate<tape_source_t>(arena, rows);
     auto [text_offsets, text_offsets_status] = arena_allocate<std::uint64_t>(arena, rows + 1);
-    failures += expect(bitmaps_status.succeeded() && presences_status.succeeded() && lengths_status.succeeded() &&
-                       scalars_status.succeeded() && measured_status.succeeded() && text_offsets_status.succeeded());
-    if (failures) return failures;
+    if (!expect_true(bitmaps_status.succeeded() && presences_status.succeeded() && lengths_status.succeeded() &&
+                     scalars_status.succeeded() && measured_status.succeeded() && text_offsets_status.succeeded()))
+        return;
 
     for (std::size_t field = 0; field != fields.size(); ++field) {
         auto const host_cell = [&](std::size_t row) noexcept { return cells[field * rows + row]; };
         auto const report_row = [&](char const* what, std::size_t row) {
-            fmt::println(stderr, "  device {} differs for field '{}' of document {}: {}", what, fields[field], row,
-                         documents[row]);
-            ++failures;
+            expect_true(false, "device {} differs for field '{}' of document {}: {}", what, fields[field], row,
+                        documents[row]);
         };
         // An output a lane refused leaves the whole call to the host, while others still compare
         auto const settle = [&](std::uint32_t lane_refused) {
@@ -539,7 +531,7 @@ std::size_t compare_device_rows(json_documents_t const& documents, std::span<std
                     text_offsets[row + 1] = text_offsets[row] + measured[row].length;
                 auto [text_bytes, text_bytes_status] = arena_allocate<char>(
                     arena, static_cast<std::size_t>(text_offsets[rows]));
-                failures += expect(text_bytes_status.succeeded());
+                expect_true(text_bytes_status.succeeded());
                 texts.offsets = text_offsets.data();
                 texts.bytes = text_bytes.data();
                 for (std::uint32_t row = 0; row != rows; ++row) write_text_row(page, texts, row);
@@ -571,17 +563,13 @@ std::size_t compare_device_rows(json_documents_t const& documents, std::span<std
         }
     }
     // A batch the host refuses must never convert on a device
-    if (status.failed() && !walk_refused && !any_refused) {
-        fmt::println(stderr, "  device converted a batch the host refused: {}", status.message);
-        ++failures;
-    }
-    return failures;
+    if (status.failed() && !walk_refused && !any_refused)
+        expect_true(false, "device converted a batch the host refused: {}", status.message);
 }
 
 /** Extracts every field of @p fields over @p batch and compares it with yyjson's lookup, answering the status of the
  *  extraction in @p status, which a batch of lenient documents may leave malformed. */
-std::size_t compare_batch(documents_batch_t& batch, std::span<std::string_view const> fields, status_t& status) {
-    std::size_t failures = 0;
+void compare_batch(documents_batch_t& batch, std::span<std::string_view const> fields, status_t& status) {
     scoped_arena_t arena;
     json_documents_t const documents = batch.view();
     std::size_t const cells_count = documents.count * fields.size();
@@ -591,21 +579,20 @@ std::size_t compare_batch(documents_batch_t& batch, std::span<std::string_view c
     json_cells_t cells;
     status = extract_fields<strings_kit_t>(documents, fields, cells_count, cell_of, strings_capabilities(), arena,
                                            cells);
-    failures += compare_device_rows(documents, fields, cells, status, arena);
-    if (status.failed()) return failures;
+    compare_device_rows(documents, fields, cells, status, arena);
+    if (status.failed()) return;
     for (std::size_t document_index = 0; document_index != documents.count; ++document_index) {
         std::string_view const document = documents[document_index];
         auto [parsed, parsed_status] = json_parse(document, arena);
-        failures += expect(parsed_status.succeeded());
+        expect_true(parsed_status.succeeded());
         yyjson_val* const root = parsed ? yyjson_doc_get_root(parsed.handle) : nullptr;
         for (std::size_t field_index = 0; field_index != fields.size(); ++field_index) {
             std::string const context = fmt::format("field '{}' of document {}: {}", fields[field_index],
                                                     document_index, document);
-            failures += compare_values(json_lookup(root, fields[field_index]),
-                                       cells[field_index * documents.count + document_index], arena, context);
+            compare_values(json_lookup(root, fields[field_index]),
+                           cells[field_index * documents.count + document_index], arena, context);
         }
     }
-    return failures;
 }
 
 #pragma endregion Comparisons
@@ -613,8 +600,7 @@ std::size_t compare_batch(documents_batch_t& batch, std::span<std::string_view c
 #pragma region Cases
 
 /** Fields translate into one JSONPath each, with index unions and escapes, and into none for invalid pointers. */
-std::size_t json_paths_translation() {
-    std::size_t failures = 0;
+void test_json_paths_translation() {
     scoped_arena_t arena;
     struct translation_t {
         std::string_view field;
@@ -641,17 +627,15 @@ std::size_t json_paths_translation() {
     for (translation_t const& translation : translations) {
         st::vector<char, arena_allocator<char>> path {{ustore_arena_t {arena}}};
         auto [valid, status] = json_path_of(translation.field, path);
-        failures += expect(status.succeeded());
-        failures += expect_eq(valid, !translation.path.empty());
-        if (valid) failures += expect_eq(std::string_view(path.begin(), path.end()), translation.path);
+        expect_true(status.succeeded());
+        expect_equal(valid, !translation.path.empty());
+        if (valid) expect_equal(std::string_view(path.begin(), path.end()), translation.path);
     }
-    return failures;
 }
 
 /** Slashes inside strings extract as written, while a comment anywhere, even inside a container no path enters, makes
  *  the document malformed, as a write refuses it too. */
-std::size_t json_paths_comments() {
-    std::size_t failures = 0;
+void test_json_paths_comments() {
     std::string_view const fields[] = {"a", "/a", "/x/y", ""};
     documents_batch_t strict;
     strict.texts = {
@@ -664,8 +648,8 @@ std::size_t json_paths_comments() {
     };
     strict.present.assign(strict.texts.size(), true);
     status_t status;
-    failures += compare_batch(strict, fields, status);
-    failures += expect(status.succeeded());
+    compare_batch(strict, fields, status);
+    expect_true(status.succeeded());
 
     scoped_arena_t arena;
     for (std::string_view const text : {
@@ -679,19 +663,17 @@ std::size_t json_paths_comments() {
              "// c\n{\"a\": 3}",
          }) {
         // Writes parse strictly, so no such document reaches a read
-        failures += expect(json_parse(text, arena).status() == status_code_t::malformed_k);
+        expect_true(json_parse(text, arena).status() == status_code_t::malformed_k);
         documents_batch_t batch;
         batch.texts = {R"({"a": 4})", std::string(text)};
         batch.present = {true, true};
-        failures += compare_batch(batch, fields, status);
-        failures += expect(status == status_code_t::malformed_k);
+        compare_batch(batch, fields, status);
+        expect_true(status == status_code_t::malformed_k);
     }
-    return failures;
 }
 
 /** Duplicate keys resolve through the first member, as yyjson's lookup does, at every depth. */
-std::size_t json_paths_duplicates() {
-    std::size_t failures = 0;
+void test_json_paths_duplicates() {
     documents_batch_t batch;
     batch.texts = {
         R"({"a": {"x": 1}, "a": {"b": 2}})", R"({"a": 1, "a": 2})",          R"({"a": {"b": 1}, "a": {"b": 2}})",
@@ -701,28 +683,24 @@ std::size_t json_paths_duplicates() {
     batch.present.assign(batch.texts.size(), true);
     std::string_view const fields[] = {"a", "/a", "/a/b", "/a/0", "/a/x", "/0/a", "/1/a", ""};
     status_t status;
-    failures += compare_batch(batch, fields, status);
-    failures += expect(status.succeeded());
-    return failures;
+    compare_batch(batch, fields, status);
+    expect_true(status.succeeded());
 }
 
 /** Missing and empty documents hold no field, not even the root. */
-std::size_t json_paths_missing() {
-    std::size_t failures = 0;
+void test_json_paths_missing() {
     documents_batch_t batch;
     batch.texts = {R"({"a": 1})", "", R"({"a": 2})", R"({"a": 3})"};
     batch.present = {true, true, false, true};
     std::string_view const fields[] = {"", "a", "/a"};
     status_t status;
-    failures += compare_batch(batch, fields, status);
-    failures += expect(status.succeeded());
-    return failures;
+    compare_batch(batch, fields, status);
+    expect_true(status.succeeded());
 }
 
 /** A selected value yyjson would refuse, and NaN, which only lenient JSON spells, read as malformed, while a selected
  *  container reads as written. */
-std::size_t json_paths_refusals() {
-    std::size_t failures = 0;
+void test_json_paths_refusals() {
     std::string_view const refused[] = {
         "{\"a\": \"raw\x01control\"}",
         "{\"a\": \"bad\xC3utf8\"}",
@@ -737,8 +715,8 @@ std::size_t json_paths_refusals() {
         batch.texts = {std::string(text)};
         batch.present = {true};
         status_t status;
-        failures += compare_batch(batch, fields, status);
-        failures += expect(status == status_code_t::malformed_k);
+        compare_batch(batch, fields, status);
+        expect_true(status == status_code_t::malformed_k);
     }
 
     // A selected container is not validated inside, which only documents no write would take could tell
@@ -748,16 +726,13 @@ std::size_t json_paths_refusals() {
     scoped_arena_t arena;
     json_cells_t cells;
     auto const first_cell = [](std::size_t) noexcept { return field_cell_t {0, 0}; };
-    failures += expect(
-        extract_fields<strings_kit_t>(lazy.view(), fields, 1, first_cell, strings_capabilities(), arena, cells)
-            .succeeded());
-    failures += expect(cells[0].token == json_token_t::array_k);
-    return failures;
+    expect_true(extract_fields<strings_kit_t>(lazy.view(), fields, 1, first_cell, strings_capabilities(), arena, cells)
+                    .succeeded());
+    expect_true(cells[0].token == json_token_t::array_k);
 }
 
 /** Big numbers, reals at the edges of plain notation and escapes print as yyjson prints them at the top level. */
-std::size_t json_paths_printing() {
-    std::size_t failures = 0;
+void test_json_paths_printing() {
     documents_batch_t batch;
     batch.texts = {
         R"({"a": 100})",
@@ -777,16 +752,14 @@ std::size_t json_paths_printing() {
     batch.present.assign(batch.texts.size(), true);
     std::string_view const fields[] = {"a"};
     status_t status;
-    failures += compare_batch(batch, fields, status);
-    failures += expect(status.succeeded());
-    return failures;
+    compare_batch(batch, fields, status);
+    expect_true(status.succeeded());
 }
 
 /** Random batches of documents a write takes extract and convert exactly as yyjson resolves them; the lenient writer's
  *  comments and non-finite literals never pass the strict parse a write makes, so its documents that do are strict. */
-std::size_t json_paths_random(std::uint64_t seed) {
-    std::size_t failures = 0;
-    random_t random {seed};
+void test_json_paths_random() {
+    split_mix_generator_t random {case_stream_key()};
     for (std::size_t round = 0; round != 400; ++round) {
         document_writer_t writer {random, round % 4 == 3 ? json_dialect_t::lenient_k : json_dialect_t::strict_k};
         documents_batch_t batch;
@@ -800,14 +773,13 @@ std::size_t json_paths_random(std::uint64_t seed) {
             batch.present.push_back(random.below(10) != 0);
         }
         status_t status;
-        failures += compare_batch(batch, fields_k, status);
-        failures += expect(status.succeeded());
+        compare_batch(batch, fields_k, status);
+        expect_true(status.succeeded());
     }
     // The device steps must convert most rows themselves, or the comparison above checks nothing
     fmt::println("  device rows: {} compared, {} outputs left to the host", device_rows_tally.compared,
                  device_rows_tally.left_to_host);
-    failures += expect(device_rows_tally.compared > device_rows_tally.left_to_host);
-    return failures;
+    expect_true(device_rows_tally.compared > device_rows_tally.left_to_host);
 }
 
 #pragma endregion Cases
@@ -815,18 +787,13 @@ std::size_t json_paths_random(std::uint64_t seed) {
 } // namespace unum::ustore::test
 
 int main(int argc, char** argv) {
-    suite_options_t options;
-    if (argument_status_t const status = parse_suite_options(argc, argv, options);
-        status != argument_status_t::parsed_k)
-        return status == argument_status_t::help_k ? 0 : 1;
-    suite_totals_t totals = options.totals();
-    report(totals, "json_paths.translation", json_paths_translation);
-    report(totals, "json_paths.comments", json_paths_comments);
-    report(totals, "json_paths.duplicates", json_paths_duplicates);
-    report(totals, "json_paths.missing", json_paths_missing);
-    report(totals, "json_paths.refusals", json_paths_refusals);
-    report(totals, "json_paths.printing", json_paths_printing);
-    report(totals, "json_paths.random", json_paths_random, std::uint64_t {options.seed});
-
-    return suite_exit_code(totals);
+    start_test_run(argc, argv);
+    run_test_case("test_json_paths_translation", test_json_paths_translation);
+    run_test_case("test_json_paths_comments", test_json_paths_comments);
+    run_test_case("test_json_paths_duplicates", test_json_paths_duplicates);
+    run_test_case("test_json_paths_missing", test_json_paths_missing);
+    run_test_case("test_json_paths_refusals", test_json_paths_refusals);
+    run_test_case("test_json_paths_printing", test_json_paths_printing);
+    run_test_case("test_json_paths_random", test_json_paths_random);
+    return finish_test_run();
 }

@@ -6,12 +6,11 @@ Author: Ash Vardanian
 Date: September 18, 2026
 """
 
-import sys
 import threading
 
 import numpy as np
 import pytest
-from capabilities import keys
+from base import keys
 
 import ustore
 
@@ -67,6 +66,7 @@ def test_scan_batch_repeats_a_start(populated, blobs, arena):
 
 
 def test_a_deferred_scan_batch_answers_once_waited(populated, blobs, later, arena):
+    """A deferred scan batch answers what a blocking one does, and an empty one no runs, once waited."""
     found = later.scan_batch([1, 9], 3, arena, collection=blobs).wait()
     assert runs(found) == runs(populated.scan_batch([1, 9], 3, ustore.Arena(), collection=blobs))
     assert len(later.scan_batch([], 3, arena, collection=blobs).wait()) == 0
@@ -158,6 +158,7 @@ def test_sample_batch_of_no_samples(populated, blobs, arena):
 
 
 def test_a_deferred_sample_batch_answers_once_waited(populated, blobs, later, arena):
+    """A deferred sample batch draws stored keys for every task once waited."""
     found = later.sample_batch(2, 3, arena, collection=blobs).wait()
     assert len(found) == 2
     assert set(found[0]) | set(found[1]) <= set(keys(KEYS))
@@ -225,21 +226,17 @@ def test_a_falsy_progress_cancels(populated, blobs, arena, answer: object):
     ]
 
 
-def test_a_raising_progress_reports_unraisable_and_cancels(populated, blobs, arena, monkeypatch):
+def test_a_raising_progress_reports_unraisable_and_cancels(populated, blobs, arena, unraisable):
     """An exception inside the callable goes to `sys.unraisablehook`, and the call ends cancelled."""
-    reported: list[type[BaseException]] = []
-    monkeypatch.setattr(sys, "unraisablehook", lambda unraisable: reported.append(unraisable.exc_type))
     with pytest.raises(ustore.CancelledError):
         populated.scan(1, 2, arena, progress=lambda finished, total: finished / 0, collection=blobs)
-    assert reported == [ZeroDivisionError]
+    assert [report.exc_type for report in unraisable] == [ZeroDivisionError]
 
 
-def test_progress_runs_on_the_executors_threads(populated, blobs, monkeypatch):
+def test_progress_runs_on_the_executors_threads(populated, blobs, unraisable):
     """A deferred call reports from the executor's threads, where the callable attaches the interpreter itself, and
     one that raises reports there and cancels the call, which `wait` raises as cancelled."""
     reporters: set[int] = set()
-    reported: list[type[BaseException]] = []
-    monkeypatch.setattr(sys, "unraisablehook", lambda unraisable: reported.append(unraisable.exc_type))
 
     def report(finished: int, total: int) -> None:
         reporters.add(threading.get_ident())
@@ -252,11 +249,13 @@ def test_progress_runs_on_the_executors_threads(populated, blobs, monkeypatch):
         failing = later.scan_batch(KEYS, 1, arena, progress=lambda finished, total: finished / 0, collection=blobs)
         with pytest.raises(ustore.CancelledError):
             failing.wait()
-    assert reporters and threading.get_ident() not in reporters
-    assert reported == [ZeroDivisionError]
+    assert reporters
+    assert threading.get_ident() not in reporters
+    assert [report.exc_type for report in unraisable] == [ZeroDivisionError]
 
 
 def test_progress_must_be_callable(populated, blobs, arena):
+    """A progress that is not callable raises TypeError naming it."""
     with pytest.raises(TypeError, match="progress"):
         populated.scan_batch([1], 2, arena, progress=5, collection=blobs)
 

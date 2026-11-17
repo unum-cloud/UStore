@@ -266,94 +266,86 @@ status_t level_runs(database_type_& store, collection_id_t collection, st::vecto
 
 /** An empty collection takes an ingest on a sorted level, leaving level zero empty, and answers every row. */
 template <typename mount_type_>
-std::size_t empty_collection_lands_on_a_sorted_level(mount_type_ const& mount) {
+void test_empty_collection_lands_on_a_sorted_level(mount_type_ const& mount) {
     using types_t = database_types<typename mount_type_::fixture_t>;
     using stack_t = typename types_t::stack_t;
-    std::size_t failures = 0;
     expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
+    expect_status(stack, status_code_t::success_k);
+    if (!stack) return;
     expected<collection_id_t> const fresh = create_named(*(*stack)->store, "fresh", test_config(8, 0));
-    failures += expect(fresh.has_value());
-    if (!fresh) return failures;
+    expect_true(fresh.has_value());
+    if (!fresh) return;
 
     st::vector<stored_key_t> const keys = keys_between(0, 300);
     expected<transaction_stamp_t> const landed = ingest_rows(
         *(*stack)->store, *fresh, rows_of(std::span<stored_key_t const> {keys}, 9), ustore_durability_buffered_k);
-    failures += expect(landed.has_value());
+    expect_true(landed.has_value());
     st::vector<std::size_t> runs;
-    failures += expect(level_runs(*(*stack)->store, *fresh, runs).succeeded());
-    failures += expect(runs.size() > 1);
-    if (runs.size() <= 1) return failures;
-    failures += expect_eq(runs[0], std::size_t {0});
-    failures += expect_eq(runs[runs.size() - 1], std::size_t {1});
-    failures += expect_eq(count_valued(*(*stack)->store, *fresh, std::span<stored_key_t const> {keys}, 9), keys.size());
-    return failures;
+    expect_true(level_runs(*(*stack)->store, *fresh, runs).succeeded());
+    expect_true(runs.size() > 1);
+    if (runs.size() <= 1) return;
+    expect_equal(runs[0], std::size_t {0});
+    expect_equal(runs[runs.size() - 1], std::size_t {1});
+    expect_equal(count_valued(*(*stack)->store, *fresh, std::span<stored_key_t const> {keys}, 9), keys.size());
 }
 
 /** Keys a run on level one already holds take an ingest on level zero, above it, so the ingest answers them. */
 template <typename mount_type_>
-std::size_t overlap_at_level_one_lands_on_level_zero(mount_type_ const& mount) {
+void test_overlap_at_level_one_lands_on_level_zero(mount_type_ const& mount) {
     using types_t = database_types<typename mount_type_::fixture_t>;
     using stack_t = typename types_t::stack_t;
-    std::size_t failures = 0;
     expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
+    expect_status(stack, status_code_t::success_k);
+    if (!stack) return;
     typename types_t::database_t& store = *(*stack)->store;
     expected<collection_id_t> const deep = create_named(store, "deep", test_config(8, 0));
-    failures += expect(deep.has_value());
-    if (!deep) return failures;
+    expect_true(deep.has_value());
+    if (!deep) return;
 
     // Level zero is due at four runs, so four flushes and a merge leave every key on level one.
     st::vector<stored_key_t> const keys = keys_between(0, 100);
     for (std::uint64_t round = 0; round != 4; ++round) {
         for (stored_key_t const key : keys) {
             std::array<byte_t, 8> const counter = counted(round);
-            failures += expect(
-                store.insert(any_collection_id_t {*deep}, key, stored_value_view_t {counter}).succeeded());
+            expect_true(store.insert(any_collection_id_t {*deep}, key, stored_value_view_t {counter}).succeeded());
         }
-        failures += expect(store.flush().succeeded());
+        expect_true(store.flush().succeeded());
     }
-    failures += expect(store.compact().succeeded());
+    expect_true(store.compact().succeeded());
     st::vector<std::size_t> runs;
-    failures += expect(level_runs(store, *deep, runs).succeeded());
-    failures += expect(runs.size() > 1 && runs[0] == 0 && runs[1] != 0);
+    expect_true(level_runs(store, *deep, runs).succeeded());
+    expect_true(runs.size() > 1 && runs[0] == 0 && runs[1] != 0);
 
-    failures += expect(
+    expect_true(
         ingest_rows(store, *deep, rows_of(std::span<stored_key_t const> {keys}, 42), ustore_durability_buffered_k)
             .has_value());
-    failures += expect(level_runs(store, *deep, runs).succeeded());
-    failures += expect(!runs.empty() && runs[0] == 1);
-    failures += expect_eq(count_valued(store, *deep, std::span<stored_key_t const> {keys}, 42), keys.size());
-    return failures;
+    expect_true(level_runs(store, *deep, runs).succeeded());
+    expect_true(!runs.empty() && runs[0] == 1);
+    expect_equal(count_valued(store, *deep, std::span<stored_key_t const> {keys}, 42), keys.size());
 }
 
 /** Appends far smaller than a run land together in one run, not one run each. */
 template <typename mount_type_>
-std::size_t appends_share_one_run(mount_type_ const& mount) {
+void test_appends_share_one_run(mount_type_ const& mount) {
     using types_t = database_types<typename mount_type_::fixture_t>;
     using stack_t = typename types_t::stack_t;
-    std::size_t failures = 0;
     expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
+    expect_status(stack, status_code_t::success_k);
+    if (!stack) return;
     expected<collection_id_t> const coalesced = create_named(*(*stack)->store, "coalesced", test_config(8, 0));
-    failures += expect(coalesced.has_value());
-    if (!coalesced) return failures;
+    expect_true(coalesced.has_value());
+    if (!coalesced) return;
 
     st::vector<stored_key_t> const keys = keys_between(0, 8000);
-    failures += expect(ingest_rows(*(*stack)->store, *coalesced, rows_of(std::span<stored_key_t const> {keys}, 3),
-                                   ustore_durability_buffered_k, 1000)
-                           .has_value());
+    expect_true(ingest_rows(*(*stack)->store, *coalesced, rows_of(std::span<stored_key_t const> {keys}, 3),
+                            ustore_durability_buffered_k, 1000)
+                    .has_value());
     st::vector<std::size_t> runs;
-    failures += expect(level_runs(*(*stack)->store, *coalesced, runs).succeeded());
+    expect_true(level_runs(*(*stack)->store, *coalesced, runs).succeeded());
     std::size_t total_runs = 0;
     for (std::size_t const level : runs) total_runs += level;
-    failures += expect_eq(total_runs, std::size_t {1});
-    failures += expect_eq(count_valued(*(*stack)->store, *coalesced, std::span<stored_key_t const> {keys}, 3),
-                          keys.size());
-    return failures;
+    expect_equal(total_runs, std::size_t {1});
+    expect_equal(count_valued(*(*stack)->store, *coalesced, std::span<stored_key_t const> {keys}, 3), keys.size());
 }
 
 #pragma endregion Placement Cases
@@ -362,51 +354,51 @@ std::size_t appends_share_one_run(mount_type_ const& mount) {
 
 /** What a crash right after an ingest leaves: all of it or none of it when buffered, all of it when flushed. */
 template <typename mount_type_>
-std::size_t crash_after_ingest(mount_type_ const& mount, ustore_durability_t durability) {
+void crash_after_ingest(mount_type_ const& mount, ustore_durability_t durability) {
     using types_t = database_types<typename mount_type_::fixture_t>;
     using database_t = typename types_t::database_t;
     using stack_t = typename types_t::stack_t;
-    std::size_t failures = 0;
     expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
+    expect_status(stack, status_code_t::success_k);
+    if (!stack) return;
     expected<collection_id_t> const landed = create_named(*(*stack)->store, "landed", test_config(8, 0));
-    failures += expect(landed.has_value());
-    if (!landed) return failures;
+    expect_true(landed.has_value());
+    if (!landed) return;
     st::vector<stored_key_t> const keys = keys_between(0, 200);
-    failures += expect(
-        ingest_rows(*(*stack)->store, *landed, rows_of(std::span<stored_key_t const> {keys}, 5), durability)
-            .has_value());
+    expect_true(ingest_rows(*(*stack)->store, *landed, rows_of(std::span<stored_key_t const> {keys}, 5), durability)
+                    .has_value());
 
-    failures += expect(capture_data_directory(*(*stack)->fixture).succeeded());
+    expect_true(capture_data_directory(*(*stack)->fixture).succeeded());
     (*stack)->store.reset();
     (*stack)->volume = typename types_t::volume_t {};
-    failures += expect(restore_data_directory(*(*stack)->fixture).succeeded());
+    expect_true(restore_data_directory(*(*stack)->fixture).succeeded());
     expected<std::unique_ptr<database_t>> reopened = open_database(**stack);
-    failures += expect(reopened.has_value());
-    if (!reopened) return failures;
+    expect_true(reopened.has_value());
+    if (!reopened) return;
     std::size_t const kept = count_valued(**reopened, *landed, std::span<stored_key_t const> {keys}, 5);
-    if (durability == ustore_durability_flushed_k) failures += expect_eq(kept, keys.size());
-    else failures += expect(kept == 0 || kept == keys.size());
-    return failures;
+    if (durability == ustore_durability_flushed_k) expect_equal(kept, keys.size());
+    else expect_true(kept == 0 || kept == keys.size());
 }
+
+/** The reason a crash case reports on a block device, whose medium it cannot copy aside. */
+constexpr char const* needs_copyable_medium_k = "needs a medium a case may copy, not a block device";
 
 /** A buffered ingest a crash catches before any flush reopens whole or not at all. */
 template <typename mount_type_>
-case_result_t buffered_ingest_is_all_or_nothing(mount_type_ const& mount) {
+case_result_t test_buffered_ingest_is_all_or_nothing(mount_type_ const& mount) {
     if (mount.transport == transport_t::memory_k) return case_result_t::skipped(memory_volumes_vanish_k);
-    if (mount.transport == transport_t::device_k)
-        return case_result_t::skipped("a block device's medium is not one a case may copy", 0);
-    return crash_after_ingest(mount, ustore_durability_buffered_k);
+    if (mount.transport == transport_t::device_k) return case_result_t::skipped(needs_copyable_medium_k);
+    crash_after_ingest(mount, ustore_durability_buffered_k);
+    return {};
 }
 
 /** A flushed ingest survives a crash right after it returns. */
 template <typename mount_type_>
-case_result_t flushed_ingest_survives_reopen(mount_type_ const& mount) {
+case_result_t test_flushed_ingest_survives_reopen(mount_type_ const& mount) {
     if (mount.transport == transport_t::memory_k) return case_result_t::skipped(memory_volumes_vanish_k);
-    if (mount.transport == transport_t::device_k)
-        return case_result_t::skipped("a block device's medium is not one a case may copy", 0);
-    return crash_after_ingest(mount, ustore_durability_flushed_k);
+    if (mount.transport == transport_t::device_k) return case_result_t::skipped(needs_copyable_medium_k);
+    crash_after_ingest(mount, ustore_durability_flushed_k);
+    return {};
 }
 
 #pragma endregion Durability Cases
@@ -415,63 +407,57 @@ case_result_t flushed_ingest_survives_reopen(mount_type_ const& mount) {
 
 /** A snapshot pinned before an ingest reads the value the key held before it. */
 template <typename mount_type_>
-std::size_t snapshot_reads_the_older_value(mount_type_ const& mount) {
+void test_snapshot_reads_the_older_value(mount_type_ const& mount) {
     using types_t = database_types<typename mount_type_::fixture_t>;
     using database_t = typename types_t::database_t;
     using stack_t = typename types_t::stack_t;
-    std::size_t failures = 0;
     expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
+    expect_status(stack, status_code_t::success_k);
+    if (!stack) return;
     database_t& store = *(*stack)->store;
     expected<collection_id_t> const held = create_named(store, "held", test_config(8, 0));
-    failures += expect(held.has_value());
-    if (!held) return failures;
+    expect_true(held.has_value());
+    if (!held) return;
 
     std::array<byte_t, 8> const older = counted(1);
-    failures += expect(
-        store.insert(any_collection_id_t {*held}, stored_key_t {5}, stored_value_view_t {older}).succeeded());
+    expect_true(store.insert(any_collection_id_t {*held}, stored_key_t {5}, stored_value_view_t {older}).succeeded());
     expected<typename database_t::snapshot_t> taken = store.pin_stamp();
-    failures += expect(taken.has_value());
-    if (!taken) return failures;
+    expect_true(taken.has_value());
+    if (!taken) return;
     std::array<stored_key_t, 1> const key {5};
-    failures += expect(
-        ingest_rows(store, *held, rows_of(std::span<stored_key_t const> {key}, 2), ustore_durability_buffered_k)
-            .has_value());
+    expect_true(ingest_rows(store, *held, rows_of(std::span<stored_key_t const> {key}, 2), ustore_durability_buffered_k)
+                    .has_value());
 
-    failures += expect_eq(count_valued(*taken, *held, std::span<stored_key_t const> {key}, 1), std::size_t {1});
-    failures += expect_eq(count_valued(store, *held, std::span<stored_key_t const> {key}, 2), std::size_t {1});
-    return failures;
+    expect_equal(count_valued(*taken, *held, std::span<stored_key_t const> {key}, 1), std::size_t {1});
+    expect_equal(count_valued(store, *held, std::span<stored_key_t const> {key}, 2), std::size_t {1});
 }
 
 /** A transaction that started before an ingest and wrote one of its keys fails at commit. */
 template <typename mount_type_>
-std::size_t older_transaction_conflicts(mount_type_ const& mount) {
+void test_older_transaction_conflicts(mount_type_ const& mount) {
     using types_t = database_types<typename mount_type_::fixture_t>;
     using database_t = typename types_t::database_t;
     using stack_t = typename types_t::stack_t;
-    std::size_t failures = 0;
     expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
+    expect_status(stack, status_code_t::success_k);
+    if (!stack) return;
     database_t& store = *(*stack)->store;
     expected<collection_id_t> const contested = create_named(store, "contested", test_config(8, 0));
-    failures += expect(contested.has_value());
-    if (!contested) return failures;
+    expect_true(contested.has_value());
+    if (!contested) return;
 
     expected<typename database_t::transaction_unique_ptr_t> older = store.create_transaction();
-    failures += expect(older.has_value());
-    if (!older) return failures;
+    expect_true(older.has_value());
+    if (!older) return;
     std::array<byte_t, 8> const mine = counted(1);
-    failures += expect(
+    expect_true(
         (*older)->insert(any_collection_id_t {*contested}, stored_key_t {5}, stored_value_view_t {mine}).succeeded());
     std::array<stored_key_t, 1> const key {5};
-    failures += expect(
+    expect_true(
         ingest_rows(store, *contested, rows_of(std::span<stored_key_t const> {key}, 2), ustore_durability_buffered_k)
             .has_value());
-    failures += expect_status((*older)->commit(), status_code_t::write_conflict_k);
-    failures += expect_eq(count_valued(store, *contested, std::span<stored_key_t const> {key}, 2), std::size_t {1});
-    return failures;
+    expect_status((*older)->commit(), status_code_t::write_conflict_k);
+    expect_equal(count_valued(store, *contested, std::span<stored_key_t const> {key}, 2), std::size_t {1});
 }
 
 #pragma endregion Isolation Cases
@@ -480,63 +466,57 @@ std::size_t older_transaction_conflicts(mount_type_ const& mount) {
 
 /** Keys that do not strictly ascend are refused, leaving nothing of the ingest behind, no run included. */
 template <typename mount_type_>
-std::size_t descending_key_is_refused(mount_type_ const& mount) {
+void test_descending_key_is_refused(mount_type_ const& mount) {
     using types_t = database_types<typename mount_type_::fixture_t>;
     using stack_t = typename types_t::stack_t;
-    std::size_t failures = 0;
     expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
+    expect_status(stack, status_code_t::success_k);
+    if (!stack) return;
     expected<collection_id_t> const refused = create_named(*(*stack)->store, "refused", test_config(8, 0));
-    failures += expect(refused.has_value());
-    if (!refused) return failures;
+    expect_true(refused.has_value());
+    if (!refused) return;
 
     st::vector<stored_key_t> keys = keys_between(0, 20);
     keys[19] = 3;
     counted_rows_t const rows = rows_of(std::span<stored_key_t const> {keys}, 7);
     expected<transaction_stamp_t> const landed = ingest_rows(*(*stack)->store, *refused, rows,
                                                              ustore_durability_buffered_k);
-    failures += expect_status(landed, status_code_t::invalid_argument_k);
-    failures += expect_eq(count_valued(*(*stack)->store, *refused, std::span<stored_key_t const> {keys}, 7),
-                          std::size_t {0});
-    failures += expect_eq(run_count_of(*(*stack)->fixture), std::size_t {0});
-    failures += expect_eq(run_files_of(*(*stack)->fixture), std::size_t {0});
-    return failures;
+    expect_status(landed, status_code_t::invalid_argument_k);
+    expect_equal(count_valued(*(*stack)->store, *refused, std::span<stored_key_t const> {keys}, 7), std::size_t {0});
+    expect_equal(run_count_of(*(*stack)->fixture), std::size_t {0});
+    expect_equal(run_files_of(*(*stack)->fixture), std::size_t {0});
 }
 
 #pragma endregion Refusal Cases
 
 } // namespace unum::ustore::test
 
-int main(int argc, char const* argv[]) {
+int main(int argc, char** argv) {
     using namespace unum::ustore;
     using namespace unum::ustore::test;
 
-    suite_options_t options;
-    if (argument_status_t const status = parse_suite_options(argc, argv, options);
-        status != argument_status_t::parsed_k)
-        return status == argument_status_t::help_k ? 0 : 1;
-    suite_totals_t totals = options.totals();
+    start_test_run(argc, argv);
 
-    st::expected<directory_t> const directory = directory_t::make(options.directory);
+    st::expected<scratch_directory_t> const directory = scratch_directory_t::make(test_run.settings.directory);
     if (!directory) {
         fmt::println(stderr, "  the working directory would not open");
         return 1;
     }
-    test_environment_t const environment = test_environment_t::of(options, *directory);
 
     auto const cases = [&](auto const& mount) {
-        report(totals, mount, "empty_lands_on_a_sorted_level", empty_collection_lands_on_a_sorted_level);
-        report(totals, mount, "overlap_at_level_one_lands_on_zero", overlap_at_level_one_lands_on_level_zero);
-        report(totals, mount, "appends_share_one_run", appends_share_one_run);
-        report(totals, mount, "buffered_is_all_or_nothing", buffered_ingest_is_all_or_nothing);
-        report(totals, mount, "flushed_survives_reopen", flushed_ingest_survives_reopen);
-        report(totals, mount, "snapshot_reads_the_older_value", snapshot_reads_the_older_value);
-        report(totals, mount, "older_transaction_conflicts", older_transaction_conflicts);
-        report(totals, mount, "descending_key_is_refused", descending_key_is_refused);
+        report_on_mount(mount, "test_empty_collection_lands_on_a_sorted_level",
+                        test_empty_collection_lands_on_a_sorted_level);
+        report_on_mount(mount, "test_overlap_at_level_one_lands_on_level_zero",
+                        test_overlap_at_level_one_lands_on_level_zero);
+        report_on_mount(mount, "test_appends_share_one_run", test_appends_share_one_run);
+        report_on_mount(mount, "test_buffered_ingest_is_all_or_nothing", test_buffered_ingest_is_all_or_nothing);
+        report_on_mount(mount, "test_flushed_ingest_survives_reopen", test_flushed_ingest_survives_reopen);
+        report_on_mount(mount, "test_snapshot_reads_the_older_value", test_snapshot_reads_the_older_value);
+        report_on_mount(mount, "test_older_transaction_conflicts", test_older_transaction_conflicts);
+        report_on_mount(mount, "test_descending_key_is_refused", test_descending_key_is_refused);
     };
     for (transport_t const transport : every_transport_k)
-        run_on_transport(totals, transport, environment, ingest_config_k, 1, "ingest", cases);
+        run_on_transport(transport, directory->path(), ingest_config_k, 1, "ingest", cases);
 
-    return suite_exit_code(totals);
+    return finish_test_run();
 }

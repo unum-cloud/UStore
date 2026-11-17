@@ -16,9 +16,8 @@
 #include <array>     // `std::array`
 #include <chrono>    // `std::chrono::steady_clock`
 #include <limits>    // `std::numeric_limits`
-#include <random>    // `std::mt19937`, `std::uniform_int_distribution`
 #include <span>      // `std::span`
-#include <utility>   // `std::exchange`, `std::move`
+#include <utility>   // `std::move`
 
 #include <fmt/format.h>
 
@@ -28,14 +27,14 @@
 
 #include "ustore/utilities/ram_device.hpp" // `caller_exclusivity_t`, `executor_t`
 
-#include "harness.hpp" // `suite_exit_code`, `expect`, `expect_eq`
+#include "harness.hpp" // `run_test_case`, `expect_true`, `expect_equal`, `split_mix_generator_t`
 
 using namespace unum::ustore;
 using namespace unum::ustore::test;
 using namespace unum::ustore::utilities;
 using namespace unum;
 
-/** Workload of the suite, each field set by the flag of the same name. */
+/** Workload of the suite, each field set by the setting of the same name. */
 struct linearizability_options_t {
 
     /** Wall-clock bound of the whole run, shared evenly by every configuration. */
@@ -45,7 +44,7 @@ struct linearizability_options_t {
     count_t checkpoints {.value = 1'000, .minimum = 1};
 
     /** Writing thread counts, each run against every transaction count. */
-    counts_t threads {.values = {2, 3, 4, 5, 6, 7, 8, 9, 10}, .size = 9, .minimum = 1};
+    counts_t thread_counts {.values = {2, 3, 4, 5, 6, 7, 8, 9, 10}, .size = 9, .minimum = 1};
 
     /** Transactions every thread commits between two checkpoints. */
     counts_t transactions {{1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 20, 50, 100}, 13};
@@ -143,11 +142,8 @@ struct writer_slot_t {
     /** Transaction reset before every commit, reusing the engine's buffers. */
     transaction_t transaction;
 
-    /** Generator of codes, keys and values, seeded once per run. */
-    std::mt19937 random_generator;
-
-    /** Failures the thread counted this round, folded in by the main thread once the round ends. */
-    std::size_t failures = 0;
+    /** Generator of codes, keys and values, seeded once per case. */
+    split_mix_generator_t random_generator {0};
 
     writer_slot_t() noexcept = default;
 };
@@ -184,67 +180,59 @@ struct linearizability_run_t {
 #pragma region Setup
 
 /** Begins the transaction a slot resets before every commit. */
-[[nodiscard]] std::size_t begin_transaction(database_t& database, transaction_t& transaction) {
+bool begin_transaction(database_t& database, transaction_t& transaction) {
     auto maybe_transaction = database.on().transaction();
-    std::size_t const failures = expect(maybe_transaction);
-    if (failures) return failures;
+    if (!expect_true(maybe_transaction.has_value())) return false;
     transaction = *std::move(maybe_transaction);
-    return 0;
+    return true;
 }
 
-/** Makes the arena of @p run, sizes its buffers for its largest configuration and seeds one
- *  generator per thread. */
-[[nodiscard]] std::size_t prepare_run(linearizability_run_t& run, linearizability_options_t const& options,
-                                      random_t random) {
+/** Makes the arena of @p run and sizes its buffers for its largest configuration. */
+bool prepare_run(linearizability_run_t& run, linearizability_options_t const& options) {
     std::size_t parts = 0;
     for (operations_mix_t const mix : mixes_k) parts = fu::max_of(parts, mix.parts());
-    std::size_t const threads_count = (std::ranges::max)(options.threads.view());
+    std::size_t const threads_count = (std::ranges::max)(options.thread_counts.view());
     std::size_t const operations_count = threads_count * (std::ranges::max)(options.transactions.view()) * parts;
     std::size_t const keys_count = fu::max_of<std::size_t>(operations_count / options.writes_per_key.value, 1) + 1;
 
     auto [arena, arena_status] = arena_t::make();
     run.arena = std::move(arena);
-    std::size_t failures = expect(arena_status.succeeded());
-    failures += expect(st::succeeded(run.slots.resize(threads_count)));
-    failures += expect(st::succeeded(run.operations.resize(operations_count)));
-    failures += expect(st::succeeded(run.latest.resize(keys_count)));
-    failures += expect(st::succeeded(run.present_keys.resize(keys_count)));
-    for (std::size_t index = 0; index != run.slots.size(); ++index)
-        run.slots[index].random_generator.seed(static_cast<std::uint32_t>(random.fork(index).next()));
-    return failures;
+    return expect_true(arena_status.succeeded()) && expect_true(st::succeeded(run.slots.resize(threads_count))) &&
+           expect_true(st::succeeded(run.operations.resize(operations_count))) &&
+           expect_true(st::succeeded(run.latest.resize(keys_count))) &&
+           expect_true(st::succeeded(run.present_keys.resize(keys_count)));
 }
 
 /** Reopens the database of @p run and begins one transaction per slot, freeing the
  *  previous ones first. */
-[[nodiscard]] std::size_t reopen_run(linearizability_run_t& run) {
+bool reopen_run(linearizability_run_t& run) {
     for (writer_slot_t& slot : run.slots) slot.transaction = transaction_t {};
     if (run.database) run.database.close();
     auto [database, open_status] = open_database<database_t>(*run.config);
-    std::size_t failures = expect(open_status.succeeded());
-    if (failures) return failures;
+    if (!expect_true(open_status.succeeded())) return false;
     run.database = std::move(database);
     auto [collection, create_status] = run.database.on().find_or_create("linearizability");
-    failures += expect(create_status.succeeded());
+    if (!expect_true(create_status.succeeded())) return false;
     run.collection = collection;
-    for (std::size_t thread = 0; thread != run.slots.size() && !failures; ++thread)
-        failures += begin_transaction(run.database, run.slots[thread].transaction);
-    return failures;
+    for (writer_slot_t& slot : run.slots)
+        if (!begin_transaction(run.database, slot.transaction)) return false;
+    return true;
 }
 
 #pragma endregion Setup
 
 #pragma region Round
 
-/** Stages and commits one transaction of random writes, stamping each logged write with
- *  the commit's outcome. */
-std::size_t write_transaction(writer_slot_t& slot, ustore_collection_id_t collection, std::span<operation_t> batch,
-                              operations_mix_t mix, std::uniform_int_distribution<std::uint64_t>& key_distribution) {
-    std::size_t failures = expect(slot.transaction.on().reset().has_value());
+/** Stages and commits one transaction of random writes to keys up to @p max_key , stamping each
+ *  logged write with the commit's outcome. */
+void write_transaction(writer_slot_t& slot, ustore_collection_id_t collection, std::span<operation_t> batch,
+                       operations_mix_t mix, std::uint64_t max_key) {
+    expect_true(slot.transaction.on().reset().has_value());
     blobs_collection_t inside {slot.transaction.receiver(), collection};
     for (operation_t& operation : batch) {
-        operation.code = slot.random_generator() % mix.parts() < mix.inserts ? operation_code_t::insert_k
-                                                                             : operation_code_t::remove_k;
-        operation.key = key_distribution(slot.random_generator);
+        operation.code = slot.random_generator.below(mix.parts()) < mix.inserts ? operation_code_t::insert_k
+                                                                                : operation_code_t::remove_k;
+        operation.key = 1 + slot.random_generator.below(max_key);
         operation.value = slot.random_generator();
         // A stage refused for a busy channel changed nothing, and another thread gives
         // the channel back
@@ -254,7 +242,7 @@ std::size_t write_transaction(writer_slot_t& slot, ustore_collection_id_t collec
                          ? inside[key_from_integer(operation.key)].assign(operation.value_view())
                          : inside[key_from_integer(operation.key)].remove();
         } while (staged == status_code_t::capacity_exhausted_k);
-        failures += expect(staged.succeeded());
+        expect_true(staged.succeeded());
     }
 
     auto maybe_stamp = slot.transaction.on().commit();
@@ -265,17 +253,14 @@ std::size_t write_transaction(writer_slot_t& slot, ustore_collection_id_t collec
         operation.committed = committed;
         operation.stamp = stamp;
     }
-    return failures;
 }
 
 /** Commits every transaction of one thread's round, logging its writes into @p log. */
 void write_round(writer_slot_t& slot, ustore_collection_id_t collection, std::span<operation_t> log,
                  workload_t const& workload) {
-    std::uniform_int_distribution<std::uint64_t> key_distribution(1, workload.max_key);
     std::size_t const parts = workload.mix.parts();
     for (std::size_t iteration = 0; iteration != workload.transactions; ++iteration)
-        slot.failures += write_transaction(slot, collection, log.subspan(iteration * parts, parts), workload.mix,
-                                           key_distribution);
+        write_transaction(slot, collection, log.subspan(iteration * parts, parts), workload.mix, workload.max_key);
 }
 
 /** Keeps, per key, the committed write with the highest stamp, and the later-logged one
@@ -295,53 +280,45 @@ bool leaves_inserted(operation_t const* winner) noexcept {
 }
 
 /** Checks that @p retrieved holds the payload @p operation inserted. */
-std::size_t expect_payload(value_view_t retrieved, operation_t const& operation) {
-    std::size_t failures = expect_eq(retrieved.size(), sizeof(payload_t));
-    if (retrieved.size() == sizeof(payload_t)) {
-        payload_t stored = 0;
-        std::memcpy(&stored, retrieved.data(), sizeof(payload_t));
-        failures += expect_eq(stored, operation.value);
-    }
-    if (failures) fmt::println(stderr, "  for key {}", operation.key);
-    return failures;
+void expect_payload(value_view_t retrieved, operation_t const& operation) {
+    if (!expect_equal(retrieved.size(), sizeof(payload_t), "for key {}", operation.key)) return;
+    payload_t stored = 0;
+    std::memcpy(&stored, retrieved.data(), sizeof(payload_t));
+    expect_equal(stored, operation.value, "for key {}", operation.key);
 }
 
 /** Checks the database against the replay: every inserted key holds its payload, and no other
  *  key is present. */
-std::size_t verify_round(linearizability_run_t& run, std::span<operation_t const*> latest) {
+void verify_round(linearizability_run_t& run, std::span<operation_t const*> latest) {
     std::size_t present_count = 0;
     for (operation_t const* const winner : latest)
         if (leaves_inserted(winner)) run.present_keys[present_count++] = key_from_integer(winner->key);
 
     ustore_key_t const* const keys = run.present_keys.data();
     auto maybe_retrieved = run.collection[strided(keys, keys + present_count)].value(run.arena);
-    std::size_t failures = expect(maybe_retrieved);
-    if (!maybe_retrieved) return failures;
+    if (!expect_true(maybe_retrieved.has_value())) return;
 
     std::size_t index = 0;
     for (operation_t const* const winner : latest)
-        if (leaves_inserted(winner)) failures += expect_payload((*maybe_retrieved)[index++], *winner);
-    failures += expect(run.collection.pairs().size() == present_count);
-    return failures;
+        if (leaves_inserted(winner)) expect_payload((*maybe_retrieved)[index++], *winner);
+    expect_true(run.collection.pairs().size() == present_count);
 }
 
 /** Runs one round: threads commit their transactions, then the main thread replays their logs,
  *  checks and clears. */
-std::size_t run_round(linearizability_run_t& run, executor_t& executor, workload_t const& workload) {
+void run_round(linearizability_run_t& run, executor_t& executor, workload_t const& workload) {
     std::size_t const per_thread = workload.operations_per_thread();
     std::span<operation_t> const operations {run.operations.data(), workload.threads_count * per_thread};
     std::span<writer_slot_t> const slots {run.slots.data(), workload.threads_count};
     auto writer = [&](std::size_t thread) noexcept {
         write_round(slots[thread], run.collection, operations.subspan(thread * per_thread, per_thread), workload);
     };
-    std::size_t failures = expect(st::succeeded(executor.for_threads(writer)));
-    for (writer_slot_t& slot : slots) failures += std::exchange(slot.failures, 0);
+    expect_true(st::succeeded(executor.for_threads(writer)));
 
     std::span<operation_t const*> const latest {run.latest.data(), static_cast<std::size_t>(workload.max_key) + 1};
     replay_round(operations, latest);
-    failures += verify_round(run, latest);
-    failures += expect(run.database.on().clear(ustore_drop_pairs_k).succeeded());
-    return failures;
+    verify_round(run, latest);
+    expect_true(run.database.on().clear(ustore_drop_pairs_k).succeeded());
 }
 
 #pragma endregion Round
@@ -354,7 +331,7 @@ std::size_t run_round(linearizability_run_t& run, executor_t& executor, workload
  *
  *  Every round ends at a checkpoint where all threads stop, the main thread replays the
  *  committed writes in stamp order, compares the replay against the database, and clears it for
- *  the next round.
+ *  the next round, which does not start after one failed a check.
  *
  *  @param[in,out] run Database, logs and thread slots the run allocated once.
  *  @param[in,out] executor Pool of exactly the workload's thread count.
@@ -362,75 +339,87 @@ std::size_t run_round(linearizability_run_t& run, executor_t& executor, workload
  *  @param[in] checkpoints Most rounds to run.
  *  @param[in] slice Time after which no further round starts; the first round always runs.
  */
-std::size_t linear_writes(linearizability_run_t& run, executor_t& executor, workload_t const& workload,
-                          std::size_t checkpoints, std::chrono::nanoseconds slice) {
+void linear_writes(linearizability_run_t& run, executor_t& executor, workload_t const& workload,
+                   std::size_t checkpoints, std::chrono::nanoseconds slice) {
     auto const deadline = std::chrono::steady_clock::now() + slice;
-    std::size_t failures = 0;
-    for (std::size_t checkpoint = 0; checkpoint != checkpoints && !failures; ++checkpoint) {
+    std::size_t const failed_before = test_run.failed_checks.load();
+    for (std::size_t checkpoint = 0; checkpoint != checkpoints && test_run.failed_checks.load() == failed_before;
+         ++checkpoint) {
         if (checkpoint != 0 && std::chrono::steady_clock::now() >= deadline) break;
-        failures += run_round(run, executor, workload);
+        run_round(run, executor, workload);
     }
-    return failures;
 }
 
 /** Runs every mix of inserts and removes at @p threads threads committing
  *  @p transactions per round. */
-std::size_t linear_writes_mixes(linearizability_run_t& run, executor_t& executor,
-                                linearizability_options_t const& options, std::size_t threads, std::size_t transactions,
-                                std::chrono::nanoseconds slice) {
-    std::size_t failures = 0;
+void linear_writes_mixes(linearizability_run_t& run, executor_t& executor, linearizability_options_t const& options,
+                         std::size_t threads, std::size_t transactions, std::chrono::nanoseconds slice) {
     for (operations_mix_t const mix : mixes_k) {
         std::size_t const writes = mix.parts() * transactions * threads;
         std::uint64_t const max_key = fu::max_of<std::uint64_t>(writes / options.writes_per_key.value, 1);
         workload_t const workload {mix, threads, transactions, max_key};
-        failures += linear_writes(run, executor, workload, options.checkpoints.value, slice);
+        linear_writes(run, executor, workload, options.checkpoints.value, slice);
     }
-    return failures;
 }
 
-/** Runs and reports every transaction count on one pool of @p threads threads, each on a
- *  freshly opened database. */
-void linear_writes_on_threads(suite_totals_t& totals, linearizability_run_t& run,
-                              linearizability_options_t const& options, std::size_t threads,
+/** Runs every mix at @p threads threads committing @p transactions per round on @p executor , null
+ *  when the pool would not start, over a freshly opened database whose writers draw from the
+ *  streams of this case. */
+void test_linear_writes(linearizability_run_t& run, linearizability_options_t const& options, executor_t* executor,
+                        std::size_t threads, std::size_t transactions, std::chrono::nanoseconds slice) {
+    if (!expect_true(executor != nullptr) || !reopen_run(run)) return;
+    for (std::size_t index = 0; index != run.slots.size(); ++index)
+        run.slots[index].random_generator = split_mix_generator_t {case_stream_key(index)};
+    linear_writes_mixes(run, *executor, options, threads, transactions, slice);
+}
+
+/** Runs every transaction count on one pool of @p threads threads, each as a case of its own. */
+void linear_writes_on_threads(linearizability_run_t& run, linearizability_options_t const& options, std::size_t threads,
                               std::chrono::nanoseconds slice) {
     auto maybe_executor = executor_t::make(threads, caller_exclusivity_t::caller_inclusive_k);
+    executor_t* const executor = maybe_executor ? &*maybe_executor : nullptr;
     for (std::size_t const transactions : options.transactions.view()) {
-        char name[64];
-        auto const written = fmt::format_to_n(name, sizeof(name) - 1, "linear_writes.threads_{}.between_{}", threads,
+        char label[96];
+        auto const written = fmt::format_to_n(label, sizeof(label) - 1, "test_linear_writes({}, {})", threads,
                                               transactions);
         *written.out = '\0';
-        if (!totals.selects(name)) continue;
-        std::size_t failures = expect(maybe_executor);
-        if (!failures) failures += reopen_run(run);
-        if (!failures) failures += linear_writes_mixes(run, *maybe_executor, options, threads, transactions, slice);
-        report(totals, name, failures);
+        run_test_case(label, test_linear_writes, run, options, executor, threads, transactions, slice);
     }
 }
 
 #pragma endregion Configurations
 
-int main(int argc, char** argv) {
-    suite_options_t suite;
-    linearizability_options_t options;
-    std::array<flag_t, 5> const flags {{
-        {"--time-limit", "duration", "bound of the whole run, like 10s", &options.time_limit},
-        {"--checkpoints", "count", "most replayed rounds per configuration", &options.checkpoints},
-        {"--threads", "counts", "writing thread counts, like 2,4,8", &options.threads},
-        {"--transactions", "counts", "transactions per thread between checkpoints, like 1,10,100",
-         &options.transactions},
-        {"--writes-per-key", "count", "mean writes one key receives per round", &options.writes_per_key},
-    }};
-    if (argument_status_t const status = parse_suite_options(argc, argv, suite, flags);
-        status != argument_status_t::parsed_k)
-        return status == argument_status_t::help_k ? 0 : 1;
-    suite_totals_t totals = suite.totals();
+/** Reads the counts setting @p variable or @p flag into @p counts , exiting on one that
+ *  does not parse. */
+void read_counts_setting(int argc, char** argv, char const* variable, std::string_view flag, counts_t& counts) {
+    char const* text = setting_text(argc, argv, variable, flag);
+    if (text && parse_counts(text, counts) != argument_status_t::parsed_k)
+        exit_unparsed(variable, text, "comma-separated counts like 2,4,8");
+}
 
-    auto const maybe_directory = directory_t::make(suite.directory);
+/** Reads the count setting @p variable or @p flag into @p count , within its bounds, exiting on one
+ *  that does not parse. */
+void read_bounded_setting(int argc, char** argv, char const* variable, std::string_view flag, count_t& count) {
+    char const* text = setting_text(argc, argv, variable, flag);
+    if (text && parse_count(text, count) != argument_status_t::parsed_k)
+        exit_unparsed(variable, text, "a positive count");
+}
+
+int main(int argc, char** argv) {
+    start_test_run(argc, argv);
+    linearizability_options_t options;
+    options.time_limit = read_duration_setting(argc, argv, "USTORE_TIME_LIMIT", "--time-limit", options.time_limit);
+    read_bounded_setting(argc, argv, "USTORE_CHECKPOINTS", "--checkpoints", options.checkpoints);
+    read_counts_setting(argc, argv, "USTORE_THREAD_COUNTS", "--thread-counts", options.thread_counts);
+    read_counts_setting(argc, argv, "USTORE_TRANSACTIONS", "--transactions", options.transactions);
+    read_bounded_setting(argc, argv, "USTORE_WRITES_PER_KEY", "--writes-per-key", options.writes_per_key);
+
+    auto const maybe_directory = scratch_directory_t::make(test_run.settings.directory);
     if (!maybe_directory) {
-        fmt::println(stderr, "Cannot create a unique directory under {}", suite.directory);
+        fmt::println(stderr, "Cannot create a unique directory under {}", test_run.settings.directory);
         return 1;
     }
-    config_t const config {suite.engine, maybe_directory->path()};
+    config_t const config {test_run.settings.engine, maybe_directory->path()};
     linearizability_run_t run {&config};
     auto [database, open_status] = open_database<database_t>(*run.config);
     if (open_status.failed()) {
@@ -439,17 +428,16 @@ int main(int argc, char** argv) {
     }
     run.database = std::move(database);
     if (!run.database.on().supports_transactions()) {
-        report(totals, "linear_writes", case_result_t::skipped("the engine does not support transactions"));
-        return suite_exit_code(totals);
+        run_test_case("test_linear_writes", [] { return case_result_t::skipped(needs_transactions_k); });
+        return finish_test_run();
     }
-    if (std::size_t const failures = prepare_run(run, options, suite.random()); failures) {
-        report(totals, "setup", failures);
-        return suite_exit_code(totals);
-    }
+    // The setup runs outside any case, so a filter never leaves it out, and a check it fails
+    // fails the run
+    if (!prepare_run(run, options)) return finish_test_run();
 
-    std::size_t const configurations_count = options.threads.size * options.transactions.size * mixes_k.size();
+    std::size_t const configurations_count = options.thread_counts.size * options.transactions.size * mixes_k.size();
     std::chrono::nanoseconds const slice = options.time_limit / configurations_count;
-    for (std::size_t const threads : options.threads.view())
-        linear_writes_on_threads(totals, run, options, threads, slice);
-    return suite_exit_code(totals);
+    for (std::size_t const threads : options.thread_counts.view())
+        linear_writes_on_threads(run, options, threads, slice);
+    return finish_test_run();
 }

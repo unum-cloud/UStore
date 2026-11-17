@@ -28,7 +28,7 @@
 #include "ustore/ranges.hpp" // `tape_string`
 #include "ustore/ustore.h"
 
-#include "harness.hpp" // `suite_exit_code`, `expect`, `expect_eq`, `open_raw`
+#include "harness.hpp" // `run_test_case`, `expect_true`, `expect_equal`, `open_raw`
 
 using namespace unum::ustore;
 using namespace unum::ustore::test;
@@ -58,16 +58,12 @@ struct fixture_t {
 
     explicit fixture_t(config_t const& config) noexcept {
         auto [opened, open_status] = open_raw(config);
-        if (open_status.failed()) {
-            fmt::println(stderr, "  failed to open the database: {}", open_status.message);
-            return;
-        }
+        if (!expect_status(open_status, status_code_t::success_k)) return;
         database = opened;
         ustore_outcome_t outcome {};
         ustore_database_clear_t clear {.database = database, .outcome = &outcome, .mode = ustore_drop_collection_k};
         ustore_database_clear(&clear);
-        if (outcome.status != ustore_status_success_k)
-            fmt::println(stderr, "  failed to clear the database: {}", outcome.message);
+        expect_success(outcome);
     }
 
     ~fixture_t() noexcept { ustore_database_free(database); }
@@ -82,8 +78,7 @@ struct fixture_t {
                                            .modality = modality,
                                            .collection = &collection};
         ustore_collection_create(&create);
-        if (outcome.status != ustore_status_success_k)
-            fmt::println(stderr, "  failed to create {}: {}", name, outcome.message);
+        expect_success(outcome);
         return collection;
     }
 };
@@ -124,10 +119,11 @@ struct arena_t {
     ~arena_t() noexcept { ustore_arena_free(arena); }
 };
 
-/** Pulls up to @p wanted keys and values of @p cursor through @p next_ into @p arena, appending them to @p rows. */
+/** Pulls up to @p wanted keys and values of @p cursor through @p next_ into @p arena, appending
+ *  them to @p rows, and answers how many it pulled, none once the pull is refused. */
 template <typename next_type_, typename cursor_type_>
 ustore_size_t pull_keyed(ustore_database_t database, cursor_type_ cursor, void (*next_)(next_type_*),
-                         ustore_arena_t arena, ustore_size_t wanted, rows_t& rows, std::size_t& failures) {
+                         ustore_arena_t arena, ustore_size_t wanted, rows_t& rows) {
     ustore_outcome_t outcome {};
     ustore_key_t const* keys = nullptr;
     ustore_strings_view_t values {};
@@ -137,7 +133,7 @@ ustore_size_t pull_keyed(ustore_database_t database, cursor_type_ cursor, void (
     next.values = &values, next.written = &written, next.arena = arena, next.wanted = wanted;
     if constexpr (requires { next.outputs_encoding; }) next.outputs_encoding = ustore_page_encoding_xml_k;
     next_(&next);
-    failures += expect_success(outcome);
+    if (!expect_success(outcome)) return 0;
     for (ustore_size_t index = 0; index != written; ++index)
         rows.push_back({cell_of(keys[index]), cell_of(values, index)});
     return written;
@@ -145,24 +141,21 @@ ustore_size_t pull_keyed(ustore_database_t database, cursor_type_ cursor, void (
 
 /** Walks @p cursor of @p init_ to its end through @p next_, appending every row to @p rows. */
 template <typename cursor_type_, typename init_type_, typename next_type_>
-std::size_t walk_keyed(ustore_database_t database, ustore_collection_id_t collection, void (*init_)(init_type_*),
-                       void (*next_)(next_type_*), void (*free_)(cursor_type_), rows_t& rows) {
-    std::size_t failures = 0;
+void walk_keyed(ustore_database_t database, ustore_collection_id_t collection, void (*init_)(init_type_*),
+                void (*next_)(next_type_*), void (*free_)(cursor_type_), rows_t& rows) {
     cursor_type_ cursor = nullptr;
     ustore_outcome_t outcome {};
     init_type_ init {};
     init.cursor = &cursor, init.database = database, init.outcome = &outcome, init.collection = collection;
     init_(&init);
-    if ((failures += expect_success(outcome))) return failures;
+    if (!expect_success(outcome)) return;
     arena_t arena;
-    while (pull_keyed(database, cursor, next_, arena.arena, 64, rows, failures) && !failures) {}
+    while (pull_keyed(database, cursor, next_, arena.arena, 64, rows)) {}
     free_(cursor);
-    return failures;
 }
 
 /** Reads every row of @p collection of @p modality into @p rows through its cursor, a graph as its edges. */
-std::size_t dump(ustore_database_t database, ustore_collection_id_t collection, ustore_modality_t modality,
-                 rows_t& rows) {
+void dump(ustore_database_t database, ustore_collection_id_t collection, ustore_modality_t modality, rows_t& rows) {
     switch (modality) {
     case ustore_modality_docs_k:
         return walk_keyed(database, collection, &ustore_docs_cursor_init, &ustore_docs_cursor_next,
@@ -176,7 +169,6 @@ std::size_t dump(ustore_database_t database, ustore_collection_id_t collection, 
         return walk_keyed(database, collection, &ustore_blobs_cursor_init, &ustore_blobs_cursor_next,
                           &ustore_blobs_cursor_free, rows);
     }
-    std::size_t failures = 0;
     ustore_outcome_t outcome {};
     arena_t arena;
     if (modality == ustore_modality_strings_k) {
@@ -186,8 +178,8 @@ std::size_t dump(ustore_database_t database, ustore_collection_id_t collection, 
                                            .outcome = &outcome,
                                            .collection = collection};
         ustore_strings_cursor_init(&init);
-        if ((failures += expect_success(outcome))) return failures;
-        for (ustore_size_t written = 1; written && !failures;) {
+        if (!expect_success(outcome)) return;
+        for (ustore_size_t written = 1; written;) {
             ustore_strings_view_t strings {};
             ustore_key_t const* values = nullptr;
             ustore_strings_cursor_next_t next {.database = database,
@@ -199,12 +191,12 @@ std::size_t dump(ustore_database_t database, ustore_collection_id_t collection, 
                                                .arena = arena.arena,
                                                .wanted = 64};
             ustore_strings_cursor_next(&next);
-            failures += expect_success(outcome);
+            if (!expect_success(outcome)) break;
             for (ustore_size_t index = 0; index != written; ++index)
                 rows.push_back({cell_of(strings, index), cell_of(values[index])});
         }
         ustore_strings_cursor_free(cursor);
-        return failures;
+        return;
     }
     ustore_graph_vertices_cursor_t cursor = nullptr;
     ustore_graph_vertices_cursor_init_t init {.cursor = &cursor,
@@ -212,9 +204,9 @@ std::size_t dump(ustore_database_t database, ustore_collection_id_t collection, 
                                               .outcome = &outcome,
                                               .collection = collection};
     ustore_graph_vertices_cursor_init(&init);
-    if ((failures += expect_success(outcome))) return failures;
+    if (!expect_success(outcome)) return;
     arena_t edges_arena;
-    for (ustore_size_t written = 1; written && !failures;) {
+    for (ustore_size_t written = 1; written;) {
         ustore_key_t const* vertices = nullptr;
         ustore_graph_vertices_cursor_next_t next {.database = database,
                                                   .outcome = &outcome,
@@ -224,8 +216,7 @@ std::size_t dump(ustore_database_t database, ustore_collection_id_t collection, 
                                                   .arena = arena.arena,
                                                   .wanted = 64};
         ustore_graph_vertices_cursor_next(&next);
-        failures += expect_success(outcome);
-        if (!written || failures) break;
+        if (!expect_success(outcome) || !written) break;
         ustore_vertex_role_t const role = ustore_vertex_role_source_k;
         ustore_vertex_degree_t const* degrees = nullptr;
         ustore_length_t const* offsets = nullptr;
@@ -241,17 +232,16 @@ std::size_t dump(ustore_database_t database, ustore_collection_id_t collection, 
                                         .edges_per_vertex = &triples,
                                         .arena = edges_arena.arena};
         ustore_graph_read_edges(&read);
-        failures += expect_success(outcome);
+        expect_success(outcome);
         for (ustore_length_t edge = 0; offsets && edge != offsets[written]; ++edge)
             rows.push_back(
                 {cell_of(triples[edge * 3]), cell_of(triples[edge * 3 + 1]), cell_of(triples[edge * 3 + 2])});
     }
     ustore_graph_vertices_cursor_free(cursor);
-    return failures;
 }
 
 /** Writes @p count blobs, keyed 1 to @p count, each valued "value-" and its key. */
-std::size_t fill_blobs(ustore_database_t database, ustore_collection_id_t collection, std::size_t count) {
+bool fill_blobs(ustore_database_t database, ustore_collection_id_t collection, std::size_t count) {
     std::vector<ustore_key_t> keys;
     tape_t values;
     for (std::size_t index = 1; index <= count; ++index) {
@@ -286,8 +276,8 @@ struct modality_rows_t {
 };
 
 /** Fills @p collection of @p modality with @p rows through its own writes. */
-std::size_t fill(ustore_database_t database, ustore_collection_id_t collection, ustore_modality_t modality,
-                 modality_rows_t const& rows) {
+bool fill(ustore_database_t database, ustore_collection_id_t collection, ustore_modality_t modality,
+          modality_rows_t const& rows) {
     ustore_size_t const count = rows.keys.size();
     ustore_outcome_t outcome {};
     ustore_collections_view_t const collections {&collection, 0};
@@ -388,18 +378,16 @@ struct column_t {
 
 /** Converters read keys and tapes in place at the column's offset, and refuse nulls, dictionaries, views, other
  *  formats, released inputs and missing buffers. */
-std::size_t arrow_converters(config_t const&) {
-    std::size_t failures = 0;
+void test_arrow_converters(config_t const&) {
     std::array<ustore_key_t, 3> const keys {key_from_integer(1), key_from_integer(2), key_from_integer(3)};
     column_t keyed {"w:16", 2, 2};
     keyed.buffers[1] = keys.data();
     keyed.array.offset = 1;
     ustore_keys_view_t view {};
     ustore_size_t count = 0;
-    failures += expect_eq(ustore_keys_view_from_arrow(&keyed.schema, &keyed.array, &view, &count),
-                          ustore_status_success_k);
-    failures += expect_eq(count, 2u);
-    failures += expect(view.data == keys.data() + 1 && view.stride == sizeof(ustore_key_t));
+    expect_equal(ustore_keys_view_from_arrow(&keyed.schema, &keyed.array, &view, &count), ustore_status_success_k);
+    expect_equal(count, 2u);
+    expect_true(view.data == keys.data() + 1 && view.stride == sizeof(ustore_key_t));
 
     std::array<std::uint32_t, 4> const narrow {0, 1, 3, 6};
     std::array<std::uint64_t, 4> const wide {0, 1, 3, 6};
@@ -410,48 +398,45 @@ std::size_t arrow_converters(config_t const&) {
         texts.buffers[2] = "abbccc";
         texts.array.offset = 1;
         ustore_strings_view_t strings {};
-        failures += expect_eq(ustore_strings_view_from_arrow(&texts.schema, &texts.array, &strings, &count),
-                              ustore_status_success_k);
-        failures += expect_eq(count, 2u);
-        failures += expect(cell_of(strings, 0) == "bb" && cell_of(strings, 1) == "ccc");
-        failures += expect_eq(strings.layout, is_wide ? ustore_strings_u64_tape_k : ustore_strings_u32_tape_k);
+        expect_equal(ustore_strings_view_from_arrow(&texts.schema, &texts.array, &strings, &count),
+                     ustore_status_success_k);
+        expect_equal(count, 2u);
+        expect_true(cell_of(strings, 0) == "bb" && cell_of(strings, 1) == "ccc");
+        expect_equal(strings.layout, is_wide ? ustore_strings_u64_tape_k : ustore_strings_u32_tape_k);
     }
 
     std::uint8_t const validity = 0b01;
     column_t nulled {"w:16", 2, 2};
     nulled.buffers = {&validity, keys.data(), nullptr};
     nulled.array.null_count = 1;
-    failures += expect_eq(ustore_keys_view_from_arrow(&nulled.schema, &nulled.array, &view, &count),
-                          ustore_status_invalid_argument_k);
+    expect_equal(ustore_keys_view_from_arrow(&nulled.schema, &nulled.array, &view, &count),
+                 ustore_status_invalid_argument_k);
     nulled.array.null_count = -1;
-    failures += expect_eq(ustore_keys_view_from_arrow(&nulled.schema, &nulled.array, &view, &count),
-                          ustore_status_invalid_argument_k);
+    expect_equal(ustore_keys_view_from_arrow(&nulled.schema, &nulled.array, &view, &count),
+                 ustore_status_invalid_argument_k);
     column_t short_of_buffers {"z", 2, 2};
     ustore_strings_view_t strings {};
-    failures += expect_eq(
-        ustore_strings_view_from_arrow(&short_of_buffers.schema, &short_of_buffers.array, &strings, &count),
-        ustore_status_malformed_k);
+    expect_equal(ustore_strings_view_from_arrow(&short_of_buffers.schema, &short_of_buffers.array, &strings, &count),
+                 ustore_status_malformed_k);
     for (char const* format : {"vz", "vu", "w:8", "i"}) {
         column_t other {format, 2, 3};
-        failures += expect_eq(ustore_strings_view_from_arrow(&other.schema, &other.array, &strings, &count),
-                              ustore_status_unsupported_k);
+        expect_equal(ustore_strings_view_from_arrow(&other.schema, &other.array, &strings, &count),
+                     ustore_status_unsupported_k);
     }
     column_t dictionary {"w:16", 2, 2};
     dictionary.schema.dictionary = &keyed.schema;
-    failures += expect_eq(ustore_keys_view_from_arrow(&dictionary.schema, &dictionary.array, &view, &count),
-                          ustore_status_unsupported_k);
+    expect_equal(ustore_keys_view_from_arrow(&dictionary.schema, &dictionary.array, &view, &count),
+                 ustore_status_unsupported_k);
     keyed.array.release = nullptr;
-    failures += expect_eq(ustore_keys_view_from_arrow(&keyed.schema, &keyed.array, &view, &count),
-                          ustore_status_invalid_argument_k);
-    return failures;
+    expect_equal(ustore_keys_view_from_arrow(&keyed.schema, &keyed.array, &view, &count),
+                 ustore_status_invalid_argument_k);
 }
 
 /** Gathered columns export with their validities: numbers and binary strings in place, booleans
  *  packed into bits, and strings without the null byte ending every row. */
-std::size_t arrow_docs_columns_export(config_t const& config) {
-    std::size_t failures = 0;
+void test_arrow_docs_columns_export(config_t const& config) {
     fixture_t fixture {config};
-    if (!fixture.database) return failures + 1;
+    if (!fixture.database) return;
     ustore_collection_id_t const collection = fixture.create("scientists", ustore_modality_docs_k);
     std::array<ustore_key_t, 10> keys {};
     std::array<char[64], 10> texts {};
@@ -472,7 +457,7 @@ std::size_t arrow_docs_columns_export(config_t const& config) {
                                .keys = {keys.data(), sizeof(ustore_key_t)},
                                .values = values.view()};
     ustore_docs_write(&write);
-    if ((failures += expect_success(outcome))) return failures;
+    if (!expect_success(outcome)) return;
 
     std::array<std::string_view, 4> const fields {"alive", "born", "name", "name"};
     strided_strings<std::string_view> const fields_strings {strided(fields).begin()};
@@ -494,49 +479,47 @@ std::size_t arrow_docs_columns_export(config_t const& config) {
                                  .arena = arena,
                                  .outputs_types = types.data()};
     ustore_docs_gather(&gather);
-    if ((failures += expect_success(outcome))) return failures;
+    if (!expect_success(outcome)) return;
 
     std::array<ArrowSchema, 4> schemas {};
     std::array<ArrowDeviceArray, 4> arrays {};
     for (std::size_t field = 0; field != fields.size(); ++field) {
-        failures += expect_eq(ustore_docs_column_view_to_arrow(&columns[field], keys.size(), types[field], arena,
-                                                               &schemas[field], &arrays[field]),
-                              ustore_status_success_k);
-        failures += expect(arrays[field].array.buffers[0] == columns[field].validities);
-        failures += expect_eq(arrays[field].array.null_count, -1);
+        expect_equal(ustore_docs_column_view_to_arrow(&columns[field], keys.size(), types[field], arena,
+                                                      &schemas[field], &arrays[field]),
+                     ustore_status_success_k);
+        expect_true(arrays[field].array.buffers[0] == columns[field].validities);
+        expect_equal(arrays[field].array.null_count, -1);
     }
-    failures += expect_eq(std::string_view(schemas[0].format), std::string_view("b"));
-    failures += expect_eq(std::string_view(schemas[1].format), std::string_view("I"));
-    failures += expect_eq(std::string_view(schemas[2].format), std::string_view("u"));
-    failures += expect_eq(std::string_view(schemas[3].format), std::string_view("z"));
-    failures += expect(arrays[1].array.buffers[1] == columns[1].scalars);
+    expect_equal(std::string_view(schemas[0].format), std::string_view("b"));
+    expect_equal(std::string_view(schemas[1].format), std::string_view("I"));
+    expect_equal(std::string_view(schemas[2].format), std::string_view("u"));
+    expect_equal(std::string_view(schemas[3].format), std::string_view("z"));
+    expect_true(arrays[1].array.buffers[1] == columns[1].scalars);
     auto const* const alive = static_cast<std::uint8_t const*>(arrays[0].array.buffers[1]);
     auto const* const names = static_cast<std::uint32_t const*>(arrays[2].array.buffers[1]);
     auto const* const name_bytes = static_cast<char const*>(arrays[2].array.buffers[2]);
     for (std::size_t row = 0; row != keys.size(); ++row) {
         if (row == 4) continue;
         char name[8];
-        failures += expect_eq(((alive[row / 8] >> (row % 8)) & 1u) != 0, row % 3 == 0);
-        failures += expect_eq(std::string_view(name_bytes + names[row], names[row + 1] - names[row]),
-                              std::string_view(name, fmt::format_to(name, "n{}", row)));
+        expect_equal(((alive[row / 8] >> (row % 8)) & 1u) != 0, row % 3 == 0);
+        expect_equal(std::string_view(name_bytes + names[row], names[row + 1] - names[row]),
+                     std::string_view(name, fmt::format_to(name, "n{}", row)));
     }
-    failures += expect_eq(names[5] - names[4], 0u);
-    failures += expect_eq(ustore_docs_column_view_to_arrow(&columns[0], keys.size(), ustore_docs_field_type_json_k,
-                                                           arena, &schemas[0], &arrays[0]),
-                          ustore_status_invalid_argument_k);
+    expect_equal(names[5] - names[4], 0u);
+    expect_equal(ustore_docs_column_view_to_arrow(&columns[0], keys.size(), ustore_docs_field_type_json_k, arena,
+                                                  &schemas[0], &arrays[0]),
+                 ustore_status_invalid_argument_k);
     for (std::size_t field = 0; field != fields.size(); ++field) {
         arrays[field].array.release(&arrays[field].array);
         schemas[field].release(&schemas[field]);
     }
     ustore_arena_free(arena);
-    return failures;
 }
 
 /** A text column whose entry lacks the null byte ending it is refused before its copy is carved. */
-std::size_t arrow_export_refuses_an_entry_without_terminator(config_t const& config) {
-    std::size_t failures = 0;
+void test_arrow_export_refuses_an_entry_without_terminator(config_t const& config) {
     fixture_t fixture {config};
-    if (!fixture.database) return failures + 1;
+    if (!fixture.database) return;
     ustore_collection_id_t const collection = fixture.create("unterminated", ustore_modality_blobs_k);
     tape_t empty;
     empty.push("");
@@ -549,7 +532,7 @@ std::size_t arrow_export_refuses_an_entry_without_terminator(config_t const& con
                                 .keys = {&key, 0},
                                 .values = empty.view()};
     ustore_blobs_write(&write);
-    if ((failures += expect_success(outcome))) return failures;
+    if (!expect_success(outcome)) return;
 
     // The empty value read back gives offsets inside the arena with no byte between them
     arena_t const arena;
@@ -564,46 +547,42 @@ std::size_t arrow_export_refuses_an_entry_without_terminator(config_t const& con
                               .values = &values,
                               .arena = arena.arena};
     ustore_blobs_read(&read);
-    if ((failures += expect_success(outcome))) return failures;
+    if (!expect_success(outcome)) return;
     ustore_docs_column_view_t const column {.validities = presences, .strings = values};
     ArrowSchema schema {};
     ArrowDeviceArray array {};
-    failures += expect_eq(
+    expect_equal(
         ustore_docs_column_view_to_arrow(&column, 1, ustore_docs_field_type_string_k, arena.arena, &schema, &array),
         ustore_status_invalid_argument_k);
-    return failures;
 }
 
 /** A tape whose offsets lie outside the arena is refused, as is one whose count wraps the bytes
  *  of its offsets to the empty run an arena holds anywhere. */
-std::size_t arrow_export_refuses_offsets_outside_the_arena(config_t const&) {
-    std::size_t failures = 0;
+void test_arrow_export_refuses_offsets_outside_the_arena(config_t const&) {
     arena_t const arena;
     tape_t outside;
     outside.push("outside");
     ArrowSchema schema {};
     ArrowDeviceArray array {};
-    failures += expect_eq(
+    expect_equal(
         ustore_strings_view_to_arrow(outside.view(), 1, ustore_strings_u32_tape_k, arena.arena, &schema, &array),
         ustore_status_invalid_argument_k);
     std::size_t const wrapping = (std::numeric_limits<std::size_t>::max)() / sizeof(std::uint32_t);
-    failures += expect_eq(
+    expect_equal(
         ustore_strings_view_to_arrow(outside.view(), wrapping, ustore_strings_u32_tape_k, arena.arena, &schema, &array),
         ustore_status_invalid_argument_k);
-    failures += expect_eq(
+    expect_equal(
         ustore_strings_view_to_arrow(outside.view(), wrapping, ustore_strings_u64_tape_k, arena.arena, &schema, &array),
         ustore_status_invalid_argument_k);
-    return failures;
 }
 
 /** A cursor's keys and values export in place and read back through the converters until the
  *  arena's next call. */
-std::size_t arrow_exports_read_in_place(config_t const& config) {
-    std::size_t failures = 0;
+void test_arrow_exports_read_in_place(config_t const& config) {
     fixture_t fixture {config};
-    if (!fixture.database) return failures + 1;
+    if (!fixture.database) return;
     ustore_collection_id_t const collection = fixture.create("posters", ustore_modality_blobs_k);
-    if ((failures += fill_blobs(fixture.database, collection, 100))) return failures;
+    if (!fill_blobs(fixture.database, collection, 100)) return;
 
     ustore_blobs_cursor_t cursor = nullptr;
     ustore_outcome_t outcome {};
@@ -612,7 +591,7 @@ std::size_t arrow_exports_read_in_place(config_t const& config) {
                                      .outcome = &outcome,
                                      .collection = collection};
     ustore_blobs_cursor_init(&init);
-    if ((failures += expect_success(outcome))) return failures;
+    if (!expect_success(outcome)) return;
     ustore_arena_t arena = nullptr;
     ustore_arena_init_t made {.arena = &arena, .outcome = &outcome};
     ustore_arena_init(&made);
@@ -628,51 +607,48 @@ std::size_t arrow_exports_read_in_place(config_t const& config) {
                                      .arena = arena,
                                      .wanted = 40};
     ustore_blobs_cursor_next(&next);
-    failures += expect_success(outcome);
-    failures += expect_eq(written, 40u);
+    expect_success(outcome);
+    expect_equal(written, 40u);
 
     ArrowSchema key_schema {}, value_schema {};
     ArrowDeviceArray key_array {}, value_array {};
-    failures += expect_eq(
-        ustore_keys_view_to_arrow({keys, sizeof(ustore_key_t)}, written, arena, &key_schema, &key_array),
-        ustore_status_success_k);
-    failures += expect_eq(
+    expect_equal(ustore_keys_view_to_arrow({keys, sizeof(ustore_key_t)}, written, arena, &key_schema, &key_array),
+                 ustore_status_success_k);
+    expect_equal(
         ustore_strings_view_to_arrow(values, written, ustore_strings_u32_tape_k, arena, &value_schema, &value_array),
         ustore_status_success_k);
-    failures += expect_eq(std::string_view(key_schema.format), std::string_view("w:16"));
-    failures += expect(key_schema.metadata != nullptr);
-    failures += expect_eq(key_array.device_type, ARROW_DEVICE_CPU);
+    expect_equal(std::string_view(key_schema.format), std::string_view("w:16"));
+    expect_true(key_schema.metadata != nullptr);
+    expect_equal(key_array.device_type, ARROW_DEVICE_CPU);
 
     // A key outside the arena is refused, while a strided run is carved dense behind the outputs
     ustore_key_t const outside = key_from_integer(7);
     ArrowSchema refused_schema {};
     ArrowDeviceArray refused_array {};
-    failures += expect_eq(
-        ustore_keys_view_to_arrow({&outside, sizeof(ustore_key_t)}, 1, arena, &refused_schema, &refused_array),
-        ustore_status_invalid_argument_k);
+    expect_equal(ustore_keys_view_to_arrow({&outside, sizeof(ustore_key_t)}, 1, arena, &refused_schema, &refused_array),
+                 ustore_status_invalid_argument_k);
     ArrowSchema every_other_schema {};
     ArrowDeviceArray every_other_array {};
-    failures += expect_eq(ustore_keys_view_to_arrow({keys, 2 * sizeof(ustore_key_t)}, written / 2, arena,
-                                                    &every_other_schema, &every_other_array),
-                          ustore_status_success_k);
+    expect_equal(ustore_keys_view_to_arrow({keys, 2 * sizeof(ustore_key_t)}, written / 2, arena, &every_other_schema,
+                                           &every_other_array),
+                 ustore_status_success_k);
     auto const* const carved = static_cast<ustore_key_t const*>(every_other_array.array.buffers[1]);
-    for (std::size_t row = 0; row != written / 2; ++row)
-        failures += expect(cell_of(carved[row]) == cell_of(keys[2 * row]));
+    for (std::size_t row = 0; row != written / 2; ++row) expect_true(cell_of(carved[row]) == cell_of(keys[2 * row]));
     every_other_array.array.release(&every_other_array.array);
     every_other_schema.release(&every_other_schema);
 
     // A tape asked for in the other width is converted behind the outputs
     ArrowSchema wide_schema {};
     ArrowDeviceArray wide_array {};
-    failures += expect_eq(
+    expect_equal(
         ustore_strings_view_to_arrow(values, written, ustore_strings_u64_tape_k, arena, &wide_schema, &wide_array),
         ustore_status_success_k);
-    failures += expect_eq(std::string_view(wide_schema.format), std::string_view("Z"));
+    expect_equal(std::string_view(wide_schema.format), std::string_view("Z"));
     ustore_strings_view_t widened {};
     ustore_size_t widened_count = 0;
-    failures += expect_eq(ustore_strings_view_from_arrow(&wide_schema, &wide_array.array, &widened, &widened_count),
-                          ustore_status_success_k);
-    failures += expect(widened_count == written && cell_of(widened, 39) == cell_of(values, 39));
+    expect_equal(ustore_strings_view_from_arrow(&wide_schema, &wide_array.array, &widened, &widened_count),
+                 ustore_status_success_k);
+    expect_true(widened_count == written && cell_of(widened, 39) == cell_of(values, 39));
 
     // A wide tape narrows from its first byte, and one spanning past 32 bits is refused before its
     // bytes are looked for
@@ -680,15 +656,14 @@ std::size_t arrow_exports_read_in_place(config_t const& config) {
     sliced.data.u64_tape.offsets = widened.data.u64_tape.offsets + 1;
     ArrowSchema sliced_schema {};
     ArrowDeviceArray sliced_array {};
-    failures += expect_eq(ustore_strings_view_to_arrow(sliced, written - 1, ustore_strings_u32_tape_k, arena,
-                                                       &sliced_schema, &sliced_array),
-                          ustore_status_success_k);
+    expect_equal(ustore_strings_view_to_arrow(sliced, written - 1, ustore_strings_u32_tape_k, arena, &sliced_schema,
+                                              &sliced_array),
+                 ustore_status_success_k);
     ustore_strings_view_t narrowed {};
     ustore_size_t narrowed_count = 0;
-    failures += expect_eq(
-        ustore_strings_view_from_arrow(&sliced_schema, &sliced_array.array, &narrowed, &narrowed_count),
-        ustore_status_success_k);
-    failures += expect(narrowed_count == written - 1 && cell_of(narrowed, 38) == cell_of(values, 39));
+    expect_equal(ustore_strings_view_from_arrow(&sliced_schema, &sliced_array.array, &narrowed, &narrowed_count),
+                 ustore_status_success_k);
+    expect_true(narrowed_count == written - 1 && cell_of(narrowed, 38) == cell_of(values, 39));
     sliced_array.array.release(&sliced_array.array);
     sliced_schema.release(&sliced_schema);
     // The far offsets are gathered as a column of their own arena, as an export reads only offsets
@@ -704,7 +679,7 @@ std::size_t arrow_exports_read_in_place(config_t const& config) {
                                    .keys = {far_keys.data(), sizeof(ustore_key_t)},
                                    .values = far_values.view()};
     ustore_docs_write(&far_write);
-    failures += expect_success(outcome);
+    expect_success(outcome);
     std::array<std::string_view, 1> const far_fields {"offset"};
     strided_strings<std::string_view> const far_fields_strings {strided(far_fields).begin()};
     ustore_docs_field_type_t const far_type = ustore_docs_field_type_u64_k;
@@ -721,14 +696,14 @@ std::size_t arrow_exports_read_in_place(config_t const& config) {
                                      .arena = far_arena.arena,
                                      .outputs_types = &far_type};
     ustore_docs_gather(&far_gather);
-    failures += expect_success(outcome);
+    expect_success(outcome);
     ustore_strings_view_t far_view {};
     far_view.layout = ustore_strings_u64_tape_k;
     far_view.data.u64_tape.data = widened.data.u64_tape.data;
     if (far_columns) far_view.data.u64_tape.offsets = reinterpret_cast<std::uint64_t const*>(far_columns[0].scalars);
     ArrowSchema far_schema {};
     ArrowDeviceArray far_array {};
-    failures += expect_eq(
+    expect_equal(
         ustore_strings_view_to_arrow(far_view, 1, ustore_strings_u32_tape_k, far_arena.arena, &far_schema, &far_array),
         ustore_status_capacity_exhausted_k);
     wide_array.array.release(&wide_array.array);
@@ -740,22 +715,21 @@ std::size_t arrow_exports_read_in_place(config_t const& config) {
     ustore_keys_view_t read_keys {};
     ustore_strings_view_t read_values {};
     ustore_size_t key_count = 0, value_count = 0;
-    failures += expect_eq(ustore_keys_view_from_arrow(&key_schema, &key_array.array, &read_keys, &key_count),
-                          ustore_status_success_k);
-    failures += expect_eq(ustore_strings_view_from_arrow(&value_schema, &value_array.array, &read_values, &value_count),
-                          ustore_status_success_k);
-    failures += expect(read_keys.data == pulled_keys && key_count == pulled && value_count == pulled);
+    expect_equal(ustore_keys_view_from_arrow(&key_schema, &key_array.array, &read_keys, &key_count),
+                 ustore_status_success_k);
+    expect_equal(ustore_strings_view_from_arrow(&value_schema, &value_array.array, &read_values, &value_count),
+                 ustore_status_success_k);
+    expect_true(read_keys.data == pulled_keys && key_count == pulled && value_count == pulled);
 
-    failures += expect(cell_of(read_values, 0) == first_value);
-    failures += expect(cell_of(read_keys.data[39]) == cell_of(key_from_integer(40)));
+    expect_true(cell_of(read_values, 0) == first_value);
+    expect_true(cell_of(read_keys.data[39]) == cell_of(key_from_integer(40)));
     key_array.array.release(&key_array.array);
-    failures += expect(cell_of(read_values, 39) == "value-40");
+    expect_true(cell_of(read_values, 39) == "value-40");
     value_array.array.release(&value_array.array);
     key_schema.release(&key_schema);
     value_schema.release(&value_schema);
     ustore_arena_free(arena);
     ustore_blobs_cursor_free(cursor);
-    return failures;
 }
 
 /** What an ingest of two rows answers on one engine. */
@@ -811,8 +785,11 @@ struct ingest_t {
     }
 };
 
-/** Counts a failure unless @p outcome succeeded, for an outcome a call answered. */
-std::size_t expect_succeeded(ustore_outcome_t outcome) { return expect_success(outcome); }
+/** Holds when @p outcome succeeded, for an outcome a call answered by value, failing a check at the
+ *  caller's line otherwise. */
+bool expect_succeeded(ustore_outcome_t outcome, std::source_location where = std::source_location::current()) {
+    return expect_success(outcome, where);
+}
 
 /** Whether the engine @p config ingests, as its row of @c ingest_expectations_k says. */
 bool ingests(config_t const& config) noexcept {
@@ -825,34 +802,31 @@ bool ingests(config_t const& config) noexcept {
 constexpr char const* needs_ingest_k = "needs an engine whose row of `ingest_expectations_k` ingests";
 
 /** Every engine opens an ingest as its row of @c ingest_expectations_k says. */
-case_result_t arrow_ingest_per_engine(config_t const& config) {
+case_result_t test_arrow_ingest_per_engine(config_t const& config) {
     ingest_expectation_t const* expectation = nullptr;
     for (ingest_expectation_t const& row : ingest_expectations_k)
         if (row.engine == config.engine()) expectation = &row;
-    if (!expectation) return case_result_t::skipped("the engine has no row in `ingest_expectations_k`");
-    std::size_t failures = 0;
+    if (!expectation) return case_result_t::skipped("needs a row in `ingest_expectations_k`");
     fixture_t fixture {config};
-    if (!fixture.database) return failures + 1;
+    if (!fixture.database) return {};
     ustore_collection_id_t const collection = fixture.create("ingested", ustore_modality_blobs_k);
     ingest_t ingest {fixture.database, collection, ustore_ingest_sorted_k};
-    failures += expect_status(status_t {ingest.outcome}, expectation->status);
-    failures += expect_eq(ingest.ingest != nullptr, expectation->status == status_code_t::success_k);
-    if (!ingest.ingest) return failures;
+    expect_status(status_t {ingest.outcome}, expectation->status);
+    expect_equal(ingest.ingest != nullptr, expectation->status == status_code_t::success_k);
+    if (!ingest.ingest) return {};
     modality_rows_t const rows {ustore_modality_blobs_k, 2};
-    failures += expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 0, 2));
-    failures += expect_succeeded(ingest.finish());
+    expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 0, 2));
+    expect_succeeded(ingest.finish());
     // A finished ingest takes no more rows
-    failures += expect_status(status_t {ingest.append(ustore_modality_blobs_k, rows, 0, 2)},
-                              status_code_t::invalid_argument_k);
-    return failures;
+    expect_status(status_t {ingest.append(ustore_modality_blobs_k, rows, 0, 2)}, status_code_t::invalid_argument_k);
+    return {};
 }
 
 /** An ingest of every modality, in either order and over several appends, lands what the modality's writes land. */
-case_result_t arrow_ingest_equals_writes(config_t const& config) {
+case_result_t test_arrow_ingest_equals_writes(config_t const& config) {
     if (!ingests(config)) return case_result_t::skipped(needs_ingest_k);
-    std::size_t failures = 0;
     fixture_t fixture {config};
-    if (!fixture.database) return failures + 1;
+    if (!fixture.database) return {};
     constexpr std::size_t count_k = 100;
     for (ustore_modality_t const modality : {ustore_modality_blobs_k, ustore_modality_docs_k, ustore_modality_pages_k,
                                              ustore_modality_strings_k, ustore_modality_graph_k}) {
@@ -860,76 +834,72 @@ case_result_t arrow_ingest_equals_writes(config_t const& config) {
         modality_rows_t const rows {modality, count_k};
         ustore_collection_id_t const written_collection = fixture.create(fmt::format("{}-written", name).c_str(),
                                                                          modality);
-        if ((failures += fill(fixture.database, written_collection, modality, rows))) return failures;
+        if (!fill(fixture.database, written_collection, modality, rows)) return {};
         rows_t from_writes;
-        failures += dump(fixture.database, written_collection, modality, from_writes);
-        failures += expect_eq(from_writes.size(), count_k);
+        dump(fixture.database, written_collection, modality, from_writes);
+        expect_equal(from_writes.size(), count_k);
 
         for (ustore_ingest_order_t const order : {ustore_ingest_sorted_k, ustore_ingest_unsorted_k}) {
             std::string const ingested_name = fmt::format("{}-ingested-{}", name, ustore_ingest_order_name(order));
             ustore_collection_id_t const ingested = fixture.create(ingested_name.c_str(), modality);
             ingest_t ingest {fixture.database, ingested, order};
-            if ((failures += expect_succeeded(ingest.outcome))) return failures;
+            if (!expect_succeeded(ingest.outcome)) return {};
             // Unsorted, the later half arrives first
             std::array<std::size_t, 3> firsts {0, 30, 70};
             if (order == ustore_ingest_unsorted_k) firsts = {70, 30, 0};
             for (std::size_t const first : firsts) {
                 std::size_t const count = first == 70 ? 30 : first == 30 ? 40 : 30;
-                failures += expect_succeeded(ingest.append(modality, rows, first, count));
+                expect_succeeded(ingest.append(modality, rows, first, count));
             }
             ustore_stamp_t stamp = 0;
-            failures += expect_succeeded(ingest.finish(&stamp));
-            failures += expect(stamp != 0);
+            expect_succeeded(ingest.finish(&stamp));
+            expect_true(stamp != 0);
             rows_t from_ingest;
-            failures += dump(fixture.database, ingested, modality, from_ingest);
+            dump(fixture.database, ingested, modality, from_ingest);
             if (from_ingest != from_writes)
                 fmt::println(stderr, "  the {} ingest differs from the writes", ingested_name);
-            failures += expect(from_ingest == from_writes);
+            expect_true(from_ingest == from_writes);
         }
     }
-    return failures;
+    return {};
 }
 
 /** Under @c ustore_ingest_unsorted_k a repeated key keeps the last of its rows. */
-case_result_t arrow_ingest_last_repeat_wins(config_t const& config) {
+case_result_t test_arrow_ingest_last_repeat_wins(config_t const& config) {
     if (!ingests(config)) return case_result_t::skipped(needs_ingest_k);
-    std::size_t failures = 0;
     fixture_t fixture {config};
-    if (!fixture.database) return failures + 1;
+    if (!fixture.database) return {};
     ustore_collection_id_t const collection = fixture.create("repeated", ustore_modality_blobs_k);
     modality_rows_t rows {ustore_modality_blobs_k, 3};
     rows.keys = {key_from_integer(7), key_from_integer(7), key_from_integer(7)};
     ingest_t ingest {fixture.database, collection, ustore_ingest_unsorted_k};
-    failures += expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 0, 2));
-    failures += expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 2, 1));
-    failures += expect_succeeded(ingest.finish());
-    failures += expect(stored_value(fixture.database, collection, key_from_integer(7)) ==
-                       std::optional<std::string> {"text-003"});
-    return failures;
+    expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 0, 2));
+    expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 2, 1));
+    expect_succeeded(ingest.finish());
+    expect_true(stored_value(fixture.database, collection, key_from_integer(7)) ==
+                std::optional<std::string> {"text-003"});
+    return {};
 }
 
 /** Under @c ustore_ingest_sorted_k a key below the one before it, in its append or the one before, refuses that
  *  append alone. */
-case_result_t arrow_ingest_refuses_a_descending_key(config_t const& config) {
+case_result_t test_arrow_ingest_refuses_a_descending_key(config_t const& config) {
     if (!ingests(config)) return case_result_t::skipped(needs_ingest_k);
-    std::size_t failures = 0;
     fixture_t fixture {config};
-    if (!fixture.database) return failures + 1;
+    if (!fixture.database) return {};
     ustore_collection_id_t const collection = fixture.create("descending", ustore_modality_blobs_k);
     modality_rows_t rows {ustore_modality_blobs_k, 4};
     std::reverse(rows.keys.begin() + 2, rows.keys.end());
     ingest_t ingest {fixture.database, collection, ustore_ingest_sorted_k};
-    failures += expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 0, 2));
-    failures += expect_status(status_t {ingest.append(ustore_modality_blobs_k, rows, 2, 2)},
-                              status_code_t::invalid_argument_k);
-    failures += expect_status(status_t {ingest.append(ustore_modality_blobs_k, rows, 0, 1)},
-                              status_code_t::invalid_argument_k);
-    failures += expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 3, 1));
-    failures += expect_succeeded(ingest.finish());
-    failures += expect(!stored_value(fixture.database, collection, key_from_integer(4)).has_value());
-    failures += expect(stored_value(fixture.database, collection, key_from_integer(3)) ==
-                       std::optional<std::string> {"text-004"});
-    return failures;
+    expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 0, 2));
+    expect_status(status_t {ingest.append(ustore_modality_blobs_k, rows, 2, 2)}, status_code_t::invalid_argument_k);
+    expect_status(status_t {ingest.append(ustore_modality_blobs_k, rows, 0, 1)}, status_code_t::invalid_argument_k);
+    expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 3, 1));
+    expect_succeeded(ingest.finish());
+    expect_true(!stored_value(fixture.database, collection, key_from_integer(4)).has_value());
+    expect_true(stored_value(fixture.database, collection, key_from_integer(3)) ==
+                std::optional<std::string> {"text-004"});
+    return {};
 }
 
 /** What an accessor appending to its own ingest reads: the ingest, the value it views, and the
@@ -952,11 +922,10 @@ void append_from_accessor(void const* handle, ustore_size_t const*, ustore_size_
 
 /** An ingest serves one call at a time, so an append made while another reads its values is
  *  contended, and the outer append lands as if alone. */
-case_result_t arrow_ingest_contends_a_second_append(config_t const& config) {
+case_result_t test_arrow_ingest_contends_a_second_append(config_t const& config) {
     if (!ingests(config)) return case_result_t::skipped(needs_ingest_k);
-    std::size_t failures = 0;
     fixture_t fixture {config};
-    if (!fixture.database) return failures + 1;
+    if (!fixture.database) return {};
     ustore_collection_id_t const collection = fixture.create("reentered", ustore_modality_blobs_k);
     ingest_t ingest {fixture.database, collection, ustore_ingest_sorted_k};
     ustore_outcome_t nested {};
@@ -967,126 +936,122 @@ case_result_t arrow_ingest_contends_a_second_append(config_t const& config) {
     append.values.layout = ustore_strings_accessor_k;
     append.values.data.accessor = {.get = &append_from_accessor, .handle = &values};
     ustore_ingest_append(&append);
-    failures += expect_succeeded(appended);
-    failures += expect_status(status_t {nested}, status_code_t::contended_k);
-    failures += expect_succeeded(ingest.finish());
-    failures += expect(stored_value(fixture.database, collection, key) == std::optional<std::string> {"outer"});
-    return failures;
+    expect_succeeded(appended);
+    expect_status(status_t {nested}, status_code_t::contended_k);
+    expect_succeeded(ingest.finish());
+    expect_true(stored_value(fixture.database, collection, key) == std::optional<std::string> {"outer"});
+    return {};
 }
 
 /** A clear, a create, a drop, a flush or a compaction an open ingest would outlast answers
  *  contended at once, changing nothing, and serves once the ingest finished; an engine that
  *  ingests nothing never holds one open. */
-case_result_t arrow_ingest_contends_a_clear(config_t const& config) {
+case_result_t test_arrow_ingest_contends_a_clear(config_t const& config) {
     if (!ingests(config)) return case_result_t::skipped(needs_ingest_k);
-    std::size_t failures = 0;
     fixture_t fixture {config};
-    if (!fixture.database) return failures + 1;
+    if (!fixture.database) return {};
     ustore_collection_id_t const collection = fixture.create("cleared", ustore_modality_blobs_k);
     modality_rows_t const rows {ustore_modality_blobs_k, 2};
-    failures += fill(fixture.database, collection, ustore_modality_blobs_k, rows);
+    fill(fixture.database, collection, ustore_modality_blobs_k, rows);
     std::optional<std::string> const before = stored_value(fixture.database, collection, key_from_integer(1));
     ingest_t ingest {fixture.database, collection, ustore_ingest_unsorted_k};
-    failures += expect_succeeded(ingest.outcome);
-    failures += expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 0, 2));
+    expect_succeeded(ingest.outcome);
+    expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 0, 2));
     for (ustore_drop_mode_t const mode : {ustore_drop_collection_k, ustore_drop_pairs_k, ustore_drop_values_k}) {
         ustore_outcome_t cleared {};
         ustore_database_clear_t clear {.database = fixture.database, .outcome = &cleared, .mode = mode};
         ustore_database_clear(&clear);
-        failures += expect_status(status_t {cleared}, status_code_t::contended_k);
+        expect_status(status_t {cleared}, status_code_t::contended_k);
     }
     ustore_outcome_t created {};
     ustore_collection_id_t made {};
     ustore_collection_create_t create {.database = fixture.database,
                                        .outcome = &created,
-                                       .modality = ustore_modality_blobs_k,
                                        .name = {reinterpret_cast<uint8_t const*>("later"), 5},
+                                       .modality = ustore_modality_blobs_k,
                                        .collection = &made};
     ustore_collection_create(&create);
-    failures += expect_status(status_t {created}, status_code_t::contended_k);
+    expect_status(status_t {created}, status_code_t::contended_k);
     ustore_outcome_t dropped {};
     ustore_collection_drop_t drop {.database = fixture.database,
                                    .outcome = &dropped,
                                    .collection = collection,
                                    .mode = ustore_drop_pairs_k};
     ustore_collection_drop(&drop);
-    failures += expect_status(status_t {dropped}, status_code_t::contended_k);
+    expect_status(status_t {dropped}, status_code_t::contended_k);
     ustore_outcome_t flushed {};
     ustore_database_flush_t flush {.database = fixture.database, .outcome = &flushed};
     ustore_database_flush(&flush);
-    failures += expect_status(status_t {flushed}, status_code_t::contended_k);
+    expect_status(status_t {flushed}, status_code_t::contended_k);
     ustore_outcome_t compacted {};
     ustore_database_compact_t compact {.database = fixture.database, .outcome = &compacted};
     ustore_database_compact(&compact);
-    failures += expect_status(status_t {compacted}, status_code_t::contended_k);
-    failures += expect(stored_value(fixture.database, collection, key_from_integer(1)) == before);
-    failures += expect_succeeded(ingest.finish());
+    expect_status(status_t {compacted}, status_code_t::contended_k);
+    expect_true(stored_value(fixture.database, collection, key_from_integer(1)) == before);
+    expect_succeeded(ingest.finish());
     ustore_database_flush(&flush);
-    failures += expect_succeeded(flushed);
+    expect_succeeded(flushed);
     ustore_outcome_t cleared {};
     ustore_database_clear_t clear {.database = fixture.database, .outcome = &cleared, .mode = ustore_drop_pairs_k};
     ustore_database_clear(&clear);
-    failures += expect_succeeded(cleared);
-    return failures;
+    expect_succeeded(cleared);
+    return {};
 }
 
 /** A freed ingest that never finished lands nothing. */
-case_result_t arrow_ingest_freed_lands_nothing(config_t const& config) {
+case_result_t test_arrow_ingest_freed_lands_nothing(config_t const& config) {
     if (!ingests(config)) return case_result_t::skipped(needs_ingest_k);
-    std::size_t failures = 0;
     fixture_t fixture {config};
-    if (!fixture.database) return failures + 1;
+    if (!fixture.database) return {};
     ustore_collection_id_t const collection = fixture.create("abandoned", ustore_modality_blobs_k);
     modality_rows_t const rows {ustore_modality_blobs_k, 2};
     {
         ingest_t ingest {fixture.database, collection, ustore_ingest_sorted_k};
-        failures += expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 0, 2));
+        expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 0, 2));
     }
-    failures += expect(!stored_value(fixture.database, collection, key_from_integer(1)).has_value());
-    return failures;
+    expect_true(!stored_value(fixture.database, collection, key_from_integer(1)).has_value());
+    return {};
 }
 
 /** A snapshot taken before an ingest reads the value the key held before it. */
-case_result_t arrow_ingest_spares_older_snapshots(config_t const& config) {
+case_result_t test_arrow_ingest_spares_older_snapshots(config_t const& config) {
     if (!ingests(config)) return case_result_t::skipped(needs_ingest_k);
-    std::size_t failures = 0;
     fixture_t fixture {config};
-    if (!fixture.database) return failures + 1;
+    if (!fixture.database) return {};
     ustore_collection_id_t const collection = fixture.create("versioned", ustore_modality_blobs_k);
-    if ((failures += fill_blobs(fixture.database, collection, 1))) return failures;
+    if (!fill_blobs(fixture.database, collection, 1)) return {};
     ustore_snapshot_t snapshot = nullptr;
     ustore_outcome_t outcome {};
     ustore_snapshot_init_t init {.snapshot = &snapshot, .database = fixture.database, .outcome = &outcome};
     ustore_snapshot_init(&init);
-    if ((failures += expect_success(outcome))) return failures;
+    if (!expect_success(outcome)) return {};
 
     modality_rows_t const rows {ustore_modality_blobs_k, 2};
     {
         ingest_t ingest {fixture.database, collection, ustore_ingest_sorted_k};
-        failures += expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 0, 2));
-        failures += expect_succeeded(ingest.finish());
+        expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 0, 2));
+        expect_succeeded(ingest.finish());
     }
     std::optional<std::string> const before = stored_value(fixture.database, collection, key_from_integer(1),
                                                            ustore_snapshot_view(snapshot));
-    failures += expect(before == std::optional<std::string> {"value-1"});
-    failures += expect(stored_value(fixture.database, collection, key_from_integer(1)) ==
-                       std::optional<std::string> {"text-001"});
+    expect_true(before == std::optional<std::string> {"value-1"});
+    expect_true(stored_value(fixture.database, collection, key_from_integer(1)) ==
+                std::optional<std::string> {"text-001"});
     ustore_snapshot_free(snapshot);
-    return failures;
+    return {};
 }
 
 /** A transaction that began before an ingest and wrote a key the ingest lands fails at commit. */
-case_result_t arrow_ingest_conflicts_older_transactions(config_t const& config) {
+case_result_t test_arrow_ingest_conflicts_older_transactions(config_t const& config) {
     if (!ingests(config)) return case_result_t::skipped(needs_ingest_k);
-    std::size_t failures = 0;
     fixture_t fixture {config};
-    if (!fixture.database) return failures + 1;
+    if (!fixture.database) return {};
     ustore_collection_id_t const collection = fixture.create("contested", ustore_modality_blobs_k);
     ustore_transaction_t transaction = nullptr;
     ustore_outcome_t outcome {};
     ustore_transaction_init_t init {.transaction = &transaction, .database = fixture.database, .outcome = &outcome};
     ustore_transaction_init(&init);
-    if ((failures += expect_success(outcome))) return failures;
+    if (!expect_success(outcome)) return {};
     ustore_key_t const key = key_from_integer(1);
     tape_t values;
     values.push("staged");
@@ -1098,56 +1063,60 @@ case_result_t arrow_ingest_conflicts_older_transactions(config_t const& config) 
                                 .keys = {&key, 0},
                                 .values = values.view()};
     ustore_blobs_write(&write);
-    failures += expect_success(outcome);
+    expect_success(outcome);
 
     modality_rows_t const rows {ustore_modality_blobs_k, 2};
     {
         ingest_t ingest {fixture.database, collection, ustore_ingest_sorted_k};
-        failures += expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 0, 2));
-        failures += expect_succeeded(ingest.finish());
+        expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 0, 2));
+        expect_succeeded(ingest.finish());
     }
     ustore_transaction_commit_t commit {.database = fixture.database, .outcome = &outcome, .transaction = transaction};
     ustore_transaction_commit(&commit);
-    failures += expect_status(status_t {outcome}, status_code_t::write_conflict_k);
+    expect_status(status_t {outcome}, status_code_t::write_conflict_k);
     ustore_transaction_free(transaction);
-    return failures;
+    return {};
 }
 
 } // namespace unum::ustore::test
 
 int main(int argc, char** argv) {
-    suite_options_t options;
-    if (argument_status_t const status = parse_suite_options(argc, argv, options);
-        status != argument_status_t::parsed_k)
-        return status == argument_status_t::help_k ? 0 : 1;
-    suite_totals_t totals = options.totals();
+    start_test_run(argc, argv);
 
-    auto const maybe_test_directory = directory_t::make(options.directory);
+    auto const maybe_test_directory = scratch_directory_t::make(test_run.settings.directory);
     if (!maybe_test_directory) {
-        fmt::println(stderr, "Cannot create a unique directory under {}", options.directory);
+        fmt::println(stderr, "Cannot create a unique directory under {}", test_run.settings.directory);
         return 1;
     }
     char const* const directory = maybe_test_directory->path();
     if (directory) fmt::println("Will work in directory: {}", directory);
     else fmt::println("Will work with default configuration");
-    config_t const config {options.engine, directory};
+    config_t const config {test_run.settings.engine, directory};
 
-    report(totals, "arrow.converters", arrow_converters, config);
-    report(totals, "arrow.exports_read_in_place", arrow_exports_read_in_place, config);
-    report(totals, "arrow.docs_columns_export", arrow_docs_columns_export, config);
-    report(totals, "arrow.export_refuses_an_entry_without_terminator", arrow_export_refuses_an_entry_without_terminator,
-           config);
-    report(totals, "arrow.export_refuses_offsets_outside_the_arena", arrow_export_refuses_offsets_outside_the_arena,
-           config);
-    report(totals, "arrow.ingest_per_engine", arrow_ingest_per_engine, config);
-    report(totals, "arrow.ingest_equals_writes", arrow_ingest_equals_writes, config);
-    report(totals, "arrow.ingest_last_repeat_wins", arrow_ingest_last_repeat_wins, config);
-    report(totals, "arrow.ingest_refuses_a_descending_key", arrow_ingest_refuses_a_descending_key, config);
-    report(totals, "arrow.ingest_contends_a_second_append", arrow_ingest_contends_a_second_append, config);
-    report(totals, "arrow.ingest_contends_a_clear", arrow_ingest_contends_a_clear, config);
-    report(totals, "arrow.ingest_freed_lands_nothing", arrow_ingest_freed_lands_nothing, config);
-    report(totals, "arrow.ingest_spares_older_snapshots", arrow_ingest_spares_older_snapshots, config);
-    report(totals, "arrow.ingest_conflicts_older_transactions", arrow_ingest_conflicts_older_transactions, config);
+    run_test_case(engine_label_t {"test_arrow_converters"}.c_str(), test_arrow_converters, config);
+    run_test_case(engine_label_t {"test_arrow_exports_read_in_place"}.c_str(), test_arrow_exports_read_in_place,
+                  config);
+    run_test_case(engine_label_t {"test_arrow_docs_columns_export"}.c_str(), test_arrow_docs_columns_export, config);
+    run_test_case(engine_label_t {"test_arrow_export_refuses_an_entry_without_terminator"}.c_str(),
+                  test_arrow_export_refuses_an_entry_without_terminator, config);
+    run_test_case(engine_label_t {"test_arrow_export_refuses_offsets_outside_the_arena"}.c_str(),
+                  test_arrow_export_refuses_offsets_outside_the_arena, config);
+    run_test_case(engine_label_t {"test_arrow_ingest_per_engine"}.c_str(), test_arrow_ingest_per_engine, config);
+    run_test_case(engine_label_t {"test_arrow_ingest_equals_writes"}.c_str(), test_arrow_ingest_equals_writes, config);
+    run_test_case(engine_label_t {"test_arrow_ingest_last_repeat_wins"}.c_str(), test_arrow_ingest_last_repeat_wins,
+                  config);
+    run_test_case(engine_label_t {"test_arrow_ingest_refuses_a_descending_key"}.c_str(),
+                  test_arrow_ingest_refuses_a_descending_key, config);
+    run_test_case(engine_label_t {"test_arrow_ingest_contends_a_second_append"}.c_str(),
+                  test_arrow_ingest_contends_a_second_append, config);
+    run_test_case(engine_label_t {"test_arrow_ingest_contends_a_clear"}.c_str(), test_arrow_ingest_contends_a_clear,
+                  config);
+    run_test_case(engine_label_t {"test_arrow_ingest_freed_lands_nothing"}.c_str(),
+                  test_arrow_ingest_freed_lands_nothing, config);
+    run_test_case(engine_label_t {"test_arrow_ingest_spares_older_snapshots"}.c_str(),
+                  test_arrow_ingest_spares_older_snapshots, config);
+    run_test_case(engine_label_t {"test_arrow_ingest_conflicts_older_transactions"}.c_str(),
+                  test_arrow_ingest_conflicts_older_transactions, config);
 
-    return suite_exit_code(totals);
+    return finish_test_run();
 }

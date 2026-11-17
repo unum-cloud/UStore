@@ -30,13 +30,13 @@
 #include "ustore/ranges.hpp" // `place_batch_t`, `strided`
 #include "ustore/strings.h"
 
-#include "ustore/blobs/ram_store.hpp"          // `ordered_store`, `values_by_key_store`, `order_t`, `translate`
-#include "ustore/docs/ram_store.hpp"           // `docs::document_pair_t`, `documents_by_key_store`
-#include "ustore/graph/half_edges.hpp"         // `half_edge_t`, `half_edge_direction_t`
-#include "ustore/graph/ram_store.hpp"          // `half_edges_store`
-#include "ustore/pages/ram_store.hpp"          // `pages::page_pair_t`, `pages_by_key_store`
-#include "ustore/strings/ram_store.hpp"        // `string_pair_t`, `keys_by_string_store`, `string_key_from`
-#include "ustore/strings/string_keys.hpp"      // `string_key_t`, `blob_t`
+#include "ustore/blobs/ram_store.hpp"     // `ordered_store`, `values_by_key_store`, `order_t`, `translate`
+#include "ustore/docs/ram_store.hpp"      // `docs::document_pair_t`, `documents_by_key_store`
+#include "ustore/graph/half_edges.hpp"    // `half_edge_t`, `half_edge_direction_t`
+#include "ustore/graph/ram_store.hpp"     // `half_edges_store`
+#include "ustore/pages/ram_store.hpp"     // `pages::page_pair_t`, `pages_by_key_store`
+#include "ustore/strings/ram_store.hpp"   // `string_pair_t`, `keys_by_string_store`, `string_key_from`
+#include "ustore/strings/string_keys.hpp" // `string_key_t`, `blob_t`
 #include "ustore/utilities/blocking_files.hpp" // `directory_exists`, `replace_file_durably`, `file_appender_t`, `mapped_file_t`
 
 #include "engine.hpp"             // `engine_t`, `ustore_*_handle_t`, `state_of`, `view_t`, `strings_kit_of`
@@ -2067,7 +2067,8 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_database_de
     return assign_describe(
         arguments,
         {
-            .capabilities = ustore_capabilities_t(ustore_capabilities_transactions_k | ustore_capabilities_snapshots_k),
+            .capabilities = ustore_capabilities_t(ustore_capabilities_transactions_k | ustore_capabilities_snapshots_k |
+                                                  ustore_capabilities_saves_snapshots_k),
             .engine = ustore_engine_ram_k,
             .isolation = isolation_ == isolation_t::snapshot_k ? ustore_isolation_snapshot_k
                                                                : ustore_isolation_strict_serializable_k,

@@ -8,11 +8,14 @@ Date: October 31, 2026
 from uuid import UUID
 
 import pytest
-from capabilities import key
+from base import key, pyarrow_available
 
 import ustore
 
-pyarrow = pytest.importorskip("pyarrow")
+if pyarrow_available:
+    import pyarrow
+
+pytestmark = pytest.mark.skipif(not pyarrow_available, reason="PyArrow is not installed")
 
 
 def write_posters(database: ustore.Database, count: int) -> list[tuple[UUID, bytes]]:
@@ -31,6 +34,7 @@ def table_of(rows: list[tuple[UUID, bytes]]) -> "pyarrow.Table":
 
 
 def test_table_reads_what_was_written(database: ustore.Database) -> None:
+    """A collection exports as an Arrow table of keys and values in key order, tagged with its modality."""
     rows = write_posters(database, 3000)
     table = pyarrow.table(database["posters"])
     assert table.column_names == ["key", "value"]
@@ -40,6 +44,7 @@ def test_table_reads_what_was_written(database: ustore.Database) -> None:
 
 
 def test_pyarrow_table_imports(database: ustore.Database) -> None:
+    """A PyArrow table of 16-byte keys and binary values imports every row."""
     rows = [(key(index), bytes([index]) * index) for index in range(1, 101)]
     database.collection_create("copies", modality=ustore.Modality.BLOBS)
     assert database.import_arrow(table_of(rows), collection="copies") == len(rows)
@@ -47,6 +52,7 @@ def test_pyarrow_table_imports(database: ustore.Database) -> None:
 
 
 def test_exported_stream_imports_elsewhere(database: ustore.Database) -> None:
+    """The stream one collection exports imports into another as an equal table."""
     rows = write_posters(database, 100)
     database.collection_create("copies", modality=ustore.Modality.BLOBS)
     assert database.import_arrow(database["posters"], collection="copies") == len(rows)
@@ -54,6 +60,7 @@ def test_exported_stream_imports_elsewhere(database: ustore.Database) -> None:
 
 
 def test_array_alone_imports(database: ustore.Database) -> None:
+    """An object exporting only `__arrow_c_array__` imports its record batch."""
     rows = [(key(1), b"a"), (key(2), b"bb")]
     batch = table_of(rows).to_batches()[0]
 
@@ -69,6 +76,7 @@ def test_array_alone_imports(database: ustore.Database) -> None:
 
 
 def test_null_raises(database: ustore.Database) -> None:
+    """A null value in an import raises InvalidArgumentError."""
     keys = pyarrow.array([key(1).bytes, key(2).bytes], type=pyarrow.binary(16))
     values = pyarrow.array([b"a", None], type=pyarrow.binary())
     database.collection_create("copies", modality=ustore.Modality.BLOBS)

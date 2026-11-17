@@ -76,97 +76,91 @@ void paint(std::span<byte_t> buffer, std::uint64_t seed) noexcept {
 /** An arena charges its budget once, beside the disk's own pools, and the mount returns every byte
  *  when it dies. */
 template <typename mount_type_>
-std::size_t arena_charges_its_budget_once(mount_type_ const& mount) {
+void test_arena_charges_its_budget_once(mount_type_ const& mount) {
     using types_t = channels_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
-    std::size_t failures = 0;
     expected<std::unique_ptr<fixture_t>> fixture = mount();
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return;
 
     resources_shared_ptr_t const resources = (*fixture)->resources;
     std::size_t const charged = resources->memory_constraint.used();
-    failures += expect(charged >= static_cast<std::size_t>((*fixture)->arena.size()));
+    expect_true(charged >= static_cast<std::size_t>((*fixture)->arena.size()));
 
     // Nothing below the arena is charged again, so its death returns every byte the mount paid for.
     (*fixture).reset();
-    failures += expect_eq(resources->memory_constraint.used(), std::size_t {0});
-    return failures;
+    expect_equal(resources->memory_constraint.used(), std::size_t {0});
 }
 
 /** Every block of a pool is handed out once, and the pool refuses once they are all out. */
 template <typename mount_type_>
-std::size_t pool_exhausts_and_recycles(mount_type_ const& mount) {
+void test_pool_exhausts_and_recycles(mount_type_ const& mount) {
     using types_t = channels_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
-    std::size_t failures = 0;
     expected<std::unique_ptr<fixture_t>> fixture = mount();
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return;
 
     expected<guard_t> guard = (*fixture)->channels.acquire();
-    failures += expect(guard.has_value());
-    if (!guard) return failures;
+    expect_true(guard.has_value());
+    if (!guard) return;
     buffer_pool_t& pool = guard->channel().requests();
-    failures += expect_eq(pool.available_buffers(), channels_config_k.request_buffers);
+    expect_equal(pool.available_buffers(), channels_config_k.request_buffers);
 
     st::vector<pooled_buffer_t> held;
     for (std::uint32_t index = 0; index != channels_config_k.request_buffers; ++index) {
         expected<pooled_buffer_t> block = pool.acquire();
-        failures += expect(block.has_value());
+        expect_true(block.has_value());
         if (!block) break;
-        failures += expect(held.push_back(std::move(*block)) == st::status_t::success_k);
+        expect_true(held.push_back(std::move(*block)) == st::status_t::success_k);
     }
-    failures += expect_eq(pool.available_buffers(), std::uint32_t {0});
+    expect_equal(pool.available_buffers(), std::uint32_t {0});
     expected<pooled_buffer_t> const beyond = pool.acquire();
-    failures += expect(!beyond.has_value());
-    failures += expect_status(beyond, status_code_t::capacity_exhausted_k);
+    expect_true(!beyond.has_value());
+    expect_status(beyond, status_code_t::capacity_exhausted_k);
 
     // Every block resolves to its own place, so two queue pairs never name the same bytes.
     for (std::size_t first = 0; first + 1 < held.size(); ++first)
-        failures += expect(held[first].reference().offset != held[first + 1].reference().offset);
+        expect_true(held[first].reference().offset != held[first + 1].reference().offset);
 
     held.clear();
-    failures += expect_eq(pool.available_buffers(), channels_config_k.request_buffers);
-    return failures;
+    expect_equal(pool.available_buffers(), channels_config_k.request_buffers);
 }
 
 /** A moved-from queue pair recycles nothing, and a destroyed one recycles exactly once. */
 template <typename mount_type_>
-std::size_t pool_recycles_exactly_once(mount_type_ const& mount) {
+void test_pool_recycles_exactly_once(mount_type_ const& mount) {
     using types_t = channels_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
-    std::size_t failures = 0;
     expected<std::unique_ptr<fixture_t>> fixture = mount();
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return;
 
     expected<guard_t> guard = (*fixture)->channels.acquire();
-    failures += expect(guard.has_value());
-    if (!guard) return failures;
+    expect_true(guard.has_value());
+    if (!guard) return;
     buffer_pool_t& pool = guard->channel().requests();
     std::uint32_t const before = pool.available_buffers();
 
     {
         expected<pooled_buffer_t> first = pool.acquire();
-        failures += expect(first.has_value());
-        if (!first) return failures;
-        failures += expect_eq(pool.available_buffers(), before - 1);
+        expect_true(first.has_value());
+        if (!first) return;
+        expect_equal(pool.available_buffers(), before - 1);
 
         pooled_buffer_t moved = std::move(*first);
-        failures += expect(moved.held());
-        failures += expect(!first->held());
-        failures += expect_eq(pool.available_buffers(), before - 1);
+        expect_true(moved.held());
+        expect_true(!first->held());
+        expect_equal(pool.available_buffers(), before - 1);
 
         moved.release();
-        failures += expect_eq(pool.available_buffers(), before);
+        expect_equal(pool.available_buffers(), before);
         moved.release();
-        failures += expect_eq(pool.available_buffers(), before);
+        expect_equal(pool.available_buffers(), before);
     }
-    failures += expect_eq(pool.available_buffers(), before);
-    return failures;
+    expect_equal(pool.available_buffers(), before);
 }
 
 #pragma endregion Arena and Pool Cases
@@ -175,58 +169,52 @@ std::size_t pool_recycles_exactly_once(mount_type_ const& mount) {
 
 /** Every executor thread gets a channel of its own, and no two threads get the same queue pair. */
 template <typename mount_type_>
-std::size_t channels_separate_executor_threads(mount_type_ const& mount) {
+void test_channels_separate_executor_threads(mount_type_ const& mount) {
     using types_t = channels_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
-    std::size_t failures = 0;
     constexpr std::size_t threads_k = 4;
     fixture_config_t threaded = mount.config;
     threaded.executor_threads = threads_k;
     expected<std::unique_ptr<fixture_t>> fixture = mount(threaded);
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return;
 
     std::array<std::uint16_t, threads_k> queue_pairs {};
-    std::array<std::size_t, threads_k> thread_failures {};
     st::vector<std::thread> workers;
     for (std::size_t index = 0; index != threads_k; ++index)
-        failures += expect(workers.push_back(std::thread {[&, index]() noexcept {
+        expect_true(workers.push_back(std::thread {[&, index]() noexcept {
             expected<guard_t> guard = (*fixture)->channels.acquire(index);
-            thread_failures[index] += expect(guard.has_value());
-            if (!guard) return;
+            if (!expect_true(guard.has_value())) return;
             queue_pairs[index] = static_cast<std::uint16_t>(guard->channel().queue_pair().id());
         }}) == st::status_t::success_k);
     for (std::size_t index = 0; index != workers.size(); ++index) workers[index].join();
-    for (std::size_t index = 0; index != threads_k; ++index) failures += thread_failures[index];
 
     for (std::size_t first = 0; first != threads_k; ++first)
         for (std::size_t second = first + 1; second != threads_k; ++second)
-            failures += expect(queue_pairs[first] != queue_pairs[second]);
-    return failures;
+            expect_true(queue_pairs[first] != queue_pairs[second]);
 }
 
 /** A thread finding every spare channel out waits for one to be released rather than being
  *  refused, and never shares a queue pair with the thread holding it. */
 template <typename mount_type_>
-std::size_t channels_wait_beyond_their_spares(mount_type_ const& mount) {
+void test_channels_wait_beyond_their_spares(mount_type_ const& mount) {
     using types_t = channels_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
-    std::size_t failures = 0;
     constexpr std::size_t spares_k = 2;
     fixture_config_t spared = mount.config;
     spared.shared_io_channels = spares_k;
     expected<std::unique_ptr<fixture_t>> fixture = mount(spared);
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return;
 
     st::vector<guard_t> guards;
     for (std::size_t index = 0; index != spares_k; ++index) {
         expected<guard_t> guard = (*fixture)->channels.acquire();
-        failures += expect(guard.has_value());
+        expect_true(guard.has_value());
         if (!guard) break;
-        failures += expect(guards.push_back(std::move(*guard)) == st::status_t::success_k);
+        expect_true(guards.push_back(std::move(*guard)) == st::status_t::success_k);
     }
     io_channel_t const* const released_channel = &guards[0].channel();
     bool releasing {false};
@@ -242,9 +230,8 @@ std::size_t channels_wait_beyond_their_spares(mount_type_ const& mount) {
     atomic_reference<bool> {releasing}.store(true, std::memory_order_release);
     guards.erase(0);
     waiter.join();
-    failures += expect(!atomic_reference<bool> {acquired_early}.load(std::memory_order_relaxed));
-    failures += expect(waited_channel == released_channel);
-    return failures;
+    expect_true(!atomic_reference<bool> {acquired_early}.load(std::memory_order_relaxed));
+    expect_true(waited_channel == released_channel);
 }
 
 #pragma endregion Channel Cases
@@ -254,77 +241,74 @@ std::size_t channels_wait_beyond_their_spares(mount_type_ const& mount) {
 /** A pipeline holds its channel's queue pair alone: a second pipeline on it is refused with
  *  @c contended_k while the first lives, and one acquires it again once the first is gone. */
 template <typename mount_type_>
-std::size_t second_pipeline_is_refused(mount_type_ const& mount) {
+void test_second_pipeline_is_refused(mount_type_ const& mount) {
     using types_t = channels_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
     using read_pipeline_t = typename types_t::read_pipeline_t;
     using write_pipeline_t = typename types_t::write_pipeline_t;
-    std::size_t failures = 0;
     expected<std::unique_ptr<fixture_t>> fixture = mount();
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return;
     expected<guard_t> guard = (*fixture)->channels.acquire();
-    failures += expect(guard.has_value());
-    if (!guard) return failures;
+    expect_true(guard.has_value());
+    if (!guard) return;
     medium_reference_t const medium = (*fixture)->media[0].reference();
 
     {
         expected<io_channel_t::acquired_channel_t> first = guard->channel().acquire();
-        failures += expect(first.has_value());
-        if (!first) return failures;
+        expect_true(first.has_value());
+        if (!first) return;
         write_pipeline_t writer {(*fixture)->disk, std::move(*first), medium};
         expected<io_channel_t::acquired_channel_t> second = guard->channel().acquire();
-        failures += expect_status(second, status_code_t::contended_k);
+        expect_status(second, status_code_t::contended_k);
     }
     expected<io_channel_t::acquired_channel_t> again = guard->channel().acquire();
-    failures += expect(again.has_value());
-    if (!again) return failures;
+    expect_true(again.has_value());
+    if (!again) return;
     read_pipeline_t reader {(*fixture)->disk, std::move(*again), medium};
     expected<io_channel_t::acquired_channel_t> beside = guard->channel().acquire();
-    failures += expect_status(beside, status_code_t::contended_k);
-    return failures;
+    expect_status(beside, status_code_t::contended_k);
 }
 
 /** A write pipeline puts bytes on the volume and a read pipeline brings the same bytes back. */
 template <typename mount_type_>
-std::size_t pipeline_reads_back_what_it_wrote(mount_type_ const& mount) {
+void test_pipeline_reads_back_what_it_wrote(mount_type_ const& mount) {
     using types_t = channels_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
     using read_pipeline_t = typename types_t::read_pipeline_t;
     using write_pipeline_t = typename types_t::write_pipeline_t;
-    std::size_t failures = 0;
     constexpr std::uint64_t blocks_k = 64;
     expected<std::unique_ptr<fixture_t>> fixture = mount();
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return;
 
     expected<guard_t> guard = (*fixture)->channels.acquire();
-    failures += expect(guard.has_value());
-    if (!guard) return failures;
+    expect_true(guard.has_value());
+    if (!guard) return;
     medium_reference_t const medium = (*fixture)->media[0].reference();
 
     {
         expected<io_channel_t::acquired_channel_t> acquired_channel = guard->channel().acquire();
-        failures += expect(acquired_channel.has_value());
-        if (!acquired_channel) return failures;
+        expect_true(acquired_channel.has_value());
+        if (!acquired_channel) return;
         write_pipeline_t writer {(*fixture)->disk, std::move(*acquired_channel), medium};
         for (std::uint64_t index = 0; index != blocks_k; ++index) {
             expected<pooled_buffer_t> block = writer.acquire_buffer_or_poll();
-            failures += expect(block.has_value());
-            if (!block) return failures;
+            expect_true(block.has_value());
+            if (!block) return;
             paint(block->bytes(), index);
-            failures += expect(
+            expect_true(
                 writer.enqueue_write(std::move(*block), extent_t {index * block_bytes_k, block_bytes_k}).succeeded());
-            failures += expect(writer.submit().succeeded());
+            expect_true(writer.submit().succeeded());
         }
-        failures += expect(writer.make_durable().succeeded());
+        expect_true(writer.make_durable().succeeded());
     }
 
     expected<io_channel_t::acquired_channel_t> acquired_channel = guard->channel().acquire();
-    failures += expect(acquired_channel.has_value());
-    if (!acquired_channel) return failures;
+    expect_true(acquired_channel.has_value());
+    if (!acquired_channel) return;
     read_pipeline_t reader {(*fixture)->disk, std::move(*acquired_channel), medium};
     std::size_t seen = 0;
     std::size_t mismatches = 0;
@@ -350,14 +334,13 @@ std::size_t pipeline_reads_back_what_it_wrote(mount_type_ const& mount) {
                 break;
             ++offered;
         }
-        failures += expect(reader.submit().succeeded());
+        expect_true(reader.submit().succeeded());
         expected<std::size_t> const polled = reader.poll_completions(sink);
-        failures += expect(polled.has_value());
-        if (!polled) return failures;
+        expect_true(polled.has_value());
+        if (!polled) return;
     }
-    failures += expect_eq(seen, static_cast<std::size_t>(blocks_k));
-    failures += expect_eq(mismatches, std::size_t {0});
-    return failures;
+    expect_equal(seen, static_cast<std::size_t>(blocks_k));
+    expect_equal(mismatches, std::size_t {0});
 }
 
 /**
@@ -368,24 +351,23 @@ std::size_t pipeline_reads_back_what_it_wrote(mount_type_ const& mount) {
  *  depth and stays there through the middle of the run.
  */
 template <typename mount_type_>
-std::size_t pipeline_holds_its_depth(mount_type_ const& mount) {
+void test_pipeline_holds_its_depth(mount_type_ const& mount) {
     using types_t = channels_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
     using read_pipeline_t = typename types_t::read_pipeline_t;
-    std::size_t failures = 0;
     constexpr std::uint64_t blocks_k = 512;
     expected<std::unique_ptr<fixture_t>> fixture = mount();
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return;
 
     expected<guard_t> guard = (*fixture)->channels.acquire();
-    failures += expect(guard.has_value());
-    if (!guard) return failures;
+    expect_true(guard.has_value());
+    if (!guard) return;
 
     expected<io_channel_t::acquired_channel_t> acquired_channel = guard->channel().acquire();
-    failures += expect(acquired_channel.has_value());
-    if (!acquired_channel) return failures;
+    expect_true(acquired_channel.has_value());
+    if (!acquired_channel) return;
     read_pipeline_t reader {(*fixture)->disk, std::move(*acquired_channel), (*fixture)->media[0].reference()};
     std::uint64_t offered = 0;
     std::size_t polled_total = 0;
@@ -401,76 +383,73 @@ std::size_t pipeline_holds_its_depth(mount_type_ const& mount) {
                 break;
             ++offered;
         }
-        failures += expect(reader.submit().succeeded());
+        expect_true(reader.submit().succeeded());
         std::size_t const in_flight = (*fixture)->disk.outstanding(guard->channel().queue_pair());
         if (in_flight > deepest) deepest = in_flight;
         expected<std::size_t> const seen = reader.poll_completions(sink);
-        failures += expect(seen.has_value());
-        if (!seen) return failures;
+        expect_true(seen.has_value());
+        if (!seen) return;
     }
 
-    failures += expect_eq(polled_total, static_cast<std::size_t>(blocks_k));
-    failures += expect_eq(deepest, static_cast<std::size_t>(channels_config_k.queue_depth));
-    return failures;
+    expect_equal(polled_total, static_cast<std::size_t>(blocks_k));
+    expect_equal(deepest, static_cast<std::size_t>(channels_config_k.queue_depth));
 }
 
 /** A write that runs past the end of a fixed medium is a refusal, never a silent short write. */
 template <typename mount_type_>
-case_result_t pipeline_refuses_a_short_write(mount_type_ const& mount) {
+case_result_t test_pipeline_refuses_a_short_write(mount_type_ const& mount) {
     using types_t = channels_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
     using write_pipeline_t = typename types_t::write_pipeline_t;
     if (capacity_behavior_of(mount.transport) == capacity_behavior_t::growing_k)
-        return case_result_t::skipped("a regular file grows past its end");
-    std::size_t failures = 0;
+        return case_result_t::skipped("needs a medium of fixed size, not a regular file");
     expected<std::unique_ptr<fixture_t>> fixture = mount();
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return {};
 
     expected<guard_t> guard = (*fixture)->channels.acquire();
-    failures += expect(guard.has_value());
-    if (!guard) return failures;
+    expect_true(guard.has_value());
+    if (!guard) return {};
 
     expected<io_channel_t::acquired_channel_t> acquired_channel = guard->channel().acquire();
-    failures += expect(acquired_channel.has_value());
-    if (!acquired_channel) return failures;
+    expect_true(acquired_channel.has_value());
+    if (!acquired_channel) return {};
     write_pipeline_t writer {(*fixture)->disk, std::move(*acquired_channel), (*fixture)->media[0].reference()};
     expected<pooled_buffer_t> block = writer.acquire_buffer();
-    failures += expect(block.has_value());
-    if (!block) return failures;
+    expect_true(block.has_value());
+    if (!block) return {};
     paint(block->bytes(), 5);
-    failures += expect(
+    expect_true(
         writer.enqueue_write(std::move(*block), extent_t {channels_config_k.volume_bytes, block_bytes_k}).succeeded());
-    failures += expect(writer.submit().succeeded());
-    failures += expect(writer.make_durable().failed());
-    return failures;
+    expect_true(writer.submit().succeeded());
+    expect_true(writer.make_durable().failed());
+    return {};
 }
 
 /** A read that meets the end of the volume polls a partial, with the byte count it moved. */
 template <typename mount_type_>
-std::size_t pipeline_reports_a_partial_read(mount_type_ const& mount) {
+void test_pipeline_reports_a_partial_read(mount_type_ const& mount) {
     using types_t = channels_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
     using read_pipeline_t = typename types_t::read_pipeline_t;
-    std::size_t failures = 0;
     expected<std::unique_ptr<fixture_t>> fixture = mount();
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return;
 
     expected<guard_t> guard = (*fixture)->channels.acquire();
-    failures += expect(guard.has_value());
-    if (!guard) return failures;
+    expect_true(guard.has_value());
+    if (!guard) return;
 
     expected<io_channel_t::acquired_channel_t> acquired_channel = guard->channel().acquire();
-    failures += expect(acquired_channel.has_value());
-    if (!acquired_channel) return failures;
+    expect_true(acquired_channel.has_value());
+    if (!acquired_channel) return;
     read_pipeline_t reader {(*fixture)->disk, std::move(*acquired_channel), (*fixture)->media[0].reference()};
     constexpr std::uint64_t reachable_k = block_bytes_k;
-    failures += expect(
+    expect_true(
         reader.enqueue_read(extent_t {channels_config_k.volume_bytes - reachable_k, 2 * block_bytes_k}, 0).succeeded());
-    failures += expect(reader.submit().succeeded());
+    expect_true(reader.submit().succeeded());
 
     std::size_t seen = 0;
     std::size_t partials = 0;
@@ -479,50 +458,44 @@ std::size_t pipeline_reports_a_partial_read(mount_type_ const& mount) {
         ++seen;
         if (completed.state == completion_state_t::partial_k) ++partials;
         moved = completed.bytes.size();
-        failures += expect_status(require_completed_in_full(completed), status_code_t::io_k);
+        expect_status(require_completed_in_full(completed), status_code_t::io_k);
     };
-    failures += expect(reader.poll_all_completions(sink).succeeded());
-    failures += expect_eq(seen, std::size_t {1});
-    failures += expect_eq(partials, std::size_t {1});
-    failures += expect_eq(moved, reachable_k);
-    return failures;
+    expect_true(reader.poll_all_completions(sink).succeeded());
+    expect_equal(seen, std::size_t {1});
+    expect_equal(partials, std::size_t {1});
+    expect_equal(moved, reachable_k);
 }
 
 #pragma endregion Pipeline Cases
 
 } // namespace unum::ustore::test
 
-int main(int argc, char const* argv[]) {
+int main(int argc, char** argv) {
     using namespace unum::ustore;
     using namespace unum::ustore::test;
 
-    suite_options_t options;
-    if (argument_status_t const status = parse_suite_options(argc, argv, options);
-        status != argument_status_t::parsed_k)
-        return status == argument_status_t::help_k ? 0 : 1;
-    suite_totals_t totals = options.totals();
+    start_test_run(argc, argv);
 
-    st::expected<directory_t> const directory = directory_t::make(options.directory);
+    st::expected<scratch_directory_t> const directory = scratch_directory_t::make(test_run.settings.directory);
     if (!directory) {
         fmt::println(stderr, "  the working directory would not open");
         return 1;
     }
-    test_environment_t const environment = test_environment_t::of(options, *directory);
 
     auto const cases = [&](auto const& mount) {
-        report(totals, mount, "arena_charges_once", arena_charges_its_budget_once);
-        report(totals, mount, "pool_exhausts_and_recycles", pool_exhausts_and_recycles);
-        report(totals, mount, "pool_recycles_exactly_once", pool_recycles_exactly_once);
-        report(totals, mount, "separate_threads", channels_separate_executor_threads);
-        report(totals, mount, "wait_beyond_spares", channels_wait_beyond_their_spares);
-        report(totals, mount, "second_pipeline_refused", second_pipeline_is_refused);
-        report(totals, mount, "pipeline_reads_back", pipeline_reads_back_what_it_wrote);
-        report(totals, mount, "pipeline_holds_its_depth", pipeline_holds_its_depth);
-        report(totals, mount, "pipeline_refuses_short_write", pipeline_refuses_a_short_write);
-        report(totals, mount, "pipeline_partial_read", pipeline_reports_a_partial_read);
+        report_on_mount(mount, "test_arena_charges_its_budget_once", test_arena_charges_its_budget_once);
+        report_on_mount(mount, "test_pool_exhausts_and_recycles", test_pool_exhausts_and_recycles);
+        report_on_mount(mount, "test_pool_recycles_exactly_once", test_pool_recycles_exactly_once);
+        report_on_mount(mount, "test_channels_separate_executor_threads", test_channels_separate_executor_threads);
+        report_on_mount(mount, "test_channels_wait_beyond_their_spares", test_channels_wait_beyond_their_spares);
+        report_on_mount(mount, "test_second_pipeline_is_refused", test_second_pipeline_is_refused);
+        report_on_mount(mount, "test_pipeline_reads_back_what_it_wrote", test_pipeline_reads_back_what_it_wrote);
+        report_on_mount(mount, "test_pipeline_holds_its_depth", test_pipeline_holds_its_depth);
+        report_on_mount(mount, "test_pipeline_refuses_a_short_write", test_pipeline_refuses_a_short_write);
+        report_on_mount(mount, "test_pipeline_reports_a_partial_read", test_pipeline_reports_a_partial_read);
     };
     for (transport_t const transport : every_transport_k)
-        run_on_transport(totals, transport, environment, channels_config_k, 1, "channels", cases);
+        run_on_transport(transport, directory->path(), channels_config_k, 1, "channels", cases);
 
-    return suite_exit_code(totals);
+    return finish_test_run();
 }

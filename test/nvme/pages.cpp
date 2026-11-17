@@ -24,7 +24,7 @@
 
 #include "ustore/ustore.hpp"
 
-#include "harness.hpp" // `expect`, `expect_eq`, `report`, `suite_exit_code`, `directory_t`, `random_t`
+#include "harness.hpp" // `expect_true`, `expect_equal`, `run_test_case`, `scratch_directory_t`
 
 using namespace unum::ustore;
 using namespace unum::ustore::test;
@@ -62,7 +62,7 @@ expected<database_t> open_small_nvme(char const* directory) noexcept {
     ustore_database_open_nvme_t open {};
     open.database = &database;
     open.outcome = &outcome;
-    path_t const manifest {directory, "pages.ustore.json"};
+    std::string const manifest = fmt::format("{}/{}", directory, "pages.ustore.json");
     open.directory = {reinterpret_cast<ustore_byte_t const*>(manifest.c_str()), std::strlen(manifest.c_str())};
     open.collection_memory_runs_max_bytes = small_memory_runs_bytes_k;
     open.collection_value_max_size = small_memory_runs_bytes_k / 4;
@@ -211,72 +211,64 @@ expected<pages_client_t> pages_client(ustore_database_t database, std::string_vi
 
 /** Two transactions editing one page both commit, each reading its own edit before it does, and the page lands as
  *  the in-memory engine leaves it after the two edits in commit order. */
-case_result_t concurrent_edits_commit(char const* directory) {
+case_result_t test_concurrent_edits_commit(char const* directory) {
     if (!directory) return case_result_t::skipped(needs_directory_k);
-    std::size_t failures = 0;
-    path_t const home {directory, "concurrent"};
-    if (!recreate_directory(home.c_str())) return failures + 1;
+    std::string const home = fmt::format("{}/{}", directory, "concurrent");
+    if (!expect_true(scratch_directory_t::recreate(home.c_str()))) return {};
     auto [memory, memory_status] = open_database<database_t>(config_t {engine_options_t {}, nullptr});
     auto [drive, drive_status] = open_small_nvme(home.c_str());
-    failures += expect(memory_status.succeeded() && drive_status.succeeded());
-    if (failures) return failures;
+    if (!expect_true(memory_status.succeeded() && drive_status.succeeded())) return {};
     auto [expected_pages, expected_status] = pages_client(memory, "concurrent");
     auto [stored_pages, stored_status] = pages_client(drive, "concurrent");
-    failures += expect(expected_status.succeeded() && stored_status.succeeded());
-    if (failures) return failures;
+    if (!expect_true(expected_status.succeeded() && stored_status.succeeded())) return {};
 
     ustore_key_t const page = key_from_integer(7);
     ustore_key_t const inserted = key_from_integer(70);
     std::string_view const markup = "<doc><p>one</p></doc>";
-    failures += expect(expected_pages.import(page, markup).succeeded() &&
-                       stored_pages.import(page, markup).succeeded());
-    failures += expect(expected_pages.insert(page, inserted, nil_k, nil_k, "<p>two</p>").succeeded());
+    expect_true(expected_pages.import(page, markup).succeeded() && stored_pages.import(page, markup).succeeded());
+    expect_true(expected_pages.insert(page, inserted, nil_k, nil_k, "<p>two</p>").succeeded());
     std::string const after_insert = expected_pages.read(page);
-    failures += expect(expected_pages.set_attribute(page, page, "class", "x").succeeded());
+    expect_true(expected_pages.set_attribute(page, page, "class", "x").succeeded());
     std::string const after_both = expected_pages.read(page);
 
     auto [first, first_status] = drive.on().transaction();
     auto [second, second_status] = drive.on().transaction();
-    failures += expect(first_status.succeeded() && second_status.succeeded());
-    if (failures) return failures;
+    if (!expect_true(first_status.succeeded() && second_status.succeeded())) return {};
     pages_client_t first_pages {drive, stored_pages.collection, first.transaction(), std::move(stored_pages.arena)};
     auto [second_arena, second_arena_status] = arena_t::make();
-    failures += expect(second_arena_status.succeeded());
-    if (failures) return failures;
+    if (!expect_true(second_arena_status.succeeded())) return {};
     pages_client_t second_pages {drive, first_pages.collection, second.transaction(), std::move(second_arena)};
     pages_client_t head_pages {drive, first_pages.collection, nullptr, std::move(expected_pages.arena)};
 
-    failures += expect(first_pages.insert(page, inserted, nil_k, nil_k, "<p>two</p>").succeeded());
-    failures += expect(second_pages.set_attribute(page, page, "class", "x").succeeded());
-    failures += expect_eq(first_pages.read(page), after_insert);
-    failures += expect_eq(head_pages.read(page), std::string(markup));
-    failures += expect(first.on().commit().has_value());
-    failures += expect(second.on().commit().has_value());
-    failures += expect_eq(head_pages.read(page), after_both);
-    return failures;
+    expect_true(first_pages.insert(page, inserted, nil_k, nil_k, "<p>two</p>").succeeded());
+    expect_true(second_pages.set_attribute(page, page, "class", "x").succeeded());
+    expect_equal(first_pages.read(page), after_insert);
+    expect_equal(head_pages.read(page), std::string(markup));
+    expect_true(first.on().commit().has_value());
+    expect_true(second.on().commit().has_value());
+    expect_equal(head_pages.read(page), after_both);
+    return {};
 }
 
 /** Random edits of a few pages, many small commits with page removals and imports among them, flushed every hundred
  *  calls into small levels that merge often, read against the in-memory engine as the records reach flushed runs, after
  *  a compaction folds them to the bottom, and after a reopen. */
-case_result_t fold_survives_maintenance(char const* directory, random_t random) {
+case_result_t test_fold_survives_maintenance(char const* directory) {
     if (!directory) return case_result_t::skipped(needs_directory_k);
-    std::size_t failures = 0;
-    path_t const home {directory, "maintenance"};
-    if (!recreate_directory(home.c_str())) return failures + 1;
+    split_mix_generator_t random {case_stream_key()};
+    std::string const home = fmt::format("{}/{}", directory, "maintenance");
+    if (!expect_true(scratch_directory_t::recreate(home.c_str()))) return {};
     auto [memory, memory_status] = open_database<database_t>(config_t {engine_options_t {}, nullptr});
-    failures += expect(memory_status.succeeded());
-    if (failures) return failures;
+    if (!expect_true(memory_status.succeeded())) return {};
     auto [expected_pages, expected_status] = pages_client(memory, "maintenance");
-    failures += expect(expected_status.succeeded());
-    if (failures) return failures;
+    if (!expect_true(expected_status.succeeded())) return {};
 
     std::array<ustore_key_t, model_pages_k> pages;
     std::array<std::vector<ustore_key_t>, model_pages_k> given;
     for (std::size_t index = 0; index != model_pages_k; ++index) pages[index] = key_from_integer(1000 + index);
     std::uint64_t next_given = 1'000'000;
     std::size_t landed = 0;
-    auto const text = [](random_t& draws, std::size_t longest) {
+    auto const text = [](split_mix_generator_t& draws, std::size_t longest) {
         static constexpr std::string_view alphabet = "abcxyz &<>";
         std::string result(draws.below(longest + 1), ' ');
         for (char& character : result) character = alphabet[draws.below(alphabet.size())];
@@ -292,42 +284,38 @@ case_result_t fold_survives_maintenance(char const* directory, random_t random) 
         return result;
     };
     // A key the page gave out, live or retired, the page key itself, or Nil
-    auto const any_key = [&](random_t& draws, std::size_t index) {
+    auto const any_key = [&](split_mix_generator_t& draws, std::size_t index) {
         std::uint64_t const roll = draws.below(10);
         if (roll == 0 || given[index].empty()) return pages[index];
         if (roll == 1) return nil_k;
         return given[index][draws.below(given[index].size())];
     };
     auto const compare_all = [&](pages_client_t& stored, std::string_view context) {
-        std::size_t differing = 0;
+        bool agreed = true;
         for (ustore_key_t const& page : pages) {
             std::string const wanted = expected_pages.read(page);
             std::string const found = stored.read(page);
-            if (found == wanted) continue;
-            fmt::println(stderr, "  {}: wanted `{}`, got `{}`", context, wanted, found);
-            ++differing;
+            agreed = expect_true(found == wanted, "{}: wanted `{}`, got `{}`", context, wanted, found) && agreed;
         }
-        return differing;
+        return agreed;
     };
 
     ustore_collection_id_t stored_collection {};
     {
         auto [drive, drive_status] = open_small_nvme(home.c_str());
-        failures += expect(drive_status.succeeded());
-        if (failures) return failures;
+        if (!expect_true(drive_status.succeeded())) return {};
         auto [stored_pages, stored_status] = pages_client(drive, "maintenance");
-        failures += expect(stored_status.succeeded());
-        if (failures) return failures;
+        if (!expect_true(stored_status.succeeded())) return {};
         stored_collection = stored_pages.collection;
 
-        for (std::size_t call = 0; call != model_calls_k && failures == 0; ++call) {
+        for (std::size_t call = 0; call != model_calls_k; ++call) {
             std::size_t const index = random.below(model_pages_k);
             ustore_key_t const page = pages[index];
             std::uint64_t const roll = random.below(100);
             bool const missing = expected_pages.read(page) == page_absent_k;
             // Both engines see the same call, as each replays the draws of one seed
             auto const apply = [&](pages_client_t& client, std::uint64_t draw) -> status_t {
-                random_t replay {draw};
+                split_mix_generator_t replay {draw};
                 auto const pick = [&](std::vector<ustore_key_t> const& keys) {
                     return keys.empty() ? nil_k : keys[replay.below(keys.size())];
                 };
@@ -349,51 +337,42 @@ case_result_t fold_survives_maintenance(char const* directory, random_t random) 
             std::uint64_t const draw = random.below(~std::uint64_t(0));
             status_t const wanted = apply(expected_pages, draw);
             status_t const answered = apply(stored_pages, draw);
-            if (answered.code != wanted.code) {
-                fmt::println(stderr, "  call {} of roll {}: wanted {}, got {}", call, roll, describe(wanted.code),
-                             describe(answered.code));
-                ++failures;
-            }
+            if (!expect_true(answered.code == wanted.code, "call {} of roll {}: wanted {}, got {}", call, roll,
+                             status_name(wanted.code), status_name(answered.code)))
+                break;
             landed += wanted.succeeded();
             if (roll >= 6 && roll < 40 && !missing) given[index].push_back(key_from_integer(next_given++));
             // A compaction flushes the memory runs first, so the records land in runs over bases in older ones
-            if (call % flush_calls_k == 0) failures += expect(drive.on().compact().succeeded());
-            if (call % checkpoint_calls_k == 0) failures += compare_all(stored_pages, "after a checkpoint");
+            if (call % flush_calls_k == 0 && !expect_true(drive.on().compact().succeeded())) break;
+            if (call % checkpoint_calls_k == 0 && !compare_all(stored_pages, "after a checkpoint")) break;
         }
-        fmt::println("  {} of {} calls landed", landed, model_calls_k);
-        failures += expect(landed * 10 > model_calls_k * 9);
-        failures += compare_all(stored_pages, "after every call");
-        failures += expect(drive.on().compact().succeeded());
-        failures += compare_all(stored_pages, "after a compaction");
+        expect_true(landed * 10 > model_calls_k * 9, "{} of {} calls landed", landed, model_calls_k);
+        compare_all(stored_pages, "after every call");
+        expect_true(drive.on().compact().succeeded());
+        compare_all(stored_pages, "after a compaction");
     }
 
     auto [reopened, reopen_status] = open_small_nvme(home.c_str());
-    failures += expect(reopen_status.succeeded());
-    if (failures) return failures;
+    if (!expect_true(reopen_status.succeeded())) return {};
     auto [arena, arena_status] = arena_t::make();
-    failures += expect(arena_status.succeeded());
-    if (failures) return failures;
+    if (!expect_true(arena_status.succeeded())) return {};
     pages_client_t stored_pages {reopened, stored_collection, nullptr, std::move(arena)};
-    failures += compare_all(stored_pages, "after a reopen");
-    return failures;
+    compare_all(stored_pages, "after a reopen");
+    return {};
 }
 
 #pragma endregion Cases
 
-int main(int argc, char const* argv[]) {
-    suite_options_t options;
-    if (argument_status_t const status = parse_suite_options(argc, argv, options);
-        status != argument_status_t::parsed_k)
-        return status == argument_status_t::help_k ? 0 : 1;
-    suite_totals_t totals = options.totals();
+int main(int argc, char** argv) {
+    start_test_run(argc, argv);
 
-    st::expected<directory_t> const directory = directory_t::make(options.directory);
+    st::expected<scratch_directory_t> const directory = scratch_directory_t::make(test_run.settings.directory);
     if (!directory) {
         fmt::println(stderr, "  the working directory would not open");
         return 1;
     }
     char const* const home = directory->path();
-    report(totals, "pages.concurrent_edits_commit", concurrent_edits_commit, home);
-    report(totals, "pages.fold_survives_maintenance", fold_survives_maintenance, home, options.random());
-    return suite_exit_code(totals);
+    run_test_case("test_concurrent_edits_commit", test_concurrent_edits_commit, home);
+    run_test_case("test_fold_survives_maintenance", test_fold_survives_maintenance, home);
+    return finish_test_run();
 }

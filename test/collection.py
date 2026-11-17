@@ -1,11 +1,16 @@
-"""Collections addressed by name: resolution at first use, creation by the first write, and the modality views."""
+"""Collections addressed by name: resolution at first use, creation by the first write, and the modality views.
+
+File: test/collection.py
+Author: Ash Vardanian
+Date: October 7, 2026
+"""
 
 import gc
 import json
 
 import numpy as np
 import pytest
-from capabilities import NEEDS_TRANSACTIONS, key, keys
+from base import NEEDS_TRANSACTIONS, key, keys, pyarrow_available
 
 import ustore
 
@@ -27,6 +32,7 @@ def test_indexing_resolves_on_first_use(database):
     [("blobs", ustore.Modality.BLOBS, "docs"), ("docs", ustore.Modality.DOCS, "blobs")],
 )
 def test_first_write_declares_the_modality(database, member: str, modality: ustore.Modality, other: str):
+    """The first write through a modality view creates the collection with it, refusing the other view."""
     written = b"bytes" if modality is ustore.Modality.BLOBS else {"k": 1}
     getattr(database["things"], member)[1] = written
     assert database["things"].modality is modality
@@ -38,6 +44,7 @@ def test_first_write_declares_the_modality(database, member: str, modality: usto
 
 @pytest.mark.parametrize(("member", "modality"), [("graph", ustore.Modality.GRAPH), ("table", ustore.Modality.DOCS)])
 def test_graph_and_table_declare_on_access(database, member: str, modality: ustore.Modality):
+    """Reaching the graph or table view creates the collection as a graph or as documents."""
     getattr(database["declared"], member)
     assert database["declared"].modality is modality
     with pytest.raises(ustore.InvalidArgumentError, match="'declared' holds"):
@@ -58,6 +65,7 @@ def test_a_created_collection_keeps_its_modality(database, modality: ustore.Moda
 
 
 def test_the_empty_name_addresses_no_collection(database):
+    """The empty name raises NotFoundError through a mapping view and a verb alike."""
     with pytest.raises(ustore.NotFoundError):
         database[""].blobs[1]
     with pytest.raises(ustore.NotFoundError):
@@ -77,6 +85,7 @@ def test_docs_round_trip_python_objects(view):
 
 
 def test_docs_refuse_what_json_cannot_hold(database):
+    """Sets and keys that are no strings raise TypeError, since JSON holds neither."""
     with pytest.raises(TypeError, match="set"):
         database["people"].docs[1] = {"tags": {"a"}}
     with pytest.raises(TypeError, match="keys are strings"):
@@ -94,7 +103,8 @@ def test_missing_keys(database, member: str, writer: str, written: bytes | dict)
     mapping = getattr(database["things"], member)
     with pytest.raises(KeyError):
         mapping[2]
-    assert 1 in mapping and 2 not in mapping
+    assert 1 in mapping
+    assert 2 not in mapping
     assert mapping[[2, 1]][0] is None
 
 
@@ -104,12 +114,15 @@ def test_blobs_copy_out_of_a_one_off_arena(database, arena):
     poster = database["posters"].blobs[1]
     batch = database["posters"].blobs[[1, 2]]
     gc.collect()
-    assert poster == b"first" and batch == [b"first", b"second"]
+    assert poster == b"first"
+    assert batch == [b"first", b"second"]
     borrowed = database.read([1, 2], arena, collection="posters")
-    assert isinstance(borrowed[0], memoryview) and [bytes(value) for value in borrowed] == batch
+    assert isinstance(borrowed[0], memoryview)
+    assert [bytes(value) for value in borrowed] == batch
 
 
 def test_deleting_removes_and_never_creates(database):
+    """Deleting from a missing collection raises without creating it, and deleting a key removes it."""
     with pytest.raises(ustore.NotFoundError):
         del database["posters"].blobs[1]
     assert not database.collection_contains("posters")
@@ -131,6 +144,7 @@ def test_transactions_stage_writes_and_create_at_the_head(database):
 
 
 def test_sample_answers_keys_onto_values(database, arena):
+    """A collection samples a dict of keys onto values, and its key sample and scan stay inside it."""
     stored = {key(1): b"one", key(2): b"two", key(3): b"three"}
     database["pictures"].blobs[list(stored)] = list(stored.values())
     assert database["pictures"].sample(1000) == stored
@@ -145,9 +159,11 @@ def test_docs_write_serializes_dicts(database, docs):
     assert database["docs"].docs[[1, 2, 3, 4]] == [{"same": True}, {"same": True}, {"n": 3}, {"n": 4}]
 
 
+@pytest.mark.skipif(not pyarrow_available, reason="PyArrow is not installed")
 def test_values_export_as_arrow_binary(database, arena):
     """A small read writes 32-bit offsets, so it exports as Arrow `binary` over the arena's own bytes."""
-    pyarrow = pytest.importorskip("pyarrow")
+    import pyarrow
+
     database["posters"].blobs[[1, 2]] = [b"first", b""]
     values = database.read([1, 3, 2], arena, collection="posters")
     array = pyarrow.array(values)

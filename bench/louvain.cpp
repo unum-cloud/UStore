@@ -57,7 +57,7 @@ namespace unum::ustore::bench {
 #pragma region Settings
 
 /** Command-line options of the benchmark, each field set by the flag of the same name. */
-struct settings_t : shared_settings_t {
+struct louvain_settings_t : bench_settings_t {
 
     /** File holding one source and target pair per line; a graph is generated without it. */
     std::string_view dataset;
@@ -156,14 +156,14 @@ status_t read_edge_list(char const* path, std::size_t max_edges, st::vector<inpu
 }
 
 /** Draws a planted partition: @c inner_degree edges inside each community and @c outer_degree across them. */
-status_t generate_edge_list(settings_t const& settings, st::vector<input_edge_t>& edges) noexcept {
+status_t generate_edge_list(louvain_settings_t const& settings, st::vector<input_edge_t>& edges) noexcept {
     std::size_t const community_size = settings.vertices.value / settings.communities.value;
     if (community_size < 2) return {status_code_t::invalid_argument_k, "--vertices below twice --communities"};
     std::size_t const planted = community_size * settings.communities.value;
     std::size_t const drawn_per_vertex = settings.inner_degree.value + settings.outer_degree.value;
     if (st::failed(edges.reserve(planted * drawn_per_vertex))) return status_code_t::out_of_memory_k;
 
-    splitmix64_t random {stream_key(settings.seed, "edges", 0)};
+    split_mix_generator_t random {stream_key(settings.seed, "edges", 0)};
     for (std::size_t vertex = 0; vertex != planted; ++vertex) {
         std::size_t const community_begin = (vertex / community_size) * community_size;
         ustore_key_t const source = key_from_integer(vertex);
@@ -555,7 +555,7 @@ struct run_result_t {
  *  @param[in] settings Supplies the growth threshold and the ceiling on levels.
  */
 template <typename graph_type_>
-expected<run_result_t> run_louvain(graph_type_& graph, settings_t const& settings) noexcept {
+expected<run_result_t> run_louvain(graph_type_& graph, louvain_settings_t const& settings) noexcept {
     double const min_growth = static_cast<double>(settings.min_modularity_growth_per_billion.value) / 1e9;
 
     auto [level, optimize_level_status] = optimize_level(graph);
@@ -597,7 +597,7 @@ expected<run_result_t> run_louvain(graph_type_& graph, settings_t const& setting
 
 /** Runs Louvain over @p graph into @p result, counting its vertices, or skips @p loop on a failure. */
 template <typename graph_type_>
-void louvain_call(loop_t& loop, graph_type_& graph, settings_t const& settings, run_result_t& result) noexcept {
+void louvain_call(loop_t& loop, graph_type_& graph, louvain_settings_t const& settings, run_result_t& result) noexcept {
     auto [run, run_louvain_status] = run_louvain(graph, settings);
     if (run_louvain_status.failed()) return loop.skip("failed to detect communities");
     result = run;
@@ -612,7 +612,7 @@ int main(int argc, char** argv) {
     using namespace unum::ustore;
     using namespace unum::ustore::bench;
 
-    settings_t settings;
+    louvain_settings_t settings;
     std::array<flag_t, 13> const flags {{
         {"--dataset", "path", "SNAP edge list; a planted partition is generated without it", &settings.dataset},
         {"--engine", "name", "engine to open: ram, rocksdb, leveldb or nvme", &settings.engine.name},
@@ -629,8 +629,15 @@ int main(int argc, char** argv) {
          &settings.min_modularity_growth_per_billion},
         {"--max-levels", "count", "levels either run coarsens through", &settings.max_levels},
     }};
+    std::array<char const*, 13> const variables {"USTORE_DATASET",           "USTORE_ENGINE",
+                                                 "USTORE_ISOLATION",         "USTORE_ENGINE_TRANSPORT",
+                                                 "USTORE_DIRECTORY",         "USTORE_VERTICES",
+                                                 "USTORE_COMMUNITIES",       "USTORE_INNER_DEGREE",
+                                                 "USTORE_OUTER_DEGREE",      "USTORE_MAX_EDGES",
+                                                 "USTORE_BATCH_SIZE_UPSERT", "USTORE_MIN_MODULARITY_GROWTH_PER_BILLION",
+                                                 "USTORE_MAX_LEVELS"};
 
-    read_settings(argc, argv, settings, flags);
+    read_bench_settings(argc, argv, settings, flags, variables);
     auto maybe_executor = executor_t::make(1, caller_exclusivity_t::caller_inclusive_k);
     if (!maybe_executor) {
         fmt::println(stderr, "Failed to pin the calling thread");
@@ -694,7 +701,7 @@ int main(int argc, char** argv) {
 
     run_result_t memory_result;
     run_result_t stored_result;
-    if (settings.selects("graph_upsert") || settings.selects("louvain_over_ustore")) {
+    if (settings.filter.selects("graph_upsert") || settings.filter.selects("louvain_over_ustore")) {
         std::size_t const batch_size = settings.batch_size_upsert.value;
         std::span<edge_t const> const batches {staged.begin(), staged.end()};
         row_t const upserted = run_pass(
@@ -708,14 +715,14 @@ int main(int argc, char** argv) {
                     loop.count(batch.size(), batch.size() * sizeof(edge_t));
                 }
             });
-        if (settings.selects("graph_upsert")) print(upserted);
+        if (settings.filter.selects("graph_upsert")) print(upserted);
         if (upserted.skipped) return 1;
     }
-    if (settings.selects("louvain_in_memory"))
+    if (settings.filter.selects("louvain_in_memory"))
         print(run_pass(executor, "louvain_in_memory", 1, [&](loop_t& loop, std::size_t) noexcept {
             for ([[maybe_unused]] std::size_t call : loop) louvain_call(loop, memory_graph, settings, memory_result);
         }));
-    if (settings.selects("louvain_over_ustore"))
+    if (settings.filter.selects("louvain_over_ustore"))
         print(run_pass(executor, "louvain_over_ustore", 1, [&](loop_t& loop, std::size_t) noexcept {
             for ([[maybe_unused]] std::size_t call : loop) {
                 auto [stored, make_stored_graph_status] = stored_graph_t::make(graph);

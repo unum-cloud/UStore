@@ -1,4 +1,9 @@
-"""Graphs over the C ABI: edge and vertex writes and removals, degrees and edge reads in every role."""
+"""Graphs over the C ABI: edge and vertex writes and removals, degrees and edge reads in every role.
+
+File: test/graph.py
+Author: Ash Vardanian
+Date: September 18, 2026
+"""
 
 import asyncio
 import gc
@@ -6,7 +11,7 @@ from uuid import UUID
 
 import numpy as np
 import pytest
-from capabilities import BATCH_SIZES, NEEDS_SNAPSHOTS, NEEDS_TRANSACTIONS, key, keys
+from base import BATCH_SIZES, NEEDS_SNAPSHOTS, NEEDS_TRANSACTIONS, key, keys
 
 import ustore
 from ustore import Modality, Role
@@ -37,6 +42,7 @@ def expected_edges(sources: list[int], targets: list[int], identifiers: list[UUI
 @pytest.mark.parametrize("role", ROLES)
 @pytest.mark.parametrize("identifiers", EDGE_IDENTIFIERS)
 def test_read_edges_answers_triples_per_vertex(view, arena, graph, role: Role, identifiers: str):
+    """Each vertex reads back its edges in the asked role as (source, target, identifier) triples."""
     sources, targets = TRIANGLE
     given = EDGE_IDENTIFIERS[identifiers](len(sources))
     view.graph_write_edges(sources, targets, edges=given, collection=graph)
@@ -54,6 +60,7 @@ def test_read_edges_answers_triples_per_vertex(view, arena, graph, role: Role, i
 
 @pytest.mark.parametrize("count", [count for count in BATCH_SIZES if count])
 def test_a_chain_of_edges(view, arena, graph, count: int):
+    """A chain's inner vertices have degree two, its ends one, and a vertex past it none."""
     sources = np.arange(count, dtype=np.int64)
     targets = sources + 1
     view.graph_write_edges(sources, targets, collection=graph)
@@ -66,12 +73,14 @@ def test_a_chain_of_edges(view, arena, graph, count: int):
 
 @pytest.mark.parametrize("repeats", [1, 2, 3])
 def test_writing_an_edge_again_changes_nothing(view, arena, graph, repeats: int):
+    """Writing an edge again leaves one edge."""
     for _ in range(repeats):
         view.graph_write_edges([1], [2], collection=graph)
     assert view.graph_degrees([1, 2], arena, collection=graph) == (1, 1)
 
 
 def test_edge_identifiers_tell_parallel_edges_apart(view, arena, graph):
+    """Parallel edges with distinct identifiers stay apart, and a repeated identifier collapses."""
     view.graph_write_edges([1, 1, 1], [2, 2, 2], edges=[7, 8, 7], collection=graph)
     assert view.graph_read_edges([1], arena, role=Role.SOURCE, collection=graph)[0] == (
         (key(1), key(2), key(7)),
@@ -81,6 +90,7 @@ def test_edge_identifiers_tell_parallel_edges_apart(view, arena, graph):
 
 @pytest.mark.parametrize("identifiers", ["default", "list"])
 def test_remove_edges_keeps_the_vertices(view, arena, graph, identifiers: str):
+    """Removing edges keeps their vertices."""
     sources, targets = TRIANGLE
     given = EDGE_IDENTIFIERS[identifiers](len(sources))
     view.graph_write_edges(sources, targets, edges=given, collection=graph)
@@ -90,18 +100,21 @@ def test_remove_edges_keeps_the_vertices(view, arena, graph, identifiers: str):
 
 
 def test_removing_by_pair_spares_edges_with_identifiers(view, arena, graph):
+    """A removal by source and target alone removes the edge with the default identifier only."""
     view.graph_write_edges([1, 1], [2, 2], edges=[ustore.edge_id_default, 5], collection=graph)
     view.graph_remove_edges([1], [2], collection=graph)
     assert view.graph_read_edges([1], arena, role=Role.SOURCE, collection=graph)[0] == ((key(1), key(2), key(5)),)
 
 
 def test_self_loops_count_in_both_roles(view, arena, graph):
+    """A self-loop counts once as a source and twice in either role."""
     view.graph_write_edges([4], [4], collection=graph)
     assert view.graph_degrees([4], arena, role=Role.SOURCE, collection=graph) == (1,)
     assert view.graph_degrees([4], arena, role=Role.ANY, collection=graph) == (2,)
 
 
 def test_a_missing_vertex_spans_no_edges(view, arena, graph):
+    """A missing vertex reads as None and takes no rows of the exported triples."""
     view.graph_write_edges([1, 3, 3], [2, 4, 5], edges=[10, 11, 12], collection=graph)
     found = view.graph_read_edges([1, 404, 3], arena, role=Role.SOURCE, collection=graph)
     assert found.degrees == (1, None, 2)
@@ -111,6 +124,7 @@ def test_a_missing_vertex_spans_no_edges(view, arena, graph):
 
 
 def test_edge_views_outlive_their_tape(view, arena, graph):
+    """Exported edge triples stay readable after their tape is collected."""
     view.graph_write_edges([1], [2], edges=[3], collection=graph)
     held = memoryview(view.graph_read_edges([1], arena, collection=graph))
     gc.collect()
@@ -119,6 +133,7 @@ def test_edge_views_outlive_their_tape(view, arena, graph):
 
 
 def test_empty_reads(view, arena, graph):
+    """Reads of no vertices answer empty tapes shaped as triples."""
     found = view.graph_read_edges([], arena, collection=graph)
     assert len(found) == 0
     assert np.asarray(found).shape == (0, 3, 16)
@@ -132,6 +147,7 @@ def test_empty_reads(view, arena, graph):
 
 @pytest.mark.parametrize("count", BATCH_SIZES)
 def test_write_vertices_without_edges(view, arena, graph, count: int):
+    """Vertices written alone exist with degree zero."""
     vertices = list(range(count))
     view.graph_write_vertices(vertices, collection=graph)
     assert None not in view.graph_degrees(vertices, arena, collection=graph)
@@ -139,6 +155,7 @@ def test_write_vertices_without_edges(view, arena, graph, count: int):
 
 
 def test_writing_a_vertex_keeps_its_edges(view, arena, graph):
+    """Writing a vertex again keeps its edges."""
     view.graph_write_edges([1], [2], collection=graph)
     view.graph_write_vertices([1, 2], collection=graph)
     assert view.graph_degrees([1, 2], arena, collection=graph) == (1, 1)
@@ -146,6 +163,7 @@ def test_writing_a_vertex_keeps_its_edges(view, arena, graph):
 
 @pytest.mark.parametrize("removed", [[1], [2], [1, 3], [1, 2, 3]])
 def test_remove_vertices_removes_their_edges(view, arena, graph, removed: list[int]):
+    """Removing vertices removes every edge they touch and spares the rest."""
     sources, targets = TRIANGLE
     view.graph_write_edges(sources, targets, collection=graph)
     view.graph_remove_vertices(removed, collection=graph)
@@ -178,6 +196,7 @@ def test_a_collection_of_values_refuses_the_graph_calls(view, blobs, arena, stor
 
 
 def test_graphs_in_named_collections_stay_apart(database, arena):
+    """Two graph collections hold their edges apart."""
     database.collection_create("first", modality=Modality.GRAPH)
     database.collection_create("second", modality=Modality.GRAPH)
     database.graph_write_edges([1], [2], collection="first")
@@ -263,17 +282,20 @@ def test_a_write_to_one_graph_depends_on_a_read_of_another(database, arena):
 
 
 def test_a_deferred_graph_write_edges_lands_once_waited(view, arena, graph, later):
+    """A deferred edge write lands once waited."""
     assert later.graph_write_edges(*TRIANGLE, collection=graph).wait() is None
     assert view.graph_degrees([1, 2, 3], arena, collection=graph) == (3, 2, 3)
 
 
 def test_a_deferred_graph_remove_edges_lands_once_waited(view, arena, graph, later):
+    """A deferred edge removal lands once waited."""
     view.graph_write_edges(*TRIANGLE, collection=graph)
     assert later.graph_remove_edges([1], [2], collection=graph).wait() is None
     assert view.graph_degrees([1, 2], arena, role=Role.SOURCE, collection=graph) == (1, 1)
 
 
 def test_a_deferred_graph_read_edges_answers_once_waited(view, arena, graph, later):
+    """A deferred edge read answers what a blocking one does, once waited."""
     view.graph_write_edges(*TRIANGLE, collection=graph)
     found = later.graph_read_edges([1, 2, 3, 4], arena, role=Role.SOURCE, collection=graph).wait()
     blocking = view.graph_read_edges([1, 2, 3, 4], ustore.Arena(), role=Role.SOURCE, collection=graph)
@@ -282,22 +304,27 @@ def test_a_deferred_graph_read_edges_answers_once_waited(view, arena, graph, lat
 
 
 def test_a_deferred_graph_degrees_answers_once_waited(view, arena, graph, later):
+    """A deferred degree read answers once waited."""
     view.graph_write_edges(*TRIANGLE, collection=graph)
     assert later.graph_degrees([1, 2, 3, 4], arena, role=Role.TARGET, collection=graph).wait() == (1, 1, 2, None)
 
 
 def test_a_deferred_graph_write_vertices_lands_once_waited(view, arena, graph, later):
+    """A deferred vertex write lands once waited."""
     assert later.graph_write_vertices([5, 6], collection=graph).wait() is None
     assert view.graph_degrees([5, 6, 7], arena, collection=graph) == (0, 0, None)
 
 
 def test_a_deferred_graph_remove_vertices_lands_once_waited(view, arena, graph, later):
+    """A deferred vertex removal lands once waited."""
     view.graph_write_edges(*TRIANGLE, collection=graph)
     assert later.graph_remove_vertices([3], collection=graph).wait() is None
     assert view.graph_degrees([1, 2, 3], arena, collection=graph) == (1, 1, None)
 
 
 def test_await_graph_calls_under_asyncio(arena, graph, later):
+    """Deferred graph calls await under asyncio."""
+
     async def main() -> tuple[int | None, ...]:
         await later.graph_write_edges(*TRIANGLE, collection=graph)
         return await later.graph_degrees([1, 2, 3], arena, collection=graph)
@@ -310,6 +337,7 @@ def test_await_graph_calls_under_asyncio(arena, graph, later):
 # region Refusals
 
 
+@pytest.mark.any_engine
 @pytest.mark.parametrize(
     ("call", "failure"),
     [
@@ -324,6 +352,7 @@ def test_await_graph_calls_under_asyncio(arena, graph, later):
     ids=["widths", "identifier-width", "positional-identifiers", "role-value", "role-type", "vertex-type", "keyword"],
 )
 def test_binding_refusals(view, graph, call, failure: type):
+    """Mismatched widths, positional identifiers, unknown roles and wrong key types raise."""
     with pytest.raises(failure):
         call(view)
 

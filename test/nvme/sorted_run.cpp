@@ -122,15 +122,15 @@ struct variable_data_t {
 /**
  *  @brief Lays out @p count variable-width key slots whose value sizes come from @p sized.
  *  @param[in] sized Called as @c sized(index); a negative answer is a removal and zero an empty value.
+ *  @return Whether every buffer fit, so the slots are laid out.
  */
 template <typename sized_type_>
-[[nodiscard]] std::size_t build_variable(std::size_t count, sized_type_&& sized, variable_data_t& into) {
-    std::size_t failures = 0;
-    failures += expect(into.sizes.resize(count) == st::status_t::success_k);
-    failures += expect(into.key_slots.resize(count) == st::status_t::success_k);
-    failures += expect(into.kinds.resize(count) == st::status_t::success_k);
-    failures += expect(into.offsets.resize(count + 1) == st::status_t::success_k);
-    if (failures != 0) return failures;
+bool build_variable(std::size_t count, sized_type_&& sized, variable_data_t& into) {
+    if (!expect_true(into.sizes.resize(count) == st::status_t::success_k) ||
+        !expect_true(into.key_slots.resize(count) == st::status_t::success_k) ||
+        !expect_true(into.kinds.resize(count) == st::status_t::success_k) ||
+        !expect_true(into.offsets.resize(count + 1) == st::status_t::success_k))
+        return false;
 
     std::uint64_t total = 0;
     for (std::size_t index = 0; index != count; ++index) {
@@ -138,8 +138,7 @@ template <typename sized_type_>
         into.sizes[index] = wanted > 0 ? static_cast<std::uint64_t>(wanted) : 0;
         total += into.sizes[index];
     }
-    failures += expect(into.values.resize(static_cast<std::size_t>(total)) == st::status_t::success_k);
-    if (failures != 0) return failures;
+    if (!expect_true(into.values.resize(static_cast<std::size_t>(total)) == st::status_t::success_k)) return false;
 
     std::uint64_t written = 0;
     for (std::size_t index = 0; index != count; ++index) {
@@ -154,20 +153,17 @@ template <typename sized_type_>
         into.key_slots[index] = slot;
     }
     into.offsets[count] = static_cast<stored_value_offset_t>(written);
-    return failures;
+    return true;
 }
 
 /** Reads every value of @p run at every position, counting the bytes that do not match what was written. */
 template <typename run_type_>
-[[nodiscard]] std::size_t check_variable_values(run_type_ const& run, io_channel_t& channel,
-                                                variable_data_t const& data) {
-    std::size_t failures = 0;
+void check_variable_values(run_type_ const& run, io_channel_t& channel, variable_data_t const& data) {
     std::size_t const count = data.sizes.size();
     st::vector<std::uint64_t> seen;
-    failures += expect(seen.resize(count) == st::status_t::success_k);
+    expect_true(seen.resize(count) == st::status_t::success_k);
     st::vector<std::uint64_t> positions;
-    failures += expect(positions.resize(count) == st::status_t::success_k);
-    if (failures != 0) return failures;
+    if (!expect_true(positions.resize(count) == st::status_t::success_k)) return;
     for (std::size_t index = 0; index != count; ++index) {
         seen[index] = 0;
         positions[index] = index;
@@ -179,10 +175,9 @@ template <typename run_type_>
         for (std::size_t index = 0; index != bytes.size(); ++index)
             if (bytes[index] != painted(request, offset + index)) ++mismatches;
     };
-    failures += expect(run.read_values(channel, std::span<std::uint64_t const> {positions}, sink).succeeded());
-    failures += expect_eq(mismatches, std::size_t {0});
-    for (std::size_t index = 0; index != count; ++index) failures += expect_eq(seen[index], data.sizes[index]);
-    return failures;
+    expect_true(run.read_values(channel, std::span<std::uint64_t const> {positions}, sink).succeeded());
+    expect_equal(mismatches, std::size_t {0});
+    for (std::size_t index = 0; index != count; ++index) expect_equal(seen[index], data.sizes[index]);
 }
 
 #pragma endregion Builders
@@ -191,95 +186,92 @@ template <typename run_type_>
 
 /** A run of many values comes back byte for byte, through a volume mounted again from the environment. */
 template <typename mount_type_>
-case_result_t run_reads_back_every_value(mount_type_ const& mount) {
+case_result_t test_run_reads_back_every_value(mount_type_ const& mount) {
     using types_t = run_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
     using volume_t = typename types_t::volume_t;
     using variable_run_t = typename types_t::variable_run_t;
-    std::size_t failures = 0;
     constexpr std::size_t count_k = 1500;
     expected<std::unique_ptr<fixture_t>> fixture = mount();
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return {};
     if (!(*fixture)->persists_volumes()) return case_result_t::skipped(memory_volumes_vanish_k);
 
     expected<guard_t> guard = (*fixture)->channels.acquire();
-    failures += expect(guard.has_value());
-    if (!guard) return failures;
+    expect_true(guard.has_value());
+    if (!guard) return {};
 
     uuid128_t const content_id = uuid_generator();
     variable_data_t data;
-    failures += build_variable(
-        count_k, [](std::size_t index) { return 1 + static_cast<std::int64_t>(index * 37 % 4096); }, data);
-    if (failures != 0) return failures;
+    if (!build_variable(
+            count_k, [](std::size_t index) { return 1 + static_cast<std::int64_t>(index * 37 % 4096); }, data))
+        return {};
 
     {
         expected<volume_t> mounted = (*fixture)->mount_volume(guard->channel());
-        failures += expect(mounted.has_value());
-        if (!mounted) return failures;
+        expect_true(mounted.has_value());
+        if (!mounted) return {};
 
         expected<variable_run_t> written = variable_run_t::write(
             *mounted, guard->channel(), uuid128_t {}, content_id, std::span<variable_slot_t const> {data.key_slots},
             std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())},
             std::span<std::uint8_t const> {data.kinds}, 0, std::span<byte_t const> {data.values},
             std::span<stored_value_offset_t const> {data.offsets}, 4096);
-        failures += expect(written.has_value());
-        if (!written) return failures;
-        failures += expect_eq(written->population_count(), static_cast<std::uint64_t>(count_k));
-        failures += expect_eq(written->lower_stored_key(), key_of(0));
-        failures += expect_eq(written->upper_stored_key(), key_of(count_k - 1));
-        failures += check_variable_values(*written, guard->channel(), data);
+        expect_true(written.has_value());
+        if (!written) return {};
+        expect_equal(written->population_count(), static_cast<std::uint64_t>(count_k));
+        expect_equal(written->lower_stored_key(), key_of(0));
+        expect_equal(written->upper_stored_key(), key_of(count_k - 1));
+        check_variable_values(*written, guard->channel(), data);
         manifest_file_t const files[] {file_of(written->extent(), content_id)};
-        failures += expect(publish_naming(*mounted, **fixture, guard->channel(), files).succeeded());
+        expect_true(publish_naming(*mounted, **fixture, guard->channel(), files).succeeded());
     }
 
     // A run is only really written once a volume mounted again from the manifest finds it.
     expected<volume_t> remounted = (*fixture)->mount_volume(guard->channel());
-    failures += expect(remounted.has_value());
-    if (!remounted) return failures;
-    failures += expect_eq(remounted->manifest().files.size(), std::size_t {1});
-    if (remounted->manifest().files.size() != 1) return failures;
+    expect_true(remounted.has_value());
+    if (!remounted) return {};
+    expect_equal(remounted->manifest().files.size(), std::size_t {1});
+    if (remounted->manifest().files.size() != 1) return {};
     expected<medium_extent_t> found = remounted->open(remounted->manifest().files[0]);
-    failures += expect(found.has_value());
-    if (!found) return failures;
+    expect_true(found.has_value());
+    if (!found) return {};
 
     expected<variable_run_t> opened = variable_run_t::open(*remounted, guard->channel(), *found);
-    failures += expect(opened.has_value());
-    if (!opened) return failures;
-    failures += expect_eq(opened->population_count(), static_cast<std::uint64_t>(count_k));
-    failures += expect(opened->content_id() == content_id);
-    failures += check_variable_values(*opened, guard->channel(), data);
-    return failures;
+    expect_true(opened.has_value());
+    if (!opened) return {};
+    expect_equal(opened->population_count(), static_cast<std::uint64_t>(count_k));
+    expect_true(opened->content_id() == content_id);
+    check_variable_values(*opened, guard->channel(), data);
+    return {};
 }
 
 /** A fixed-width run locates every value at one width, and reads them all back. */
 template <typename mount_type_>
-std::size_t fixed_width_run_reads_back(mount_type_ const& mount) {
+void test_fixed_width_run_reads_back(mount_type_ const& mount) {
     using types_t = run_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
     using volume_t = typename types_t::volume_t;
     using fixed_run_t = typename types_t::fixed_run_t;
-    std::size_t failures = 0;
     constexpr std::size_t count_k = 700;
     constexpr stored_value_size_t value_size_k = 512;
     expected<std::unique_ptr<fixture_t>> fixture = mount();
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return;
 
     expected<guard_t> guard = (*fixture)->channels.acquire();
-    failures += expect(guard.has_value());
-    if (!guard) return failures;
+    expect_true(guard.has_value());
+    if (!guard) return;
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
-    failures += expect(volume.has_value());
-    if (!volume) return failures;
+    expect_true(volume.has_value());
+    if (!volume) return;
 
     st::vector<fixed_slot_t> key_slots;
     st::vector<byte_t> values;
-    failures += expect(key_slots.resize(count_k) == st::status_t::success_k);
-    failures += expect(values.resize(count_k * value_size_k) == st::status_t::success_k);
-    if (failures != 0) return failures;
+    expect_true(key_slots.resize(count_k) == st::status_t::success_k);
+    if (!expect_true(values.resize(count_k * value_size_k) == st::status_t::success_k)) return;
     // Every seventh key is a removal, whose stride the run still spends and leaves zeroed.
     st::vector<std::uint8_t> kinds = written_kinds(count_k);
     for (std::size_t index = 0; index != count_k; ++index) {
@@ -296,73 +288,67 @@ std::size_t fixed_width_run_reads_back(mount_type_ const& mount) {
         *volume, guard->channel(), uuid128_t {}, uuid_generator(), std::span<fixed_slot_t const> {key_slots},
         std::span<std::uint64_t const> {ascending_stamps(key_slots.size())}, std::span<std::uint8_t const> {kinds}, 0,
         std::span<byte_t const> {values}, {}, value_size_k);
-    failures += expect(written.has_value());
-    if (!written) return failures;
+    expect_true(written.has_value());
+    if (!written) return;
 
     // A fixed-width run takes exactly one stride per key slot, and finds each value by stride from its position.
     expected<fixed_run_t> short_values = fixed_run_t::write(
         *volume, guard->channel(), uuid128_t {}, uuid_generator(), std::span<fixed_slot_t const> {key_slots},
         std::span<std::uint64_t const> {ascending_stamps(key_slots.size())}, std::span<std::uint8_t const> {kinds}, 0,
         std::span<byte_t const> {values}.first(values.size() - 1), {}, value_size_k);
-    failures += expect_status(short_values, status_code_t::invalid_argument_k);
+    expect_status(short_values, status_code_t::invalid_argument_k);
     std::uint64_t const values_begin = written->extent().extent.offset + fixed_layout_t::values_offset(count_k);
     for (std::size_t index = 0; index != count_k; ++index) {
         value_window_t const window = written->value_window(index);
         if (index % 7 == 3) {
-            failures += expect_eq(window.extent.length, std::uint64_t {0});
+            expect_equal(window.extent.length, std::uint64_t {0});
             continue;
         }
-        failures += expect_eq(window.extent.offset + window.skipped, values_begin + index * value_size_k);
-        failures += expect_eq(window.bytes, std::uint32_t {value_size_k});
+        expect_equal(window.extent.offset + window.skipped, values_begin + index * value_size_k);
+        expect_equal(window.bytes, std::uint32_t {value_size_k});
     }
 
     st::vector<std::uint64_t> positions;
-    failures += expect(positions.resize(count_k) == st::status_t::success_k);
-    if (failures != 0) return failures;
+    if (!expect_true(positions.resize(count_k) == st::status_t::success_k)) return;
     for (std::size_t index = 0; index != count_k; ++index) positions[index] = index;
 
     std::size_t mismatches = 0;
     st::vector<std::uint64_t> seen;
-    failures += expect(seen.resize(count_k) == st::status_t::success_k);
-    if (failures != 0) return failures;
+    if (!expect_true(seen.resize(count_k) == st::status_t::success_k)) return;
     for (std::size_t index = 0; index != count_k; ++index) seen[index] = 0;
     auto sink = [&](std::size_t request, std::uint64_t offset, std::span<byte_t const> bytes) noexcept {
         seen[request] += bytes.size();
         for (std::size_t index = 0; index != bytes.size(); ++index)
             if (bytes[index] != painted(request, offset + index)) ++mismatches;
     };
-    failures += expect(
-        written->read_values(guard->channel(), std::span<std::uint64_t const> {positions}, sink).succeeded());
-    failures += expect_eq(mismatches, std::size_t {0});
+    expect_true(written->read_values(guard->channel(), std::span<std::uint64_t const> {positions}, sink).succeeded());
+    expect_equal(mismatches, std::size_t {0});
     for (std::size_t index = 0; index != count_k; ++index)
-        failures += expect_eq(seen[index], static_cast<std::uint64_t>(index % 7 == 3 ? 0 : value_size_k));
-    return failures;
+        expect_equal(seen[index], static_cast<std::uint64_t>(index % 7 == 3 ? 0 : value_size_k));
 }
 
 /** An inline run carries its values in its key slots, so reading them moves no bytes at all. */
 template <typename mount_type_>
-std::size_t inline_run_needs_no_reads(mount_type_ const& mount) {
+void test_inline_run_needs_no_reads(mount_type_ const& mount) {
     using types_t = run_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
     using volume_t = typename types_t::volume_t;
     using inline_run_t = typename types_t::inline_run_t;
-    std::size_t failures = 0;
     constexpr std::size_t count_k = 300;
     expected<std::unique_ptr<fixture_t>> fixture = mount();
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return;
 
     expected<guard_t> guard = (*fixture)->channels.acquire();
-    failures += expect(guard.has_value());
-    if (!guard) return failures;
+    expect_true(guard.has_value());
+    if (!guard) return;
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
-    failures += expect(volume.has_value());
-    if (!volume) return failures;
+    expect_true(volume.has_value());
+    if (!volume) return;
 
     st::vector<inline_slot_t> key_slots;
-    failures += expect(key_slots.resize(count_k) == st::status_t::success_k);
-    if (failures != 0) return failures;
+    if (!expect_true(key_slots.resize(count_k) == st::status_t::success_k)) return;
     for (std::size_t index = 0; index != count_k; ++index) {
         inline_slot_t slot;
         slot.stored_key = key_of(index);
@@ -375,12 +361,11 @@ std::size_t inline_run_needs_no_reads(mount_type_ const& mount) {
         *volume, guard->channel(), uuid128_t {}, uuid_generator(), std::span<inline_slot_t const> {key_slots},
         std::span<std::uint64_t const> {ascending_stamps(key_slots.size())},
         std::span<std::uint8_t const> {written_kinds(key_slots.size())}, 0, std::span<byte_t const> {}, {}, 8);
-    failures += expect(written.has_value());
-    if (!written) return failures;
+    expect_true(written.has_value());
+    if (!written) return;
 
     st::vector<std::uint64_t> positions;
-    failures += expect(positions.resize(count_k) == st::status_t::success_k);
-    if (failures != 0) return failures;
+    if (!expect_true(positions.resize(count_k) == st::status_t::success_k)) return;
     for (std::size_t index = 0; index != count_k; ++index) positions[index] = index;
 
     std::size_t mismatches = 0;
@@ -392,17 +377,15 @@ std::size_t inline_run_needs_no_reads(mount_type_ const& mount) {
             if (bytes[index] != painted(request, offset + index)) ++mismatches;
     };
     std::size_t const before = (*fixture)->disk.outstanding(guard->channel().queue_pair());
-    failures += expect(
-        written->read_values(guard->channel(), std::span<std::uint64_t const> {positions}, sink).succeeded());
-    failures += expect_eq(seen, count_k);
-    failures += expect_eq(mismatches, std::size_t {0});
-    failures += expect_eq((*fixture)->disk.outstanding(guard->channel().queue_pair()), before);
+    expect_true(written->read_values(guard->channel(), std::span<std::uint64_t const> {positions}, sink).succeeded());
+    expect_equal(seen, count_k);
+    expect_equal(mismatches, std::size_t {0});
+    expect_equal((*fixture)->disk.outstanding(guard->channel().queue_pair()), before);
 
     // An inline run carries no values section, so its blob ends where its index does.
-    failures += expect_eq(written->size_bytes(),
-                          sorted_run_layout<inline_slot_t>::blob_bytes(count_k, 0, written->stamps().saved_bytes(),
-                                                                       written->kinds().saved_bytes()));
-    return failures;
+    expect_equal(written->size_bytes(),
+                 sorted_run_layout<inline_slot_t>::blob_bytes(count_k, 0, written->stamps().saved_bytes(),
+                                                              written->kinds().saved_bytes()));
 }
 
 #pragma endregion Round Trip Cases
@@ -446,82 +429,79 @@ status_t read_raw(disk_type_& disk, io_channel_t& channel, medium_extent_t const
  *  value window and tape window lands where a prefix sum of the sizes says, at the counts around a row of cells and a
  *  page of offsets. */
 template <typename mount_type_>
-std::size_t sections_sit_on_page_boundaries(mount_type_ const& mount) {
+void test_sections_sit_on_page_boundaries(mount_type_ const& mount) {
     using types_t = run_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
     using volume_t = typename types_t::volume_t;
     using variable_run_t = typename types_t::variable_run_t;
-    std::size_t failures = 0;
     expected<std::unique_ptr<fixture_t>> fixture = mount();
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return;
     expected<guard_t> guard = (*fixture)->channels.acquire();
-    failures += expect(guard.has_value());
-    if (!guard) return failures;
+    expect_true(guard.has_value());
+    if (!guard) return;
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
-    failures += expect(volume.has_value());
-    if (!volume) return failures;
+    expect_true(volume.has_value());
+    if (!volume) return;
 
     // A page of offsets holds 1024 of them, so 1023 key slots fill it with the one past the last and 1024 spill.
     std::array<std::size_t, 7> const counts {0, 1, 15, 16, 1023, 1024, 1025};
     for (std::size_t const count : counts) {
         variable_data_t data;
-        failures += build_variable(
-            count,
-            [](std::size_t index) -> std::int64_t {
-                if (index % 11 == 5) return -1;
-                return static_cast<std::int64_t>(index * 37 % 300);
-            },
-            data);
-        if (failures != 0) return failures;
+        if (!build_variable(
+                count,
+                [](std::size_t index) -> std::int64_t {
+                    if (index % 11 == 5) return -1;
+                    return static_cast<std::int64_t>(index * 37 % 300);
+                },
+                data))
+            return;
         expected<variable_run_t> run = variable_run_t::write(
             *volume, guard->channel(), uuid128_t {}, uuid_generator(),
             std::span<variable_slot_t const> {data.key_slots}, std::span<std::uint64_t const> {ascending_stamps(count)},
             std::span<std::uint8_t const> {data.kinds}, 0, std::span<byte_t const> {data.values},
             std::span<stored_value_offset_t const> {data.offsets}, 4096);
-        failures += expect(run.has_value());
-        if (!run) return failures;
+        expect_true(run.has_value());
+        if (!run) return;
 
         std::uint64_t const keys_section = variable_layout_t::keys_offset(count);
         std::uint64_t const offsets_section = variable_layout_t::value_offsets_offset(count);
         std::uint64_t const values_section = variable_layout_t::values_offset(count);
         std::uint64_t const trailer_section = variable_layout_t::stamps_offset(count, data.values.size());
         // A cell that is its key alone is not saved, so the tree of the keys follows the header.
-        failures += expect_eq(keys_section, variable_layout_t::header_bytes());
-        failures += expect_eq(offsets_section - keys_section,
-                              round_up_to_multiple(variable_layout_t::keys_saved_bytes(count), portable_alignment_k));
-        failures += expect_eq(values_section - offsets_section,
-                              round_up_to_multiple((count + 1) * 4, portable_alignment_k));
-        failures += expect_eq(trailer_section - values_section,
-                              round_up_to_multiple(data.values.size(), portable_alignment_k));
-        failures += expect_eq(offsets_section % portable_alignment_k, std::uint64_t {0});
-        failures += expect_eq(values_section % portable_alignment_k, std::uint64_t {0});
-        failures += expect_eq(trailer_section % portable_alignment_k, std::uint64_t {0});
+        expect_equal(keys_section, variable_layout_t::header_bytes());
+        expect_equal(offsets_section - keys_section,
+                     round_up_to_multiple(variable_layout_t::keys_saved_bytes(count), portable_alignment_k));
+        expect_equal(values_section - offsets_section, round_up_to_multiple((count + 1) * 4, portable_alignment_k));
+        expect_equal(trailer_section - values_section, round_up_to_multiple(data.values.size(), portable_alignment_k));
+        expect_equal(offsets_section % portable_alignment_k, std::uint64_t {0});
+        expect_equal(values_section % portable_alignment_k, std::uint64_t {0});
+        expect_equal(trailer_section % portable_alignment_k, std::uint64_t {0});
 
         // The header, the offsets and the values read raw off the blob as the run was handed them.
         st::vector<byte_t> stored_bytes;
-        failures += expect(
-            read_raw((*fixture)->disk, guard->channel(), run->extent(), 0, values_section, stored_bytes).succeeded());
-        if (failures != 0) return failures;
+        if (!expect_true(read_raw((*fixture)->disk, guard->channel(), run->extent(), 0, values_section, stored_bytes)
+                             .succeeded()))
+            return;
         sorted_run_header_t header {};
         std::memcpy(&header, stored_bytes.data(), sizeof(header));
-        failures += expect_eq(header.format_version, std::uint32_t {1});
-        failures += expect_eq(header.key_slot_bytes, std::uint32_t {sizeof(variable_slot_t)});
-        failures += expect_eq(header.stored_values_bytes, std::uint64_t {data.values.size()});
+        expect_equal(header.format_version, std::uint32_t {1});
+        expect_equal(header.key_slot_bytes, std::uint32_t {sizeof(variable_slot_t)});
+        expect_equal(header.stored_values_bytes, std::uint64_t {data.values.size()});
         std::size_t wrong_offsets = 0;
         for (std::size_t index = 0; index <= count; ++index) {
             stored_value_offset_t offset = 0;
             std::memcpy(&offset, stored_bytes.data() + offsets_section + index * sizeof(offset), sizeof(offset));
             wrong_offsets += offset != data.offsets[index];
         }
-        failures += expect_eq(wrong_offsets, std::size_t {0});
+        expect_equal(wrong_offsets, std::size_t {0});
         if (!data.values.empty()) {
-            failures += expect(read_raw((*fixture)->disk, guard->channel(), run->extent(), values_section,
-                                        round_up_to_multiple(data.values.size(), portable_alignment_k), stored_bytes)
-                                   .succeeded());
-            failures += expect(same_bytes(std::span<byte_t const> {stored_bytes}.first(data.values.size()),
-                                          std::span<byte_t const> {data.values}));
+            expect_true(read_raw((*fixture)->disk, guard->channel(), run->extent(), values_section,
+                                 round_up_to_multiple(data.values.size(), portable_alignment_k), stored_bytes)
+                            .succeeded());
+            expect_true(same_bytes(std::span<byte_t const> {stored_bytes}.first(data.values.size()),
+                                   std::span<byte_t const> {data.values}));
         }
 
         // Every point window covers its value at the values section plus the prefix sum of the sizes before it.
@@ -539,54 +519,52 @@ std::size_t sections_sit_on_page_boundaries(mount_type_ const& mount) {
                              window.extent.length % portable_alignment_k != 0 ||
                              window.skipped + window.bytes > window.extent.length;
         }
-        failures += expect_eq(wrong_windows, std::size_t {0});
+        expect_equal(wrong_windows, std::size_t {0});
 
         // The whole run's tape starts at offset zero, so it reads with no rebase; a slice rebases from its first.
         value_tape_window_t const whole = run->value_tape_window(0, count);
-        failures += expect_eq(whole.offsets.offset, run->extent().extent.offset + offsets_section);
-        failures += expect_eq(whole.offsets_skipped, std::uint32_t {0});
-        failures += expect_eq(whole.first_offset, std::uint32_t {0});
-        failures += expect_eq(std::uint64_t {whole.bytes}, std::uint64_t {data.values.size()});
+        expect_equal(whole.offsets.offset, run->extent().extent.offset + offsets_section);
+        expect_equal(whole.offsets_skipped, std::uint32_t {0});
+        expect_equal(whole.first_offset, std::uint32_t {0});
+        expect_equal(std::uint64_t {whole.bytes}, std::uint64_t {data.values.size()});
         std::size_t const begin = count / 3;
         std::size_t const end = count - count / 3;
         value_tape_window_t const slice = run->value_tape_window(begin, end);
-        failures += expect_eq(slice.offsets.offset + slice.offsets_skipped,
-                              run->extent().extent.offset + offsets_section + begin * sizeof(stored_value_offset_t));
-        failures += expect(slice.offsets_skipped + (end - begin + 1) * sizeof(stored_value_offset_t) <=
-                           slice.offsets.length);
-        failures += expect_eq(slice.first_offset, data.offsets[begin]);
-        failures += expect_eq(slice.bytes, data.offsets[end] - data.offsets[begin]);
+        expect_equal(slice.offsets.offset + slice.offsets_skipped,
+                     run->extent().extent.offset + offsets_section + begin * sizeof(stored_value_offset_t));
+        expect_true(slice.offsets_skipped + (end - begin + 1) * sizeof(stored_value_offset_t) <= slice.offsets.length);
+        expect_equal(slice.first_offset, data.offsets[begin]);
+        expect_equal(slice.bytes, data.offsets[end] - data.offsets[begin]);
         if (slice.bytes != 0)
-            failures += expect_eq(slice.values.offset + slice.values_skipped, values_begin + data.offsets[begin]);
+            expect_equal(slice.values.offset + slice.values_skipped, values_begin + data.offsets[begin]);
     }
-    return failures;
 }
 
 /** A run written as @c reserve, @c write_sections and @c open holds on its extent every byte
  *  @c write leaves there for the same key slots under the same name. */
 template <typename mount_type_>
-std::size_t split_write_matches_write(mount_type_ const& mount) {
+void test_split_write_matches_write(mount_type_ const& mount) {
     using types_t = run_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
     using volume_t = typename types_t::volume_t;
     using variable_run_t = typename types_t::variable_run_t;
-    std::size_t failures = 0;
     expected<std::unique_ptr<fixture_t>> fixture = mount();
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return;
     expected<guard_t> guard = (*fixture)->channels.acquire();
-    failures += expect(guard.has_value());
-    if (!guard) return failures;
+    expect_true(guard.has_value());
+    if (!guard) return;
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
-    failures += expect(volume.has_value());
-    if (!volume) return failures;
+    expect_true(volume.has_value());
+    if (!volume) return;
 
     variable_data_t data;
-    failures += build_variable(
-        1025, [](std::size_t index) -> std::int64_t { return index % 11 == 5 ? -1 : std::int64_t(index * 37 % 300); },
-        data);
-    if (failures != 0) return failures;
+    if (!build_variable(
+            1025,
+            [](std::size_t index) -> std::int64_t { return index % 11 == 5 ? -1 : std::int64_t(index * 37 % 300); },
+            data))
+        return;
     st::vector<std::uint64_t> const stamps = ascending_stamps(data.key_slots.size());
     std::span<variable_slot_t const> const key_slots {data.key_slots};
     std::span<byte_t const> const values {data.values};
@@ -599,9 +577,9 @@ std::size_t split_write_matches_write(mount_type_ const& mount) {
         expected<variable_run_t> whole = variable_run_t::write(
             *volume, guard->channel(), uuid128_t {}, content_id, key_slots, std::span<std::uint64_t const> {stamps},
             std::span<std::uint8_t const> {data.kinds}, 0, values, offsets, 4096);
-        failures += expect(whole.has_value());
-        if (!whole) return failures;
-        failures += expect(
+        expect_true(whole.has_value());
+        if (!whole) return;
+        expect_true(
             read_raw((*fixture)->disk, guard->channel(), whole->extent(), 0, whole->extent().extent.length, whole_bytes)
                 .succeeded());
         whole_extent = whole->extent();
@@ -611,20 +589,18 @@ std::size_t split_write_matches_write(mount_type_ const& mount) {
     expected<sorted_run_reservation_t> reservation = variable_run_t::reserve(
         *volume, guard->channel(), uuid128_t {}, content_id, key_slots, std::span<std::uint64_t const> {stamps},
         std::span<std::uint8_t const> {data.kinds}, 0, values, offsets, 4096);
-    failures += expect(reservation.has_value());
-    if (!reservation) return failures;
-    failures += expect(
-        variable_run_t::write_sections(*volume, guard->channel(), *reservation, key_slots, values, offsets)
-            .succeeded());
+    expect_true(reservation.has_value());
+    if (!reservation) return;
+    expect_true(variable_run_t::write_sections(*volume, guard->channel(), *reservation, key_slots, values, offsets)
+                    .succeeded());
     expected<variable_run_t> split = variable_run_t::open(*volume, guard->channel(), reservation->extent);
-    failures += expect(split.has_value());
-    if (!split) return failures;
+    expect_true(split.has_value());
+    if (!split) return;
     st::vector<byte_t> split_bytes;
-    failures += expect(
+    expect_true(
         read_raw((*fixture)->disk, guard->channel(), split->extent(), 0, split->extent().extent.length, split_bytes)
             .succeeded());
-    failures += expect(same_bytes(std::span<byte_t const> {whole_bytes}, std::span<byte_t const> {split_bytes}));
-    return failures;
+    expect_true(same_bytes(std::span<byte_t const> {whole_bytes}, std::span<byte_t const> {split_bytes}));
 }
 
 #pragma endregion Layout Cases
@@ -666,89 +642,86 @@ status_t paint_stub_header(disk_type_& disk, io_channel_t& channel, medium_refer
 
 /** A run whose index runs off the end of its medium is malformed, and attaches nothing. */
 template <typename mount_type_>
-case_result_t truncated_index_is_malformed(mount_type_ const& mount) {
+case_result_t test_truncated_index_is_malformed(mount_type_ const& mount) {
     using types_t = run_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
     using volume_t = typename types_t::volume_t;
     using variable_run_t = typename types_t::variable_run_t;
-    std::size_t failures = 0;
     constexpr std::uint64_t claimed_k = 4000;
     if (char const* const reason = mount.refusal(2)) return case_result_t::skipped(reason);
     std::array<std::uint64_t, 2> const capacities {run_config_k.volume_bytes, stub_bytes_k};
     expected<std::unique_ptr<fixture_t>> fixture = mount(capacities);
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return {};
 
     expected<guard_t> guard = (*fixture)->channels.acquire();
-    failures += expect(guard.has_value());
-    if (!guard) return failures;
+    expect_true(guard.has_value());
+    if (!guard) return {};
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
-    failures += expect(volume.has_value());
-    if (!volume) return failures;
+    expect_true(volume.has_value());
+    if (!volume) return {};
 
     medium_reference_t const stub = (*fixture)->media[1].reference();
-    failures += expect(paint_stub_header((*fixture)->disk, guard->channel(), stub, claimed_k).succeeded());
+    expect_true(paint_stub_header((*fixture)->disk, guard->channel(), stub, claimed_k).succeeded());
 
     // The extent is as long as the run claims, so nothing but the medium can cut the index short.
     medium_extent_t handed;
     handed.medium = stub;
     handed.extent = extent_t {0, variable_layout_t::blob_bytes(claimed_k, 0, 0, 0)};
-    failures += expect(handed.extent.length > stub_bytes_k);
+    expect_true(handed.extent.length > stub_bytes_k);
 
     expected<variable_run_t> attached = variable_run_t::open(*volume, guard->channel(), handed);
-    failures += expect(!attached.has_value());
-    failures += expect_status(attached, status_code_t::malformed_k);
+    expect_true(!attached.has_value());
+    expect_status(attached, status_code_t::malformed_k);
 
     // An extent shorter than the run it carries is refused before a byte of the index is asked for.
     medium_extent_t clipped = handed;
     clipped.extent = extent_t {0, run_config_k.page_bytes * 2};
     expected<variable_run_t> narrow = variable_run_t::open(*volume, guard->channel(), clipped);
-    failures += expect(!narrow.has_value());
-    failures += expect_status(narrow, status_code_t::malformed_k);
+    expect_true(!narrow.has_value());
+    expect_status(narrow, status_code_t::malformed_k);
 
     // An extent with no header at all is refused as well, rather than read as an empty run.
     medium_extent_t blank = handed;
     blank.extent = extent_t {run_config_k.page_bytes, run_config_k.page_bytes};
     expected<variable_run_t> unwritten = variable_run_t::open(*volume, guard->channel(), blank);
-    failures += expect(!unwritten.has_value());
-    failures += expect_status(unwritten, status_code_t::malformed_k);
+    expect_true(!unwritten.has_value());
+    expect_status(unwritten, status_code_t::malformed_k);
 
     // Trailer lengths whose sum wraps to nothing fit no extent either.
-    failures += expect(
+    expect_true(
         paint_stub_header((*fixture)->disk, guard->channel(), stub, 1, (std::numeric_limits<std::uint64_t>::max)(), 1)
             .succeeded());
     medium_extent_t wrapped = handed;
     wrapped.extent = extent_t {0, stub_bytes_k};
     expected<variable_run_t> forged = variable_run_t::open(*volume, guard->channel(), wrapped);
-    failures += expect(!forged.has_value());
-    failures += expect_status(forged, status_code_t::malformed_k);
-    return failures;
+    expect_true(!forged.has_value());
+    expect_status(forged, status_code_t::malformed_k);
+    return {};
 }
 
 /** A run opens again from its extent until the volume deallocates it, and then opens nothing. */
 template <typename mount_type_>
-std::size_t deallocated_run_opens_nothing(mount_type_ const& mount) {
+void test_deallocated_run_opens_nothing(mount_type_ const& mount) {
     using types_t = run_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
     using volume_t = typename types_t::volume_t;
     using variable_run_t = typename types_t::variable_run_t;
-    std::size_t failures = 0;
     expected<std::unique_ptr<fixture_t>> fixture = mount();
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return;
 
     expected<guard_t> guard = (*fixture)->channels.acquire();
-    failures += expect(guard.has_value());
-    if (!guard) return failures;
+    expect_true(guard.has_value());
+    if (!guard) return;
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
-    failures += expect(volume.has_value());
-    if (!volume) return failures;
+    expect_true(volume.has_value());
+    if (!volume) return;
 
     variable_data_t data;
-    failures += build_variable(32, [](std::size_t) { return std::int64_t {64}; }, data);
-    if (failures != 0) return failures;
+    if (!build_variable(32, [](std::size_t) { return std::int64_t {64}; }, data)) return;
     medium_extent_t extent;
     {
         expected<variable_run_t> written = variable_run_t::write(
@@ -757,17 +730,16 @@ std::size_t deallocated_run_opens_nothing(mount_type_ const& mount) {
             std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())},
             std::span<std::uint8_t const> {data.kinds}, 0, std::span<byte_t const> {data.values},
             std::span<stored_value_offset_t const> {data.offsets}, 4096);
-        failures += expect(written.has_value());
-        if (!written) return failures;
+        expect_true(written.has_value());
+        if (!written) return;
         extent = written->extent();
     }
     expected<variable_run_t> reopened = variable_run_t::open(*volume, guard->channel(), extent);
-    failures += expect(reopened.has_value());
+    expect_true(reopened.has_value());
 
     volume->deallocate(extent);
     expected<variable_run_t> dropped = variable_run_t::open(*volume, guard->channel(), extent);
-    failures += expect(!dropped.has_value());
-    return failures;
+    expect_true(!dropped.has_value());
 }
 
 #pragma endregion Truncation Cases
@@ -776,53 +748,51 @@ std::size_t deallocated_run_opens_nothing(mount_type_ const& mount) {
 
 /** A present key is found at its own position, and an absent one is reported as nothing. */
 template <typename mount_type_>
-std::size_t point_lookup_finds_and_misses(mount_type_ const& mount) {
+void test_point_lookup_finds_and_misses(mount_type_ const& mount) {
     using types_t = run_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
     using volume_t = typename types_t::volume_t;
     using variable_run_t = typename types_t::variable_run_t;
-    std::size_t failures = 0;
     constexpr std::size_t count_k = 811;
     expected<std::unique_ptr<fixture_t>> fixture = mount();
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return;
 
     expected<guard_t> guard = (*fixture)->channels.acquire();
-    failures += expect(guard.has_value());
-    if (!guard) return failures;
+    expect_true(guard.has_value());
+    if (!guard) return;
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
-    failures += expect(volume.has_value());
-    if (!volume) return failures;
+    expect_true(volume.has_value());
+    if (!volume) return;
 
     variable_data_t data;
-    failures += build_variable(
-        count_k, [](std::size_t index) { return 1 + static_cast<std::int64_t>(index % 97); }, data);
-    if (failures != 0) return failures;
+    if (!build_variable(count_k, [](std::size_t index) { return 1 + static_cast<std::int64_t>(index % 97); }, data))
+        return;
     expected<variable_run_t> run = variable_run_t::write(
         *volume, guard->channel(), uuid128_t {}, uuid_generator(), std::span<variable_slot_t const> {data.key_slots},
         std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())},
         std::span<std::uint8_t const> {data.kinds}, 0, std::span<byte_t const> {data.values},
         std::span<stored_value_offset_t const> {data.offsets}, 4096);
-    failures += expect(run.has_value());
-    if (!run) return failures;
+    expect_true(run.has_value());
+    if (!run) return;
 
     for (std::size_t index = 0; index != count_k; ++index) {
         std::uint64_t position = 0;
-        failures += expect(run->find(key_of(index), position) == lookup_result_t::written_k);
-        failures += expect_eq(position, static_cast<std::uint64_t>(index));
-        failures += expect_eq(run->key_slot(position).stored_key, key_of(index));
+        expect_true(run->find(key_of(index), position) == lookup_result_t::written_k);
+        expect_equal(position, static_cast<std::uint64_t>(index));
+        expect_equal(run->key_slot(position).stored_key, key_of(index));
     }
     for (std::size_t index = 0; index != count_k; ++index) {
         std::uint64_t position = 0;
-        failures += expect(run->find(key_of(index) + 1, position) == lookup_result_t::missing_k);
-        failures += expect_eq(position, static_cast<std::uint64_t>(count_k));
+        expect_true(run->find(key_of(index) + 1, position) == lookup_result_t::missing_k);
+        expect_equal(position, static_cast<std::uint64_t>(count_k));
     }
 
     // Keys outside the run's bounds miss as cleanly as keys inside the gaps do.
     std::uint64_t position = 0;
-    failures += expect(run->find(0, position) == lookup_result_t::missing_k);
-    failures += expect(run->find(key_of(count_k) + 1000, position) == lookup_result_t::missing_k);
+    expect_true(run->find(0, position) == lookup_result_t::missing_k);
+    expect_true(run->find(key_of(count_k) + 1000, position) == lookup_result_t::missing_k);
 
     // A walk visits every key slot exactly once, in ascending order of the keys.
     std::size_t visited = 0;
@@ -834,57 +804,54 @@ std::size_t point_lookup_finds_and_misses(mount_type_ const& mount) {
         previous = slot.stored_key;
         ++visited;
     });
-    failures += expect_eq(visited, count_k);
-    failures += expect_eq(disordered, std::size_t {0});
-    return failures;
+    expect_equal(visited, count_k);
+    expect_equal(disordered, std::size_t {0});
 }
 
 /** Every lookup of a run reopened from its volume lands where the saved tree of its keys, read raw
  *  off the volume, ranks it, over every present and absent key across a tree three levels deep. */
 template <typename mount_type_>
-std::size_t lookups_descend_the_saved_tree(mount_type_ const& mount) {
+void test_lookups_descend_the_saved_tree(mount_type_ const& mount) {
     using types_t = run_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
     using volume_t = typename types_t::volume_t;
     using variable_run_t = typename types_t::variable_run_t;
     using keys_view_t = typename variable_layout_t::keys_view_t;
-    std::size_t failures = 0;
     constexpr std::size_t count_k = 5000;
     expected<std::unique_ptr<fixture_t>> fixture = mount();
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return;
     expected<guard_t> guard = (*fixture)->channels.acquire();
-    failures += expect(guard.has_value());
-    if (!guard) return failures;
+    expect_true(guard.has_value());
+    if (!guard) return;
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
-    failures += expect(volume.has_value());
-    if (!volume) return failures;
+    expect_true(volume.has_value());
+    if (!volume) return;
 
     variable_data_t data;
-    failures += build_variable(count_k, [](std::size_t index) { return static_cast<std::int64_t>(index % 5); }, data);
-    if (failures != 0) return failures;
+    if (!build_variable(count_k, [](std::size_t index) { return static_cast<std::int64_t>(index % 5); }, data)) return;
     expected<variable_run_t> written = variable_run_t::write(
         *volume, guard->channel(), uuid128_t {}, uuid_generator(), std::span<variable_slot_t const> {data.key_slots},
         std::span<std::uint64_t const> {ascending_stamps(count_k)}, std::span<std::uint8_t const> {data.kinds}, 0,
         std::span<byte_t const> {data.values}, std::span<stored_value_offset_t const> {data.offsets}, 4096);
-    failures += expect(written.has_value());
-    if (!written) return failures;
+    expect_true(written.has_value());
+    if (!written) return;
     expected<variable_run_t> run = variable_run_t::open(*volume, guard->channel(), written->extent());
-    failures += expect(run.has_value());
-    if (!run) return failures;
+    expect_true(run.has_value());
+    if (!run) return;
 
     st::vector<byte_t> saved_bytes;
-    failures += expect(read_raw((*fixture)->disk, guard->channel(), run->extent(),
-                                variable_layout_t::keys_offset(count_k), variable_layout_t::keys_section_bytes(count_k),
-                                saved_bytes)
-                           .succeeded());
-    if (failures != 0) return failures;
+    if (!expect_true(read_raw((*fixture)->disk, guard->channel(), run->extent(),
+                              variable_layout_t::keys_offset(count_k), variable_layout_t::keys_section_bytes(count_k),
+                              saved_bytes)
+                         .succeeded()))
+        return;
     st::expected<keys_view_t> const saved = keys_view_t::make(std::as_bytes(std::span<byte_t const> {saved_bytes}));
-    failures += expect(saved.has_value());
-    if (!saved) return failures;
-    failures += expect_eq(saved->size(), count_k);
-    failures += expect_eq(run->keys().size(), count_k);
+    expect_true(saved.has_value());
+    if (!saved) return;
+    expect_equal(saved->size(), count_k);
+    expect_equal(run->keys().size(), count_k);
 
     std::size_t misranked = 0;
     std::size_t misfound = 0;
@@ -898,100 +865,95 @@ std::size_t lookups_descend_the_saved_tree(mount_type_ const& mount) {
         misfound += present ? result == lookup_result_t::missing_k || position != below
                             : result != lookup_result_t::missing_k;
     }
-    failures += expect_eq(misranked, std::size_t {0});
-    failures += expect_eq(misfound, std::size_t {0});
-    return failures;
+    expect_equal(misranked, std::size_t {0});
+    expect_equal(misfound, std::size_t {0});
 }
 
 /** A run of one key slot and a run of none both open, and answer the only questions they can. */
 template <typename mount_type_>
-std::size_t runs_at_the_smallest_sizes(mount_type_ const& mount) {
+void test_runs_at_the_smallest_sizes(mount_type_ const& mount) {
     using types_t = run_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
     using volume_t = typename types_t::volume_t;
     using variable_run_t = typename types_t::variable_run_t;
-    std::size_t failures = 0;
     expected<std::unique_ptr<fixture_t>> fixture = mount();
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return;
 
     expected<guard_t> guard = (*fixture)->channels.acquire();
-    failures += expect(guard.has_value());
-    if (!guard) return failures;
+    expect_true(guard.has_value());
+    if (!guard) return;
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
-    failures += expect(volume.has_value());
-    if (!volume) return failures;
+    expect_true(volume.has_value());
+    if (!volume) return;
 
     variable_data_t alone;
-    failures += build_variable(1, [](std::size_t) { return std::int64_t {7}; }, alone);
-    if (failures != 0) return failures;
+    if (!build_variable(1, [](std::size_t) { return std::int64_t {7}; }, alone)) return;
     expected<variable_run_t> alone_run = variable_run_t::write(
         *volume, guard->channel(), uuid128_t {}, uuid_generator(), std::span<variable_slot_t const> {alone.key_slots},
         std::span<std::uint64_t const> {ascending_stamps(alone.key_slots.size())},
         std::span<std::uint8_t const> {alone.kinds}, 0, std::span<byte_t const> {alone.values},
         std::span<stored_value_offset_t const> {alone.offsets}, 4096);
-    failures += expect(alone_run.has_value());
-    if (!alone_run) return failures;
-    failures += expect_eq(alone_run->population_count(), std::uint64_t {1});
-    failures += expect_eq(alone_run->lower_stored_key(), key_of(0));
-    failures += expect_eq(alone_run->upper_stored_key(), key_of(0));
+    expect_true(alone_run.has_value());
+    if (!alone_run) return;
+    expect_equal(alone_run->population_count(), std::uint64_t {1});
+    expect_equal(alone_run->lower_stored_key(), key_of(0));
+    expect_equal(alone_run->upper_stored_key(), key_of(0));
     std::uint64_t position = 0;
-    failures += expect(alone_run->find(key_of(0), position) == lookup_result_t::written_k);
-    failures += expect_eq(position, std::uint64_t {0});
-    failures += expect(alone_run->find(key_of(1), position) == lookup_result_t::missing_k);
-    failures += check_variable_values(*alone_run, guard->channel(), alone);
+    expect_true(alone_run->find(key_of(0), position) == lookup_result_t::written_k);
+    expect_equal(position, std::uint64_t {0});
+    expect_true(alone_run->find(key_of(1), position) == lookup_result_t::missing_k);
+    check_variable_values(*alone_run, guard->channel(), alone);
 
     variable_data_t none;
-    failures += build_variable(0, [](std::size_t) { return std::int64_t {0}; }, none);
+    build_variable(0, [](std::size_t) { return std::int64_t {0}; }, none);
     expected<variable_run_t> empty = variable_run_t::write(
         *volume, guard->channel(), uuid128_t {}, uuid_generator(), std::span<variable_slot_t const> {none.key_slots},
         std::span<std::uint64_t const> {ascending_stamps(none.key_slots.size())},
         std::span<std::uint8_t const> {none.kinds}, 0, std::span<byte_t const> {none.values},
         std::span<stored_value_offset_t const> {none.offsets}, 4096);
-    failures += expect(empty.has_value());
-    if (!empty) return failures;
-    failures += expect_eq(empty->population_count(), std::uint64_t {0});
+    expect_true(empty.has_value());
+    if (!empty) return;
+    expect_equal(empty->population_count(), std::uint64_t {0});
     // An empty run is its header, the page of its empty tree, the page of its one value offset, and
     // the trailer of empty stamps and kinds columns
-    failures += expect_eq(empty->size_bytes(), variable_layout_t::header_bytes() + 2 * portable_alignment_k +
-                                                   variable_layout_t::trailer_bytes(empty->stamps().saved_bytes(),
-                                                                                    empty->kinds().saved_bytes()));
-    failures += expect(empty->lower_stored_key() == limit<stored_key_t>::max_k);
-    failures += expect(empty->upper_stored_key() == limit<stored_key_t>::min_k);
-    failures += expect(empty->find(key_of(0), position) == lookup_result_t::missing_k);
-    failures += expect_eq(position, std::uint64_t {0});
-    failures += check_variable_values(*empty, guard->channel(), none);
+    expect_equal(empty->size_bytes(),
+                 variable_layout_t::header_bytes() + 2 * portable_alignment_k +
+                     variable_layout_t::trailer_bytes(empty->stamps().saved_bytes(), empty->kinds().saved_bytes()));
+    expect_true(empty->lower_stored_key() == limit<stored_key_t>::max_k);
+    expect_true(empty->upper_stored_key() == limit<stored_key_t>::min_k);
+    expect_true(empty->find(key_of(0), position) == lookup_result_t::missing_k);
+    expect_equal(position, std::uint64_t {0});
+    check_variable_values(*empty, guard->channel(), none);
 
     // Both survive a reopen, which is where a zero-length index would have been read anyway.
     expected<variable_run_t> reopened_alone = variable_run_t::open(*volume, guard->channel(), alone_run->extent());
-    failures += expect(reopened_alone.has_value());
+    expect_true(reopened_alone.has_value());
     expected<variable_run_t> reopened_empty = variable_run_t::open(*volume, guard->channel(), empty->extent());
-    failures += expect(reopened_empty.has_value());
-    if (reopened_empty) failures += expect_eq(reopened_empty->population_count(), std::uint64_t {0});
-    return failures;
+    expect_true(reopened_empty.has_value());
+    if (reopened_empty) expect_equal(reopened_empty->population_count(), std::uint64_t {0});
 }
 
 /** Values at both ends of what the layout admits read back whole, across as many blocks as they need. */
 template <typename mount_type_>
-std::size_t values_section_the_size_extremes(mount_type_ const& mount) {
+void test_values_section_the_size_extremes(mount_type_ const& mount) {
     using types_t = run_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
     using volume_t = typename types_t::volume_t;
     using variable_run_t = typename types_t::variable_run_t;
-    std::size_t failures = 0;
     constexpr std::int64_t largest_k = 192 * 1024;
     expected<std::unique_ptr<fixture_t>> fixture = mount();
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return;
 
     expected<guard_t> guard = (*fixture)->channels.acquire();
-    failures += expect(guard.has_value());
-    if (!guard) return failures;
+    expect_true(guard.has_value());
+    if (!guard) return;
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
-    failures += expect(volume.has_value());
-    if (!volume) return failures;
+    expect_true(volume.has_value());
+    if (!volume) return;
 
     // One byte, one empty value, one that fills a block exactly, and one that spans several.
     auto sized = [](std::size_t index) -> std::int64_t {
@@ -1004,51 +966,48 @@ std::size_t values_section_the_size_extremes(mount_type_ const& mount) {
         }
     };
     variable_data_t data;
-    failures += build_variable(40, sized, data);
-    if (failures != 0) return failures;
+    if (!build_variable(40, sized, data)) return;
 
     expected<variable_run_t> run = variable_run_t::write(
         *volume, guard->channel(), uuid128_t {}, uuid_generator(), std::span<variable_slot_t const> {data.key_slots},
         std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())},
         std::span<std::uint8_t const> {data.kinds}, 0, std::span<byte_t const> {data.values},
         std::span<stored_value_offset_t const> {data.offsets}, largest_k);
-    failures += expect(run.has_value());
-    if (!run) return failures;
-    failures += check_variable_values(*run, guard->channel(), data);
+    expect_true(run.has_value());
+    if (!run) return;
+    check_variable_values(*run, guard->channel(), data);
 
     // The widest value needs more than one block, so its window is wider than the channel's block.
     std::uint64_t position = 0;
-    failures += expect(run->find(key_of(3), position) == lookup_result_t::written_k);
+    expect_true(run->find(key_of(3), position) == lookup_result_t::written_k);
     value_window_t const widest = run->value_window(position);
-    failures += expect(widest.extent.length > run_config_k.request_buffer_bytes);
-    failures += expect_eq(static_cast<std::uint64_t>(widest.bytes), static_cast<std::uint64_t>(largest_k));
+    expect_true(widest.extent.length > run_config_k.request_buffer_bytes);
+    expect_equal(static_cast<std::uint64_t>(widest.bytes), static_cast<std::uint64_t>(largest_k));
 
     // A present but empty value needs no read at all, and says so with an empty window.
-    failures += expect(run->find(key_of(1), position) == lookup_result_t::written_k);
-    failures += expect_eq(run->value_window(position).extent.length, std::uint64_t {0});
-    return failures;
+    expect_true(run->find(key_of(1), position) == lookup_result_t::written_k);
+    expect_equal(run->value_window(position).extent.length, std::uint64_t {0});
 }
 
 /** A remove delta is a key the run carries and a value it does not, at every layer that reports it. */
 template <typename mount_type_>
-std::size_t remove_deltas_read_back_as_removals(mount_type_ const& mount) {
+void test_remove_deltas_read_back_as_removals(mount_type_ const& mount) {
     using types_t = run_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
     using volume_t = typename types_t::volume_t;
     using variable_run_t = typename types_t::variable_run_t;
-    std::size_t failures = 0;
     constexpr std::size_t count_k = 401;
     expected<std::unique_ptr<fixture_t>> fixture = mount();
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return;
 
     expected<guard_t> guard = (*fixture)->channels.acquire();
-    failures += expect(guard.has_value());
-    if (!guard) return failures;
+    expect_true(guard.has_value());
+    if (!guard) return;
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
-    failures += expect(volume.has_value());
-    if (!volume) return failures;
+    expect_true(volume.has_value());
+    if (!volume) return;
 
     // Every third key is removed, every fifth holds a value that is present and empty.
     auto sized = [](std::size_t index) -> std::int64_t {
@@ -1057,8 +1016,7 @@ std::size_t remove_deltas_read_back_as_removals(mount_type_ const& mount) {
         return 1 + static_cast<std::int64_t>(index % 613);
     };
     variable_data_t data;
-    failures += build_variable(count_k, sized, data);
-    if (failures != 0) return failures;
+    if (!build_variable(count_k, sized, data)) return;
 
     medium_extent_t extent;
     {
@@ -1068,36 +1026,35 @@ std::size_t remove_deltas_read_back_as_removals(mount_type_ const& mount) {
             std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())},
             std::span<std::uint8_t const> {data.kinds}, 0, std::span<byte_t const> {data.values},
             std::span<stored_value_offset_t const> {data.offsets}, 4096);
-        failures += expect(written.has_value());
-        if (!written) return failures;
+        expect_true(written.has_value());
+        if (!written) return;
         extent = written->extent();
     }
     expected<variable_run_t> run = variable_run_t::open(*volume, guard->channel(), extent);
-    failures += expect(run.has_value());
-    if (!run) return failures;
+    expect_true(run.has_value());
+    if (!run) return;
 
     for (std::size_t index = 0; index != count_k; ++index) {
         std::uint64_t position = 0;
         lookup_result_t const found = run->find(key_of(index), position);
         if (sized(index) < 0) {
-            failures += expect(found == lookup_result_t::removed_k);
-            failures += expect(run->kind(position) == delta_kind_t::remove_k);
-            failures += expect_eq(run->value_window(position).extent.length, std::uint64_t {0});
+            expect_true(found == lookup_result_t::removed_k);
+            expect_true(run->kind(position) == delta_kind_t::remove_k);
+            expect_equal(run->value_window(position).extent.length, std::uint64_t {0});
         }
         else {
-            failures += expect(found == lookup_result_t::written_k);
-            failures += expect(run->kind(position) == delta_kind_t::write_k);
+            expect_true(found == lookup_result_t::written_k);
+            expect_true(run->kind(position) == delta_kind_t::write_k);
         }
     }
-    failures += check_variable_values(*run, guard->channel(), data);
-    return failures;
+    check_variable_values(*run, guard->channel(), data);
 }
 
 /** A run's range tombstones read back with their raw stamps and widen its key bounds, and a run of
  *  tombstones alone, which a merge leaves when it keeps tombstones past every key, opens with
  *  bounds of its own. */
 template <typename mount_type_>
-std::size_t range_tombstones_read_back(mount_type_ const& mount) {
+void test_range_tombstones_read_back(mount_type_ const& mount) {
     using types_t = run_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
@@ -1105,28 +1062,25 @@ std::size_t range_tombstones_read_back(mount_type_ const& mount) {
     using variable_run_t = typename types_t::variable_run_t;
     using range_tombstones_t = typename variable_run_t::range_tombstones_t;
     using range_t = typename range_tombstones_t::range_t;
-    std::size_t failures = 0;
     constexpr std::size_t count_k = 10;
     expected<std::unique_ptr<fixture_t>> fixture = mount();
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return;
     expected<guard_t> guard = (*fixture)->channels.acquire();
-    failures += expect(guard.has_value());
-    if (!guard) return failures;
+    expect_true(guard.has_value());
+    if (!guard) return;
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
-    failures += expect(volume.has_value());
-    if (!volume) return failures;
+    expect_true(volume.has_value());
+    if (!volume) return;
 
     // Keys 1 to 19 sit inside the tombstones' reach of 0 up to 40, stamped past every key slot.
     variable_data_t data;
-    failures += build_variable(
-        count_k, [](std::size_t index) { return std::int64_t {static_cast<std::int64_t>(index)}; }, data);
+    build_variable(count_k, [](std::size_t index) { return std::int64_t {static_cast<std::int64_t>(index)}; }, data);
     std::array<range_t, 2> const ranges {range_t {25, 40}, range_t {0, 6}};
     std::array<std::uint64_t, 2> const stamps {count_k + 7, 3};
     auto [tombstones, tombstones_status] = range_tombstones_t::make(std::span<range_t const> {ranges},
                                                                     std::span<std::uint64_t const> {stamps});
-    failures += expect(tombstones_status.succeeded());
-    if (failures != 0) return failures;
+    if (!expect_true(tombstones_status.succeeded())) return;
 
     std::array<medium_extent_t, 2> extents;
     for (std::size_t shape = 0; shape != extents.size(); ++shape) {
@@ -1138,29 +1092,28 @@ std::size_t range_tombstones_read_back(mount_type_ const& mount) {
             std::span<std::uint8_t const> {data.kinds}.first(slots), 0,
             std::span<byte_t const> {data.values}.first(shape == 0 ? data.values.size() : 0),
             std::span<stored_value_offset_t const> {data.offsets}.first(slots + 1), 4096, {}, tombstones);
-        failures += expect(written.has_value());
-        if (!written) return failures;
+        expect_true(written.has_value());
+        if (!written) return;
         extents[shape] = written->extent();
     }
     for (std::size_t shape = 0; shape != extents.size(); ++shape) {
         expected<variable_run_t> run = variable_run_t::open(*volume, guard->channel(), extents[shape]);
-        failures += expect(run.has_value());
-        if (!run) return failures;
+        expect_true(run.has_value());
+        if (!run) return;
         range_tombstones_t const& read = run->range_tombstones();
-        failures += expect_eq(read.size(), std::size_t {2});
+        expect_equal(read.size(), std::size_t {2});
         if (read.size() != 2) continue;
-        failures += expect(read.range(0).start == 0 && read.range(0).end == 6 && read.stamp(0) == 3);
-        failures += expect(read.range(1).start == 25 && read.range(1).end == 40 && read.stamp(1) == count_k + 7);
-        failures += expect(run->holds_keys());
-        failures += expect_eq(run->lower_stored_key(), stored_key_t {0});
-        failures += expect_eq(run->upper_stored_key(), stored_key_t {39});
-        failures += expect_eq(run->newest_stamp(), std::uint64_t {count_k + 7});
-        failures += expect_eq(run->size_bytes(), variable_layout_t::blob_bytes(run->header()));
-        failures += expect_eq(read.covering_stamp(30, count_k + 7), std::uint64_t {count_k + 7});
-        failures += expect_eq(read.covering_stamp(30, count_k), std::uint64_t {0});
-        failures += expect_eq(read.covering_stamp(6, count_k + 7), std::uint64_t {0});
+        expect_true(read.range(0).start == 0 && read.range(0).end == 6 && read.stamp(0) == 3);
+        expect_true(read.range(1).start == 25 && read.range(1).end == 40 && read.stamp(1) == count_k + 7);
+        expect_true(run->holds_keys());
+        expect_equal(run->lower_stored_key(), stored_key_t {0});
+        expect_equal(run->upper_stored_key(), stored_key_t {39});
+        expect_equal(run->newest_stamp(), std::uint64_t {count_k + 7});
+        expect_equal(run->size_bytes(), variable_layout_t::blob_bytes(run->header()));
+        expect_equal(read.covering_stamp(30, count_k + 7), std::uint64_t {count_k + 7});
+        expect_equal(read.covering_stamp(30, count_k), std::uint64_t {0});
+        expect_equal(read.covering_stamp(6, count_k + 7), std::uint64_t {0});
     }
-    return failures;
 }
 
 #pragma endregion Lookup Cases
@@ -1174,43 +1127,41 @@ std::size_t range_tombstones_read_back(mount_type_ const& mount) {
  *  value read is built on rather than a batch of blocks the case made up.
  */
 template <typename mount_type_>
-std::size_t batched_read_holds_its_depth(mount_type_ const& mount) {
+void test_batched_read_holds_its_depth(mount_type_ const& mount) {
     using types_t = run_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
     using volume_t = typename types_t::volume_t;
     using variable_run_t = typename types_t::variable_run_t;
     using read_pipeline_t = typename types_t::read_pipeline_t;
-    std::size_t failures = 0;
     constexpr std::size_t count_k = 512;
     expected<std::unique_ptr<fixture_t>> fixture = mount();
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return;
 
     expected<guard_t> guard = (*fixture)->channels.acquire();
-    failures += expect(guard.has_value());
-    if (!guard) return failures;
+    expect_true(guard.has_value());
+    if (!guard) return;
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
-    failures += expect(volume.has_value());
-    if (!volume) return failures;
+    expect_true(volume.has_value());
+    if (!volume) return;
 
     variable_data_t data;
-    failures += build_variable(
-        count_k, [](std::size_t index) { return 1 + static_cast<std::int64_t>(index % 1024); }, data);
-    if (failures != 0) return failures;
+    if (!build_variable(count_k, [](std::size_t index) { return 1 + static_cast<std::int64_t>(index % 1024); }, data))
+        return;
     expected<variable_run_t> run = variable_run_t::write(
         *volume, guard->channel(), uuid128_t {}, uuid_generator(), std::span<variable_slot_t const> {data.key_slots},
         std::span<std::uint64_t const> {ascending_stamps(data.key_slots.size())},
         std::span<std::uint8_t const> {data.kinds}, 0, std::span<byte_t const> {data.values},
         std::span<stored_value_offset_t const> {data.offsets}, 4096);
-    failures += expect(run.has_value());
-    if (!run) return failures;
+    expect_true(run.has_value());
+    if (!run) return;
 
     // The test's own pipeline gives the queue pair back before the run's batched read takes it.
     {
         expected<io_channel_t::acquired_channel_t> acquired_channel = guard->channel().acquire();
-        failures += expect(acquired_channel.has_value());
-        if (!acquired_channel) return failures;
+        expect_true(acquired_channel.has_value());
+        if (!acquired_channel) return;
         read_pipeline_t reader {(*fixture)->disk, std::move(*acquired_channel), run->extent().medium};
         std::size_t offered = 0;
         std::size_t polled_total = 0;
@@ -1233,24 +1184,23 @@ std::size_t batched_read_holds_its_depth(mount_type_ const& mount) {
                 if (reader.enqueue_read(window.extent, static_cast<std::uint32_t>(offered)).failed()) break;
                 ++offered;
             }
-            failures += expect(reader.submit().succeeded());
+            expect_true(reader.submit().succeeded());
             std::size_t const live = (*fixture)->disk.outstanding(guard->channel().queue_pair());
             if (live > deepest) deepest = live;
             expected<std::size_t> const seen = reader.poll_completions(sink);
-            failures += expect(seen.has_value());
-            if (!seen) return failures;
+            expect_true(seen.has_value());
+            if (!seen) return;
         }
 
-        failures += expect_eq(polled_total, count_k);
-        failures += expect_eq(mismatches, std::size_t {0});
-        failures += expect_eq(deepest, static_cast<std::size_t>(run_config_k.queue_depth));
+        expect_equal(polled_total, count_k);
+        expect_equal(mismatches, std::size_t {0});
+        expect_equal(deepest, static_cast<std::size_t>(run_config_k.queue_depth));
     }
 
     // The run's own batched read holds as many blocks as the queue pair has credit, counted in the pool
     // because the ring performs a channel's requests inside the poll that hands them to the sink.
     st::vector<std::uint64_t> positions;
-    failures += expect(positions.resize(count_k) == st::status_t::success_k);
-    if (failures != 0) return failures;
+    if (!expect_true(positions.resize(count_k) == st::status_t::success_k)) return;
     for (std::size_t index = 0; index != count_k; ++index) positions[index] = index;
 
     std::uint32_t idlest = run_config_k.request_buffers;
@@ -1258,10 +1208,8 @@ std::size_t batched_read_holds_its_depth(mount_type_ const& mount) {
         std::uint32_t const free_blocks = guard->channel().requests().available_buffers();
         if (free_blocks < idlest) idlest = free_blocks;
     };
-    failures += expect(
-        run->read_values(guard->channel(), std::span<std::uint64_t const> {positions}, counting).succeeded());
-    failures += expect_eq(run_config_k.request_buffers - idlest, run_config_k.queue_depth);
-    return failures;
+    expect_true(run->read_values(guard->channel(), std::span<std::uint64_t const> {positions}, counting).succeeded());
+    expect_equal(run_config_k.request_buffers - idlest, run_config_k.queue_depth);
 }
 
 #pragma endregion Depth Cases
@@ -1272,7 +1220,7 @@ std::size_t batched_read_holds_its_depth(mount_type_ const& mount) {
  *  bytes past the head in its tails, which order the strings of one head and read back whole through a volume mounted
  *  again, while a run of strings its heads hold whole carries neither tails nor their offsets. */
 template <typename mount_type_>
-case_result_t tails_read_back(mount_type_ const& mount) {
+case_result_t test_tails_read_back(mount_type_ const& mount) {
     using types_t = run_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
@@ -1280,16 +1228,15 @@ case_result_t tails_read_back(mount_type_ const& mount) {
     using tailed_slot_t = key_slot<st::key128_t, value_layout_t::uuid_k, key_tails_t::carried_k>;
     using tailed_run_t = lsm_sorted_run<tailed_slot_t, volume_t, waiter_t>;
     using tailed_layout_t = strings_run_layout<tailed_slot_t>;
-    std::size_t failures = 0;
     expected<std::unique_ptr<fixture_t>> fixture = mount();
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return {};
     if (!(*fixture)->persists_volumes()) return case_result_t::skipped(memory_volumes_vanish_k);
     // A run of strings with no tie wider than a row carries the layers section's header alone.
     constexpr std::uint64_t no_layers_bytes_k = sizeof(head_layers_header_t);
     expected<guard_t> guard = (*fixture)->channels.acquire();
-    failures += expect(guard.has_value());
-    if (!guard) return failures;
+    expect_true(guard.has_value());
+    if (!guard) return {};
 
     // Ascending as whole strings, the two versions of one string newest first, five long strings sharing one head
     std::string const long_tail(1000, 'z');
@@ -1307,10 +1254,9 @@ case_result_t tails_read_back(mount_type_ const& mount) {
     st::vector<std::uint8_t> kinds;
     st::vector<std::uint32_t> tail_offsets;
     std::string tails;
-    failures += expect(key_slots.resize(texts.size()) == st::status_t::success_k);
-    failures += expect(kinds.resize(texts.size()) == st::status_t::success_k);
-    failures += expect(tail_offsets.resize(texts.size() + 1) == st::status_t::success_k);
-    if (failures != 0) return failures;
+    expect_true(key_slots.resize(texts.size()) == st::status_t::success_k);
+    expect_true(kinds.resize(texts.size()) == st::status_t::success_k);
+    if (!expect_true(tail_offsets.resize(texts.size() + 1) == st::status_t::success_k)) return {};
     for (std::size_t index = 0; index != texts.size(); ++index) {
         tailed_slot_t slot;
         slot.stored_key = strings::head_of(texts[index]);
@@ -1330,21 +1276,21 @@ case_result_t tails_read_back(mount_type_ const& mount) {
     uuid128_t const content_id = uuid_generator();
     {
         expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
-        failures += expect(volume.has_value());
-        if (!volume) return failures;
+        expect_true(volume.has_value());
+        if (!volume) return {};
         expected<tailed_run_t> written = tailed_run_t::write(
             *volume, guard->channel(), uuid128_t {}, content_id, std::span<tailed_slot_t const> {key_slots},
             std::span<std::uint64_t const> {stamps}, std::span<std::uint8_t const> {kinds}, 0, {}, {},
             tailed_slot_t::size, run_tails);
-        failures += expect(written.has_value());
-        if (!written) return failures;
+        expect_true(written.has_value());
+        if (!written) return {};
         std::uint64_t whole_bytes = 0;
         for (std::string const& text : texts) whole_bytes += text.size();
-        failures += expect_eq(std::uint64_t {written->header().key_tape_bytes}, whole_bytes);
-        failures += expect_eq(written->size_bytes(), tailed_layout_t::blob_bytes(written->header()));
-        failures += expect_eq(written->size_bytes(),
-                              tailed_layout_t::blob_bytes(texts.size(), whole_bytes, written->stamps().saved_bytes(),
-                                                          written->kinds().saved_bytes(), no_layers_bytes_k));
+        expect_equal(std::uint64_t {written->header().key_tape_bytes}, whole_bytes);
+        expect_equal(written->size_bytes(), tailed_layout_t::blob_bytes(written->header()));
+        expect_equal(written->size_bytes(),
+                     tailed_layout_t::blob_bytes(texts.size(), whole_bytes, written->stamps().saved_bytes(),
+                                                 written->kinds().saved_bytes(), no_layers_bytes_k));
 
         // Two strings of one head whose tails descend are out of order, which the run refuses
         std::array<tailed_slot_t, 2> const swapped_slots {key_slots[6], key_slots[5]};
@@ -1357,7 +1303,7 @@ case_result_t tails_read_back(mount_type_ const& mount) {
             std::span<std::uint64_t const> {swapped_stamps}, std::span<std::uint8_t const> {swapped_kinds}, 0, {}, {},
             tailed_slot_t::size,
             key_tails_column_t {std::span<std::uint32_t const> {swapped_offsets}, bytes_of(swapped_tails)});
-        failures += expect_status(misordered, status_code_t::invalid_argument_k);
+        expect_status(misordered, status_code_t::invalid_argument_k);
 
         // Strings their heads hold whole save no tails and no offsets
         std::array<tailed_slot_t, 3> const short_slots {key_slots[0], key_slots[1], key_slots[2]};
@@ -1365,42 +1311,41 @@ case_result_t tails_read_back(mount_type_ const& mount) {
             *volume, guard->channel(), uuid128_t {}, uuid_generator(), std::span<tailed_slot_t const> {short_slots},
             std::span<std::uint64_t const> {stamps}.first(3), std::span<std::uint8_t const> {kinds}.first(3), 0, {}, {},
             tailed_slot_t::size);
-        failures += expect(whole.has_value());
-        if (!whole) return failures;
-        failures += expect_eq(whole->key(2), std::string_view {texts[2]});
+        expect_true(whole.has_value());
+        if (!whole) return {};
+        expect_equal(whole->key(2), std::string_view {texts[2]});
         std::uint64_t const short_bytes = texts[0].size() + texts[1].size() + texts[2].size();
-        failures += expect_eq(whole->size_bytes(),
-                              tailed_layout_t::blob_bytes(3, short_bytes, whole->stamps().saved_bytes(),
-                                                          whole->kinds().saved_bytes(), no_layers_bytes_k));
+        expect_equal(whole->size_bytes(), tailed_layout_t::blob_bytes(3, short_bytes, whole->stamps().saved_bytes(),
+                                                                      whole->kinds().saved_bytes(), no_layers_bytes_k));
         manifest_file_t const files[] {file_of(written->extent(), content_id)};
-        failures += expect(publish_naming(*volume, **fixture, guard->channel(), files).succeeded());
+        expect_true(publish_naming(*volume, **fixture, guard->channel(), files).succeeded());
     }
 
     expected<volume_t> remounted = (*fixture)->mount_volume(guard->channel());
-    failures += expect(remounted.has_value());
-    if (!remounted) return failures;
-    failures += expect_eq(remounted->manifest().files.size(), std::size_t {1});
-    if (remounted->manifest().files.size() != 1) return failures;
+    expect_true(remounted.has_value());
+    if (!remounted) return {};
+    expect_equal(remounted->manifest().files.size(), std::size_t {1});
+    if (remounted->manifest().files.size() != 1) return {};
     expected<medium_extent_t> found = remounted->open(remounted->manifest().files[0]);
-    failures += expect(found.has_value());
-    if (!found) return failures;
+    expect_true(found.has_value());
+    if (!found) return {};
     expected<tailed_run_t> opened = tailed_run_t::open(*remounted, guard->channel(), *found);
-    failures += expect(opened.has_value());
-    if (!opened) return failures;
-    failures += expect_eq(opened->population_count(), static_cast<std::uint64_t>(texts.size()));
-    failures += expect_eq(opened->header().key_slot_bytes, std::uint32_t {32});
-    failures += expect(opened->header().value_layout == value_layout_t::uuid_k);
-    failures += expect_eq(opened->header().stored_values_bytes, std::uint64_t {0});
+    expect_true(opened.has_value());
+    if (!opened) return {};
+    expect_equal(opened->population_count(), static_cast<std::uint64_t>(texts.size()));
+    expect_equal(opened->header().key_slot_bytes, std::uint32_t {32});
+    expect_true(opened->header().value_layout == value_layout_t::uuid_k);
+    expect_equal(opened->header().stored_values_bytes, std::uint64_t {0});
     for (std::size_t index = 0; index != texts.size(); ++index) {
-        failures += expect(opened->head(index) == strings::head_of(texts[index]));
-        failures += expect_eq(opened->key(index), std::string_view {texts[index]});
-        failures += expect_eq(opened->stamp(index), stamps[index]);
+        expect_true(opened->head(index) == strings::head_of(texts[index]));
+        expect_equal(opened->key(index), std::string_view {texts[index]});
+        expect_equal(opened->stamp(index), stamps[index]);
     }
     std::array<byte_t, tailed_slot_t::size> read {};
-    failures += expect(opened->read_value(guard->channel(), 7, std::span<byte_t> {read}).succeeded());
+    expect_true(opened->read_value(guard->channel(), 7, std::span<byte_t> {read}).succeeded());
     for (std::size_t position = 0; position != read.size(); ++position)
-        failures += expect(read[position] == painted(7, position));
-    return failures;
+        expect_true(read[position] == painted(7, position));
+    return {};
 }
 
 /** URLs of 60 sections of 400 items each under one long prefix, ascending, so equal heads
@@ -1435,10 +1380,9 @@ struct url_corpus_t {
     }
 };
 
-/** Lays the URL corpus out, @p sections by @p items, ascending. */
-[[nodiscard]] std::size_t build_url_corpus(std::size_t sections, std::size_t items, url_corpus_t& corpus) {
-    std::size_t failures = 0;
-    failures += expect(corpus.offsets.push_back(std::uint32_t {0}) == st::status_t::success_k);
+/** Lays the URL corpus out, @p sections by @p items, ascending, answering whether all of it fit. */
+bool build_url_corpus(std::size_t sections, std::size_t items, url_corpus_t& corpus) {
+    if (!expect_true(corpus.offsets.push_back(std::uint32_t {0}) == st::status_t::success_k)) return false;
     for (std::size_t section = 0; section != sections; ++section)
         for (std::size_t item = 0; item != items; ++item) {
             char url[96];
@@ -1446,20 +1390,20 @@ struct url_corpus_t {
                 url, sizeof(url), "https://example.org/catalog/section-{:03}/item-{:05}", section, item);
             std::size_t const length = static_cast<std::size_t>(written.out - url);
             std::size_t const at = corpus.tape.size();
-            failures += expect(corpus.tape.resize(at + length) == st::status_t::success_k);
-            if (failures != 0) return failures;
+            if (!expect_true(corpus.tape.resize(at + length) == st::status_t::success_k)) return false;
             std::memcpy(corpus.tape.data() + at, url, length);
-            failures += expect(corpus.offsets.push_back(static_cast<std::uint32_t>(at + length)) ==
-                               st::status_t::success_k);
+            if (!expect_true(corpus.offsets.push_back(static_cast<std::uint32_t>(at + length)) ==
+                             st::status_t::success_k))
+                return false;
         }
-    return failures;
+    return true;
 }
 
 /** A run of URLs sharing a 36-byte prefix gets nested layers, and every lookup the heads and the
  *  layers answer leaves at most one row of keys to compare, never a binary search over the key
  *  tape, while a key with more versions than a row keeps them in one range of its own. */
 template <typename mount_type_>
-std::size_t layers_narrow_every_lookup(mount_type_ const& mount) {
+void test_layers_narrow_every_lookup(mount_type_ const& mount) {
     using types_t = run_types<typename mount_type_::fixture_t>;
     using fixture_t = typename types_t::fixture_t;
     using guard_t = typename types_t::guard_t;
@@ -1468,20 +1412,18 @@ std::size_t layers_narrow_every_lookup(mount_type_ const& mount) {
     using tailed_run_t = lsm_sorted_run<tailed_slot_t, volume_t, waiter_t>;
     constexpr std::size_t row_k = strings_run_layout<tailed_slot_t>::keys_per_row_k;
     constexpr std::size_t versions_k = 40;
-    std::size_t failures = 0;
     expected<std::unique_ptr<fixture_t>> fixture = mount();
-    failures += expect_status(fixture, status_code_t::success_k);
-    if (!fixture) return failures;
+    expect_status(fixture, status_code_t::success_k);
+    if (!fixture) return;
     expected<guard_t> guard = (*fixture)->channels.acquire();
-    failures += expect(guard.has_value());
-    if (!guard) return failures;
+    expect_true(guard.has_value());
+    if (!guard) return;
     expected<volume_t> volume = (*fixture)->mount_volume(guard->channel());
-    failures += expect(volume.has_value());
-    if (!volume) return failures;
+    expect_true(volume.has_value());
+    if (!volume) return;
 
     url_corpus_t corpus;
-    failures += build_url_corpus(60, 400, corpus);
-    if (failures != 0) return failures;
+    if (!build_url_corpus(60, 400, corpus)) return;
 
     // One short key in many versions, newest first, ahead of every URL.
     std::size_t const count = versions_k + corpus.size();
@@ -1490,11 +1432,10 @@ std::size_t layers_narrow_every_lookup(mount_type_ const& mount) {
     st::vector<std::uint8_t> kinds;
     st::vector<std::uint32_t> tail_offsets;
     st::vector<byte_t> tails;
-    failures += expect(key_slots.resize(count) == st::status_t::success_k);
-    failures += expect(stamps.resize(count) == st::status_t::success_k);
-    failures += expect(kinds.resize(count) == st::status_t::success_k);
-    failures += expect(tail_offsets.resize(count + 1) == st::status_t::success_k);
-    if (failures != 0) return failures;
+    expect_true(key_slots.resize(count) == st::status_t::success_k);
+    expect_true(stamps.resize(count) == st::status_t::success_k);
+    expect_true(kinds.resize(count) == st::status_t::success_k);
+    if (!expect_true(tail_offsets.resize(count + 1) == st::status_t::success_k)) return;
     auto text_of = [&](std::size_t position) noexcept {
         return position < versions_k ? std::string_view {"a"} : corpus.at(position - versions_k);
     };
@@ -1509,8 +1450,7 @@ std::size_t layers_narrow_every_lookup(mount_type_ const& mount) {
         kinds[position] = static_cast<std::uint8_t>(delta_kind_t::write_k);
         tail_offsets[position] = tails_bytes;
         std::string_view const tail = strings::tail_of(text);
-        failures += expect(tails.resize(tails_bytes + tail.size()) == st::status_t::success_k);
-        if (failures != 0) return failures;
+        if (!expect_true(tails.resize(tails_bytes + tail.size()) == st::status_t::success_k)) return;
         if (!tail.empty()) std::memcpy(tails.data() + tails_bytes, tail.data(), tail.size());
         tails_bytes += static_cast<std::uint32_t>(tail.size());
     }
@@ -1520,15 +1460,15 @@ std::size_t layers_narrow_every_lookup(mount_type_ const& mount) {
         *volume, guard->channel(), uuid128_t {}, uuid_generator(), std::span<tailed_slot_t const> {key_slots},
         std::span<std::uint64_t const> {stamps}, std::span<std::uint8_t const> {kinds}, 0, {}, {}, tailed_slot_t::size,
         key_tails_column_t {std::span<std::uint32_t const> {tail_offsets}, std::span<byte_t const> {tails}});
-    failures += expect(run.has_value());
-    if (!run) return failures;
+    expect_true(run.has_value());
+    if (!run) return;
 
     // The URLs tie on "https://example", on ".org/catalog/se", and on each section's "ction-000/item-".
     std::uint32_t deepest = 0;
     for (head_layer_t const& layer : run->layers()) deepest = fu::max_of(deepest, layer.depth);
-    failures += expect_eq(deepest, std::uint32_t {3});
-    failures += expect(run->header().layers_bytes > sizeof(head_layers_header_t));
-    failures += expect_eq(run->size_bytes(), strings_run_layout<tailed_slot_t>::blob_bytes(run->header()));
+    expect_equal(deepest, std::uint32_t {3});
+    expect_true(run->header().layers_bytes > sizeof(head_layers_header_t));
+    expect_equal(run->size_bytes(), strings_run_layout<tailed_slot_t>::blob_bytes(run->header()));
 
     std::size_t wide = 0;
     std::size_t misplaced = 0;
@@ -1542,9 +1482,9 @@ std::size_t layers_narrow_every_lookup(mount_type_ const& mount) {
         std::span<byte_t const> const value = run->value(position);
         misread += value[0] != painted(position, 0);
     }
-    failures += expect_eq(wide, std::size_t {0});
-    failures += expect_eq(misplaced, std::size_t {0});
-    failures += expect_eq(misread, std::size_t {0});
+    expect_equal(wide, std::size_t {0});
+    expect_equal(misplaced, std::size_t {0});
+    expect_equal(misread, std::size_t {0});
 
     // A key no URL equals lands where a plain search of the corpus puts it.
     std::size_t missed = 0;
@@ -1557,58 +1497,52 @@ std::size_t layers_narrow_every_lookup(mount_type_ const& mount) {
         missed += run->lower_bound(above) != versions_k + corpus.lower_bound(above);
         missed += run->lower_bound(text.substr(0, 40)) != versions_k + corpus.lower_bound(text.substr(0, 40));
     }
-    failures += expect_eq(missed, std::size_t {0});
+    expect_equal(missed, std::size_t {0});
 
     // The versions of one key stay one range wider than a row, which one compare places whole.
     key_positions_t const versions = run->key_range("a");
-    failures += expect_eq(versions.first, std::uint64_t {0});
-    failures += expect_eq(versions.last, std::uint64_t {versions_k});
-    failures += expect_eq(run->lower_bound("a"), std::uint64_t {0});
-    failures += expect_eq(run->lower_bound("b"), std::uint64_t {versions_k});
-    return failures;
+    expect_equal(versions.first, std::uint64_t {0});
+    expect_equal(versions.last, std::uint64_t {versions_k});
+    expect_equal(run->lower_bound("a"), std::uint64_t {0});
+    expect_equal(run->lower_bound("b"), std::uint64_t {versions_k});
 }
 
 #pragma endregion Tails Cases
 
 } // namespace unum::ustore::test
 
-int main(int argc, char const* argv[]) {
+int main(int argc, char** argv) {
     using namespace unum::ustore;
     using namespace unum::ustore::test;
 
-    suite_options_t options;
-    if (argument_status_t const status = parse_suite_options(argc, argv, options);
-        status != argument_status_t::parsed_k)
-        return status == argument_status_t::help_k ? 0 : 1;
-    suite_totals_t totals = options.totals();
+    start_test_run(argc, argv);
 
-    st::expected<directory_t> const directory = directory_t::make(options.directory);
+    st::expected<scratch_directory_t> const directory = scratch_directory_t::make(test_run.settings.directory);
     if (!directory) {
         fmt::println(stderr, "  the working directory would not open");
         return 1;
     }
-    test_environment_t const environment = test_environment_t::of(options, *directory);
 
     auto const cases = [&](auto const& mount) {
-        report(totals, mount, "reads_back_every_value", run_reads_back_every_value);
-        report(totals, mount, "fixed_width_reads_back", fixed_width_run_reads_back);
-        report(totals, mount, "inline_needs_no_reads", inline_run_needs_no_reads);
-        report(totals, mount, "sections_on_pages", sections_sit_on_page_boundaries);
-        report(totals, mount, "split_write_matches_write", split_write_matches_write);
-        report(totals, mount, "truncated_index", truncated_index_is_malformed);
-        report(totals, mount, "deallocated_opens_nothing", deallocated_run_opens_nothing);
-        report(totals, mount, "point_lookup", point_lookup_finds_and_misses);
-        report(totals, mount, "lookups_descend_the_saved_tree", lookups_descend_the_saved_tree);
-        report(totals, mount, "smallest_sizes", runs_at_the_smallest_sizes);
-        report(totals, mount, "value_size_extremes", values_section_the_size_extremes);
-        report(totals, mount, "remove_deltas", remove_deltas_read_back_as_removals);
-        report(totals, mount, "range_tombstones_read_back", range_tombstones_read_back);
-        report(totals, mount, "holds_its_depth", batched_read_holds_its_depth);
-        report(totals, mount, "tails_read_back", tails_read_back);
-        report(totals, mount, "layers_narrow_every_lookup", layers_narrow_every_lookup);
+        report_on_mount(mount, "test_run_reads_back_every_value", test_run_reads_back_every_value);
+        report_on_mount(mount, "test_fixed_width_run_reads_back", test_fixed_width_run_reads_back);
+        report_on_mount(mount, "test_inline_run_needs_no_reads", test_inline_run_needs_no_reads);
+        report_on_mount(mount, "test_sections_sit_on_page_boundaries", test_sections_sit_on_page_boundaries);
+        report_on_mount(mount, "test_split_write_matches_write", test_split_write_matches_write);
+        report_on_mount(mount, "test_truncated_index_is_malformed", test_truncated_index_is_malformed);
+        report_on_mount(mount, "test_deallocated_run_opens_nothing", test_deallocated_run_opens_nothing);
+        report_on_mount(mount, "test_point_lookup_finds_and_misses", test_point_lookup_finds_and_misses);
+        report_on_mount(mount, "test_lookups_descend_the_saved_tree", test_lookups_descend_the_saved_tree);
+        report_on_mount(mount, "test_runs_at_the_smallest_sizes", test_runs_at_the_smallest_sizes);
+        report_on_mount(mount, "test_values_section_the_size_extremes", test_values_section_the_size_extremes);
+        report_on_mount(mount, "test_remove_deltas_read_back_as_removals", test_remove_deltas_read_back_as_removals);
+        report_on_mount(mount, "test_range_tombstones_read_back", test_range_tombstones_read_back);
+        report_on_mount(mount, "test_batched_read_holds_its_depth", test_batched_read_holds_its_depth);
+        report_on_mount(mount, "test_tails_read_back", test_tails_read_back);
+        report_on_mount(mount, "test_layers_narrow_every_lookup", test_layers_narrow_every_lookup);
     };
     for (transport_t const transport : every_transport_k)
-        run_on_transport(totals, transport, environment, run_config_k, 1, "run", cases);
+        run_on_transport(transport, directory->path(), run_config_k, 1, "sorted_run", cases);
 
-    return suite_exit_code(totals);
+    return finish_test_run();
 }

@@ -783,7 +783,8 @@ status_t gather_families(database_t const& database, columns_t const& columns,
 status_t database_describe(ustore_database_describe_t const& arguments, view_t const&) {
     database_t& database = *state_of<database_t>(arguments.database);
     ustore_database_description_t description {
-        .capabilities = ustore_capabilities_t(ustore_capabilities_transactions_k | ustore_capabilities_snapshots_k),
+        .capabilities = ustore_capabilities_t(ustore_capabilities_transactions_k | ustore_capabilities_snapshots_k |
+                                              ustore_capabilities_saves_snapshots_k),
         .engine = ustore_engine_rocksdb_k,
         .isolation = ustore_isolation_snapshot_k,
     };

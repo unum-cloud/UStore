@@ -51,10 +51,35 @@ from ustore import (
     VertexRolesView,
 )
 
+
+# region Shared Testing
+def _skipped(reason: String):
+    """Announces a skipped test, so a run shows what it left out rather than passing in silence."""
+    print("skipped:", reason)
+
+
+def _split_mix_bits(value: UInt64) -> UInt64:
+    """SplitMix64's finalizer, a bijection that spreads every input bit over all 64 output bits."""
+    var mixed = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9
+    mixed = (mixed ^ (mixed >> 27)) * 0x94D049BB133111EB
+    return mixed ^ (mixed >> 31)
+
+
+def _stream_key(seed: UInt64, name: String, index: UInt64 = 0) -> UInt64:
+    """The `index`-th stream of the family `name` under `seed`, identical in C, C++, Rust and Python."""
+    var hashed: UInt64 = 0xCBF29CE484222325
+    for byte in name.as_bytes():
+        hashed = (hashed ^ UInt64(byte)) * 0x100000001B3
+    return _split_mix_bits(_split_mix_bits(seed ^ hashed) + index)
+# endregion Shared Testing
+
+
+comptime library_missing_k = "the shared library is not on the loader path"
+
 # region Helpers
 
 
-struct Tape:
+struct _Tape:
     """Strings packed as an Apache Arrow tape, owned by the test."""
 
     var bytes: List[UInt8]
@@ -77,12 +102,14 @@ def _text[origin: Origin](bytes: Span[UInt8, origin]) -> String:
     return text
 
 
-def _engine_is_present() -> Bool:
-    """Whether a library is on the loader path, so the engine checks can run."""
+def _library_is_present() raises -> Bool:
+    """Whether the shared library is on the loader path; any other failure to load it raises rather than skips."""
     try:
         _ = Library()
         return True
-    except:
+    except error:
+        if error.status != Status.LIBRARY_MISSING:
+            raise error
         return False
 
 
@@ -107,10 +134,10 @@ def test_keys_spell_integers_big_endian() raises:
 # region Engine
 
 
-def test_library_reports_its_version_and_names() raises:
+def test_enums_spell_and_parse_as_the_library_names_them() raises:
     """The engine reports major version 1, spells its enumerators both ways and refuses other names."""
-    if not _engine_is_present():
-        print("skipped: no UStore library on the loader path")
+    if not _library_is_present():
+        _skipped(library_missing_k)
         return
     var library = Library()
     assert_equal(library.version()[0], 1)
@@ -127,14 +154,14 @@ def test_library_reports_its_version_and_names() raises:
 
 def test_blobs_write_read_and_scan() raises:
     """Values written in one batch read back in key order, a missing key reads absent, and a scan lists them."""
-    if not _engine_is_present():
-        print("skipped: no UStore library on the loader path")
+    if not _library_is_present():
+        _skipped(library_missing_k)
         return
     var library = Library()
     var db = Database.init_ram(Executor(library))
     var people = db.collection_create("people", Modality.BLOBS)
     var keys: List[Key] = [Key(1), Key(2), Key(3)]
-    var values = Tape(["Ada", "Grace", "Barbara"])
+    var values = _Tape(["Ada", "Grace", "Barbara"])
     db.write(CollectionsView.repeating(people), KeysView.of(keys), StringsView.of(values.bytes, values.offsets))
 
     var arena = Arena(library)
@@ -154,14 +181,14 @@ def test_blobs_write_read_and_scan() raises:
 
 def test_a_later_call_retires_earlier_results() raises:
     """A result refuses reads once a later call rewinds its arena."""
-    if not _engine_is_present():
-        print("skipped: no UStore library on the loader path")
+    if not _library_is_present():
+        _skipped(library_missing_k)
         return
     var library = Library()
     var db = Database.init_ram(Executor(library))
     var people = db.collection_create("", Modality.BLOBS)
     var key = Key(1)
-    var values = Tape(["one"])
+    var values = _Tape(["one"])
     db.write(CollectionsView.repeating(people), KeysView.repeating(key), StringsView.of(values.bytes, values.offsets))
     var arena = Arena(library)
     var first = db.read(CollectionsView.repeating(people), KeysView.repeating(key), arena)
@@ -176,24 +203,24 @@ def test_a_later_call_retires_earlier_results() raises:
 
 def test_strings_map_onto_keys() raises:
     """Strings written onto keys read back as those keys, and a prefix scan lists only its prefix."""
-    if not _engine_is_present():
-        print("skipped: no UStore library on the loader path")
+    if not _library_is_present():
+        _skipped(library_missing_k)
         return
     var library = Library()
     var db = Database.init_ram(Executor(library))
     var names = db.collection_create("names", Modality.STRINGS)
-    var strings = Tape(["apple", "apricot", "banana"])
+    var strings = _Tape(["apple", "apricot", "banana"])
     var keys: List[Key] = [Key(10), Key(11), Key(12)]
     db.strings_write(CollectionsView.repeating(names), StringsView.of(strings.bytes, strings.offsets), KeysView.of(keys))
 
     var arena = Arena(library)
-    var asked = Tape(["apricot", "cherry"])
+    var asked = _Tape(["apricot", "cherry"])
     var found = db.strings_read(CollectionsView.repeating(names), StringsView.of(asked.bytes, asked.offsets), arena)
     assert_true(found.present(0))
     assert_false(found.present(1))
     assert_true(found.keys()[0] == Key(11))
 
-    var prefix = Tape(["ap"])
+    var prefix = _Tape(["ap"])
     var listed = db.strings_scan(CollectionsView.repeating(names), StringsView.of(prefix.bytes, prefix.offsets), 10, arena)
     var tape = listed.strings()
     assert_equal(len(tape), 2)
@@ -203,14 +230,14 @@ def test_strings_map_onto_keys() raises:
 
 def test_docs_write_and_read() raises:
     """A JSON document reads back whole, and one field of it reads as text."""
-    if not _engine_is_present():
-        print("skipped: no UStore library on the loader path")
+    if not _library_is_present():
+        _skipped(library_missing_k)
         return
     var library = Library()
     var db = Database.init_ram(Executor(library))
     var movies = db.collection_create("movies", Modality.DOCS)
     var key = Key(1)
-    var documents = Tape(['{"title":"Alien","year":1979}'])
+    var documents = _Tape(['{"title":"Alien","year":1979}'])
     db.docs_write(CollectionsView.repeating(movies), KeysView.repeating(key), StringsView.of(documents.bytes, documents.offsets))
 
     var arena = Arena(library)
@@ -218,7 +245,7 @@ def test_docs_write_and_read() raises:
     assert_true(whole.present(0))
     assert_true("Alien" in _text(whole.values()[0]))
 
-    var fields = Tape(["/year"])
+    var fields = _Tape(["/year"])
     var year = db.docs_read(
         CollectionsView.repeating(movies), KeysView.repeating(key), arena, DocsReadConfig(fields=StringsView.of(fields.bytes, fields.offsets))
     )
@@ -227,8 +254,8 @@ def test_docs_write_and_read() raises:
 
 def test_graph_edges_round_trip() raises:
     """An edge written from one vertex to another reads back from both ends."""
-    if not _engine_is_present():
-        print("skipped: no UStore library on the loader path")
+    if not _library_is_present():
+        _skipped(library_missing_k)
         return
     var library = Library()
     var db = Database.init_ram(Executor(library))
@@ -256,15 +283,15 @@ def test_graph_edges_round_trip() raises:
 
 def test_deferred_calls_match_blocking_ones() raises:
     """A write and a read submitted to an executor finish once waited on, with the blocking call's answer."""
-    if not _engine_is_present():
-        print("skipped: no UStore library on the loader path")
+    if not _library_is_present():
+        _skipped(library_missing_k)
         return
     var library = Library()
     var executor = Executor.for_ram(library, threads=2)
     var db = Database.init_ram(Executor(library))
     var people = db.collection_create("people", Modality.BLOBS)
     var key = Key(5)
-    var values = Tape(["deferred"])
+    var values = _Tape(["deferred"])
     var write = db.deferred(executor).write(
         CollectionsView.repeating(people), KeysView.repeating(key), StringsView.of(values.bytes, values.offsets)
     )
@@ -293,7 +320,7 @@ def _write_on_the_held_executor(
     for index in range(len(keys)):
         admissions[index] = Admission.ADMIT
     var key = Key(9)
-    var values = Tape(["inner"])
+    var values = _Tape(["inner"])
     try:
         holder[].database[].on(holder[].executor[]).write(
             CollectionsView.repeating(holder[].collection),
@@ -308,15 +335,15 @@ def _write_on_the_held_executor(
 def test_a_held_executor_refuses_the_next_call() raises:
     """A call finding another one holding its executor, here from that call's own predicate, finishes `CONTENDED`
     without running, and the executor serves the next call once the holder returns."""
-    if not _engine_is_present():
-        print("skipped: no UStore library on the loader path")
+    if not _library_is_present():
+        _skipped(library_missing_k)
         return
     var library = Library()
     var executor = Executor.for_ram(library, threads=1)
     var db = Database.init_ram(Executor(library))
     var people = db.collection_create("people", Modality.BLOBS)
     var key = Key(1)
-    var values = Tape(["held"])
+    var values = _Tape(["held"])
     db.write(CollectionsView.repeating(people), KeysView.repeating(key), StringsView.of(values.bytes, values.offsets))
 
     var holder = _Holder(
@@ -344,15 +371,15 @@ def test_a_held_executor_refuses_the_next_call() raises:
 
 def test_a_drain_frees_the_executor_in_either_mood() raises:
     """A drain only waits until no call holds the executor, so the next call on it runs, whichever mood it left."""
-    if not _engine_is_present():
-        print("skipped: no UStore library on the loader path")
+    if not _library_is_present():
+        _skipped(library_missing_k)
         return
     var library = Library()
     var executor = Executor.for_ram(library, threads=2)
     var db = Database.init_ram(Executor(library))
     var people = db.collection_create("people", Modality.BLOBS)
     var key = Key(5)
-    var values = Tape(["drained"])
+    var values = _Tape(["drained"])
     var arena = Arena(executor)
     var moods: List[Mood] = [Mood.SPINNING, Mood.PARKED]
     for mood in moods:
@@ -371,16 +398,16 @@ def _stop_at_first_report(finished: Int, total: Int, reports: Pointer[Int, MutAn
     return Continuation.CANCEL
 
 
-def test_progress_cancels_a_scan() raises:
+def test_progress_reports_and_cancels() raises:
     """A handler answering `CANCEL` stops the scan, which finishes `CANCELLED`."""
-    if not _engine_is_present():
-        print("skipped: no UStore library on the loader path")
+    if not _library_is_present():
+        _skipped(library_missing_k)
         return
     var library = Library()
     var db = Database.init_ram(Executor(library))
     var people = db.collection_create("people", Modality.BLOBS)
     var keys: List[Key] = [Key(1), Key(2), Key(3), Key(4)]
-    var values = Tape(["a", "b", "c", "d"])
+    var values = _Tape(["a", "b", "c", "d"])
     db.write(CollectionsView.repeating(people), KeysView.of(keys), StringsView.of(values.bytes, values.offsets))
 
     var arena = Arena(library)
@@ -402,14 +429,14 @@ def test_progress_cancels_a_scan() raises:
 
 def test_compact_plans_stay_live_until_finished() raises:
     """A cancelled compaction leaves its plan live, a deferred one continues it to the end, and a finish frees it."""
-    if not _engine_is_present():
-        print("skipped: no UStore library on the loader path")
+    if not _library_is_present():
+        _skipped(library_missing_k)
         return
     var library = Library()
     var executor = Executor.for_ram(library, threads=2)
     var db = Database.init_ram(Executor(library))
     var keys: List[Key] = [Key(1), Key(2)]
-    var values = Tape(["a", "b"])
+    var values = _Tape(["a", "b"])
     for name in ["first", "second"]:
         var collection = db.collection_create(name, Modality.BLOBS)
         db.write(CollectionsView.repeating(collection), KeysView.of(keys), StringsView.of(values.bytes, values.offsets))
@@ -452,14 +479,14 @@ def _admit_even(keys: Span[Key, MutAnyOrigin], admissions: Span[Admission, MutAn
 
 def test_predicate_filters_a_scan() raises:
     """A scan lists only the keys its predicate admits."""
-    if not _engine_is_present():
-        print("skipped: no UStore library on the loader path")
+    if not _library_is_present():
+        _skipped(library_missing_k)
         return
     var library = Library()
     var db = Database.init_ram(Executor(library))
     var people = db.collection_create("people", Modality.BLOBS)
     var keys: List[Key] = [Key(1), Key(2), Key(3), Key(4), Key(5), Key(6)]
-    var values = Tape(["a", "b", "c", "d", "e", "f"])
+    var values = _Tape(["a", "b", "c", "d", "e", "f"])
     db.write(CollectionsView.repeating(people), KeysView.of(keys), StringsView.of(values.bytes, values.offsets))
 
     var arena = Arena(library)
@@ -480,14 +507,14 @@ def test_predicate_filters_a_scan() raises:
 
 def test_transactions_commit_their_writes() raises:
     """A write inside a transaction is invisible at the head until the commit lands it."""
-    if not _engine_is_present():
-        print("skipped: no UStore library on the loader path")
+    if not _library_is_present():
+        _skipped(library_missing_k)
         return
     var library = Library()
     var db = Database.init_ram(Executor(library))
     var people = db.collection_create("people", Modality.BLOBS)
     var key = Key(3)
-    var values = Tape(["pending"])
+    var values = _Tape(["pending"])
     var arena = Arena(library)
     var transaction = db.transaction()
     transaction.write(CollectionsView.repeating(people), KeysView.repeating(key), StringsView.of(values.bytes, values.offsets))
@@ -497,15 +524,15 @@ def test_transactions_commit_their_writes() raises:
     assert_true(db.read(CollectionsView.repeating(people), KeysView.repeating(key), arena).present(0))
 
 
-def test_open_ram_persists_across_reopens() raises:
+def test_databases_open_at_a_directory_and_keep_what_they_held() raises:
     """A database served from a directory reloads what it held when it closed."""
-    if not _engine_is_present():
-        print("skipped: no UStore library on the loader path")
+    if not _library_is_present():
+        _skipped(library_missing_k)
         return
     var directory = mkdtemp()
     var library = Library()
     var key = Key(8)
-    var values = Tape(["kept"])
+    var values = _Tape(["kept"])
     var db = Database.open_ram(Executor(library), directory)
     var collection = db.collection_create("", Modality.BLOBS)
     db.write(CollectionsView.repeating(collection), KeysView.repeating(key), StringsView.of(values.bytes, values.offsets))
@@ -523,14 +550,14 @@ def test_open_ram_persists_across_reopens() raises:
 
 def test_arrow_exports_read_in_place() raises:
     """Scanned keys export as Arrow and read back as a call's keys, and a read's tape and a gathered column export."""
-    if not _engine_is_present():
-        print("skipped: no UStore library on the loader path")
+    if not _library_is_present():
+        _skipped(library_missing_k)
         return
     var library = Library()
     var db = Database.init_ram(Executor(library))
     var people = db.collection_create("people", Modality.BLOBS)
     var keys: List[Key] = [Key(1), Key(2), Key(3)]
-    var values = Tape(["Ada", "Grace", "Barbara"])
+    var values = _Tape(["Ada", "Grace", "Barbara"])
     db.write(CollectionsView.repeating(people), KeysView.of(keys), StringsView.of(values.bytes, values.offsets))
     var arena = Arena(library)
     var start = Key(0)
@@ -549,9 +576,9 @@ def test_arrow_exports_read_in_place() raises:
 
     var movies = db.collection_create("movies", Modality.DOCS)
     var key = Key(1)
-    var documents = Tape(['{"year":1979}'])
+    var documents = _Tape(['{"year":1979}'])
     db.docs_write(CollectionsView.repeating(movies), KeysView.repeating(key), StringsView.of(documents.bytes, documents.offsets))
-    var fields = Tape(["year"])
+    var fields = _Tape(["year"])
     var types: List[FieldType] = [FieldType.I64]
     var gathered = db.docs_gather(
         CollectionsView.repeating(movies), KeysView.repeating(key), StringsView.of(fields.bytes, fields.offsets), types, arena
@@ -561,14 +588,14 @@ def test_arrow_exports_read_in_place() raises:
 
 def test_a_cpu_class_ceiling_the_machine_lacks_narrows_the_pick() raises:
     """A ceiling caps the class the database runs as: one the CPU lacks narrows the pick rather than refusing it."""
-    if not _engine_is_present():
-        print("skipped: no UStore library on the loader path")
+    if not _library_is_present():
+        _skipped(library_missing_k)
         return
     var library = Library()
     var machine = Database.init_ram(Executor(library)).describe().cpu_class
     # A monoversioned build compiles no class under any other, so it refuses a lower ceiling
     if machine == CPUClass.MONOVERSIONED:
-        print("skipped: a monoversioned build compiles no class under a foreign ceiling")
+        _skipped("built without USTORE_MULTIVERSIONED")
         return
     var capped = Database.init_ram(Executor(library), cpu_class_ceiling=machine)
     assert_true(capped.describe().cpu_class == machine)
@@ -585,7 +612,7 @@ def test_a_cpu_class_ceiling_the_machine_lacks_narrows_the_pick() raises:
 def main() raises:
     var suite = TestSuite()
     suite.test[test_keys_spell_integers_big_endian]()
-    suite.test[test_library_reports_its_version_and_names]()
+    suite.test[test_enums_spell_and_parse_as_the_library_names_them]()
     suite.test[test_blobs_write_read_and_scan]()
     suite.test[test_a_later_call_retires_earlier_results]()
     suite.test[test_strings_map_onto_keys]()
@@ -594,11 +621,11 @@ def main() raises:
     suite.test[test_deferred_calls_match_blocking_ones]()
     suite.test[test_a_held_executor_refuses_the_next_call]()
     suite.test[test_a_drain_frees_the_executor_in_either_mood]()
-    suite.test[test_progress_cancels_a_scan]()
+    suite.test[test_progress_reports_and_cancels]()
     suite.test[test_compact_plans_stay_live_until_finished]()
     suite.test[test_predicate_filters_a_scan]()
     suite.test[test_transactions_commit_their_writes]()
-    suite.test[test_open_ram_persists_across_reopens]()
-    suite.test[test_a_cpu_class_ceiling_the_machine_lacks_narrows_the_pick]()
+    suite.test[test_databases_open_at_a_directory_and_keep_what_they_held]()
     suite.test[test_arrow_exports_read_in_place]()
+    suite.test[test_a_cpu_class_ceiling_the_machine_lacks_narrows_the_pick]()
     suite^.run()

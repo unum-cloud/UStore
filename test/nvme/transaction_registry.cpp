@@ -4,12 +4,12 @@
  *  @date September 19, 2026
  *  @brief What the optimistic transaction layer promises: the conflicts it catches, and that it invents none.
  *
- *  The results this file exists for are @c serializable_under_threads, @c write_write_one_winner
- *  and @c disjoint_transactions_never_conflict. A missed write turns two concurrent transactions
- *  into a lost update, which no single-threaded case can show, so the money-moving case drives real
- *  threads at overlapping keys and checks the one quantity a half-applied or lost commit cannot
- *  preserve - the total. An invented conflict is the opposite failure, so two transactions writing
- *  a thousand keys each must both land.
+ *  The results this file exists for are @c test_serializable_under_threads, @c
+ *  test_write_write_one_winner and @c test_disjoint_transactions_never_conflict. A missed write
+ *  turns two concurrent transactions into a lost update, which no single-threaded case can show, so
+ *  the money-moving case drives real threads at overlapping keys and checks the one quantity a
+ *  half-applied or lost commit cannot preserve - the total. An invented conflict is the opposite
+ *  failure, so two transactions writing a thousand keys each must both land.
  *
  *  Nothing here touches a disk. The registry reaches its store through a handful of calls, so the store is a
  *  table of words and stamps in memory and every case runs at memory speed under both sanitizers.
@@ -29,7 +29,7 @@
 
 #include "ustore/blobs/nvme_transactions.hpp" // `transaction_registry`, `transaction_core`, `transaction_deltas`
 
-#include "harness.hpp"      // `suite_exit_code`, `expect`, `expect_eq`
+#include "harness.hpp"      // `run_test_case`, `expect_true`, `expect_equal`
 #include "nvme/fixture.hpp" // `atomic_reference`, `waiter_t`, `commit_ledger_t`, `stamp_pin_t`, `resources_t`
 
 namespace unum::ustore {
@@ -374,8 +374,7 @@ constexpr collection_id_t other_collection_k {uuid_from_integer(8)};
 
 /** The last delta of a key wins inside its own collection alone, an empty value reads back empty, a value past the
  *  collection's width is refused, and every byte returns to the budget once the deltas die. */
-static std::size_t deltas_read_back_per_collection() {
-    std::size_t failures = 0;
+static void test_deltas_read_back_per_collection() {
     resources_shared_ptr_t const resources = std::make_shared<resources_t>(1ull << 20, 0);
     {
         transaction_deltas_t deltas(deltas_bytes_k, deltas_max_count_k, resources);
@@ -383,49 +382,45 @@ static std::size_t deltas_read_back_per_collection() {
         std::array<byte_t, 3> const first {byte_t {1}, byte_t {2}, byte_t {3}};
         std::array<byte_t, 2> const second {byte_t {7}, byte_t {8}};
         std::array<byte_t, 5> too_wide {};
-        failures += expect(deltas.write(collection_k, widths, 1, first).succeeded());
-        failures += expect(deltas.write(other_collection_k, widths, 1, first).succeeded());
-        failures += expect(deltas.remove(collection_k, widths, 1).succeeded());
-        failures += expect(deltas.write(collection_k, widths, 1, second).succeeded());
-        failures += expect(deltas.remove(collection_k, widths, 2).succeeded());
-        failures += expect(deltas.write(collection_k, widths, 3, stored_value_view_t {}).succeeded());
-        failures += expect_status(deltas.write(collection_k, widths, 4, too_wide), status_code_t::malformed_k);
-        failures += expect_eq(deltas.count(), std::size_t {4});
-        failures += expect_eq(deltas.count(collection_k), std::size_t {3});
-        failures += expect(deltas.lookup(collection_k, 2) == lookup_result_t::removed_k);
-        failures += expect(deltas.lookup(collection_k, 4) == lookup_result_t::missing_k);
-        failures += expect(deltas.lookup(other_collection_k, 2) == lookup_result_t::missing_k);
+        expect_true(deltas.write(collection_k, widths, 1, first).succeeded());
+        expect_true(deltas.write(other_collection_k, widths, 1, first).succeeded());
+        expect_true(deltas.remove(collection_k, widths, 1).succeeded());
+        expect_true(deltas.write(collection_k, widths, 1, second).succeeded());
+        expect_true(deltas.remove(collection_k, widths, 2).succeeded());
+        expect_true(deltas.write(collection_k, widths, 3, stored_value_view_t {}).succeeded());
+        expect_status(deltas.write(collection_k, widths, 4, too_wide), status_code_t::malformed_k);
+        expect_equal(deltas.count(), std::size_t {4});
+        expect_equal(deltas.count(collection_k), std::size_t {3});
+        expect_true(deltas.lookup(collection_k, 2) == lookup_result_t::removed_k);
+        expect_true(deltas.lookup(collection_k, 4) == lookup_result_t::missing_k);
+        expect_true(deltas.lookup(other_collection_k, 2) == lookup_result_t::missing_k);
 
         std::array<byte_t, 4> into {};
         stored_value_size_t size = 0;
-        failures += expect(deltas.select(collection_k, 1, into, size).succeeded());
-        failures += expect_eq(std::size_t {size}, second.size());
-        failures += expect(std::memcmp(into.data(), second.data(), second.size()) == 0);
-        failures += expect(deltas.select(other_collection_k, 1, into, size).succeeded());
-        failures += expect_eq(std::size_t {size}, first.size());
-        failures += expect(std::memcmp(into.data(), first.data(), first.size()) == 0);
-        failures += expect(deltas.select(collection_k, 3, into, size).succeeded());
-        failures += expect_eq(std::size_t {size}, std::size_t {0});
-        failures += expect_status(deltas.select(collection_k, 2, into, size), status_code_t::not_found_k);
+        expect_true(deltas.select(collection_k, 1, into, size).succeeded());
+        expect_equal(std::size_t {size}, second.size());
+        expect_true(std::memcmp(into.data(), second.data(), second.size()) == 0);
+        expect_true(deltas.select(other_collection_k, 1, into, size).succeeded());
+        expect_equal(std::size_t {size}, first.size());
+        expect_true(std::memcmp(into.data(), first.data(), first.size()) == 0);
+        expect_true(deltas.select(collection_k, 3, into, size).succeeded());
+        expect_equal(std::size_t {size}, std::size_t {0});
+        expect_status(deltas.select(collection_k, 2, into, size), status_code_t::not_found_k);
     }
-    failures += expect_eq(resources->memory_constraint.used(), std::size_t {0});
-    return failures;
+    expect_equal(resources->memory_constraint.used(), std::size_t {0});
 }
 
 /** Deltas holding as many keys as they admit refuse the next key with @c capacity_exhausted_k and keep the rest. */
-static std::size_t deltas_refuse_past_their_bound() {
-    std::size_t failures = 0;
+static void test_deltas_refuse_past_their_bound() {
     resources_shared_ptr_t const resources = std::make_shared<resources_t>(1ull << 20, 0);
     constexpr std::size_t bound_k = 8;
     transaction_deltas_t deltas(deltas_bytes_k, bound_k, resources);
     transaction_deltas_t::value_widths_t const widths {value_bytes_k, 0};
-    for (stored_key_t key = 0; key != bound_k; ++key)
-        failures += expect(deltas.remove(collection_k, widths, key).succeeded());
-    failures += expect_status(deltas.remove(collection_k, widths, bound_k), status_code_t::capacity_exhausted_k);
-    failures += expect_eq(deltas.count(), bound_k);
-    failures += expect(deltas.lookup(collection_k, bound_k - 1) == lookup_result_t::removed_k);
-    failures += expect(deltas.lookup(collection_k, bound_k) == lookup_result_t::missing_k);
-    return failures;
+    for (stored_key_t key = 0; key != bound_k; ++key) expect_true(deltas.remove(collection_k, widths, key).succeeded());
+    expect_status(deltas.remove(collection_k, widths, bound_k), status_code_t::capacity_exhausted_k);
+    expect_equal(deltas.count(), bound_k);
+    expect_true(deltas.lookup(collection_k, bound_k - 1) == lookup_result_t::removed_k);
+    expect_true(deltas.lookup(collection_k, bound_k) == lookup_result_t::missing_k);
 }
 
 #pragma endregion Deltas Cases
@@ -438,8 +433,7 @@ static void publish_nothing(void*, transaction_stamp_t) noexcept {}
 
 /** Commits of many threads, combined by whichever of them leads, draw distinct stamps, and the watermark covers every
  *  one of them once all returned. */
-static std::size_t commit_stamps_are_distinct() {
-    std::size_t failures = 0;
+static void test_commit_stamps_are_distinct() {
     commit_ledger_t ledger;
 
     constexpr std::size_t threads_k = 8;
@@ -474,11 +468,10 @@ static std::size_t commit_stamps_are_distinct() {
             if (stamp > highest) highest = stamp;
         }
 
-    failures += expect_eq(repeats, std::size_t {0});
-    failures += expect_eq(atomic_reference<std::size_t> {unpublished}.load(), std::size_t {0});
-    failures += expect_eq(highest, transaction_stamp_t {threads_k * per_thread_k});
-    failures += expect_eq(ledger.published(), highest);
-    return failures;
+    expect_equal(repeats, std::size_t {0});
+    expect_equal(atomic_reference<std::size_t> {unpublished}.load(), std::size_t {0});
+    expect_equal(highest, transaction_stamp_t {threads_k * per_thread_k});
+    expect_equal(ledger.published(), highest);
 }
 
 /** What a collection's first commit into empty memory does to its view's pin, as a request's publication. */
@@ -493,53 +486,51 @@ static void publish_bounding(void* context, transaction_stamp_t stamp) noexcept 
 }
 
 /** Readers and views pin stamps without allocating, and the ledger answers from exactly those pins. */
-static std::size_t pins_answer_the_ledger() {
-    std::size_t failures = 0;
+static void test_pins_answer_the_ledger() {
     commit_ledger_t ledger;
-    failures += expect(ledger.resume(41).succeeded());
-    failures += expect(ledger.resume(43).failed());
+    expect_true(ledger.resume(41).succeeded());
+    expect_true(ledger.resume(43).failed());
 
     stamp_pin_t reader;
-    failures += expect_eq(ledger.pin_reader(reader), transaction_stamp_t {41});
-    failures += expect_eq(ledger.newest_reader(), transaction_stamp_t {41});
-    failures += expect_eq(ledger.durable_stamp(), transaction_stamp_t {41});
+    expect_equal(ledger.pin_reader(reader), transaction_stamp_t {41});
+    expect_equal(ledger.newest_reader(), transaction_stamp_t {41});
+    expect_equal(ledger.durable_stamp(), transaction_stamp_t {41});
 
     // A registered view holding no memory runs bounds nothing; its first commit bounds it below that commit.
     stamp_pin_t view;
     ledger.register_view(view);
-    failures += expect_eq(ledger.durable_stamp(), transaction_stamp_t {41});
+    expect_equal(ledger.durable_stamp(), transaction_stamp_t {41});
     bounding_t bounding {&ledger, &view};
     commit_request_t request;
     request.context = &bounding;
     request.prepare = &prepare_nothing;
     request.publish = &publish_bounding;
     expected<transaction_stamp_t> const landed = ledger.submit(request);
-    failures += expect(landed && *landed == transaction_stamp_t {42});
-    failures += expect_eq(ledger.published(), transaction_stamp_t {42});
-    failures += expect_eq(ledger.durable_stamp(), transaction_stamp_t {41});
-    failures += expect_eq(ledger.horizon_besides(view), transaction_stamp_t {42});
+    expect_true(landed && *landed == transaction_stamp_t {42});
+    expect_equal(ledger.published(), transaction_stamp_t {42});
+    expect_equal(ledger.durable_stamp(), transaction_stamp_t {41});
+    expect_equal(ledger.horizon_besides(view), transaction_stamp_t {42});
 
     // A pin moves by relinking, so the moved-to object answers and the moved-from one holds nothing.
     stamp_pin_t moved {std::move(reader)};
-    failures += expect(!reader.held() && moved.held());
+    expect_true(!reader.held() && moved.held());
     stamp_pin_t later;
-    failures += expect_eq(ledger.pin_reader(later), transaction_stamp_t {42});
+    expect_equal(ledger.pin_reader(later), transaction_stamp_t {42});
     st::vector<transaction_stamp_t> pinned;
-    failures += expect(ledger.pinned_readers(pinned).succeeded());
-    failures += expect_eq(pinned.size(), std::size_t {2});
-    failures += expect(pinned.size() == 2 && pinned[0] == 41 && pinned[1] == 42);
+    expect_true(ledger.pinned_readers(pinned).succeeded());
+    expect_equal(pinned.size(), std::size_t {2});
+    expect_true(pinned.size() == 2 && pinned[0] == 41 && pinned[1] == 42);
 
     moved.release();
-    failures += expect_eq(ledger.newest_reader(), transaction_stamp_t {42});
+    expect_equal(ledger.newest_reader(), transaction_stamp_t {42});
     later.release();
-    failures += expect_eq(ledger.newest_reader(), unwritten_stamp_k);
+    expect_equal(ledger.newest_reader(), unwritten_stamp_k);
     // A flush that writes every memory run out bounds nothing again, and an unregistered view counts for nothing.
     ledger.bound_view(view, head_stamp_k);
-    failures += expect_eq(ledger.durable_stamp(), transaction_stamp_t {42});
+    expect_equal(ledger.durable_stamp(), transaction_stamp_t {42});
     ledger.bound_view(view, 30);
     view.release();
-    failures += expect_eq(ledger.durable_stamp(), transaction_stamp_t {42});
-    return failures;
+    expect_equal(ledger.durable_stamp(), transaction_stamp_t {42});
 }
 
 #pragma endregion Ordering Cases
@@ -547,74 +538,64 @@ static std::size_t pins_answer_the_ledger() {
 #pragma region Conflict Cases
 
 /** A key watched before another transaction wrote it refuses to stage. */
-static std::size_t read_write_conflict_is_caught() {
-    std::size_t failures = 0;
+static void test_read_write_conflict_is_caught() {
     fixture_t fixture;
 
     auto reader = fixture.open();
     auto writer = fixture.open();
-    failures += expect(reader.has_value() && writer.has_value());
-    if (failures != 0) return failures;
+    if (!expect_true(reader.has_value() && writer.has_value())) return;
 
-    failures += expect(reader->get()->watch<watch_schedule_t::on_commit_k>(5, watch_purpose_t::read_k).succeeded());
-    failures += expect(writer->get()->insert(5, 42).succeeded());
-    failures += expect(writer->get()->commit().succeeded());
+    expect_true(reader->get()->watch<watch_schedule_t::on_commit_k>(5, watch_purpose_t::read_k).succeeded());
+    expect_true(writer->get()->insert(5, 42).succeeded());
+    expect_true(writer->get()->commit().succeeded());
 
     status_t const staged = reader->get()->stage();
-    failures += expect(staged.failed());
-    failures += expect_status(staged, status_code_t::write_conflict_k);
+    expect_true(staged.failed());
+    expect_status(staged, status_code_t::write_conflict_k);
     reader->get()->rollback();
-    return failures;
 }
 
 /** A key nobody else touched stages and commits. */
-static std::size_t untouched_key_commits() {
-    std::size_t failures = 0;
+static void test_untouched_key_commits() {
     fixture_t fixture;
 
     auto reader = fixture.open();
     auto writer = fixture.open();
-    failures += expect(reader.has_value() && writer.has_value());
-    if (failures != 0) return failures;
+    if (!expect_true(reader.has_value() && writer.has_value())) return;
 
-    failures += expect(reader->get()->watch<watch_schedule_t::on_commit_k>(5, watch_purpose_t::read_k).succeeded());
-    failures += expect(writer->get()->insert(6, 42).succeeded());
-    failures += expect(writer->get()->commit().succeeded());
+    expect_true(reader->get()->watch<watch_schedule_t::on_commit_k>(5, watch_purpose_t::read_k).succeeded());
+    expect_true(writer->get()->insert(6, 42).succeeded());
+    expect_true(writer->get()->commit().succeeded());
 
-    failures += expect(reader->get()->stage().succeeded());
-    failures += expect(reader->get()->commit().succeeded());
-    failures += expect_eq(fixture.store.balance(6), std::uint64_t {42});
-    return failures;
+    expect_true(reader->get()->stage().succeeded());
+    expect_true(reader->get()->commit().succeeded());
+    expect_equal(fixture.store.balance(6), std::uint64_t {42});
 }
 
 /** Two transactions writing one key leave exactly one winner. */
-static std::size_t write_write_one_winner() {
-    std::size_t failures = 0;
+static void test_write_write_one_winner() {
     fixture_t fixture;
 
     auto first = fixture.open();
     auto second = fixture.open();
-    failures += expect(first.has_value() && second.has_value());
-    if (failures != 0) return failures;
+    if (!expect_true(first.has_value() && second.has_value())) return;
 
-    failures += expect(first->get()->insert(9, 111).succeeded());
-    failures += expect(second->get()->insert(9, 222).succeeded());
+    expect_true(first->get()->insert(9, 111).succeeded());
+    expect_true(second->get()->insert(9, 222).succeeded());
 
     std::size_t winners = 0;
     winners += first->get()->commit().succeeded();
     winners += second->get()->commit().succeeded();
-    failures += expect_eq(winners, std::size_t {1});
-    failures += expect_eq(fixture.store.balance(9), std::uint64_t {111});
+    expect_equal(winners, std::size_t {1});
+    expect_equal(fixture.store.balance(9), std::uint64_t {111});
 
     // The loser's writes survive its refusal, which is what a caller logging them relies on.
-    failures += expect_eq(second->get()->state().deltas.count(), std::size_t {1});
+    expect_equal(second->get()->state().deltas.count(), std::size_t {1});
     second->get()->rollback();
-    return failures;
 }
 
 /** Two transactions writing a thousand watched keys each, disjoint, both land: no conflict is ever invented. */
-static std::size_t disjoint_transactions_never_conflict() {
-    std::size_t failures = 0;
+static void test_disjoint_transactions_never_conflict() {
     fixture_t fixture;
     constexpr std::size_t band_k = 1000;
     constexpr std::size_t rounds_k = 20;
@@ -623,40 +604,36 @@ static std::size_t disjoint_transactions_never_conflict() {
     for (std::size_t round = 0; round != rounds_k; ++round) {
         auto first = fixture.open();
         auto second = fixture.open();
-        failures += expect(first.has_value() && second.has_value());
-        if (failures != 0) return failures;
+        if (!expect_true(first.has_value() && second.has_value())) return;
         for (std::size_t key = 0; key != band_k; ++key) {
-            failures += expect(first->get()->insert(key, round).succeeded());
-            failures += expect(second->get()->insert(band_k + key, round).succeeded());
-            failures += expect(first->get()
-                                   ->watch<watch_schedule_t::on_commit_k>(2 * band_k + key, watch_purpose_t::read_k)
-                                   .succeeded());
+            expect_true(first->get()->insert(key, round).succeeded());
+            expect_true(second->get()->insert(band_k + key, round).succeeded());
+            expect_true(first->get()
+                            ->watch<watch_schedule_t::on_commit_k>(2 * band_k + key, watch_purpose_t::read_k)
+                            .succeeded());
         }
         refused += first->get()->commit().failed();
         refused += second->get()->commit().failed();
     }
-    failures += expect_eq(refused, std::size_t {0});
-    failures += expect_eq(fixture.store.balance(band_k - 1), std::uint64_t {rounds_k - 1});
-    failures += expect_eq(fixture.store.balance(2 * band_k - 1), std::uint64_t {rounds_k - 1});
-    return failures;
+    expect_equal(refused, std::size_t {0});
+    expect_equal(fixture.store.balance(band_k - 1), std::uint64_t {rounds_k - 1});
+    expect_equal(fixture.store.balance(2 * band_k - 1), std::uint64_t {rounds_k - 1});
 }
 
 /** Each of the four schedules watches exactly what it says it does. */
-static std::size_t watch_schedules_behave() {
-    std::size_t failures = 0;
+static void test_watch_schedules_behave() {
 
     // `never_k` ignores a collision outright.
     {
         fixture_t fixture;
         auto reader = fixture.open();
         auto writer = fixture.open();
-        failures += expect(reader.has_value() && writer.has_value());
-        if (failures == 0) {
-            failures += expect(reader->get()->watch<watch_schedule_t::never_k>(5, watch_purpose_t::read_k).succeeded());
-            failures += expect(writer->get()->insert(5, 1).succeeded());
-            failures += expect(writer->get()->commit().succeeded());
-            failures += expect(reader->get()->stage().succeeded());
-            failures += expect_eq(reader->get()->state().read_set.count(), std::size_t {0});
+        if (expect_true(reader.has_value() && writer.has_value())) {
+            expect_true(reader->get()->watch<watch_schedule_t::never_k>(5, watch_purpose_t::read_k).succeeded());
+            expect_true(writer->get()->insert(5, 1).succeeded());
+            expect_true(writer->get()->commit().succeeded());
+            expect_true(reader->get()->stage().succeeded());
+            expect_equal(reader->get()->state().read_set.count(), std::size_t {0});
             reader->get()->rollback();
         }
     }
@@ -666,16 +643,15 @@ static std::size_t watch_schedules_behave() {
         fixture_t fixture;
         auto reader = fixture.open();
         auto writer = fixture.open();
-        failures += expect(reader.has_value() && writer.has_value());
-        if (failures == 0) {
-            failures += expect(reader->get()->watch<watch_schedule_t::now_k>(5, watch_purpose_t::read_k).succeeded());
-            failures += expect(writer->get()->insert(5, 1).succeeded());
-            failures += expect(writer->get()->commit().succeeded());
+        if (expect_true(reader.has_value() && writer.has_value())) {
+            expect_true(reader->get()->watch<watch_schedule_t::now_k>(5, watch_purpose_t::read_k).succeeded());
+            expect_true(writer->get()->insert(5, 1).succeeded());
+            expect_true(writer->get()->commit().succeeded());
             status_t const late = reader->get()->watch<watch_schedule_t::now_k>(5, watch_purpose_t::read_k);
-            failures += expect_status(late, status_code_t::write_conflict_k);
+            expect_status(late, status_code_t::write_conflict_k);
             // Nothing was recorded for later, so the stage itself has nothing to refuse.
-            failures += expect_eq(reader->get()->state().read_set.count(), std::size_t {0});
-            failures += expect(reader->get()->stage().succeeded());
+            expect_equal(reader->get()->state().read_set.count(), std::size_t {0});
+            expect_true(reader->get()->stage().succeeded());
             reader->get()->rollback();
         }
     }
@@ -685,14 +661,12 @@ static std::size_t watch_schedules_behave() {
         fixture_t fixture;
         auto reader = fixture.open();
         auto writer = fixture.open();
-        failures += expect(reader.has_value() && writer.has_value());
-        if (failures == 0) {
-            failures += expect(writer->get()->insert(5, 1).succeeded());
-            failures += expect(writer->get()->commit().succeeded());
-            failures += expect(
-                reader->get()->watch<watch_schedule_t::on_commit_k>(5, watch_purpose_t::read_k).succeeded());
+        if (expect_true(reader.has_value() && writer.has_value())) {
+            expect_true(writer->get()->insert(5, 1).succeeded());
+            expect_true(writer->get()->commit().succeeded());
+            expect_true(reader->get()->watch<watch_schedule_t::on_commit_k>(5, watch_purpose_t::read_k).succeeded());
             status_t const staged = reader->get()->stage();
-            failures += expect_status(staged, status_code_t::write_conflict_k);
+            expect_status(staged, status_code_t::write_conflict_k);
             reader->get()->rollback();
         }
     }
@@ -702,33 +676,29 @@ static std::size_t watch_schedules_behave() {
         fixture_t fixture;
         auto reader = fixture.open();
         auto writer = fixture.open();
-        failures += expect(reader.has_value() && writer.has_value());
-        if (failures == 0) {
-            failures += expect(writer->get()->insert(5, 1).succeeded());
-            failures += expect(writer->get()->commit().succeeded());
-            failures += expect(reader->get()
-                                   ->watch<watch_schedule_t::on_commit_since_operation_k>(5, watch_purpose_t::read_k)
-                                   .succeeded());
-            failures += expect(reader->get()->stage().succeeded());
+        if (expect_true(reader.has_value() && writer.has_value())) {
+            expect_true(writer->get()->insert(5, 1).succeeded());
+            expect_true(writer->get()->commit().succeeded());
+            expect_true(reader->get()
+                            ->watch<watch_schedule_t::on_commit_since_operation_k>(5, watch_purpose_t::read_k)
+                            .succeeded());
+            expect_true(reader->get()->stage().succeeded());
             reader->get()->rollback();
 
             // A commit after the operation does count, which is the half that must still refuse.
             auto second_writer = fixture.open();
-            failures += expect(second_writer.has_value());
+            expect_true(second_writer.has_value());
             if (second_writer.has_value()) {
-                failures += expect(
-                    reader->get()
-                        ->watch<watch_schedule_t::on_commit_since_operation_k>(5, watch_purpose_t::read_k)
-                        .succeeded());
-                failures += expect(second_writer->get()->insert(5, 2).succeeded());
-                failures += expect(second_writer->get()->commit().succeeded());
-                failures += expect_status(reader->get()->stage(), status_code_t::write_conflict_k);
+                expect_true(reader->get()
+                                ->watch<watch_schedule_t::on_commit_since_operation_k>(5, watch_purpose_t::read_k)
+                                .succeeded());
+                expect_true(second_writer->get()->insert(5, 2).succeeded());
+                expect_true(second_writer->get()->commit().succeeded());
+                expect_status(reader->get()->stage(), status_code_t::write_conflict_k);
                 reader->get()->rollback();
             }
         }
     }
-
-    return failures;
 }
 
 #pragma endregion Conflict Cases
@@ -736,133 +706,121 @@ static std::size_t watch_schedules_behave() {
 #pragma region Lifecycle Cases
 
 /** A commit the store refuses leaves the changes exactly as they were, so a caller can log them. */
-static std::size_t failed_commit_keeps_changes() {
-    std::size_t failures = 0;
+static void test_failed_commit_keeps_changes() {
     fixture_t fixture;
 
     auto transaction = fixture.open();
     auto reader = fixture.open();
-    failures += expect(transaction.has_value() && reader.has_value());
-    if (failures != 0) return failures;
+    if (!expect_true(transaction.has_value() && reader.has_value())) return;
 
     // The reader watches what the doomed commit is about to write, from before it runs.
-    failures += expect(reader->get()->watch<watch_schedule_t::on_commit_k>(3, watch_purpose_t::read_k).succeeded());
-    failures += expect(transaction->get()->insert(3, 7).succeeded());
-    failures += expect(transaction->get()->insert(4, 8).succeeded());
+    expect_true(reader->get()->watch<watch_schedule_t::on_commit_k>(3, watch_purpose_t::read_k).succeeded());
+    expect_true(transaction->get()->insert(3, 7).succeeded());
+    expect_true(transaction->get()->insert(4, 8).succeeded());
 
     fixture.store.behaviour = store_behaviour_t::refusing_applies_k;
-    failures += expect(transaction->get()->commit().failed());
-    failures += expect_eq(transaction->get()->state().deltas.count(), std::size_t {2});
+    expect_true(transaction->get()->commit().failed());
+    expect_equal(transaction->get()->state().deltas.count(), std::size_t {2});
 
     // The room was refused before a stamp was drawn, so nothing landed and a reader spanning the failure stages.
-    failures += expect(reader->get()->stage().succeeded());
+    expect_true(reader->get()->stage().succeeded());
     reader->get()->rollback();
 
     // Retrying is what renewal is for: the changes stay and only the watches and the stamp restart.
-    failures += expect(transaction->get()->renew().succeeded());
-    failures += expect_eq(transaction->get()->state().deltas.count(), std::size_t {2});
+    expect_true(transaction->get()->renew().succeeded());
+    expect_equal(transaction->get()->state().deltas.count(), std::size_t {2});
 
     // A refused stage leaves them too, which is the other half of the same promise.
     fixture.store.behaviour = store_behaviour_t::refusing_flushes_k;
-    failures += expect_status(transaction->get()->stage(), status_code_t::device_k);
-    failures += expect_eq(transaction->get()->state().deltas.count(), std::size_t {2});
+    expect_status(transaction->get()->stage(), status_code_t::device_k);
+    expect_equal(transaction->get()->state().deltas.count(), std::size_t {2});
 
     // The refused stage handed the write path back, so the retry can still take it.
     fixture.store.behaviour = store_behaviour_t::accepting_k;
-    failures += expect(transaction->get()->commit().succeeded());
-    failures += expect_eq(fixture.store.balance(3), std::uint64_t {7});
-    failures += expect_eq(fixture.store.balance(4), std::uint64_t {8});
-    return failures;
+    expect_true(transaction->get()->commit().succeeded());
+    expect_equal(fixture.store.balance(3), std::uint64_t {7});
+    expect_equal(fixture.store.balance(4), std::uint64_t {8});
 }
 
 /** A stage that has to flush first does, and hands the write path back once the commit lands. */
-static std::size_t refused_flush_releases_the_channel() {
-    std::size_t failures = 0;
+static void test_refused_flush_releases_the_channel() {
     fixture_t fixture;
     fixture.store.behaviour = store_behaviour_t::always_flushing_k;
 
     auto transaction = fixture.open();
-    failures += expect(transaction.has_value());
-    if (failures != 0) return failures;
-    failures += expect(transaction->get()->insert(3, 7).succeeded());
+    if (!expect_true(transaction.has_value())) return;
+    expect_true(transaction->get()->insert(3, 7).succeeded());
 
-    failures += expect(transaction->get()->stage().succeeded());
-    failures += expect_eq(fixture.store.flushes, std::size_t {1});
-    failures += expect(transaction->get()->commit().succeeded());
+    expect_true(transaction->get()->stage().succeeded());
+    expect_equal(fixture.store.flushes, std::size_t {1});
+    expect_true(transaction->get()->commit().succeeded());
 
     // The write path was handed back, so the next transaction can still take it.
     auto second = fixture.open();
-    failures += expect(second.has_value());
+    expect_true(second.has_value());
     if (second.has_value()) {
-        failures += expect(second->get()->insert(4, 8).succeeded());
-        failures += expect(second->get()->commit().succeeded());
+        expect_true(second->get()->insert(4, 8).succeeded());
+        expect_true(second->get()->commit().succeeded());
     }
-    return failures;
 }
 
 /** Rollback and renewal leave the registry with no trace of the transaction, and its pin goes with it. */
-static std::size_t rollback_and_renew_leave_no_trace() {
-    std::size_t failures = 0;
+static void test_rollback_and_renew_leave_no_trace() {
     fixture_t fixture;
 
     {
         auto transaction = fixture.open();
-        failures += expect(transaction.has_value());
-        if (failures != 0) return failures;
+        if (!expect_true(transaction.has_value())) return;
 
-        failures += expect(transaction->get()->insert(3, 7).succeeded());
-        failures += expect(transaction->get()->stage().succeeded());
+        expect_true(transaction->get()->insert(3, 7).succeeded());
+        expect_true(transaction->get()->stage().succeeded());
         transaction->get()->rollback();
-        failures += expect_eq(transaction->get()->state().deltas.count(), std::size_t {0});
-        failures += expect_eq(transaction->get()->state().read_set.count(), std::size_t {0});
+        expect_equal(transaction->get()->state().deltas.count(), std::size_t {0});
+        expect_equal(transaction->get()->state().read_set.count(), std::size_t {0});
 
         // Renewal keeps the changes and drops only the watches, once the stage hands the
         // write path back.
-        failures += expect(transaction->get()->insert(3, 9).succeeded());
-        failures += expect(transaction->get()->stage().succeeded());
+        expect_true(transaction->get()->insert(3, 9).succeeded());
+        expect_true(transaction->get()->stage().succeeded());
         transaction->get()->unstage();
-        failures += expect(transaction->get()->renew().succeeded());
-        failures += expect_eq(transaction->get()->state().deltas.count(), std::size_t {1});
-        failures += expect_eq(transaction->get()->state().read_set.count(), std::size_t {0});
-        failures += expect(transaction->get()->commit().succeeded());
-        failures += expect_eq(fixture.store.balance(3), std::uint64_t {9});
-        failures += expect_eq(fixture.store.ledger().newest_reader(), fixture.store.ledger().published());
+        expect_true(transaction->get()->renew().succeeded());
+        expect_equal(transaction->get()->state().deltas.count(), std::size_t {1});
+        expect_equal(transaction->get()->state().read_set.count(), std::size_t {0});
+        expect_true(transaction->get()->commit().succeeded());
+        expect_equal(fixture.store.balance(3), std::uint64_t {9});
+        expect_equal(fixture.store.ledger().newest_reader(), fixture.store.ledger().published());
     }
 
     // The transaction is gone with its object, and so is its pin.
-    failures += expect_eq(fixture.store.ledger().newest_reader(), unwritten_stamp_k);
-    return failures;
+    expect_equal(fixture.store.ledger().newest_reader(), unwritten_stamp_k);
 }
 
 /** A watcher beside twenty thousand commits is refused by exactly the one that wrote its key, and a watcher of a
  *  key nobody wrote is refused by none, since the store answers from the stamps it keeps per key. */
-static std::size_t long_watchers_stay_exact() {
-    std::size_t failures = 0;
+static void test_long_watchers_stay_exact() {
     fixture_t fixture;
 
     auto lingering = fixture.open();
     auto untouched = fixture.open();
-    failures += expect(lingering.has_value() && untouched.has_value());
-    if (failures != 0) return failures;
+    if (!expect_true(lingering.has_value() && untouched.has_value())) return;
     // The watched key is written by the very first of the commits below, and by nothing after it.
-    failures += expect(lingering->get()->watch<watch_schedule_t::on_commit_k>(1, watch_purpose_t::read_k).succeeded());
-    failures += expect(untouched->get()->watch<watch_schedule_t::on_commit_k>(0, watch_purpose_t::read_k).succeeded());
+    expect_true(lingering->get()->watch<watch_schedule_t::on_commit_k>(1, watch_purpose_t::read_k).succeeded());
+    expect_true(untouched->get()->watch<watch_schedule_t::on_commit_k>(0, watch_purpose_t::read_k).succeeded());
 
     for (std::size_t round = 0; round != 20000; ++round) {
         auto writer = fixture.open();
         if (!writer.has_value()) {
-            failures += expect(false);
+            expect_true(false);
             break;
         }
-        failures += expect(writer->get()->insert(round == 0 ? 1 : 2 + round % (accounts_k - 2), round).succeeded());
-        if (writer->get()->commit().failed()) failures += expect(false);
+        expect_true(writer->get()->insert(round == 0 ? 1 : 2 + round % (accounts_k - 2), round).succeeded());
+        if (writer->get()->commit().failed()) expect_true(false);
     }
 
-    failures += expect_status(lingering->get()->stage(), status_code_t::write_conflict_k);
+    expect_status(lingering->get()->stage(), status_code_t::write_conflict_k);
     lingering->get()->rollback();
-    failures += expect(untouched->get()->stage().succeeded());
+    expect_true(untouched->get()->stage().succeeded());
     untouched->get()->rollback();
-    return failures;
 }
 
 #pragma endregion Lifecycle Cases
@@ -876,8 +834,7 @@ static std::size_t long_watchers_stay_exact() {
  *  half that landed, so the sum is the whole result. Every transaction reads two balances outside
  *  the write path and writes both inside it, which is the shape the stamps have to survive.
  */
-static std::size_t serializable_under_threads() {
-    std::size_t failures = 0;
+static void test_serializable_under_threads() {
     fixture_t fixture;
 
     constexpr std::size_t threads_k = 8;
@@ -937,12 +894,11 @@ static std::size_t serializable_under_threads() {
         refusals += refused[index];
     }
 
-    failures += expect_eq(fixture.store.total(), total_before);
-    failures += expect(commits + refusals > 0);
+    expect_equal(fixture.store.total(), total_before);
+    expect_true(commits + refusals > 0);
 
     // A layer that refused everything would pass the total while proving nothing, so it must not.
-    failures += expect(commits > 0);
-    return failures;
+    expect_true(commits > 0);
 }
 
 /**
@@ -954,49 +910,45 @@ static std::size_t serializable_under_threads() {
  *  refuse it. Starting the reader at the drawn stamp instead of the published one lets it through
  *  with a value that was never committed.
  */
-static std::size_t start_during_apply_still_conflicts() {
-    std::size_t failures = 0;
+static void test_start_during_apply_still_conflicts() {
     fixture_t fixture;
     fixture.store.behaviour = store_behaviour_t::pausing_in_apply_k;
 
     auto writer = fixture.open();
-    failures += expect(writer.has_value());
-    if (failures != 0) return failures;
+    if (!expect_true(writer.has_value())) return;
 
     std::size_t committed = 0;
-    failures += expect(writer->get()->insert(5, 77).succeeded());
+    expect_true(writer->get()->insert(5, 77).succeeded());
     std::thread committing([&] { committed = writer->get()->commit().succeeded(); });
 
     // The commit is now past its stamp and has not written a byte.
-    failures += expect(spin_until([&] { return fixture.store.paused(); }));
+    expect_true(spin_until([&] { return fixture.store.paused(); }));
 
     auto reader = fixture.open();
-    failures += expect(reader.has_value());
+    expect_true(reader.has_value());
     std::uint64_t seen = 0;
     if (reader.has_value()) {
-        failures += expect(reader->get()->watch<watch_schedule_t::on_commit_k>(5, watch_purpose_t::read_k).succeeded());
+        expect_true(reader->get()->watch<watch_schedule_t::on_commit_k>(5, watch_purpose_t::read_k).succeeded());
         seen = fixture.store.balance(5);
     }
 
     fixture.store.resume();
     committing.join();
 
-    failures += expect_eq(committed, std::size_t {1});
-    failures += expect_eq(fixture.store.balance(5), std::uint64_t {77});
+    expect_equal(committed, std::size_t {1});
+    expect_equal(fixture.store.balance(5), std::uint64_t {77});
 
     // The reader really did read the value the commit was about to replace, and must be refused for it.
-    failures += expect_eq(seen, initial_balance_k);
+    expect_equal(seen, initial_balance_k);
     if (reader.has_value()) {
         fixture.store.behaviour = store_behaviour_t::accepting_k;
-        failures += expect_status(reader->get()->stage(), status_code_t::write_conflict_k);
+        expect_status(reader->get()->stage(), status_code_t::write_conflict_k);
         reader->get()->rollback();
     }
-    return failures;
 }
 
 /** Threads opening and closing transactions against one ledger leave no pin behind. */
-static std::size_t pins_survive_churn() {
-    std::size_t failures = 0;
+static void test_pins_survive_churn() {
     fixture_t fixture;
 
     constexpr std::size_t threads_k = 8;
@@ -1020,43 +972,38 @@ static std::size_t pins_survive_churn() {
 
     std::size_t total_opened = 0;
     for (std::size_t const count : opened) total_opened += count;
-    failures += expect_eq(total_opened, threads_k * rounds_k);
-    failures += expect_eq(fixture.store.ledger().newest_reader(), unwritten_stamp_k);
-    return failures;
+    expect_equal(total_opened, threads_k * rounds_k);
+    expect_equal(fixture.store.ledger().newest_reader(), unwritten_stamp_k);
 }
 
 #pragma endregion Concurrency Cases
 
 } // namespace unum::ustore
 
-int main(int argc, char const* argv[]) {
+int main(int argc, char** argv) {
     using namespace unum::ustore;
     using namespace unum::ustore::test;
     using namespace unum::ustore::blobs;
     using namespace unum::ustore::utilities;
 
-    suite_options_t options;
-    if (argument_status_t const status = parse_suite_options(argc, argv, options);
-        status != argument_status_t::parsed_k)
-        return status == argument_status_t::help_k ? 0 : 1;
-    suite_totals_t totals = options.totals();
+    start_test_run(argc, argv);
 
-    report(totals, "deltas.per_collection", deltas_read_back_per_collection);
-    report(totals, "deltas.bound", deltas_refuse_past_their_bound);
-    report(totals, "stamps.distinct", commit_stamps_are_distinct);
-    report(totals, "ledger.pins", pins_answer_the_ledger);
-    report(totals, "conflict.read_write", read_write_conflict_is_caught);
-    report(totals, "conflict.untouched_commits", untouched_key_commits);
-    report(totals, "conflict.write_write_one_winner", write_write_one_winner);
-    report(totals, "conflict.disjoint_never", disjoint_transactions_never_conflict);
-    report(totals, "conflict.watch_schedules", watch_schedules_behave);
-    report(totals, "lifecycle.failed_commit_keeps", failed_commit_keeps_changes);
-    report(totals, "lifecycle.flush_releases_channel", refused_flush_releases_the_channel);
-    report(totals, "lifecycle.rollback_and_renew", rollback_and_renew_leave_no_trace);
-    report(totals, "lifecycle.long_watchers_exact", long_watchers_stay_exact);
-    report(totals, "threads.serializable", serializable_under_threads);
-    report(totals, "threads.start_during_apply", start_during_apply_still_conflicts);
-    report(totals, "threads.pins_churn", pins_survive_churn);
+    run_test_case("test_deltas_read_back_per_collection", test_deltas_read_back_per_collection);
+    run_test_case("test_deltas_refuse_past_their_bound", test_deltas_refuse_past_their_bound);
+    run_test_case("test_commit_stamps_are_distinct", test_commit_stamps_are_distinct);
+    run_test_case("test_pins_answer_the_ledger", test_pins_answer_the_ledger);
+    run_test_case("test_read_write_conflict_is_caught", test_read_write_conflict_is_caught);
+    run_test_case("test_untouched_key_commits", test_untouched_key_commits);
+    run_test_case("test_write_write_one_winner", test_write_write_one_winner);
+    run_test_case("test_disjoint_transactions_never_conflict", test_disjoint_transactions_never_conflict);
+    run_test_case("test_watch_schedules_behave", test_watch_schedules_behave);
+    run_test_case("test_failed_commit_keeps_changes", test_failed_commit_keeps_changes);
+    run_test_case("test_refused_flush_releases_the_channel", test_refused_flush_releases_the_channel);
+    run_test_case("test_rollback_and_renew_leave_no_trace", test_rollback_and_renew_leave_no_trace);
+    run_test_case("test_long_watchers_stay_exact", test_long_watchers_stay_exact);
+    run_test_case("test_serializable_under_threads", test_serializable_under_threads);
+    run_test_case("test_start_during_apply_still_conflicts", test_start_during_apply_still_conflicts);
+    run_test_case("test_pins_survive_churn", test_pins_survive_churn);
 
-    return suite_exit_code(totals);
+    return finish_test_run();
 }

@@ -111,16 +111,15 @@ class device_buffer_t {
     }
 };
 
-/** Submits @p requests in one batch and waits for every completion, counting each that did not complete in full. */
-std::size_t move_in_full(linux_cufile_files_disk_t& disk, queue_pair_t const& queue_pair,
-                         std::span<request_t const> requests) {
+/** Submits @p requests in one batch and waits for every completion, checking that each
+ *  completed in full. */
+void move_in_full(linux_cufile_files_disk_t& disk, queue_pair_t const& queue_pair,
+                  std::span<request_t const> requests) {
     std::array<completion_t, polling_room_k> completions {};
-    std::size_t failures = expect(disk.submit(queue_pair, requests) == requests.size());
-    failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
-                                                           requests.size()) == requests.size());
-    for (std::size_t index = 0; index != requests.size(); ++index)
-        failures += expect(completions[index].completed_in_full());
-    return failures;
+    expect_true(disk.submit(queue_pair, requests) == requests.size());
+    expect_true(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
+                                                    requests.size()) == requests.size());
+    for (std::size_t index = 0; index != requests.size(); ++index) expect_true(completions[index].completed_in_full());
 }
 
 #pragma endregion Fixtures
@@ -128,39 +127,38 @@ std::size_t move_in_full(linux_cufile_files_disk_t& disk, queue_pair_t const& qu
 #pragma region Cases
 
 /** Without the @c nvidia_fs module, a mount that demands DMA is refused as a device failure. */
-case_result_t cufile_refuses_direct_without_nvidia_fs() {
+case_result_t test_cufile_refuses_direct_without_nvidia_fs() {
     if (linux_cufile_files_disk_t::probe(cufile()) == linux_cufile_probe_t::direct_k)
-        return case_result_t::skipped("nvidia_fs is loaded, so GPUDirect Storage is direct");
+        return case_result_t::skipped("needs cuFile without nvidia_fs");
     linux_cufile_disk_config_t config;
     config.gds = ustore_gds_direct_k;
-    return expect_status(linux_cufile_files_disk_t::make(cufile(), config), status_code_t::device_k);
+    expect_status(linux_cufile_files_disk_t::make(cufile(), config), status_code_t::device_k);
+    return {};
 }
 
 /** Writes painted host bytes to the medium, reads them into device memory, writes that device memory to a second
  *  extent, and reads the second extent back into host memory, which must hold the same bytes. */
-case_result_t cufile_moves_device_memory(linux_cufile_files_disk_t& disk, medium_reference_t medium,
-                                         test_cuda_t const& cuda) {
-    if (!cuda) return case_result_t::skipped("needs libcuda and a GPU for device memory");
-    std::size_t failures = 0;
+case_result_t test_cufile_moves_device_memory(linux_cufile_files_disk_t& disk, medium_reference_t medium,
+                                              test_cuda_t const& cuda) {
+    if (!cuda) return case_result_t::skipped(no_gpu_device_k);
     device_buffer_t const device {cuda, device_bytes_k};
     test_buffer_t host = make_buffer(2 * device_bytes_k);
-    failures += expect(!device.bytes().empty() && host.size() == 2 * device_bytes_k);
-    if (failures) return failures;
+    if (!expect_true(!device.bytes().empty() && host.size() == 2 * device_bytes_k)) return {};
     std::span<byte_t> const written = whole(host).first(device_bytes_k);
     std::span<byte_t> const read = whole(host).subspan(device_bytes_k);
     paint(written, 41);
 
     expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(acquired.has_value());
-    if (!acquired) return failures;
+    expect_true(acquired.has_value());
+    if (!acquired) return {};
     queue_pair_t queue_pair = std::move(*acquired);
     expected<registered_memory_t> host_registered = disk.register_memory(whole(host), memory_space_t::host_k);
     expected<registered_memory_t> device_registered = disk.register_memory(device.bytes(), memory_space_t::gpu_k);
-    failures += expect(host_registered.has_value() && device_registered.has_value());
+    expect_true(host_registered.has_value() && device_registered.has_value());
     if (host_registered && device_registered) {
         registered_memory_t host_memory = std::move(*host_registered);
         registered_memory_t device_memory = std::move(*device_registered);
-        failures += expect(device_memory.space() == memory_space_t::gpu_k);
+        expect_true(device_memory.space() == memory_space_t::gpu_k);
 
         extent_t const first {0, device_bytes_k}, second {device_bytes_k, device_bytes_k};
         std::array<request_t, 1> const host_write {
@@ -171,25 +169,25 @@ case_result_t cufile_moves_device_memory(linux_cufile_files_disk_t& disk, medium
             write_request(medium, second, device_memory.reference(0), queue_pair.token(2))};
         std::array<request_t, 1> const host_read {
             read_request(medium, second, host_memory.reference(device_bytes_k), queue_pair.token(3))};
-        failures += move_in_full(disk, queue_pair, host_write);
-        failures += move_in_full(disk, queue_pair, device_read);
+        move_in_full(disk, queue_pair, host_write);
+        move_in_full(disk, queue_pair, device_read);
 
         // The device must hold what was written before it writes it back, which a copy of its own checks
         test_buffer_t copied = make_buffer(device_bytes_k);
-        failures += expect(device.download(whole(copied)) && same_bytes(whole(copied), written));
-        failures += move_in_full(disk, queue_pair, device_write);
-        failures += move_in_full(disk, queue_pair, host_read);
-        failures += expect(same_bytes(read, written));
+        expect_true(device.download(whole(copied)) && same_bytes(whole(copied), written));
+        move_in_full(disk, queue_pair, device_write);
+        move_in_full(disk, queue_pair, host_read);
+        expect_true(same_bytes(read, written));
 
-        failures += expect(disk.unregister_memory(device_memory).succeeded());
-        failures += expect(disk.unregister_memory(host_memory).succeeded());
+        expect_true(disk.unregister_memory(device_memory).succeeded());
+        expect_true(disk.unregister_memory(host_memory).succeeded());
     }
     else {
-        if (host_registered) failures += expect(disk.unregister_memory(*host_registered).succeeded());
-        if (device_registered) failures += expect(disk.unregister_memory(*device_registered).succeeded());
+        if (host_registered) expect_true(disk.unregister_memory(*host_registered).succeeded());
+        if (device_registered) expect_true(disk.unregister_memory(*device_registered).succeeded());
     }
-    failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-    return failures;
+    expect_true(disk.release_queue_pair(queue_pair).succeeded());
+    return {};
 }
 
 #pragma endregion Cases
@@ -197,8 +195,8 @@ case_result_t cufile_moves_device_memory(linux_cufile_files_disk_t& disk, medium
 #pragma region Driver
 
 /** Mounts cuFile in compat mode on unbuffered files and runs the suite on it. */
-void cufile_transport(suite_totals_t& totals, char const* directory) {
-    report(totals, "cufile.direct_without_nvidia_fs", cufile_refuses_direct_without_nvidia_fs);
+void cufile_transport(char const* directory) {
+    run_test_case("test_cufile_refuses_direct_without_nvidia_fs", test_cufile_refuses_direct_without_nvidia_fs);
 
     linux_cufile_disk_config_t config;
     config.queue_pairs_limit = 4;
@@ -207,34 +205,40 @@ void cufile_transport(suite_totals_t& totals, char const* directory) {
     config.media_limit = 4;
     config.gds = ustore_gds_compatibility_k;
     expected<linux_cufile_files_disk_t> disk = linux_cufile_files_disk_t::make(cufile(), config);
-    if (report(totals, "cufile.mount", expect_status(disk, status_code_t::success_k)) != 0) return;
-    report(totals, "cufile.reaches_gpu_memory", expect(disk->capabilities().reaches_gpu_memory));
+    run_test_case("linux_cufile_files_disk_t::make", [&] { expect_status(disk, status_code_t::success_k); });
+    if (!disk) return;
+    run_test_case("linux_cufile_files_disk_t::capabilities",
+                  [&] { expect_true(disk->capabilities().reaches_gpu_memory); });
 
     test_cuda_t const cuda = test_cuda_t::load();
-    path_t const path {directory, "volume.bin"};
-    on_medium(totals, "cufile.volume", *disk, volume_request(path.c_str()), [&](medium_reference_t medium) {
-        ring_cases(totals, "cufile", *disk, medium);
-        report(totals, "cufile.moves_device_memory", cufile_moves_device_memory, *disk, medium, cuda);
-    });
+    std::string const path = fmt::format("{}/{}", directory, "volume.bin");
+    on_medium("linux_cufile_files_disk_t::register_medium", *disk, volume_request(path.c_str()),
+              [&](medium_reference_t medium) {
+                  ring_cases("linux_cufile_files_disk_t", *disk, medium);
+                  run_test_case("test_cufile_moves_device_memory", test_cufile_moves_device_memory, *disk, medium,
+                                cuda);
+              });
 
-    path_t const borrowed_path {directory, "volume_borrowed.bin"};
-    report(totals, "cufile.medium_in_flight", ring_holds_a_medium_in_flight<linux_cufile_files_disk_t>, *disk,
-           volume_request(borrowed_path.c_str()));
-    path_t const durable_path {directory, "volume_durable.bin"};
-    report(totals, "cufile.keeps_what_it_flushed", ring_keeps_what_it_flushed<linux_cufile_files_disk_t>, *disk,
-           volume_request(durable_path.c_str()));
+    std::string const borrowed_path = fmt::format("{}/{}", directory, "volume_borrowed.bin");
+    run_test_case("test_ring_holds_a_medium_in_flight<linux_cufile_files_disk_t>",
+                  test_ring_holds_a_medium_in_flight<linux_cufile_files_disk_t>, *disk,
+                  volume_request(borrowed_path.c_str()));
+    std::string const durable_path = fmt::format("{}/{}", directory, "volume_durable.bin");
+    run_test_case("test_ring_keeps_what_it_flushed<linux_cufile_files_disk_t>",
+                  test_ring_keeps_what_it_flushed<linux_cufile_files_disk_t>, *disk,
+                  volume_request(durable_path.c_str()));
 }
 
 /** Why this machine cannot run the suite, or null when it can. */
-[[nodiscard]] char const* cufile_refusal(test_environment_t const& environment) noexcept {
+[[nodiscard]] char const* cufile_refusal(char const* directory) noexcept {
     switch (linux_cufile_files_disk_t::probe(cufile())) {
     case linux_cufile_probe_t::absent_k: return "needs libcufile";
-    case linux_cufile_probe_t::refused_k: return "cuFile has neither nvidia_fs nor compat mode";
+    case linux_cufile_probe_t::refused_k: return "cuFile is refused on this machine";
     case linux_cufile_probe_t::direct_k:
     case linux_cufile_probe_t::compat_k: break;
     }
-    if (!environment.directory) return needs_directory_k;
-    if (on_memory_filesystem(environment.directory)) return "needs a filesystem that enforces O_DIRECT, not tmpfs";
+    if (!directory) return needs_directory_k;
+    if (on_memory_filesystem(directory)) return needs_direct_filesystem_k;
     return nullptr;
 }
 
@@ -242,25 +246,20 @@ void cufile_transport(suite_totals_t& totals, char const* directory) {
 
 } // namespace unum::ustore::test
 
-int main(int argc, char const* argv[]) {
+int main(int argc, char** argv) {
     using namespace unum::ustore;
     using namespace unum::ustore::test;
 
-    suite_options_t options;
-    if (argument_status_t const status = parse_suite_options(argc, argv, options);
-        status != argument_status_t::parsed_k)
-        return status == argument_status_t::help_k ? 0 : 1;
-    suite_totals_t totals = options.totals();
+    start_test_run(argc, argv);
 
-    st::expected<directory_t> directory = directory_t::make(options.directory);
+    st::expected<scratch_directory_t> directory = scratch_directory_t::make(test_run.settings.directory);
     if (!directory) {
         fmt::println(stderr, "  the working directory would not open");
         return 1;
     }
-    test_environment_t const environment = test_environment_t::of(options, *directory);
 
-    if (char const* const reason = cufile_refusal(environment))
-        report(totals, "cufile", case_result_t::skipped(reason));
-    else cufile_transport(totals, environment.directory);
-    return suite_exit_code(totals);
+    if (char const* const reason = cufile_refusal(directory->path()))
+        run_test_case("linux_cufile_files_disk_t::make", [reason] { return case_result_t::skipped(reason); });
+    else cufile_transport(directory->path());
+    return finish_test_run();
 }

@@ -64,7 +64,7 @@ constexpr std::array<std::string_view, 2> format_names_k {"ndjson", "csv"};
 }
 
 /** Command-line options of the benchmark, each field set by the flag of the same name; text views into @c argv. */
-struct settings_t : shared_settings_t {
+struct tabular_graph_settings_t : bench_settings_t {
 
     /** Directory holding the input files. */
     std::string_view dataset;
@@ -101,7 +101,7 @@ struct settings_t : shared_settings_t {
 };
 
 /** The input and export format @p settings selected, which @c format_names_k orders. */
-[[nodiscard]] file_format_t selected_format(settings_t const& settings) noexcept {
+[[nodiscard]] file_format_t selected_format(tabular_graph_settings_t const& settings) noexcept {
     return static_cast<file_format_t>(settings.format.selected);
 }
 
@@ -152,7 +152,7 @@ struct tabular_t {
 }
 
 /** Lists up to @c max_input_files_total files with the extension of the requested format. */
-[[nodiscard]] bool list_files(settings_t const& settings, tabular_t& tabular) noexcept {
+[[nodiscard]] bool list_files(tabular_graph_settings_t const& settings, tabular_t& tabular) noexcept {
     std::string_view const extension = format_as(selected_format(settings));
     fmt::println("Will search for .{} files...", extension);
     sz::string_t directory;
@@ -207,7 +207,7 @@ void clear_collection(ustore_database_t database, ustore_collection_id_t collect
 }
 
 /** Composes the path of the export named @p stem that the thread at @p thread_index writes, in the input format. */
-[[nodiscard]] bool export_path(sz::string_t& path, settings_t const& settings, std::string_view stem,
+[[nodiscard]] bool export_path(sz::string_t& path, tabular_graph_settings_t const& settings, std::string_view stem,
                                std::size_t thread_index) noexcept {
     std::string_view const extension = format_as(selected_format(settings));
     char infix[24];
@@ -221,7 +221,7 @@ void clear_collection(ustore_database_t database, ustore_collection_id_t collect
 }
 
 /** Imports every listed file as documents, each thread over its own contiguous share of the files. */
-void bench_docs_import(executor_t& executor, tabular_t const& tabular, settings_t const& settings,
+void bench_docs_import(executor_t& executor, tabular_t const& tabular, tabular_graph_settings_t const& settings,
                        std::string_view name) {
     print(run_pass(executor, name, tabular.files.size(), [&](loop_t& loop, std::size_t) noexcept {
         ustore_outcome_t outcome {};
@@ -242,7 +242,7 @@ void bench_docs_import(executor_t& executor, tabular_t const& tabular, settings_
 }
 
 /** Imports every listed file as a graph, each thread over its own contiguous share of the files. */
-void bench_graph_import(executor_t& executor, tabular_t const& tabular, settings_t const& settings,
+void bench_graph_import(executor_t& executor, tabular_t const& tabular, tabular_graph_settings_t const& settings,
                         std::string_view name) {
     print(run_pass(executor, name, tabular.files.size(), [&](loop_t& loop, std::size_t) noexcept {
         ustore_outcome_t outcome {};
@@ -265,7 +265,7 @@ void bench_graph_import(executor_t& executor, tabular_t const& tabular, settings
 }
 
 /** Exports the documents once from every thread, each into its own file. */
-void bench_docs_export(executor_t& executor, tabular_t const& tabular, settings_t const& settings,
+void bench_docs_export(executor_t& executor, tabular_t const& tabular, tabular_graph_settings_t const& settings,
                        std::string_view name) {
     print(run_pass(executor, name, executor.threads_count(), [&](loop_t& loop, std::size_t thread) noexcept {
         sz::string_t output;
@@ -291,7 +291,7 @@ void bench_docs_export(executor_t& executor, tabular_t const& tabular, settings_
 }
 
 /** Exports the graph once from every thread, each into its own file. */
-void bench_graph_export(executor_t& executor, tabular_t const& tabular, settings_t const& settings,
+void bench_graph_export(executor_t& executor, tabular_t const& tabular, tabular_graph_settings_t const& settings,
                         std::string_view name) {
     print(run_pass(executor, name, executor.threads_count(), [&](loop_t& loop, std::size_t thread) noexcept {
         sz::string_t output;
@@ -336,7 +336,7 @@ int main(int argc, char** argv) {
     using namespace unum::ustore;
     using namespace unum::ustore::bench;
 
-    settings_t settings;
+    tabular_graph_settings_t settings;
     std::array<flag_t, 13> const flags {{
         {"--dataset", "path", "directory of input files, required", &settings.dataset},
         {"--format", "name", "format of the input files and the exports", &settings.format},
@@ -352,8 +352,13 @@ int main(int argc, char** argv) {
         {"--max-input-files-total", "count", "input files listed from the dataset", &settings.max_input_files_total},
         {"--memory-limit", "size", "bytes an import or export buffers per batch, like 1GB", &settings.memory_limit},
     }};
+    std::array<char const*, 13> const variables {
+        "USTORE_DATASET",          "USTORE_FORMAT",     "USTORE_ENGINE",   "USTORE_ISOLATION",
+        "USTORE_ENGINE_TRANSPORT", "USTORE_DIRECTORY",  "USTORE_ID_FIELD", "USTORE_SOURCE_FIELD",
+        "USTORE_TARGET_FIELD",     "USTORE_EDGE_FIELD", "USTORE_THREADS",  "USTORE_MAX_INPUT_FILES_TOTAL",
+        "USTORE_MEMORY_LIMIT"};
 
-    read_settings(argc, argv, settings, flags);
+    read_bench_settings(argc, argv, settings, flags, variables);
     if (settings.dataset.empty() || settings.directory.empty() || settings.id_field.empty() ||
         settings.source_field.empty() || settings.target_field.empty() || settings.edge_field.empty()) {
         fmt::println(stderr,
@@ -403,11 +408,11 @@ int main(int argc, char** argv) {
     std::string const docs_export_name = fmt::format("docs_export_{}", format);
     std::string const graph_import_name = fmt::format("graph_import_{}", format);
     std::string const graph_export_name = fmt::format("graph_export_{}", format);
-    if (settings.selects(docs_import_name)) bench_docs_import(executor, tabular, settings, docs_import_name);
-    if (settings.selects(docs_export_name)) bench_docs_export(executor, tabular, settings, docs_export_name);
+    if (settings.filter.selects(docs_import_name)) bench_docs_import(executor, tabular, settings, docs_import_name);
+    if (settings.filter.selects(docs_export_name)) bench_docs_export(executor, tabular, settings, docs_export_name);
     clear_collection(tabular.database, tabular.docs);
-    if (settings.selects(graph_import_name)) bench_graph_import(executor, tabular, settings, graph_import_name);
-    if (settings.selects(graph_export_name)) bench_graph_export(executor, tabular, settings, graph_export_name);
+    if (settings.filter.selects(graph_import_name)) bench_graph_import(executor, tabular, settings, graph_import_name);
+    if (settings.filter.selects(graph_export_name)) bench_graph_export(executor, tabular, settings, graph_export_name);
     clear_collection(tabular.database, tabular.graph);
 
     ustore_database_free(tabular.database);

@@ -53,8 +53,8 @@ inline constexpr std::array<std::string_view, 2> engine_names_k {"nvme", "rocksd
 inline constexpr std::array<std::string_view, 2> compactor_names_k {"cpu", "gpu"};
 
 /** Command-line options of the benchmark, each field set by the flag of the same name. */
-struct settings_t {
-    shared_settings_t shared;
+struct compaction_settings_t {
+    bench_settings_t shared;
     choice_t engine {engine_names_k};
     choice_t compactor {compactor_names_k};
     std::string_view directory;
@@ -111,7 +111,7 @@ struct process_counters_t {
 #pragma region Records
 
 /** The key of record @p index, two words of the seeded stream. */
-[[nodiscard]] ustore_key_t key_of(std::uint32_t seed, std::size_t index) noexcept {
+[[nodiscard]] ustore_key_t key_of(std::uint64_t seed, std::size_t index) noexcept {
     std::array<std::uint64_t, 2> const words {stream_key(seed, "keys", 2 * index),
                                               stream_key(seed, "keys", 2 * index + 1)};
     ustore_key_t key;
@@ -121,10 +121,10 @@ struct process_counters_t {
 
 /** Fills @p value with the bytes record @p index holds, derived from its key so a read
  *  can be checked. */
-void fill_value(std::uint32_t seed, std::size_t index, std::span<std::byte> value) noexcept {
+void fill_value(std::uint64_t seed, std::size_t index, std::span<std::byte> value) noexcept {
     std::uint64_t const origin = stream_key(seed, "values", index);
     for (std::size_t offset = 0; offset < value.size(); offset += sizeof(std::uint64_t)) {
-        std::uint64_t const word = mix(origin + offset);
+        std::uint64_t const word = split_mix_bits(origin + offset);
         std::memcpy(value.data() + offset, &word, fu::min_of(sizeof(word), value.size() - offset));
     }
 }
@@ -134,7 +134,7 @@ void fill_value(std::uint32_t seed, std::size_t index, std::span<std::byte> valu
 #pragma region Engines
 
 /** Opens the database @p settings name, answering a reason when it cannot. */
-[[nodiscard]] char const* open_database(settings_t const& settings, ustore_executor_t executor,
+[[nodiscard]] char const* open_database(compaction_settings_t const& settings, ustore_executor_t executor,
                                         ustore_executor_t compactions, ustore_database_t& database) {
     ustore_outcome_t outcome {};
     if (settings.on_rocksdb()) {
@@ -266,7 +266,7 @@ std::uint64_t drop_cached(std::string_view directory) noexcept {
 
 /** Writes every record of @p settings in batches, refusing to pass the write limit, answering a
  *  reason when it stops. */
-[[nodiscard]] char const* load(settings_t const& settings, ustore_database_t database,
+[[nodiscard]] char const* load(compaction_settings_t const& settings, ustore_database_t database,
                                ustore_collection_id_t collection) {
     std::size_t const records = settings.records(), batch = settings.batch_size.value;
     std::size_t const value_size = settings.value_size.value;
@@ -310,7 +310,7 @@ std::uint64_t drop_cached(std::string_view directory) noexcept {
 
 /** Reads back @p settings' sampled records after the merge, answering a reason on a missing
  *  or changed value. */
-[[nodiscard]] char const* check(settings_t const& settings, ustore_database_t database,
+[[nodiscard]] char const* check(compaction_settings_t const& settings, ustore_database_t database,
                                 ustore_collection_id_t collection) {
     std::size_t const samples = settings.samples.value, value_size = settings.value_size.value;
     st::vector<ustore_key_t> keys;
@@ -319,7 +319,7 @@ std::uint64_t drop_cached(std::string_view directory) noexcept {
     if (st::failed(keys.resize(samples)) || st::failed(indices.resize(samples)) ||
         st::failed(expected.resize(value_size)))
         return "Failed to allocate the samples";
-    splitmix64_t random {settings.shared.seed};
+    split_mix_generator_t random {settings.shared.seed};
     for (std::size_t sample = 0; sample != samples; ++sample) {
         indices[sample] = static_cast<std::size_t>(random.below(settings.records()));
         keys[sample] = key_of(settings.shared.seed, indices[sample]);
@@ -357,7 +357,7 @@ std::uint64_t drop_cached(std::string_view directory) noexcept {
 #pragma endregion Phases
 
 /** Runs the benchmark, answering a reason when it stops early. */
-[[nodiscard]] char const* run(settings_t const& settings) {
+[[nodiscard]] char const* run(compaction_settings_t const& settings) {
     if (settings.on_rocksdb() && settings.on_gpu()) return "RocksDB merges on the CPU alone";
     if (settings.on_rocksdb() && !settings.open.empty()) return "RocksDB opens a directory alone";
     if (settings.on_rocksdb() && settings.threads.value != 0) return "RocksDB compacts on its own threads";
@@ -434,8 +434,8 @@ std::uint64_t drop_cached(std::string_view directory) noexcept {
 
 int main(int argc, char** argv) {
     using namespace unum::ustore::bench;
-    settings_t settings;
-    flag_t const flags[] {
+    compaction_settings_t settings;
+    std::array<flag_t, 12> const flags {{
         {"--engine", "name", "engine to open: nvme or rocksdb", &settings.engine},
         {"--compactor", "name", "where nvme merges: cpu or gpu", &settings.compactor},
         {"--directory", "path", "an empty directory the database fills", &settings.directory},
@@ -450,8 +450,20 @@ int main(int argc, char** argv) {
         {"--batch-size", "count", "records per write call", &settings.batch_size},
         {"--samples", "count", "keys read back after the merge", &settings.samples},
         {"--write-limit", "bytes", "bytes the process may write before it stops", &settings.write_limit},
-    };
-    read_settings(argc, argv, settings.shared, flags);
+    }};
+    std::array<char const*, 12> const variables {"USTORE_ENGINE",
+                                                 "USTORE_COMPACTOR",
+                                                 "USTORE_DIRECTORY",
+                                                 "USTORE_OPEN",
+                                                 "USTORE_ROCKSDB_SUBCOMPACTIONS",
+                                                 "USTORE_THREADS",
+                                                 "USTORE_RUNS",
+                                                 "USTORE_RUN_RECORDS",
+                                                 "USTORE_VALUE_SIZE",
+                                                 "USTORE_BATCH_SIZE",
+                                                 "USTORE_SAMPLES",
+                                                 "USTORE_WRITE_LIMIT"};
+    read_bench_settings(argc, argv, settings.shared, flags, variables);
     if (settings.directory.empty() && settings.open.empty()) {
         fmt::println(stderr, "--directory or --open is required");
         return 1;

@@ -582,7 +582,7 @@ mod tests {
     /// name, and its return type spells `std::result::Result`, since this module's `Result` is the
     /// crate's own.
     #[test]
-    fn quickstart() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    fn readme_quickstart() -> std::result::Result<(), Box<dyn std::error::Error>> {
         use crate::{Database, Durability, Edge, Key, RAMOptions, Role, jsontape};
 
         let database = Database::init_ram(&RAMOptions::default())?;

@@ -1,4 +1,9 @@
-"""Typed columns over the C ABI: scalar writes that skip JSON, and the half-precision and UUID gathers."""
+"""Typed columns over the C ABI: scalar writes that skip JSON, and the half-precision and UUID gathers.
+
+File: test/columns.py
+Author: Ash Vardanian
+Date: September 18, 2026
+"""
 
 import json
 import struct
@@ -139,7 +144,8 @@ def test_gather_half_precision(view, docs, arena):
     assert column.itemsize == 2
     assert np.asarray(column).dtype == np.float16
     assert np.asarray(column).tolist() == [1.5, -0.25]
-    assert bit(columns.validities(0), 0) and bit(columns.validities(0), 1)
+    assert bit(columns.validities(0), 0)
+    assert bit(columns.validities(0), 1)
 
 
 def test_gather_half_precision_as_bytes(view, docs, arena):
@@ -218,7 +224,7 @@ def test_gather_holds_its_arena(view, docs, arena):
 def test_gather_refuses_unconvertible_types(view, docs, arena, field_type: FieldType | int):
     """A gather converts into scalars, UUIDs, strings or bytes, and into no other type or value."""
     view.docs_write([0], "{}", collection=docs)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="A gather converts|FieldType, and 128 is none"):
         view.docs_gather([0], ["v"], field_type, arena, collection=docs)
 
 
@@ -265,7 +271,7 @@ def test_table_column_of_objects_still_writes_json(view, docs, arena):
 def test_table_column_of_the_wrong_length(view, docs):
     """A column shorter than the rows it would fill is refused before anything is written."""
     table = Table.from_records(view, [{"n": row} for row in range(3)], collection=docs)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="values for 3 rows"):
         table["v"] = np.zeros(2, dtype=np.float64)
 
 

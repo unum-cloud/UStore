@@ -404,7 +404,8 @@ status_t database_describe(ustore_database_describe_t const& arguments, view_t c
     std::uint64_t disk_bytes = 0;
     database.native->GetApproximateSizes(&everything, 1, &disk_bytes);
     return assign_describe(arguments, {
-                                          .capabilities = ustore_capabilities_snapshots_k,
+                                          .capabilities = ustore_capabilities_t(ustore_capabilities_snapshots_k |
+                                                                                ustore_capabilities_saves_snapshots_k),
                                           .engine = ustore_engine_leveldb_k,
                                           .isolation = ustore_isolation_snapshot_k,
                                           .memory_bytes = memory_bytes,

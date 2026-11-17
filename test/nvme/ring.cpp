@@ -21,7 +21,7 @@
 #include "ustore/utilities/nvme_linux_uring_disk.hpp" // `linux_uring_files_disk`
 #include "ustore/utilities/nvme_mounts.hpp"           // `any_files_disk`
 
-#include "nvme/ring_cases.hpp" // `ring_cases`, `ring_fails_a_misaligned_request`
+#include "nvme/ring_cases.hpp" // `ring_cases`, `test_ring_fails_a_misaligned_request`
 
 namespace unum::ustore::test {
 
@@ -39,7 +39,7 @@ static_assert(ring_concept<any_files_disk<atomic_reference, waiter_t>>,
 #pragma region Transport Drivers
 
 /** Mounts the RAM transport and runs the suite on it, with and without demanded alignment. */
-void memory_transport(suite_totals_t& totals) {
+void memory_transport() {
     resource_constraint_t budget {unlimited_resource_k};
     disk_config_t config;
     config.queue_pairs_limit = 4;
@@ -50,26 +50,28 @@ void memory_transport(suite_totals_t& totals) {
     auto [device, make_device_status] = memory_device_t::make();
     expected<memory_disk_t> disk = make_device_status.failed() ? make_device_status
                                                                : memory_disk_t::make(std::move(device), config, budget);
-    if (report(totals, "memory.mount", expect(disk.has_value())) != 0) return;
-    on_medium(totals, "memory.volume", *disk, volume_request("memory"),
-              [&](medium_reference_t medium) { ring_cases(totals, "memory", *disk, medium); });
-    report(totals, "memory.medium_in_flight", ring_holds_a_medium_in_flight<memory_disk_t>, *disk,
-           volume_request("memory_borrowed"));
+    run_test_case("memory_disk_t::make", [&] { expect_true(disk.has_value()); });
+    if (!disk) return;
+    on_medium("memory_disk_t::register_medium", *disk, volume_request("memory"),
+              [&](medium_reference_t medium) { ring_cases("memory_disk_t", *disk, medium); });
+    run_test_case("test_ring_holds_a_medium_in_flight<memory_disk_t>",
+                  test_ring_holds_a_medium_in_flight<memory_disk_t>, *disk, volume_request("memory_borrowed"));
 
     auto [strict_device, make_strict_device_status] = memory_device_t::make(portable_alignment_k);
     expected<memory_disk_t> strict_disk = make_strict_device_status.failed()
                                               ? make_strict_device_status
                                               : memory_disk_t::make(std::move(strict_device), config, budget);
-    if (report(totals, "memory_strict.mount", expect(strict_disk.has_value())) != 0) return;
-    on_medium(totals, "memory_strict.volume", *strict_disk, volume_request("memory_strict"),
+    run_test_case("memory_disk_t::make(portable_alignment_k)", [&] { expect_true(strict_disk.has_value()); });
+    if (!strict_disk) return;
+    on_medium("memory_disk_t::register_medium(portable_alignment_k)", *strict_disk, volume_request("memory_strict"),
               [&](medium_reference_t medium) {
-                  report(totals, "memory.misaligned_request", ring_fails_a_misaligned_request<memory_disk_t>,
-                         *strict_disk, medium);
+                  run_test_case("test_ring_fails_a_misaligned_request<memory_disk_t>",
+                                test_ring_fails_a_misaligned_request<memory_disk_t>, *strict_disk, medium);
               });
 }
 
 /** Mounts the blocking file transport on a preallocated volume and runs the suite on it. */
-void blocking_files_transport(suite_totals_t& totals, char const* directory) {
+void blocking_files_transport(char const* directory) {
     resource_constraint_t budget {unlimited_resource_k};
     disk_config_t config;
     config.queue_pairs_limit = 4;
@@ -81,60 +83,62 @@ void blocking_files_transport(suite_totals_t& totals, char const* directory) {
     expected<blocking_files_disk_t> disk = make_device_status.failed()
                                                ? make_device_status
                                                : blocking_files_disk_t::make(std::move(device), config, budget);
-    if (report(totals, "blocking.mount", expect(disk.has_value())) != 0) return;
-    path_t const path {directory, "volume.bin"};
-    on_medium(totals, "blocking.volume", *disk, volume_request(path.c_str()),
-              [&](medium_reference_t medium) { ring_cases(totals, "blocking", *disk, medium); });
-    path_t const borrowed_path {directory, "volume_borrowed.bin"};
-    report(totals, "blocking.medium_in_flight", ring_holds_a_medium_in_flight<blocking_files_disk_t>, *disk,
-           volume_request(borrowed_path.c_str()));
-    path_t const durable_path {directory, "volume_durable.bin"};
-    report(totals, "blocking.keeps_what_it_flushed", ring_keeps_what_it_flushed<blocking_files_disk_t>, *disk,
-           volume_request(durable_path.c_str()));
-    path_t const deallocated_path {directory, "volume_deallocated.bin"};
-    report(totals, "blocking.deallocates_a_file_extent", ring_deallocates_a_file_extent<blocking_files_disk_t>, *disk,
-           volume_request(deallocated_path.c_str()));
+    run_test_case("blocking_files_disk_t::make(file_buffering_t::buffered_k)", [&] { expect_true(disk.has_value()); });
+    if (!disk) return;
+    std::string const path = fmt::format("{}/{}", directory, "volume.bin");
+    on_medium("blocking_files_disk_t::register_medium(file_buffering_t::buffered_k)", *disk,
+              volume_request(path.c_str()),
+              [&](medium_reference_t medium) { ring_cases("blocking_files_disk_t", *disk, medium); });
+    std::string const borrowed_path = fmt::format("{}/{}", directory, "volume_borrowed.bin");
+    run_test_case("test_ring_holds_a_medium_in_flight<blocking_files_disk_t>",
+                  test_ring_holds_a_medium_in_flight<blocking_files_disk_t>, *disk,
+                  volume_request(borrowed_path.c_str()));
+    std::string const durable_path = fmt::format("{}/{}", directory, "volume_durable.bin");
+    run_test_case("test_ring_keeps_what_it_flushed<blocking_files_disk_t>",
+                  test_ring_keeps_what_it_flushed<blocking_files_disk_t>, *disk, volume_request(durable_path.c_str()));
+    std::string const deallocated_path = fmt::format("{}/{}", directory, "volume_deallocated.bin");
+    run_test_case("test_ring_deallocates_a_file_extent<blocking_files_disk_t>",
+                  test_ring_deallocates_a_file_extent<blocking_files_disk_t>, *disk,
+                  volume_request(deallocated_path.c_str()));
 
     auto [strict_device, make_strict_device_status] = blocking_files_device_t::make(file_buffering_t::unbuffered_k);
     expected<blocking_files_disk_t> strict_disk = make_strict_device_status.failed()
                                                       ? make_strict_device_status
                                                       : blocking_files_disk_t::make(std::move(strict_device), config,
                                                                                     budget);
-    if (report(totals, "blocking_unbuffered.mount", expect(strict_disk.has_value())) != 0) return;
-    path_t const strict_path {directory, "volume_unbuffered.bin"};
-    on_medium(totals, "blocking_unbuffered.volume", *strict_disk, volume_request(strict_path.c_str()),
-              [&](medium_reference_t medium) {
-                  report(totals, "blocking.misaligned_request", ring_fails_a_misaligned_request<blocking_files_disk_t>,
-                         *strict_disk, medium);
+    run_test_case("blocking_files_disk_t::make(file_buffering_t::unbuffered_k)",
+                  [&] { expect_true(strict_disk.has_value()); });
+    if (!strict_disk) return;
+    std::string const strict_path = fmt::format("{}/{}", directory, "volume_unbuffered.bin");
+    on_medium("blocking_files_disk_t::register_medium(file_buffering_t::unbuffered_k)", *strict_disk,
+              volume_request(strict_path.c_str()), [&](medium_reference_t medium) {
+                  run_test_case("test_ring_fails_a_misaligned_request<blocking_files_disk_t>",
+                                test_ring_fails_a_misaligned_request<blocking_files_disk_t>, *strict_disk, medium);
               });
-    path_t const logical_block_path {directory, "volume_logical_block.bin"};
-    report(totals, "blocking.logical_block", ring_reports_a_logical_block<blocking_files_disk_t>, *strict_disk,
-           volume_request(logical_block_path.c_str()));
+    std::string const logical_block_path = fmt::format("{}/{}", directory, "volume_logical_block.bin");
+    run_test_case("test_ring_reports_a_logical_block<blocking_files_disk_t>",
+                  test_ring_reports_a_logical_block<blocking_files_disk_t>, *strict_disk,
+                  volume_request(logical_block_path.c_str()));
 }
 
 #pragma endregion Transport Drivers
 
 } // namespace unum::ustore::test
 
-int main(int argc, char const* argv[]) {
+int main(int argc, char** argv) {
     using namespace unum::ustore;
     using namespace unum::ustore::test;
 
-    suite_options_t options;
-    if (argument_status_t const status = parse_suite_options(argc, argv, options);
-        status != argument_status_t::parsed_k)
-        return status == argument_status_t::help_k ? 0 : 1;
-    suite_totals_t totals = options.totals();
+    start_test_run(argc, argv);
+    memory_transport();
 
-    memory_transport(totals);
-
-    st::expected<directory_t> directory = directory_t::make(options.directory);
+    st::expected<scratch_directory_t> directory = scratch_directory_t::make(test_run.settings.directory);
     if (!directory) {
         fmt::println(stderr, "  the working directory would not open");
         return 1;
     }
-    if (directory->path()) blocking_files_transport(totals, directory->path());
-    else report(totals, "blocking", case_result_t::skipped(needs_directory_k));
+    if (directory->path()) blocking_files_transport(directory->path());
+    else run_test_case("blocking_files_disk_t::make", [] { return case_result_t::skipped(needs_directory_k); });
 
-    return suite_exit_code(totals);
+    return finish_test_run();
 }

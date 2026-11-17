@@ -1,7 +1,12 @@
-"""Paged conversion of a document collection into Pandas, against the frame one unpaged call builds."""
+"""Paged conversion of a document collection into Pandas, against the frame one unpaged call builds.
+
+File: test/paging.py
+Author: Ash Vardanian
+Date: September 18, 2026
+"""
 
 import pytest
-from capabilities import keys
+from base import keys
 from pandas.testing import assert_frame_equal
 
 from ustore.table_view import Table
@@ -13,6 +18,7 @@ PEOPLE = [{"name": f"person-{row}", "tweets": row * 3, "score": row / 4} for row
 
 @pytest.fixture
 def people(view, docs) -> Table:
+    """The `PEOPLE` records written as a Table over the view."""
     return Table.from_records(view, PEOPLE, collection=docs)
 
 
@@ -52,5 +58,5 @@ def test_paged_empty_view(view, docs):
 @pytest.mark.parametrize("page", [0, -1])
 def test_page_must_hold_a_row(people, page: int):
     """A page holds at least one row, so a page size below one is refused."""
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="A page holds at least one row"):
         people.to_pandas(page=page)

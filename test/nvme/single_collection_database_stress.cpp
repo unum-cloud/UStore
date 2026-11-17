@@ -50,9 +50,6 @@ constexpr std::size_t keys_per_worker_k = 256;
 /** Operations every worker runs, about a third each of selects, inserts and removes. */
 constexpr std::size_t operations_per_worker_k = 3000;
 
-/** The seed every worker's generator is forked from. */
-constexpr std::uint64_t seed_k = 42;
-
 /** The keys every case of this suite drives. */
 using stored_key_t = std::uint64_t;
 
@@ -141,17 +138,14 @@ expected<std::unique_ptr<stress_stack<typename mount_type_::fixture_t>>> make_st
 
 /** Reads every key of @p wanted through one batched select and counts what the model disagrees with. */
 template <typename database_type_>
-[[nodiscard]] std::size_t check_model(database_type_ const& store, io_channel_t& channel,
-                                      std::span<expectation_t const> wanted) {
-    std::size_t failures = 0;
+void check_model(database_type_ const& store, io_channel_t& channel, std::span<expectation_t const> wanted) {
     std::size_t const count = wanted.size();
     st::vector<stored_key_t> keys;
     st::vector<lookup_result_t> results;
     st::vector<std::uint64_t> seen;
-    failures += expect(keys.resize(count) == st::status_t::success_k);
-    failures += expect(results.resize(count) == st::status_t::success_k);
-    failures += expect(seen.resize(count) == st::status_t::success_k);
-    if (failures != 0) return failures;
+    expect_true(keys.resize(count) == st::status_t::success_k);
+    expect_true(results.resize(count) == st::status_t::success_k);
+    if (!expect_true(seen.resize(count) == st::status_t::success_k)) return;
     for (std::size_t index = 0; index != count; ++index) {
         keys[index] = wanted[index].stored_key;
         results[index] = lookup_result_t::missing_k;
@@ -164,19 +158,17 @@ template <typename database_type_>
         for (std::size_t index = 0; index != bytes.size(); ++index)
             if (bytes[index] != painted(wanted[request].seed, offset + index)) ++mismatches;
     };
-    failures += expect(
-        store.select(channel, std::span<stored_key_t const> {keys}, std::span<lookup_result_t> {results}, sink)
-            .succeeded());
-    failures += expect_eq(mismatches, std::size_t {0});
+    expect_true(store.select(channel, std::span<stored_key_t const> {keys}, std::span<lookup_result_t> {results}, sink)
+                    .succeeded());
+    expect_equal(mismatches, std::size_t {0});
 
     for (std::size_t index = 0; index != count; ++index) {
         // A key never written answers missing, and a removed key answers its remove delta; neither carries a value.
         bool const absent_wanted = wanted[index].state != lookup_result_t::written_k;
         bool const absent_seen = results[index] != lookup_result_t::written_k;
-        failures += expect(absent_wanted == absent_seen);
-        if (!absent_wanted) failures += expect_eq(seen[index], wanted[index].bytes);
+        expect_true(absent_wanted == absent_seen);
+        if (!absent_wanted) expect_equal(seen[index], wanted[index].bytes);
     }
-    return failures;
 }
 
 #pragma endregion Model
@@ -190,40 +182,36 @@ template <typename database_type_>
  *  @param[in] value_max_size Bytes the largest value takes, which is zero for a fixed-width layout.
  */
 template <typename key_slot_type_, typename mount_type_>
-[[nodiscard]] std::size_t concurrent_operations_keep_their_values(mount_type_ const& mount,
-                                                                  stored_value_size_t value_size,
-                                                                  stored_value_size_t value_max_size) {
+void concurrent_operations_keep_their_values(mount_type_ const& mount, stored_value_size_t value_size,
+                                             stored_value_size_t value_max_size) {
     using stack_t = stress_stack<typename mount_type_::fixture_t>;
     using guard_t = typename stack_t::guard_t;
     using volume_t = typename stack_t::volume_t;
     using database_t = basic_single_collection_database<
         typename key_slot_type_::stored_key_t, volume_t, atomic_reference, waiter_t,
         nvme_store<key_slot_type_, volume_t, atomic_reference, waiter_t, last_write_fold_t, no_device_fold_t>>;
-    std::size_t failures = 0;
 
     expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    failures += expect_status(stack, status_code_t::success_k);
-    if (!stack) return failures;
+    expect_status(stack, status_code_t::success_k);
+    if (!stack) return;
 
     expected<typename database_t::database_unique_ptr_t> store = database_t::open(
         *(*stack)->volume, (*stack)->writing.channel(), (*stack)->merging.channel(),
         stress_config(value_size, value_max_size), (*stack)->fixture->resources);
-    failures += expect(store.has_value());
-    if (!store) return failures;
+    expect_true(store.has_value());
+    if (!store) return;
     stored_value_size_t const widest = (*store)->value_max_size();
 
     std::array<st::vector<expectation_t>, worker_threads_k> models;
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker) {
-        failures += expect(models[worker].resize(keys_per_worker_k) == st::status_t::success_k);
-        if (failures != 0) return failures;
+        if (!expect_true(models[worker].resize(keys_per_worker_k) == st::status_t::success_k)) return;
         for (std::size_t index = 0; index != keys_per_worker_k; ++index)
             models[worker][index].stored_key = static_cast<stored_key_t>(worker * keys_per_worker_k + index);
     }
 
     // Every key starts written and flushed, so the reads below reach the runs as well as the memory runs.
     st::vector<byte_t> first;
-    failures += expect(first.resize(widest) == st::status_t::success_k);
-    if (failures != 0) return failures;
+    if (!expect_true(first.resize(widest) == st::status_t::success_k)) return;
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker)
         for (expectation_t& entry : models[worker]) {
             entry.state = lookup_result_t::written_k;
@@ -231,25 +219,22 @@ template <typename key_slot_type_, typename mount_type_>
             entry.seed = entry.stored_key + widest;
             std::span<byte_t> const painted_value {first.data(), static_cast<std::size_t>(entry.bytes)};
             paint_into(entry, painted_value);
-            failures += expect_status((*store)->insert(entry.stored_key, std::span<byte_t const> {painted_value}),
-                                      status_code_t::success_k);
+            expect_status((*store)->insert(entry.stored_key, std::span<byte_t const> {painted_value}),
+                          status_code_t::success_k);
         }
-    failures += expect((*store)->flush().succeeded());
-    if (failures != 0) return failures;
+    if (!expect_true((*store)->flush().succeeded())) return;
 
-    std::array<std::size_t, worker_threads_k> worker_failures {};
     std::array<std::thread, worker_threads_k> workers;
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker)
         workers[worker] = std::thread {[&, worker]() noexcept {
             expected<guard_t> guard = (*stack)->fixture->channels.acquire();
-            worker_failures[worker] += expect(guard.has_value());
+            expect_true(guard.has_value());
             if (!guard) return;
 
-            random_t random = random_t {seed_k}.fork(worker);
+            split_mix_generator_t random {case_stream_key(worker)};
             st::vector<expectation_t>& model = models[worker];
             st::vector<byte_t> value;
-            worker_failures[worker] += expect(value.resize(widest) == st::status_t::success_k);
-            if (worker_failures[worker] != 0) return;
+            if (!expect_true(value.resize(widest) == st::status_t::success_k)) return;
 
             for (std::size_t operation = 0; operation != operations_per_worker_k; ++operation) {
                 std::uint64_t const choice = random.below(3);
@@ -265,96 +250,87 @@ template <typename key_slot_type_, typename mount_type_>
                     status_t const read = (*store)->select(guard->channel(), key, std::span<byte_t> {value}, size);
                     if (read.succeeded()) {
                         if (owned) {
-                            worker_failures[worker] += expect(entry.state == lookup_result_t::written_k);
-                            worker_failures[worker] += expect_eq(std::uint64_t {size}, entry.bytes);
+                            expect_true(entry.state == lookup_result_t::written_k);
+                            expect_equal(std::uint64_t {size}, entry.bytes);
                             for (std::size_t position = 0; position != size; ++position)
-                                worker_failures[worker] += expect(value[position] == painted(entry.seed, position));
+                                expect_true(value[position] == painted(entry.seed, position));
                         }
                     }
                     else {
-                        worker_failures[worker] += expect(read == status_code_t::not_found_k);
-                        if (owned) worker_failures[worker] += expect(entry.state != lookup_result_t::written_k);
+                        expect_true(read == status_code_t::not_found_k);
+                        if (owned) expect_true(entry.state != lookup_result_t::written_k);
                     }
                 }
                 else if (choice == 1) {
                     entry.state = lookup_result_t::written_k;
                     entry.bytes = value_size != 0 ? value_size : 1 + random.below(widest);
-                    entry.seed = random.next();
+                    entry.seed = random();
                     std::span<byte_t> const painted_value {value.data(), static_cast<std::size_t>(entry.bytes)};
                     paint_into(entry, painted_value);
-                    worker_failures[worker] += expect_status(
-                        (*store)->insert(entry.stored_key, std::span<byte_t const> {painted_value}),
-                        status_code_t::success_k);
+                    expect_status((*store)->insert(entry.stored_key, std::span<byte_t const> {painted_value}),
+                                  status_code_t::success_k);
                 }
                 else {
                     entry.state = lookup_result_t::removed_k;
                     entry.bytes = 0;
-                    worker_failures[worker] += expect_status((*store)->remove(entry.stored_key),
-                                                             status_code_t::success_k);
+                    expect_status((*store)->remove(entry.stored_key), status_code_t::success_k);
                 }
             }
         }};
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker) workers[worker].join();
-    for (std::size_t worker = 0; worker != worker_threads_k; ++worker) failures += worker_failures[worker];
 
     // Once with the last writes still in memory runs, and once more out of the runs alone.
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker)
-        failures += check_model(**store, (*stack)->channel(), std::span<expectation_t const> {models[worker]});
-    failures += expect((*store)->flush().succeeded());
+        check_model(**store, (*stack)->channel(), std::span<expectation_t const> {models[worker]});
+    expect_true((*store)->flush().succeeded());
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker)
-        failures += check_model(**store, (*stack)->channel(), std::span<expectation_t const> {models[worker]});
-    return failures;
+        check_model(**store, (*stack)->channel(), std::span<expectation_t const> {models[worker]});
 }
 
 /** Values of up to 12 bytes kept inside the key slots. */
 template <typename mount_type_>
-std::size_t inline_12_bytes_keeps_its_values(mount_type_ const& mount) {
+void test_inline_12_bytes_keeps_its_values(mount_type_ const& mount) {
     using slot_t = key_slot<stored_key_t, value_layout_t::inline_12_bytes_k>;
-    return concurrent_operations_keep_their_values<slot_t>(mount, 0, 0);
+    concurrent_operations_keep_their_values<slot_t>(mount, 0, 0);
 }
 
 /** Values of one width in the stored values section. */
 template <typename mount_type_>
-std::size_t fixed_width_keeps_its_values(mount_type_ const& mount) {
+void test_fixed_width_keeps_its_values(mount_type_ const& mount) {
     using slot_t = key_slot<stored_key_t, value_layout_t::fixed_width_k>;
-    return concurrent_operations_keep_their_values<slot_t>(mount, 55, 0);
+    concurrent_operations_keep_their_values<slot_t>(mount, 55, 0);
 }
 
 /** Values of any width up to a bound in the stored values section. */
 template <typename mount_type_>
-std::size_t variable_width_keeps_its_values(mount_type_ const& mount) {
+void test_variable_width_keeps_its_values(mount_type_ const& mount) {
     using slot_t = key_slot<stored_key_t, value_layout_t::variable_width_k>;
-    return concurrent_operations_keep_their_values<slot_t>(mount, 0, 129);
+    concurrent_operations_keep_their_values<slot_t>(mount, 0, 129);
 }
 
 #pragma endregion Stress Cases
 
 } // namespace unum::ustore::test
 
-int main(int argc, char const* argv[]) {
+int main(int argc, char** argv) {
     using namespace unum::ustore;
     using namespace unum::ustore::test;
 
-    suite_options_t options;
-    if (argument_status_t const status = parse_suite_options(argc, argv, options);
-        status != argument_status_t::parsed_k)
-        return status == argument_status_t::help_k ? 0 : 1;
-    suite_totals_t totals = options.totals();
+    start_test_run(argc, argv);
 
-    st::expected<directory_t> const directory = directory_t::make(options.directory);
+    st::expected<scratch_directory_t> const directory = scratch_directory_t::make(test_run.settings.directory);
     if (!directory) {
         fmt::println(stderr, "  the working directory would not open");
         return 1;
     }
-    test_environment_t const environment = test_environment_t::of(options, *directory);
 
     auto const cases = [&](auto const& mount) {
-        report(totals, mount, "inline_12_bytes", inline_12_bytes_keeps_its_values);
-        report(totals, mount, "fixed_width", fixed_width_keeps_its_values);
-        report(totals, mount, "variable_width", variable_width_keeps_its_values);
+        report_on_mount(mount, "test_inline_12_bytes_keeps_its_values", test_inline_12_bytes_keeps_its_values);
+        report_on_mount(mount, "test_fixed_width_keeps_its_values", test_fixed_width_keeps_its_values);
+        report_on_mount(mount, "test_variable_width_keeps_its_values", test_variable_width_keeps_its_values);
     };
     for (transport_t const transport : every_transport_k)
-        run_on_transport(totals, transport, environment, stress_config_k, 1, "scdb_stress", cases);
+        run_on_transport(transport, directory->path(), stress_config_k, 1, "single_collection_database_stress", cases);
 
-    return suite_exit_code(totals);
+    return finish_test_run();
 }

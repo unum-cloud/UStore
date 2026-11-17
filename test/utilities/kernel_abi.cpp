@@ -17,9 +17,9 @@
 #include <linux/stat.h>     // `struct statx`
 #include <linux/version.h>  // `LINUX_VERSION_CODE`
 
-#include <fmt/format.h> // `fmt::println`
-
 #include "ustore/utilities/nvme_linux_uring_disk.hpp" // `linux_uring_sqe_t`, `linux_statx_t`
+
+#include "harness.hpp" // `run_test_case`
 
 namespace unum::ustore::test {
 
@@ -61,9 +61,14 @@ static_assert(offsetof(linux_statx_t, dio_mem_align) == offsetof(struct statx, s
 static_assert(offsetof(linux_statx_t, dio_offset_align) == offsetof(struct statx, stx_dio_offset_align));
 #endif
 
+/** The mirrors match the kernel's headers, which the assertions above settle at compile time. */
+void test_mirrors_match_the_kernel_headers() {}
+
 } // namespace unum::ustore::test
 
-int main() {
-    fmt::println("kernel_abi: the Linux mirrors match the kernel headers, checked at compile time");
-    return 0;
+int main(int argc, char** argv) {
+    using namespace unum::ustore::test;
+    start_test_run(argc, argv);
+    run_test_case("test_mirrors_match_the_kernel_headers", test_mirrors_match_the_kernel_headers);
+    return finish_test_run();
 }

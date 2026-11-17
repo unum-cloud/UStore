@@ -1,7 +1,12 @@
-"""Transactions over the C ABI: commits, rollbacks, conflicts and staging, at every isolation the engine offers."""
+"""Transactions over the C ABI: commits, rollbacks, conflicts and staging, at every isolation the engine offers.
+
+File: test/transactions.py
+Author: Ash Vardanian
+Date: September 18, 2026
+"""
 
 import pytest
-from capabilities import BATCH_SIZES, NEEDS_TRANSACTIONS, keys
+from base import BATCH_SIZES, NEEDS_TRANSACTIONS, keys
 
 import ustore
 
@@ -26,6 +31,7 @@ def read_conflicts(isolation: ustore.Isolation | None, watch: ustore.Watch) -> b
 @pytest.mark.parametrize("count", BATCH_SIZES)
 @pytest.mark.parametrize("durability", ustore.Durability)
 def test_commit_publishes_every_write(database, blobs, count: int, durability: ustore.Durability):
+    """A commit publishes every key it staged, at every durability."""
     staged = database.transaction()
     for key in range(count):
         staged.set(key, str(key).encode(), collection=blobs)
@@ -36,6 +42,7 @@ def test_commit_publishes_every_write(database, blobs, count: int, durability: u
 
 @pytest.mark.parametrize("count", BATCH_SIZES)
 def test_commit_publishes_every_removal(database, blobs, count: int):
+    """A commit publishes a staged removal of every key of a batch."""
     database.write(list(range(count)), b"value", collection=blobs)
     with database.transaction() as staged:
         staged.remove(list(range(count)), collection=blobs)
@@ -44,6 +51,7 @@ def test_commit_publishes_every_removal(database, blobs, count: int):
 
 @pytest.mark.parametrize("verb", ["set", "write"])
 def test_staged_work_is_invisible_until_it_commits(database, blobs, verb: str):
+    """Staged writes read back through their transaction alone until it commits."""
     staged = database.transaction()
     if verb == "set":
         staged.set(1, b"staged", collection=blobs)
@@ -59,6 +67,7 @@ def test_staged_work_is_invisible_until_it_commits(database, blobs, verb: str):
 
 
 def test_reset_drops_the_staged_work(database, blobs):
+    """A reset drops what was staged, so the commit after it publishes nothing."""
     staged = database.transaction()
     staged.set(1, b"staged", collection=blobs)
     staged.reset()
@@ -82,11 +91,14 @@ def test_rollback_withdraws_a_stage_and_keeps_the_writes(database, blobs):
 
 
 def test_an_exception_leaves_the_work_unpublished(database, blobs):
+    """A body that raises leaves its transaction uncommitted."""
+
     class Interrupted(Exception):
         """Raised inside the body to stop it short of a commit."""
 
-    with pytest.raises(Interrupted), database.transaction() as staged:
-        staged.set(1, b"staged", collection=blobs)
+    staged = database.transaction()
+    staged.set(1, b"staged", collection=blobs)
+    with pytest.raises(Interrupted), staged:
         raise Interrupted
 
     assert not database.contains(1, collection=blobs)
@@ -99,7 +111,8 @@ def test_stage_reads_at_or_below_the_commit_stamp(database, blobs):
         staged.set(1, b"staged", collection=blobs)
         read_stamp = staged.stage()
         commit_stamp = staged.commit()
-        assert isinstance(read_stamp, int) and isinstance(commit_stamp, int)
+        assert isinstance(read_stamp, int)
+        assert isinstance(commit_stamp, int)
         assert read_stamp <= commit_stamp
     finally:
         staged.close()
@@ -107,6 +120,7 @@ def test_stage_reads_at_or_below_the_commit_stamp(database, blobs):
 
 
 def test_batch_verbs_reach_through_a_transaction(database, blobs, arena):
+    """Batch writes, reads and scans run through a transaction and see its staged work."""
     with database.transaction() as staged:
         staged.write([1, 2, 3], [b"a", b"bb", b"ccc"], collection=blobs)
         assert [bytes(value) for value in staged.read([1, 2, 3], arena, collection=blobs)] == [b"a", b"bb", b"ccc"]
@@ -120,6 +134,7 @@ def test_batch_verbs_reach_through_a_transaction(database, blobs, arena):
 
 @pytest.mark.parametrize("stride", [1, 2])
 def test_transactions_writing_apart_both_commit(database, blobs, stride: int):
+    """Two transactions writing disjoint keys, adjacent or strided, both commit."""
     first = database.transaction()
     second = database.transaction()
     for key in range(0, 100, 2):
@@ -139,6 +154,7 @@ def test_transactions_writing_apart_both_commit(database, blobs, stride: int):
 def test_a_read_conflicts_with_a_concurrent_write_when_recorded(
     database, blobs, arena, isolation, watch: ustore.Watch, read_verb: str
 ):
+    """A read fails its commit after a concurrent write exactly when its watch or isolation recorded it."""
     reader = database.transaction(watch)
     try:
         if read_verb == "read":
@@ -156,6 +172,7 @@ def test_a_read_conflicts_with_a_concurrent_write_when_recorded(
 
 
 def test_a_write_conflicts_with_a_concurrent_write(database, blobs):
+    """The second of two transactions writing one key fails its commit, and the first one's value stays."""
     first = database.transaction()
     second = database.transaction()
     try:
@@ -176,27 +193,29 @@ def test_a_write_conflicts_with_a_concurrent_write(database, blobs):
 
 
 def test_a_transaction_names_its_database(database):
+    """A transaction's `database` is the database that began it."""
     with database.transaction() as staged:
         assert staged.database is database
 
 
 def test_a_transaction_cannot_be_built_by_name():
+    """A transaction comes from `Database.transaction` alone, never from its constructor."""
     with pytest.raises(TypeError):
         ustore.Transaction()
 
 
 @pytest.mark.parametrize("verb", ["set", "commit", "stage", "rollback", "reset"])
 def test_a_closed_transaction_refuses_work(database, blobs, verb: str):
+    """Every verb of a closed transaction raises UninitializedError."""
     staged = database.transaction()
     staged.close()
+    refused = (lambda: staged.set(1, b"late", collection=blobs)) if verb == "set" else getattr(staged, verb)
     with pytest.raises(ustore.UninitializedError):
-        if verb == "set":
-            staged.set(1, b"late", collection=blobs)
-        else:
-            getattr(staged, verb)()
+        refused()
 
 
 def test_closing_a_transaction_twice_is_safe(database):
+    """Closing a transaction a second time does nothing."""
     staged = database.transaction()
     staged.close()
     staged.close()
@@ -208,6 +227,7 @@ def test_closing_a_transaction_twice_is_safe(database):
 
 
 def test_deferred_calls_stage_and_commit(database, blobs):
+    """Deferred writes, reads and the commit of a transaction each answer once waited."""
     with ustore.Executor.for_ram(2) as executor:
         staged = database.transaction()
         try:

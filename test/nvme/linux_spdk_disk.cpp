@@ -39,7 +39,7 @@
 
 #include "nvme/ring_cases.hpp" // `ring_cases`, `ring_edge_t`, every transport-independent result
 
-/** Where the rig script lives, compiled in by CMake, since a suite reads no environment. */
+/** Where the rig script lives, compiled in by CMake. */
 #if !defined(USTORE_SPDK_RIG)
 #define USTORE_SPDK_RIG "scripts/rigs/spdk_target.sh"
 #endif
@@ -68,7 +68,8 @@ constexpr char const* fabric_address_k =
 /** Leases the mount asks for, which the target may lower to the queue pairs it grants. */
 [[maybe_unused]] constexpr std::uint16_t spdk_queue_pairs_k = 4;
 
-/** The flags this suite adds to the shared ones. */
+/** The settings this suite adds to the shared ones, each a <tt>--flag</tt> or a @c
+ *  USTORE_ variable. */
 struct linux_spdk_suite_flags_t {
 
     /** An SPDK tree with a finished build, whose target the suite starts and stops through the rig. */
@@ -101,7 +102,7 @@ MemFree:         98765432 kB
 )";
 
 /** What a probe result is called, so a machine's own answer reads as a word rather than a number. */
-[[nodiscard]] char const* describe(linux_spdk_probe_t result) noexcept {
+[[nodiscard]] char const* name_of(linux_spdk_probe_t result) noexcept {
     switch (result) {
     case linux_spdk_probe_t::available_k: return "available_k";
     case linux_spdk_probe_t::without_hugepages_k: return "without_hugepages_k";
@@ -139,119 +140,110 @@ MemFree:         98765432 kB
 #pragma region Probe
 
 /** A bogus address answers @c not_found_k, without a crash and without a wait. */
-[[nodiscard]] std::size_t spdk_refuses_an_absent_address() {
-    std::size_t failures = 0;
-    failures += expect(linux_spdk_environment_t::probe(absent_address_k) == linux_spdk_probe_t::not_found_k);
-    failures += expect(linux_spdk_environment_t::probe(nullptr) == linux_spdk_probe_t::not_found_k);
-    failures += expect(linux_spdk_environment_t::probe("") == linux_spdk_probe_t::not_found_k);
-    failures += expect(linux_spdk_environment_t::probe("not an address") == linux_spdk_probe_t::not_found_k);
-    failures += expect(linux_spdk_environment_t::probe("0000:ff:1f.7:0") == linux_spdk_probe_t::not_found_k);
-    failures += expect(linux_spdk_environment_t::probe("/dev/nvme0n1") == linux_spdk_probe_t::not_found_k);
-    return failures;
+void test_spdk_refuses_an_absent_address() {
+    expect_true(linux_spdk_environment_t::probe(absent_address_k) == linux_spdk_probe_t::not_found_k);
+    expect_true(linux_spdk_environment_t::probe(nullptr) == linux_spdk_probe_t::not_found_k);
+    expect_true(linux_spdk_environment_t::probe("") == linux_spdk_probe_t::not_found_k);
+    expect_true(linux_spdk_environment_t::probe("not an address") == linux_spdk_probe_t::not_found_k);
+    expect_true(linux_spdk_environment_t::probe("0000:ff:1f.7:0") == linux_spdk_probe_t::not_found_k);
+    expect_true(linux_spdk_environment_t::probe("/dev/nvme0n1") == linux_spdk_probe_t::not_found_k);
 }
 
 /** The hugepage parser reads what @c /proc/meminfo says, and nothing it does not say. */
-[[nodiscard]] std::size_t spdk_parses_the_hugepage_pool() {
-    std::size_t failures = 0;
+void test_spdk_parses_the_hugepage_pool() {
     hugepage_inventory_t const present = hugepages_in_meminfo(meminfo_with_hugepages_k);
-    failures += expect_eq(present.total_pages, std::uint64_t {1024});
-    failures += expect_eq(present.free_pages, std::uint64_t {768});
-    failures += expect_eq(present.page_bytes, std::uint64_t {2048} * 1024);
+    expect_equal(present.total_pages, std::uint64_t {1024});
+    expect_equal(present.free_pages, std::uint64_t {768});
+    expect_equal(present.page_bytes, std::uint64_t {2048} * 1024);
 
     hugepage_inventory_t const empty = hugepages_in_meminfo(meminfo_without_hugepages_k);
-    failures += expect_eq(empty.total_pages, std::uint64_t {0});
-    failures += expect_eq(empty.free_pages, std::uint64_t {0});
-    failures += expect_eq(empty.page_bytes, std::uint64_t {2048} * 1024);
+    expect_equal(empty.total_pages, std::uint64_t {0});
+    expect_equal(empty.free_pages, std::uint64_t {0});
+    expect_equal(empty.page_bytes, std::uint64_t {2048} * 1024);
 
     hugepage_inventory_t const silent = hugepages_in_meminfo(meminfo_without_lines_k);
-    failures += expect_eq(silent.free_pages, std::uint64_t {0});
-    failures += expect_eq(silent.page_bytes, std::uint64_t {0});
+    expect_equal(silent.free_pages, std::uint64_t {0});
+    expect_equal(silent.page_bytes, std::uint64_t {0});
 
     hugepage_inventory_t const nothing = hugepages_in_meminfo("");
-    failures += expect_eq(nothing.free_pages, std::uint64_t {0});
+    expect_equal(nothing.free_pages, std::uint64_t {0});
 
     /*  A key is matched in full, so a longer name that starts the same way is not its line. */
-    failures += expect_eq(meminfo_value("HugePages_Freeish:   99\n", "HugePages_Free"), std::uint64_t {0});
-    failures += expect_eq(meminfo_value("HugePages_Free:\t512 \n", "HugePages_Free"), std::uint64_t {512});
-    failures += expect_eq(meminfo_value("HugePages_Free: 7", "HugePages_Free"), std::uint64_t {7});
-    return failures;
+    expect_equal(meminfo_value("HugePages_Freeish:   99\n", "HugePages_Free"), std::uint64_t {0});
+    expect_equal(meminfo_value("HugePages_Free:\t512 \n", "HugePages_Free"), std::uint64_t {512});
+    expect_equal(meminfo_value("HugePages_Free: 7", "HugePages_Free"), std::uint64_t {7});
 }
 
 /** The driver classifier reads the last component of the link sysfs keeps. */
-[[nodiscard]] std::size_t spdk_names_the_bound_driver() {
-    std::size_t failures = 0;
-    failures += expect(pci_driver_named("../../../../bus/pci/drivers/nvme") == pci_driver_t::kernel_nvme_k);
-    failures += expect(pci_driver_named("../../../../bus/pci/drivers/vfio-pci") == pci_driver_t::vfio_pci_k);
-    failures += expect(pci_driver_named("../../../../bus/pci/drivers/uio_pci_generic") == pci_driver_t::uio_generic_k);
-    failures += expect(pci_driver_named("igb_uio") == pci_driver_t::uio_generic_k);
-    failures += expect(pci_driver_named("../../../../bus/pci/drivers/xhci_hcd") == pci_driver_t::foreign_k);
-    failures += expect(pci_driver_named("") == pci_driver_t::unbound_k);
-    failures += expect(pci_driver_named("drivers/") == pci_driver_t::unbound_k);
-    return failures;
+void test_spdk_names_the_bound_driver() {
+    expect_true(pci_driver_named("../../../../bus/pci/drivers/nvme") == pci_driver_t::kernel_nvme_k);
+    expect_true(pci_driver_named("../../../../bus/pci/drivers/vfio-pci") == pci_driver_t::vfio_pci_k);
+    expect_true(pci_driver_named("../../../../bus/pci/drivers/uio_pci_generic") == pci_driver_t::uio_generic_k);
+    expect_true(pci_driver_named("igb_uio") == pci_driver_t::uio_generic_k);
+    expect_true(pci_driver_named("../../../../bus/pci/drivers/xhci_hcd") == pci_driver_t::foreign_k);
+    expect_true(pci_driver_named("") == pci_driver_t::unbound_k);
+    expect_true(pci_driver_named("drivers/") == pci_driver_t::unbound_k);
 }
 
 /** An address is normalised to the long form sysfs names devices by, or refused outright. */
-[[nodiscard]] std::size_t spdk_normalises_an_address() {
-    std::size_t failures = 0;
+void test_spdk_normalises_an_address() {
     expected<pci_address_t> const full = pci_address_parsed("0000:01:00.0");
-    failures += expect(full.has_value());
-    if (full) failures += expect(std::string_view {full->text} == "0000:01:00.0");
+    expect_true(full.has_value());
+    if (full) expect_true(std::string_view {full->text} == "0000:01:00.0");
 
     expected<pci_address_t> const brief = pci_address_parsed("1:2.3");
-    failures += expect(brief.has_value());
-    if (brief) failures += expect(std::string_view {brief->text} == "0000:01:02.3");
+    expect_true(brief.has_value());
+    if (brief) expect_true(std::string_view {brief->text} == "0000:01:02.3");
 
     expected<pci_address_t> const domained = pci_address_parsed("304C:00:1F.7");
-    failures += expect(domained.has_value());
-    if (domained) failures += expect(std::string_view {domained->text} == "304c:00:1f.7");
+    expect_true(domained.has_value());
+    if (domained) expect_true(std::string_view {domained->text} == "304c:00:1f.7");
 
-    failures += expect(pci_address_parsed("").failed());
-    failures += expect(pci_address_parsed("0000:01:00").failed());
-    failures += expect(pci_address_parsed("0000:01:00.").failed());
-    failures += expect(pci_address_parsed("0000:zz:00.0").failed());
-    failures += expect(pci_address_parsed("00000:01:00.0").failed());
-    failures += expect(pci_address_parsed("0000:01:20.0").failed());
-    failures += expect(pci_address_parsed("0000:01:00.8").failed());
-    failures += expect(pci_address_parsed("0000:00:01:00.0").failed());
-    return failures;
+    expect_true(pci_address_parsed("").failed());
+    expect_true(pci_address_parsed("0000:01:00").failed());
+    expect_true(pci_address_parsed("0000:01:00.").failed());
+    expect_true(pci_address_parsed("0000:zz:00.0").failed());
+    expect_true(pci_address_parsed("00000:01:00.0").failed());
+    expect_true(pci_address_parsed("0000:01:20.0").failed());
+    expect_true(pci_address_parsed("0000:01:00.8").failed());
+    expect_true(pci_address_parsed("0000:00:01:00.0").failed());
 }
 
 /** A fabric transport ID probes available at once, since nothing on the machine can stand in its way. */
-[[nodiscard]] std::size_t spdk_passes_a_fabric_address() {
-    std::size_t failures = 0;
-    failures += expect(spdk_transport_named(fabric_address_k) == linux_spdk_transport_t::fabric_k);
-    failures += expect(spdk_transport_named("TRTYPE:tcp traddr:10.0.0.1") == linux_spdk_transport_t::fabric_k);
-    failures += expect(spdk_transport_named("trtype:PCIe traddr:0000:01:00.0") == linux_spdk_transport_t::pcie_k);
-    failures += expect(spdk_transport_named("0000:01:00.0") == linux_spdk_transport_t::pcie_k);
-    failures += expect(spdk_transport_named("") == linux_spdk_transport_t::pcie_k);
-    failures += expect(transport_field("trtype:TCP traddr:10.0.0.1 trsvcid:4420", "traddr:") == "10.0.0.1");
-    failures += expect(transport_field("trtype:TCP traddr:10.0.0.1 trsvcid:4420", "trsvcid:") == "4420");
-    failures += expect(transport_field("trtype:TCP", "traddr:").empty());
-    failures += expect(linux_spdk_environment_t::probe(fabric_address_k) == linux_spdk_probe_t::available_k);
-    failures += expect(linux_spdk_environment_t::probe("trtype:PCIe traddr:0000:ff:1f.7") ==
-                       linux_spdk_probe_t::not_found_k);
-    return failures;
+void test_spdk_passes_a_fabric_address() {
+    expect_true(spdk_transport_named(fabric_address_k) == linux_spdk_transport_t::fabric_k);
+    expect_true(spdk_transport_named("TRTYPE:tcp traddr:10.0.0.1") == linux_spdk_transport_t::fabric_k);
+    expect_true(spdk_transport_named("trtype:PCIe traddr:0000:01:00.0") == linux_spdk_transport_t::pcie_k);
+    expect_true(spdk_transport_named("0000:01:00.0") == linux_spdk_transport_t::pcie_k);
+    expect_true(spdk_transport_named("") == linux_spdk_transport_t::pcie_k);
+    expect_true(transport_field("trtype:TCP traddr:10.0.0.1 trsvcid:4420", "traddr:") == "10.0.0.1");
+    expect_true(transport_field("trtype:TCP traddr:10.0.0.1 trsvcid:4420", "trsvcid:") == "4420");
+    expect_true(transport_field("trtype:TCP", "traddr:").empty());
+    expect_true(linux_spdk_environment_t::probe(fabric_address_k) == linux_spdk_probe_t::available_k);
+    expect_true(linux_spdk_environment_t::probe("trtype:PCIe traddr:0000:ff:1f.7") == linux_spdk_probe_t::not_found_k);
 }
 
 /** The result this machine gets agrees with what the test reads of the hugepage pool itself. */
-[[nodiscard]] std::size_t spdk_probes_this_machine() {
-    std::size_t failures = 0;
+void test_spdk_probes_this_machine() {
     std::array<char, 8192> meminfo {};
     hugepage_inventory_t const hugepages = hugepages_in_meminfo(read_meminfo(meminfo));
 
     std::array<char, 64> address {};
     std::string_view const first = first_pci_address(address);
     if (first.empty()) {
-        fmt::println("  this machine lists no PCIe device, so every address probes not_found_k");
-        return failures + expect(linux_spdk_environment_t::probe(absent_address_k) == linux_spdk_probe_t::not_found_k);
+        expect_true(linux_spdk_environment_t::probe(absent_address_k) == linux_spdk_probe_t::not_found_k,
+                    "this machine lists no PCIe device, so every address probes not_found_k");
+        return;
     }
 
     linux_spdk_probe_t const result = linux_spdk_environment_t::probe(address.data());
-    fmt::println("  probe({}) answers {}, with {} of {} hugepages free", first, describe(result), hugepages.free_pages,
-                 hugepages.total_pages);
-    if (hugepages.free_pages == 0) failures += expect(result == linux_spdk_probe_t::without_hugepages_k);
-    else failures += expect(result != linux_spdk_probe_t::not_found_k);
-    return failures;
+    if (hugepages.free_pages == 0)
+        expect_true(result == linux_spdk_probe_t::without_hugepages_k,
+                    "probe({}) answers {}, with {} of {} hugepages free", first, name_of(result), hugepages.free_pages,
+                    hugepages.total_pages);
+    else
+        expect_true(result != linux_spdk_probe_t::not_found_k, "probe({}) answers {}, with {} of {} hugepages free",
+                    first, name_of(result), hugepages.free_pages, hugepages.total_pages);
 }
 
 #pragma endregion Probe
@@ -345,53 +337,46 @@ class linux_spdk_rig_t {
 #pragma region Cases
 
 /** The controller identifies as the serial the rig set; a foreign target's serial is only printed. */
-[[nodiscard]] std::size_t spdk_identifies_the_controller(linux_spdk_disk_t& disk, std::string_view wanted) {
-    std::size_t failures = 0;
+void test_spdk_identifies_the_controller(linux_spdk_disk_t& disk, std::string_view wanted) {
     linux_spdk_controller_identity_t const identity = disk.identity();
     fmt::println("  serial {}, model {}", identity.serial, identity.model);
-    failures += expect(std::strlen(identity.serial) != 0);
-    if (!wanted.empty()) failures += expect(std::string_view {identity.serial} == wanted);
-    return failures;
+    expect_true(std::strlen(identity.serial) != 0);
+    if (!wanted.empty()) expect_true(std::string_view {identity.serial} == wanted);
 }
 
 /** What the disk reports is the namespace's sector, the queue pair shape the mount asked for,
  *  and sixteen targets. */
-[[nodiscard]] std::size_t spdk_reports_the_namespace(linux_spdk_disk_t& disk) {
-    std::size_t failures = 0;
+void test_spdk_reports_the_namespace(linux_spdk_disk_t& disk) {
     ring_capabilities_t const limits = disk.capabilities();
     fmt::println("  sector {} bytes, transfer up to {} bytes, {} queue pairs of {}", limits.offset_alignment,
                  limits.max_transfer_bytes, limits.queue_pairs_limit, limits.depth_limit);
-    failures += expect(std::has_single_bit(limits.offset_alignment) && limits.offset_alignment <= block_bytes_k);
-    failures += expect_eq(limits.length_granularity, limits.offset_alignment);
-    failures += expect_eq(limits.memory_alignment, std::uint64_t {portable_alignment_k});
-    failures += expect(limits.max_transfer_bytes >= block_bytes_k);
-    failures += expect_eq(limits.depth_limit, queue_pair_depth_k);
-    failures += expect(limits.queue_pairs_limit >= 1 && limits.queue_pairs_limit <= spdk_queue_pairs_k);
-    failures += expect_eq(limits.media_limit, std::uint16_t {16});
-    failures += expect(!limits.reaches_gpu_memory);
-    return failures;
+    expect_true(std::has_single_bit(limits.offset_alignment) && limits.offset_alignment <= block_bytes_k);
+    expect_equal(limits.length_granularity, limits.offset_alignment);
+    expect_equal(limits.memory_alignment, std::uint64_t {portable_alignment_k});
+    expect_true(limits.max_transfer_bytes >= block_bytes_k);
+    expect_equal(limits.depth_limit, queue_pair_depth_k);
+    expect_true(limits.queue_pairs_limit >= 1 && limits.queue_pairs_limit <= spdk_queue_pairs_k);
+    expect_equal(limits.media_limit, std::uint16_t {16});
+    expect_true(!limits.reaches_gpu_memory);
 }
 
 /** A second disk on @p address shares the process's connection, and a namespace one disk
  *  registered is refused to the other until it is given back. */
-[[nodiscard]] std::size_t spdk_shares_the_controller(linux_spdk_disk_t& disk,
-                                                     linux_spdk_environment_t const& environment, char const* address,
-                                                     linux_spdk_disk_config_t const& config) {
-    std::size_t failures = 0;
+void test_spdk_shares_the_controller(linux_spdk_disk_t& disk, linux_spdk_environment_t const& environment,
+                                     char const* address, linux_spdk_disk_config_t const& config) {
     expected<linux_spdk_disk_t> second = linux_spdk_disk_t::open(environment, address, config);
-    failures += expect_status(second, status_code_t::success_k);
-    if (!second) return failures;
+    expect_status(second, status_code_t::success_k);
+    if (!second) return;
     expected<registered_medium_t> held = disk.register_medium(volume_request("1"));
-    failures += expect(held.has_value());
+    expect_true(held.has_value());
     if (held) {
-        failures += expect_status(second->register_medium(volume_request("1")), status_code_t::contended_k);
-        failures += expect(disk.unregister_medium(*held).succeeded());
+        expect_status(second->register_medium(volume_request("1")), status_code_t::contended_k);
+        expect_true(disk.unregister_medium(*held).succeeded());
         expected<registered_medium_t> taken = second->register_medium(volume_request("1"));
-        failures += expect(taken.has_value());
-        if (taken) failures += expect(second->unregister_medium(*taken).succeeded());
+        expect_true(taken.has_value());
+        if (taken) expect_true(second->unregister_medium(*taken).succeeded());
     }
     second->release();
-    return failures;
 }
 
 /** Connections the process holds, read while no other thread opens or closes one. */
@@ -404,80 +389,79 @@ class linux_spdk_rig_t {
 
 /** Releasing the last disk on @p address detaches its controller, and a fresh open in the same
  *  process connects it again and serves its namespace. */
-[[nodiscard]] std::size_t spdk_reconnects_after_release(linux_spdk_disk_t& disk,
-                                                        linux_spdk_environment_t const& environment,
-                                                        char const* address, linux_spdk_disk_config_t const& config,
-                                                        std::string_view serial) {
-    std::size_t failures = 0;
-    failures += expect_eq(spdk_connections(), std::size_t {1});
+void test_spdk_reconnects_after_release(linux_spdk_disk_t& disk, linux_spdk_environment_t const& environment,
+                                        char const* address, linux_spdk_disk_config_t const& config,
+                                        std::string_view serial) {
+    expect_equal(spdk_connections(), std::size_t {1});
     disk.release();
-    failures += expect_eq(spdk_connections(), std::size_t {0});
+    expect_equal(spdk_connections(), std::size_t {0});
     expected<linux_spdk_disk_t> fresh = linux_spdk_disk_t::open(environment, address, config);
-    failures += expect_status(fresh, status_code_t::success_k);
-    if (!fresh) return failures;
-    failures += expect_eq(spdk_connections(), std::size_t {1});
-    if (!serial.empty()) failures += expect(std::string_view {fresh->identity().serial} == serial);
+    expect_status(fresh, status_code_t::success_k);
+    if (!fresh) return;
+    expect_equal(spdk_connections(), std::size_t {1});
+    if (!serial.empty()) expect_true(std::string_view {fresh->identity().serial} == serial);
     expected<registered_medium_t> registered = fresh->register_medium(volume_request("1"));
-    failures += expect(registered.has_value());
-    if (registered) failures += expect(fresh->unregister_medium(*registered).succeeded());
+    expect_true(registered.has_value());
+    if (registered) expect_true(fresh->unregister_medium(*registered).succeeded());
     fresh->release();
-    failures += expect_eq(spdk_connections(), std::size_t {0});
-    return failures;
+    expect_equal(spdk_connections(), std::size_t {0});
 }
 
 /** Connects to @p address, checks what the controller says it is, and runs the ring contract over it. */
-void spdk_transport(suite_totals_t& totals, char const* address, std::string_view serial) {
+void spdk_transport(char const* address, std::string_view serial) {
     expected<linux_spdk_environment_t> environment = linux_spdk_environment_t::acquire(
         linux_spdk_environment_config_t {});
-    if (report(totals, "linux-spdk.environment", expect_status(environment, status_code_t::success_k)) != 0) return;
+    run_test_case("linux_spdk_environment_t::acquire", [&] { expect_status(environment, status_code_t::success_k); });
+    if (!environment) return;
 
     linux_spdk_disk_config_t config;
     config.queue_pairs_limit = spdk_queue_pairs_k;
     config.depth_limit = queue_pair_depth_k;
     config.registered_memory_limit = 4;
     expected<linux_spdk_disk_t> disk = linux_spdk_disk_t::open(*environment, address, config);
-    if (report(totals, "linux-spdk.mount", expect_status(disk, status_code_t::success_k)) != 0) return;
+    run_test_case("linux_spdk_disk_t::open", [&] { expect_status(disk, status_code_t::success_k); });
+    if (!disk) return;
 
-    report(totals, "linux-spdk.identify", spdk_identifies_the_controller, *disk, serial);
-    report(totals, "linux-spdk.namespace", spdk_reports_the_namespace, *disk);
+    run_test_case("test_spdk_identifies_the_controller", test_spdk_identifies_the_controller, *disk, serial);
+    run_test_case("test_spdk_reports_the_namespace", test_spdk_reports_the_namespace, *disk);
 
-    std::size_t volume_failures = 0;
     expected<registered_medium_t> registered = disk->register_medium(volume_request("1"));
-    volume_failures += expect(registered.has_value());
-    if (registered) {
-        registered_medium_t descriptor = std::move(*registered);
-        volume_failures += expect_eq(descriptor.capacity(), volume_bytes_k);
-        if (descriptor.capacity() == volume_bytes_k)
-            ring_cases(totals, "linux-spdk", *disk, descriptor.reference(), ring_edge_t::refused_k);
-        volume_failures += expect(disk->unregister_medium(descriptor).succeeded());
-    }
-    report(totals, "linux-spdk.volume", volume_failures);
+    if (registered && registered->capacity() == volume_bytes_k)
+        ring_cases("linux_spdk_disk_t", *disk, registered->reference(), ring_edge_t::refused_k);
+    run_test_case("linux_spdk_disk_t::register_medium", [&] {
+        if (!expect_true(registered.has_value())) return;
+        expect_equal(registered->capacity(), volume_bytes_k);
+        expect_true(disk->unregister_medium(*registered).succeeded());
+    });
 
-    report(totals, "linux-spdk.medium_in_flight", ring_holds_a_medium_in_flight<linux_spdk_disk_t>, *disk,
-           volume_request("1"));
-    report(totals, "linux-spdk.keeps_what_it_flushed", ring_keeps_what_it_flushed<linux_spdk_disk_t>, *disk,
-           volume_request("1"));
-    report(totals, "linux-spdk.shares_the_controller", spdk_shares_the_controller, *disk, *environment, address,
-           config);
-    report(totals, "linux-spdk.reconnects_after_release", spdk_reconnects_after_release, *disk, *environment, address,
-           config, serial);
+    run_test_case("test_ring_holds_a_medium_in_flight<linux_spdk_disk_t>",
+                  test_ring_holds_a_medium_in_flight<linux_spdk_disk_t>, *disk, volume_request("1"));
+    run_test_case("test_ring_keeps_what_it_flushed<linux_spdk_disk_t>",
+                  test_ring_keeps_what_it_flushed<linux_spdk_disk_t>, *disk, volume_request("1"));
+    run_test_case("test_spdk_shares_the_controller", test_spdk_shares_the_controller, *disk, *environment, address,
+                  config);
+    run_test_case("test_spdk_reconnects_after_release", test_spdk_reconnects_after_release, *disk, *environment,
+                  address, config, serial);
     disk->release();
 }
 
 /** Runs the transport where the flags name a target, starting one through the rig when asked to. */
-void spdk_suite(suite_totals_t& totals, suite_options_t const& options, linux_spdk_suite_flags_t const& flags) {
-    if (!options.spdk_address.empty()) {
-        spdk_transport(totals, options.spdk_address.data(), flags.serial);
+void spdk_suite(linux_spdk_suite_flags_t const& flags) {
+    if (!test_run.settings.spdk_address.empty()) {
+        spdk_transport(test_run.settings.spdk_address.data(), flags.serial);
         return;
     }
     if (flags.root.empty()) {
-        report(totals, "linux-spdk", case_result_t::skipped("needs --spdk-address or --spdk-root"));
+        run_test_case("linux_spdk_disk_t::open",
+                      [] { return case_result_t::skipped("needs USTORE_SPDK_ADDRESS or USTORE_SPDK_ROOT"); });
         return;
     }
     linux_spdk_rig_t rig;
-    if (report(totals, "linux-spdk.rig", expect(rig.up(flags.root))) != 0) return;
+    bool const up = rig.up(flags.root);
+    run_test_case("linux_spdk_rig_t::up", [up] { expect_true(up); });
+    if (!up) return;
     fmt::println("  target at {}", rig.address());
-    spdk_transport(totals, rig.address(), flags.serial.empty() ? std::string_view {rig.serial()} : flags.serial);
+    spdk_transport(rig.address(), flags.serial.empty() ? std::string_view {rig.serial()} : flags.serial);
     rig.down();
 }
 
@@ -488,17 +472,15 @@ void spdk_suite(suite_totals_t& totals, suite_options_t const& options, linux_sp
 #pragma region Refusals
 
 /** Every entry point answers @c unsupported_k in a build that carries no driver, and nothing crashes. */
-[[nodiscard]] std::size_t spdk_refuses_without_the_option() {
-    std::size_t failures = 0;
-    failures += expect_status(linux_spdk_environment_t::acquire(linux_spdk_environment_config_t {}),
-                              status_code_t::unsupported_k);
+void test_spdk_refuses_without_the_option() {
+    expect_status(linux_spdk_environment_t::acquire(linux_spdk_environment_config_t {}), status_code_t::unsupported_k);
 
     linux_spdk_disk_config_t config;
     config.queue_pairs_limit = 4;
     config.depth_limit = 8;
     config.registered_memory_limit = 4;
     expected<linux_spdk_disk_t> disk = linux_spdk_disk_t::open(linux_spdk_environment_t {}, absent_address_k, config);
-    failures += expect_status(disk, status_code_t::unsupported_k);
+    expect_status(disk, status_code_t::unsupported_k);
 
     linux_spdk_disk_t empty;
     queue_pair_t queue_pair;
@@ -507,33 +489,33 @@ void spdk_suite(suite_totals_t& totals, suite_options_t const& options, linux_sp
     std::array<byte_t, 4096> buffer {};
     std::array<request_t, 1> requests {};
     std::array<completion_t, 1> completions {};
-    failures += expect_status(empty.acquire_queue_pair(std::uint32_t {8}), status_code_t::unsupported_k);
-    failures += expect_status(empty.bind_queue_pair(queue_pair), status_code_t::unsupported_k);
-    failures += expect_status(empty.release_queue_pair(queue_pair), status_code_t::unsupported_k);
-    failures += expect(empty.register_memory(std::span<byte_t> {buffer}, memory_space_t::host_k) ==
-                       status_code_t::unsupported_k);
-    failures += expect_status(empty.unregister_memory(registered_memory), status_code_t::unsupported_k);
-    failures += expect_status(empty.register_medium(medium_options_t {}), status_code_t::unsupported_k);
-    failures += expect_status(empty.unregister_medium(descriptor), status_code_t::unsupported_k);
-    failures += expect(empty.submit(queue_pair, std::span<request_t const> {requests}) == status_code_t::unsupported_k);
-    failures += expect(empty.poll_completions(queue_pair, std::span<completion_t> {completions}) ==
-                       status_code_t::unsupported_k);
-    failures += expect_status(empty.drain(queue_pair), status_code_t::unsupported_k);
-    failures += expect_eq(empty.outstanding(queue_pair), std::size_t {0});
+    expect_status(empty.acquire_queue_pair(std::uint32_t {8}), status_code_t::unsupported_k);
+    expect_status(empty.bind_queue_pair(queue_pair), status_code_t::unsupported_k);
+    expect_status(empty.release_queue_pair(queue_pair), status_code_t::unsupported_k);
+    expect_true(empty.register_memory(std::span<byte_t> {buffer}, memory_space_t::host_k) ==
+                status_code_t::unsupported_k);
+    expect_status(empty.unregister_memory(registered_memory), status_code_t::unsupported_k);
+    expect_status(empty.register_medium(medium_options_t {}), status_code_t::unsupported_k);
+    expect_status(empty.unregister_medium(descriptor), status_code_t::unsupported_k);
+    expect_true(empty.submit(queue_pair, std::span<request_t const> {requests}) == status_code_t::unsupported_k);
+    expect_true(empty.poll_completions(queue_pair, std::span<completion_t> {completions}) ==
+                status_code_t::unsupported_k);
+    expect_status(empty.drain(queue_pair), status_code_t::unsupported_k);
+    expect_equal(empty.outstanding(queue_pair), std::size_t {0});
     empty.cancel(queue_pair);
 
     ring_capabilities_t const reported = empty.capabilities();
-    failures += expect_eq(reported.depth_limit, std::uint32_t {0});
-    failures += expect_eq(reported.queue_pairs_limit, std::uint16_t {0});
-    failures += expect(!reported.reaches_gpu_memory);
-    failures += expect_eq(std::strlen(empty.identity().serial), std::size_t {0});
-    return failures;
+    expect_equal(reported.depth_limit, std::uint32_t {0});
+    expect_equal(reported.queue_pairs_limit, std::uint16_t {0});
+    expect_true(!reported.reaches_gpu_memory);
+    expect_equal(std::strlen(empty.identity().serial), std::size_t {0});
 }
 
 /** Checks the refusals, and reports that the transport itself needs a build that carries the driver. */
-void spdk_suite(suite_totals_t& totals, suite_options_t const&, linux_spdk_suite_flags_t const&) {
-    report(totals, "linux-spdk.refuses_without_the_option", spdk_refuses_without_the_option);
-    report(totals, "linux-spdk", case_result_t::skipped("needs a build with USTORE_WITH_LINUX_SPDK"));
+void spdk_suite(linux_spdk_suite_flags_t const&) {
+    run_test_case("test_spdk_refuses_without_the_option", test_spdk_refuses_without_the_option);
+    run_test_case("linux_spdk_disk_t::open",
+                  [] { return case_result_t::skipped("built without USTORE_WITH_LINUX_SPDK"); });
 }
 
 #pragma endregion Refusals
@@ -542,30 +524,24 @@ void spdk_suite(suite_totals_t& totals, suite_options_t const&, linux_spdk_suite
 
 } // namespace unum::ustore::test
 
-int main(int argc, char const* argv[]) {
+int main(int argc, char** argv) {
     using namespace unum::ustore;
     using namespace unum::ustore::test;
     using namespace unum::ustore::blobs;
     using namespace unum::ustore::utilities;
 
-    suite_options_t options;
+    start_test_run(argc, argv);
     linux_spdk_suite_flags_t flags;
-    std::array<flag_t, 2> const suite_flags {{
-        {"--spdk-root", "path", "SPDK tree with a finished build, whose target the suite starts and stops",
-         &flags.root},
-        {"--spdk-serial", "text", "serial the controller must identify as, the rig's when absent", &flags.serial},
-    }};
-    if (argument_status_t const status = parse_suite_options(argc, argv, options, suite_flags);
-        status != argument_status_t::parsed_k)
-        return status == argument_status_t::help_k ? 0 : 1;
-    suite_totals_t totals = options.totals();
+    if (char const* const root = setting_text(argc, argv, "USTORE_SPDK_ROOT", "--spdk-root")) flags.root = root;
+    if (char const* const serial = setting_text(argc, argv, "USTORE_SPDK_SERIAL", "--spdk-serial"))
+        flags.serial = serial;
 
-    report(totals, "linux-spdk.absent_address", spdk_refuses_an_absent_address);
-    report(totals, "linux-spdk.hugepage_pool", spdk_parses_the_hugepage_pool);
-    report(totals, "linux-spdk.bound_driver", spdk_names_the_bound_driver);
-    report(totals, "linux-spdk.normalises_address", spdk_normalises_an_address);
-    report(totals, "linux-spdk.fabric_address", spdk_passes_a_fabric_address);
-    report(totals, "linux-spdk.probes_this_machine", spdk_probes_this_machine);
-    spdk_suite(totals, options, flags);
-    return suite_exit_code(totals);
+    run_test_case("test_spdk_refuses_an_absent_address", test_spdk_refuses_an_absent_address);
+    run_test_case("test_spdk_parses_the_hugepage_pool", test_spdk_parses_the_hugepage_pool);
+    run_test_case("test_spdk_names_the_bound_driver", test_spdk_names_the_bound_driver);
+    run_test_case("test_spdk_normalises_an_address", test_spdk_normalises_an_address);
+    run_test_case("test_spdk_passes_a_fabric_address", test_spdk_passes_a_fabric_address);
+    run_test_case("test_spdk_probes_this_machine", test_spdk_probes_this_machine);
+    spdk_suite(flags);
+    return finish_test_run();
 }

@@ -11,11 +11,9 @@
 #include <cstdio>  // `stderr`
 
 #include <algorithm> // `std::ranges::max`
-#include <array>     // `std::array`
 #include <chrono>    // `std::chrono::steady_clock`
-#include <random>    // `std::mt19937`
 #include <span>      // `std::span`
-#include <utility>   // `std::exchange`, `std::move`
+#include <utility>   // `std::move`
 
 #include <fmt/format.h>
 
@@ -25,14 +23,14 @@
 
 #include "ustore/utilities/ram_device.hpp" // `caller_exclusivity_t`, `executor_t`
 
-#include "harness.hpp" // `suite_exit_code`, `expect`, `suite_totals_t`
+#include "harness.hpp" // `run_test_case`, `expect_true`, `split_mix_generator_t`
 
 using namespace unum::ustore;
 using namespace unum::ustore::test;
 using namespace unum::ustore::utilities;
 using namespace unum;
 
-/** Workload of the suite, each field set by the flag of the same name. */
+/** Workload of the suite, each field set by the setting of the same name. */
 struct atomicity_options_t {
 
     /** Wall-clock bound of the whole run, shared evenly by every configuration. */
@@ -42,7 +40,7 @@ struct atomicity_options_t {
     count_t checkpoints {.value = 1'000, .minimum = 1};
 
     /** Competing thread counts, each run against every batch size. */
-    counts_t threads {.values = {4, 8, 13, 16}, .size = 4, .minimum = 1};
+    counts_t thread_counts {.values = {4, 8, 13, 16}, .size = 4, .minimum = 1};
 
     /** Consecutive keys one transaction changes. */
     counts_t batch_sizes {.values = {10, 100, 150}, .size = 3, .minimum = 1};
@@ -72,11 +70,8 @@ struct writer_slot_t {
     /** Transaction reset before every attempt, reusing the engine's buffers. */
     transaction_t transaction;
 
-    /** Generator choosing which batches to erase, seeded once per run. */
-    std::mt19937 random_generator;
-
-    /** Failures the thread counted this round, folded in by the main thread once the round ends. */
-    std::size_t failures = 0;
+    /** Generator choosing which batches to erase, seeded once per case. */
+    split_mix_generator_t random_generator {0};
 
     writer_slot_t() noexcept = default;
 };
@@ -131,29 +126,26 @@ struct batches_t {
 #pragma region Setup
 
 /** Begins the transaction a slot resets before every attempt. */
-[[nodiscard]] std::size_t begin_transaction(database_t& database, transaction_t& transaction) {
+bool begin_transaction(database_t& database, transaction_t& transaction) {
     auto maybe_transaction = database.on().transaction();
-    std::size_t const failures = expect(maybe_transaction);
-    if (failures) return failures;
+    if (!expect_true(maybe_transaction.has_value())) return false;
     transaction = *std::move(maybe_transaction);
-    return 0;
+    return true;
 }
 
-/** Makes the arena of @p run, fills its keys, seeds one generator per thread, and begins their
- *  transactions when the engine has them. */
-[[nodiscard]] std::size_t prepare_run(atomicity_run_t& run, atomicity_options_t const& options, random_t random) {
+/** Makes the arena of @p run, fills its keys, and begins one transaction per thread when the
+ *  engine has them. */
+bool prepare_run(atomicity_run_t& run, atomicity_options_t const& options) {
     auto [arena, arena_status] = arena_t::make();
     run.arena = std::move(arena);
-    std::size_t failures = expect(arena_status.succeeded());
-    failures += expect(st::succeeded(run.keys.resize(options.keys.value)));
-    failures += expect(st::succeeded(run.slots.resize((std::ranges::max)(options.threads.view()))));
+    if (!expect_true(arena_status.succeeded()) || !expect_true(st::succeeded(run.keys.resize(options.keys.value))) ||
+        !expect_true(st::succeeded(run.slots.resize((std::ranges::max)(options.thread_counts.view())))))
+        return false;
     for (std::size_t index = 0; index != run.keys.size(); ++index) run.keys[index] = key_from_integer(index);
-    for (std::size_t index = 0; index != run.slots.size(); ++index)
-        run.slots[index].random_generator.seed(static_cast<std::uint32_t>(random.fork(index).next()));
-    if (failures || !run.database.on().supports_transactions()) return failures;
-    for (std::size_t thread = 0; thread != run.slots.size() && !failures; ++thread)
-        failures += begin_transaction(run.database, run.slots[thread].transaction);
-    return failures;
+    if (!run.database.on().supports_transactions()) return true;
+    for (writer_slot_t& slot : run.slots)
+        if (!begin_transaction(run.database, slot.transaction)) return false;
+    return true;
 }
 
 #pragma endregion Setup
@@ -162,52 +154,47 @@ struct batches_t {
 
 /** Commits one batch, retrying staging and conflicts until it lands, and fails only when
  *  no transaction begins. */
-std::size_t commit_batch(transaction_t& transaction, ustore_collection_id_t target, keys_view_t keys,
-                         value_view_t value, batch_operation_t operation) {
+bool commit_batch(transaction_t& transaction, ustore_collection_id_t target, keys_view_t keys, value_view_t value,
+                  batch_operation_t operation) {
     while (true) {
-        std::size_t const failures = expect(transaction.on().reset().has_value());
-        if (failures) return failures;
+        if (!expect_true(transaction.on().reset().has_value())) return false;
         blobs_collection_t collection {transaction.receiver(), target};
         bool const staged = operation == batch_operation_t::erase_k ? collection[keys].remove().succeeded()
                                                                     : collection[keys].assign(value).succeeded();
         if (!staged) continue;
-        if (transaction.on().commit()) return 0;
+        if (transaction.on().commit()) return true;
     }
 }
 
 /** Writes every batch once from @p thread, stopping at its first failure. */
 void write_round(writer_slot_t& slot, ustore_collection_id_t collection, batches_t const& batches, std::size_t thread) {
-    for (std::size_t batch = 0; batch != batches.count() && !slot.failures; ++batch) {
+    for (std::size_t batch = 0; batch != batches.count(); ++batch) {
         std::uint64_t const number = batch * batches.threads_count + thread;
         value_view_t const value(reinterpret_cast<byte_t const*>(&number), sizeof(number));
         bool const erases = batches.deletes == round_deletes_t::with_deletes_k &&
-                            slot.random_generator() % batches.deletes_periodicity == 0;
+                            slot.random_generator.below(batches.deletes_periodicity) == 0;
         batch_operation_t const operation = erases ? batch_operation_t::erase_k : batch_operation_t::overwrite_k;
-        slot.failures += commit_batch(slot.transaction, collection, batches[batch], value, operation);
+        if (!commit_batch(slot.transaction, collection, batches[batch], value, operation)) return;
     }
 }
 
 /** Checks that one batch holds one value in all its keys, reading them into @p arena. */
-std::size_t verify_batch(blobs_collection_t& collection, arena_t& arena, keys_view_t keys) {
+void verify_batch(blobs_collection_t& collection, arena_t& arena, keys_view_t keys) {
     auto maybe_retrieved = collection[keys].value(arena);
-    std::size_t failures = expect(maybe_retrieved);
-    if (!maybe_retrieved) return failures;
+    if (!expect_true(maybe_retrieved.has_value())) return;
     auto const& retrieved = *maybe_retrieved;
-    for (std::size_t offset = 1; offset != keys.size(); ++offset) failures += expect(retrieved[0] == retrieved[offset]);
-    return failures;
+    for (std::size_t offset = 1; offset != keys.size(); ++offset) expect_true(retrieved[0] == retrieved[offset]);
 }
 
 /** Runs one round: every thread writes every batch, then the main thread checks what they left
  *  and clears it. */
-std::size_t run_round(atomicity_run_t& run, executor_t& executor, batches_t const& batches) {
+void run_round(atomicity_run_t& run, executor_t& executor, batches_t const& batches) {
     std::span<writer_slot_t> const slots {run.slots.data(), batches.threads_count};
     auto writer = [&](std::size_t thread) noexcept { write_round(slots[thread], run.collection, batches, thread); };
-    std::size_t failures = expect(st::succeeded(executor.for_threads(writer)));
-    for (writer_slot_t& slot : slots) failures += std::exchange(slot.failures, 0);
+    expect_true(st::succeeded(executor.for_threads(writer)));
     for (std::size_t batch = 0; batch != batches.count(); ++batch)
-        failures += verify_batch(run.collection, run.arena, batches[batch]);
-    failures += expect(run.database.on().clear(ustore_drop_pairs_k).succeeded());
-    return failures;
+        verify_batch(run.collection, run.arena, batches[batch]);
+    expect_true(run.database.on().clear(ustore_drop_pairs_k).succeeded());
 }
 
 #pragma endregion Round
@@ -220,7 +207,7 @@ std::size_t run_round(atomicity_run_t& run, executor_t& executor, batches_t cons
  *
  *  Each thread picks its own value per batch, so once all threads finish a round every batch must
  *  hold one value in all of its keys, whichever thread won it. Every round ends by clearing the
- *  database, so the next starts empty.
+ *  database, so the next starts empty, and no round starts after one failed a check.
  *
  *  @param[in,out] run Database, keys and thread slots the run allocated once.
  *  @param[in,out] executor Pool of exactly the configuration's thread count.
@@ -228,67 +215,77 @@ std::size_t run_round(atomicity_run_t& run, executor_t& executor, batches_t cons
  *  @param[in] checkpoints Most rounds to run.
  *  @param[in] slice Time after which no further round starts; the first round always runs.
  */
-std::size_t insert_atomic_isolated(atomicity_run_t& run, executor_t& executor, batches_t const& batches,
-                                   std::size_t checkpoints, std::chrono::nanoseconds slice) {
+void insert_atomic_isolated(atomicity_run_t& run, executor_t& executor, batches_t const& batches,
+                            std::size_t checkpoints, std::chrono::nanoseconds slice) {
     auto const deadline = std::chrono::steady_clock::now() + slice;
-    std::size_t failures = 0;
-    for (std::size_t checkpoint = 0; checkpoint != checkpoints && !failures; ++checkpoint) {
+    std::size_t const failed_before = test_run.failed_checks.load();
+    for (std::size_t checkpoint = 0; checkpoint != checkpoints && test_run.failed_checks.load() == failed_before;
+         ++checkpoint) {
         if (checkpoint != 0 && std::chrono::steady_clock::now() >= deadline) break;
-        failures += run_round(run, executor, batches);
+        run_round(run, executor, batches);
     }
-    return failures;
 }
 
 /** Runs every batch size on one pool of @p threads threads. */
-std::size_t inserts_on_threads(atomicity_run_t& run, atomicity_options_t const& options, std::size_t threads,
-                               round_deletes_t deletes, std::chrono::nanoseconds slice) {
+void inserts_on_threads(atomicity_run_t& run, atomicity_options_t const& options, std::size_t threads,
+                        round_deletes_t deletes, std::chrono::nanoseconds slice) {
     auto maybe_executor = executor_t::make(threads, caller_exclusivity_t::caller_inclusive_k);
-    std::size_t failures = expect(maybe_executor);
-    if (!maybe_executor) return failures;
+    if (!expect_true(maybe_executor.has_value())) return;
     for (std::size_t const batch_size : options.batch_sizes.view()) {
         std::span<ustore_key_t const> const keys {run.keys.data(), run.keys.size() / batch_size * batch_size};
         batches_t const batches {keys, batch_size, threads, deletes, options.deletes_periodicity.value};
-        failures += insert_atomic_isolated(run, *maybe_executor, batches, options.checkpoints.value, slice);
+        insert_atomic_isolated(run, *maybe_executor, batches, options.checkpoints.value, slice);
     }
-    return failures;
 }
 
 /** Runs every thread count against every batch size, erasing batches when @p deletes
  *  asks for it. */
-std::size_t database_inserts(atomicity_run_t& run, atomicity_options_t const& options, round_deletes_t deletes) {
-    if (!run.database.on().supports_transactions()) return 0;
-    std::size_t const configurations_count = 2 * options.threads.size * options.batch_sizes.size;
+case_result_t test_database_inserts(atomicity_run_t& run, atomicity_options_t const& options, round_deletes_t deletes) {
+    if (!run.database.on().supports_transactions()) return case_result_t::skipped(needs_transactions_k);
+    for (std::size_t index = 0; index != run.slots.size(); ++index)
+        run.slots[index].random_generator = split_mix_generator_t {case_stream_key(index)};
+    std::size_t const configurations_count = 2 * options.thread_counts.size * options.batch_sizes.size;
     std::chrono::nanoseconds const slice = options.time_limit / configurations_count;
-    std::size_t failures = 0;
-    for (std::size_t const threads : options.threads.view())
-        failures += inserts_on_threads(run, options, threads, deletes, slice);
-    return failures;
+    for (std::size_t const threads : options.thread_counts.view())
+        inserts_on_threads(run, options, threads, deletes, slice);
+    return {};
 }
 
 #pragma endregion Configurations
 
-int main(int argc, char** argv) {
-    suite_options_t suite;
-    atomicity_options_t options;
-    std::array<flag_t, 6> const flags {{
-        {"--time-limit", "duration", "bound of the whole run, like 10s", &options.time_limit},
-        {"--checkpoints", "count", "most write-and-verify rounds per configuration", &options.checkpoints},
-        {"--threads", "counts", "competing thread counts, like 4,8,13,16", &options.threads},
-        {"--batch-sizes", "counts", "keys per transaction, like 10,100,150", &options.batch_sizes},
-        {"--keys", "count", "keys one round writes", &options.keys},
-        {"--deletes-periodicity", "count", "one batch in this many is erased", &options.deletes_periodicity},
-    }};
-    if (argument_status_t const status = parse_suite_options(argc, argv, suite, flags);
-        status != argument_status_t::parsed_k)
-        return status == argument_status_t::help_k ? 0 : 1;
-    suite_totals_t totals = suite.totals();
+/** Reads the counts setting @p variable or @p flag into @p counts , exiting on one that
+ *  does not parse. */
+void read_counts_setting(int argc, char** argv, char const* variable, std::string_view flag, counts_t& counts) {
+    char const* text = setting_text(argc, argv, variable, flag);
+    if (text && parse_counts(text, counts) != argument_status_t::parsed_k)
+        exit_unparsed(variable, text, "comma-separated counts like 4,8,13,16");
+}
 
-    auto const maybe_directory = directory_t::make(suite.directory);
+/** Reads the count setting @p variable or @p flag into @p count , within its bounds, exiting on one
+ *  that does not parse. */
+void read_bounded_setting(int argc, char** argv, char const* variable, std::string_view flag, count_t& count) {
+    char const* text = setting_text(argc, argv, variable, flag);
+    if (text && parse_count(text, count) != argument_status_t::parsed_k)
+        exit_unparsed(variable, text, "a positive count");
+}
+
+int main(int argc, char** argv) {
+    start_test_run(argc, argv);
+    atomicity_options_t options;
+    options.time_limit = read_duration_setting(argc, argv, "USTORE_TIME_LIMIT", "--time-limit", options.time_limit);
+    read_bounded_setting(argc, argv, "USTORE_CHECKPOINTS", "--checkpoints", options.checkpoints);
+    read_counts_setting(argc, argv, "USTORE_THREAD_COUNTS", "--thread-counts", options.thread_counts);
+    read_counts_setting(argc, argv, "USTORE_BATCH_SIZES", "--batch-sizes", options.batch_sizes);
+    read_bounded_setting(argc, argv, "USTORE_KEYS", "--keys", options.keys);
+    read_bounded_setting(argc, argv, "USTORE_DELETES_PERIODICITY", "--deletes-periodicity",
+                         options.deletes_periodicity);
+
+    auto const maybe_directory = scratch_directory_t::make(test_run.settings.directory);
     if (!maybe_directory) {
-        fmt::println(stderr, "Cannot create a unique directory under {}", suite.directory);
+        fmt::println(stderr, "Cannot create a unique directory under {}", test_run.settings.directory);
         return 1;
     }
-    config_t const config {suite.engine, maybe_directory->path()};
+    config_t const config {test_run.settings.engine, maybe_directory->path()};
     auto [database, open_status] = open_database<database_t>(config);
     if (open_status.failed()) {
         fmt::println(stderr, "Cannot open the database");
@@ -301,13 +298,14 @@ int main(int argc, char** argv) {
         return 1;
     }
 
+    // The setup runs outside any case, so a filter never leaves it out, and a check it fails
+    // fails the run
     atomicity_run_t run {database, collection};
-    if (std::size_t const failures = prepare_run(run, options, suite.random()); failures) {
-        report(totals, "setup", failures);
-        return suite_exit_code(totals);
-    }
+    if (!prepare_run(run, options)) return finish_test_run();
 
-    report(totals, "database.inserts", database_inserts, run, options, round_deletes_t::without_deletes_k);
-    report(totals, "database.inserts_and_deletes", database_inserts, run, options, round_deletes_t::with_deletes_k);
-    return suite_exit_code(totals);
+    run_test_case(engine_label_t {"test_database_inserts", "round_deletes_t::without_deletes_k"}.c_str(),
+                  test_database_inserts, run, options, round_deletes_t::without_deletes_k);
+    run_test_case(engine_label_t {"test_database_inserts", "round_deletes_t::with_deletes_k"}.c_str(),
+                  test_database_inserts, run, options, round_deletes_t::with_deletes_k);
+    return finish_test_run();
 }

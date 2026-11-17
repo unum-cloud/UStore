@@ -1,4 +1,9 @@
-"""The NetworkX-compatible graph view, checked against NetworkX itself as the oracle for every graph kind."""
+"""The NetworkX-compatible graph view, checked against NetworkX itself as the oracle for every graph kind.
+
+File: test/graph_view.py
+Author: Ash Vardanian
+Date: September 18, 2026
+"""
 
 from typing import Any
 from uuid import UUID
@@ -6,7 +11,7 @@ from uuid import UUID
 import networkx
 import numpy as np
 import pytest
-from capabilities import NEEDS_TRANSACTIONS, key
+from base import NEEDS_TRANSACTIONS, key
 
 import ustore
 from ustore.graph_view import DiGraph, Graph, MultiDiGraph, MultiGraph
@@ -18,7 +23,8 @@ GRAPH_KINDS = {
     "multidigraph": (MultiDiGraph, networkx.MultiDiGraph),
 }
 
-SIZES = [1, 10, 100]
+COUNTS = [1, 10, 100]
+"""Edges or vertices per case, kept below `BATCH_SIZES`, as NetworkX builds every oracle one edge at a time."""
 
 
 def plain(value: Any) -> Any:
@@ -41,6 +47,7 @@ def canonical(graph, edges) -> list[tuple[int, ...]]:
 
 @pytest.fixture(params=GRAPH_KINDS)
 def kind(request: pytest.FixtureRequest) -> str:
+    """The graph kind a case runs on, one of `GRAPH_KINDS`."""
     return request.param
 
 
@@ -59,6 +66,7 @@ def attributed(view, kind: str):
 
 
 def assert_same_structure(ours, reference) -> None:
+    """Checks that the view and NetworkX hold the same vertices, edges and degrees."""
     assert plain(list(ours.nodes)) == sorted(reference.nodes)
     assert ours.number_of_nodes() == reference.number_of_nodes()
     assert ours.number_of_edges() == reference.number_of_edges()
@@ -71,8 +79,10 @@ def assert_same_structure(ours, reference) -> None:
 
 @pytest.mark.parametrize(("source", "target"), [(1, 2), (2, 1), (5, 5)])
 def test_one_edge(graphs, source: int, target: int):
+    """Adding and removing one edge, a loop included, matches NetworkX and keeps both vertices."""
     ours, reference = graphs
-    assert not ours.has_node(source) and not ours.has_edge(source, target)
+    assert not ours.has_node(source)
+    assert not ours.has_edge(source, target)
 
     ours.add_edge(source, target)
     reference.add_edge(source, target)
@@ -84,16 +94,19 @@ def test_one_edge(graphs, source: int, target: int):
     ours.remove_edge(source, target)
     reference.remove_edge(source, target)
     assert_same_structure(ours, reference)
-    assert ours.has_node(source) and ours.has_node(target)
+    assert ours.has_node(source)
+    assert ours.has_node(target)
 
 
 def test_triangle(graphs):
+    """A triangle matches NetworkX, with its successors and predecessors when directed."""
     ours, reference = graphs
     for source, target in [(1, 2), (2, 3), (3, 1)]:
         ours.add_edge(source, target)
         reference.add_edge(source, target)
     assert_same_structure(ours, reference)
-    assert 1 in ours and 4 not in ours
+    assert 1 in ours
+    assert 4 not in ours
     if ours.is_directed():
         assert plain(list(ours.successors(1))) == sorted(reference.successors(1))
         assert plain(list(ours.predecessors(1))) == sorted(reference.predecessors(1))
@@ -101,6 +114,7 @@ def test_triangle(graphs):
 
 @pytest.mark.parametrize("container", ["list", "numpy"])
 def test_triangle_in_batches(graphs, container: str):
+    """Adding and removing a triangle from lists or NumPy arrays matches NetworkX."""
     ours, reference = graphs
     spell = np.array if container == "numpy" else list
     ours.add_edges_from_arrays(spell([1, 2, 3]), spell([2, 3, 1]))
@@ -112,12 +126,13 @@ def test_triangle_in_batches(graphs, container: str):
     assert_same_structure(ours, reference)
 
 
-@pytest.mark.parametrize("size", SIZES)
-def test_random_fill_matches_networkx(graphs, size: int, seed: int):
+@pytest.mark.parametrize("count", COUNTS)
+def test_random_fill_matches_networkx(graphs, count: int, seed: int):
+    """Random edges, repeats and loops included, match NetworkX in structure and reverse lookups."""
     ours, reference = graphs
     generator = np.random.default_rng(seed)
-    sources = generator.integers(0, 50, size)
-    targets = generator.integers(0, 50, size)
+    sources = generator.integers(0, 50, count)
+    targets = generator.integers(0, 50, count)
     ours.add_edges_from_arrays(sources, targets)
     reference.add_edges_from(zip(sources.tolist(), targets.tolist(), strict=True))
     assert_same_structure(ours, reference)
@@ -127,6 +142,7 @@ def test_random_fill_matches_networkx(graphs, size: int, seed: int):
 
 @pytest.mark.parametrize("node", [1, 2, 3])
 def test_neighbors(graphs, node: int):
+    """The neighbors and the adjacency of every vertex match NetworkX."""
     ours, reference = graphs
     for source, target in [(1, 2), (1, 3), (2, 3)]:
         ours.add_edge(source, target)
@@ -136,6 +152,7 @@ def test_neighbors(graphs, node: int):
 
 
 def test_adding_existing_vertices_keeps_their_edges(graphs):
+    """Adding vertices that exist keeps their edges, as NetworkX does."""
     ours, reference = graphs
     ours.add_edge(1, 2)
     reference.add_edge(1, 2)
@@ -144,8 +161,9 @@ def test_adding_existing_vertices_keeps_their_edges(graphs):
     assert_same_structure(ours, reference)
 
 
-@pytest.mark.parametrize("count", SIZES)
+@pytest.mark.parametrize("count", COUNTS)
 def test_add_and_remove_nodes_in_batches(graphs, count: int):
+    """Adding and removing vertices in batches matches NetworkX."""
     ours, reference = graphs
     nodes = np.arange(count)
     ours.add_nodes_from(nodes)
@@ -156,8 +174,9 @@ def test_add_and_remove_nodes_in_batches(graphs, count: int):
     assert_same_structure(ours, reference)
 
 
-@pytest.mark.parametrize("count", SIZES)
+@pytest.mark.parametrize("count", COUNTS)
 def test_removing_nodes_removes_their_edges(graphs, count: int):
+    """Removing a vertex removes its edges as NetworkX does, and a missing one raises KeyError."""
     ours, reference = graphs
     ours.add_edges_from_arrays(np.arange(count), np.arange(count, 2 * count))
     reference.add_edges_from(zip(range(count), range(count, 2 * count), strict=True))
@@ -170,6 +189,7 @@ def test_removing_nodes_removes_their_edges(graphs, count: int):
 
 
 def test_clear_edges_then_clear(graphs):
+    """Clearing the edges keeps the vertices, and clearing the graph empties it, as in NetworkX."""
     ours, reference = graphs
     ours.add_edges_from_arrays(np.arange(20), np.arange(20, 40))
     reference.add_edges_from(zip(range(20), range(20, 40), strict=True))
@@ -182,6 +202,7 @@ def test_clear_edges_then_clear(graphs):
 
 
 def test_duplicate_edges_in_one_batch(graphs):
+    """A batch repeating an edge adds and removes it as NetworkX does."""
     ours, reference = graphs
     ours.add_edges_from_arrays([1, 2, 2, 3], [4, 5, 5, 6])
     reference.add_edges_from([(1, 4), (2, 5), (2, 5), (3, 6)])
@@ -191,8 +212,9 @@ def test_duplicate_edges_in_one_batch(graphs):
     assert_same_structure(ours, reference)
 
 
-@pytest.mark.parametrize("count", SIZES)
+@pytest.mark.parametrize("count", COUNTS)
 def test_degrees(graphs, count: int):
+    """Degrees of a vertex and of a batch match NetworkX, and a missing vertex raises KeyError."""
     ours, reference = graphs
     ours.add_edges_from_arrays(np.arange(count), np.arange(1, count + 1))
     reference.add_edges_from(zip(range(count), range(1, count + 1), strict=True))
@@ -209,6 +231,7 @@ def test_degrees(graphs, count: int):
 
 @pytest.mark.parametrize("kind", ["digraph"], indirect=True)
 def test_read_edges_in_every_role(graphs):
+    """A directed view reads the edges leaving a vertex, entering it, or both, as triples."""
     ours, _ = graphs
     ours.add_edges_from_arrays([1, 3], [2, 1])
     leaving = (key(1), key(2), ustore.edge_id_default)
@@ -220,6 +243,7 @@ def test_read_edges_in_every_role(graphs):
 
 @pytest.mark.parametrize("kind", ["digraph"], indirect=True)
 def test_read_edges_of_a_batch(graphs):
+    """A batch read answers each vertex's edges, an empty tuple for a lone one and None for a missing one."""
     ours, _ = graphs
     ours.add_edges_from_arrays([1, 1], [2, 3])
     ours.add_node(4)
@@ -234,6 +258,7 @@ def test_read_edges_of_a_batch(graphs):
 
 @pytest.mark.parametrize("weight", [1, 2.5])
 def test_weighted_degrees_and_size(attributed, kind: str, weight: float):
+    """Weighted degrees and sizes match NetworkX under integer and real weights."""
     reference = GRAPH_KINDS[kind][1]()
     attributed.add_edges_from_arrays(np.arange(10), np.arange(1, 11), weight=weight)
     reference.add_edges_from(zip(range(10), range(1, 11), strict=True), weight=weight)
@@ -243,6 +268,7 @@ def test_weighted_degrees_and_size(attributed, kind: str, weight: float):
 
 
 def test_a_weight_that_is_not_a_number_is_refused(attributed):
+    """A weighted size over a weight that is no number raises TypeError."""
     attributed.add_edge(1, 2, weight="heavy")
     attributed.add_edge(2, 3, weight=1)
     with pytest.raises(TypeError):
@@ -250,6 +276,7 @@ def test_a_weight_that_is_not_a_number_is_refused(attributed):
 
 
 def test_node_attributes(attributed):
+    """Vertex attributes read back whole, by name and with a default, as NetworkX spells them."""
     expected = {}
     for node in range(10):
         if node % 2:
@@ -275,6 +302,7 @@ def test_node_attributes(attributed):
 
 
 def test_set_node_attributes(attributed):
+    """Vertex attributes set from one value, a dict of values or a dict of dicts merge into each vertex."""
     attributed.add_nodes_from([0, 1, 2])
     attributed.set_node_attributes(1, name="weight")
     assert plain(dict(attributed.nodes(data="weight"))) == {0: 1, 1: 1, 2: 1}
@@ -289,6 +317,7 @@ def test_set_node_attributes(attributed):
 
 
 def test_edge_attributes_match_networkx(attributed, kind: str):
+    """Edge attributes, with defaults and narrowed to some vertices, match NetworkX."""
     reference = GRAPH_KINDS[kind][1]()
     for node in range(20):
         attributes = {"weight": node} if node % 2 else {}
@@ -314,12 +343,15 @@ def test_edge_attributes_match_networkx(attributed, kind: str):
 
 
 def test_edge_attributes_in_batches(attributed):
+    """A batch of edges takes its attributes as columns, one row per edge."""
     sources = np.array([1, 2, 3])
     targets = np.array([2, 3, 1])
     attributed.add_edges_from_arrays(
         sources, targets, columns={"weight": [0, 1, 2], "name": ["edge0", "edge1", "edge2"]}
     )
-    assert attributed.has_edge(1, 2) and attributed.has_edge(2, 3) and attributed.has_edge(3, 1)
+    assert attributed.has_edge(1, 2)
+    assert attributed.has_edge(2, 3)
+    assert attributed.has_edge(3, 1)
     labelled = {plain((source, target)): data for source, target, data in attributed.edges(data=True)}
     assert labelled == {
         (1, 2): {"weight": 0, "name": "edge0"},
@@ -330,6 +362,7 @@ def test_edge_attributes_in_batches(attributed):
 
 @pytest.mark.parametrize("kind", ["graph", "digraph"], indirect=True)
 def test_set_edge_attributes_of_simple_graphs(attributed):
+    """Edge attributes of a simple graph set from one value or from dicts merge into each edge."""
     for node in range(3):
         attributed.add_edge(node, node + 1)
     attributed.set_edge_attributes(1, name="weight")
@@ -345,6 +378,7 @@ def test_set_edge_attributes_of_simple_graphs(attributed):
 
 @pytest.mark.parametrize("kind", ["multigraph", "multidigraph"], indirect=True)
 def test_set_edge_attributes_of_multigraphs(attributed):
+    """A multigraph sets and reads edge attributes by the keys its edges were given."""
     keys = [attributed.add_edge(node, node + 1) for node in range(3)]
     attributed.set_edge_attributes({(node, node + 1, key): f"edge{node}" for node, key in enumerate(keys)}, name="name")
     assert attributed.get_edge_attributes("name") == {
@@ -355,6 +389,7 @@ def test_set_edge_attributes_of_multigraphs(attributed):
 
 
 def test_adding_an_edge_again_merges_its_attributes(attributed):
+    """An edge added again merges its attributes, or adds a parallel edge in a multigraph."""
     attributed.add_edge(1, 2, name="edge1", weight=2)
     if not attributed.is_multigraph():
         attributed.add_edge(1, 2, id=1, weight=3)
@@ -370,6 +405,7 @@ def test_adding_an_edge_again_merges_its_attributes(attributed):
 
 @pytest.mark.parametrize("kind", ["multigraph", "multidigraph"], indirect=True)
 def test_multigraph_keys(attributed):
+    """A multigraph keys parallel edges upwards from zero, past the keys already taken."""
     for weight in (1, 2, 3):
         attributed.add_edge(1, 2, weight=weight)
     assert plain(list(attributed.edges(keys=True, data=True))) == [
@@ -391,19 +427,25 @@ def test_multigraph_keys(attributed):
     ]
 
 
+@pytest.mark.any_engine
 def test_attributes_never_share_the_graph_collection(view):
-    with pytest.raises(ValueError):
+    """Attributes kept in the graph's own collection raise ValueError."""
+    with pytest.raises(ValueError, match="apart from the graph"):
         Graph(view, "graph", nodes="graph")
 
 
+@pytest.mark.any_engine
 def test_attributes_need_a_collection(graphs):
+    """An attribute on a view without an attribute collection raises ValueError."""
     ours, _ = graphs
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="need a collection of their own"):
         ours.add_edge(1, 2, weight=1)
 
 
+@pytest.mark.any_engine
 @pytest.mark.parametrize("kind", ["graph", "digraph"], indirect=True)
 def test_simple_graphs_take_no_keys(graphs):
+    """A simple graph refuses edge keys on writes and reads."""
     ours, _ = graphs
     with pytest.raises(TypeError):
         ours.add_edges_from_arrays([1], [2], [7])
@@ -418,6 +460,7 @@ def test_simple_graphs_take_no_keys(graphs):
 
 @NEEDS_TRANSACTIONS
 def test_a_watched_edge_conflicts_with_a_concurrent_removal(database, kind: str):
+    """An edge a transaction read fails its commit once a concurrent call removes it."""
     ours = GRAPH_KINDS[kind][0]
     ours(database, "graph").add_edges_from_arrays([1, 2], [2, 3])
 
@@ -433,6 +476,7 @@ def test_a_watched_edge_conflicts_with_a_concurrent_removal(database, kind: str)
 
 @NEEDS_TRANSACTIONS
 def test_transactions_touching_one_vertex_conflict(database, kind: str):
+    """Two transactions adding edges at one vertex conflict, and the first one's edge stays."""
     ours = GRAPH_KINDS[kind][0]
     first = database.transaction()
     second = database.transaction()

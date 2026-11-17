@@ -1416,8 +1416,8 @@ mod tests {
     use std::slice;
 
     use super::*;
-    use crate::db::{Database, NVMEOptions, RAMOptions, RocksDBOptions};
-    use crate::testing::{key, temporary_directory};
+    use crate::db::{Database, RAMOptions};
+    use crate::testing::key;
 
     /// The rows of every batch `stream` answers, each a key and its value, read through the C data interface alone.
     fn rows_of(mut stream: ArrowArrayStream) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -1483,25 +1483,39 @@ mod tests {
     }
 
     #[test]
-    fn arrow_ingest_lands_every_row_on_ram_and_nvme() {
+    fn arrow_ingest_lands_every_row_on_ram() {
         ingests_every_row(&Database::init_ram(&RAMOptions::default()).unwrap());
-        let directory = temporary_directory("arrow_ingest_nvme");
-        let manifest = format!("{}/ustore.ustore.json", directory.path());
-        match Database::open_nvme(&NVMEOptions::at(&manifest)) {
-            Ok(database) => ingests_every_row(&database),
-            Err(failure) => assert_eq!((failure.status, cfg!(feature = "nvme")), (Status::Unsupported, false)),
-        }
     }
 
     #[test]
+    #[cfg(feature = "nvme")]
+    fn arrow_ingest_lands_every_row_on_nvme() {
+        let directory = crate::testing::ScratchDirectory::new("arrow_ingest_nvme");
+        let manifest = directory.path().join("ustore.ustore.json");
+        ingests_every_row(&Database::open_nvme(&crate::db::NVMEOptions::at(manifest.to_str().unwrap())).unwrap());
+    }
+
+    #[test]
+    #[cfg(not(feature = "nvme"))]
+    fn arrow_ingest_lands_every_row_on_nvme() {
+        crate::testing::skipped("built without the nvme feature");
+    }
+
+    #[test]
+    #[cfg(feature = "rocksdb")]
     fn arrow_ingest_is_unsupported_and_takes_the_stream() {
-        let directory = temporary_directory("arrow_ingest_rocksdb");
-        let Ok(database) = Database::open_rocksdb(&RocksDBOptions::at(directory.path())) else {
-            return assert!(!cfg!(feature = "rocksdb"));
-        };
+        let directory = crate::testing::ScratchDirectory::new("arrow_ingest_rocksdb");
+        let options = crate::db::RocksDBOptions::at(directory.path().to_str().unwrap());
+        let database = Database::open_rocksdb(&options).unwrap();
         let mut posters = posters(&database);
         let exported = posters.export_arrow().unwrap();
         let refused = posters.ingest_arrow(exported, IngestOrder::Sorted, Durability::Buffered);
         assert_eq!(refused.unwrap_err().status, Status::Unsupported);
+    }
+
+    #[test]
+    #[cfg(not(feature = "rocksdb"))]
+    fn arrow_ingest_is_unsupported_and_takes_the_stream() {
+        crate::testing::skipped("built without the rocksdb feature");
     }
 }

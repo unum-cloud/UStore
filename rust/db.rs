@@ -4664,8 +4664,7 @@ impl<'arena> Changes<'arena> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::temporary_directory;
-    use crate::testing::{block_on, created, key, keys};
+    use crate::testing::{ScratchDirectory, block_on, created, key, keys, skipped};
 
     #[test]
     fn change_feeds_hand_out_writes_and_removals_oldest_first() {
@@ -4703,16 +4702,17 @@ mod tests {
 
     #[test]
     fn databases_open_at_a_directory_and_keep_what_they_held() {
-        let directory = temporary_directory("database_reopens");
+        let directory = ScratchDirectory::new("database_reopens");
+        let path = directory.path().to_str().unwrap();
         let mut arena = Arena::new().unwrap();
 
-        let database = Database::open_ram(directory.path(), &RAMOptions::default()).unwrap();
+        let database = Database::open_ram(path, &RAMOptions::default()).unwrap();
         let blobs = created(&database, Modality::Blobs);
         let entries = [crate::blobs::Entry::new(key(7), b"alpha")];
         database.head().write(blobs, &entries, Durability::Flushed).unwrap();
         drop(database);
 
-        let reopened = Database::open_ram(directory.path(), &RAMOptions::default()).unwrap();
+        let reopened = Database::open_ram(path, &RAMOptions::default()).unwrap();
         let values = reopened.head().read(blobs, keys([7]), &mut arena).unwrap();
         assert_eq!(values.get(0), Some(b"alpha".as_slice()));
     }
@@ -4734,72 +4734,105 @@ mod tests {
         }
     }
 
-    #[test]
-    fn databases_open_on_every_engine_or_report_it_missing() {
-        let executor = Executor::for_ram(&[], 2).unwrap();
-        let ram = temporary_directory("database_ram");
-        let rocksdb = temporary_directory("database_rocksdb");
-        let leveldb = temporary_directory("database_leveldb");
-        let nvme = temporary_directory("database_nvme");
-        let nvme_manifest = format!("{}/ustore.ustore.json", nvme.path());
-        let opened = [
-            (Database::open_ram(ram.path(), &RAMOptions::default()), true),
-            (Database::open_rocksdb(&RocksDBOptions::at(rocksdb.path())), cfg!(feature = "rocksdb")),
-            (Database::open_leveldb(&LevelDBOptions::at(leveldb.path())), cfg!(feature = "leveldb")),
-            (Database::open_nvme(&NVMEOptions::at(&nvme_manifest)), cfg!(feature = "nvme")),
-        ];
+    /// Writes a key into a new collection of the database `open` answers on the calling thread,
+    /// then reopens it on an executor, which finds the collection by its name and the key under it.
+    fn reopens_on_an_executor(open: impl Fn(Option<&Executor>) -> Result<Database>) {
         let mut arena = Arena::new().unwrap();
-        for (database, compiled) in opened {
-            if !compiled {
-                assert_eq!(database.unwrap_err().status, Status::Unsupported);
-                continue;
-            }
-            let database = database.unwrap();
-            let blobs = created(&database, Modality::Blobs);
-            let entries = [crate::blobs::Entry::new(key(7), b"alpha")];
-            database.head().write(blobs, &entries, Durability::Flushed).unwrap();
-            let values = database.head().read(blobs, keys([7]), &mut arena).unwrap();
-            assert_eq!(values.get(0), Some(b"alpha".as_slice()));
-        }
+        let database = open(None).unwrap();
+        let blobs = created(&database, Modality::Blobs);
+        let entries = [crate::blobs::Entry::new(key(7), b"alpha")];
+        database.head().write(blobs, &entries, Durability::Flushed).unwrap();
+        let values = database.head().read(blobs, keys([7]), &mut arena).unwrap();
+        assert_eq!(values.get(0), Some(b"alpha".as_slice()));
+        drop(database);
 
-        // Every engine but NVMe reopens on an executor, keeping what it held.
-        let on = Some(&executor);
-        let reopened = [
-            (Database::open_ram(ram.path(), &RAMOptions { executor: on, ..RAMOptions::default() }), true),
-            (
-                Database::open_rocksdb(&RocksDBOptions { executor: on, ..RocksDBOptions::at(rocksdb.path()) }),
-                cfg!(feature = "rocksdb"),
-            ),
-            (
-                Database::open_leveldb(&LevelDBOptions { executor: on, ..LevelDBOptions::at(leveldb.path()) }),
-                cfg!(feature = "leveldb"),
-            ),
-        ];
-        for (database, compiled) in reopened {
-            if !compiled {
-                assert_eq!(database.unwrap_err().status, Status::Unsupported);
-                continue;
-            }
-            let database = database.unwrap();
-            let (blobs, modality) = database.head().collection_find("blobs", &mut arena).unwrap();
-            assert_eq!(modality, Modality::Blobs, "a reopened name keeps its modality");
-            let values = database.head().read(blobs, keys([7]), &mut arena).unwrap();
-            assert_eq!(values.get(0), Some(b"alpha".as_slice()));
-        }
+        let executor = Executor::for_ram(&[], 2).unwrap();
+        let reopened = open(Some(&executor)).unwrap();
+        let (blobs, modality) = reopened.head().collection_find("blobs", &mut arena).unwrap();
+        assert_eq!(modality, Modality::Blobs, "a reopened name keeps its modality");
+        let values = reopened.head().read(blobs, keys([7]), &mut arena).unwrap();
+        assert_eq!(values.get(0), Some(b"alpha".as_slice()));
+    }
+
+    #[test]
+    fn ram_databases_reopen_on_an_executor() {
+        let directory = ScratchDirectory::new("database_ram");
+        let path = directory.path().to_str().unwrap();
+        reopens_on_an_executor(|executor| Database::open_ram(path, &RAMOptions { executor, ..RAMOptions::default() }));
+    }
+
+    #[test]
+    #[cfg(feature = "rocksdb")]
+    fn rocksdb_databases_reopen_or_report_the_engine_missing() {
+        let directory = ScratchDirectory::new("database_rocksdb");
+        let path = directory.path().to_str().unwrap();
+        reopens_on_an_executor(|executor| {
+            Database::open_rocksdb(&RocksDBOptions { executor, ..RocksDBOptions::at(path) })
+        });
+    }
+
+    #[test]
+    #[cfg(not(feature = "rocksdb"))]
+    fn rocksdb_databases_reopen_or_report_the_engine_missing() {
+        let directory = ScratchDirectory::new("database_rocksdb");
+        let missing = Database::open_rocksdb(&RocksDBOptions::at(directory.path().to_str().unwrap())).unwrap_err();
+        assert_eq!(missing.status, Status::Unsupported);
+    }
+
+    #[test]
+    #[cfg(feature = "leveldb")]
+    fn leveldb_databases_reopen_or_report_the_engine_missing() {
+        let directory = ScratchDirectory::new("database_leveldb");
+        let path = directory.path().to_str().unwrap();
+        reopens_on_an_executor(|executor| {
+            Database::open_leveldb(&LevelDBOptions { executor, ..LevelDBOptions::at(path) })
+        });
+    }
+
+    #[test]
+    #[cfg(not(feature = "leveldb"))]
+    fn leveldb_databases_reopen_or_report_the_engine_missing() {
+        let directory = ScratchDirectory::new("database_leveldb");
+        let missing = Database::open_leveldb(&LevelDBOptions::at(directory.path().to_str().unwrap())).unwrap_err();
+        assert_eq!(missing.status, Status::Unsupported);
+    }
+
+    #[test]
+    #[cfg(feature = "nvme")]
+    fn nvme_databases_open_or_report_the_engine_missing() {
+        let directory = ScratchDirectory::new("database_nvme");
+        let manifest = directory.path().join("ustore.ustore.json");
+        let database = Database::open_nvme(&NVMEOptions::at(manifest.to_str().unwrap())).unwrap();
+        let mut arena = Arena::new().unwrap();
+        let blobs = created(&database, Modality::Blobs);
+        let entries = [crate::blobs::Entry::new(key(7), b"alpha")];
+        database.head().write(blobs, &entries, Durability::Flushed).unwrap();
+        let values = database.head().read(blobs, keys([7]), &mut arena).unwrap();
+        assert_eq!(values.get(0), Some(b"alpha".as_slice()));
+    }
+
+    #[test]
+    #[cfg(not(feature = "nvme"))]
+    fn nvme_databases_open_or_report_the_engine_missing() {
+        let directory = ScratchDirectory::new("database_nvme");
+        let manifest = directory.path().join("ustore.ustore.json");
+        let missing = Database::open_nvme(&NVMEOptions::at(manifest.to_str().unwrap())).unwrap_err();
+        assert_eq!(missing.status, Status::Unsupported);
     }
 
     #[test]
     #[cfg(feature = "rocksdb")]
     fn a_viewed_rocksdb_database_reads_and_refuses_changes() {
-        let directory = temporary_directory("database_viewed");
+        let directory = ScratchDirectory::new("database_viewed");
+        let path = directory.path().to_str().unwrap();
         let mut arena = Arena::new().unwrap();
         let entries = [crate::blobs::Entry::new(key(7), b"alpha")];
-        let written = Database::open_rocksdb(&RocksDBOptions::at(directory.path())).unwrap();
+        let written = Database::open_rocksdb(&RocksDBOptions::at(path)).unwrap();
         let blobs = created(&written, Modality::Blobs);
         written.head().write(blobs, &entries, Durability::Flushed).unwrap();
         drop(written);
 
-        let viewed = Database::view_rocksdb(&RocksDBOptions::at(directory.path())).unwrap();
+        let viewed = Database::view_rocksdb(&RocksDBOptions::at(path)).unwrap();
         assert_eq!(viewed.describe().unwrap().engine, Engine::RocksDB);
         let values = viewed.head().read(blobs, keys([7]), &mut arena).unwrap();
         assert_eq!(values.get(0), Some(b"alpha".as_slice()));
@@ -4866,7 +4899,7 @@ mod tests {
     }
 
     #[test]
-    fn compact_plans_open_through_a_stop_continue_and_finish() {
+    fn compact_plans_stay_live_until_finished() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let entries = [crate::blobs::Entry::new(key(1), b"Ada")];
         for name in ["people", "places", "things"] {
@@ -4950,7 +4983,7 @@ mod tests {
         let machine = picked_under(None).unwrap();
         // A monoversioned build compiles no class under any other, so it refuses a lower ceiling.
         if machine == CPUClass::Monoversioned {
-            return;
+            return skipped("built without USTORE_MULTIVERSIONED");
         }
         assert_eq!(picked_under(Some(machine)), Some(machine));
         // Power10 and AWS G5 share no architecture, so one of them is foreign to every machine.
@@ -5193,15 +5226,16 @@ mod tests {
         let entries = [crate::blobs::Entry::new(key(6), b"saved")];
         database.head().write(blobs, &entries, Durability::Buffered).unwrap();
 
-        let directory = temporary_directory("snapshot_saves");
-        let deferred_directory = temporary_directory("snapshot_saves_deferred");
+        let directory = ScratchDirectory::new("snapshot_saves");
+        let deferred_directory = ScratchDirectory::new("snapshot_saves_deferred");
+        let paths = [directory.path().to_str().unwrap(), deferred_directory.path().to_str().unwrap()];
         let executor = Executor::for_ram(&[], 1).unwrap();
         let snapshot = database.snapshot().unwrap();
-        snapshot.save(directory.path()).unwrap();
-        snapshot.deferred(&executor).save(deferred_directory.path().to_owned()).unwrap().wait().unwrap();
+        snapshot.save(paths[0]).unwrap();
+        snapshot.deferred(&executor).save(paths[1].to_owned()).unwrap().wait().unwrap();
         assert_eq!(snapshot.save("/nonexistent/ustore/directory").unwrap_err().status, Status::NotFound);
 
-        for path in [directory.path(), deferred_directory.path()] {
+        for path in paths {
             let saved = Database::open_ram(path, &RAMOptions::default()).unwrap();
             let values = saved.head().read(blobs, &keys([6]), &mut arena).unwrap();
             assert_eq!(values.get(0), Some(b"saved".as_slice()));
@@ -5406,7 +5440,7 @@ mod tests {
     }
 
     #[test]
-    fn a_held_executor_answers_contended() {
+    fn a_held_executor_refuses_the_next_call() {
         let (database, blobs) = crowded(100_000);
         let executor = Executor::for_ram(&[], 1).unwrap();
         let mut scanned = Arena::new_in(&executor).unwrap();

@@ -87,23 +87,22 @@ void paint(std::span<byte_t> buffer, std::uint64_t seed) noexcept {
 /** A write of a few blocks comes back byte for byte through a read of the same extents. */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
-std::size_t ring_reads_back_what_it_wrote(disk_type_& disk, medium_reference_t medium) {
-    std::size_t failures = 0;
+void test_ring_reads_back_what_it_wrote(disk_type_& disk, medium_reference_t medium) {
     constexpr std::size_t blocks_k = 4;
     test_buffer_t buffer = make_buffer(2 * blocks_k * block_bytes_k);
-    failures += expect_eq(buffer.size(), 2 * blocks_k * block_bytes_k);
-    if (buffer.size() != 2 * blocks_k * block_bytes_k) return failures;
+    expect_equal(buffer.size(), 2 * blocks_k * block_bytes_k);
+    if (buffer.size() != 2 * blocks_k * block_bytes_k) return;
 
     expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(acquired.has_value());
-    if (!acquired) return failures;
+    expect_true(acquired.has_value());
+    if (!acquired) return;
     queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
-    failures += expect(pinned.has_value());
+    expect_true(pinned.has_value());
     if (!pinned) {
-        failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-        return failures;
+        expect_true(disk.release_queue_pair(queue_pair).succeeded());
+        return;
     }
     registered_memory_t registered_memory = std::move(*pinned);
 
@@ -118,15 +117,15 @@ std::size_t ring_reads_back_what_it_wrote(disk_type_& disk, medium_reference_t m
                                       registered_memory.reference(index * block_bytes_k),
                                       queue_pair.token(static_cast<std::uint32_t>(index)));
     expected<std::size_t> const submitted = disk.submit(queue_pair, std::span<request_t const> {writes});
-    failures += expect(submitted == blocks_k);
+    expect_true(submitted == blocks_k);
 
     std::array<completion_t, polling_room_k> completions {};
     expected<std::size_t> const written = poll_completions_at_least<waiter_t>(
         disk, queue_pair, std::span<completion_t> {completions}, blocks_k);
-    failures += expect(written == blocks_k);
+    expect_true(written == blocks_k);
     for (std::size_t index = 0; index != blocks_k; ++index) {
-        failures += expect(completions[index].completed_in_full());
-        failures += expect_eq(completions[index].transferred_bytes, std::uint64_t {block_bytes_k});
+        expect_true(completions[index].completed_in_full());
+        expect_equal(completions[index].transferred_bytes, std::uint64_t {block_bytes_k});
     }
 
     std::array<request_t, blocks_k> reads {};
@@ -135,39 +134,37 @@ std::size_t ring_reads_back_what_it_wrote(disk_type_& disk, medium_reference_t m
                                     registered_memory.reference((blocks_k + index) * block_bytes_k),
                                     queue_pair.token(static_cast<std::uint32_t>(blocks_k + index)));
     expected<std::size_t> const asked = disk.submit(queue_pair, std::span<request_t const> {reads});
-    failures += expect(asked == blocks_k);
+    expect_true(asked == blocks_k);
     expected<std::size_t> const read = poll_completions_at_least<waiter_t>(
         disk, queue_pair, std::span<completion_t> {completions}, blocks_k);
-    failures += expect(read == blocks_k);
-    for (std::size_t index = 0; index != blocks_k; ++index) failures += expect(completions[index].completed_in_full());
-    failures += expect(same_bytes(source, destination));
+    expect_true(read == blocks_k);
+    for (std::size_t index = 0; index != blocks_k; ++index) expect_true(completions[index].completed_in_full());
+    expect_true(same_bytes(source, destination));
 
-    failures += expect(disk.drain(queue_pair).succeeded());
-    failures += expect(disk.unregister_memory(registered_memory).succeeded());
-    failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-    return failures;
+    expect_true(disk.drain(queue_pair).succeeded());
+    expect_true(disk.unregister_memory(registered_memory).succeeded());
+    expect_true(disk.release_queue_pair(queue_pair).succeeded());
 }
 
 /** One queue pair of eight carries sixty-four requests by polling what it submitted and submitting again. */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
-std::size_t ring_reaches_depth_beyond_its_credit(disk_type_& disk, medium_reference_t medium) {
-    std::size_t failures = 0;
+void test_ring_reaches_depth_beyond_its_credit(disk_type_& disk, medium_reference_t medium) {
     constexpr std::size_t rounds_k = 8;
     test_buffer_t buffer = make_buffer(queue_pair_depth_k * block_bytes_k);
-    failures += expect_eq(buffer.size(), queue_pair_depth_k * block_bytes_k);
-    if (buffer.size() != queue_pair_depth_k * block_bytes_k) return failures;
+    expect_equal(buffer.size(), queue_pair_depth_k * block_bytes_k);
+    if (buffer.size() != queue_pair_depth_k * block_bytes_k) return;
 
     expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(acquired.has_value());
-    if (!acquired) return failures;
+    expect_true(acquired.has_value());
+    if (!acquired) return;
     queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
-    failures += expect(pinned.has_value());
+    expect_true(pinned.has_value());
     if (!pinned) {
-        failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-        return failures;
+        expect_true(disk.release_queue_pair(queue_pair).succeeded());
+        return;
     }
     registered_memory_t registered_memory = std::move(*pinned);
 
@@ -183,42 +180,40 @@ std::size_t ring_reaches_depth_beyond_its_credit(disk_type_& disk, medium_refere
                                          queue_pair.token(static_cast<std::uint32_t>(retired + index)));
         }
         expected<std::size_t> const submitted = disk.submit(queue_pair, std::span<request_t const> {batch});
-        failures += expect(submitted == queue_pair_depth_k);
+        expect_true(submitted == queue_pair_depth_k);
         expected<std::size_t> const completed = poll_completions_at_least<waiter_t>(
             disk, queue_pair, std::span<completion_t> {completions}, queue_pair_depth_k);
-        failures += expect(completed == queue_pair_depth_k);
+        expect_true(completed == queue_pair_depth_k);
         for (std::size_t index = 0; index != queue_pair_depth_k; ++index)
-            failures += expect(completions[index].completed_in_full());
+            expect_true(completions[index].completed_in_full());
         retired += queue_pair_depth_k;
     }
-    failures += expect_eq(retired, rounds_k * queue_pair_depth_k);
-    failures += expect_eq(disk.outstanding(queue_pair), std::size_t {0});
+    expect_equal(retired, rounds_k * queue_pair_depth_k);
+    expect_equal(disk.outstanding(queue_pair), std::size_t {0});
 
-    failures += expect(disk.unregister_memory(registered_memory).succeeded());
-    failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-    return failures;
+    expect_true(disk.unregister_memory(registered_memory).succeeded());
+    expect_true(disk.release_queue_pair(queue_pair).succeeded());
 }
 
 /** A full ring takes a prefix and then nothing at all, and never waits for room. */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
-std::size_t ring_refuses_when_full(disk_type_& disk, medium_reference_t medium) {
-    std::size_t failures = 0;
+void test_ring_refuses_when_full(disk_type_& disk, medium_reference_t medium) {
     constexpr std::size_t offered_k = queue_pair_depth_k + 3;
     test_buffer_t buffer = make_buffer(block_bytes_k);
-    failures += expect_eq(buffer.size(), std::size_t {block_bytes_k});
-    if (buffer.size() != block_bytes_k) return failures;
+    expect_equal(buffer.size(), std::size_t {block_bytes_k});
+    if (buffer.size() != block_bytes_k) return;
 
     expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(acquired.has_value());
-    if (!acquired) return failures;
+    expect_true(acquired.has_value());
+    if (!acquired) return;
     queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
-    failures += expect(pinned.has_value());
+    expect_true(pinned.has_value());
     if (!pinned) {
-        failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-        return failures;
+        expect_true(disk.release_queue_pair(queue_pair).succeeded());
+        return;
     }
     registered_memory_t registered_memory = std::move(*pinned);
 
@@ -227,45 +222,43 @@ std::size_t ring_refuses_when_full(disk_type_& disk, medium_reference_t medium) 
         batch[index] = read_request(medium, extent_t {0, block_bytes_k}, registered_memory.reference(0),
                                     queue_pair.token(static_cast<std::uint32_t>(index)));
     expected<std::size_t> const first = disk.submit(queue_pair, std::span<request_t const> {batch});
-    failures += expect(first == std::size_t {queue_pair_depth_k});
+    expect_true(first == std::size_t {queue_pair_depth_k});
     expected<std::size_t> const second = disk.submit(queue_pair, std::span<request_t const> {batch}.first(1));
-    failures += expect(second == std::size_t {0});
-    failures += expect_eq(disk.outstanding(queue_pair), std::size_t {queue_pair_depth_k});
+    expect_true(second == std::size_t {0});
+    expect_equal(disk.outstanding(queue_pair), std::size_t {queue_pair_depth_k});
 
     std::array<completion_t, polling_room_k> completions {};
     expected<std::size_t> const completed = poll_completions_at_least<waiter_t>(
         disk, queue_pair, std::span<completion_t> {completions}, queue_pair_depth_k);
-    failures += expect(completed == std::size_t {queue_pair_depth_k});
+    expect_true(completed == std::size_t {queue_pair_depth_k});
     expected<std::size_t> const third = disk.submit(queue_pair, std::span<request_t const> {batch}.first(1));
-    failures += expect(third == std::size_t {1});
+    expect_true(third == std::size_t {1});
 
-    failures += expect(disk.drain(queue_pair).succeeded());
-    failures += expect(disk.unregister_memory(registered_memory).succeeded());
-    failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-    return failures;
+    expect_true(disk.drain(queue_pair).succeeded());
+    expect_true(disk.unregister_memory(registered_memory).succeeded());
+    expect_true(disk.release_queue_pair(queue_pair).succeeded());
 }
 
 /** A read that meets the end of the volume moves a prefix, says so, and leaves the tail alone. */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
-std::size_t ring_reports_a_partial_transfer(disk_type_& disk, medium_reference_t medium, ring_edge_t edge) {
-    std::size_t failures = 0;
+void test_ring_reports_a_partial_transfer(disk_type_& disk, medium_reference_t medium, ring_edge_t edge) {
     std::uint64_t const reachable = edge == ring_edge_t::clipped_k ? 1024 : block_bytes_k;
     std::size_t const bytes = edge == ring_edge_t::clipped_k ? block_bytes_k : 2 * block_bytes_k;
     test_buffer_t buffer = make_buffer(bytes);
-    failures += expect_eq(buffer.size(), bytes);
-    if (buffer.size() != bytes) return failures;
+    expect_equal(buffer.size(), bytes);
+    if (buffer.size() != bytes) return;
 
     expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(acquired.has_value());
-    if (!acquired) return failures;
+    expect_true(acquired.has_value());
+    if (!acquired) return;
     queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
-    failures += expect(pinned.has_value());
+    expect_true(pinned.has_value());
     if (!pinned) {
-        failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-        return failures;
+        expect_true(disk.release_queue_pair(queue_pair).succeeded());
+        return;
     }
     registered_memory_t registered_memory = std::move(*pinned);
 
@@ -275,48 +268,46 @@ std::size_t ring_reports_a_partial_transfer(disk_type_& disk, medium_reference_t
     std::array<request_t, 1> batch {read_request(medium, extent_t {volume_bytes_k - reachable, bytes},
                                                  registered_memory.reference(0), queue_pair.token(0))};
     expected<std::size_t> const submitted = disk.submit(queue_pair, std::span<request_t const> {batch});
-    failures += expect(submitted == std::size_t {1});
+    expect_true(submitted == std::size_t {1});
 
     std::array<completion_t, polling_room_k> completions {};
     expected<std::size_t> const completed = poll_completions_at_least<waiter_t>(
         disk, queue_pair, std::span<completion_t> {completions}, 1);
-    failures += expect(completed == std::size_t {1});
-    failures += expect(!completions[0].completed_in_full());
+    expect_true(completed == std::size_t {1});
+    expect_true(!completions[0].completed_in_full());
     if (edge == ring_edge_t::clipped_k) {
-        failures += expect(completions[0].state == completion_state_t::partial_k);
-        failures += expect_eq(completions[0].transferred_bytes, reachable);
+        expect_true(completions[0].state == completion_state_t::partial_k);
+        expect_equal(completions[0].transferred_bytes, reachable);
     }
     else {
-        failures += expect(completions[0].state == completion_state_t::failed_k);
-        failures += expect_status(completions[0].status, status_code_t::invalid_argument_k);
-        failures += expect_eq(completions[0].transferred_bytes, std::uint64_t {0});
-        failures += expect(buffer[0] == poison_k);
+        expect_true(completions[0].state == completion_state_t::failed_k);
+        expect_status(completions[0].status, status_code_t::invalid_argument_k);
+        expect_equal(completions[0].transferred_bytes, std::uint64_t {0});
+        expect_true(buffer[0] == poison_k);
     }
 
-    failures += expect(disk.unregister_memory(registered_memory).succeeded());
-    failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-    return failures;
+    expect_true(disk.unregister_memory(registered_memory).succeeded());
+    expect_true(disk.release_queue_pair(queue_pair).succeeded());
 }
 
 /** A read wholly past the end of the volume refuses rather than handing back whatever the buffer held. */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
-std::size_t ring_refuses_a_torn_read(disk_type_& disk, medium_reference_t medium) {
-    std::size_t failures = 0;
+void test_ring_refuses_a_torn_read(disk_type_& disk, medium_reference_t medium) {
     test_buffer_t buffer = make_buffer(block_bytes_k);
-    failures += expect_eq(buffer.size(), std::size_t {block_bytes_k});
-    if (buffer.size() != block_bytes_k) return failures;
+    expect_equal(buffer.size(), std::size_t {block_bytes_k});
+    if (buffer.size() != block_bytes_k) return;
 
     expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(acquired.has_value());
-    if (!acquired) return failures;
+    expect_true(acquired.has_value());
+    if (!acquired) return;
     queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
-    failures += expect(pinned.has_value());
+    expect_true(pinned.has_value());
     if (!pinned) {
-        failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-        return failures;
+        expect_true(disk.release_queue_pair(queue_pair).succeeded());
+        return;
     }
     registered_memory_t registered_memory = std::move(*pinned);
 
@@ -326,39 +317,37 @@ std::size_t ring_refuses_a_torn_read(disk_type_& disk, medium_reference_t medium
     std::array<request_t, 1> batch {read_request(medium, extent_t {volume_bytes_k + block_bytes_k, block_bytes_k},
                                                  registered_memory.reference(0), queue_pair.token(0))};
     expected<std::size_t> const submitted = disk.submit(queue_pair, std::span<request_t const> {batch});
-    failures += expect(submitted == std::size_t {1});
+    expect_true(submitted == std::size_t {1});
 
     std::array<completion_t, polling_room_k> completions {};
     expected<std::size_t> const completed = poll_completions_at_least<waiter_t>(
         disk, queue_pair, std::span<completion_t> {completions}, 1);
-    failures += expect(completed == std::size_t {1});
-    failures += expect(!completions[0].completed_in_full());
-    failures += expect_eq(completions[0].transferred_bytes, std::uint64_t {0});
+    expect_true(completed == std::size_t {1});
+    expect_true(!completions[0].completed_in_full());
+    expect_equal(completions[0].transferred_bytes, std::uint64_t {0});
 
-    failures += expect(disk.unregister_memory(registered_memory).succeeded());
-    failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-    return failures;
+    expect_true(disk.unregister_memory(registered_memory).succeeded());
+    expect_true(disk.release_queue_pair(queue_pair).succeeded());
 }
 
 /** A cancelled queue pair's outstanding requests come back cancelled, and its queue pair drains and releases. */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
-std::size_t ring_drains_a_cancelled_queue_pair(disk_type_& disk, medium_reference_t medium) {
-    std::size_t failures = 0;
+void test_ring_drains_a_cancelled_queue_pair(disk_type_& disk, medium_reference_t medium) {
     test_buffer_t buffer = make_buffer(queue_pair_depth_k * block_bytes_k);
-    failures += expect_eq(buffer.size(), queue_pair_depth_k * block_bytes_k);
-    if (buffer.size() != queue_pair_depth_k * block_bytes_k) return failures;
+    expect_equal(buffer.size(), queue_pair_depth_k * block_bytes_k);
+    if (buffer.size() != queue_pair_depth_k * block_bytes_k) return;
 
     expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(acquired.has_value());
-    if (!acquired) return failures;
+    expect_true(acquired.has_value());
+    if (!acquired) return;
     queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
-    failures += expect(pinned.has_value());
+    expect_true(pinned.has_value());
     if (!pinned) {
-        failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-        return failures;
+        expect_true(disk.release_queue_pair(queue_pair).succeeded());
+        return;
     }
     registered_memory_t registered_memory = std::move(*pinned);
 
@@ -368,7 +357,7 @@ std::size_t ring_drains_a_cancelled_queue_pair(disk_type_& disk, medium_referenc
                                     registered_memory.reference(index * block_bytes_k),
                                     queue_pair.token(static_cast<std::uint32_t>(index)));
     expected<std::size_t> const submitted = disk.submit(queue_pair, std::span<request_t const> {batch});
-    failures += expect(submitted == std::size_t {queue_pair_depth_k});
+    expect_true(submitted == std::size_t {queue_pair_depth_k});
 
     // A cancel stops what has not started, so a transport that runs its requests eagerly may have
     // finished them already; what every transport owes is one terminal completion per request.
@@ -379,59 +368,56 @@ std::size_t ring_drains_a_cancelled_queue_pair(disk_type_& disk, medium_referenc
     for (std::size_t spins = 0; retired != queue_pair_depth_k && spins != poll_spin_limit_k; ++spins) {
         expected<std::size_t> const completed = disk.poll_completions(queue_pair,
                                                                       std::span<completion_t> {completions});
-        failures += expect(completed.has_value());
+        expect_true(completed.has_value());
         if (!completed) break;
         for (std::size_t index = 0; index != *completed; ++index) {
             completion_t const& completion = completions[index];
             if (!completion.retires()) continue;
             std::uint32_t const tag = completion.token.tag();
-            failures += expect(tag < queue_pair_depth_k);
+            expect_true(tag < queue_pair_depth_k);
             if (tag < queue_pair_depth_k) ++seen[tag];
             if (completion.state == completion_state_t::cancelled_k)
-                failures += expect_eq(completion.transferred_bytes, std::uint64_t {0});
+                expect_equal(completion.transferred_bytes, std::uint64_t {0});
             ++retired;
         }
     }
-    failures += expect_eq(retired, std::size_t {queue_pair_depth_k});
-    for (std::size_t index = 0; index != queue_pair_depth_k; ++index)
-        failures += expect_eq(seen[index], std::uint32_t {1});
+    expect_equal(retired, std::size_t {queue_pair_depth_k});
+    for (std::size_t index = 0; index != queue_pair_depth_k; ++index) expect_equal(seen[index], std::uint32_t {1});
 
-    failures += expect(disk.drain(queue_pair).succeeded());
-    failures += expect_eq(disk.outstanding(queue_pair), std::size_t {0});
-    failures += expect(disk.unregister_memory(registered_memory).succeeded());
-    failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-    return failures;
+    expect_true(disk.drain(queue_pair).succeeded());
+    expect_equal(disk.outstanding(queue_pair), std::size_t {0});
+    expect_true(disk.unregister_memory(registered_memory).succeeded());
+    expect_true(disk.release_queue_pair(queue_pair).succeeded());
 }
 
 /** Two queue pairs interleave their batches on one ring and each polls only the tokens it minted. */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
-case_result_t ring_separates_two_queue_pairs(disk_type_& disk, medium_reference_t medium) {
-    std::size_t failures = 0;
-    if (disk.capabilities().queue_pairs_limit < 2) return case_result_t::skipped("the ring queue pairs one queue_pair");
+case_result_t test_ring_separates_two_queue_pairs(disk_type_& disk, medium_reference_t medium) {
+    if (disk.capabilities().queue_pairs_limit < 2) return case_result_t::skipped("needs a ring of two queue pairs");
 
     test_buffer_t buffer = make_buffer(2 * queue_pair_depth_k * block_bytes_k);
-    failures += expect_eq(buffer.size(), 2 * queue_pair_depth_k * block_bytes_k);
-    if (buffer.size() != 2 * queue_pair_depth_k * block_bytes_k) return failures;
+    expect_equal(buffer.size(), 2 * queue_pair_depth_k * block_bytes_k);
+    if (buffer.size() != 2 * queue_pair_depth_k * block_bytes_k) return {};
 
     expected<queue_pair_t> first_acquired = disk.acquire_queue_pair(queue_pair_depth_k);
     expected<queue_pair_t> second_acquired = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(first_acquired.has_value());
-    failures += expect(second_acquired.has_value());
+    expect_true(first_acquired.has_value());
+    expect_true(second_acquired.has_value());
     if (!first_acquired || !second_acquired) {
-        if (first_acquired) failures += expect(disk.release_queue_pair(*first_acquired).succeeded());
-        if (second_acquired) failures += expect(disk.release_queue_pair(*second_acquired).succeeded());
-        return failures;
+        if (first_acquired) expect_true(disk.release_queue_pair(*first_acquired).succeeded());
+        if (second_acquired) expect_true(disk.release_queue_pair(*second_acquired).succeeded());
+        return {};
     }
     queue_pair_t first = std::move(*first_acquired);
     queue_pair_t second = std::move(*second_acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
-    failures += expect(pinned.has_value());
+    expect_true(pinned.has_value());
     if (!pinned) {
-        failures += expect(disk.release_queue_pair(first).succeeded());
-        failures += expect(disk.release_queue_pair(second).succeeded());
-        return failures;
+        expect_true(disk.release_queue_pair(first).succeeded());
+        expect_true(disk.release_queue_pair(second).succeeded());
+        return {};
     }
     registered_memory_t registered_memory = std::move(*pinned);
 
@@ -445,55 +431,54 @@ case_result_t ring_separates_two_queue_pairs(disk_type_& disk, medium_reference_
                                            registered_memory.reference((queue_pair_depth_k + index) * block_bytes_k),
                                            second.token(static_cast<std::uint32_t>(100 + index)));
     }
-    failures += expect(disk.submit(first, std::span<request_t const> {first_batch}.first(4)) == std::size_t {4});
-    failures += expect(disk.submit(second, std::span<request_t const> {second_batch}.first(4)) == std::size_t {4});
-    failures += expect(disk.submit(first, std::span<request_t const> {first_batch}.subspan(4)) ==
-                       std::size_t {queue_pair_depth_k - 4});
+    expect_true(disk.submit(first, std::span<request_t const> {first_batch}.first(4)) == std::size_t {4});
+    expect_true(disk.submit(second, std::span<request_t const> {second_batch}.first(4)) == std::size_t {4});
+    expect_true(disk.submit(first, std::span<request_t const> {first_batch}.subspan(4)) ==
+                std::size_t {queue_pair_depth_k - 4});
 
     std::array<completion_t, polling_room_k> completions {};
     expected<std::size_t> const first_reaped = poll_completions_at_least<waiter_t>(
         disk, first, std::span<completion_t> {completions}, queue_pair_depth_k);
-    failures += expect(first_reaped == std::size_t {queue_pair_depth_k});
+    expect_true(first_reaped == std::size_t {queue_pair_depth_k});
     for (std::size_t index = 0; index != queue_pair_depth_k; ++index) {
-        failures += expect(completions[index].token.queue_pair() == first.id());
-        failures += expect(completions[index].token.tag() < 100u);
+        expect_true(completions[index].token.queue_pair() == first.id());
+        expect_true(completions[index].token.tag() < 100u);
     }
 
     expected<std::size_t> const second_reaped = poll_completions_at_least<waiter_t>(
         disk, second, std::span<completion_t> {completions}, 4);
-    failures += expect(second_reaped == std::size_t {4});
+    expect_true(second_reaped == std::size_t {4});
     for (std::size_t index = 0; index != 4; ++index) {
-        failures += expect(completions[index].token.queue_pair() == second.id());
-        failures += expect(completions[index].token.tag() >= 100u);
+        expect_true(completions[index].token.queue_pair() == second.id());
+        expect_true(completions[index].token.tag() >= 100u);
     }
 
-    failures += expect(disk.drain(first).succeeded());
-    failures += expect(disk.drain(second).succeeded());
-    failures += expect(disk.unregister_memory(registered_memory).succeeded());
-    failures += expect(disk.release_queue_pair(first).succeeded());
-    failures += expect(disk.release_queue_pair(second).succeeded());
-    return failures;
+    expect_true(disk.drain(first).succeeded());
+    expect_true(disk.drain(second).succeeded());
+    expect_true(disk.unregister_memory(registered_memory).succeeded());
+    expect_true(disk.release_queue_pair(first).succeeded());
+    expect_true(disk.release_queue_pair(second).succeeded());
+    return {};
 }
 
 /** A batch carrying another queue pair's token is refused whole, since a misrouted completion is unrecoverable. */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
-std::size_t ring_refuses_a_foreign_token(disk_type_& disk, medium_reference_t medium) {
-    std::size_t failures = 0;
+void test_ring_refuses_a_foreign_token(disk_type_& disk, medium_reference_t medium) {
     test_buffer_t buffer = make_buffer(block_bytes_k);
-    failures += expect_eq(buffer.size(), std::size_t {block_bytes_k});
-    if (buffer.size() != block_bytes_k) return failures;
+    expect_equal(buffer.size(), std::size_t {block_bytes_k});
+    if (buffer.size() != block_bytes_k) return;
 
     expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(acquired.has_value());
-    if (!acquired) return failures;
+    expect_true(acquired.has_value());
+    if (!acquired) return;
     queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
-    failures += expect(pinned.has_value());
+    expect_true(pinned.has_value());
     if (!pinned) {
-        failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-        return failures;
+        expect_true(disk.release_queue_pair(queue_pair).succeeded());
+        return;
     }
     registered_memory_t registered_memory = std::move(*pinned);
 
@@ -501,71 +486,67 @@ std::size_t ring_refuses_a_foreign_token(disk_type_& disk, medium_reference_t me
     std::array<request_t, 1> batch {
         read_request(medium, extent_t {0, block_bytes_k}, registered_memory.reference(0), foreign)};
     expected<std::size_t> const submitted = disk.submit(queue_pair, std::span<request_t const> {batch});
-    failures += expect(submitted.failed());
-    failures += expect_status(submitted, status_code_t::invalid_argument_k);
-    failures += expect_eq(disk.outstanding(queue_pair), std::size_t {0});
+    expect_true(submitted.failed());
+    expect_status(submitted, status_code_t::invalid_argument_k);
+    expect_equal(disk.outstanding(queue_pair), std::size_t {0});
 
-    failures += expect(disk.unregister_memory(registered_memory).succeeded());
-    failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-    return failures;
+    expect_true(disk.unregister_memory(registered_memory).succeeded());
+    expect_true(disk.release_queue_pair(queue_pair).succeeded());
 }
 
 /** A registered range cannot be handed back while the device may still be writing into it. */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
-std::size_t ring_holds_a_registered_memory_in_flight(disk_type_& disk, medium_reference_t medium) {
-    std::size_t failures = 0;
+void test_ring_holds_a_registered_memory_in_flight(disk_type_& disk, medium_reference_t medium) {
     test_buffer_t buffer = make_buffer(block_bytes_k);
-    failures += expect_eq(buffer.size(), std::size_t {block_bytes_k});
-    if (buffer.size() != block_bytes_k) return failures;
+    expect_equal(buffer.size(), std::size_t {block_bytes_k});
+    if (buffer.size() != block_bytes_k) return;
 
     expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(acquired.has_value());
-    if (!acquired) return failures;
+    expect_true(acquired.has_value());
+    if (!acquired) return;
     queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
-    failures += expect(pinned.has_value());
+    expect_true(pinned.has_value());
     if (!pinned) {
-        failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-        return failures;
+        expect_true(disk.release_queue_pair(queue_pair).succeeded());
+        return;
     }
     registered_memory_t registered_memory = std::move(*pinned);
 
     std::array<request_t, 1> batch {
         read_request(medium, extent_t {0, block_bytes_k}, registered_memory.reference(0), queue_pair.token(0))};
-    failures += expect(disk.submit(queue_pair, std::span<request_t const> {batch}) == std::size_t {1});
-    failures += expect(disk.unregister_memory(registered_memory).failed());
-    failures += expect(registered_memory.held());
+    expect_true(disk.submit(queue_pair, std::span<request_t const> {batch}) == std::size_t {1});
+    expect_true(disk.unregister_memory(registered_memory).failed());
+    expect_true(registered_memory.held());
 
     std::array<completion_t, polling_room_k> completions {};
-    failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
-                                                           1) == std::size_t {1});
-    failures += expect(disk.unregister_memory(registered_memory).succeeded());
-    failures += expect(!registered_memory.held());
-    failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-    return failures;
+    expect_true(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions}, 1) ==
+                std::size_t {1});
+    expect_true(disk.unregister_memory(registered_memory).succeeded());
+    expect_true(!registered_memory.held());
+    expect_true(disk.release_queue_pair(queue_pair).succeeded());
 }
 
 /** A chain runs in submission order and is cut at the first result that is not whole. */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
-std::size_t ring_cuts_a_chain(disk_type_& disk, medium_reference_t medium) {
-    std::size_t failures = 0;
+void test_ring_cuts_a_chain(disk_type_& disk, medium_reference_t medium) {
     test_buffer_t buffer = make_buffer(3 * block_bytes_k);
-    failures += expect_eq(buffer.size(), 3 * block_bytes_k);
-    if (buffer.size() != 3 * block_bytes_k) return failures;
+    expect_equal(buffer.size(), 3 * block_bytes_k);
+    if (buffer.size() != 3 * block_bytes_k) return;
 
     expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(acquired.has_value());
-    if (!acquired) return failures;
+    expect_true(acquired.has_value());
+    if (!acquired) return;
     queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
-    failures += expect(pinned.has_value());
+    expect_true(pinned.has_value());
     if (!pinned) {
-        failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-        return failures;
+        expect_true(disk.release_queue_pair(queue_pair).succeeded());
+        return;
     }
     registered_memory_t registered_memory = std::move(*pinned);
 
@@ -578,60 +559,57 @@ std::size_t ring_cuts_a_chain(disk_type_& disk, medium_reference_t medium) {
     chain[2] = read_request(medium, extent_t {block_bytes_k, block_bytes_k},
                             registered_memory.reference(2 * block_bytes_k), queue_pair.token(2));
 
-    failures += expect(disk.submit(queue_pair, std::span<request_t const> {chain}) == std::size_t {3});
+    expect_true(disk.submit(queue_pair, std::span<request_t const> {chain}) == std::size_t {3});
     std::array<completion_t, polling_room_k> completions {};
-    failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
-                                                           3) == std::size_t {3});
-    failures += expect(completions[0].completed_in_full());
-    failures += expect(!completions[1].completed_in_full());
-    failures += expect(completions[2].state == completion_state_t::cancelled_k);
+    expect_true(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions}, 3) ==
+                std::size_t {3});
+    expect_true(completions[0].completed_in_full());
+    expect_true(!completions[1].completed_in_full());
+    expect_true(completions[2].state == completion_state_t::cancelled_k);
 
-    failures += expect(disk.unregister_memory(registered_memory).succeeded());
-    failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-    return failures;
+    expect_true(disk.unregister_memory(registered_memory).succeeded());
+    expect_true(disk.release_queue_pair(queue_pair).succeeded());
 }
 
 /** Durability is written as submit, poll, flush, poll, since the ring orders nothing on its own. */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
-std::size_t ring_flushes_what_it_reaped(disk_type_& disk, medium_reference_t medium) {
-    std::size_t failures = 0;
+void test_ring_flushes_what_it_reaped(disk_type_& disk, medium_reference_t medium) {
     test_buffer_t buffer = make_buffer(block_bytes_k);
-    failures += expect_eq(buffer.size(), std::size_t {block_bytes_k});
-    if (buffer.size() != block_bytes_k) return failures;
+    expect_equal(buffer.size(), std::size_t {block_bytes_k});
+    if (buffer.size() != block_bytes_k) return;
 
     expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(acquired.has_value());
-    if (!acquired) return failures;
+    expect_true(acquired.has_value());
+    if (!acquired) return;
     queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
-    failures += expect(pinned.has_value());
+    expect_true(pinned.has_value());
     if (!pinned) {
-        failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-        return failures;
+        expect_true(disk.release_queue_pair(queue_pair).succeeded());
+        return;
     }
     registered_memory_t registered_memory = std::move(*pinned);
 
     paint(whole(buffer), 42);
     std::array<request_t, 1> writes {
         write_request(medium, extent_t {0, block_bytes_k}, registered_memory.reference(0), queue_pair.token(0))};
-    failures += expect(disk.submit(queue_pair, std::span<request_t const> {writes}) == std::size_t {1});
+    expect_true(disk.submit(queue_pair, std::span<request_t const> {writes}) == std::size_t {1});
     std::array<completion_t, polling_room_k> completions {};
-    failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
-                                                           1) == std::size_t {1});
-    failures += expect(completions[0].completed_in_full());
+    expect_true(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions}, 1) ==
+                std::size_t {1});
+    expect_true(completions[0].completed_in_full());
 
     std::array<request_t, 1> flushes {flush_request(medium, queue_pair.token(1))};
-    failures += expect(disk.submit(queue_pair, std::span<request_t const> {flushes}) == std::size_t {1});
-    failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
-                                                           1) == std::size_t {1});
-    failures += expect(completions[0].completed_in_full());
-    failures += expect_eq(completions[0].token.tag(), std::uint32_t {1});
+    expect_true(disk.submit(queue_pair, std::span<request_t const> {flushes}) == std::size_t {1});
+    expect_true(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions}, 1) ==
+                std::size_t {1});
+    expect_true(completions[0].completed_in_full());
+    expect_equal(completions[0].token.tag(), std::uint32_t {1});
 
-    failures += expect(disk.unregister_memory(registered_memory).succeeded());
-    failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-    return failures;
+    expect_true(disk.unregister_memory(registered_memory).succeeded());
+    expect_true(disk.release_queue_pair(queue_pair).succeeded());
 }
 
 /** A request that misses the disk's alignment fails on its own completion, and not on the submission,
@@ -639,24 +617,23 @@ std::size_t ring_flushes_what_it_reaped(disk_type_& disk, medium_reference_t med
  *  comes back with @c -EINVAL on that one entry, leaving the rest of the batch alone. */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
-std::size_t ring_fails_a_misaligned_request(disk_type_& disk, medium_reference_t medium) {
-    std::size_t failures = 0;
+void test_ring_fails_a_misaligned_request(disk_type_& disk, medium_reference_t medium) {
     ring_capabilities_t const limits = disk.capabilities();
-    failures += expect_eq(limits.offset_alignment, std::uint64_t {portable_alignment_k});
+    expect_equal(limits.offset_alignment, std::uint64_t {portable_alignment_k});
     test_buffer_t buffer = make_buffer(2 * block_bytes_k);
-    failures += expect_eq(buffer.size(), 2 * block_bytes_k);
-    if (buffer.size() != 2 * block_bytes_k) return failures;
+    expect_equal(buffer.size(), 2 * block_bytes_k);
+    if (buffer.size() != 2 * block_bytes_k) return;
 
     expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(acquired.has_value());
-    if (!acquired) return failures;
+    expect_true(acquired.has_value());
+    if (!acquired) return;
     queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
-    failures += expect(pinned.has_value());
+    expect_true(pinned.has_value());
     if (!pinned) {
-        failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-        return failures;
+        expect_true(disk.release_queue_pair(queue_pair).succeeded());
+        return;
     }
     registered_memory_t registered_memory = std::move(*pinned);
 
@@ -665,237 +642,222 @@ std::size_t ring_fails_a_misaligned_request(disk_type_& disk, medium_reference_t
     batch[1] = read_request(medium, extent_t {0, block_bytes_k}, registered_memory.reference(1), queue_pair.token(1));
     batch[2] = read_request(medium, extent_t {0, block_bytes_k}, registered_memory.reference(block_bytes_k),
                             queue_pair.token(2));
-    failures += expect(disk.submit(queue_pair, std::span<request_t const> {batch}) == std::size_t {3});
+    expect_true(disk.submit(queue_pair, std::span<request_t const> {batch}) == std::size_t {3});
 
     std::array<completion_t, polling_room_k> completions {};
-    failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
-                                                           3) == std::size_t {3});
-    failures += expect(completions[0].state == completion_state_t::failed_k);
-    failures += expect_status(completions[0].status, status_code_t::invalid_argument_k);
-    failures += expect(completions[1].state == completion_state_t::failed_k);
-    failures += expect(completions[2].completed_in_full());
+    expect_true(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions}, 3) ==
+                std::size_t {3});
+    expect_true(completions[0].state == completion_state_t::failed_k);
+    expect_status(completions[0].status, status_code_t::invalid_argument_k);
+    expect_true(completions[1].state == completion_state_t::failed_k);
+    expect_true(completions[2].completed_in_full());
 
-    failures += expect(disk.unregister_memory(registered_memory).succeeded());
-    failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-    return failures;
+    expect_true(disk.unregister_memory(registered_memory).succeeded());
+    expect_true(disk.release_queue_pair(queue_pair).succeeded());
 }
 
 /** A queue pair is refused when it asks for no depth, or for more than the mount reserved per queue pair. */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
-std::size_t ring_refuses_an_impossible_queue_pair(disk_type_& disk, [[maybe_unused]] medium_reference_t medium) {
-    std::size_t failures = 0;
+void test_ring_refuses_an_impossible_queue_pair(disk_type_& disk, [[maybe_unused]] medium_reference_t medium) {
 
     expected<queue_pair_t> const none = disk.acquire_queue_pair(0);
-    failures += expect(!none.has_value());
-    failures += expect_status(none, status_code_t::invalid_argument_k);
+    expect_true(!none.has_value());
+    expect_status(none, status_code_t::invalid_argument_k);
 
     expected<queue_pair_t> const beyond = disk.acquire_queue_pair(disk.capabilities().depth_limit + 1);
-    failures += expect(!beyond.has_value());
-    failures += expect_status(beyond, status_code_t::invalid_argument_k);
-    return failures;
+    expect_true(!beyond.has_value());
+    expect_status(beyond, status_code_t::invalid_argument_k);
 }
 
 /** Every queue pair, registered memory and medium slot runs out, and each says so rather than overbooking. */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
-std::size_t ring_exhausts_its_slots(disk_type_& disk, [[maybe_unused]] medium_reference_t medium) {
-    std::size_t failures = 0;
+void test_ring_exhausts_its_slots(disk_type_& disk, [[maybe_unused]] medium_reference_t medium) {
     ring_capabilities_t const limits = disk.capabilities();
 
     st::vector<queue_pair_t> queue_pairs;
     for (std::uint16_t index = 0; index != limits.queue_pairs_limit; ++index) {
         expected<queue_pair_t> acquired = disk.acquire_queue_pair(1);
-        failures += expect(acquired.has_value());
+        expect_true(acquired.has_value());
         if (!acquired) break;
-        failures += expect(queue_pairs.push_back(std::move(*acquired)) == st::status_t::success_k);
+        expect_true(queue_pairs.push_back(std::move(*acquired)) == st::status_t::success_k);
     }
     expected<queue_pair_t> const beyond = disk.acquire_queue_pair(1);
-    failures += expect(!beyond.has_value());
-    failures += expect_status(beyond, status_code_t::capacity_exhausted_k);
+    expect_true(!beyond.has_value());
+    expect_status(beyond, status_code_t::capacity_exhausted_k);
     for (std::size_t index = 0; index != queue_pairs.size(); ++index)
-        failures += expect(disk.release_queue_pair(queue_pairs[index]).succeeded());
+        expect_true(disk.release_queue_pair(queue_pairs[index]).succeeded());
 
     test_buffer_t buffer = make_buffer(block_bytes_k);
-    failures += expect_eq(buffer.size(), std::size_t {block_bytes_k});
-    if (buffer.size() != block_bytes_k) return failures;
+    expect_equal(buffer.size(), std::size_t {block_bytes_k});
+    if (buffer.size() != block_bytes_k) return;
     st::vector<registered_memory_t> ranges;
     bool refused = false;
     for (std::size_t attempt = 0; attempt != registered_memories_probe_k && !refused; ++attempt) {
         expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
         if (!pinned) {
-            failures += expect_status(pinned, status_code_t::capacity_exhausted_k);
+            expect_status(pinned, status_code_t::capacity_exhausted_k);
             refused = true;
             break;
         }
-        failures += expect(ranges.push_back(std::move(*pinned)) == st::status_t::success_k);
+        expect_true(ranges.push_back(std::move(*pinned)) == st::status_t::success_k);
     }
-    failures += expect(refused);
-    failures += expect(!ranges.empty());
+    expect_true(refused);
+    expect_true(!ranges.empty());
     for (std::size_t index = 0; index != ranges.size(); ++index)
-        failures += expect(disk.unregister_memory(ranges[index]).succeeded());
-    return failures;
+        expect_true(disk.unregister_memory(ranges[index]).succeeded());
 }
 
 /** A queue pair with completions nobody completed refuses to go back, since its buffers are still borrowed. */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
-std::size_t ring_refuses_an_undrained_release(disk_type_& disk, medium_reference_t medium) {
-    std::size_t failures = 0;
+void test_ring_refuses_an_undrained_release(disk_type_& disk, medium_reference_t medium) {
     test_buffer_t buffer = make_buffer(block_bytes_k);
-    failures += expect_eq(buffer.size(), std::size_t {block_bytes_k});
-    if (buffer.size() != block_bytes_k) return failures;
+    expect_equal(buffer.size(), std::size_t {block_bytes_k});
+    if (buffer.size() != block_bytes_k) return;
 
     expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(acquired.has_value());
-    if (!acquired) return failures;
+    expect_true(acquired.has_value());
+    if (!acquired) return;
     queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
-    failures += expect(pinned.has_value());
+    expect_true(pinned.has_value());
     if (!pinned) {
-        failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-        return failures;
+        expect_true(disk.release_queue_pair(queue_pair).succeeded());
+        return;
     }
     registered_memory_t registered_memory = std::move(*pinned);
 
     std::array<request_t, 1> batch {
         read_request(medium, extent_t {0, block_bytes_k}, registered_memory.reference(0), queue_pair.token(0))};
-    failures += expect(disk.submit(queue_pair, std::span<request_t const> {batch}) == std::size_t {1});
-    failures += expect(disk.release_queue_pair(queue_pair).failed());
+    expect_true(disk.submit(queue_pair, std::span<request_t const> {batch}) == std::size_t {1});
+    expect_true(disk.release_queue_pair(queue_pair).failed());
 
-    failures += expect(disk.drain(queue_pair).succeeded());
-    failures += expect_eq(disk.outstanding(queue_pair), std::size_t {0});
-    failures += expect(disk.unregister_memory(registered_memory).succeeded());
-    failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-    return failures;
+    expect_true(disk.drain(queue_pair).succeeded());
+    expect_equal(disk.outstanding(queue_pair), std::size_t {0});
+    expect_true(disk.unregister_memory(registered_memory).succeeded());
+    expect_true(disk.release_queue_pair(queue_pair).succeeded());
 }
 
 /** A medium with requests against it refuses to be given back, exactly as a registered range does,
  *  and a reference kept past its release names nothing, even once another medium takes its slot. */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
-std::size_t ring_holds_a_medium_in_flight(disk_type_& disk, medium_options_t const& request) {
-    std::size_t failures = 0;
+void test_ring_holds_a_medium_in_flight(disk_type_& disk, medium_options_t const& request) {
     test_buffer_t buffer = make_buffer(block_bytes_k);
-    failures += expect_eq(buffer.size(), std::size_t {block_bytes_k});
-    if (buffer.size() != block_bytes_k) return failures;
+    expect_equal(buffer.size(), std::size_t {block_bytes_k});
+    if (buffer.size() != block_bytes_k) return;
 
     expected<registered_medium_t> registered = disk.register_medium(request);
-    failures += expect(registered.has_value());
-    if (!registered) return failures;
+    expect_true(registered.has_value());
+    if (!registered) return;
     registered_medium_t registered_medium = std::move(*registered);
 
     expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(acquired.has_value());
+    expect_true(acquired.has_value());
     if (!acquired) {
-        failures += expect(disk.unregister_medium(registered_medium).succeeded());
-        return failures;
+        expect_true(disk.unregister_medium(registered_medium).succeeded());
+        return;
     }
     queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
-    failures += expect(pinned.has_value());
+    expect_true(pinned.has_value());
     if (!pinned) {
-        failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-        failures += expect(disk.unregister_medium(registered_medium).succeeded());
-        return failures;
+        expect_true(disk.release_queue_pair(queue_pair).succeeded());
+        expect_true(disk.unregister_medium(registered_medium).succeeded());
+        return;
     }
     registered_memory_t registered_memory = std::move(*pinned);
 
     std::array<request_t, 1> batch {read_request(registered_medium.reference(), extent_t {0, block_bytes_k},
                                                  registered_memory.reference(0), queue_pair.token(0))};
-    failures += expect(disk.submit(queue_pair, std::span<request_t const> {batch}) == std::size_t {1});
-    failures += expect(disk.unregister_medium(registered_medium).failed());
-    failures += expect(registered_medium.held());
+    expect_true(disk.submit(queue_pair, std::span<request_t const> {batch}) == std::size_t {1});
+    expect_true(disk.unregister_medium(registered_medium).failed());
+    expect_true(registered_medium.held());
 
     std::array<completion_t, polling_room_k> completions {};
-    failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
-                                                           1) == std::size_t {1});
+    expect_true(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions}, 1) ==
+                std::size_t {1});
     medium_reference_t const stale = registered_medium.reference();
-    failures += expect(disk.unregister_medium(registered_medium).succeeded());
+    expect_true(disk.unregister_medium(registered_medium).succeeded());
 
     medium_options_t reopened = request;
     reopened.access = medium_access_t::read_write_k;
     expected<registered_medium_t> successor = disk.register_medium(reopened);
-    failures += expect(successor.has_value());
+    expect_true(successor.has_value());
     if (successor) {
         registered_medium_t successor_medium = std::move(*successor);
         std::array<request_t, 1> stale_batch {
             read_request(stale, extent_t {0, block_bytes_k}, registered_memory.reference(0), queue_pair.token(1))};
-        failures += expect(disk.submit(queue_pair, std::span<request_t const> {stale_batch}) == std::size_t {1});
-        failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
-                                                               1) == std::size_t {1});
-        failures += expect(completions[0].state == completion_state_t::failed_k);
-        failures += expect_status(completions[0].status, status_code_t::invalid_argument_k);
-        failures += expect(disk.unregister_medium(successor_medium).succeeded());
+        expect_true(disk.submit(queue_pair, std::span<request_t const> {stale_batch}) == std::size_t {1});
+        expect_true(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions}, 1) ==
+                    std::size_t {1});
+        expect_true(completions[0].state == completion_state_t::failed_k);
+        expect_status(completions[0].status, status_code_t::invalid_argument_k);
+        expect_true(disk.unregister_medium(successor_medium).succeeded());
     }
-    failures += expect(disk.unregister_memory(registered_memory).succeeded());
-    failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-    return failures;
+    expect_true(disk.unregister_memory(registered_memory).succeeded());
+    expect_true(disk.release_queue_pair(queue_pair).succeeded());
 }
 
 /** A bounded wait that wants more than it has room for is refused rather than truncating silently. */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
-std::size_t ring_refuses_an_oversized_wait(disk_type_& disk, [[maybe_unused]] medium_reference_t medium) {
-    std::size_t failures = 0;
+void test_ring_refuses_an_oversized_wait(disk_type_& disk, [[maybe_unused]] medium_reference_t medium) {
 
     expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(acquired.has_value());
-    if (!acquired) return failures;
+    expect_true(acquired.has_value());
+    if (!acquired) return;
     queue_pair_t queue_pair = std::move(*acquired);
 
     std::array<completion_t, 2> room {};
     expected<std::size_t> const wanted = poll_completions_at_least<waiter_t>(disk, queue_pair,
                                                                              std::span<completion_t> {room}, 3, 1);
-    failures += expect(!wanted.has_value());
-    failures += expect_status(wanted, status_code_t::invalid_argument_k);
+    expect_true(!wanted.has_value());
+    expect_status(wanted, status_code_t::invalid_argument_k);
 
-    failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-    return failures;
+    expect_true(disk.release_queue_pair(queue_pair).succeeded());
 }
 
 /** A queue pair moves to another thread, which submits and polls on it there and hands it back. */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
-std::size_t ring_moves_a_queue_pair_between_threads(disk_type_& disk, medium_reference_t medium) {
-    std::size_t failures = 0;
+void test_ring_moves_a_queue_pair_between_threads(disk_type_& disk, medium_reference_t medium) {
     test_buffer_t buffer = make_buffer(block_bytes_k);
-    failures += expect_eq(buffer.size(), std::size_t {block_bytes_k});
-    if (buffer.size() != block_bytes_k) return failures;
+    expect_equal(buffer.size(), std::size_t {block_bytes_k});
+    if (buffer.size() != block_bytes_k) return;
 
     expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(acquired.has_value());
-    if (!acquired) return failures;
+    expect_true(acquired.has_value());
+    if (!acquired) return;
     queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
-    failures += expect(pinned.has_value());
+    expect_true(pinned.has_value());
     if (!pinned) {
-        failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-        return failures;
+        expect_true(disk.release_queue_pair(queue_pair).succeeded());
+        return;
     }
     registered_memory_t registered_memory = std::move(*pinned);
 
-    std::size_t moved_failures = 0;
     std::thread bound_thread {[&]() noexcept {
-        moved_failures += expect(disk.bind_queue_pair(queue_pair).succeeded());
+        expect_true(disk.bind_queue_pair(queue_pair).succeeded());
         std::array<request_t, 1> batch {
             read_request(medium, extent_t {0, block_bytes_k}, registered_memory.reference(0), queue_pair.token(0))};
-        moved_failures += expect(disk.submit(queue_pair, std::span<request_t const> {batch}) == std::size_t {1});
+        expect_true(disk.submit(queue_pair, std::span<request_t const> {batch}) == std::size_t {1});
         std::array<completion_t, polling_room_k> completions {};
-        moved_failures += expect(poll_completions_at_least<waiter_t>(
-                                     disk, queue_pair, std::span<completion_t> {completions}, 1) == std::size_t {1});
-        moved_failures += expect(completions[0].completed_in_full());
+        expect_true(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions}, 1) ==
+                    std::size_t {1});
+        expect_true(completions[0].completed_in_full());
     }};
     bound_thread.join();
-    failures += moved_failures;
-    failures += expect(disk.bind_queue_pair(queue_pair).succeeded());
+    expect_true(disk.bind_queue_pair(queue_pair).succeeded());
 
-    failures += expect(disk.unregister_memory(registered_memory).succeeded());
-    failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-    return failures;
+    expect_true(disk.unregister_memory(registered_memory).succeeded());
+    expect_true(disk.release_queue_pair(queue_pair).succeeded());
 }
 
 /**
@@ -905,93 +867,90 @@ std::size_t ring_moves_a_queue_pair_between_threads(disk_type_& disk, medium_ref
  */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
-std::size_t ring_keeps_what_it_flushed(disk_type_& disk, medium_options_t const& request) {
-    std::size_t failures = 0;
+void test_ring_keeps_what_it_flushed(disk_type_& disk, medium_options_t const& request) {
     test_buffer_t buffer = make_buffer(2 * block_bytes_k);
-    failures += expect_eq(buffer.size(), 2 * block_bytes_k);
-    if (buffer.size() != 2 * block_bytes_k) return failures;
+    expect_equal(buffer.size(), 2 * block_bytes_k);
+    if (buffer.size() != 2 * block_bytes_k) return;
 
     expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(acquired.has_value());
-    if (!acquired) return failures;
+    expect_true(acquired.has_value());
+    if (!acquired) return;
     queue_pair_t queue_pair = std::move(*acquired);
 
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
-    failures += expect(pinned.has_value());
+    expect_true(pinned.has_value());
     if (!pinned) {
-        failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-        return failures;
+        expect_true(disk.release_queue_pair(queue_pair).succeeded());
+        return;
     }
     registered_memory_t registered_memory = std::move(*pinned);
     std::array<completion_t, polling_room_k> completions {};
 
     expected<registered_medium_t> first = disk.register_medium(request);
-    failures += expect(first.has_value());
+    expect_true(first.has_value());
     if (first) {
         registered_medium_t registered_medium = std::move(*first);
         paint(whole(buffer).first(block_bytes_k), 99);
         std::array<request_t, 1> writes {write_request(registered_medium.reference(), extent_t {0, block_bytes_k},
                                                        registered_memory.reference(0), queue_pair.token(0))};
-        failures += expect(disk.submit(queue_pair, std::span<request_t const> {writes}) == std::size_t {1});
-        failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
-                                                               1) == std::size_t {1});
+        expect_true(disk.submit(queue_pair, std::span<request_t const> {writes}) == std::size_t {1});
+        expect_true(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions}, 1) ==
+                    std::size_t {1});
         std::array<request_t, 1> flushes {flush_request(registered_medium.reference(), queue_pair.token(1))};
-        failures += expect(disk.submit(queue_pair, std::span<request_t const> {flushes}) == std::size_t {1});
-        failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
-                                                               1) == std::size_t {1});
-        failures += expect(disk.unregister_medium(registered_medium).succeeded());
+        expect_true(disk.submit(queue_pair, std::span<request_t const> {flushes}) == std::size_t {1});
+        expect_true(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions}, 1) ==
+                    std::size_t {1});
+        expect_true(disk.unregister_medium(registered_medium).succeeded());
     }
 
     medium_options_t reopened = request;
     reopened.access = medium_access_t::read_write_k;
     expected<registered_medium_t> second = disk.register_medium(reopened);
-    failures += expect(second.has_value());
+    expect_true(second.has_value());
     if (second) {
         registered_medium_t registered_medium = std::move(*second);
         std::array<request_t, 1> reads {read_request(registered_medium.reference(), extent_t {0, block_bytes_k},
                                                      registered_memory.reference(block_bytes_k), queue_pair.token(2))};
-        failures += expect(disk.submit(queue_pair, std::span<request_t const> {reads}) == std::size_t {1});
-        failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
-                                                               1) == std::size_t {1});
-        failures += expect(completions[0].completed_in_full());
-        failures += expect(
+        expect_true(disk.submit(queue_pair, std::span<request_t const> {reads}) == std::size_t {1});
+        expect_true(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions}, 1) ==
+                    std::size_t {1});
+        expect_true(completions[0].completed_in_full());
+        expect_true(
             same_bytes(whole(buffer).first(block_bytes_k), whole(buffer).subspan(block_bytes_k, block_bytes_k)));
-        failures += expect(disk.unregister_medium(registered_medium).succeeded());
+        expect_true(disk.unregister_medium(registered_medium).succeeded());
     }
 
-    failures += expect(disk.unregister_memory(registered_memory).succeeded());
-    failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-    return failures;
+    expect_true(disk.unregister_memory(registered_memory).succeeded());
+    expect_true(disk.release_queue_pair(queue_pair).succeeded());
 }
 
 /** Deallocating a written extent of a file gives its blocks back to the filesystem, and it
  *  reads as zeros. */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
-std::size_t ring_deallocates_a_file_extent(disk_type_& disk, medium_options_t const& request) {
-    std::size_t failures = 0;
+void test_ring_deallocates_a_file_extent(disk_type_& disk, medium_options_t const& request) {
     constexpr std::size_t blocks_k = 16;
     test_buffer_t buffer = make_buffer(blocks_k * block_bytes_k);
-    failures += expect_eq(buffer.size(), blocks_k * block_bytes_k);
-    if (buffer.size() != blocks_k * block_bytes_k) return failures;
+    expect_equal(buffer.size(), blocks_k * block_bytes_k);
+    if (buffer.size() != blocks_k * block_bytes_k) return;
 
     expected<registered_medium_t> registered = disk.register_medium(request);
-    failures += expect(registered.has_value());
-    if (!registered) return failures;
+    expect_true(registered.has_value());
+    if (!registered) return;
     registered_medium_t registered_medium = std::move(*registered);
     expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
-    failures += expect(acquired.has_value());
+    expect_true(acquired.has_value());
     if (!acquired) {
-        failures += expect(disk.unregister_medium(registered_medium).succeeded());
-        return failures;
+        expect_true(disk.unregister_medium(registered_medium).succeeded());
+        return;
     }
     queue_pair_t queue_pair = std::move(*acquired);
     expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
-    failures += expect(pinned.has_value());
+    expect_true(pinned.has_value());
     if (!pinned) {
-        failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-        failures += expect(disk.unregister_medium(registered_medium).succeeded());
-        return failures;
+        expect_true(disk.release_queue_pair(queue_pair).succeeded());
+        expect_true(disk.unregister_medium(registered_medium).succeeded());
+        return;
     }
     registered_memory_t registered_memory = std::move(*pinned);
     extent_t const extent {0, blocks_k * block_bytes_k};
@@ -1002,109 +961,112 @@ std::size_t ring_deallocates_a_file_extent(disk_type_& disk, medium_options_t co
         write_request(registered_medium.reference(), extent, registered_memory.reference(0), queue_pair.token(0)),
         flush_request(registered_medium.reference(), queue_pair.token(1))};
     writes[0].chaining = request_chaining_t::chained_k;
-    failures += expect(disk.submit(queue_pair, std::span<request_t const> {writes}) == std::size_t {2});
-    failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
-                                                           2) == std::size_t {2});
+    expect_true(disk.submit(queue_pair, std::span<request_t const> {writes}) == std::size_t {2});
+    expect_true(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions}, 2) ==
+                std::size_t {2});
     struct stat written {};
-    failures += expect(::stat(request.name, &written) == 0);
+    expect_true(::stat(request.name, &written) == 0);
 
     std::array<request_t, 1> deallocations {
         deallocate_request(registered_medium.reference(), extent, queue_pair.token(2))};
-    failures += expect(disk.submit(queue_pair, std::span<request_t const> {deallocations}) == std::size_t {1});
-    failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
-                                                           1) == std::size_t {1});
-    failures += expect(completions[0].completed_in_full());
+    expect_true(disk.submit(queue_pair, std::span<request_t const> {deallocations}) == std::size_t {1});
+    expect_true(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions}, 1) ==
+                std::size_t {1});
+    expect_true(completions[0].completed_in_full());
     struct stat punched {};
-    failures += expect(::stat(request.name, &punched) == 0);
-    failures += expect(punched.st_blocks < written.st_blocks);
-    failures += expect_eq(static_cast<std::uint64_t>(punched.st_size), static_cast<std::uint64_t>(written.st_size));
+    expect_true(::stat(request.name, &punched) == 0);
+    expect_true(punched.st_blocks < written.st_blocks);
+    expect_equal(static_cast<std::uint64_t>(punched.st_size), static_cast<std::uint64_t>(written.st_size));
 
     std::array<request_t, 1> reads {
         read_request(registered_medium.reference(), extent, registered_memory.reference(0), queue_pair.token(3))};
-    failures += expect(disk.submit(queue_pair, std::span<request_t const> {reads}) == std::size_t {1});
-    failures += expect(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
-                                                           1) == std::size_t {1});
-    failures += expect(completions[0].completed_in_full());
+    expect_true(disk.submit(queue_pair, std::span<request_t const> {reads}) == std::size_t {1});
+    expect_true(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions}, 1) ==
+                std::size_t {1});
+    expect_true(completions[0].completed_in_full());
     test_buffer_t zeros = make_buffer(blocks_k * block_bytes_k);
     std::memset(zeros.data(), 0, zeros.size());
-    failures += expect(same_bytes(whole(buffer), whole(zeros)));
+    expect_true(same_bytes(whole(buffer), whole(zeros)));
 
-    failures += expect(disk.unregister_memory(registered_memory).succeeded());
-    failures += expect(disk.release_queue_pair(queue_pair).succeeded());
-    failures += expect(disk.unregister_medium(registered_medium).succeeded());
-    return failures;
+    expect_true(disk.unregister_memory(registered_memory).succeeded());
+    expect_true(disk.release_queue_pair(queue_pair).succeeded());
+    expect_true(disk.unregister_medium(registered_medium).succeeded());
 }
 
 /** A file reports a power-of-two logical block, and an unbuffered disk aligns every request to
  *  whole ones of it. */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
-std::size_t ring_reports_a_logical_block(disk_type_& disk, medium_options_t const& request) {
-    std::size_t failures = 0;
+void test_ring_reports_a_logical_block(disk_type_& disk, medium_options_t const& request) {
     expected<registered_medium_t> registered = disk.register_medium(request);
-    failures += expect(registered.has_value());
-    if (!registered) return failures;
+    expect_true(registered.has_value());
+    if (!registered) return;
     registered_medium_t registered_medium = std::move(*registered);
     std::uint64_t const logical_block_bytes = registered_medium.logical_block_bytes();
-    failures += expect(std::has_single_bit(logical_block_bytes));
+    expect_true(std::has_single_bit(logical_block_bytes));
     if (std::has_single_bit(logical_block_bytes))
-        failures += expect_eq(disk.capabilities().offset_alignment % logical_block_bytes, std::uint64_t {0});
-    failures += expect(disk.unregister_medium(registered_medium).succeeded());
-    return failures;
+        expect_equal(disk.capabilities().offset_alignment % logical_block_bytes, std::uint64_t {0});
+    expect_true(disk.unregister_medium(registered_medium).succeeded());
 }
 
 #pragma endregion Cases
 #pragma region Drivers
 
-/** Runs every transport-independent case against one mounted disk, reporting each under @c ring.<transport>. */
+/** Runs every transport-independent case against one mounted disk, labelling each as its function
+ *  instantiated for @p disk_type , the disk's type as the caller spells it, like
+ *  <tt>test_ring_cuts_a_chain<memory_disk_t></tt>. */
 template <typename disk_type_>
     requires ring_concept<disk_type_>
-void ring_cases(suite_totals_t& totals, char const* transport, disk_type_& disk, medium_reference_t medium,
+void ring_cases(char const* disk_type, disk_type_& disk, medium_reference_t medium,
                 ring_edge_t edge = ring_edge_t::clipped_k) {
-    auto const label = [&](char const* name) noexcept { return case_label_t {"ring", transport, name}; };
-    report(totals, label("reads_back").c_str(), ring_reads_back_what_it_wrote<disk_type_>, disk, medium);
-    report(totals, label("depth_beyond_credit").c_str(), ring_reaches_depth_beyond_its_credit<disk_type_>, disk,
-           medium);
-    report(totals, label("refuses_when_full").c_str(), ring_refuses_when_full<disk_type_>, disk, medium);
-    report(totals, label("partial_transfer").c_str(), ring_reports_a_partial_transfer<disk_type_>, disk, medium, edge);
-    report(totals, label("refuses_torn_read").c_str(), ring_refuses_a_torn_read<disk_type_>, disk, medium);
-    report(totals, label("cancelled_queue_pair").c_str(), ring_drains_a_cancelled_queue_pair<disk_type_>, disk, medium);
-    report(totals, label("separates_queue_pairs").c_str(), ring_separates_two_queue_pairs<disk_type_>, disk, medium);
-    report(totals, label("foreign_token").c_str(), ring_refuses_a_foreign_token<disk_type_>, disk, medium);
-    report(totals, label("registered_memory_in_flight").c_str(), ring_holds_a_registered_memory_in_flight<disk_type_>,
-           disk, medium);
-    report(totals, label("cuts_a_chain").c_str(), ring_cuts_a_chain<disk_type_>, disk, medium);
-    report(totals, label("flushes_what_it_reaped").c_str(), ring_flushes_what_it_reaped<disk_type_>, disk, medium);
-    report(totals, label("impossible_queue pair").c_str(), ring_refuses_an_impossible_queue_pair<disk_type_>, disk,
-           medium);
-    report(totals, label("exhausts_its_slots").c_str(), ring_exhausts_its_slots<disk_type_>, disk, medium);
-    report(totals, label("undrained_release").c_str(), ring_refuses_an_undrained_release<disk_type_>, disk, medium);
-    report(totals, label("oversized_wait").c_str(), ring_refuses_an_oversized_wait<disk_type_>, disk, medium);
-    report(totals, label("moves_a_queue pair").c_str(), ring_moves_a_queue_pair_between_threads<disk_type_>, disk,
-           medium);
+    auto const label = [disk_type](char const* function) { return fmt::format("{}<{}>", function, disk_type); };
+    run_test_case(label("test_ring_reads_back_what_it_wrote").c_str(), test_ring_reads_back_what_it_wrote<disk_type_>,
+                  disk, medium);
+    run_test_case(label("test_ring_reaches_depth_beyond_its_credit").c_str(),
+                  test_ring_reaches_depth_beyond_its_credit<disk_type_>, disk, medium);
+    run_test_case(label("test_ring_refuses_when_full").c_str(), test_ring_refuses_when_full<disk_type_>, disk, medium);
+    run_test_case(label("test_ring_reports_a_partial_transfer").c_str(),
+                  test_ring_reports_a_partial_transfer<disk_type_>, disk, medium, edge);
+    run_test_case(label("test_ring_refuses_a_torn_read").c_str(), test_ring_refuses_a_torn_read<disk_type_>, disk,
+                  medium);
+    run_test_case(label("test_ring_drains_a_cancelled_queue_pair").c_str(),
+                  test_ring_drains_a_cancelled_queue_pair<disk_type_>, disk, medium);
+    run_test_case(label("test_ring_separates_two_queue_pairs").c_str(), test_ring_separates_two_queue_pairs<disk_type_>,
+                  disk, medium);
+    run_test_case(label("test_ring_refuses_a_foreign_token").c_str(), test_ring_refuses_a_foreign_token<disk_type_>,
+                  disk, medium);
+    run_test_case(label("test_ring_holds_a_registered_memory_in_flight").c_str(),
+                  test_ring_holds_a_registered_memory_in_flight<disk_type_>, disk, medium);
+    run_test_case(label("test_ring_cuts_a_chain").c_str(), test_ring_cuts_a_chain<disk_type_>, disk, medium);
+    run_test_case(label("test_ring_flushes_what_it_reaped").c_str(), test_ring_flushes_what_it_reaped<disk_type_>, disk,
+                  medium);
+    run_test_case(label("test_ring_refuses_an_impossible_queue_pair").c_str(),
+                  test_ring_refuses_an_impossible_queue_pair<disk_type_>, disk, medium);
+    run_test_case(label("test_ring_exhausts_its_slots").c_str(), test_ring_exhausts_its_slots<disk_type_>, disk,
+                  medium);
+    run_test_case(label("test_ring_refuses_an_undrained_release").c_str(),
+                  test_ring_refuses_an_undrained_release<disk_type_>, disk, medium);
+    run_test_case(label("test_ring_refuses_an_oversized_wait").c_str(), test_ring_refuses_an_oversized_wait<disk_type_>,
+                  disk, medium);
+    run_test_case(label("test_ring_moves_a_queue_pair_between_threads").c_str(),
+                  test_ring_moves_a_queue_pair_between_threads<disk_type_>, disk, medium);
 }
 
 /**
- *  @brief Registers one volume on @p disk, runs @p body against it, and gives the medium back.
- *  @param[in,out] totals Where the registered memory and its release report under @p name.
- *  @param[in] name The case label of the registered memory itself.
+ *  @brief Registers one volume on @p disk as the case @p label, runs @p body against it, and gives
+ *      the medium back.
+ *  @param[in] label The case label of the registered medium itself.
  *  @param[in,out] disk The mounted ring the volume is registered on.
  *  @param[in] request The volume to register, which a RAM device allocates and a file device opens.
- *  @param[in] body What to run against the registered medium, reporting its own cases.
+ *  @param[in] body What to run against the registered medium, running its own cases.
  */
 template <typename disk_type_, typename body_type_>
     requires ring_concept<disk_type_>
-void on_medium(suite_totals_t& totals, char const* name, disk_type_& disk, medium_options_t const& request,
-               body_type_&& body) {
-    std::size_t failures = 0;
+void on_medium(char const* label, disk_type_& disk, medium_options_t const& request, body_type_&& body) {
     expected<registered_medium_t> registered = disk.register_medium(request);
-    failures += expect(registered.has_value());
-    if (registered) {
-        registered_medium_t registered_medium = std::move(*registered);
-        body(registered_medium.reference());
-        failures += expect(disk.unregister_medium(registered_medium).succeeded());
-    }
-    report(totals, name, failures);
+    if (registered) body(registered->reference());
+    status_t const released = registered ? disk.unregister_medium(*registered) : registered.status();
+    run_test_case(label, [&] { expect_status(released, status_code_t::success_k); });
 }
 
 /** The volume every case reads and writes, sized so a request can run past its end. */

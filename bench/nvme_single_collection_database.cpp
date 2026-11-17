@@ -75,7 +75,7 @@ constexpr std::array<std::string_view, 6> storage_transport_names_k {"automatic"
                                                                      "linux-aio", "linux-spdk", "memory"};
 
 /** Command-line options of the benchmark, each field set by the flag of the same name. */
-struct settings_t : shared_settings_t {
+struct nvme_single_collection_database_settings_t : bench_settings_t {
 
     /** Directory every workload's volume is created in. */
     std::string_view directory;
@@ -182,8 +182,8 @@ status_t settle(database_type_& database) noexcept {
 /** Runs every row of @p workload over the volume and the channels of @p mount, with the database
  *  of @p layout_. */
 template <value_layout_t layout_, typename mount_type_>
-status_t run_rows(mount_type_& mount, resources_ptr_t const& resources, settings_t const& settings,
-                  workload_t const& workload) noexcept {
+status_t run_rows(mount_type_& mount, resources_ptr_t const& resources,
+                  nvme_single_collection_database_settings_t const& settings, workload_t const& workload) noexcept {
     using volume_t = typename mount_type_::volume_t;
     using slot_t = key_slot<stored_key_t, layout_>;
     using store_t = nvme_store<slot_t, volume_t, atomic_reference, waiter_t, last_write_fold_t, no_device_fold_t>;
@@ -217,7 +217,7 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources, settings
     // its line out
     std::string const insert_name = name_of("insert");
     row_t const inserted = run_pass(executor, insert_name, population, [&](loop_t& loop, std::size_t thread) noexcept {
-        splitmix64_t random {stream_key(settings.seed, insert_name, thread)};
+        split_mix_generator_t random {stream_key(settings.seed, insert_name, thread)};
         for (std::size_t call : loop) {
             std::size_t const width = layout_ == value_layout_t::variable_width_k
                                           ? 1 + static_cast<std::size_t>(random.below(value_max_size))
@@ -226,13 +226,13 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources, settings
             else loop.count(1, width);
         }
     });
-    if (settings.selects(insert_name)) print(inserted);
+    if (settings.filter.selects(insert_name)) print(inserted);
     if (status_t const settled = settle(*database); settled.failed()) return settled;
 
     std::string const find_name = name_of("find");
-    if (settings.selects(find_name))
+    if (settings.filter.selects(find_name))
         print(run_threads(executor, settings, find_name, [&](loop_t& loop, std::size_t thread) noexcept {
-            splitmix64_t random {stream_key(settings.seed, find_name, thread)};
+            split_mix_generator_t random {stream_key(settings.seed, find_name, thread)};
             for ([[maybe_unused]] std::size_t call : loop) {
                 stored_value_size_t size = 0;
                 lookup_result_t const found = database->find(random.below(population), size);
@@ -242,13 +242,13 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources, settings
         }));
 
     std::string const select_name = name_of("select");
-    if (settings.selects(select_name))
+    if (settings.filter.selects(select_name))
         print(run_threads(executor, settings, select_name, [&](loop_t& loop, std::size_t thread) noexcept {
             auto [reading, reading_status] = mount.channels().acquire(thread);
             st::vector<byte_t> value;
             if (reading_status.failed() || st::failed(value.resize(value_max_size)))
                 return loop.skip("no channel or no memory for a value");
-            splitmix64_t random {stream_key(settings.seed, select_name, thread)};
+            split_mix_generator_t random {stream_key(settings.seed, select_name, thread)};
             for ([[maybe_unused]] std::size_t call : loop) {
                 stored_value_size_t size = 0;
                 status_t const completed = database->select(reading.channel(), random.below(population),
@@ -259,13 +259,13 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources, settings
         }));
 
     std::string const batch_name = name_of(fmt::format("select_batch/{}", batch_keys_k));
-    if (settings.selects(batch_name))
+    if (settings.filter.selects(batch_name))
         print(run_threads(executor, settings, batch_name, [&](loop_t& loop, std::size_t thread) noexcept {
             auto [reading, reading_status] = mount.channels().acquire(thread);
             std::array<stored_key_t, batch_keys_k> keys {};
             std::array<lookup_result_t, batch_keys_k> results {};
             if (reading_status.failed()) return loop.skip("no channel");
-            splitmix64_t random {stream_key(settings.seed, batch_name, thread)};
+            split_mix_generator_t random {stream_key(settings.seed, batch_name, thread)};
             for ([[maybe_unused]] std::size_t call : loop) {
                 for (stored_key_t& key : keys) key = random.below(population);
                 std::size_t bytes = 0;
@@ -280,7 +280,7 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources, settings
     // Each call reads the value under the cursor and steps past it, starting over once
     // the walk ends
     std::string const scan_name = name_of("scan");
-    if (settings.selects(scan_name))
+    if (settings.filter.selects(scan_name))
         print(run_threads(executor, settings, scan_name, [&](loop_t& loop, std::size_t thread) noexcept {
             auto [reading, reading_status] = mount.channels().acquire(thread);
             st::vector<byte_t> value;
@@ -301,7 +301,7 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources, settings
         }));
 
     std::string const remove_name = name_of("remove");
-    if (settings.selects(remove_name)) {
+    if (settings.filter.selects(remove_name)) {
         print(run_pass(executor, remove_name, population, [&](loop_t& loop, std::size_t) noexcept {
             for (std::size_t call : loop)
                 if (database->remove(call).failed()) loop.fail();
@@ -315,7 +315,7 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources, settings
 /** Opens a fresh volume for @p workload under @c --directory and runs its rows, removing
  *  the volume afterwards. */
 template <value_layout_t layout_>
-status_t run_workload(settings_t const& settings, workload_t const& workload) noexcept {
+status_t run_workload(nvme_single_collection_database_settings_t const& settings, workload_t const& workload) noexcept {
     std::string const directory = fmt::format("{}/{}", settings.directory, workload.name);
     std::error_code error;
     std::filesystem::remove_all(directory, error);
@@ -358,14 +358,16 @@ int main(int argc, char** argv) {
     using namespace unum::ustore;
     using namespace unum::ustore::bench;
 
-    settings_t settings;
+    nvme_single_collection_database_settings_t settings;
     std::array<flag_t, 4> const flags {{
         {"--directory", "path", "directory every workload's volume is created in", &settings.directory},
         {"--workloads", "path", "JSON manifest of the workloads", &settings.workloads},
         {"--transport", "name", "how the volumes are reached, or memory to skip the drives", &settings.transport},
         {"--volume-size", "bytes", "bytes every workload's volume spans, like 4GB", &settings.volume_size},
     }};
-    read_settings(argc, argv, settings, flags);
+    std::array<char const*, 4> const variables {"USTORE_DIRECTORY", "USTORE_WORKLOADS", "USTORE_TRANSPORT",
+                                                "USTORE_VOLUME_SIZE"};
+    read_bench_settings(argc, argv, settings, flags, variables);
     if (settings.directory.empty() || settings.workloads.empty()) {
         fmt::println(stderr, "--directory and --workloads are required");
         return 1;

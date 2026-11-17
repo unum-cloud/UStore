@@ -16,4 +16,4 @@ asm(".section .rodata\n"                                                 //
     ".ascii \"__CLANG_OFFLOAD_BUNDLE__\"\n"                              //
     ".globl vram_amd_cdna3_bundle_end\nvram_amd_cdna3_bundle_end:\n.previous\n");
 #endif
-#include "../../src/vram/bundles.cpp"
+#include "vram/bundles.cpp"

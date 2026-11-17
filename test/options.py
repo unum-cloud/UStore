@@ -7,11 +7,15 @@ Date: September 18, 2026
 """
 
 import pytest
-from capabilities import NEEDS_TRANSACTIONS
+from base import NEEDS_TRANSACTIONS
 
 import ustore
 
 pytestmark = NEEDS_TRANSACTIONS
+
+with ustore.Database.open_ram() as _probed:
+    MACHINE_CPU_CLASS = _probed.describe().cpu_class
+"""The class an open with no ceiling picks on this machine."""
 
 
 @pytest.fixture
@@ -166,19 +170,17 @@ def test_modes_accept_plain_integers(database, blobs):
 # region CPU Class Ceiling
 
 
+@pytest.mark.skipif(MACHINE_CPU_CLASS is ustore.CPUClass.MONOVERSIONED, reason="built without USTORE_MULTIVERSIONED")
 def test_a_cpu_class_ceiling_the_machine_lacks_narrows_the_pick():
     """A ceiling caps the class the database runs as: one the CPU lacks narrows the pick rather than refusing it."""
-    with ustore.Database.open_ram() as unbounded:
-        machine = unbounded.describe().cpu_class
-    if machine is ustore.CPUClass.MONOVERSIONED:
-        pytest.skip("a monoversioned build compiles no class under a foreign ceiling")
+    machine = MACHINE_CPU_CLASS
     with ustore.Database.open_ram(cpu_class_ceiling=machine) as capped:
         assert capped.describe().cpu_class is machine
     # Power10 and AWS G5 share no architecture, so one of them is foreign to every machine
     foreign = ustore.CPUClass.AWS_G5 if machine is ustore.CPUClass.IBM_POWER10 else ustore.CPUClass.IBM_POWER10
     with ustore.Database.open_ram(cpu_class_ceiling=foreign) as narrowed:
         assert narrowed.describe().cpu_class not in (foreign, ustore.CPUClass.UNKNOWN)
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match="CPUClass, and 7 is none"):
         ustore.Database.open_ram(cpu_class_ceiling=7)
 
 

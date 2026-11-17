@@ -1782,7 +1782,8 @@ status_t database_describe(ustore_database_describe_t const& arguments, view_t c
     return assign_describe(
         arguments,
         {
-            .capabilities = ustore_capabilities_t(ustore_capabilities_transactions_k | ustore_capabilities_snapshots_k),
+            .capabilities = ustore_capabilities_t(ustore_capabilities_transactions_k | ustore_capabilities_snapshots_k |
+                                                  ustore_capabilities_saves_snapshots_k),
             .engine = ustore_engine_nvme_k,
             .isolation = ustore_isolation_snapshot_k,
             .cpu_class = static_cast<ustore_cpu_class_t>(cpu_class_),

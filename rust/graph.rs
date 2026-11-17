@@ -1233,20 +1233,20 @@ mod tests {
     use crate::db::{
         Admission, CollectionID, Collections, Database, Executor, Modality, RAMOptions, ScanDirection, Watch,
     };
-    use crate::testing::{key, keys};
+    use crate::testing::{created, key, keys};
 
     /// A directed graph of one to two, one to three and two to three, in a collection of its own.
-    fn populated() -> (Database, Arena, CollectionID) {
+    fn populated() -> (Database, CollectionID, Arena) {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
-        let graph = database.collection_create("graph", Modality::Graph).unwrap();
+        let graph = created(&database, Modality::Graph);
         let edges = [Edge::new(key(1), key(2)), Edge::new(key(1), key(3)), Edge::new(key(2), key(3))];
         database.head().graph_write_edges(graph, &edges, Durability::Buffered).unwrap();
-        (database, Arena::new().unwrap(), graph)
+        (database, graph, Arena::new().unwrap())
     }
 
     #[test]
     fn lookups_find_the_edges_of_every_role() {
-        let (database, mut arena, graph) = populated();
+        let (database, graph, mut arena) = populated();
         let outgoing =
             database.head().graph_read_edges(graph, &keys([1]), Roles::Every(Role::Source), &mut arena).unwrap();
         assert_eq!(outgoing.degrees(), &[2]);
@@ -1263,7 +1263,7 @@ mod tests {
 
     #[test]
     fn vertex_ranges_walk_down_sample_measure_and_remove() {
-        let (database, mut arena, graph) = populated();
+        let (database, graph, mut arena) = populated();
         let head = database.head();
         let descending = KeyRange { direction: ScanDirection::Descending, ..KeyRange::default() };
         let mut cursor = head.graph_vertices_cursor(graph, descending, Matching::default()).unwrap();
@@ -1278,7 +1278,7 @@ mod tests {
 
     #[test]
     fn vertex_scans_list_bare_vertices_and_ask_the_predicate() {
-        let (database, mut arena, graph) = populated();
+        let (database, graph, mut arena) = populated();
         let head = database.head();
         head.graph_write_vertices(graph, keys([4]), Durability::Buffered).unwrap();
         assert_eq!(head.graph_scan_vertices(graph, key(2), 8, &mut arena).unwrap(), &keys([2, 3, 4]));
@@ -1300,7 +1300,7 @@ mod tests {
 
     #[test]
     fn neighborhoods_split_the_tape_by_vertex() {
-        let (database, mut arena, graph) = populated();
+        let (database, graph, mut arena) = populated();
         let found =
             database.head().graph_read_edges(graph, &keys([3, 42, 1]), Roles::Every(Role::Any), &mut arena).unwrap();
         assert_eq!(found.degrees(), &[2, degree_missing(), 2]);
@@ -1317,7 +1317,7 @@ mod tests {
 
     #[test]
     fn degrees_come_without_edges() {
-        let (database, mut arena, graph) = populated();
+        let (database, graph, mut arena) = populated();
         let degrees =
             database.head().graph_degrees(graph, &keys([1, 2, 3, 4]), Roles::Every(Role::Source), &mut arena).unwrap();
         assert_eq!(degrees, &[2, 1, 0, degree_missing()]);
@@ -1325,7 +1325,7 @@ mod tests {
 
     #[test]
     fn roles_differ_per_vertex_and_match_the_batch() {
-        let (database, mut arena, graph) = populated();
+        let (database, graph, mut arena) = populated();
         let roles = [Role::Source, Role::Target];
         let degrees = database.head().graph_degrees(graph, &keys([1, 1]), Roles::Each(&roles), &mut arena).unwrap();
         assert_eq!(degrees, &[2, 0]);
@@ -1368,7 +1368,7 @@ mod tests {
 
     #[test]
     fn vertices_are_upserted_bare_and_removed_with_their_edges() {
-        let (database, mut arena, graph) = populated();
+        let (database, graph, mut arena) = populated();
         database.head().graph_write_vertices(graph, &keys([1, 7]), Durability::Buffered).unwrap();
         let degrees = database.head().graph_degrees(graph, &keys([1, 7]), Roles::Every(Role::Any), &mut arena).unwrap();
         assert_eq!(degrees, &[2, 0], "an upsert keeps the edges a vertex already has");
@@ -1384,7 +1384,7 @@ mod tests {
 
     #[test]
     fn a_vertex_removed_as_a_source_leaves_its_targets_consistent() {
-        let (database, mut arena, graph) = populated();
+        let (database, graph, mut arena) = populated();
         database
             .head()
             .graph_remove_vertices(graph, &keys([1]), Roles::Every(Role::Source), Durability::Buffered)
@@ -1396,7 +1396,7 @@ mod tests {
 
     #[test]
     fn transactions_hold_their_edges_until_commit() {
-        let (database, mut arena, graph) = populated();
+        let (database, graph, mut arena) = populated();
         let mut transaction = database.transaction().unwrap();
         let edges = [Edge::new(key(3), key(1))];
         transaction.view(Watch::Keys).graph_write_edges(graph, &edges, Durability::Buffered).unwrap();
@@ -1419,7 +1419,7 @@ mod tests {
 
     #[test]
     fn snapshots_keep_the_graph_they_were_taken_at() {
-        let (database, mut arena, graph) = populated();
+        let (database, graph, mut arena) = populated();
         let snapshot = database.snapshot().unwrap();
         database.head().graph_remove_edges(graph, &[Edge::new(key(1), key(2))], Durability::Buffered).unwrap();
         let pinned = snapshot.view().graph_degrees(graph, &keys([1]), Roles::Every(Role::Source), &mut arena).unwrap();
@@ -1474,7 +1474,7 @@ mod tests {
 
     #[test]
     fn empty_batches_reach_no_engine() {
-        let (database, mut arena, graph) = populated();
+        let (database, graph, mut arena) = populated();
         let head = database.head();
         head.graph_write_edges(graph, [], Durability::Buffered).unwrap();
         head.graph_remove_edges(graph, [], Durability::Buffered).unwrap();
@@ -1488,7 +1488,7 @@ mod tests {
 
     #[test]
     fn graph_verbs_block_or_defer_on_an_executor() {
-        let (database, _, graph) = populated();
+        let (database, graph, _) = populated();
         let executor = Executor::for_ram(&[], 2).unwrap();
         let mut arena = Arena::new_in(&executor).unwrap();
         let blocking = database.head().on(&executor);

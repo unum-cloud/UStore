@@ -49,12 +49,18 @@
 
 #include "arrow_ipc.hpp" // `ipc_read_prefix`, `ipc_write_batch`, `ipc_read_footer`
 #include "dataset.h"
-#include "harness.hpp" // `suite_exit_code`, `create_directories`, `expect`
+#include "harness.hpp" // `run_test_case`, `setting_text`, `create_directories`, `expect_true`
 
 namespace unum::ustore::test {
 
 using namespace unum::ustore::tools;
 using namespace unum::ustore::utilities;
+
+/** The reason every case driving the CLI reports when the suite ran without the @c CLI setting. */
+constexpr char const* needs_cli_k = "needs USTORE_CLI";
+
+/** The reason the manifest cases report on a build whose CLI opens no NVMe engine. */
+constexpr char const* needs_nvme_engine_k = "needs ustore_engine_nvme_k";
 
 constexpr std::int64_t rows_count_k = 1000;
 constexpr ustore_size_t max_batch_size_k = 64 * 1024;
@@ -99,32 +105,35 @@ struct fixture_paths_t {
     char const* directory;
 
     /** Subdirectory holding the fixtures and the exports. */
-    path_t files;
+    std::string files;
 
     /** Documents as NDJSON. */
-    path_t documents_ndjson;
+    std::string documents_ndjson;
 
     /** Documents as CSV. */
-    path_t documents_csv;
+    std::string documents_csv;
 
     /** Edges as NDJSON. */
-    path_t edges_ndjson;
+    std::string edges_ndjson;
 
     /** Edges as CSV. */
-    path_t edges_csv;
+    std::string edges_csv;
 
     /** Export target in NDJSON. */
-    path_t exported_ndjson;
+    std::string exported_ndjson;
 
     /** Export target in CSV. */
-    path_t exported_csv;
+    std::string exported_csv;
 
     /** Names every path under @p test_directory. */
     explicit fixture_paths_t(char const* test_directory) noexcept
-        : directory(test_directory), files(test_directory, "files"),
-          documents_ndjson(files.c_str(), documents_ndjson_k), documents_csv(files.c_str(), documents_csv_k),
-          edges_ndjson(files.c_str(), edges_ndjson_k), edges_csv(files.c_str(), edges_csv_k),
-          exported_ndjson(files.c_str(), exported_ndjson_k), exported_csv(files.c_str(), exported_csv_k) {}
+        : directory(test_directory), files(fmt::format("{}/files", test_directory)),
+          documents_ndjson(fmt::format("{}/{}", files, documents_ndjson_k)),
+          documents_csv(fmt::format("{}/{}", files, documents_csv_k)),
+          edges_ndjson(fmt::format("{}/{}", files, edges_ndjson_k)),
+          edges_csv(fmt::format("{}/{}", files, edges_csv_k)),
+          exported_ndjson(fmt::format("{}/{}", files, exported_ndjson_k)),
+          exported_csv(fmt::format("{}/{}", files, exported_csv_k)) {}
 };
 
 /** Appends @p piece to @p text, answering whether it fit. */
@@ -236,10 +245,7 @@ class test_database_t {
     /** Opens the database @p config describes and answers whether it opened. */
     [[nodiscard]] bool open(config_t const& config) noexcept {
         auto [opened, open_status] = open_raw(config);
-        if (open_status.failed()) {
-            fmt::println(stderr, "  failed to open the database: {}", open_status.message);
-            return false;
-        }
+        if (!expect_status(open_status, status_code_t::success_k)) return false;
         database_ = opened;
         return true;
     }
@@ -366,11 +372,10 @@ struct edge_row_t {
 };
 
 /** Checks that the edges exported to @p path are exactly the fixture edges. */
-[[nodiscard]] std::size_t check_edges(char const* path) noexcept {
-    std::size_t failures = 0;
+void check_edges(char const* path) noexcept {
     sz::string_t content;
     st::vector<edge_row_t> edges;
-    if (!read_file(path, content)) return expect(!"the exported edges are readable");
+    if (!expect_true(read_file(path, content), "the exported edges are readable")) return;
 
     std::size_t line_index = 0;
     for (sz::string_view_t line : sz::split(content.view(), "\n")) {
@@ -394,68 +399,65 @@ struct edge_row_t {
             parsed = yyjson_is_uint(source) && yyjson_is_uint(target) && yyjson_is_uint(label);
             edge = {yyjson_get_uint(source), yyjson_get_uint(target), yyjson_get_uint(label)};
         }
-        failures += expect(parsed);
-        if (!parsed || st::failed(edges.push_back(edge_row_t {edge}))) return failures + 1;
+        if (!expect_true(parsed) ||
+            !expect_true(!st::failed(edges.push_back(edge_row_t {edge})), "no room for an edge"))
+            return;
     }
 
     std::sort(edges.begin(), edges.end(),
               [](edge_row_t const& left, edge_row_t const& right) noexcept { return left.source < right.source; });
-    failures += expect_eq(edges.size(), static_cast<std::size_t>(rows_count_k));
+    expect_equal(edges.size(), static_cast<std::size_t>(rows_count_k));
     for (std::size_t index = 0; index != edges.size(); ++index) {
         std::uint64_t const id = index + 1;
         edge_row_t const& edge = edges[index];
         if (edge.source == id && edge.target == id % 97 && edge.edge == id * 3) continue;
-        failures += expect_eq(edge.source, id);
-        failures += expect_eq(edge.target, id % 97);
-        failures += expect_eq(edge.edge, id * 3);
+        expect_equal(edge.source, id);
+        expect_equal(edge.target, id % 97);
+        expect_equal(edge.edge, id * 3);
         break;
     }
-    return failures;
 }
 
 /** Checks one exported document against the fixture row of its key. */
-[[nodiscard]] std::size_t check_document(std::uint64_t key, std::string_view text, char const* input,
-                                         field_selection_t selection) noexcept {
-    std::size_t failures = expect(key >= 1 && key <= rows_count_k);
+void check_document(std::uint64_t key, std::string_view text, char const* input, field_selection_t selection) noexcept {
+    expect_true(key >= 1 && key <= rows_count_k);
     sz::string_t expected_text;
     auto const id = static_cast<std::int64_t>(key);
     bool const generated = is_csv(input) ? append_csv_document(expected_text, id)
                                          : append_ndjson_document(expected_text, id);
-    if (!generated) return failures + 1;
+    if (!expect_true(generated, "the fixture row of key {} regenerates", key)) return;
 
     json_document_t const exported {yyjson_read(text.data(), text.size(), 0)};
     json_document_t const expected {yyjson_read(expected_text.data(), expected_text.size(), 0)};
     yyjson_val* const exported_root = yyjson_doc_get_root(exported.handle);
     yyjson_val* const expected_root = yyjson_doc_get_root(expected.handle);
-    failures += expect(yyjson_is_obj(exported_root));
+    expect_true(yyjson_is_obj(exported_root));
 
     sz::string_t exported_value;
     sz::string_t expected_value;
     if (selection == field_selection_t::whole_k) {
-        failures += expect(canonical(exported_root, exported_value) && canonical(expected_root, expected_value));
-        failures += expect(exported_value == expected_value);
-        return failures;
+        expect_true(canonical(exported_root, exported_value) && canonical(expected_root, expected_value));
+        expect_true(exported_value == expected_value);
+        return;
     }
 
     std::span<std::string_view const> const fields = is_csv(input)
                                                          ? std::span<std::string_view const>(selected_columns_k)
                                                          : std::span<std::string_view const>(selected_paths_k);
     for (std::string_view const field : fields) {
-        failures += expect(canonical(lookup(exported_root, field), exported_value) &&
-                           canonical(lookup(expected_root, field), expected_value));
-        failures += expect(exported_value.size() != 0);
-        failures += expect(exported_value == expected_value);
+        expect_true(canonical(lookup(exported_root, field), exported_value) &&
+                    canonical(lookup(expected_root, field), expected_value));
+        expect_true(exported_value.size() != 0);
+        expect_true(exported_value == expected_value);
     }
-    failures += expect(yyjson_obj_get(exported_root, is_csv(input) ? "retweeted" : "favorited") == nullptr);
-    return failures;
+    expect_true(yyjson_obj_get(exported_root, is_csv(input) ? "retweeted" : "favorited") == nullptr);
 }
 
 /** Checks that the documents exported to @p output match the fixture rows of @p input,
  *  one per key. */
-[[nodiscard]] std::size_t check_documents(char const* output, char const* input, field_selection_t selection) noexcept {
-    std::size_t failures = 0;
+void check_documents(char const* output, char const* input, field_selection_t selection) noexcept {
     sz::string_t content;
-    if (!read_file(output, content)) return expect(!"the exported documents are readable");
+    if (!expect_true(read_file(output, content), "the exported documents are readable")) return;
 
     std::size_t rows = 0;
     sz::string_t unescaped;
@@ -468,30 +470,29 @@ struct edge_row_t {
             std::uint64_t key = 0;
             bool const quoted = comma != std::string_view::npos && row.size() >= comma + 3 && row[comma + 1] == '"' &&
                                 row.back() == '"';
-            failures += expect(quoted && parse_key(row.substr(0, comma), key));
+            expect_true(quoted && parse_key(row.substr(0, comma), key));
             if (!quoted) continue;
             unescaped.clear();
             std::string_view separator;
             sz::string_view_t const inner {row.data() + comma + 2, row.size() - comma - 3};
             for (sz::string_view_t segment : sz::split(inner, "\"\"")) {
-                failures += expect(append(unescaped, separator) && append(unescaped, segment));
+                expect_true(append(unescaped, separator) && append(unescaped, segment));
                 separator = "\"";
             }
-            failures += check_document(key, unescaped, input, selection);
+            check_document(key, unescaped, input, selection);
         }
         else {
             json_document_t const document {yyjson_read(row.data(), row.size(), 0)};
             yyjson_val* const root = yyjson_doc_get_root(document.handle);
             yyjson_val* const key = yyjson_obj_get(root, "_id");
             sz::string_t text;
-            failures += expect(yyjson_is_uint(key) && canonical(yyjson_obj_get(root, "doc"), text));
+            expect_true(yyjson_is_uint(key) && canonical(yyjson_obj_get(root, "doc"), text));
             if (!yyjson_is_uint(key)) continue;
-            failures += check_document(yyjson_get_uint(key), text, input, selection);
+            check_document(yyjson_get_uint(key), text, input, selection);
         }
         ++rows;
     }
-    failures += expect_eq(rows, static_cast<std::size_t>(rows_count_k));
-    return failures;
+    expect_equal(rows, static_cast<std::size_t>(rows_count_k));
 }
 
 #pragma endregion Checks
@@ -500,15 +501,14 @@ struct edge_row_t {
 
 /** Imports edges from @p input, exports them to @p output, and checks the export holds exactly
  *  the fixture edges. */
-[[nodiscard]] std::size_t graph_round_trip(config_t const& config, char const* input, char const* output) noexcept {
+void test_graph_round_trip(config_t const& config, char const* input, char const* output) noexcept {
     test_database_t database;
-    if (!database.open(config)) return 1;
+    if (!database.open(config)) return;
     database.clear();
 
-    std::size_t failures = 0;
     ustore_outcome_t outcome {};
     ustore_collection_id_t const graph = database.create(ustore_modality_graph_k, outcome);
-    failures += expect_success(outcome);
+    expect_success(outcome);
 
     ustore_graph_import_t importing {};
     importing.database = database.get();
@@ -520,7 +520,7 @@ struct edge_row_t {
     importing.target_id_field = bytes_of(target_field_k);
     importing.edge_id_field = bytes_of(edge_field_k);
     ustore_graph_import(&importing);
-    failures += expect_success(outcome);
+    expect_success(outcome);
 
     ustore_graph_export_t exporting {};
     exporting.database = database.get();
@@ -532,21 +532,20 @@ struct edge_row_t {
     exporting.target_id_field = bytes_of(target_field_k);
     exporting.edge_id_field = bytes_of(edge_field_k);
     ustore_graph_export(&exporting);
-    failures += expect_success(outcome);
+    expect_success(outcome);
 
-    failures += check_edges(output);
+    check_edges(output);
     [[maybe_unused]] int const removed = std::remove(output);
     database.drop(graph, outcome);
-    failures += expect_success(outcome);
-    return failures;
+    expect_success(outcome);
 }
 
 /** Imports documents from @p input, exports them to @p output, and checks the rows or fields
  *  @p selection keeps. */
-[[nodiscard]] std::size_t documents_round_trip(config_t const& config, char const* input, char const* output,
-                                               field_selection_t selection) noexcept {
+void test_documents_round_trip(config_t const& config, char const* input, char const* output,
+                               field_selection_t selection) noexcept {
     test_database_t database;
-    if (!database.open(config)) return 1;
+    if (!database.open(config)) return;
     database.clear();
 
     std::span<std::string_view const> const fields = is_csv(input)
@@ -555,10 +554,9 @@ struct edge_row_t {
     bool const selects = selection == field_selection_t::selected_k;
     strided_strings<std::string_view> const names {strided(fields).begin()};
 
-    std::size_t failures = 0;
     ustore_outcome_t outcome {};
     ustore_collection_id_t const documents = database.create(ustore_modality_docs_k, outcome);
-    failures += expect_success(outcome);
+    expect_success(outcome);
 
     ustore_docs_import_t importing {};
     importing.database = database.get();
@@ -570,7 +568,7 @@ struct edge_row_t {
     importing.fields = selects ? names.view() : ustore_strings_view_t {};
     importing.id_field = bytes_of("id");
     ustore_docs_import(&importing);
-    failures += expect_success(outcome);
+    expect_success(outcome);
 
     ustore_docs_export_t exporting {};
     exporting.database = database.get();
@@ -581,12 +579,11 @@ struct edge_row_t {
     exporting.fields_count = importing.fields_count;
     exporting.fields = importing.fields;
     ustore_docs_export(&exporting);
-    failures += expect_success(outcome);
+    expect_success(outcome);
 
-    failures += check_documents(output, input, selection);
+    check_documents(output, input, selection);
     [[maybe_unused]] int const removed = std::remove(output);
     database.clear();
-    return failures;
 }
 
 #pragma endregion Round Trips
@@ -595,15 +592,14 @@ struct edge_row_t {
 
 /** Graph import rejects a task without a path, source, target or database, and accepts
  *  one without edges. */
-[[nodiscard]] std::size_t graph_import_rejects_invalid_tasks(config_t const& config, char const* input) noexcept {
+void test_graph_import_rejects_invalid_tasks(config_t const& config, char const* input) noexcept {
     test_database_t database;
-    if (!database.open(config)) return 1;
+    if (!database.open(config)) return;
     database.clear();
 
-    std::size_t failures = 0;
     ustore_outcome_t outcome {};
     ustore_collection_id_t const graph = database.create(ustore_modality_graph_k, outcome);
-    failures += expect_success(outcome);
+    expect_success(outcome);
     ustore_graph_import_t valid {};
     valid.database = database.get();
     valid.outcome = &outcome;
@@ -617,44 +613,42 @@ struct edge_row_t {
     ustore_graph_import_t without_path = valid;
     without_path.path = {};
     ustore_graph_import(&without_path);
-    failures += expect_failure(outcome);
+    expect_status(outcome, status_code_t::invalid_argument_k);
 
     ustore_graph_import_t without_source = valid;
     without_source.source_id_field = {};
     ustore_graph_import(&without_source);
-    failures += expect_failure(outcome);
+    expect_status(outcome, status_code_t::invalid_argument_k);
 
     ustore_graph_import_t without_target = valid;
     without_target.target_id_field = {};
     ustore_graph_import(&without_target);
-    failures += expect_failure(outcome);
+    expect_status(outcome, status_code_t::invalid_argument_k);
 
     ustore_graph_import_t without_edge = valid;
     without_edge.edge_id_field = {};
     ustore_graph_import(&without_edge);
-    failures += expect_success(outcome);
+    expect_success(outcome);
 
     ustore_graph_import_t without_database = valid;
     without_database.database = nullptr;
     ustore_graph_import(&without_database);
-    failures += expect_failure(outcome);
+    expect_status(outcome, status_code_t::uninitialized_k);
 
     database.drop(graph, outcome);
-    failures += expect_success(outcome);
-    return failures;
+    expect_success(outcome);
 }
 
 /** Graph export rejects a task without a path, source, target or database, or with
  *  a pointer field. */
-[[nodiscard]] std::size_t graph_export_rejects_invalid_tasks(config_t const& config, char const* output) noexcept {
+void test_graph_export_rejects_invalid_tasks(config_t const& config, char const* output) noexcept {
     test_database_t database;
-    if (!database.open(config)) return 1;
+    if (!database.open(config)) return;
     database.clear();
 
-    std::size_t failures = 0;
     ustore_outcome_t outcome {};
     ustore_collection_id_t const graph = database.create(ustore_modality_graph_k, outcome);
-    failures += expect_success(outcome);
+    expect_success(outcome);
     ustore_graph_export_t valid {};
     valid.database = database.get();
     valid.outcome = &outcome;
@@ -668,49 +662,47 @@ struct edge_row_t {
     ustore_graph_export_t without_path = valid;
     without_path.path = {};
     ustore_graph_export(&without_path);
-    failures += expect_failure(outcome);
+    expect_status(outcome, status_code_t::invalid_argument_k);
 
     ustore_graph_export_t without_source = valid;
     without_source.source_id_field = {};
     ustore_graph_export(&without_source);
-    failures += expect_failure(outcome);
+    expect_status(outcome, status_code_t::invalid_argument_k);
 
     ustore_graph_export_t without_target = valid;
     without_target.target_id_field = {};
     ustore_graph_export(&without_target);
-    failures += expect_failure(outcome);
+    expect_status(outcome, status_code_t::invalid_argument_k);
 
     ustore_graph_export_t with_pointer_field = valid;
     with_pointer_field.source_id_field = bytes_of("/id");
     ustore_graph_export(&with_pointer_field);
-    failures += expect_failure(outcome);
+    expect_status(outcome, status_code_t::invalid_argument_k);
 
     ustore_graph_export_t without_edge = valid;
     without_edge.edge_id_field = {};
     ustore_graph_export(&without_edge);
-    failures += expect_success(outcome);
+    expect_success(outcome);
 
     ustore_graph_export_t without_database = valid;
     without_database.database = nullptr;
     ustore_graph_export(&without_database);
-    failures += expect_failure(outcome);
+    expect_status(outcome, status_code_t::uninitialized_k);
 
     [[maybe_unused]] int const removed = std::remove(output);
-    return failures;
 }
 
 /** Document import rejects a task without a path, fields, an accessor, database or an identifier
  *  among the fields. */
-[[nodiscard]] std::size_t docs_import_rejects_invalid_tasks(config_t const& config, char const* input) noexcept {
+void test_docs_import_rejects_invalid_tasks(config_t const& config, char const* input) noexcept {
     test_database_t database;
-    if (!database.open(config)) return 1;
+    if (!database.open(config)) return;
     database.clear();
 
-    std::size_t failures = 0;
     ustore_outcome_t outcome {};
     strided_strings<std::string_view> const names {strided(selected_columns_k).begin()};
     ustore_collection_id_t const documents = database.create(ustore_modality_docs_k, outcome);
-    failures += expect_success(outcome);
+    expect_success(outcome);
     ustore_docs_import_t valid {};
     valid.database = database.get();
     valid.outcome = &outcome;
@@ -724,49 +716,47 @@ struct edge_row_t {
     ustore_docs_import_t without_path = valid;
     without_path.path = {};
     ustore_docs_import(&without_path);
-    failures += expect_failure(outcome);
+    expect_status(outcome, status_code_t::invalid_argument_k);
 
     ustore_docs_import_t without_count = valid;
     without_count.fields_count = 0;
     ustore_docs_import(&without_count);
-    failures += expect_failure(outcome);
+    expect_status(outcome, status_code_t::invalid_argument_k);
 
     ustore_docs_import_t without_fields = valid;
     without_fields.fields = {};
     ustore_docs_import(&without_fields);
-    failures += expect_failure(outcome);
+    expect_status(outcome, status_code_t::invalid_argument_k);
 
     ustore_docs_import_t without_accessor = valid;
     without_accessor.fields.data.accessor.get = nullptr;
     ustore_docs_import(&without_accessor);
-    failures += expect_failure(outcome);
+    expect_status(outcome, status_code_t::invalid_argument_k);
 
     ustore_docs_import_t without_id_among_fields = valid;
     without_id_among_fields.id_field = bytes_of("missing");
     ustore_docs_import(&without_id_among_fields);
-    failures += expect_failure(outcome);
+    expect_status(outcome, status_code_t::invalid_argument_k);
 
     ustore_docs_import_t without_database = valid;
     without_database.database = nullptr;
     ustore_docs_import(&without_database);
-    failures += expect_failure(outcome);
+    expect_status(outcome, status_code_t::uninitialized_k);
 
     database.clear();
-    return failures;
 }
 
 /** Document export rejects a task without a path, fields, an accessor or database, or with
  *  an unknown format. */
-[[nodiscard]] std::size_t docs_export_rejects_invalid_tasks(config_t const& config, char const* output) noexcept {
+void test_docs_export_rejects_invalid_tasks(config_t const& config, char const* output) noexcept {
     test_database_t database;
-    if (!database.open(config)) return 1;
+    if (!database.open(config)) return;
     database.clear();
 
-    std::size_t failures = 0;
     ustore_outcome_t outcome {};
     strided_strings<std::string_view> const names {strided(selected_columns_k).begin()};
     ustore_collection_id_t const documents = database.create(ustore_modality_docs_k, outcome);
-    failures += expect_success(outcome);
+    expect_success(outcome);
     ustore_docs_export_t valid {};
     valid.database = database.get();
     valid.outcome = &outcome;
@@ -779,35 +769,33 @@ struct edge_row_t {
     ustore_docs_export_t without_path = valid;
     without_path.path = {};
     ustore_docs_export(&without_path);
-    failures += expect_failure(outcome);
+    expect_status(outcome, status_code_t::invalid_argument_k);
 
     ustore_docs_export_t without_count = valid;
     without_count.fields_count = 0;
     ustore_docs_export(&without_count);
-    failures += expect_failure(outcome);
+    expect_status(outcome, status_code_t::invalid_argument_k);
 
     ustore_docs_export_t without_fields = valid;
     without_fields.fields = {};
     ustore_docs_export(&without_fields);
-    failures += expect_failure(outcome);
+    expect_status(outcome, status_code_t::invalid_argument_k);
 
     ustore_docs_export_t without_accessor = valid;
     without_accessor.fields.data.accessor.get = nullptr;
     ustore_docs_export(&without_accessor);
-    failures += expect_failure(outcome);
+    expect_status(outcome, status_code_t::invalid_argument_k);
 
-    path_t const unknown_format_output {config.directory(), exported_parquet_k};
+    std::string const unknown_format_output = fmt::format("{}/{}", config.directory(), exported_parquet_k);
     ustore_docs_export_t with_unknown_format = valid;
     with_unknown_format.path = bytes_of(unknown_format_output.c_str());
     ustore_docs_export(&with_unknown_format);
-    failures += expect_failure(outcome);
+    expect_status(outcome, status_code_t::unsupported_k);
 
     ustore_docs_export_t without_database = valid;
     without_database.database = nullptr;
     ustore_docs_export(&without_database);
-    failures += expect_failure(outcome);
-
-    return failures;
+    expect_status(outcome, status_code_t::uninitialized_k);
 }
 
 #pragma endregion Invalid Tasks
@@ -828,45 +816,41 @@ template <typename... arguments_type_>
 
 /** Creates, imports into, exports and drops a named collection, and refuses an import
  *  naming no collection. */
-[[nodiscard]] std::size_t cli_round_trip(fixture_paths_t const& paths, config_t const& config,
-                                         char const* executable) noexcept {
-    std::size_t failures = 0;
+void test_cli_round_trip(fixture_paths_t const& paths, config_t const& config, char const* executable) noexcept {
     char const* const directory = paths.directory;
     // The engine's name is a literal or a word of `argv`, so it ends in a null either way
     char const* const engine = config.engine().data();
     char const* const collection = "collection1";
     char const* const input = paths.documents_ndjson.c_str();
     char const* const output = paths.exported_ndjson.c_str();
-    failures += expect_eq(run_command(executable, "--engine", engine, "--directory", directory, "collection", "create",
-                                      "--collection", collection),
-                          0);
+    expect_equal(run_command(executable, "--engine", engine, "--directory", directory, "collection", "create",
+                             "--collection", collection),
+                 0);
     {
         test_database_t database;
-        failures += expect(database.open(config) && lists_collection(database.get(), collection));
+        expect_true(database.open(config) && lists_collection(database.get(), collection));
     }
 
-    failures += expect_eq(
-        run_command(executable, "--engine", engine, "--directory", directory, "collection", "import", "--input", input,
-                    "--id-field", "id", "--memory-limit", "1M", "--collection", collection),
-        0);
-    failures += expect_eq(run_command(executable, "--engine", engine, "--directory", directory, "collection", "export",
-                                      "--output", output, "--memory-limit", "1M", "--collection", collection),
-                          0);
-    failures += check_documents(output, input, field_selection_t::whole_k);
+    expect_equal(run_command(executable, "--engine", engine, "--directory", directory, "collection", "import",
+                             "--input", input, "--id-field", "id", "--memory-limit", "1M", "--collection", collection),
+                 0);
+    expect_equal(run_command(executable, "--engine", engine, "--directory", directory, "collection", "export",
+                             "--output", output, "--memory-limit", "1M", "--collection", collection),
+                 0);
+    check_documents(output, input, field_selection_t::whole_k);
     [[maybe_unused]] int const removed_named = std::remove(output);
 
-    failures += expect_eq(run_command(executable, "--engine", engine, "--directory", directory, "collection", "drop",
-                                      "--collection", collection),
-                          0);
+    expect_equal(run_command(executable, "--engine", engine, "--directory", directory, "collection", "drop",
+                             "--collection", collection),
+                 0);
     {
         test_database_t database;
-        failures += expect(database.open(config) && !lists_collection(database.get(), collection));
+        expect_true(database.open(config) && !lists_collection(database.get(), collection));
     }
 
     // Documents live only in collections of documents, so an import naming none is refused
-    failures += expect(run_command(executable, "--engine", engine, "--directory", directory, "collection", "import",
-                                   "--input", input, "--id-field", "id", "--memory-limit", "1M") != 0);
-    return failures;
+    expect_true(run_command(executable, "--engine", engine, "--directory", directory, "collection", "import", "--input",
+                            input, "--id-field", "id", "--memory-limit", "1M") != 0);
 }
 
 #pragma endregion CLI
@@ -1004,31 +988,30 @@ struct arrow_read_t {
     std::vector<std::size_t> body_offsets;
 };
 
-/** Reads the Arrow stream, or the file when it starts with the magic, in @p bytes with the codec,
- *  counting a failure for anything it refuses, and, for a stream, for any byte past its
+/** Reads the Arrow stream, or the file when it starts with the magic, in @p bytes with the
+ *  codec, failing a check for anything it refuses, and, for a stream, for any byte past its
  *  end-of-stream marker. */
-[[nodiscard]] std::size_t read_arrow(std::span<std::byte const> bytes, arrow_read_t& read) {
-    std::size_t failures = 0;
+void read_arrow(std::span<std::byte const> bytes, arrow_read_t& read) {
     bool const is_file = bytes.size() >= 8 && std::memcmp(bytes.data(), ipc_file_magic_k.data(), 8) == 0;
     std::size_t cursor = is_file ? 8 : 0;
     std::array<ipc_field_t, ipc_fields_max_k> fields {};
     std::array<ipc_key_value_t, 32> pairs {};
     ipc_schema_t schema {};
+    bool schema_read = true;
     for (;;) {
         std::uint32_t metadata_bytes = 0;
         std::size_t prefix_bytes = 0;
-        if (failures += expect(ipc_read_prefix(bytes.subspan(cursor), metadata_bytes, prefix_bytes) ==
-                               ipc_status_t::success_k))
-            return failures;
+        if (!expect_true(ipc_read_prefix(bytes.subspan(cursor), metadata_bytes, prefix_bytes) ==
+                         ipc_status_t::success_k))
+            return;
         cursor += prefix_bytes;
         if (metadata_bytes == 0) break;
         ipc_message_t message;
-        if (failures += expect(ipc_read_message(bytes.subspan(cursor, metadata_bytes), message) ==
-                               ipc_status_t::success_k))
-            return failures;
+        if (!expect_true(ipc_read_message(bytes.subspan(cursor, metadata_bytes), message) == ipc_status_t::success_k))
+            return;
         cursor += metadata_bytes;
         if (message.kind == ipc_message_kind_t::schema_k) {
-            failures += expect(ipc_read_schema(message, fields, pairs, schema) == ipc_status_t::success_k);
+            schema_read = expect_true(ipc_read_schema(message, fields, pairs, schema) == ipc_status_t::success_k);
             for (ipc_key_value_t const& pair : schema.metadata)
                 if (pair.key == "ustore.modality") read.modality = pair.value;
             for (ipc_field_t const& field : schema.fields) read.names.emplace_back(field.name);
@@ -1039,11 +1022,12 @@ struct arrow_read_t {
         ipc_batch_t batch {};
         std::size_t const body = static_cast<std::size_t>(message.body_bytes);
         read.body_offsets.push_back(cursor);
-        failures += expect(ipc_read_batch(message, bytes.subspan(cursor, fu::min_of(body, bytes.size() - cursor)),
-                                          schema, nodes, buffers, batch) == ipc_status_t::success_k);
-        failures += expect(ipc_validate_batch(schema, batch) == ipc_status_t::success_k);
+        bool const batch_read = expect_true(
+            ipc_read_batch(message, bytes.subspan(cursor, fu::min_of(body, bytes.size() - cursor)), schema, nodes,
+                           buffers, batch) == ipc_status_t::success_k);
+        bool const batch_valid = expect_true(ipc_validate_batch(schema, batch) == ipc_status_t::success_k);
         cursor += body;
-        if (failures) return failures;
+        if (!schema_read || !batch_read || !batch_valid) return;
         ++read.batches;
         for (std::int64_t row = 0; row != batch.length; ++row) {
             arrow_row_t cells;
@@ -1071,188 +1055,170 @@ struct arrow_read_t {
             read.rows.push_back(std::move(cells));
         }
     }
-    if (!is_file) failures += expect_eq(cursor, bytes.size());
-    return failures;
+    if (!is_file) expect_equal(cursor, bytes.size());
 }
 
 /** Reads the Arrow output at @p path into @p read. */
-[[nodiscard]] std::size_t read_arrow_file(char const* path, arrow_read_t& read) {
+void read_arrow_file(char const* path, arrow_read_t& read) {
     sz::string_t content;
-    if (!read_file(path, content)) return expect(!"the Arrow output is readable");
-    return read_arrow(std::as_bytes(std::span(content)), read);
+    if (!expect_true(read_file(path, content), "the Arrow output is readable")) return;
+    read_arrow(std::as_bytes(std::span(content)), read);
 }
 
-/** Counts a failure unless @p actual holds the rows of @p wanted, in any order. */
-[[nodiscard]] std::size_t expect_same_rows(std::vector<arrow_row_t> actual, std::vector<arrow_row_t> wanted) {
+/** Checks that @p actual holds the rows of @p wanted, in any order. */
+void expect_same_rows(std::vector<arrow_row_t> actual, std::vector<arrow_row_t> wanted) {
     std::sort(actual.begin(), actual.end());
     std::sort(wanted.begin(), wanted.end());
-    std::size_t failures = expect_eq(actual.size(), wanted.size());
-    if (!failures) failures += expect(actual == wanted);
-    return failures;
+    if (expect_equal(actual.size(), wanted.size())) expect_true(actual == wanted);
 }
 
 /** Imports a stream of @p modality through the CLI, by path or, for blobs, through standard input
  *  with the modality read off its columns, exports it to <tt>.arrows</tt>, and checks every row and the
  *  schema's modality come back. */
-[[nodiscard]] std::size_t arrow_round_trip(fixture_paths_t const& paths, config_t const& config, char const* executable,
-                                           ustore_modality_t modality) {
-    std::size_t failures = 0;
+void test_arrow_round_trip(fixture_paths_t const& paths, config_t const& config, char const* executable,
+                           ustore_modality_t modality) {
     std::string const name = std::string("arrow_") + ustore_modality_name(modality);
-    path_t const input {paths.files.c_str(), (name + ".in.arrows").c_str()};
-    path_t const output {paths.files.c_str(), (name + ".out.arrows").c_str()};
+    std::string const input = fmt::format("{}/{}", paths.files.c_str(), (name + ".in.arrows").c_str());
+    std::string const output = fmt::format("{}/{}", paths.files.c_str(), (name + ".out.arrows").c_str());
     arrow_table_t const table = modality_table(modality);
-    if (!write_arrow_stream(input.c_str(), table)) return expect(!"the Arrow input is written");
+    if (!expect_true(write_arrow_stream(input.c_str(), table), "the Arrow input is written")) return;
 
     char const* const engine = config.engine().data();
     bool const piped = modality == ustore_modality_blobs_k;
-    failures += expect_eq(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection",
-                                      "import", "--collection", name.c_str(), "--input", piped ? "-" : input.c_str(),
-                                      piped ? "<" : "", piped ? input.c_str() : ""),
-                          0);
-    failures += expect_eq(
-        run_command(executable, "--engine", engine, "--directory", paths.directory, "collection", "export",
-                    "--collection", name.c_str(), "--output", output.c_str(), "--batch-rows", "1000"),
-        0);
+    expect_equal(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection", "import",
+                             "--collection", name.c_str(), "--input", piped ? "-" : input.c_str(), piped ? "<" : "",
+                             piped ? input.c_str() : ""),
+                 0);
+    expect_equal(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection", "export",
+                             "--collection", name.c_str(), "--output", output.c_str(), "--batch-rows", "1000"),
+                 0);
     arrow_read_t read;
-    failures += read_arrow_file(output.c_str(), read);
-    failures += expect_eq(read.modality, std::string(ustore_modality_name(modality)));
-    failures += expect(read.batches > 1);
-    failures += expect_same_rows(read.rows, table.rows);
+    read_arrow_file(output.c_str(), read);
+    expect_equal(read.modality, std::string(ustore_modality_name(modality)));
+    expect_true(read.batches > 1);
+    expect_same_rows(read.rows, table.rows);
     [[maybe_unused]] int const removed_input = std::remove(input.c_str());
     [[maybe_unused]] int const removed_output = std::remove(output.c_str());
-    return failures;
 }
 
 /** An export to <tt>--output -</tt> writes only Arrow bytes to standard output, a stream ending at its
  *  marker, and its status line to standard error. */
-[[nodiscard]] std::size_t arrow_stdout_only_arrow(fixture_paths_t const& paths, config_t const& config,
-                                                  char const* executable) {
-    std::size_t failures = 0;
-    path_t const input {paths.files.c_str(), "stdout.in.arrows"};
-    path_t const output {paths.files.c_str(), "stdout.out"};
-    path_t const errors {paths.files.c_str(), "stdout.err"};
+void test_arrow_stdout_only_arrow(fixture_paths_t const& paths, config_t const& config, char const* executable) {
+    std::string const input = fmt::format("{}/{}", paths.files.c_str(), "stdout.in.arrows");
+    std::string const output = fmt::format("{}/{}", paths.files.c_str(), "stdout.out");
+    std::string const errors = fmt::format("{}/{}", paths.files.c_str(), "stdout.err");
     arrow_table_t const table = modality_table(ustore_modality_docs_k);
-    if (!write_arrow_stream(input.c_str(), table)) return expect(!"the Arrow input is written");
+    if (!expect_true(write_arrow_stream(input.c_str(), table), "the Arrow input is written")) return;
 
     char const* const engine = config.engine().data();
-    failures += expect_eq(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection",
-                                      "import", "--collection", "stdout", "--input", input.c_str()),
-                          0);
-    failures += expect_eq(
-        run_command(executable, "--engine", engine, "--directory", paths.directory, "collection", "export",
-                    "--collection", "stdout", "--output", "-", ">", output.c_str(), "2>", errors.c_str()),
-        0);
+    expect_equal(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection", "import",
+                             "--collection", "stdout", "--input", input.c_str()),
+                 0);
+    expect_equal(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection", "export",
+                             "--collection", "stdout", "--output", "-", ">", output.c_str(), "2>", errors.c_str()),
+                 0);
     arrow_read_t read;
-    failures += read_arrow_file(output.c_str(), read);
-    failures += expect_same_rows(read.rows, table.rows);
+    read_arrow_file(output.c_str(), read);
+    expect_same_rows(read.rows, table.rows);
     sz::string_t status;
-    failures += expect(read_file(errors.c_str(), status) && status.view().find("Exported") != sz::string_view_t::npos);
-    for (path_t const* path : {&input, &output, &errors}) {
+    expect_true(read_file(errors.c_str(), status) && status.view().find("Exported") != sz::string_view_t::npos);
+    for (std::string const* path : {&input, &output, &errors}) {
         [[maybe_unused]] int const removed = std::remove(path->c_str());
     }
-    return failures;
 }
 
 /** An <tt>.arrow</tt> file exported at 4096 bytes starts every body on a page and imports back whole. */
-[[nodiscard]] std::size_t arrow_file_direct_alignment(fixture_paths_t const& paths, config_t const& config,
-                                                      char const* executable) {
-    std::size_t failures = 0;
-    path_t const input {paths.files.c_str(), "direct.in.arrows"};
-    path_t const file {paths.files.c_str(), "direct.arrow"};
-    path_t const output {paths.files.c_str(), "direct.out.arrows"};
+void test_arrow_file_direct_alignment(fixture_paths_t const& paths, config_t const& config, char const* executable) {
+    std::string const input = fmt::format("{}/{}", paths.files.c_str(), "direct.in.arrows");
+    std::string const file = fmt::format("{}/{}", paths.files.c_str(), "direct.arrow");
+    std::string const output = fmt::format("{}/{}", paths.files.c_str(), "direct.out.arrows");
     arrow_table_t const table = modality_table(ustore_modality_graph_k);
-    if (!write_arrow_stream(input.c_str(), table)) return expect(!"the Arrow input is written");
+    if (!expect_true(write_arrow_stream(input.c_str(), table), "the Arrow input is written")) return;
 
     char const* const engine = config.engine().data();
-    failures += expect_eq(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection",
-                                      "import", "--collection", "direct", "--input", input.c_str()),
-                          0);
-    failures += expect_eq(
-        run_command(executable, "--engine", engine, "--directory", paths.directory, "collection", "export",
-                    "--collection", "direct", "--output", file.c_str(), "--alignment", "4096"),
-        0);
+    expect_equal(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection", "import",
+                             "--collection", "direct", "--input", input.c_str()),
+                 0);
+    expect_equal(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection", "export",
+                             "--collection", "direct", "--output", file.c_str(), "--alignment", "4096"),
+                 0);
     sz::string_t content;
-    if (!read_file(file.c_str(), content)) return failures + expect(!"the Arrow file is readable");
+    if (!expect_true(read_file(file.c_str(), content), "the Arrow file is readable")) return;
     std::span<std::byte const> const bytes = std::as_bytes(std::span(content));
     std::array<ipc_field_t, ipc_fields_max_k> fields {};
     std::array<ipc_key_value_t, 32> pairs {};
     std::array<ipc_block_t, 64> blocks {};
     ipc_schema_t schema {};
     std::size_t blocks_count = 0;
-    failures += expect(ipc_read_footer(bytes, fields, pairs, schema, blocks, blocks_count) == ipc_status_t::success_k);
+    expect_true(ipc_read_footer(bytes, fields, pairs, schema, blocks, blocks_count) == ipc_status_t::success_k);
     arrow_read_t read;
-    failures += read_arrow(bytes, read);
-    failures += expect_eq(blocks_count, read.batches);
+    read_arrow(bytes, read);
+    expect_equal(blocks_count, read.batches);
     for (std::size_t index = 0; index != fu::min_of(blocks_count, read.body_offsets.size()); ++index) {
-        failures += expect_eq(std::size_t(blocks[index].offset + blocks[index].metadata_bytes),
-                              read.body_offsets[index]);
-        failures += expect_eq(read.body_offsets[index] % ipc_alignment_direct_k, 0u);
+        expect_equal(std::size_t(blocks[index].offset + blocks[index].metadata_bytes), read.body_offsets[index]);
+        expect_equal(read.body_offsets[index] % ipc_alignment_direct_k, 0u);
     }
-    failures += expect_same_rows(read.rows, table.rows);
+    expect_same_rows(read.rows, table.rows);
 
-    failures += expect_eq(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection",
-                                      "import", "--collection", "direct_copy", "--input", file.c_str()),
-                          0);
-    failures += expect_eq(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection",
-                                      "export", "--collection", "direct_copy", "--output", output.c_str()),
-                          0);
+    expect_equal(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection", "import",
+                             "--collection", "direct_copy", "--input", file.c_str()),
+                 0);
+    expect_equal(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection", "export",
+                             "--collection", "direct_copy", "--output", output.c_str()),
+                 0);
     arrow_read_t copied;
-    failures += read_arrow_file(output.c_str(), copied);
-    failures += expect_eq(copied.modality, std::string("graph"));
-    failures += expect_same_rows(copied.rows, table.rows);
-    for (path_t const* path : {&input, &file, &output}) {
+    read_arrow_file(output.c_str(), copied);
+    expect_equal(copied.modality, std::string("graph"));
+    expect_same_rows(copied.rows, table.rows);
+    for (std::string const* path : {&input, &file, &output}) {
         [[maybe_unused]] int const removed = std::remove(path->c_str());
     }
-    return failures;
 }
 
 /** A bulk import either lands every row, or, on an engine that ingests no stream, fails cleanly
  *  with nothing written to standard output and drops the collection it created. */
-[[nodiscard]] std::size_t arrow_bulk_lands_or_refuses(fixture_paths_t const& paths, config_t const& config,
-                                                      char const* executable) {
-    std::size_t failures = 0;
-    path_t const input {paths.files.c_str(), "bulk.in.arrows"};
-    path_t const output {paths.files.c_str(), "bulk.out.arrows"};
-    path_t const printed {paths.files.c_str(), "bulk.out"};
-    path_t const errors {paths.files.c_str(), "bulk.err"};
+void test_arrow_bulk_lands_or_refuses(fixture_paths_t const& paths, config_t const& config, char const* executable) {
+    std::string const input = fmt::format("{}/{}", paths.files.c_str(), "bulk.in.arrows");
+    std::string const output = fmt::format("{}/{}", paths.files.c_str(), "bulk.out.arrows");
+    std::string const printed = fmt::format("{}/{}", paths.files.c_str(), "bulk.out");
+    std::string const errors = fmt::format("{}/{}", paths.files.c_str(), "bulk.err");
     arrow_table_t const table = modality_table(ustore_modality_blobs_k);
-    if (!write_arrow_stream(input.c_str(), table)) return expect(!"the Arrow input is written");
+    if (!expect_true(write_arrow_stream(input.c_str(), table), "the Arrow input is written")) return;
 
     char const* const engine = config.engine().data();
     int const bulk = run_command(executable, "--engine", engine, "--directory", paths.directory, "collection", "import",
                                  "--collection", "bulk", "--input", input.c_str(), "--ingest", "unsorted", ">",
                                  printed.c_str(), "2>", errors.c_str());
     sz::string_t out_text, error_text;
-    failures += expect(read_file(printed.c_str(), out_text) && out_text.size() == 0);
-    failures += expect(read_file(errors.c_str(), error_text));
+    expect_true(read_file(printed.c_str(), out_text) && out_text.size() == 0);
+    expect_true(read_file(errors.c_str(), error_text));
     if (bulk == 0) {
-        failures += expect_eq(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection",
-                                          "export", "--collection", "bulk", "--output", output.c_str()),
-                              0);
+        expect_equal(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection", "export",
+                                 "--collection", "bulk", "--output", output.c_str()),
+                     0);
         arrow_read_t read;
-        failures += read_arrow_file(output.c_str(), read);
-        failures += expect_same_rows(read.rows, table.rows);
+        read_arrow_file(output.c_str(), read);
+        expect_same_rows(read.rows, table.rows);
     }
     else {
         // The ingest created the collection, so its refusal drops it again
-        failures += expect(error_text.view().find("ingests nothing") != sz::string_view_t::npos);
+        expect_true(error_text.view().find("ingests nothing") != sz::string_view_t::npos);
         test_database_t database;
-        failures += expect(database.open(config) && !lists_collection(database.get(), "bulk"));
+        expect_true(database.open(config) && !lists_collection(database.get(), "bulk"));
     }
-    for (path_t const* path : {&input, &output, &printed, &errors}) {
+    for (std::string const* path : {&input, &output, &printed, &errors}) {
         [[maybe_unused]] int const removed = std::remove(path->c_str());
     }
-    return failures;
 }
 
 /** The name and modality of every named collection the CLI lists in @p directory on @p engine,
  *  sorted, as a snapshot export skips the unnamed ones. */
-[[nodiscard]] std::size_t list_collections(char const* executable, char const* engine, char const* directory,
-                                           char const* listing, std::vector<std::string>& collections) {
-    std::size_t failures = expect_eq(
+void list_collections(char const* executable, char const* engine, char const* directory, char const* listing,
+                      std::vector<std::string>& collections) {
+    expect_equal(
         run_command(executable, "--engine", engine, "--directory", directory, "collection", "list", ">", listing), 0);
     sz::string_t text;
-    failures += expect(read_file(listing, text));
+    expect_true(read_file(listing, text));
     for (sz::string_view_t line : sz::split(text.view(), "\n")) {
         std::string_view const row = line;
         std::size_t const tab = row.find('\t');
@@ -1261,19 +1227,16 @@ struct arrow_read_t {
     }
     std::sort(collections.begin(), collections.end());
     [[maybe_unused]] int const removed = std::remove(listing);
-    return failures;
 }
 
 /** A snapshot export of every modality, imported on NVMe when the build has it and on the suite's
  *  engine otherwise, holds the same collections with the same rows, and a second export into the
  *  same directory is refused. */
-[[nodiscard]] std::size_t snapshot_export_import(fixture_paths_t const& paths, config_t const& config,
-                                                 char const* executable) {
-    std::size_t failures = 0;
+void test_snapshot_export_import(fixture_paths_t const& paths, config_t const& config, char const* executable) {
     char const* const engine = config.engine().data();
-    path_t const snapshot {paths.files.c_str(), "snapshot"};
-    path_t const target {paths.files.c_str(), "snapshot_target"};
-    path_t const listing {paths.files.c_str(), "snapshot.list"};
+    std::string const snapshot = fmt::format("{}/{}", paths.files.c_str(), "snapshot");
+    std::string const target = fmt::format("{}/{}", paths.files.c_str(), "snapshot_target");
+    std::string const listing = fmt::format("{}/{}", paths.files.c_str(), "snapshot.list");
     std::error_code error;
     std::filesystem::remove_all(snapshot.c_str(), error);
     std::filesystem::remove_all(target.c_str(), error);
@@ -1284,53 +1247,52 @@ struct arrow_read_t {
                                               ustore_modality_pages_k};
     for (ustore_modality_t const modality : modalities) {
         std::string const name = std::string("snapshot_") + ustore_modality_name(modality);
-        path_t const input {paths.files.c_str(), (name + ".arrows").c_str()};
-        if (!write_arrow_stream(input.c_str(), modality_table(modality))) return expect(!"the Arrow input is written");
-        failures += expect_eq(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection",
-                                          "import", "--collection", name.c_str(), "--input", input.c_str()),
-                              0);
+        std::string const input = fmt::format("{}/{}", paths.files.c_str(), (name + ".arrows").c_str());
+        if (!expect_true(write_arrow_stream(input.c_str(), modality_table(modality)), "the Arrow input is written"))
+            return;
+        expect_equal(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection", "import",
+                                 "--collection", name.c_str(), "--input", input.c_str()),
+                     0);
         [[maybe_unused]] int const removed = std::remove(input.c_str());
     }
-    failures += expect_eq(run_command(executable, "--engine", engine, "--directory", paths.directory, "snapshot",
-                                      "export", snapshot.c_str()),
-                          0);
-    failures += expect(run_command(executable, "--engine", engine, "--directory", paths.directory, "snapshot", "export",
-                                   snapshot.c_str(), "2>", listing.c_str()) != 0);
+    expect_equal(run_command(executable, "--engine", engine, "--directory", paths.directory, "snapshot", "export",
+                             snapshot.c_str()),
+                 0);
+    expect_true(run_command(executable, "--engine", engine, "--directory", paths.directory, "snapshot", "export",
+                            snapshot.c_str(), "2>", listing.c_str()) != 0);
 
     // The NVMe engine opens only where the build has it, which a listing of an
     // empty directory probes
     bool const has_nvme = run_command(executable, "--engine", "nvme", "--directory", target.c_str(), "collection",
                                       "list", ">", listing.c_str(), "2>&1") == 0;
     char const* const target_engine = has_nvme ? "nvme" : engine;
-    failures += expect_eq(run_command(executable, "--engine", target_engine, "--directory", target.c_str(), "snapshot",
-                                      "import", snapshot.c_str()),
-                          0);
+    expect_equal(run_command(executable, "--engine", target_engine, "--directory", target.c_str(), "snapshot", "import",
+                             snapshot.c_str()),
+                 0);
 
     std::vector<std::string> source_collections, target_collections;
-    failures += list_collections(executable, engine, paths.directory, listing.c_str(), source_collections);
-    failures += list_collections(executable, target_engine, target.c_str(), listing.c_str(), target_collections);
-    failures += expect(source_collections.size() >= std::size(modalities));
-    failures += expect(source_collections == target_collections);
+    list_collections(executable, engine, paths.directory, listing.c_str(), source_collections);
+    list_collections(executable, target_engine, target.c_str(), listing.c_str(), target_collections);
+    expect_true(source_collections.size() >= std::size(modalities));
+    expect_true(source_collections == target_collections);
     for (std::string const& collection : source_collections) {
         std::string const name = collection.substr(0, collection.find('\t'));
-        path_t const source_output {paths.files.c_str(), "snapshot.source.arrows"};
-        path_t const target_output {paths.files.c_str(), "snapshot.target.arrows"};
-        failures += expect_eq(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection",
-                                          "export", "--collection", name.c_str(), "--output", source_output.c_str()),
-                              0);
-        failures += expect_eq(
-            run_command(executable, "--engine", target_engine, "--directory", target.c_str(), "collection", "export",
-                        "--collection", name.c_str(), "--output", target_output.c_str()),
-            0);
+        std::string const source_output = fmt::format("{}/{}", paths.files.c_str(), "snapshot.source.arrows");
+        std::string const target_output = fmt::format("{}/{}", paths.files.c_str(), "snapshot.target.arrows");
+        expect_equal(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection", "export",
+                                 "--collection", name.c_str(), "--output", source_output.c_str()),
+                     0);
+        expect_equal(run_command(executable, "--engine", target_engine, "--directory", target.c_str(), "collection",
+                                 "export", "--collection", name.c_str(), "--output", target_output.c_str()),
+                     0);
         arrow_read_t source_read, target_read;
-        failures += read_arrow_file(source_output.c_str(), source_read);
-        failures += read_arrow_file(target_output.c_str(), target_read);
-        failures += expect_eq(target_read.modality, source_read.modality);
-        failures += expect_same_rows(target_read.rows, source_read.rows);
+        read_arrow_file(source_output.c_str(), source_read);
+        read_arrow_file(target_output.c_str(), target_read);
+        expect_equal(target_read.modality, source_read.modality);
+        expect_same_rows(target_read.rows, source_read.rows);
     }
     std::filesystem::remove_all(snapshot.c_str(), error);
     std::filesystem::remove_all(target.c_str(), error);
-    return failures;
 }
 
 #pragma endregion Arrow
@@ -1379,15 +1341,14 @@ struct arrow_read_t {
 /** The manifest command prints the manifest a database opens by, and recover rebuilds one naming
  *  the same run files from the runs alone, every one on level 0, and the same collections from the
  *  collections system collection. */
-[[nodiscard]] case_result_t manifest_print_and_recover(fixture_paths_t const& paths, char const* executable) {
-    std::size_t failures = 0;
-    path_t const directory {paths.files.c_str(), "recovered"};
+[[nodiscard]] case_result_t test_manifest_print_and_recover(fixture_paths_t const& paths, char const* executable) {
+    std::string const directory = fmt::format("{}/{}", paths.files.c_str(), "recovered");
     std::array<char, nvme_manifest_capacity_k> manifest_buffer {};
     std::string_view const manifest_view = nvme_manifest_in(directory.c_str(), manifest_buffer);
     std::string const manifest {manifest_view};
     std::string const database {nvme_database_name_k};
-    path_t const printed {paths.files.c_str(), "recovered.printed.json"};
-    path_t const original {paths.files.c_str(), "recovered.original.json"};
+    std::string const printed = fmt::format("{}/{}", paths.files.c_str(), "recovered.printed.json");
+    std::string const original = fmt::format("{}/{}", paths.files.c_str(), "recovered.original.json");
     std::error_code error;
     std::filesystem::remove_all(directory.c_str(), error);
     std::filesystem::create_directories(directory.c_str(), error);
@@ -1395,58 +1356,57 @@ struct arrow_read_t {
     // empty directory probes
     if (run_command(executable, "--engine", "nvme", "--directory", directory.c_str(), "collection", "list", ">",
                     printed.c_str(), "2>&1") != 0)
-        return case_result_t::skipped("needs the nvme engine");
-    failures += expect_eq(run_command(executable, "--engine", "nvme", "--directory", directory.c_str(), "collection",
-                                      "create", "--collection", "people", "--modality", "blobs", "2>", printed.c_str()),
-                          0);
+        return case_result_t::skipped(needs_nvme_engine_k);
+    expect_equal(run_command(executable, "--engine", "nvme", "--directory", directory.c_str(), "collection", "create",
+                             "--collection", "people", "--modality", "blobs", "2>", printed.c_str()),
+                 0);
 
-    failures += expect_eq(run_command(executable, "manifest", manifest.c_str(), ">", printed.c_str()), 0);
-    failures += expect_eq(
+    expect_equal(run_command(executable, "manifest", manifest.c_str(), ">", printed.c_str()), 0);
+    expect_equal(
         run_command(executable, "manifest", directory.c_str(), "--database", database.c_str(), ">", original.c_str()),
         0);
-    failures += expect(manifest_files(original.c_str()) == manifest_files(manifest.c_str()));
+    expect_true(manifest_files(original.c_str()) == manifest_files(manifest.c_str()));
     std::vector<std::string> const before = manifest_files(manifest.c_str());
-    failures += expect(!before.empty());
-    failures += expect(manifest_files(printed.c_str()) == before);
-    failures += expect(run_command(executable, "recover", directory.c_str(), "--database", database.c_str(), "2>",
-                                   printed.c_str()) != 0);
+    expect_true(!before.empty());
+    expect_true(manifest_files(printed.c_str()) == before);
+    expect_true(run_command(executable, "recover", directory.c_str(), "--database", database.c_str(), "2>",
+                            printed.c_str()) != 0);
 
     std::filesystem::rename(manifest.c_str(), original.c_str(), error);
-    failures += expect(!error);
-    failures += expect_eq(
+    expect_true(!error);
+    expect_equal(
         run_command(executable, "recover", directory.c_str(), "--database", database.c_str(), "2>", printed.c_str()),
         0);
     std::vector<std::string> expected_files;
     for (std::string const& line : before) expected_files.push_back(line.substr(0, line.rfind(' ')) + " 0");
-    failures += expect(manifest_files(manifest.c_str()) == expected_files);
+    expect_true(manifest_files(manifest.c_str()) == expected_files);
     // A system collection without runs is left for the next open to reserve again
     std::vector<std::string> const collections = manifest_collections(original.c_str());
     std::vector<std::string> const recovered = manifest_collections(manifest.c_str());
-    failures += expect(std::includes(collections.begin(), collections.end(), recovered.begin(), recovered.end()));
+    expect_true(std::includes(collections.begin(), collections.end(), recovered.begin(), recovered.end()));
     for (std::string const& line : collections)
-        if (line.front() != '_') failures += expect(std::binary_search(recovered.begin(), recovered.end(), line));
-    failures += expect(std::any_of(recovered.begin(), recovered.end(),
-                                   [](std::string const& line) { return line.starts_with("_collections "); }));
-    failures += expect_eq(run_command(executable, "--engine", "nvme", "--directory", directory.c_str(), "collection",
-                                      "list", ">", printed.c_str()),
-                          0);
+        if (line.front() != '_') expect_true(std::binary_search(recovered.begin(), recovered.end(), line));
+    expect_true(std::any_of(recovered.begin(), recovered.end(),
+                            [](std::string const& line) { return line.starts_with("_collections "); }));
+    expect_equal(run_command(executable, "--engine", "nvme", "--directory", directory.c_str(), "collection", "list",
+                             ">", printed.c_str()),
+                 0);
     sz::string_t listing;
-    failures += expect(read_file(printed.c_str(), listing) &&
-                       std::string_view {listing}.find("people") != std::string_view::npos);
+    expect_true(read_file(printed.c_str(), listing) &&
+                std::string_view {listing}.find("people") != std::string_view::npos);
     std::filesystem::remove_all(directory.c_str(), error);
-    return failures;
+    return {};
 }
 
 /** Recover walks the slots of a raw medium and sizes every run, strings ones too, from its header
  *  alone, which must match the bytes the manifest named it by. */
-[[nodiscard]] case_result_t raw_recover_sizes_strings_runs(fixture_paths_t const& paths, char const* executable) {
-    std::size_t failures = 0;
+[[nodiscard]] case_result_t test_raw_recover_sizes_strings_runs(fixture_paths_t const& paths, char const* executable) {
     constexpr std::uint64_t slot_bytes = std::uint64_t {1} << 30;
     constexpr std::uint64_t slots = 8;
-    path_t const device {paths.files.c_str(), "recovered.raw"};
-    path_t const input {paths.files.c_str(), "recovered.strings.arrows"};
-    path_t const printed {paths.files.c_str(), "recovered.raw.printed.json"};
-    path_t const original {paths.files.c_str(), "recovered.raw.original.json"};
+    std::string const device = fmt::format("{}/{}", paths.files.c_str(), "recovered.raw");
+    std::string const input = fmt::format("{}/{}", paths.files.c_str(), "recovered.strings.arrows");
+    std::string const printed = fmt::format("{}/{}", paths.files.c_str(), "recovered.raw.printed.json");
+    std::string const original = fmt::format("{}/{}", paths.files.c_str(), "recovered.raw.original.json");
     std::string const address = std::string(device.c_str()) + "@0+8GiB";
     std::string const database {nvme_database_name_k};
     std::error_code error;
@@ -1458,28 +1418,29 @@ struct arrow_read_t {
     if (run_command(executable, "--engine", "nvme", "--directory", address.c_str(), "collection", "list", ">",
                     printed.c_str(), "2>&1") != 0) {
         std::filesystem::remove(device.c_str(), error);
-        return case_result_t::skipped("needs the nvme engine");
+        return case_result_t::skipped(needs_nvme_engine_k);
     }
-    if (!write_arrow_stream(input.c_str(), modality_table(ustore_modality_strings_k)))
-        return expect(!"the Arrow input is written");
-    failures += expect_eq(run_command(executable, "--engine", "nvme", "--directory", address.c_str(), "collection",
-                                      "import", "--collection", "words", "--input", input.c_str()),
-                          0);
+    if (!expect_true(write_arrow_stream(input.c_str(), modality_table(ustore_modality_strings_k)),
+                     "the Arrow input is written"))
+        return {};
+    expect_equal(run_command(executable, "--engine", "nvme", "--directory", address.c_str(), "collection", "import",
+                             "--collection", "words", "--input", input.c_str()),
+                 0);
 
-    failures += expect_eq(
+    expect_equal(
         run_command(executable, "manifest", address.c_str(), "--database", database.c_str(), ">", original.c_str()), 0);
     std::vector<std::string> const before = manifest_files(original.c_str());
-    failures += expect(!before.empty());
-    failures += expect_eq(
+    expect_true(!before.empty());
+    expect_equal(
         run_command(executable, "recover", address.c_str(), "--database", database.c_str(), "2>", printed.c_str()), 0);
-    failures += expect_eq(
+    expect_equal(
         run_command(executable, "manifest", address.c_str(), "--database", database.c_str(), ">", printed.c_str()), 0);
     std::vector<std::string> expected_files;
     for (std::string const& line : before) expected_files.push_back(line.substr(0, line.rfind(' ')) + " 0");
-    failures += expect(manifest_files(printed.c_str()) == expected_files);
+    expect_true(manifest_files(printed.c_str()) == expected_files);
     std::filesystem::remove(device.c_str(), error);
     std::filesystem::remove(input.c_str(), error);
-    return failures;
+    return {};
 }
 
 #pragma endregion Manifests
@@ -1563,62 +1524,58 @@ struct cli_run_t {
 }
 
 /** @c --help prints the usage, each flag beside its default's variable, and exits with status 0. */
-[[nodiscard]] std::size_t cli_help_lists_variables(char const* executable) {
+void test_cli_help_lists_variables(char const* executable) {
     cli_run_t const run = run_cli({executable, "--help"});
-    std::size_t failures = expect_eq(run.status, 0);
-    failures += expect(run.output.find("Usage: ") == 0);
-    failures += expect(run.output.find("--directory <path>") != std::string::npos);
-    failures += expect(run.output.find("[env: USTORE_DIRECTORY]") != std::string::npos);
-    failures += expect(run.output.find("[env: USTORE_MEMORY_LIMIT]") != std::string::npos);
-    failures += expect(run.errors.empty());
-    return failures;
+    expect_equal(run.status, 0);
+    expect_true(run.output.find("Usage: ") == 0);
+    expect_true(run.output.find("--directory <path>") != std::string::npos);
+    expect_true(run.output.find("[env: USTORE_DIRECTORY]") != std::string::npos);
+    expect_true(run.output.find("[env: USTORE_MEMORY_LIMIT]") != std::string::npos);
+    expect_true(run.errors.empty());
 }
 
 /** A value that does not parse, given as a flag or a variable, prints one line naming the grammar
  *  and exits with 1 before anything opens. */
-[[nodiscard]] std::size_t cli_bad_value_one_line(char const* executable) {
+void test_cli_bad_value_one_line(char const* executable) {
     cli_run_t const flag = run_cli({executable, "--batch-rows", "0", "collection", "list"});
-    std::size_t failures = expect_eq(flag.status, 1);
-    failures += expect_eq(flag.errors, std::string("--batch-rows=\"0\" does not parse, expected a positive count\n"));
+    expect_equal(flag.status, 1);
+    expect_equal(flag.errors, std::string("--batch-rows=\"0\" does not parse, expected a positive count\n"));
 
     cli_run_t const bytes = run_cli({executable, "--memory-limit=64MB", "collection", "list"});
-    failures += expect_eq(bytes.status, 1);
-    failures += expect_eq(bytes.errors,
-                          std::string("--memory-limit=\"64MB\" does not parse, expected bytes like 4096 or 24G\n"));
+    expect_equal(bytes.status, 1);
+    expect_equal(bytes.errors,
+                 std::string("--memory-limit=\"64MB\" does not parse, expected bytes like 4096 or 24G\n"));
 
     cli_run_t const named = run_cli({executable, "--engine", "mongo", "collection", "list"});
-    failures += expect_eq(named.status, 1);
-    failures += expect_eq(named.errors,
-                          std::string("--engine=\"mongo\" does not parse, expected ram, rocksdb, leveldb or nvme\n"));
+    expect_equal(named.status, 1);
+    expect_equal(named.errors,
+                 std::string("--engine=\"mongo\" does not parse, expected ram, rocksdb, leveldb or nvme\n"));
 
     cli_run_t const variable = run_cli({executable, "collection", "list"}, {"USTORE_BATCH_ROWS=many"});
-    failures += expect_eq(variable.status, 1);
-    failures += expect_eq(variable.errors,
-                          std::string("USTORE_BATCH_ROWS=\"many\" does not parse, expected a positive count\n"));
-    return failures;
+    expect_equal(variable.status, 1);
+    expect_equal(variable.errors,
+                 std::string("USTORE_BATCH_ROWS=\"many\" does not parse, expected a positive count\n"));
 }
 
 /** The engine and the directory come from @c USTORE_ENGINE and @c USTORE_DIRECTORY when no flag
  *  names them, and a flag overrides its variable. */
-[[nodiscard]] std::size_t cli_reads_variables(fixture_paths_t const& paths, config_t const& config,
-                                              char const* executable) {
+void test_cli_reads_variables(fixture_paths_t const& paths, config_t const& config, char const* executable) {
     std::string const engine = "USTORE_ENGINE=" + std::string(config.engine());
     std::string const directory = std::string("USTORE_DIRECTORY=") + paths.directory;
     cli_run_t const created = run_cli({executable, "collection", "create", "--collection", "from_variables"},
                                       {engine, directory});
-    std::size_t failures = expect_eq(created.status, 0);
+    expect_equal(created.status, 0);
     {
         test_database_t database;
-        failures += expect(database.open(config) && lists_collection(database.get(), "from_variables"));
+        expect_true(database.open(config) && lists_collection(database.get(), "from_variables"));
     }
     cli_run_t const overridden = run_cli({executable, "--collection", "from_variables", "collection", "drop"},
                                          {engine, directory, "USTORE_COLLECTION=missing"});
-    failures += expect_eq(overridden.status, 0);
+    expect_equal(overridden.status, 0);
     {
         test_database_t database;
-        failures += expect(database.open(config) && !lists_collection(database.get(), "from_variables"));
+        expect_true(database.open(config) && !lists_collection(database.get(), "from_variables"));
     }
-    return failures;
 }
 
 /** Waits up to a minute for @p process to print a line holding @p marker to standard error,
@@ -1644,25 +1601,26 @@ struct cli_run_t {
 /** An import from standard input that SIGINT interrupts after its first progress line stops at the
  *  next batch, prints "stopped in import" and exits with 130; a stream of one row per batch, fed in
  *  two halves, holds it at a barrier until the signal lands. */
-[[nodiscard]] std::size_t cli_stops_on_sigint(fixture_paths_t const& paths, config_t const& config,
-                                              char const* executable) {
-    std::size_t failures = 0;
-    path_t const table_path {paths.files.c_str(), "stopping.in.arrows"};
-    path_t const batches_path {paths.files.c_str(), "stopping.batches.arrows"};
-    if (!write_arrow_stream(table_path.c_str(), modality_table(ustore_modality_blobs_k)))
-        return expect(!"the Arrow input is written");
+void test_cli_stops_on_sigint(fixture_paths_t const& paths, config_t const& config, char const* executable) {
+    std::string const table_path = fmt::format("{}/{}", paths.files.c_str(), "stopping.in.arrows");
+    std::string const batches_path = fmt::format("{}/{}", paths.files.c_str(), "stopping.batches.arrows");
+    if (!expect_true(write_arrow_stream(table_path.c_str(), modality_table(ustore_modality_blobs_k)),
+                     "the Arrow input is written"))
+        return;
     std::string const engine(config.engine());
-    failures += expect_eq(run_cli({executable, "--engine", engine, "--directory", paths.directory, "collection",
-                                   "import", "--collection", "stopping_source", "--input", table_path.c_str()})
-                              .status,
-                          0);
-    failures += expect_eq(
+    bool const imported = expect_equal(
+        run_cli({executable, "--engine", engine, "--directory", paths.directory, "collection", "import", "--collection",
+                 "stopping_source", "--input", table_path.c_str()})
+            .status,
+        0);
+    bool const exported = expect_equal(
         run_cli({executable, "--engine", engine, "--directory", paths.directory, "collection", "export", "--collection",
                  "stopping_source", "--output", batches_path.c_str(), "--batch-rows", "1"})
             .status,
         0);
     sz::string_t stream;
-    if (failures || !read_file(batches_path.c_str(), stream)) return failures + expect(!"the batches are written");
+    if (!imported || !exported || !expect_true(read_file(batches_path.c_str(), stream), "the batches are written"))
+        return;
     std::string_view const bytes = stream.view();
 
     // The CLI exits once it stops, so the second half may find no reader
@@ -1672,50 +1630,47 @@ struct cli_run_t {
                                              "-"});
     std::string errors;
     bool const fed = process.pid > 0 && write_all(process.input, bytes.substr(0, bytes.size() / 2));
-    failures += expect(fed && await_errors(process, "import: ", errors));
+    expect_true(fed && await_errors(process, "import: ", errors));
     if (process.pid > 0) ::kill(process.pid, SIGINT);
     [[maybe_unused]] bool const rest = process.pid > 0 && write_all(process.input, bytes.substr(bytes.size() / 2));
     cli_run_t const run = process.pid > 0 ? finish_cli(process, std::move(errors)) : cli_run_t {};
     std::signal(SIGPIPE, previous_pipe);
 
-    failures += expect_eq(run.status, 130);
-    failures += expect(run.errors.find("stopped in import\n") != std::string::npos);
-    failures += expect(run.errors.find("Imported") == std::string::npos);
+    expect_equal(run.status, 130);
+    expect_true(run.errors.find("stopped in import\n") != std::string::npos);
+    expect_true(run.errors.find("Imported") == std::string::npos);
     [[maybe_unused]] int const removed_table = std::remove(table_path.c_str());
     [[maybe_unused]] int const removed_batches = std::remove(batches_path.c_str());
-    return failures;
 }
 
 /** An export SIGINT stops leaves a file already at its target as it was, byte for byte, and no
  *  temporary beside it: a FIFO at the temporary's name holds the export at a barrier once the pipe
  *  fills, until the signal lands. */
-[[nodiscard]] std::size_t cli_stop_keeps_existing_target(fixture_paths_t const& paths, config_t const& config,
-                                                         char const* executable) {
-    std::size_t failures = 0;
-    path_t const input {paths.files.c_str(), "keeping.in.arrows"};
-    path_t const target {paths.files.c_str(), "keeping.out.arrows"};
-    path_t const temporary {paths.files.c_str(), "keeping.out.arrows.tmp"};
-    if (!write_arrow_stream(input.c_str(), modality_table(ustore_modality_blobs_k)))
-        return expect(!"the Arrow input is written");
+void test_cli_stop_keeps_existing_target(fixture_paths_t const& paths, config_t const& config, char const* executable) {
+    std::string const input = fmt::format("{}/{}", paths.files.c_str(), "keeping.in.arrows");
+    std::string const target = fmt::format("{}/{}", paths.files.c_str(), "keeping.out.arrows");
+    std::string const temporary = fmt::format("{}/{}", paths.files.c_str(), "keeping.out.arrows.tmp");
+    if (!expect_true(write_arrow_stream(input.c_str(), modality_table(ustore_modality_blobs_k)),
+                     "the Arrow input is written"))
+        return;
     std::string const engine(config.engine());
-    failures += expect_eq(run_cli({executable, "--engine", engine, "--directory", paths.directory, "collection",
-                                   "import", "--collection", "keeping_source", "--input", input.c_str()})
-                              .status,
-                          0);
+    expect_equal(run_cli({executable, "--engine", engine, "--directory", paths.directory, "collection", "import",
+                          "--collection", "keeping_source", "--input", input.c_str()})
+                     .status,
+                 0);
 
     std::string const existing = "bytes an earlier export left, which a stopped one must keep\n";
     std::FILE* const file = std::fopen(target.c_str(), "wb");
-    failures += expect(file && std::fwrite(existing.data(), 1, existing.size(), file) == existing.size());
-    if (file) failures += expect_eq(std::fclose(file), 0);
-    failures += expect_eq(::mkfifo(temporary.c_str(), 0600), 0);
-    if (failures) return failures;
+    expect_true(file && std::fwrite(existing.data(), 1, existing.size(), file) == existing.size());
+    if (file) expect_equal(std::fclose(file), 0);
+    if (!expect_equal(::mkfifo(temporary.c_str(), 0600), 0)) return;
 
     cli_process_t const process = start_cli({executable, "--engine", engine, "--directory", paths.directory,
                                              "collection", "export", "--collection", "keeping_source", "--output",
                                              target.c_str(), "--batch-rows", "1"});
     int const reader = ::open(temporary.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
     std::string errors;
-    failures += expect(process.pid > 0 && reader >= 0 && await_errors(process, "export: ", errors));
+    expect_true(process.pid > 0 && reader >= 0 && await_errors(process, "export: ", errors));
     if (process.pid > 0) ::kill(process.pid, SIGINT);
     if (reader >= 0) {
         // Draining lets the blocked write finish, so the export reaches its next barrier and stops
@@ -1726,16 +1681,15 @@ struct cli_run_t {
     }
     cli_run_t const run = process.pid > 0 ? finish_cli(process, std::move(errors)) : cli_run_t {};
 
-    failures += expect_eq(run.status, 130);
-    failures += expect(run.errors.find("stopped in export\n") != std::string::npos);
+    expect_equal(run.status, 130);
+    expect_true(run.errors.find("stopped in export\n") != std::string::npos);
     sz::string_t kept;
-    failures += expect(read_file(target.c_str(), kept) && kept.view() == sz::string_view_t {existing});
+    expect_true(read_file(target.c_str(), kept) && kept.view() == sz::string_view_t {existing});
     struct ::stat left {};
-    failures += expect(::stat(temporary.c_str(), &left) != 0);
+    expect_true(::stat(temporary.c_str(), &left) != 0);
     [[maybe_unused]] int const removed_input = std::remove(input.c_str());
     [[maybe_unused]] int const removed_target = std::remove(target.c_str());
     [[maybe_unused]] int const removed_temporary = std::remove(temporary.c_str());
-    return failures;
 }
 
 #endif
@@ -1743,10 +1697,10 @@ struct cli_run_t {
 
 /** Runs every case against the fixtures written under the directory of @p config, and the CLI at
  *  @p executable unless it is empty. */
-void run_cases(suite_totals_t& totals, config_t const& config, std::string_view executable) noexcept {
+void run_cases(config_t const& config, std::string_view executable) noexcept {
     fixture_paths_t const paths {config.directory()};
     if (!write_fixtures(paths)) {
-        report(totals, "tools.fixtures", 1);
+        run_test_case("write_fixtures", [] { expect_true(false, "the fixtures are written"); });
         return;
     }
 
@@ -1757,82 +1711,116 @@ void run_cases(suite_totals_t& totals, config_t const& config, std::string_view 
     char const* const exported_ndjson = paths.exported_ndjson.c_str();
     char const* const exported_csv = paths.exported_csv.c_str();
 
-    report(totals, "graph.ndjson_to_ndjson", graph_round_trip, config, edges_ndjson, exported_ndjson);
-    report(totals, "graph.ndjson_to_csv", graph_round_trip, config, edges_ndjson, exported_csv);
-    report(totals, "graph.csv_to_ndjson", graph_round_trip, config, edges_csv, exported_ndjson);
-    report(totals, "graph.csv_to_csv", graph_round_trip, config, edges_csv, exported_csv);
+    run_test_case(engine_label_t {"test_graph_round_trip", "edges_ndjson, exported_ndjson"}.c_str(),
+                  test_graph_round_trip, config, edges_ndjson, exported_ndjson);
+    run_test_case(engine_label_t {"test_graph_round_trip", "edges_ndjson, exported_csv"}.c_str(), test_graph_round_trip,
+                  config, edges_ndjson, exported_csv);
+    run_test_case(engine_label_t {"test_graph_round_trip", "edges_csv, exported_ndjson"}.c_str(), test_graph_round_trip,
+                  config, edges_csv, exported_ndjson);
+    run_test_case(engine_label_t {"test_graph_round_trip", "edges_csv, exported_csv"}.c_str(), test_graph_round_trip,
+                  config, edges_csv, exported_csv);
 
     field_selection_t const whole = field_selection_t::whole_k;
     field_selection_t const selected = field_selection_t::selected_k;
-    report(totals, "docs.whole.ndjson_to_ndjson", documents_round_trip, config, documents_ndjson, exported_ndjson,
-           whole);
-    report(totals, "docs.whole.ndjson_to_csv", documents_round_trip, config, documents_ndjson, exported_csv, whole);
-    report(totals, "docs.whole.csv_to_ndjson", documents_round_trip, config, documents_csv, exported_ndjson, whole);
-    report(totals, "docs.whole.csv_to_csv", documents_round_trip, config, documents_csv, exported_csv, whole);
-    report(totals, "docs.selected.ndjson_to_ndjson", documents_round_trip, config, documents_ndjson, exported_ndjson,
-           selected);
-    report(totals, "docs.selected.ndjson_to_csv", documents_round_trip, config, documents_ndjson, exported_csv,
-           selected);
-    report(totals, "docs.selected.csv_to_ndjson", documents_round_trip, config, documents_csv, exported_ndjson,
-           selected);
-    report(totals, "docs.selected.csv_to_csv", documents_round_trip, config, documents_csv, exported_csv, selected);
+    run_test_case(engine_label_t {"test_documents_round_trip", "documents_ndjson, exported_ndjson, whole"}.c_str(),
+                  test_documents_round_trip, config, documents_ndjson, exported_ndjson, whole);
+    run_test_case(engine_label_t {"test_documents_round_trip", "documents_ndjson, exported_csv, whole"}.c_str(),
+                  test_documents_round_trip, config, documents_ndjson, exported_csv, whole);
+    run_test_case(engine_label_t {"test_documents_round_trip", "documents_csv, exported_ndjson, whole"}.c_str(),
+                  test_documents_round_trip, config, documents_csv, exported_ndjson, whole);
+    run_test_case(engine_label_t {"test_documents_round_trip", "documents_csv, exported_csv, whole"}.c_str(),
+                  test_documents_round_trip, config, documents_csv, exported_csv, whole);
+    run_test_case(engine_label_t {"test_documents_round_trip", "documents_ndjson, exported_ndjson, selected"}.c_str(),
+                  test_documents_round_trip, config, documents_ndjson, exported_ndjson, selected);
+    run_test_case(engine_label_t {"test_documents_round_trip", "documents_ndjson, exported_csv, selected"}.c_str(),
+                  test_documents_round_trip, config, documents_ndjson, exported_csv, selected);
+    run_test_case(engine_label_t {"test_documents_round_trip", "documents_csv, exported_ndjson, selected"}.c_str(),
+                  test_documents_round_trip, config, documents_csv, exported_ndjson, selected);
+    run_test_case(engine_label_t {"test_documents_round_trip", "documents_csv, exported_csv, selected"}.c_str(),
+                  test_documents_round_trip, config, documents_csv, exported_csv, selected);
 
-    report(totals, "invalid.graph_import.ndjson", graph_import_rejects_invalid_tasks, config, edges_ndjson);
-    report(totals, "invalid.graph_import.csv", graph_import_rejects_invalid_tasks, config, edges_csv);
-    report(totals, "invalid.graph_export.ndjson", graph_export_rejects_invalid_tasks, config, exported_ndjson);
-    report(totals, "invalid.graph_export.csv", graph_export_rejects_invalid_tasks, config, exported_csv);
-    report(totals, "invalid.docs_import.ndjson", docs_import_rejects_invalid_tasks, config, documents_ndjson);
-    report(totals, "invalid.docs_import.csv", docs_import_rejects_invalid_tasks, config, documents_csv);
-    report(totals, "invalid.docs_export.ndjson", docs_export_rejects_invalid_tasks, config, exported_ndjson);
-    report(totals, "invalid.docs_export.csv", docs_export_rejects_invalid_tasks, config, exported_csv);
+    run_test_case(engine_label_t {"test_graph_import_rejects_invalid_tasks", "edges_ndjson"}.c_str(),
+                  test_graph_import_rejects_invalid_tasks, config, edges_ndjson);
+    run_test_case(engine_label_t {"test_graph_import_rejects_invalid_tasks", "edges_csv"}.c_str(),
+                  test_graph_import_rejects_invalid_tasks, config, edges_csv);
+    run_test_case(engine_label_t {"test_graph_export_rejects_invalid_tasks", "exported_ndjson"}.c_str(),
+                  test_graph_export_rejects_invalid_tasks, config, exported_ndjson);
+    run_test_case(engine_label_t {"test_graph_export_rejects_invalid_tasks", "exported_csv"}.c_str(),
+                  test_graph_export_rejects_invalid_tasks, config, exported_csv);
+    run_test_case(engine_label_t {"test_docs_import_rejects_invalid_tasks", "documents_ndjson"}.c_str(),
+                  test_docs_import_rejects_invalid_tasks, config, documents_ndjson);
+    run_test_case(engine_label_t {"test_docs_import_rejects_invalid_tasks", "documents_csv"}.c_str(),
+                  test_docs_import_rejects_invalid_tasks, config, documents_csv);
+    run_test_case(engine_label_t {"test_docs_export_rejects_invalid_tasks", "exported_ndjson"}.c_str(),
+                  test_docs_export_rejects_invalid_tasks, config, exported_ndjson);
+    run_test_case(engine_label_t {"test_docs_export_rejects_invalid_tasks", "exported_csv"}.c_str(),
+                  test_docs_export_rejects_invalid_tasks, config, exported_csv);
 
     // The CLI path views into `argv`, so it ends in a null terminator
-    if (executable.empty()) report(totals, "tools.cli", case_result_t::skipped("needs --cli"));
-    else report(totals, "tools.cli", cli_round_trip, paths, config, executable.data());
+    if (executable.empty())
+        run_test_case(engine_label_t {"test_cli_round_trip"}.c_str(),
+                      [] { return case_result_t::skipped(needs_cli_k); });
+    else
+        run_test_case(engine_label_t {"test_cli_round_trip"}.c_str(), test_cli_round_trip, paths, config,
+                      executable.data());
 #if !USTORE_OS_WINDOWS_
     if (executable.empty()) {
-        report(totals, "cli.help_lists_variables", case_result_t::skipped("needs --cli"));
-        report(totals, "cli.bad_value_one_line", case_result_t::skipped("needs --cli"));
-        report(totals, "cli.reads_variables", case_result_t::skipped("needs --cli"));
-        report(totals, "cli.stops_on_sigint", case_result_t::skipped("needs --cli"));
-        report(totals, "cli.stop_keeps_existing_target", case_result_t::skipped("needs --cli"));
+        run_test_case("test_cli_help_lists_variables", [] { return case_result_t::skipped(needs_cli_k); });
+        run_test_case("test_cli_bad_value_one_line", [] { return case_result_t::skipped(needs_cli_k); });
+        run_test_case(engine_label_t {"test_cli_reads_variables"}.c_str(),
+                      [] { return case_result_t::skipped(needs_cli_k); });
+        run_test_case(engine_label_t {"test_cli_stops_on_sigint"}.c_str(),
+                      [] { return case_result_t::skipped(needs_cli_k); });
+        run_test_case(engine_label_t {"test_cli_stop_keeps_existing_target"}.c_str(),
+                      [] { return case_result_t::skipped(needs_cli_k); });
     }
     else {
-        report(totals, "cli.help_lists_variables", cli_help_lists_variables, executable.data());
-        report(totals, "cli.bad_value_one_line", cli_bad_value_one_line, executable.data());
-        report(totals, "cli.reads_variables", cli_reads_variables, paths, config, executable.data());
-        report(totals, "cli.stops_on_sigint", cli_stops_on_sigint, paths, config, executable.data());
-        report(totals, "cli.stop_keeps_existing_target", cli_stop_keeps_existing_target, paths, config,
-               executable.data());
+        run_test_case("test_cli_help_lists_variables", test_cli_help_lists_variables, executable.data());
+        run_test_case("test_cli_bad_value_one_line", test_cli_bad_value_one_line, executable.data());
+        run_test_case(engine_label_t {"test_cli_reads_variables"}.c_str(), test_cli_reads_variables, paths, config,
+                      executable.data());
+        run_test_case(engine_label_t {"test_cli_stops_on_sigint"}.c_str(), test_cli_stops_on_sigint, paths, config,
+                      executable.data());
+        run_test_case(engine_label_t {"test_cli_stop_keeps_existing_target"}.c_str(),
+                      test_cli_stop_keeps_existing_target, paths, config, executable.data());
     }
 #endif
 
     constexpr ustore_modality_t modalities[] {ustore_modality_blobs_k, ustore_modality_docs_k,
                                               ustore_modality_strings_k, ustore_modality_graph_k,
                                               ustore_modality_pages_k};
-    constexpr char const* round_trip_names[] {"arrow.blobs_round_trip", "arrow.docs_round_trip",
-                                              "arrow.strings_round_trip", "arrow.graph_round_trip",
-                                              "arrow.pages_round_trip"};
-    for (std::size_t index = 0; index != std::size(modalities); ++index)
-        if (executable.empty()) report(totals, round_trip_names[index], case_result_t::skipped("needs --cli"));
-        else
-            report(totals, round_trip_names[index], arrow_round_trip, paths, config, executable.data(),
-                   modalities[index]);
+    constexpr char const* modality_constants[] {"ustore_modality_blobs_k", "ustore_modality_docs_k",
+                                                "ustore_modality_strings_k", "ustore_modality_graph_k",
+                                                "ustore_modality_pages_k"};
+    for (std::size_t index = 0; index != std::size(modalities); ++index) {
+        engine_label_t const label {"test_arrow_round_trip", modality_constants[index]};
+        if (executable.empty()) run_test_case(label.c_str(), [] { return case_result_t::skipped(needs_cli_k); });
+        else run_test_case(label.c_str(), test_arrow_round_trip, paths, config, executable.data(), modalities[index]);
+    }
     if (executable.empty()) {
-        report(totals, "arrow.stdout_only_arrow", case_result_t::skipped("needs --cli"));
-        report(totals, "arrow.file_direct_alignment", case_result_t::skipped("needs --cli"));
-        report(totals, "arrow.bulk_lands_or_refuses", case_result_t::skipped("needs --cli"));
-        report(totals, "snapshot.export_import", case_result_t::skipped("needs --cli"));
-        report(totals, "cli.manifest_and_recover", case_result_t::skipped("needs --cli"));
-        report(totals, "cli.raw_recover_sizes_strings_runs", case_result_t::skipped("needs --cli"));
+        run_test_case(engine_label_t {"test_arrow_stdout_only_arrow"}.c_str(),
+                      [] { return case_result_t::skipped(needs_cli_k); });
+        run_test_case(engine_label_t {"test_arrow_file_direct_alignment"}.c_str(),
+                      [] { return case_result_t::skipped(needs_cli_k); });
+        run_test_case(engine_label_t {"test_arrow_bulk_lands_or_refuses"}.c_str(),
+                      [] { return case_result_t::skipped(needs_cli_k); });
+        run_test_case(engine_label_t {"test_snapshot_export_import"}.c_str(),
+                      [] { return case_result_t::skipped(needs_cli_k); });
+        run_test_case("test_manifest_print_and_recover", [] { return case_result_t::skipped(needs_cli_k); });
+        run_test_case("test_raw_recover_sizes_strings_runs", [] { return case_result_t::skipped(needs_cli_k); });
     }
     else {
-        report(totals, "arrow.stdout_only_arrow", arrow_stdout_only_arrow, paths, config, executable.data());
-        report(totals, "arrow.file_direct_alignment", arrow_file_direct_alignment, paths, config, executable.data());
-        report(totals, "arrow.bulk_lands_or_refuses", arrow_bulk_lands_or_refuses, paths, config, executable.data());
-        report(totals, "snapshot.export_import", snapshot_export_import, paths, config, executable.data());
-        report(totals, "cli.manifest_and_recover", manifest_print_and_recover, paths, executable.data());
-        report(totals, "cli.raw_recover_sizes_strings_runs", raw_recover_sizes_strings_runs, paths, executable.data());
+        run_test_case(engine_label_t {"test_arrow_stdout_only_arrow"}.c_str(), test_arrow_stdout_only_arrow, paths,
+                      config, executable.data());
+        run_test_case(engine_label_t {"test_arrow_file_direct_alignment"}.c_str(), test_arrow_file_direct_alignment,
+                      paths, config, executable.data());
+        run_test_case(engine_label_t {"test_arrow_bulk_lands_or_refuses"}.c_str(), test_arrow_bulk_lands_or_refuses,
+                      paths, config, executable.data());
+        run_test_case(engine_label_t {"test_snapshot_export_import"}.c_str(), test_snapshot_export_import, paths,
+                      config, executable.data());
+        run_test_case("test_manifest_print_and_recover", test_manifest_print_and_recover, paths, executable.data());
+        run_test_case("test_raw_recover_sizes_strings_runs", test_raw_recover_sizes_strings_runs, paths,
+                      executable.data());
     }
 }
 
@@ -1841,25 +1829,18 @@ void run_cases(suite_totals_t& totals, config_t const& config, std::string_view 
 int main(int argc, char** argv) {
     using namespace unum::ustore;
     using namespace unum::ustore::test;
-    suite_options_t options;
-    std::string_view executable;
-    std::array<flag_t, 1> const flags {{
-        {"--cli", "path", "the CLI executable its case runs, skipped without it", &executable},
-    }};
-    if (argument_status_t const status = parse_suite_options(argc, argv, options, flags);
-        status != argument_status_t::parsed_k)
-        return status == argument_status_t::help_k ? 0 : 1;
-    suite_totals_t totals = options.totals();
+    start_test_run(argc, argv);
+    char const* const cli = setting_text(argc, argv, "USTORE_CLI", "--cli");
 
-    auto const maybe_directory = directory_t::make(options.directory);
+    auto const maybe_directory = scratch_directory_t::make(test_run.settings.directory);
     if (!maybe_directory) {
-        fmt::println(stderr, "Cannot create a unique directory under {}", options.directory);
+        fmt::println(stderr, "Cannot create a unique directory under {}", test_run.settings.directory);
         return 1;
     }
     char const* const directory = maybe_directory->path();
-    config_t const config {options.engine, directory};
+    config_t const config {test_run.settings.engine, directory};
 
-    if (directory) run_cases(totals, config, executable);
-    else report(totals, "tools", case_result_t::skipped(needs_directory_k));
-    return suite_exit_code(totals);
+    if (directory) run_cases(config, cli ? cli : "");
+    else run_test_case("run_cases", [] { return case_result_t::skipped(needs_directory_k); });
+    return finish_test_run();
 }

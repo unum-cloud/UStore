@@ -2,6 +2,10 @@
 
 One random edit stream runs on a database of every engine at once, and every engine must render every page as the
 others do after every call.
+
+File: test/pages.py
+Author: Ash Vardanian
+Date: October 17, 2026
 """
 
 import random
@@ -9,31 +13,24 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
-from capabilities import ENGINES, key, open_engine
+from base import ENGINES, NEEDS_PAGES, SUPPORTS, key, open_engine
 
 import ustore
 from ustore import Modality, PageEncoding
 
+pytestmark = NEEDS_PAGES
+
 PAGE = key(500)
 NIL = key(0)
 
-
-def serves_pages(database: ustore.Database) -> UUID | None:
-    """The pages collection of `database`, or None when its engine serves no pages, as NVMe does not yet."""
-    try:
-        collection = database.collection_create("pages", modality=Modality.PAGES)
-        database.pages_import(key(1), b"<probe/>", collection=collection)
-    except ustore.UnsupportedError:
-        return None
-    return collection
+PAGE_ENGINES = [engine for engine in ENGINES if SUPPORTS[engine]["pages"]]
+"""The engines that serve pages, which the random stream runs on side by side."""
 
 
 @pytest.fixture
 def pages(database: ustore.Database) -> UUID:
-    collection = serves_pages(database)
-    if collection is None:
-        pytest.skip("the engine serves no pages")
-    return collection
+    """A pages collection."""
+    return database.collection_create("pages", modality=Modality.PAGES)
 
 
 def render(database, pages: UUID, element: UUID | None = None, encoding: PageEncoding = PageEncoding.XML):
@@ -104,6 +101,7 @@ def test_scan_and_cursor_keep_what_the_filter_matches(database, pages):
 
 
 def test_a_deferred_import_lands_once_waited(database, pages, later):
+    """A deferred import lands, and a deferred read renders it, once waited."""
     later.pages_import(PAGE, b"<later/>", collection=pages).wait()
     assert bytes(later.pages_read(PAGE, ustore.Arena(), collection=pages).wait()[0]) == b"<later/>"
 
@@ -209,21 +207,16 @@ class Stream:
         return verb, tasks
 
 
+@pytest.mark.skipif(len(PAGE_ENGINES) < 2, reason="needs two engines that serve pages")
 def test_random_streams_agree(tmp_path: Path, seed: int):
     """One random stream applied to every engine at once renders identically on all of them after every call."""
     engines = {}
-    for engine in ENGINES:
+    for engine in PAGE_ENGINES:
         directory = tmp_path / engine
         directory.mkdir()
         database = open_engine(engine, directory)
-        collection = serves_pages(database)
-        if collection is None:
-            database.close()
-            continue
-        engines[engine] = (database, collection)
+        engines[engine] = (database, database.collection_create("pages", modality=Modality.PAGES))
     try:
-        if len(engines) < 2:
-            pytest.skip("fewer than two engines serve pages")
         stream = Stream(random.Random(seed))
         for _ in range(300):
             verb, tasks = stream.call()

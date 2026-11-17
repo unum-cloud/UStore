@@ -13,7 +13,7 @@ import sys
 import textwrap
 from pathlib import Path
 
-from capabilities import NEEDS_TRANSACTIONS, location, open_engine
+from base import NEEDS_TRANSACTIONS, location, open_engine
 
 import ustore
 
@@ -31,6 +31,7 @@ def crash_after(engine: str, directory: Path, body: str) -> None:
 
 
 def test_a_flushed_write_survives_a_crash(engine: str, tmp_path: Path):
+    """A write flushed before the process dies reads back once reopened."""
     crash_after(engine, tmp_path, 'database.set(1, b"kept", durability=ustore.Durability.FLUSHED, collection=blobs)')
     with open_engine(engine, tmp_path) as database:
         assert database.get(1, collection="blobs") == b"kept"
@@ -38,6 +39,7 @@ def test_a_flushed_write_survives_a_crash(engine: str, tmp_path: Path):
 
 @NEEDS_TRANSACTIONS
 def test_a_flushed_commit_survives_a_crash(engine: str, tmp_path: Path):
+    """A commit flushed before the process dies reads back once reopened."""
     crash_after(
         engine,
         tmp_path,
@@ -53,6 +55,7 @@ def test_a_flushed_commit_survives_a_crash(engine: str, tmp_path: Path):
 
 @NEEDS_TRANSACTIONS
 def test_a_crash_keeps_whole_transactions(engine: str, tmp_path: Path):
+    """A crash keeps each transaction over two collections whole or not at all."""
     crash_after(
         engine,
         tmp_path,
@@ -74,6 +77,7 @@ def test_a_crash_keeps_whole_transactions(engine: str, tmp_path: Path):
 
 
 def test_a_crash_keeps_the_names_of_collections(engine: str, tmp_path: Path):
+    """A collection created before a crash keeps its name once reopened."""
     crash_after(engine, tmp_path, 'database.collection_create("kept", modality=ustore.Modality.DOCS)')
     with open_engine(engine, tmp_path) as database:
         assert database.collection_contains("kept")
@@ -81,6 +85,7 @@ def test_a_crash_keeps_the_names_of_collections(engine: str, tmp_path: Path):
 
 @NEEDS_TRANSACTIONS
 def test_a_crash_drops_a_staged_transaction(engine: str, tmp_path: Path):
+    """A crash drops a staged transaction, whose key then takes a new write once reopened."""
     crash_after(
         engine,
         tmp_path,

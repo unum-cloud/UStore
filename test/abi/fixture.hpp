@@ -24,7 +24,7 @@
 #include "ustore/ustore.hpp"
 
 #include "engine.hpp"  // `engine_t`, `ustore_database_handle_t`, `view_t`, `database_verbs_t`, `blobs_verbs`
-#include "harness.hpp" // `expect`, `expect_eq`, `expect_success`, `spin_until`
+#include "harness.hpp" // `expect_true`, `expect_equal`, `expect_success`, `spin_until`
 
 namespace unum::ustore::test::abi {
 
@@ -39,9 +39,9 @@ strided_strings<std::string_view> const stored_values_k {{&stored_value_k, 0}};
 
 /** Writes @p text under every key of @p keys in @p collection, joining @p transaction when
  *  one is given. */
-inline std::size_t write_text(ustore_database_t database, ustore_collection_id_t const& collection,
-                              std::span<ustore_key_t const> keys, std::string_view text,
-                              ustore_transaction_t transaction = nullptr) {
+inline bool write_text(ustore_database_t database, ustore_collection_id_t const& collection,
+                       std::span<ustore_key_t const> keys, std::string_view text,
+                       ustore_transaction_t transaction = nullptr) {
     strided_strings<std::string_view> const repeated {{&text, 0}};
     ustore_outcome_t outcome {};
     ustore_blobs_write_t write {};
@@ -203,10 +203,10 @@ inline ustore_continuation_t hold_until_released(ustore_size_t, ustore_size_t, v
 
 /** Readies @p held for @p executor with @p completion, reading through @p view, its callback
  *  holding the scan once submitted, so the executor, the arena and the view stay claimed. */
-inline std::size_t arm_held(held_scan_t& held, ustore_executor_t executor, ustore_view_t view,
-                            ustore_completion_t completion) noexcept {
+inline bool arm_held(held_scan_t& held, ustore_executor_t executor, ustore_view_t view,
+                     ustore_completion_t completion) noexcept {
     auto [arena, arena_status] = arena_t::make(executor);
-    if (arena_status.failed()) return 1;
+    if (!expect_true(arena_status.succeeded())) return false;
     held.arena = std::move(arena);
     held.executor = executor;
     held.scan = {
@@ -222,26 +222,26 @@ inline std::size_t arm_held(held_scan_t& held, ustore_executor_t executor, ustor
         .progress = &hold_until_released,
         .progress_state = &held,
     };
-    return 0;
+    return true;
 }
 
 /** Waits until the callback of @p held holds its scan. */
-inline std::size_t wait_held(held_scan_t& held) noexcept {
+inline bool wait_held(held_scan_t& held) noexcept {
     fu::standard_atomic_ref<hold_stage_t> const stage {held.stage};
-    return expect(
+    return expect_true(
         spin_until([&stage]() noexcept { return stage.load(std::memory_order_acquire) == hold_stage_t::entered_k; }));
 }
 
 /** Submits @p held to @p executor as a deferred call reading through @p view, and waits until the
  *  callback holds the scan. */
-inline std::size_t submit_held(held_scan_t& held, ustore_executor_t executor, ustore_view_t view = nullptr) noexcept {
-    if (arm_held(held, executor, view, ustore_completion_deferred_k) != 0) return 1;
+inline bool submit_held(held_scan_t& held, ustore_executor_t executor, ustore_view_t view = nullptr) noexcept {
+    if (!arm_held(held, executor, view, ustore_completion_deferred_k)) return false;
     ustore_blobs_scan(&held.scan);
     return wait_held(held);
 }
 
 /** Lets the callback of @p held return, and waits until the scan finishes. */
-inline std::size_t release_held(held_scan_t& held) noexcept {
+inline bool release_held(held_scan_t& held) noexcept {
     fu::standard_atomic_ref<hold_stage_t> {held.stage}.store(hold_stage_t::released_k, std::memory_order_release);
     ustore_outcome_wait(&held.outcome);
     return expect_success(held.outcome);
@@ -292,17 +292,14 @@ expected<ustore_blobs_cursor_t> open_cursor(ustore_database_t database, ustore_c
     return cursor;
 }
 
-/** Counts one failure for every key of the page @p pulled that is not @p wanted in order, or
- *  reads another value. */
-inline std::size_t expect_page(pulled_keys_t const& pulled, std::span<ustore_key_t const> wanted,
-                               std::string_view value) {
-    std::size_t failures = expect_eq(pulled.written, wanted.size());
-    if (pulled.written != wanted.size()) return failures;
+/** Fails a check for every key of the page @p pulled that is not @p wanted in order, or reads
+ *  another value. */
+inline void expect_page(pulled_keys_t const& pulled, std::span<ustore_key_t const> wanted, std::string_view value) {
+    if (!expect_equal(pulled.written, wanted.size())) return;
     for (std::size_t index = 0; index != wanted.size(); ++index) {
-        failures += expect_eq(pulled.keys[index], wanted[index]);
-        failures += expect_eq(pulled.value(index), value);
+        expect_equal(pulled.keys[index], wanted[index]);
+        expect_equal(pulled.value(index), value);
     }
-    return failures;
 }
 
 #pragma endregion Cursor Pulls
@@ -311,63 +308,57 @@ inline std::size_t expect_page(pulled_keys_t const& pulled, std::span<ustore_key
 
 /** Checks that every key @p reference names holds a value of @p expected_length, or is missing. */
 template <typename reference_type_>
-std::size_t check_length(reference_type_& reference, ustore_length_t expected_length) {
-    std::size_t failures = 0;
+void check_length(reference_type_& reference, ustore_length_t expected_length) {
     bool const expects_missing = expected_length == missing_length_k;
     using extractor_t = places_arg_extractor<typename reference_type_::locations_plain_t>;
     ustore_size_t const count = extractor_t {}.count(reference.locations());
 
     auto maybe_retrieved = reference.value();
-    failures += expect(maybe_retrieved);
-    if (!maybe_retrieved) return failures;
+    expect_true(maybe_retrieved.has_value());
+    if (!maybe_retrieved) return;
     auto const& retrieved = *maybe_retrieved;
-    failures += expect_eq(retrieved.size(), count);
+    expect_equal(retrieved.size(), count);
 
     auto iterator = retrieved.begin();
     for (std::size_t index = 0; index != count; ++index, ++iterator)
-        failures += expect_eq((*iterator).size(), expects_missing ? 0 : expected_length);
+        expect_equal((*iterator).size(), expects_missing ? 0 : expected_length);
 
     auto maybe_lengths = reference.length();
-    failures += expect(maybe_lengths);
-    for (std::size_t index = 0; index != count; ++index)
-        failures += expect_eq((*maybe_lengths)[index], expected_length);
+    expect_true(maybe_lengths.has_value());
+    for (std::size_t index = 0; index != count; ++index) expect_equal((*maybe_lengths)[index], expected_length);
 
     auto maybe_indicators = reference.present();
-    failures += expect(maybe_indicators);
+    expect_true(maybe_indicators.has_value());
     for (std::size_t index = 0; index != count; ++index)
-        failures += expect(static_cast<bool>(maybe_indicators->view().at(index)) == !expects_missing);
-    return failures;
+        expect_true(static_cast<bool>(maybe_indicators->view().at(index)) == !expects_missing);
 }
 
 /** Checks that the keys @p reference names hold @p values, byte for byte. */
 template <typename reference_type_>
-std::size_t check_equalities(reference_type_& reference, std::span<value_view_t const> values) {
-    std::size_t failures = 0;
+void check_equalities(reference_type_& reference, std::span<value_view_t const> values) {
     using extractor_t = places_arg_extractor<typename reference_type_::locations_plain_t>;
     ustore_size_t const count = extractor_t {}.count(reference.locations());
 
     auto maybe_retrieved = reference.value();
-    failures += expect(maybe_retrieved);
-    if (!maybe_retrieved) return failures;
+    expect_true(maybe_retrieved.has_value());
+    if (!maybe_retrieved) return;
     auto const& retrieved = *maybe_retrieved;
-    failures += expect_eq(retrieved.size(), count);
+    expect_equal(retrieved.size(), count);
 
     auto iterator = retrieved.begin();
     for (std::size_t index = 0; index != count; ++index, ++iterator) {
         value_view_t const retrieved_view = *iterator;
-        failures += expect_eq(retrieved_view.size(), values[index].size());
-        failures += expect(retrieved_view == values[index]);
+        expect_equal(retrieved_view.size(), values[index].size());
+        expect_true(retrieved_view == values[index]);
     }
-    return failures;
 }
 
 /** Assigns @p values through @p reference and checks they read back as @p expected. */
 template <typename locations_type_, typename values_type_>
-std::size_t round_trip(blobs_ref<locations_type_>& reference, values_type_ const& values,
-                       std::span<value_view_t const> expected) {
-    std::size_t failures = expect(reference.assign(values).succeeded());
-    failures += check_equalities(reference, expected);
-    return failures;
+void round_trip(blobs_ref<locations_type_>& reference, values_type_ const& values,
+                std::span<value_view_t const> expected) {
+    expect_true(reference.assign(values).succeeded());
+    check_equalities(reference, expected);
 }
 
 /** Three one-byte values under three keys, exposed in each layout a batch of strings takes. */
@@ -394,19 +385,17 @@ struct triplet_t {
 /** Round-trips @p triplet through @p reference as a tape of either offset width and
  *  through an accessor. */
 template <typename locations_type_>
-std::size_t round_trip(blobs_ref<locations_type_>& reference, triplet_t const& triplet) {
+void round_trip(blobs_ref<locations_type_>& reference, triplet_t const& triplet) {
     std::array<value_view_t, 3> const views = triplet.views();
-    std::size_t failures = 0;
-    failures += round_trip(reference, triplet.u32_layout(), views);
-    failures += round_trip(reference, triplet.u64_layout(), views);
-    failures += round_trip(reference, views, views);
-    return failures;
+    round_trip(reference, triplet.u32_layout(), views);
+    round_trip(reference, triplet.u64_layout(), views);
+    round_trip(reference, views, views);
 }
 
 /** Checks that @p reference holds @p triplet. */
 template <typename reference_type_>
-std::size_t check_equalities(reference_type_& reference, triplet_t const& triplet) {
-    return check_equalities(reference, triplet.views());
+void check_equalities(reference_type_& reference, triplet_t const& triplet) {
+    check_equalities(reference, triplet.views());
 }
 
 #pragma endregion Wrapper Round Trips
@@ -452,8 +441,8 @@ template <typename database_type_>
 expected<database_type_> open_reference(config_t const& config) noexcept {
     engine_options_t const ram;
     if (!config.directory()) return open_database<database_type_>(config_t {ram, nullptr});
-    path_t const directory {config.directory(), "reference"};
-    if (!recreate_directory(directory.c_str()))
+    std::string const directory = fmt::format("{}/{}", config.directory(), "reference");
+    if (!scratch_directory_t::recreate(directory.c_str()))
         return status_t {status_code_t::io_k, "Cannot empty the directory of the reference database"};
     return open_database<database_type_>(config_t {ram, directory.c_str()});
 }
@@ -525,27 +514,24 @@ expected<std::span<ustore_key_t const>> scan_bounds(void (*call)(arguments_type_
 /** Counts a failure for every key the engine under test lists over @p bounds through @p call apart
  *  from the reference, and for every key the reference lists apart from @p pinned. */
 template <typename arguments_type_>
-std::size_t expect_same_scan(void (*call)(arguments_type_*), compared_collections_t& compared,
-                             key_bounds_t const& bounds, std::span<ustore_key_t const> pinned) {
+void expect_same_scan(void (*call)(arguments_type_*), compared_collections_t& compared, key_bounds_t const& bounds,
+                      std::span<ustore_key_t const> pinned) {
     auto [tested, tested_status] = scan_bounds(call, compared, 0, bounds);
     auto [reference, reference_status] = scan_bounds(call, compared, 1, bounds);
-    std::size_t failures = expect(tested_status.succeeded()) + expect(reference_status.succeeded());
-    if (failures != 0) return failures;
-    failures += expect_eq(tested.size(), reference.size());
+    if (!expect_true(tested_status.succeeded()) || !expect_true(reference_status.succeeded())) return;
+    expect_equal(tested.size(), reference.size());
     for (std::size_t index = 0; index != tested.size() && index != reference.size(); ++index)
-        failures += expect_eq(tested[index], reference[index]);
-    failures += expect_eq(reference.size(), pinned.size());
+        expect_equal(tested[index], reference[index]);
+    expect_equal(reference.size(), pinned.size());
     for (std::size_t index = 0; index != reference.size() && index != pinned.size(); ++index)
-        failures += expect_eq(reference[index], pinned[index]);
-    return failures;
+        expect_equal(reference[index], pinned[index]);
 }
 
 /** Removes every key in [ start, end ) of each pair of @p starts and @p ends from both sides of
  *  @p compared through @p call, counting a failure for each side that refuses. */
 template <typename arguments_type_>
-std::size_t remove_ranges(void (*call)(arguments_type_*), compared_collections_t& compared,
-                          std::span<ustore_key_t const> starts, std::span<ustore_key_t const> ends) {
-    std::size_t failures = 0;
+void remove_ranges(void (*call)(arguments_type_*), compared_collections_t& compared,
+                   std::span<ustore_key_t const> starts, std::span<ustore_key_t const> ends) {
     for (std::size_t side = 0; side != 2; ++side) {
         ustore_outcome_t outcome {};
         arguments_type_ remove {};
@@ -556,9 +542,8 @@ std::size_t remove_ranges(void (*call)(arguments_type_*), compared_collections_t
         remove.keys = {starts.data(), sizeof(ustore_key_t)};
         remove.end_keys = {ends.data(), sizeof(ustore_key_t)};
         call(&remove);
-        failures += expect_success(outcome);
+        expect_success(outcome);
     }
-    return failures;
 }
 
 /** The bounds one measure reported of one range. */
@@ -599,24 +584,21 @@ expected<measured_bounds_t> measure_bounds(void (*call)(arguments_type_*), compa
 /** Counts a failure unless the reference measures exactly @p cardinality entries in @p bounds
  *  through @p call, and the bounds of the engine under test hold that count. */
 template <typename arguments_type_>
-std::size_t expect_measure_holds(void (*call)(arguments_type_*), compared_collections_t& compared,
-                                 key_bounds_t const& bounds, ustore_size_t cardinality) {
+void expect_measure_holds(void (*call)(arguments_type_*), compared_collections_t& compared, key_bounds_t const& bounds,
+                          ustore_size_t cardinality) {
     auto [tested, tested_status] = measure_bounds(call, compared, 0, bounds);
     auto [reference, reference_status] = measure_bounds(call, compared, 1, bounds);
-    std::size_t failures = expect(tested_status.succeeded()) + expect(reference_status.succeeded());
-    if (failures != 0) return failures;
-    failures += expect_eq(reference.min_cardinality, cardinality);
-    failures += expect_eq(reference.max_cardinality, cardinality);
-    failures += expect(tested.min_cardinality <= cardinality && cardinality <= tested.max_cardinality);
-    return failures;
+    if (!expect_true(tested_status.succeeded()) || !expect_true(reference_status.succeeded())) return;
+    expect_equal(reference.min_cardinality, cardinality);
+    expect_equal(reference.max_cardinality, cardinality);
+    expect_true(tested.min_cardinality <= cardinality && cardinality <= tested.max_cardinality);
 }
 
 /** Counts a failure unless both sides of @p compared draw @p drawn distinct keys of @p written
  *  through @p call when asked for @p wanted. */
 template <typename arguments_type_>
-std::size_t expect_samples_of(void (*call)(arguments_type_*), compared_collections_t& compared,
-                              std::span<ustore_key_t const> written, ustore_size_t wanted, std::size_t drawn) {
-    std::size_t failures = 0;
+void expect_samples_of(void (*call)(arguments_type_*), compared_collections_t& compared,
+                       std::span<ustore_key_t const> written, ustore_size_t wanted, std::size_t drawn) {
     for (std::size_t side = 0; side != 2; ++side) {
         ustore_length_t const* offsets = nullptr;
         ustore_key_t const* keys = nullptr;
@@ -631,17 +613,16 @@ std::size_t expect_samples_of(void (*call)(arguments_type_*), compared_collectio
         sample.arena = compared.arenas[side];
         sample.wanted = wanted;
         call(&sample);
-        failures += expect_success(outcome);
+        expect_success(outcome);
         if (outcome.status != ustore_status_success_k) continue;
-        failures += expect(offsets != nullptr);
+        expect_true(offsets != nullptr);
         if (!offsets) continue;
-        failures += expect_eq(static_cast<std::size_t>(offsets[1] - offsets[0]), drawn);
+        expect_equal(static_cast<std::size_t>(offsets[1] - offsets[0]), drawn);
         for (ustore_length_t index = offsets[0]; index != offsets[1]; ++index) {
-            failures += expect(std::find(written.begin(), written.end(), keys[index]) != written.end());
-            failures += expect(std::find(keys + offsets[0], keys + index, keys[index]) == keys + index);
+            expect_true(std::find(written.begin(), written.end(), keys[index]) != written.end());
+            expect_true(std::find(keys + offsets[0], keys + index, keys[index]) == keys + index);
         }
     }
-    return failures;
 }
 
 /** The keys of @p count_ integers from @p first on, in the order @p direction lists them. */

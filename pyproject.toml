@@ -134,12 +134,14 @@ testpaths = ["test"]
 xfail_strict = true
 
 [tool.ruff.lint]
-extend-select = ["D", "I", "TID"]
+extend-select = ["D", "I", "PT", "TID"]
 
 [tool.ruff.lint.per-file-ignores]
 # cmake-format evaluates its profile with `section` already in scope.
 ".cmake-format.py" = ["F821"]
-"!python/**" = ["D"]
+"!{python,test}/**" = ["D"]
+# Tests owe a docstring on every module-level function (D103) and nothing else from pydocstyle.
+"test/**" = ["D100", "D101", "D102", "D104", "D105", "D106", "D107", "D2", "D3", "D4"]
 "*.pyi" = ["D"]
 
 [tool.ruff.lint.pydocstyle]

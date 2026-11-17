@@ -5,8 +5,6 @@
  *  @brief Unit tests of `ustore/blobs/nvme_memory_run.hpp` and `ustore/blobs/nvme_collection_view.hpp`: what sealing
  *      refuses, reads at every stamp and the conflict checks over random commit streams against a reference model, a
  *      map of every version of every key, and readers walking views while one thread publishes.
- *
- *  The suite prints one line per case and a total, and exits non-zero on a failure.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
@@ -14,17 +12,15 @@
 #include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memcmp`, `std::memcpy`
 
-#include <algorithm>       // `std::sort`, `std::upper_bound`
-#include <array>           // `std::array`
-#include <map>             // `std::map`
-#include <memory>          // `std::addressof`, `std::make_unique`, `std::unique_ptr`
-#include <optional>        // `std::optional`
-#include <random>          // `std::mt19937_64`, `std::uniform_int_distribution`
-#include <source_location> // `std::source_location`
-#include <span>            // `std::span`
-#include <thread>          // `std::thread`
-#include <utility>         // `std::exchange`
-#include <vector>          // `std::vector`
+#include <algorithm> // `std::sort`, `std::upper_bound`
+#include <array>     // `std::array`
+#include <map>       // `std::map`
+#include <memory>    // `std::addressof`, `std::make_unique`, `std::unique_ptr`
+#include <optional>  // `std::optional`
+#include <span>      // `std::span`
+#include <thread>    // `std::thread`
+#include <utility>   // `std::exchange`
+#include <vector>    // `std::vector`
 
 #include <fmt/format.h> // `fmt::println`
 
@@ -35,6 +31,8 @@
 #include "ustore/blobs/nvme_collection_view.hpp" // `collection_view`, `published_view`, `epoch_domain`
 #include "ustore/blobs/nvme_memory_run.hpp"      // `keyed_delta`, `memory_run`, `sealed_deltas`
 #include "ustore/utilities/algorithm.hpp"        // `sort_by_stored_key`
+
+#include "harness.hpp" // `expect_true`, `run_test_case`, `split_mix_generator_t`
 
 namespace unum::ustore::test {
 
@@ -58,21 +56,7 @@ using waiter_t = fu::standard_yield_t;
 using epoch_domain_t = epoch_domain<atomic_reference, waiter_t>;
 using bytes_t = std::vector<byte_t>;
 
-#pragma region Harness and Model
-
-/** Prints a failed check with its location and counts it. */
-static std::size_t check(bool condition, std::source_location location = std::source_location::current()) {
-    if (condition) return 0;
-    fmt::println("    check failed at {}:{}", location.file_name(), location.line());
-    return 1;
-}
-
-template <typename body_type_>
-void run(char const* name, body_type_&& body, std::size_t& failed) {
-    std::size_t const failures = body();
-    fmt::println("{:<48} {}", name, failures ? "FAILED" : "passed");
-    failed += failures != 0;
-}
+#pragma region Model
 
 /** One version of a key as the model keeps it. */
 struct model_version_t {
@@ -100,81 +84,75 @@ static transaction_stamp_t model_newest(model_t const& model, stored_key_t store
 }
 
 /** Whether a view's answer agrees with the model's version, or with its absence. */
-static std::size_t agrees(bool found, delta_view_t const& delta, model_version_t const* version) {
-    if (!found || !version) return check(found == (version != nullptr));
-    if (check(delta.kind == version->kind && delta.bytes.size() == version->bytes.size())) return 1;
-    return check(delta.bytes.empty() ||
-                 std::memcmp(delta.bytes.data(), version->bytes.data(), delta.bytes.size()) == 0);
+static bool agrees(bool found, delta_view_t const& delta, model_version_t const* version) {
+    if (!found || !version) return expect_true(found == (version != nullptr));
+    if (!expect_true(delta.kind == version->kind && delta.bytes.size() == version->bytes.size())) return false;
+    return expect_true(delta.bytes.empty() ||
+                       std::memcmp(delta.bytes.data(), version->bytes.data(), delta.bytes.size()) == 0);
 }
 
-#pragma endregion Harness and Model
+#pragma endregion Model
 
 #pragma region Cases
 
 /** Sealing refuses what a run cannot hold, and a view refuses a run that is not newer than all it names. */
-static std::size_t refusals() {
-    std::size_t failures = 0;
+static void test_refusals() {
     bytes_t const payload(4, byte_t {7});
     std::vector<keyed_delta_t> none;
-    failures += check(sealed_t::seal(none).code() == status_code_t::invalid_argument_k);
+    expect_true(sealed_t::seal(none).code() == status_code_t::invalid_argument_k);
 
     std::vector<keyed_delta_t> repeated {{3, {delta_kind_t::write_k, payload}}, {3, {delta_kind_t::remove_k, {}}}};
-    failures += check(sealed_t::seal(repeated).code() == status_code_t::invalid_argument_k);
+    expect_true(sealed_t::seal(repeated).code() == status_code_t::invalid_argument_k);
 
     std::vector<keyed_delta_t> loaded_removal {{3, {delta_kind_t::remove_k, payload}}};
-    failures += check(sealed_t::seal(loaded_removal).code() == status_code_t::invalid_argument_k);
+    expect_true(sealed_t::seal(loaded_removal).code() == status_code_t::invalid_argument_k);
 
     std::vector<keyed_delta_t> deltas {{3, {delta_kind_t::write_k, payload}}};
     expected<sealed_t> sealed = sealed_t::seal(deltas);
-    if (check(sealed.has_value())) return failures + 1;
-    failures += check(run_t::stamped(std::move(*sealed), unwritten_stamp_k).code() ==
-                      status_code_t::invalid_argument_k);
+    if (!expect_true(sealed.has_value())) return;
+    expect_true(run_t::stamped(std::move(*sealed), unwritten_stamp_k).code() == status_code_t::invalid_argument_k);
 
     std::vector<keyed_delta_t> newer {{3, {delta_kind_t::write_k, payload}}};
     std::vector<keyed_delta_t> older {{4, {delta_kind_t::write_k, payload}}};
     expected<run_t> newer_run = run_t::stamped(*sealed_t::seal(newer), 9);
     expected<run_t> older_run = run_t::stamped(*sealed_t::seal(older), 9);
-    if (check(newer_run.has_value() && older_run.has_value())) return failures + 1;
+    if (!expect_true(newer_run.has_value() && older_run.has_value())) return;
     view_t const empty;
     expected<view_t> holding = view_t::extended(empty, *newer_run);
-    if (check(holding.has_value())) return failures + 1;
-    failures += check(view_t::extended(*holding, *older_run).code() == status_code_t::invalid_argument_k);
-    return failures;
+    if (!expect_true(holding.has_value())) return;
+    expect_true(view_t::extended(*holding, *older_run).code() == status_code_t::invalid_argument_k);
 }
 
 /** A removal and a write of no bytes read back apart, which a sentinel offset or size used to decide. */
-static std::size_t removal_and_empty_value_differ() {
-    std::size_t failures = 0;
+static void test_removal_and_empty_value_differ() {
     std::vector<keyed_delta_t> deltas {{20, {delta_kind_t::remove_k, {}}}, {10, {delta_kind_t::write_k, {}}}};
     expected<sealed_t> sealed = sealed_t::seal(deltas);
-    if (check(sealed.has_value())) return 1;
+    if (!expect_true(sealed.has_value())) return;
     expected<run_t> stamped = run_t::stamped(std::move(*sealed), 5);
-    if (check(stamped.has_value())) return 1;
+    if (!expect_true(stamped.has_value())) return;
     view_t const empty;
     expected<view_t> view = view_t::extended(empty, *stamped);
-    if (check(view.has_value())) return 1;
+    if (!expect_true(view.has_value())) return;
 
     delta_view_t found;
-    failures += check(view->find(10, 5, found) && found.kind == delta_kind_t::write_k && found.bytes.empty());
-    failures += check(view->find(20, 5, found) && found.kind == delta_kind_t::remove_k && found.bytes.empty());
-    failures += check(!view->find(10, 4, found) && !view->find(30, 5, found));
-    failures += check(view->written_since(20, 4) && !view->written_since(20, 5) && !view->written_since(30, 0));
-    failures += check(view->range_written_since(11, 20, 4) && !view->range_written_since(11, 19, 4));
-    return failures;
+    expect_true(view->find(10, 5, found) && found.kind == delta_kind_t::write_k && found.bytes.empty());
+    expect_true(view->find(20, 5, found) && found.kind == delta_kind_t::remove_k && found.bytes.empty());
+    expect_true(!view->find(10, 4, found) && !view->find(30, 5, found));
+    expect_true(view->written_since(20, 4) && !view->written_since(20, 5) && !view->written_since(30, 0));
+    expect_true(view->range_written_since(11, 20, 4) && !view->range_written_since(11, 19, 4));
 }
 
 /** Sorting orders deltas by key, by insertion below 64 entries and by radix from there, through
  *  bytes every key shares and runs of one repeated key, as a library sort over the same 16-byte
  *  keys orders them. */
-static std::size_t sort_orders_by_key() {
+static void test_sort_orders_by_key() {
     using wide_delta_t = keyed_delta<st::key128_t>;
-    std::size_t failures = 0;
-    std::mt19937_64 generator(42);
+    split_mix_generator_t generator {case_stream_key()};
     for (std::size_t const count : {std::size_t {20}, std::size_t {1000}}) {
         std::vector<wide_delta_t> deltas(count);
         for (std::size_t index = 0; index != count; ++index) {
-            std::uint64_t const high = (generator() % 4) << 40;
-            std::uint64_t const low = (generator() % 3) << 16;
+            std::uint64_t const high = generator.below(4) << 40;
+            std::uint64_t const low = generator.below(3) << 16;
             deltas[index] = wide_delta_t {{high, low}, {delta_kind_t::remove_k, {}}};
         }
         std::vector<wide_delta_t> reference = deltas;
@@ -185,19 +163,17 @@ static std::size_t sort_orders_by_key() {
         std::size_t mismatched = 0;
         for (std::size_t index = 0; index != count; ++index)
             mismatched += deltas[index].stored_key != reference[index].stored_key;
-        failures += check(mismatched == 0);
+        expect_true(mismatched == 0);
     }
-    return failures;
 }
 
 /** A range tombstone hides the older versions of its keys from a reader at or past its stamp,
  *  conflicts with a watch below it, and a merge of the runs drops the versions it hides from
  *  every reader while a pinned reader keeps its own; a write the same commit lands inside the
  *  range survives it. */
-static std::size_t range_tombstones_hide_older_runs() {
+static void test_range_tombstones_hide_older_runs() {
     using range_t = sealed_t::range_t;
     using versions_t = st::vector<stamped_delta<stored_key_t>>;
-    std::size_t failures = 0;
     std::array<byte_t, 3> const payload {byte_t {5}, byte_t {5}, byte_t {5}};
     std::array<keyed_delta_t, 3> oldest {keyed_delta_t {10, {delta_kind_t::write_k, payload}},
                                          keyed_delta_t {20, {delta_kind_t::write_k, payload}},
@@ -205,71 +181,64 @@ static std::size_t range_tombstones_hide_older_runs() {
     std::array<keyed_delta_t, 1> ranged {keyed_delta_t {25, {delta_kind_t::write_k, payload}}};
     std::array<keyed_delta_t, 1> newest {keyed_delta_t {30, {delta_kind_t::write_k, payload}}};
     range_t const range {15, 35};
-    failures += check(sealed_t::seal(std::span<keyed_delta_t> {}, std::span<range_t const> {&range, 1}).has_value());
+    expect_true(sealed_t::seal(std::span<keyed_delta_t> {}, std::span<range_t const> {&range, 1}).has_value());
     range_t const backwards {35, 15};
-    failures += check(sealed_t::seal(ranged, std::span<range_t const> {&backwards, 1}).code() ==
-                      status_code_t::invalid_argument_k);
+    expect_true(sealed_t::seal(ranged, std::span<range_t const> {&backwards, 1}).code() ==
+                status_code_t::invalid_argument_k);
     expected<run_t> first = run_t::stamped(*sealed_t::seal(oldest), 5);
     expected<run_t> second = run_t::stamped(*sealed_t::seal(ranged, std::span<range_t const> {&range, 1}), 7);
     expected<run_t> third = run_t::stamped(*sealed_t::seal(newest), 9);
-    if (check(first.has_value() && second.has_value() && third.has_value())) return failures + 1;
-    failures += check(second->newest_stamp() == 7 && second->range_tombstones().size() == 1);
+    if (!expect_true(first.has_value() && second.has_value() && third.has_value())) return;
+    expect_true(second->newest_stamp() == 7 && second->range_tombstones().size() == 1);
 
     view_t const empty;
     expected<view_t> one = view_t::extended(empty, *first);
-    if (check(one.has_value())) return failures + 1;
+    if (!expect_true(one.has_value())) return;
     expected<view_t> two = view_t::extended(*one, *second);
-    if (check(two.has_value())) return failures + 1;
+    if (!expect_true(two.has_value())) return;
     expected<view_t> view = view_t::extended(*two, *third);
-    if (check(view.has_value())) return failures + 1;
-    failures += check(view->covering_stamp(20, 9) == 7 && view->covering_stamp(20, 6) == unwritten_stamp_k);
-    failures += check(view->covering_stamp(10, 9) == unwritten_stamp_k && view->covering_stamp(35, 9) == 0);
-    failures += check(view->written_since(20, 6) && !view->written_since(20, 7) && !view->written_since(10, 5));
-    failures += check(view->range_written_since(16, 18, 6) && !view->range_written_since(16, 18, 7));
+    if (!expect_true(view.has_value())) return;
+    expect_true(view->covering_stamp(20, 9) == 7 && view->covering_stamp(20, 6) == unwritten_stamp_k);
+    expect_true(view->covering_stamp(10, 9) == unwritten_stamp_k && view->covering_stamp(35, 9) == 0);
+    expect_true(view->written_since(20, 6) && !view->written_since(20, 7) && !view->written_since(10, 5));
+    expect_true(view->range_written_since(16, 18, 6) && !view->range_written_since(16, 18, 7));
 
     run_t const* const runs[3] {std::addressof(*third), std::addressof(*second), std::addressof(*first)};
     auto const kept_keys = [&](compaction_stamps_t const& survival, std::span<stored_key_t const> wanted) {
         versions_t versions;
         // The last-write fold composes nothing, so it never allocates from the arena it is given.
         utilities::arena_allocator<byte_t> folded_bytes;
-        if (check(kept_versions(std::span<run_t const* const> {runs}, survival, utilities::last_write_fold_t {},
-                                versions, folded_bytes)
-                      .succeeded()))
-            return std::size_t {1};
-        std::size_t mismatches = check(versions.size() == wanted.size());
+        if (!expect_true(kept_versions(std::span<run_t const* const> {runs}, survival, utilities::last_write_fold_t {},
+                                       versions, folded_bytes)
+                             .succeeded()))
+            return;
+        expect_true(versions.size() == wanted.size());
         for (std::size_t index = 0; index != versions.size() && index != wanted.size(); ++index)
-            mismatches += check(versions[index].stored_key == wanted[index]);
-        return mismatches;
+            expect_true(versions[index].stored_key == wanted[index]);
     };
     // With no reader, key 20 and the older 30 drop; a reader at 6 still reads both.
     std::array<stored_key_t, 3> const newest_kept {10, 25, 30};
-    failures += kept_keys(compaction_stamps_t {}, newest_kept);
+    kept_keys(compaction_stamps_t {}, newest_kept);
     std::uint64_t const pinned[1] {6};
     compaction_stamps_t survival;
     survival.pinned = pinned;
     survival.pinned_count = 1;
     std::array<stored_key_t, 5> const pinned_kept {10, 20, 25, 30, 30};
-    failures += kept_keys(survival, pinned_kept);
+    kept_keys(survival, pinned_kept);
 
     auto [tombstones, tombstones_status] = gathered_range_tombstones(std::span<run_t const* const> {runs},
                                                                      st::default_allocator<byte_t> {});
-    failures += check(tombstones_status.succeeded() && tombstones.size() == 1 && tombstones.stamp(0) == 7);
-    return failures;
+    expect_true(tombstones_status.succeeded() && tombstones.size() == 1 && tombstones.stamp(0) == 7);
 }
 
 /** Random commits, each one run on top of the last view, read at random stamps and checked for conflicts against
  *  the model; every older view keeps answering at its own stamp. */
-static std::size_t random_streams_match_model() {
+static void test_random_streams_match_model() {
     constexpr std::size_t commits_count_k = 400;
     constexpr stored_key_t keys_count_k = 64;
     constexpr std::size_t probes_per_commit_k = 24;
-    std::size_t failures = 0;
-    for (std::uint64_t seed = 1; seed <= 3 && failures == 0; ++seed) {
-        std::mt19937_64 generator(seed);
-        std::uniform_int_distribution<std::size_t> deltas_count(1, 8), kind_pick(0, 9), length_pick(0, 16);
-        // A few keys past the written ones are probed and never found.
-        std::uniform_int_distribution<stored_key_t> key_pick(0, keys_count_k - 1), probe_pick(0, keys_count_k + 7);
-        std::uniform_int_distribution<int> byte_pick(0, 255);
+    for (std::uint64_t seed = 1; seed <= 3; ++seed) {
+        split_mix_generator_t generator {case_stream_key(seed)};
 
         model_t model;
         // Reserved whole, so the runs every view names never move.
@@ -278,64 +247,64 @@ static std::size_t random_streams_match_model() {
         runs.reserve(commits_count_k);
         views.reserve(commits_count_k + 1);
         views.emplace_back();
-        for (transaction_stamp_t stamp = 1; stamp <= commits_count_k && failures == 0; ++stamp) {
+        for (transaction_stamp_t stamp = 1; stamp <= commits_count_k; ++stamp) {
             std::vector<keyed_delta_t> deltas;
             std::vector<bytes_t> payloads;
-            std::size_t const wanted = deltas_count(generator);
+            std::size_t const wanted = 1 + generator.below(8);
             payloads.reserve(wanted);
             for (std::size_t index = 0; index != wanted; ++index) {
-                stored_key_t const stored_key = key_pick(generator);
+                stored_key_t const stored_key = generator.below(keys_count_k);
                 bool repeated = false;
                 for (keyed_delta_t const& delta : deltas) repeated |= delta.stored_key == stored_key;
                 if (repeated) continue;
-                std::size_t const kind_roll = kind_pick(generator);
+                std::size_t const kind_roll = generator.below(10);
                 delta_kind_t const kind = kind_roll < 6   ? delta_kind_t::write_k
                                           : kind_roll < 9 ? delta_kind_t::remove_k
                                                           : delta_kind_t::change_k;
                 bytes_t& payload = payloads.emplace_back();
-                if (kind != delta_kind_t::remove_k) payload.resize(length_pick(generator));
-                for (byte_t& value : payload) value = static_cast<byte_t>(byte_pick(generator));
+                if (kind != delta_kind_t::remove_k) payload.resize(generator.below(17));
+                for (byte_t& value : payload) value = static_cast<byte_t>(generator.below(256));
                 deltas.push_back(keyed_delta_t {stored_key, {kind, payload}});
                 model[stored_key].push_back(model_version_t {stamp, kind, payload});
             }
 
             expected<sealed_t> sealed = sealed_t::seal(deltas);
-            if (check(sealed.has_value())) return failures + 1;
+            if (!expect_true(sealed.has_value())) return;
             expected<run_t> stamped = run_t::stamped(std::move(*sealed), stamp);
-            if (check(stamped.has_value())) return failures + 1;
+            if (!expect_true(stamped.has_value())) return;
             runs.push_back(std::move(*stamped));
             expected<view_t> extended = view_t::extended(views.back(), runs.back());
-            if (check(extended.has_value())) return failures + 1;
+            if (!expect_true(extended.has_value())) return;
             views.push_back(std::move(*extended));
             view_t const& view = views.back();
-            failures += check(view.newest_stamp() == stamp && view.runs().size() == stamp);
+            if (!expect_true(view.newest_stamp() == stamp && view.runs().size() == stamp)) return;
 
-            std::uniform_int_distribution<transaction_stamp_t> stamp_pick(0, stamp);
             for (std::size_t probe = 0; probe != probes_per_commit_k; ++probe) {
-                stored_key_t const stored_key = probe_pick(generator);
-                transaction_stamp_t const at = stamp_pick(generator);
+                // A few keys past the written ones are probed and never found.
+                stored_key_t const stored_key = generator.below(keys_count_k + 8);
+                transaction_stamp_t const at = generator.below(stamp + 1);
                 delta_view_t found;
                 bool const answered = view.find(stored_key, at, found);
-                failures += agrees(answered, found, model_find(model, stored_key, at));
+                if (!agrees(answered, found, model_find(model, stored_key, at))) return;
 
-                transaction_stamp_t const from = stamp_pick(generator);
-                failures += check(view.written_since(stored_key, from) == (model_newest(model, stored_key) > from));
+                transaction_stamp_t const from = generator.below(stamp + 1);
+                if (!expect_true(view.written_since(stored_key, from) == (model_newest(model, stored_key) > from)))
+                    return;
 
-                stored_key_t const other = probe_pick(generator);
+                stored_key_t const other = generator.below(keys_count_k + 8);
                 stored_key_t const lower = fu::min_of(stored_key, other);
                 stored_key_t const upper = fu::max_of(stored_key, other);
                 bool range_written = false;
                 for (stored_key_t key = lower; key <= upper; ++key) range_written |= model_newest(model, key) > from;
-                failures += check(view.range_written_since(lower, upper, from) == range_written);
+                if (!expect_true(view.range_written_since(lower, upper, from) == range_written)) return;
 
                 // The view published at an older stamp still answers at that stamp, whatever came after it.
-                transaction_stamp_t const published_stamp = stamp_pick(generator);
+                transaction_stamp_t const published_stamp = generator.below(stamp + 1);
                 bool const answered_then = views[published_stamp].find(stored_key, head_stamp_k, found);
-                failures += agrees(answered_then, found, model_find(model, stored_key, published_stamp));
+                if (!agrees(answered_then, found, model_find(model, stored_key, published_stamp))) return;
             }
         }
     }
-    return failures;
 }
 
 /** Appends a change's bytes to the value below it, into bytes the case frees once a merge returns,
@@ -387,15 +356,11 @@ static std::optional<bytes_t> value_at_head(std::span<run_t const* const> runs, 
 /** Commits of writes, removals and changes, every other one lending its bytes, merge four runs of a
  *  tier at a time up to tier three, each merge copying only the values it folded and freeing the
  *  runs it took the buffers of, and every key reads back as the model. */
-static std::size_t merges_keep_values_intact() {
+static void test_merges_keep_values_intact() {
     constexpr std::size_t fan_in_k = 4;
     constexpr std::size_t commits_count_k = fan_in_k * fan_in_k * fan_in_k;
     constexpr stored_key_t keys_count_k = 24;
-    std::size_t failures = 0;
-    std::mt19937_64 generator(11);
-    std::uniform_int_distribution<std::size_t> deltas_count(1, 6), kind_pick(0, 19), length_pick(0, 48);
-    std::uniform_int_distribution<stored_key_t> key_pick(0, keys_count_k - 1);
-    std::uniform_int_distribution<int> byte_pick(0, 255);
+    split_mix_generator_t generator {case_stream_key()};
 
     std::map<stored_key_t, std::optional<bytes_t>> model;
     // Oldest first, so the runs of one tier due for a merge sit at the back.
@@ -405,20 +370,20 @@ static std::size_t merges_keep_values_intact() {
         for (std::size_t index = runs.size(); index-- != 0;) listed.push_back(runs[index].get());
         return listed;
     };
-    for (transaction_stamp_t stamp = 1; stamp <= commits_count_k && failures == 0; ++stamp) {
+    for (transaction_stamp_t stamp = 1; stamp <= commits_count_k; ++stamp) {
         std::vector<keyed_delta_t> deltas;
-        std::vector<bytes_t> payloads(deltas_count(generator));
+        std::vector<bytes_t> payloads(1 + generator.below(6));
         for (bytes_t& payload : payloads) {
-            stored_key_t const stored_key = key_pick(generator);
+            stored_key_t const stored_key = generator.below(keys_count_k);
             bool repeated = false;
             for (keyed_delta_t const& delta : deltas) repeated |= delta.stored_key == stored_key;
             if (repeated) continue;
-            std::size_t const kind_roll = kind_pick(generator);
+            std::size_t const kind_roll = generator.below(20);
             delta_kind_t const kind = kind_roll < 12   ? delta_kind_t::write_k
                                       : kind_roll < 15 ? delta_kind_t::remove_k
                                                        : delta_kind_t::change_k;
-            if (kind != delta_kind_t::remove_k) payload.resize(length_pick(generator));
-            for (byte_t& value : payload) value = static_cast<byte_t>(byte_pick(generator));
+            if (kind != delta_kind_t::remove_k) payload.resize(generator.below(49));
+            for (byte_t& value : payload) value = static_cast<byte_t>(generator.below(256));
             deltas.push_back(keyed_delta_t {stored_key, {kind, payload}});
             std::optional<bytes_t>& modelled = model[stored_key];
             if (kind == delta_kind_t::remove_k) modelled.reset();
@@ -430,7 +395,7 @@ static std::size_t merges_keep_values_intact() {
         if (stamp % 2 == 0) {
             std::size_t filled = 0;
             for (keyed_delta_t const& delta : deltas) filled += delta.delta.bytes.size();
-            failures += check(lent.resize(filled) == st::status_t::success_k);
+            if (!expect_true(lent.resize(filled) == st::status_t::success_k)) return;
             filled = 0;
             for (keyed_delta_t& delta : deltas) {
                 std::size_t const size = delta.delta.bytes.size();
@@ -442,11 +407,11 @@ static std::size_t merges_keep_values_intact() {
         }
         byte_t const* const lent_bytes = lent.data();
         expected<sealed_t> sealed = sealed_t::seal(deltas, {}, {}, std::span<byte_t const> {lent});
-        if (check(sealed.has_value())) return failures + 1;
+        if (!expect_true(sealed.has_value())) return;
         sealed->adopt(lent);
-        failures += check(lent_bytes == nullptr || (lent.empty() && sealed->bases().front() == lent_bytes));
+        if (!expect_true(lent_bytes == nullptr || (lent.empty() && sealed->bases().front() == lent_bytes))) return;
         expected<run_t> stamped = run_t::stamped(std::move(*sealed), stamp);
-        if (check(stamped.has_value())) return failures + 1;
+        if (!expect_true(stamped.has_value())) return;
         runs.push_back(std::make_unique<run_t>(std::move(*stamped)));
 
         while (runs.size() >= fan_in_k && runs[runs.size() - fan_in_k]->tier() == runs.back()->tier()) {
@@ -455,14 +420,15 @@ static std::size_t merges_keep_values_intact() {
             st::vector<stamped_delta<stored_key_t>> versions;
             std::vector<bytes_t> folded;
             utilities::arena_allocator<byte_t> unused;
-            failures += check(
-                kept_versions(group, compaction_stamps_t {}, appending_fold_t {&folded}, versions, unused).succeeded());
+            if (!expect_true(kept_versions(group, compaction_stamps_t {}, appending_fold_t {&folded}, versions, unused)
+                                 .succeeded()))
+                return;
             auto [tombstones, tombstones_status] = gathered_range_tombstones(group, st::default_allocator<byte_t> {});
-            failures += check(tombstones_status.succeeded());
+            if (!expect_true(tombstones_status.succeeded())) return;
             expected<run_t> merged = run_t::merged(group, std::span<stamped_delta<stored_key_t> const> {versions},
                                                    std::move(tombstones), group.back()->oldest_stamp(),
                                                    group.back()->tier());
-            if (check(merged.has_value())) return failures + 1;
+            if (!expect_true(merged.has_value())) return;
             for (std::size_t index = runs.size() - fan_in_k; index != runs.size(); ++index)
                 merged->inherit(std::move(*runs[index]));
             runs.resize(runs.size() - fan_in_k);
@@ -473,11 +439,10 @@ static std::size_t merges_keep_values_intact() {
         for (stored_key_t stored_key = 0; stored_key != keys_count_k; ++stored_key) {
             std::optional<bytes_t> const read = value_at_head(std::span<run_t const* const> {listed}, stored_key);
             std::map<stored_key_t, std::optional<bytes_t>>::const_iterator const found = model.find(stored_key);
-            failures += check(read == (found == model.end() ? std::nullopt : found->second));
+            if (!expect_true(read == (found == model.end() ? std::nullopt : found->second))) return;
         }
     }
-    failures += check(runs.size() == 1 && runs.front()->tier() == 3);
-    return failures;
+    expect_true(runs.size() == 1 && runs.front()->tier() == 3);
 }
 
 /** A view a publisher allocated and frees once replaced, counting itself out when freed. */
@@ -496,7 +461,7 @@ struct held_view_t {
  *  The publisher waits out the readers after every commit and frees both replaced views before the next, while one
  *  reader announces on an executor slot, the others on shared slots, and every reader nests a second announcement.
  */
-static std::size_t readers_against_one_publisher() {
+static void test_readers_against_one_publisher() {
     constexpr std::size_t commits_count_k = 2000;
     constexpr stored_key_t keys_count_k = 64;
     constexpr std::size_t readers_count_k = 3;
@@ -511,7 +476,7 @@ static std::size_t readers_against_one_publisher() {
 
     st::commit_order_t order;
     epoch_domain_t epochs;
-    std::size_t failures = check(epochs.reserve_threads(1).succeeded());
+    expect_true(epochs.reserve_threads(1).succeeded());
     std::size_t alive {0};
     auto held = [&]() noexcept {
         held_view_t* const made = new held_view_t {};
@@ -531,9 +496,8 @@ static std::size_t readers_against_one_publisher() {
     [[maybe_unused]] view_t const* const first_empty = first.replace(first_current->view);
     [[maybe_unused]] view_t const* const second_empty = second.replace(second_current->view);
 
-    std::size_t publisher_failures = 0;
     auto publish = [&]() noexcept {
-        for (transaction_stamp_t stamp = 1; stamp <= commits_count_k && publisher_failures == 0; ++stamp) {
+        for (transaction_stamp_t stamp = 1; stamp <= commits_count_k; ++stamp) {
             bytes_t payload(sizeof(stamp));
             std::memcpy(payload.data(), &stamp, sizeof(stamp));
             delta_kind_t const kind = kind_of(stamp);
@@ -543,23 +507,20 @@ static std::size_t readers_against_one_publisher() {
             keyed_delta_t second_delta {key_of(stamp), {kind, bytes}};
             expected<sealed_t> first_sealed = sealed_t::seal(std::span<keyed_delta_t>(&first_delta, 1));
             expected<sealed_t> second_sealed = sealed_t::seal(std::span<keyed_delta_t>(&second_delta, 1));
-            publisher_failures += check(first_sealed.has_value() && second_sealed.has_value());
-            if (publisher_failures) return;
+            if (!expect_true(first_sealed.has_value() && second_sealed.has_value())) return;
 
             st::commit_order_t::commit_in_flight_t in_flight;
             order.begin_commit(in_flight);
             transaction_stamp_t const drawn = static_cast<transaction_stamp_t>(in_flight.stamp());
-            publisher_failures += check(drawn == stamp);
+            if (!expect_true(drawn == stamp)) return;
             expected<run_t> first_run = run_t::stamped(std::move(*first_sealed), drawn);
             expected<run_t> second_run = run_t::stamped(std::move(*second_sealed), drawn);
-            publisher_failures += check(first_run.has_value() && second_run.has_value());
-            if (publisher_failures) return;
+            if (!expect_true(first_run.has_value() && second_run.has_value())) return;
             first_runs.push_back(std::move(*first_run));
             second_runs.push_back(std::move(*second_run));
             expected<view_t> first_view = view_t::extended(first_current->view, first_runs.back());
             expected<view_t> second_view = view_t::extended(second_current->view, second_runs.back());
-            publisher_failures += check(first_view.has_value() && second_view.has_value());
-            if (publisher_failures) return;
+            if (!expect_true(first_view.has_value() && second_view.has_value())) return;
             held_view_t* const first_next = held();
             held_view_t* const second_next = held();
             first_next->view = std::move(*first_view);
@@ -571,25 +532,22 @@ static std::size_t readers_against_one_publisher() {
             delete std::exchange(first_current, first_next);
             delete std::exchange(second_current, second_next);
             // Nothing replaced outlives the commit that replaced it.
-            publisher_failures += check(atomic_reference<std::size_t> {alive}.load(std::memory_order_relaxed) == 2);
+            if (!expect_true(atomic_reference<std::size_t> {alive}.load(std::memory_order_relaxed) == 2)) return;
         }
     };
 
-    std::vector<std::size_t> reader_failures(readers_count_k, 0);
     std::vector<std::size_t> reader_reads(readers_count_k, 0);
     auto read = [&](std::size_t reader) noexcept {
-        std::mt19937_64 generator(reader + 1);
-        std::uniform_int_distribution<stored_key_t> key_pick(0, keys_count_k - 1);
-        std::size_t& failures = reader_failures[reader];
-        for (transaction_stamp_t at = 0; at != commits_count_k && failures == 0;) {
+        split_mix_generator_t generator {case_stream_key(reader + 1)};
+        for (transaction_stamp_t at = 0; at != commits_count_k;) {
             epoch_domain_t::reader_t const inside = reader == 0 ? epochs.enter(0) : epochs.enter();
             epoch_domain_t::reader_t const nested = epochs.enter();
             at = static_cast<transaction_stamp_t>(order.published_stamp());
             view_t const* const first_view = first.load();
             view_t const* const second_view = second.load();
-            failures += check(first_view->newest_stamp() >= at && second_view->newest_stamp() >= at);
+            if (!expect_true(first_view->newest_stamp() >= at && second_view->newest_stamp() >= at)) return;
 
-            stored_key_t const stored_key = key_pick(generator);
+            stored_key_t const stored_key = generator.below(keys_count_k);
             std::vector<transaction_stamp_t> const& stamps = writers[stored_key];
             std::vector<transaction_stamp_t>::const_iterator const after = std::upper_bound(stamps.begin(),
                                                                                             stamps.end(), at);
@@ -597,14 +555,15 @@ static std::size_t readers_against_one_publisher() {
             delta_view_t first_found, second_found;
             bool const first_answered = first_view->find(stored_key, at, first_found);
             bool const second_answered = second_view->find(stored_key, at, second_found);
-            failures += check(first_answered == (newest != unwritten_stamp_k) && second_answered == first_answered);
+            if (!expect_true(first_answered == (newest != unwritten_stamp_k) && second_answered == first_answered))
+                return;
             if (first_answered && second_answered) {
-                failures += check(first_found.kind == kind_of(newest) && second_found.kind == first_found.kind);
+                if (!expect_true(first_found.kind == kind_of(newest) && second_found.kind == first_found.kind)) return;
                 if (first_found.kind == delta_kind_t::write_k) {
                     transaction_stamp_t written = unwritten_stamp_k;
-                    failures += check(first_found.bytes.size() == sizeof(written));
-                    if (failures == 0) std::memcpy(&written, first_found.bytes.data(), sizeof(written));
-                    failures += check(written == newest);
+                    if (!expect_true(first_found.bytes.size() == sizeof(written))) return;
+                    std::memcpy(&written, first_found.bytes.data(), sizeof(written));
+                    if (!expect_true(written == newest)) return;
                 }
             }
             ++reader_reads[reader];
@@ -617,34 +576,27 @@ static std::size_t readers_against_one_publisher() {
     publisher.join();
     for (std::thread& reader : readers) reader.join();
 
-    failures += publisher_failures;
     delete first_current;
     delete second_current;
-    failures += check(atomic_reference<std::size_t> {alive}.load() == 0);
+    expect_true(atomic_reference<std::size_t> {alive}.load() == 0);
     std::size_t reads = 0;
-    for (std::size_t reader = 0; reader != readers_count_k; ++reader) {
-        failures += reader_failures[reader];
-        reads += reader_reads[reader];
-    }
+    for (std::size_t reader = 0; reader != readers_count_k; ++reader) reads += reader_reads[reader];
     fmt::println("    {} reads by {} readers over {} commits", reads, readers_count_k, commits_count_k);
-    return failures;
 }
 
 #pragma endregion Cases
 
 } // namespace unum::ustore::test
 
-int main() {
+int main(int argc, char** argv) {
     using namespace unum::ustore::test;
-    std::size_t failed = 0, total = 0;
-    auto counted = [&](char const* name, auto body) { run(name, body, failed), ++total; };
-    counted("memory_run.refusals", refusals);
-    counted("memory_run.removal_and_empty_value_differ", removal_and_empty_value_differ);
-    counted("memory_run.range_tombstones_hide_older_runs", range_tombstones_hide_older_runs);
-    counted("memory_run.sort_orders_by_key", sort_orders_by_key);
-    counted("memory_run.merges_keep_values_intact", merges_keep_values_intact);
-    counted("collection_view.random_streams_match_model", random_streams_match_model);
-    counted("collection_view.readers_against_one_publisher", readers_against_one_publisher);
-    fmt::println("total {} passed, {} failed", total - failed, failed);
-    return failed ? 1 : 0;
+    start_test_run(argc, argv);
+    run_test_case("test_refusals", test_refusals);
+    run_test_case("test_removal_and_empty_value_differ", test_removal_and_empty_value_differ);
+    run_test_case("test_range_tombstones_hide_older_runs", test_range_tombstones_hide_older_runs);
+    run_test_case("test_sort_orders_by_key", test_sort_orders_by_key);
+    run_test_case("test_merges_keep_values_intact", test_merges_keep_values_intact);
+    run_test_case("test_random_streams_match_model", test_random_streams_match_model);
+    run_test_case("test_readers_against_one_publisher", test_readers_against_one_publisher);
+    return finish_test_run();
 }
