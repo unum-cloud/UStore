@@ -5,10 +5,11 @@
  *  @brief Spin model of an owner's credit against a bounded completion queue and its overflow list.
  *
  *  The completion queue an owner reaps from and the kernel-side list that catches what the queue
- *  has no room for, as the ring of `src/nvme/ring.hpp` fixes it. An overflowed entry stays
- *  invisible until the owner enters the kernel again, which is why `reap` tests
- *  `IORING_SQ_CQ_OVERFLOW`. A cancellation is what makes the full queue reachable at all. Nothing
- *  is lost in the overflow list, since `IORING_SETUP_CQ_NODROP` promises it, which is not checked.
+ *  has no room for, as @c linux_uring_files_disk in @c nvme_linux_uring_disk.hpp fixes it. An
+ *  overflowed entry stays invisible until the owner enters the kernel again, which is why
+ *  @c poll_completions tests @c IORING_SQ_CQ_OVERFLOW. A cancellation is what makes the full queue
+ *  reachable at all. Nothing is lost in the overflow list, since @c IORING_SETUP_CQ_NODROP promises
+ *  it, which is not checked.
  *
  *  - `every_request_retires`: every request the owner submitted yields one terminal completion.
  *  - `no_completion_is_lost`: the kernel never has to drop a completion for want of a seat.

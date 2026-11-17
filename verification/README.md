@@ -6,7 +6,7 @@ Both are checked here rather than argued about in review: Spin checks a Promela 
 - `durability.pml`: the two-flush manifest commit of both volumes, rename and owner block, with a crash injected at every step.
 - `nvme_ring.pml`: an owner's credit against a bounded completion queue and the overflow list behind it.
 - `nvme_ring_ownership.pml`: one issuing thread per ring, and the queue pairs that move between them.
-- `reader_gates.cpp`: the two-slot reader gate of `lsm_tree` and the catalog under GenMC, which finds the freed slot once its fences are dropped.
+- `epoch_domain.cpp`: the reader epochs a writer waits out before it frees a replaced view of a collection, under GenMC, which finds the freed view once either fence is dropped.
 - `epoch_claim/`: the parking claim a database's maintenance, catalog and blob writes run under, in Spin and GenMC: no maintenance lost, one holder at a time, and no committer starved by a holder retaking it.
 - `transaction_commit.pml`: staging and committing across collections at both isolation levels.
 - `snapshot_lifetime.pml`: snapshots created, exported and dropped while writers publish.
