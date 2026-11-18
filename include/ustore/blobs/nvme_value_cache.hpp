@@ -100,8 +100,7 @@ class value_cache {
         if (affordable == 0) return cache;
         // A slot is found by masking the hash, so the budget is rounded down to a power of
         // two of slots.
-        if (cache.slots_.resize(std::bit_floor(affordable)) != st::status_t::success_k) return cache;
-        for (std::uint64_t*& slot : cache.slots_) slot = nullptr;
+        if (cache.slots_.resize(std::bit_floor(affordable), nullptr) != st::status_t::success_k) return cache;
         cache.slot_words_ = slot_words;
         return cache;
     }
@@ -151,7 +150,7 @@ class value_cache {
      *  the budget refusing the slot's first words, caches nothing. */
     void add(stored_key_t const& stored_key, transaction_stamp_t stamp, std::span<byte_t const> stored_value) noexcept {
         if (slots_.empty() || words_of_(stored_value.size()) > slot_words_ - value_word_k) return;
-        std::uint64_t* const words = words_of_slot_(slots_[slot_of_(stored_key, stamp)]);
+        std::uint64_t* const words = words_of_slot_(slot_of_(stored_key, stamp));
         if (!words) return;
         atomic_reference_<std::uint64_t> const sequence {words[sequence_word_k]};
         std::uint64_t stable = sequence.load(std::memory_order_relaxed);
@@ -194,11 +193,11 @@ class value_cache {
         return (stored_key_hash_t {}(stored_key) ^ st::hash<transaction_stamp_t> {}(stamp)) & (slots_.size() - 1);
     }
 
-    /** The words @p slot owns, allocated with a zero header by the first fill and kept until the
-     *  cache dies, or null when the budget refuses them; two first fills racing keep the words of
-     *  whichever publishes first. */
-    [[nodiscard]] std::uint64_t* words_of_slot_(std::uint64_t*& slot) noexcept {
-        atomic_reference_<std::uint64_t*> const published {slot};
+    /** The words slot @p slot owns, allocated with a zero header by the first fill and kept until
+     *  the cache dies, or null when the budget refuses them; two first fills racing keep the words
+     *  of whichever publishes first. */
+    [[nodiscard]] std::uint64_t* words_of_slot_(std::size_t slot) noexcept {
+        atomic_reference_<std::uint64_t*> const published {slots_[slot]};
         if (std::uint64_t* const words = published.load(std::memory_order_acquire)) return words;
         words_allocator_t allocator {slots_.get_allocator()};
         std::uint64_t* const allocated = allocator.allocate(slot_words_);

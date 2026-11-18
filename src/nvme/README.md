@@ -41,7 +41,7 @@ The types are templates of `include/ustore/`, which `variants.hpp` instantiates 
 - `blobs/nvme_store.hpp` — `nvme_store` and its snapshot; `blobs/nvme_value_cache.hpp` holds the value cache and `blobs/nvme_store_cursor.hpp` holds `nvme_store_cursor`.
 - `blobs/nvme_transactions.hpp` — `transaction_deltas`, the read sets, `transaction_registry` and `transaction_core`, which both databases compose.
 - `blobs/nvme_database.hpp` and `nvme_single_collection_database.hpp` — both databases, their snapshots and transactions over the shared registry and core.
-- `graph/adjacency_fold.hpp`, `vram_nvidia_adjacency_fold.hpp` and `nvme_store.hpp` — the graph store below, and the host face of its device fold.
+- `graph/adjacency_fold.hpp`, `vram_adjacency_fold.hpp` and `nvme_store.hpp` — the graph store below, and the host face of its device fold.
 
 A run keeps its key slots in sorted order beside a saved S+ tree of their keys, and the merger hands the compactor each run's cells.
 
@@ -54,7 +54,7 @@ Levels differ by depth:
 A range removal lands as one range tombstone beside the run's deltas, never as a removal per key, as RocksDB's `DeleteRange` and ScyllaDB's range tombstones do.
 A tombstone hides every older version of the keys from its start up to its exclusive end: in memory runs by stamp, and in the levels by position, a tombstone hiding the versions of deeper levels, of older runs of level 0 and of its own run stamped below it, since merges raise version stamps to the floor and tombstones keep theirs.
 A read checks the tombstones of the runs above the version it found, a scan skips the keys they hide, and a run's key bounds cover its tombstones, so the runs of one level stay disjoint and a merge picks every run a tombstone reaches.
-A merge drops the versions a tombstone hides from every reader, keeping those a pinned reader still reads, cuts the tombstone at the bounds of the runs it writes, and drops it at the bottom once no reader reads below it; a merge carrying tombstones runs on the CPU.
+A merge drops the versions a tombstone hides from every reader, keeping those a pinned reader still reads, cuts the tombstone at the bounds of the runs it writes, and drops it at the bottom once no reader reads below it; a device merge uploads the tombstones beside the keys of their runs, and the host cuts the ones that survive.
 
 Level 0 admits `level_enlarge_factor` runs of one flush each, and every deeper level `level_enlarge_factor` times the bytes of the one above, so no level size is configured on its own.
 Level 0 is due for compaction at that many sorted runs or at that many flushes' worth of memory-run bytes, whichever comes first.
@@ -209,7 +209,7 @@ A dispatch blocks until all its threads return and admits one caller at a time, 
 
 - A vertex's value is its half-edges, 48-byte records sorted by neighbor, edge and role, as `adjacency_fold.hpp` lays them out.
 - An edge write appends one change delta per endpoint rather than rewriting either, so two transactions adding edges to one vertex both commit.
-- Reads, memory merges, flushes and compactions fold the deltas into the value through the fold path every store shares, and a merge holding a change runs on the CPU.
+- Reads, memory merges, flushes and compactions fold the deltas into the value through the fold path every store shares, and a device merge folds on the host every chain its device fold does not compose.
 - A removed vertex is a removal of its key, and its neighbors take a change removing the half-edges they filed of it.
 - A removed range of vertices is one range tombstone, and only the neighbors outside the range take those changes.
 

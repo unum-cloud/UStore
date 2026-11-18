@@ -63,8 +63,7 @@ class ingest_value_parser {
     /** The value of row @p row of @p rows as the engine files it, readable until @c rewind. */
     expected<std::span<byte_t const>> operator()(keyed_rows_t const& rows, std::size_t row) noexcept {
         ustore_bytes_view_t const given = rows.values[row];
-        std::span<byte_t const> const bytes {reinterpret_cast<byte_t const*>(given.data),
-                                             static_cast<std::size_t>(given.length)};
+        std::span<byte_t const> const bytes = bytes_of(given.data, static_cast<std::size_t>(given.length));
         if (values_ == ingest_values_t::bytes_k) return bytes;
         arena_rewind(&parsing_);
         if (values_ == ingest_values_t::documents_k) {
@@ -72,7 +71,7 @@ class ingest_value_parser {
             if (parsed.failed()) return parsed;
             return bytes;
         }
-        auto [tree, tree_status] = import_page_tree<strings_kit_type_>(pages::page_encoding_t::xml_k, string_of(given),
+        auto [tree, tree_status] = import_page_tree<strings_kit_type_>(pages::page_encoding_t::xml_k, chars_of(given),
                                                                        element_key_of(rows.keys[row]), placement_,
                                                                        page_allocator_t {&parsing_});
         if (tree_status.failed()) return tree_status;

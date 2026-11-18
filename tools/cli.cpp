@@ -440,7 +440,7 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
     list.arena = arena;
     if (!failed(outcome)) ustore_collection_list(&list);
     for (std::size_t index = 0; !failed(outcome) && index != written; ++index) {
-        std::string_view const name = string_of(tape_string(names, index));
+        std::string_view const name = chars_of(tape_string(names, index));
         char id_text[uuid_text_length_k];
         uuid_to_text(ids[index].uuid, id_text);
         fmt::println(style_of(tone_t::listing_k, stdout), "{}\t{}\t{}", std::string_view {id_text, uuid_text_length_k},
@@ -671,7 +671,7 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
             outcome = {ustore_status_cancelled_k, "Stopped between collections"};
             break;
         }
-        std::string_view const name = string_of(tape_string(names, index));
+        std::string_view const name = chars_of(tape_string(names, index));
         if (name.empty()) {
             ++unnamed;
             continue;

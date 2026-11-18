@@ -179,8 +179,8 @@ typedef struct ustore_docs_write_t {
  *  both the @c keys and the @c id_field, the fields or values come in an unknown layout, the
  *  @c transaction belongs to another engine or is staged, the @c durability, @c watch or
  *  @c modification is unknown, a flushed write names a @c transaction, @c ustore_watch_none_k comes
- *  without one, a collection holds another modality, a patch or a modifier does not apply to its
- *  field, or a field or value is past 4 GiB.
+ *  without one, a collection holds another modality, or a patch or a modifier does not apply to the
+ *  field it modifies.
  *
  *  - @c ustore_status_unsupported_k The executor computes on a device, or the @c type is not
  *    supported.
@@ -193,7 +193,8 @@ typedef struct ustore_docs_write_t {
  *    its NVMe collection admits.
  *  - @c ustore_status_write_conflict_k Concurrent commits kept conflicting, or a staged RocksDB
  *    transaction holds a key.
- *  - @c ustore_status_capacity_exhausted_k The documents outgrow the NVMe transaction's buffer.
+ *  - @c ustore_status_capacity_exhausted_k A field or value is past 4 GiB, or the documents outgrow
+ *    the NVMe transaction's buffer.
  */
 USTORE_EXPORT void ustore_docs_write(ustore_docs_write_t* arguments);
 

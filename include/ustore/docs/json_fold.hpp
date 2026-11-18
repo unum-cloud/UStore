@@ -51,10 +51,10 @@
 namespace unum::ustore::docs {
 
 using utilities::arena_allocator;
+using utilities::chars_of;
 using utilities::delta_kind_t;
 using utilities::delta_view_t;
 using utilities::growth_status;
-using utilities::string_of;
 
 #pragma region Deltas
 
@@ -90,9 +90,7 @@ struct json_delta_t {
 constexpr std::size_t delta_header_bytes_k = sizeof(std::uint64_t) + 1 + 2 * sizeof(std::uint32_t);
 
 /** The bytes @p text spells. */
-inline std::span<byte_t const> bytes_of_text(std::string_view text) noexcept {
-    return {reinterpret_cast<byte_t const*>(text.data()), text.size()};
-}
+inline std::span<byte_t const> bytes_of_text(std::string_view text) noexcept { return std::as_bytes(std::span {text}); }
 
 /** Whether @p delta makes the base and every older delta irrelevant: a write, a removal or a whole upsert. */
 inline bool closes(json_delta_t const& delta) noexcept {
@@ -126,7 +124,7 @@ inline expected<std::span<byte_t const>> encode_deltas(std::span<json_delta_t co
     std::size_t total = 0;
     for (json_delta_t const& delta : deltas) {
         if (delta.field.size() > UINT32_MAX || delta.value.size() > UINT32_MAX)
-            return status_t {status_code_t::invalid_argument_k, "A delta's field or value passes 4 GiB"};
+            return status_t {status_code_t::capacity_exhausted_k, "A delta's field or value passes 4 GiB"};
         total += encoded_size(delta);
     }
     auto [chain, status] = utilities::arena_allocate<byte_t>(arena, total);
@@ -151,8 +149,8 @@ inline expected<std::size_t> decode_delta(std::span<byte_t const> bytes, json_de
     std::size_t const size = delta_header_bytes_k + std::size_t(field_length) + std::size_t(value_length);
     if (bytes.size() < size) return status_t {status_code_t::malformed_k, "A delta is truncated"};
     delta.modification = static_cast<delta_modification_t>(modification);
-    delta.field = {reinterpret_cast<char const*>(input), field_length};
-    delta.value = {reinterpret_cast<char const*>(input) + field_length, value_length};
+    delta.field = chars_of(bytes_of(input, field_length));
+    delta.value = chars_of(bytes_of(input + field_length, value_length));
     return size;
 }
 
@@ -215,7 +213,7 @@ inline status_t apply_delta(document_state_t& document, json_delta_t const& delt
     if (document.exists() && whole && modification == modification_t::insert_k)
         return {status_code_t::already_exists_k, "Inserted document already exists"};
 
-    value_view_t const base = document.exists() ? value_view_t(string_of(document.bytes)) : value_view_t();
+    value_view_t const base = document.exists() ? value_view_t(chars_of(document.bytes)) : value_view_t();
     auto [parsed, status] = json_parse(base, arena);
     if (status.failed()) return status;
     auto [modifier, modifier_status] = any_parse(value_view_t(delta.value), ustore_docs_field_type_json_k, arena);
@@ -253,7 +251,7 @@ status_t for_each_delta(std::span<delta_view_t const> deltas, callback_type_&& c
         status_t status;
         switch (delta.kind) {
         case delta_kind_t::write_k:
-            status = callback(json_delta_t {0, delta_modification_t::write_k, {}, string_of(delta.bytes)});
+            status = callback(json_delta_t {0, delta_modification_t::write_k, {}, chars_of(delta.bytes)});
             break;
         case delta_kind_t::remove_k:
         case delta_kind_t::remove_range_k:
@@ -595,7 +593,7 @@ struct json_fold_t {
             if (replay.failure.failed()) return encode_deltas(rest, arena);
             json_delta_t folded {chain[chain.size() - 1].stamp, delta_modification_t::remove_k, {}, {}};
             if (replay.document.exists())
-                folded.modification = delta_modification_t::write_k, folded.value = string_of(replay.document.bytes);
+                folded.modification = delta_modification_t::write_k, folded.value = chars_of(replay.document.bytes);
             return encode_deltas(std::span<json_delta_t const>(&folded, 1), arena);
         }
 

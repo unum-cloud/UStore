@@ -69,11 +69,10 @@ class cuda_compactor_t {
      *  level's empty base.
      *
      *  The @p extents of every run, @p upper ones first, say where its sections sit on its volume
-     *  and which stamp an ingest gave it. With @c no_device_fold_t it refuses runs holding a
-     *  change with @c invalid_argument_k, and with no change to fold the folds and @p read_value
-     *  go unused. A merge whose scratch would pass the executor's limit, or whose planned runs
-     *  outgrow what the merge leaves free, refuses with @c out_of_memory_heap_k, so the tree
-     *  merges on the host.
+     *  and which stamp an ingest gave it. With @c no_device_fold_t the host folds every chain
+     *  through @p fold, and with no change to fold the folds and @p read_value go unused. A merge
+     *  whose scratch would pass the executor's limit, or whose planned runs outgrow what the
+     *  merge leaves free, refuses with @c out_of_memory_heap_k, so the tree merges on the host.
      */
     template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
               typename allocator_type_>
@@ -88,7 +87,8 @@ class cuda_compactor_t {
 
     /**
      *  @brief Lists the versions of @p runs that survive their merge, in merged order, as the
-     *      host's key unions and @c survives list them, ranked on the device by head and tape.
+     *      host's key unions and @c survives list them, ranked on the device by head and tape,
+     *      where the survivors pack, so they alone come back.
      *  @param[in] runs The upper runs, oldest first, then the lower runs, ascending.
      *  @param[in] upper_runs How many of @p runs are upper ones.
      *  @return Success, or @c invalid_argument_k where the device loaded no kernels or a run
@@ -117,10 +117,9 @@ class cuda_compactor_t {
                                     compaction_output<key_slot_type_, allocator_type_>& output) noexcept;
 
     /** Queues the pack of kernel @p name over @p regions in one launch chaining its scan across
-     *  blocks, pointing @p counted at the device word the survivors' count lands in. */
+     *  blocks, answering the device word the survivors' count lands in. */
     template <typename record_type_>
-    st::status_t pack_(char const* name, merge_pack_regions<record_type_> const& regions,
-                       std::uint64_t*& counted) noexcept;
+    st::expected<packed_counts_t> pack_(char const* name, merge_pack_regions<record_type_> const& regions) noexcept;
 
     cuda_compactor_t(utilities::cuda_executor_t& executor, device_sections_reader_t sections) noexcept
         : executor_(&executor), sections_(sections) {}

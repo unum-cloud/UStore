@@ -70,6 +70,7 @@ database_verbs_t const database_verbs_k {
     .changes_cursor_init = &changes_cursor_init,
     .changes_cursor_next = &guarded<&changes_cursor_next>,
     .changes_cursor_free = &changes_cursor_free,
+    .pin_call = &pin_call,
 };
 
 /** The unchecked whole-value verbs of every collection keyed by UUIDs, which the layers over blobs reach. */

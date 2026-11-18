@@ -197,8 +197,8 @@ class nvme_store_cursor;
  *      attempts, before it parks.
  *  @tparam fold_type_ What a change delta does, which reads and merges fold with.
  *  @tparam device_fold_type_ What composes the changes of a merge on a device, or
- *      @c no_device_fold_t where nothing does, which keeps every merge holding a change
- *      on the host.
+ *      @c no_device_fold_t where nothing does, which leaves every chain of a device's merge
+ *      for the host to fold.
  *  @tparam row_kit_type_ The SmashTable kit the memory runs' trees search with.
  */
 template <typename key_slot_type_, typename volume_type_, template <typename> typename atomic_reference_,

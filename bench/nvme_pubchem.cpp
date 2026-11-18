@@ -475,7 +475,7 @@ int main(int argc, char** argv) {
 
     // Point reads of random keys of the ingest, while a sampler reads the depth the drives see.
     auto blobs_reads = [&](executor_t& readers, std::string const& name, std::size_t batch) {
-        if (!settings.filter.selects(name)) return;
+        if (!settings.regex_filter.selects(name)) return;
         std::atomic<bool> reading {true}, reported {false};
         std::uint64_t depth_sum = 0, depth_samples = 0, depth_peak = 0;
         std::thread depths([&] {
@@ -522,7 +522,7 @@ int main(int argc, char** argv) {
     if (maybe_readers) blobs_reads(*maybe_readers, "pubchem_blobs_read_single_32_threads", 1);
     for (std::size_t const depth : {std::size_t {32}, std::size_t {1024}}) {
         std::string const strings_name = fmt::format("pubchem_strings_read_batch{}", depth);
-        if (settings.filter.selects(strings_name))
+        if (settings.regex_filter.selects(strings_name))
             print(run_threads(executor, settings, strings_name, [&](loop_t& loop, std::size_t thread) noexcept {
                 ustore_arena_t arena = nullptr;
                 ustore_outcome_t local {};

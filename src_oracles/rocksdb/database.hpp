@@ -19,7 +19,7 @@
 #include <memory>       // `std::unique_ptr`
 #include <mutex>        // `std::lock_guard`, `std::mutex`
 #include <shared_mutex> // `std::shared_lock`, `std::shared_mutex`
-#include <new>          // `std::nothrow`
+#include <new>          // `std::nothrow`, `std::launder`
 #include <span>         // `std::span`
 #include <string>       // `std::string`, the path and name type RocksDB takes
 #include <string_view>  // `std::string_view`
@@ -354,9 +354,24 @@ native_status_t clear_column(database_t& database, column_t* column, ustore_drop
     return transactional(database).Write(write_options, optimizations, &batch);
 }
 
-/** Points @p options at the snapshot @p view names, leaving them at the head for any other view. */
+/** Points @p options at the snapshot @p view names or the one its call pinned, leaving them at the
+ *  head for any other view. */
 void use_snapshot(view_t const& view, ::rocksdb::ReadOptions& options) noexcept {
     if (view.snapshot) options.snapshot = state_of<snapshot_t>(view.snapshot)->native;
+    else options.snapshot = static_cast<::rocksdb::Snapshot const*>(view.reading);
+}
+
+/** Takes a snapshot of @p handle into @p pin, which every verb of one call reads through. */
+void pin_call(ustore_database_t handle, ustore_collection_id_t const*, view_t const&, call_pin_t& pin) noexcept {
+    static_assert(sizeof(::rocksdb::ManagedSnapshot) <= call_pin_bytes_k &&
+                      alignof(::rocksdb::ManagedSnapshot) <= alignof(std::max_align_t),
+                  "A managed snapshot fits the room the router keeps for it");
+    database_t& database = *state_of<database_t>(handle);
+    ::rocksdb::ManagedSnapshot* const held = new (pin.room)::rocksdb::ManagedSnapshot {database.native.get()};
+    pin.reading = held->snapshot();
+    pin.release = [](call_pin_t& pinned) noexcept {
+        std::launder(reinterpret_cast<::rocksdb::ManagedSnapshot*>(pinned.room))->~ManagedSnapshot();
+    };
 }
 
 #pragma endregion Database
@@ -609,7 +624,7 @@ status_t open_database(arguments_type_ const& arguments, access_t access) {
     if (arguments.data_directories_count && !arguments.data_directories)
         return {status_code_t::invalid_argument_k, "Counted data directories are null"};
 
-    std::string const root(string_of(arguments.directory));
+    std::string const root(chars_of(arguments.directory));
     auto [root_exists, directory_exists_status] = directory_exists(root.c_str());
     if (directory_exists_status.failed()) return directory_exists_status;
     if (!root_exists) return {status_code_t::not_found_k, "Root isn't a directory"};
@@ -644,7 +659,7 @@ status_t open_database(arguments_type_ const& arguments, access_t access) {
          std::span {arguments.data_directories, static_cast<std::size_t>(arguments.data_directories_count)}) {
         if (!names_path(directory.path)) return {status_code_t::invalid_argument_k, "A data directory needs a path"};
         options.db_paths.push_back(
-            {std::string(string_of(directory.path)), directory.max_bytes ? directory.max_bytes : UINT64_MAX});
+            {std::string(chars_of(directory.path)), directory.max_bytes ? directory.max_bytes : UINT64_MAX});
     }
 
     auto [made, made_status] = make_handle<ustore_database_handle_t, database_t>(engine_k);
@@ -856,7 +871,7 @@ status_t snapshot_save(ustore_snapshot_save_t const& arguments, view_t const& vi
     options.create_if_missing = true;
     options.error_if_exists = true;
 
-    std::string const path(string_of(arguments.path));
+    std::string const path(chars_of(arguments.path));
     std::unique_ptr<::rocksdb::DB> exported;
     native_status_t status = ::rocksdb::DB::Open(options, path, &exported);
     if (!status.ok()) return status_of(status);
@@ -1031,7 +1046,7 @@ status_t collection_find(ustore_collection_find_t const& arguments, strings_arg_
     std::string entry;
     for (std::size_t index = 0; index != arguments.count; ++index) {
         native_status_t const status = database.native->Get(read_options, database.names,
-                                                            ::rocksdb::Slice(string_of(names[index])), &entry);
+                                                            ::rocksdb::Slice(chars_of(names[index])), &entry);
         if (status.IsNotFound()) {
             outputs.assign(index, ustore_collection_id_t {}, ustore_modality_t {}, false);
             continue;
@@ -1286,9 +1301,9 @@ status_t begin(database_t& database, transaction_t& transaction) {
 }
 
 /**
- *  @brief Stages @p transaction unless it already is: locks and validates every watched read and
- *      buffered write against the snapshot its first read or write took, then replays the writes
- *      into RocksDB's transaction.
+ *  @brief Stages @p transaction unless it already is: replays every buffered write into RocksDB's
+ *      transaction, then locks every watched read, each validated against the snapshot its first
+ *      read or write took.
  *
  *  A refused key rolls back to the save point taken before the first lock, leaving the transaction
  *  buffering and retryable as on the reference engine, unless the rollback itself failed and left
@@ -1309,9 +1324,27 @@ status_t stage(database_t& database, transaction_t& transaction) {
     watched.erase(distinct, watched.size() - distinct);
 
     native.SetSavePoint();
-    ::rocksdb::ReadOptions const read_options;
     native_status_t status;
     column_t* column = nullptr;
+
+    // Writes validate before reads, so a key read and written conflicts as written
+    for (std::size_t index = 0; status.ok() && index != transaction.written.size(); ++index) {
+        column = column_of(database, transaction.written[index]);
+        if (!column) {
+            status = native_status_t::NotFound("The collection was dropped");
+            break;
+        }
+        std::unique_ptr<::rocksdb::WBWIIterator> entries {transaction.batch.NewIterator(column)};
+        for (entries->SeekToFirst(); status.ok() && entries->Valid(); entries->Next()) {
+            ::rocksdb::WriteEntry const entry = entries->Entry();
+            status = entry.type == ::rocksdb::kDeleteRecord ? native.Delete(column, entry.key)
+                                                            : native.Put(column, entry.key, entry.value);
+        }
+        if (status.ok()) status = entries->status();
+    }
+    bool const writes_validated = status.ok();
+
+    ::rocksdb::ReadOptions const read_options;
     for (std::size_t index = 0; status.ok() && index != watched.size(); ++index) {
         if (index == 0 || watched[index - 1].collection != watched[index].collection)
             column = column_of(database, watched[index].collection);
@@ -1331,23 +1364,6 @@ status_t stage(database_t& database, transaction_t& transaction) {
                                               static_cast<std::string*>(nullptr), false, true)
                         : native_status_t::NotFound("The collection was dropped");
     }
-    bool const reads_validated = status.ok();
-
-    // The index holds each key's latest write once, in key order, so a key written twice replays and locks once
-    for (std::size_t index = 0; status.ok() && index != transaction.written.size(); ++index) {
-        column = column_of(database, transaction.written[index]);
-        if (!column) {
-            status = native_status_t::NotFound("The collection was dropped");
-            break;
-        }
-        std::unique_ptr<::rocksdb::WBWIIterator> entries {transaction.batch.NewIterator(column)};
-        for (entries->SeekToFirst(); status.ok() && entries->Valid(); entries->Next()) {
-            ::rocksdb::WriteEntry const entry = entries->Entry();
-            status = entry.type == ::rocksdb::kDeleteRecord ? native.Delete(column, entry.key)
-                                                            : native.Put(column, entry.key, entry.value);
-        }
-        if (status.ok()) status = entries->status();
-    }
     if (status.ok()) {
         transaction.staging = staging_t::staged_k;
         return {};
@@ -1358,9 +1374,9 @@ status_t stage(database_t& database, transaction_t& transaction) {
     if (!undone) transaction.staging = staging_t::broken_k;
 
     if (!status.IsBusy() && !status.IsTimedOut()) return status_of(status);
-    if (reads_validated)
-        return {status_code_t::write_conflict_k, "A concurrent write changed a key the transaction wrote"};
-    return {status_code_t::read_conflict_k, "A concurrent write changed a key the transaction read"};
+    if (writes_validated)
+        return {status_code_t::read_conflict_k, "A concurrent write changed a key the transaction read"};
+    return {status_code_t::write_conflict_k, "A concurrent write changed a key the transaction wrote"};
 }
 
 status_t transaction_init(ustore_transaction_init_t const& arguments, view_t const&) {

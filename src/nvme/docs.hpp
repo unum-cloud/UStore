@@ -85,7 +85,7 @@ status_t docs_write(ustore_docs_write_t const& arguments, strings_arg_t const& f
     std::size_t const count = arguments.count;
     if (!count) return {};
     if (!values) return {status_code_t::invalid_argument_k, "No values were provided"};
-    std::string_view const id_field = string_of(arguments.id_field);
+    std::string_view const id_field = chars_of(arguments.id_field);
     if (!arguments.keys.data && id_field.empty())
         return {status_code_t::invalid_argument_k, "Documents without keys need an id field"};
     database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);

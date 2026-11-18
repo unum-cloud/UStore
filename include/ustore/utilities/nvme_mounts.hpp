@@ -906,7 +906,7 @@ std::shared_ptr<object_type_> make_constrained_shared(
 
     auto deleter = [allocator](object_type_* constructed) mutable {
         constructed->~object_type_();
-        allocator.deallocate(reinterpret_cast<byte_t*>(constructed), sizeof(object_type_));
+        allocator.deallocate(bytes_of(constructed, 1).data(), sizeof(object_type_));
     };
     return std::shared_ptr<object_type_>(new (pointer) object_type_(std::forward<argument_types_>(arguments)...),
                                          deleter);

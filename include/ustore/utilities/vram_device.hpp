@@ -49,7 +49,7 @@ concept gpu_executor_concept = requires(executor_type_& executor, executor_type_
     { arena.blocks } -> std::convertible_to<device_blocks_t&>;
     { executor.wait() } -> std::same_as<status_t>;
     { executor.bind() } -> std::same_as<status_t>;
-    { spawned.device() } -> std::same_as<int>;
+    { spawned.device() } -> std::same_as<gpu_device_t const&>;
     { spawned.device_of(target.data()) } -> std::same_as<int>;
     { spawned.scratch_limit() } -> std::same_as<std::size_t>;
     { executor.allocate_async(bytes) } -> std::same_as<expected<std::uintptr_t>>;
@@ -132,8 +132,10 @@ inline constexpr char const* vram_kernel_names_k[] = {"ustore_tape_offsets_u32",
                                                       "ustore_merge_pack_variable_width",
                                                       "ustore_merge_place_variable_width",
                                                       "ustore_merge_strings_rank",
+                                                      "ustore_merge_strings_pack",
                                                       "ustore_merge_gather_fixed_width",
                                                       "ustore_merge_gather_variable_width",
+                                                      "ustore_fold_sort_step",
                                                       "ustore_fold_chains",
                                                       "ustore_fold_write",
                                                       "ustore_substrings_contains_per_thread",
@@ -154,8 +156,9 @@ inline constexpr char const* vram_kernel_names_k[] = {"ustore_tape_offsets_u32",
                                                       "ustore_docs_drop_terminators_u32",
                                                       "ustore_docs_drop_terminators_u64"};
 
-/** The C names every Apple bundle exports its kernels under: every other vendor's, and the select
- *  and the value offsets an Apple merge packs through, with no 64-bit atomics to chain with. */
+/** The C names every Apple bundle exports its kernels under: every other vendor's but the strings
+ *  pack, and the select and the value offsets an Apple merge packs through, with no 64-bit atomics
+ *  to chain with. */
 inline constexpr char const* vram_apple_kernel_names_k[] = {"ustore_tape_offsets_u32",
                                                             "ustore_tape_offsets_u64",
                                                             "ustore_tape_gather",
@@ -175,6 +178,7 @@ inline constexpr char const* vram_apple_kernel_names_k[] = {"ustore_tape_offsets
                                                             "ustore_merge_strings_rank",
                                                             "ustore_merge_gather_fixed_width",
                                                             "ustore_merge_gather_variable_width",
+                                                            "ustore_fold_sort_step",
                                                             "ustore_fold_chains",
                                                             "ustore_fold_write",
                                                             "ustore_substrings_contains_per_thread",
@@ -440,7 +444,7 @@ template <gpu_executor_concept executor_type_>
 device_blocks_t* device_blocks_of(ustore_arena_t arena, executor_type_ const& executor) noexcept {
     using arena_blocks_t = typename executor_type_::arena_blocks_t;
     arena_blocks_t* const memory = arena ? std::get_if<arena_blocks_t>(&arena->memory) : nullptr;
-    return memory && memory->device == executor.device() ? &memory->blocks : nullptr;
+    return memory && memory->device == static_cast<int>(executor.device().vendor_ordinal) ? &memory->blocks : nullptr;
 }
 
 /** Whether @p pointer lies on a device of a vendor other than @p executor_type_'s, which

@@ -192,7 +192,7 @@ struct pages_client_t {
         ustore_pages_read(&read);
         if (outcome.status != ustore_status_success_k) return ustore_status_name(outcome.status);
         if (!(presences[0] & 1)) return std::string(page_absent_k);
-        return std::string(string_of(tape_string(values, 0)));
+        return std::string(chars_of(tape_string(values, 0)));
     }
 };
 

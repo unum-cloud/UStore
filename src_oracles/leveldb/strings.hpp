@@ -23,6 +23,7 @@
 #include "utilities/batches.hpp"  // `validate_choices`, `validate_direction`, `samples_of`, `sample_generator_t`
 #include "utilities/outputs.hpp"  // `strings_read_outputs_t`, `strings_scan_outputs_t`, `measure_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
+#include "utilities/slices.hpp"   // `for_task_slices`
 
 namespace unum::ustore::oracles::leveldb {
 
@@ -77,7 +78,7 @@ status_t strings_write(ustore_strings_write_t const& arguments, strings_arg_t co
     std::string key;
     for (std::size_t index = 0; index != arguments.count; ++index) {
         ::leveldb::Slice const value {reinterpret_cast<char const*>(values[index].uuid.bytes), sizeof(ustore_key_t)};
-        batch.Put(string_key(collections[index], string_of(texts[index]), key), value);
+        batch.Put(string_key(collections[index], chars_of(texts[index]), key), value);
     }
     return status_of(database.native->Write(write_options_for(arguments.durability), &batch));
 }
@@ -99,7 +100,7 @@ status_t strings_remove(ustore_strings_remove_t const& arguments, strings_arg_t 
     std::string key;
     if (!ends) {
         for (std::size_t index = 0; index != arguments.count; ++index)
-            batch.Delete(string_key(collections[index], string_of(texts[index]), key));
+            batch.Delete(string_key(collections[index], chars_of(texts[index]), key));
         return status_of(database.native->Write(write_options_for(arguments.durability), &batch));
     }
 
@@ -107,9 +108,9 @@ status_t strings_remove(ustore_strings_remove_t const& arguments, strings_arg_t 
     iterator_pointer_t iterator {database.native->NewIterator(::leveldb::ReadOptions())};
     for (std::size_t index = 0; index != arguments.count; ++index) {
         ustore_collection_id_t const collection = collections[index];
-        std::string_view const end = string_of(ends[index]);
+        std::string_view const end = chars_of(ends[index]);
         ::leveldb::Slice const strings = prefix_of(collection);
-        for (iterator->Seek(string_key(collection, string_of(texts[index]), key));
+        for (iterator->Seek(string_key(collection, chars_of(texts[index]), key));
              iterator->Valid() && iterator->key().starts_with(strings) &&
              string_before_end(to_value(tail_of(iterator->key())), end, ustore_scan_ascending_k);
              iterator->Next())
@@ -134,22 +135,32 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
 
     auto [outputs, outputs_status] = strings_read_outputs_t::make(arguments);
     if (outputs_status.failed()) return outputs_status;
-    std::string key;
-    std::string value;
-    for (std::size_t index = 0; index != arguments.count; ++index) {
-        native_status_t const status = database.native->Get(
-            options, string_key(collections[index], string_of(texts[index]), key), &value);
-        if (status.IsNotFound()) {
-            outputs.assign_missing(index);
-            continue;
+    auto read_slice = [&](std::size_t first, std::size_t length, view_t const&) noexcept -> status_t {
+        std::string key;
+        std::string value;
+        for (std::size_t index = first; index != first + length; ++index) {
+            native_status_t const status = database.native->Get(
+                options, string_key(collections[index], chars_of(texts[index]), key), &value);
+            if (status.IsNotFound()) {
+                outputs.assign_missing(index);
+                continue;
+            }
+            if (!status.ok()) return status_of(status);
+            if (value.size() != sizeof(ustore_key_t))
+                return {status_code_t::malformed_k, "The key a string maps onto is malformed"};
+            ustore_key_t found;
+            std::memcpy(found.uuid.bytes, value.data(), sizeof(found.uuid.bytes));
+            outputs.assign_present(index, found);
         }
-        if (!status.ok()) return status_of(status);
-        if (value.size() != sizeof(ustore_key_t))
-            return {status_code_t::malformed_k, "The key a string maps onto is malformed"};
-        ustore_key_t found;
-        std::memcpy(found.uuid.bytes, value.data(), sizeof(found.uuid.bytes));
-        outputs.assign_present(index, found);
-    }
+        return {};
+    };
+
+    // Slices read one version, which a read outside a snapshot pins for itself
+    ::leveldb::Snapshot const* const pinned = options.snapshot ? nullptr : database.native->GetSnapshot();
+    if (pinned) options.snapshot = pinned;
+    status_t const read = for_task_slices(view, arguments.count, read_slice);
+    if (pinned) database.native->ReleaseSnapshot(pinned);
+    if (read.failed()) return read;
     outputs.finish(arguments);
     return {};
 }
@@ -181,9 +192,9 @@ status_t strings_scan(ustore_strings_scan_t const& arguments, strings_arg_t cons
     iterator_pointer_t iterator {database.native->NewIterator(options)};
     for (std::size_t task = 0; task != count; ++task) {
         ustore_collection_id_t const collection = collections[task];
-        std::string_view const prefix = prefixes ? string_of(prefixes[task]) : std::string_view {};
-        std::string_view const start = starts ? string_of(starts[task]) : std::string_view {};
-        std::string_view const end = ends ? string_of(ends[task]) : std::string_view {};
+        std::string_view const prefix = prefixes ? chars_of(prefixes[task]) : std::string_view {};
+        std::string_view const start = starts ? chars_of(starts[task]) : std::string_view {};
+        std::string_view const end = ends ? chars_of(ends[task]) : std::string_view {};
         std::size_t const scan_end = outputs.size() + arguments.wanted;
         outputs.open_task(task);
 
@@ -282,8 +293,8 @@ status_t strings_measure(ustore_strings_measure_t const& arguments, strings_arg_
     iterator_pointer_t iterator {database.native->NewIterator(options)};
     for (std::size_t task = 0; task != arguments.count; ++task) {
         ustore_collection_id_t const collection = collections[task];
-        std::string_view const start = starts ? string_of(starts[task]) : std::string_view {};
-        std::string_view const end = ends ? string_of(ends[task]) : std::string_view {};
+        std::string_view const start = starts ? chars_of(starts[task]) : std::string_view {};
+        std::string_view const end = ends ? chars_of(ends[task]) : std::string_view {};
         ::leveldb::Slice const strings = prefix_of(collection);
 
         ustore_size_t cardinality = 0;

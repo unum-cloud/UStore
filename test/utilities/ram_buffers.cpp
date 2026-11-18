@@ -22,7 +22,7 @@
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_grow`, `arena_allocator`, `growing_strings`
-#include "ustore/utilities/types.hpp"       // `bytes_of`, `string_of`
+#include "ustore/utilities/types.hpp"       // `bytes_of`, `chars_of`
 #include "ustore/utilities/tapes.hpp"       // `assemble_tape`, `tape_source_t`
 
 #include "harness.hpp" // `run_test_case`, `expect_true`, `expect_equal`, `expect_status`
@@ -156,7 +156,7 @@ void test_growing_strings_export() {
     expect_equal(column.size(), 0u);
     for (std::string_view text : texts) expect_status(column.push_back(bytes_of(text)), status_code_t::success_k);
     expect_equal(column.size(), texts.size());
-    for (std::size_t index = 0; index != texts.size(); ++index) expect_true(string_of(column[index]) == texts[index]);
+    for (std::size_t index = 0; index != texts.size(); ++index) expect_true(chars_of(column[index]) == texts[index]);
 
     ustore_strings_view_t const tape = column.tape();
     expect_true(tape.layout == ustore_strings_u64_tape_k);

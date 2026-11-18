@@ -26,7 +26,6 @@ namespace unum::ustore {
 
 using utilities::bits_in_byte_k;
 using utilities::byte_t;
-using utilities::bytes_of;
 using utilities::collection_key_hash_t;
 using utilities::collection_key_t;
 using utilities::divide_round_up;
@@ -49,7 +48,6 @@ using utilities::next_power_of_two;
 using utilities::round_down_to_multiple;
 using utilities::round_up_to_multiple;
 using utilities::smallest_key_k;
-using utilities::string_of;
 using utilities::u16_t;
 using utilities::u32_t;
 using utilities::u64_t;
@@ -103,9 +101,7 @@ concept key_location_concept = std::same_as<std::remove_cvref_t<location_type_>,
 template <std::ranges::contiguous_range container_type_>
     requires std::ranges::sized_range<container_type_>
 value_view_t value_view(container_type_&& container) noexcept {
-    using element_t = std::ranges::range_value_t<container_type_>;
-    return {reinterpret_cast<byte_t const*>(std::ranges::data(container)),
-            std::ranges::size(container) * sizeof(element_t)};
+    return value_view_t {bytes_of(std::ranges::data(container), std::ranges::size(container))};
 }
 
 #pragma endregion Variable Length Views

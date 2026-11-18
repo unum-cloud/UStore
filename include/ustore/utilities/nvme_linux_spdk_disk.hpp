@@ -58,6 +58,8 @@
 #include <spdk/nvme.h>     // `spdk_nvme_connect`, `spdk_nvme_ns_cmd_read`, `spdk_nvme_qpair`
 #endif
 
+#include <fmt/format.h> // `fmt::format_to_n`
+
 #include <smashtable/basic_growing_pool.hpp> // `st::basic_growing_pool`
 #include <smashtable/basic_vector.hpp>       // `st::vector`
 
@@ -274,9 +276,8 @@ inline expected<pci_address_t> pci_address_parsed(std::string_view spelled) noex
         return status_t {status_code_t::invalid_argument_k, "A PCIe device is below 32 and a function below 8"};
 
     pci_address_t address;
-    [[maybe_unused]] int const written = std::snprintf(address.text, sizeof(address.text), "%04x:%02x:%02x.%01x",
-                                                       static_cast<unsigned>(domain), static_cast<unsigned>(bus),
-                                                       static_cast<unsigned>(device), static_cast<unsigned>(function));
+    fmt::format_to_n(address.text, sizeof(address.text) - 1, "{:04x}:{:02x}:{:02x}.{:x}", domain, bus, device,
+                     function);
     return address;
 }
 
@@ -456,7 +457,7 @@ linux_spdk_probe_t linux_spdk_environment<atomic_reference_, waiter_type_>::prob
     if (!parsed) return linux_spdk_probe_t::not_found_k;
 
     char device_path[64] = {};
-    std::snprintf(device_path, sizeof(device_path), "/sys/bus/pci/devices/%s", parsed->text);
+    fmt::format_to_n(device_path, sizeof(device_path) - 1, "/sys/bus/pci/devices/{}", parsed->text);
     if (!system_path_exists(device_path)) return linux_spdk_probe_t::not_found_k;
 
     std::array<char, meminfo_bytes_k> meminfo {};
@@ -465,7 +466,7 @@ linux_spdk_probe_t linux_spdk_environment<atomic_reference_, waiter_type_>::prob
     if (!system_path_exists("/sys/kernel/mm/hugepages")) return linux_spdk_probe_t::without_hugepages_k;
 
     char driver_path[80] = {};
-    std::snprintf(driver_path, sizeof(driver_path), "/sys/bus/pci/devices/%s/driver", parsed->text);
+    fmt::format_to_n(driver_path, sizeof(driver_path) - 1, "/sys/bus/pci/devices/{}/driver", parsed->text);
     std::array<char, link_bytes_k> link {};
     pci_driver_t const driver = pci_driver_named(read_system_link(driver_path, link));
     if (driver != pci_driver_t::vfio_pci_k && driver != pci_driver_t::uio_generic_k)

@@ -508,42 +508,41 @@ class device_match {
     utilities::device_blocks_t& blocks_;
 };
 
-/** Copies the @p count elements @p data names, @p stride bytes apart or one repeated for zero, into @p scratch and
- *  repoints them there, as every page of a device listing rewinds the bounce, where staging may have put them. */
-template <typename element_type_>
-status_t settle(element_type_ const*& data, ustore_size_t& stride, std::size_t count, ustore_arena_t scratch) noexcept {
-    if (!data || !count) return {};
-    std::size_t const copied = stride ? count : 1;
+/** Copies the @p count elements of the strided @p column, its stride apart or one repeated for
+ *  zero, into @p scratch and repoints it there, as every page of a device listing rewinds the
+ *  bounce, where staging may have put them. */
+template <typename element_type_, typename strided_type_>
+status_t settle(strided_type_& column, std::size_t count, ustore_arena_t scratch) noexcept {
+    if (!column.data || !count) return {};
+    std::size_t const copied = column.stride ? count : 1;
     auto [copy, copy_status] = arena_allocate<element_type_>(scratch, copied);
     if (copy_status.failed()) return copy_status;
     for (std::size_t index = 0; index != copied; ++index)
-        std::memcpy(&copy[index], reinterpret_cast<byte_t const*>(data) + index * stride, sizeof(element_type_));
-    data = copy.data();
-    if (stride) stride = sizeof(element_type_);
+        std::memcpy(&copy[index], bytes_of(column.data, 1).data() + index * column.stride, sizeof(element_type_));
+    column.data = copy.data();
+    if (column.stride) column.stride = sizeof(element_type_);
     return {};
 }
 
-/** Copies the tape of @p count strings at @p data and @p offsets into @p scratch and repoints it there, as @c settle
+/** Copies @p tape, of @p count strings, into @p scratch and repoints it there, as @c settle
  *  copies a column. */
-template <typename data_type_, typename offset_type_>
-status_t settle(data_type_ const*& data, offset_type_ const*& offsets, std::size_t count,
-                ustore_arena_t scratch) noexcept {
-    if (!offsets || !count) return {};
-    auto [copied_offsets, offsets_status] = arena_copy<offset_type_>(scratch, {offsets, count + 1});
+template <typename tape_type_>
+status_t settle_tape(tape_type_& tape, std::size_t count, ustore_arena_t scratch) noexcept {
+    if (!tape.offsets || !count) return {};
+    auto [copied_offsets, offsets_status] = arena_copy(scratch, std::span {tape.offsets, count + 1});
     if (offsets_status.failed()) return offsets_status;
-    auto [copied_data, data_status] = arena_copy<data_type_>(scratch, {data, static_cast<std::size_t>(offsets[count])});
+    auto [copied_data, data_status] = arena_copy(scratch,
+                                                 std::span {tape.data, static_cast<std::size_t>(tape.offsets[count])});
     if (data_status.failed()) return data_status;
-    data = copied_data.data(), offsets = copied_offsets.data();
+    tape.data = copied_data.data(), tape.offsets = copied_offsets.data();
     return {};
 }
 
 /** Copies the tape @p strings, of @p count strings, into @p scratch as @c settle does, leaving accessors, which write
  *  host memory by contract, in place. */
 inline status_t settle(ustore_strings_view_t& strings, std::size_t count, ustore_arena_t scratch) noexcept {
-    if (strings.layout == ustore_strings_u32_tape_k)
-        return settle(strings.data.u32_tape.data, strings.data.u32_tape.offsets, count, scratch);
-    if (strings.layout == ustore_strings_u64_tape_k)
-        return settle(strings.data.u64_tape.data, strings.data.u64_tape.offsets, count, scratch);
+    if (strings.layout == ustore_strings_u32_tape_k) return settle_tape(strings.data.u32_tape, count, scratch);
+    if (strings.layout == ustore_strings_u64_tape_k) return settle_tape(strings.data.u64_tape, count, scratch);
     return {};
 }
 
@@ -570,12 +569,11 @@ status_t scan_matched_on_device(residency_tables<vendored_residency_t::host_k> c
     arguments_type_ hosted = arguments;
     hosted.arena = executor.bounce();
     std::size_t const count = static_cast<std::size_t>(arguments.count);
-    if (status_t const status = settle(hosted.collections.data, hosted.collections.stride, count, view.scratch);
+    if (status_t const status = settle<ustore_collection_id_t>(hosted.collections, count, view.scratch);
         status.failed())
         return status;
     if constexpr (takes_start_keys_concept<arguments_type_>)
-        if (status_t const status = settle(hosted.start_keys.data, hosted.start_keys.stride, count, view.scratch);
-            status.failed())
+        if (status_t const status = settle<ustore_key_t>(hosted.start_keys, count, view.scratch); status.failed())
             return status;
     status_t const served = [&]<std::size_t... index_>(std::index_sequence<index_...>) noexcept {
         std::array<strings_arg_t, ragged_count> settled {std::get<index_>(tail)...};

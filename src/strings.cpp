@@ -82,7 +82,7 @@ status_t pull(engine_t const& engine, ustore_strings_cursor_next_t const& argume
 
 /** Copies @p bytes into @p copy, answering whether they fit in memory. */
 bool copy_bytes(ustore_bytes_view_t bytes, sz::string_t& copy) noexcept {
-    return copy.assign(sz::string_view_t {string_of(bytes)}) == sz::status_t::success_k;
+    return copy.assign(sz::string_view_t {chars_of(bytes)}) == sz::status_t::success_k;
 }
 
 } // namespace unum::ustore

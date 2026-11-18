@@ -595,7 +595,7 @@ void test_arena_outputs_only(config_t const& config) {
         expect_equal(written, 3u);
         expect_true(tape_written(paths));
         if (!tape_written(paths)) continue;
-        expect_equal(string_of(tape_string(paths, 1)), "/name");
+        expect_equal(chars_of(tape_string(paths, 1)), "/name");
         std::array<output_extent_t, 2> gist_columns = tape_extents(paths, written);
         expect_only_outputs(arena, gist_columns);
 
@@ -652,7 +652,7 @@ void test_arena_outputs_only(config_t const& config) {
             expect_true(offsets && tape_written(found));
             if (!offsets || !tape_written(found)) continue;
             expect_equal(offsets[1], many_count);
-            expect_equal(string_of(tape_string(found, many_count - 1)), texts[many_count - 1]);
+            expect_equal(chars_of(tape_string(found, many_count - 1)), texts[many_count - 1]);
             std::array<output_extent_t, 2> const found_tape = tape_extents(found, many_count);
             std::array<output_extent_t, 3> scan_columns {{
                 {offsets, 2 * sizeof(ustore_length_t)},
@@ -1476,7 +1476,7 @@ void test_executor_sliced_docs(config_t const& config) {
         }
         expect_true(std::memcmp(alone.presences, sliced.presences, (docs_k + 7) / 8) == 0);
         for (std::size_t index = 0; index != docs_k; ++index)
-            expect_equal(string_of(tape_string(sliced.values, index)), string_of(tape_string(alone.values, index)));
+            expect_equal(chars_of(tape_string(sliced.values, index)), chars_of(tape_string(alone.values, index)));
         expect_true(std::memcmp(alone.columns[0].validities, sliced.columns[0].validities, (docs_k + 7) / 8) == 0);
         expect_true(std::memcmp(alone.columns[0].scalars, sliced.columns[0].scalars, docs_k * sizeof(std::int32_t)) ==
                     0);
@@ -1627,7 +1627,7 @@ case_result_t test_executor_sliced_strings(config_t const& config) {
         expect_true(std::memcmp(alone_offsets, sliced_offsets, (strings_k + 1) * sizeof(ustore_length_t)) == 0);
         expect_true(sliced_strings.layout == alone_strings.layout);
         for (std::size_t index = 0; index != alone_offsets[strings_k]; ++index)
-            expect_equal(string_of(tape_string(sliced_strings, index)), string_of(tape_string(alone_strings, index)));
+            expect_equal(chars_of(tape_string(sliced_strings, index)), chars_of(tape_string(alone_strings, index)));
     }
     ustore_executor_free(executor);
     return {};

@@ -136,7 +136,9 @@ class mover_t {
     /** Whether @p pointer lies on this mover's device. */
     bool holds(void const* pointer) noexcept {
         bool held = false;
-        visit([&](auto& executor) noexcept { held = executor.device_of(pointer) == executor.device(); });
+        visit([&](auto& executor) noexcept {
+            held = executor.device_of(pointer) == static_cast<int>(executor.device().vendor_ordinal);
+        });
         return held;
     }
 
@@ -306,7 +308,9 @@ template <typename element_type_>
 bool expect_column(mover_t& mover, element_type_ const* host, element_type_ const* device, std::size_t count,
                    std::source_location const where = std::source_location::current()) {
     if (!count || (!host && !device)) return true;
-    if (!expect_true(host && device, format_at_t {"one side has no column", where})) return false;
+    located_format<> one_sided {"one side has no column"};
+    one_sided.location = where; // a consteval constructor cannot take the caller's runtime location
+    if (!expect_true(host && device, one_sided)) return false;
     std::vector<element_type_> const fetched = mover.fetch(device, count);
     std::span<std::byte const> const fetched_bytes = std::as_bytes(std::span<element_type_ const> {fetched});
     std::span<std::byte const> const host_bytes = std::as_bytes(std::span<element_type_ const> {host, count});
@@ -317,8 +321,10 @@ bool expect_column(mover_t& mover, element_type_ const* host, element_type_ cons
     unsigned const host_byte = same ? 0 : std::to_integer<unsigned>(host_bytes[differing]);
     bool const on_device = expect_true(mover.holds(device), where);
     bool const fetched_whole = expect_true(mover.status().succeeded(), where);
-    bool const equal = expect_true(same, format_at_t {"byte {} of {} is {:#x} on the device, {:#x} on the host", where},
-                                   differing, host_bytes.size(), device_byte, host_byte);
+    located_format<std::size_t, std::size_t, unsigned, unsigned> unequal {
+        "byte {} of {} is {:#x} on the device, {:#x} on the host"};
+    unequal.location = where;
+    bool const equal = expect_true(same, unequal, differing, host_bytes.size(), device_byte, host_byte);
     return on_device && fetched_whole && equal;
 }
 
@@ -1087,11 +1093,12 @@ int main(int argc, char** argv) {
     config_t const config {test_run.settings.engine, maybe_test_directory->path()};
 
     std::vector<ustore_gpu_device_t> const devices = listed_devices();
-    if (devices.empty()) run_test_case("vram.devices", [] { return case_result_t::skipped(no_gpu_device_k); });
+    if (devices.empty())
+        run_test_case("test_vram_devices_listed", [] { return case_result_t::skipped(no_gpu_device_k); });
     for (std::size_t ordinal = 0; ordinal != devices.size(); ++ordinal) {
         ustore_gpu_device_t const& listed = devices[ordinal];
         fmt::println("device {}: {}, vendor ordinal {}", ordinal, listed.name, listed.vendor_ordinal);
-        std::string const prefix = fmt::format("vram.{}{}.", ustore_gpu_vendor_name(listed.vendor), ordinal);
+        std::string const prefix = fmt::format("test_vram_{}{}_", ustore_gpu_vendor_name(listed.vendor), ordinal);
         run_test_case((prefix + "listing").c_str(), test_vram_listing, listed);
         run_test_case((prefix + "class_ceiling").c_str(), test_vram_class_ceiling, ordinal, listed);
         run_test_case((prefix + "arenas").c_str(), test_vram_arenas, ordinal, config);
@@ -1102,9 +1109,9 @@ int main(int argc, char** argv) {
         run_test_case((prefix + "warm_calls").c_str(), test_vram_warm_calls, ordinal, listed, config);
         run_test_case((prefix + "frees_everything").c_str(), test_vram_frees_everything, ordinal, listed, config);
         run_test_case((prefix + "matching").c_str(), test_vram_matching, ordinal, listed, config);
-        // A build embedding no kernels for the vendor, like the one the HIP stand-in runs under,
-        // lists no tape case
-        if (embeds_kernels(listed)) run_test_case((prefix + "tapes").c_str(), test_vram_tapes, listed);
+        // Tapes launch kernels, which neither a build embedding none nor the HIP stand-in can run
+        if (embeds_kernels(listed) && (listed.vendor != ustore_gpu_vendor_amd_k || !fake_hip_counters()))
+            run_test_case((prefix + "tapes").c_str(), test_vram_tapes, listed);
     }
     return finish_test_run();
 }

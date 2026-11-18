@@ -274,6 +274,10 @@ class transaction_deltas {
 
     inline bool can_fit(std::size_t stored_values_count, std::size_t stored_values_sum_size) const noexcept;
 
+    /** The keys and bytes the deltas would have held with the last delta refused for want of
+     *  room, which a transaction sized to them takes, zero keys before any refusal. */
+    transaction_config_t wanted_shape() const noexcept { return wanted_shape_; }
+
     inline void clear() noexcept;
 
 #pragma endregion Validators
@@ -282,8 +286,15 @@ class transaction_deltas {
 #pragma region Collection Reach
 
     /** Finds the deltas of @p id, starting them at @p widths when the collection is new. */
-    inline status_t reach_collection_(collection_id_t id, value_widths_t widths,
-                                      collection_deltas_t*& collection) noexcept;
+    inline expected<collection_deltas_t*> reach_collection_(collection_id_t id, value_widths_t widths) noexcept;
+
+    /** Refuses a delta of @p stored_values_count keys and @p stored_values_sum_size bytes that
+     *  @c can_fit found no room for, noting the shape it wanted. */
+    status_t refuse_for_room_(std::size_t stored_values_count, std::size_t stored_values_sum_size) noexcept {
+        wanted_shape_ = {next_inserted_offset + stored_values_sum_size, elements_count_ + stored_values_count};
+        return {status_code_t::capacity_exhausted_k,
+                "The transaction holds transaction_max_deltas or transaction_max_bytes"};
+    }
 
 #pragma endregion Collection Reach
 
@@ -300,6 +311,9 @@ class transaction_deltas {
 
     /** The keys every collection together holds. */
     std::size_t elements_count_ = 0;
+
+    /** What the last delta refused for want of room wanted, as @c wanted_shape answers. */
+    transaction_config_t wanted_shape_ {};
 
 #pragma endregion Private Members
 };
@@ -321,7 +335,7 @@ inline transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row
     : collections_by_id(std::move(other.collections_by_id)), insertions_buffer(std::move(other.insertions_buffer)),
       next_inserted_offset(other.next_inserted_offset), resources_(std::move(other.resources_)),
       capacity_bytes_(other.capacity_bytes_), elements_max_count_(other.elements_max_count_),
-      elements_count_(other.elements_count_) {}
+      elements_count_(other.elements_count_), wanted_shape_(other.wanted_shape_) {}
 
 template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
           typename row_kit_type_>
@@ -335,6 +349,7 @@ transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_ty
     std::swap(capacity_bytes_, other.capacity_bytes_);
     std::swap(elements_max_count_, other.elements_max_count_);
     std::swap(elements_count_, other.elements_count_);
+    std::swap(wanted_shape_, other.wanted_shape_);
     return *this;
 }
 
@@ -492,8 +507,10 @@ inline void transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_
 
 template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
           typename row_kit_type_>
-inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::reach_collection_(
-    collection_id_t id, value_widths_t widths, collection_deltas_t*& collection) noexcept {
+inline expected<
+    typename transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::collection_deltas_t*>
+transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::reach_collection_(
+    collection_id_t id, value_widths_t widths) noexcept {
 
     auto iterator = collections_by_id.find(id);
     if (iterator == collections_by_id.end()) {
@@ -512,8 +529,7 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
         if (iterator == collections_by_id.end())
             return status_t {status_code_t::out_of_memory_k, "No room for another collection"};
     }
-    collection = &iterator.value_ref();
-    return status_t {};
+    return &iterator.value_ref();
 }
 
 template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
@@ -522,16 +538,14 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     collection_id_t id, value_widths_t widths, stored_key_t stored_key, stored_value_view_t stored_value,
     transaction_stamp_t watch_stamp) noexcept {
 
-    collection_deltas_t* collection = nullptr;
-    auto status = reach_collection_(id, widths, collection);
-    if (status.failed()) return status;
+    auto const [collection, reach_status] = reach_collection_(id, widths);
+    if (reach_status.failed()) return reach_status;
 
-    status = check_stored_value(collection->widths, stored_key, stored_value.size());
+    status_t const status = check_stored_value(collection->widths, stored_key, stored_value.size());
     if (status.failed()) return status;
 
     if (!can_fit(1, stored_value.size())) [[unlikely]]
-        return status_t {status_code_t::capacity_exhausted_k,
-                         "The transaction holds transaction_max_deltas or transaction_max_bytes"};
+        return refuse_for_room_(1, stored_value.size());
 
     // The room for the key is taken before a byte of the value lands, so a refusal writes nothing.
     if (collection->stored_values.reserve_more(1) == collection_deltas_t::stored_values_t::reserve_result_t::failed_k)
@@ -574,13 +588,11 @@ template <typename stored_key_type_, template <typename> typename atomic_referen
 inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::remove(
     collection_id_t id, value_widths_t widths, stored_key_t stored_key, transaction_stamp_t watch_stamp) noexcept {
 
-    collection_deltas_t* collection = nullptr;
-    auto status = reach_collection_(id, widths, collection);
-    if (status.failed()) return status;
+    auto const [collection, reach_status] = reach_collection_(id, widths);
+    if (reach_status.failed()) return reach_status;
 
     if (!can_fit(1, 0)) [[unlikely]]
-        return status_t {status_code_t::capacity_exhausted_k,
-                         "The transaction holds transaction_max_deltas or transaction_max_bytes"};
+        return refuse_for_room_(1, 0);
 
     if (collection->stored_values.reserve_more(1) == collection_deltas_t::stored_values_t::reserve_result_t::failed_k)
         return status_t {status_code_t::out_of_memory_k, "No room for another key"};
@@ -610,13 +622,11 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     collection_id_t id, value_widths_t widths, stored_key_t start, stored_key_t end) noexcept {
 
     if (!(start < end)) return status_t {status_code_t::invalid_argument_k, "A range ends at or before its start"};
-    collection_deltas_t* collection = nullptr;
-    auto status = reach_collection_(id, widths, collection);
-    if (status.failed()) return status;
+    auto const [collection, reach_status] = reach_collection_(id, widths);
+    if (reach_status.failed()) return reach_status;
 
     if (!can_fit(1, 0)) [[unlikely]]
-        return status_t {status_code_t::capacity_exhausted_k,
-                         "The transaction holds transaction_max_deltas or transaction_max_bytes"};
+        return refuse_for_room_(1, 0);
     if (collection->ranges.reserve(collection->ranges.size() + 1) != st::status_t::success_k)
         return status_t {status_code_t::out_of_memory_k, "No room for another range"};
 
@@ -658,9 +668,8 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     collection_id_t id, value_widths_t widths, stored_key_t stored_key, stored_value_view_t change,
     fold_type_ const& fold) noexcept {
 
-    collection_deltas_t* collection = nullptr;
-    auto status = reach_collection_(id, widths, collection);
-    if (status.failed()) return status;
+    auto const [collection, reach_status] = reach_collection_(id, widths);
+    if (reach_status.failed()) return reach_status;
     if (stored_key == limit<stored_key_t>::max_k) return status_t {status_code_t::malformed_k, "Invalid stored key"};
     if (collection->stored_values.reserve_more(1) == collection_deltas_t::stored_values_t::reserve_result_t::failed_k)
         return status_t {status_code_t::out_of_memory_k, "No room for another key"};
@@ -689,8 +698,7 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     }
 
     if (!can_fit(held ? 0 : 1, folded.bytes.size())) [[unlikely]]
-        return status_t {status_code_t::capacity_exhausted_k,
-                         "The transaction holds transaction_max_deltas or transaction_max_bytes"};
+        return refuse_for_room_(held ? 0 : 1, folded.bytes.size());
     if (!folded.bytes.empty() && insertions_buffer.size() != capacity_bytes_ &&
         insertions_buffer.resize(st::assume_uninitialized, capacity_bytes_) != st::status_t::success_k)
         return status_t {status_code_t::out_of_memory_k, "No room for the bytes of the transaction"};
@@ -855,6 +863,7 @@ inline void transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_
     collections_by_id.clear();
     next_inserted_offset = 0;
     elements_count_ = 0;
+    wanted_shape_ = {};
 }
 
 #pragma endregion Transaction Deltas

@@ -6,19 +6,20 @@
  *      gathering cells from key trees, ranking strings, and folding graph adjacency.
  *
  *  The Metal twin of the merge and fold kernels of @c vram_kernels_nvidia.cu , under the same
- *  names, each running the body of @c vram_nvidia_compaction.cuh or
- *  @c vram_nvidia_adjacency_fold.cuh restated here, as MSL includes no host header. The host
- *  splices it after @c vram_kernels_apple.metal , whose block table, block scans and select
- *  it reuses, and binds every kernel as that file's do: the CUDA parameters packed as one
- *  struct, every pointer among them, embedded ones too, a host address the block table turns
- *  into a device one.
+ *  names, each running the body of @c vram_nvidia_compaction.cuh or @c vram_adjacency_fold.cuh
+ *  restated here, as MSL includes no host header. The host splices it after
+ *  @c vram_kernels_apple.metal , whose block table, block scans and select it reuses, and binds
+ *  every kernel as that file's do: the CUDA parameters packed as one struct, every pointer among
+ *  them, embedded ones too, a host address the block table turns into a device one.
  *
  *  Rank, place, gather and the strings rank take the CUDA parameters as they are. The pack and the
  *  fold write chain one scan across every block on CUDA with 64-bit atomics, which Metal lacks, so
- *  here they run after the select instead: the select lists the flagged items in order, the pack
- *  takes every survivor by its rank among them, and the fold writes every kept record by its own.
- *  The pack scans its value offsets per tile and @c ustore_merge_offsets_apple adds the bytes of
- *  the tiles before, and the fold write hands every chain the rank of its first kept record.
+ *  here they run after the select's passes instead: the pack takes every tile of the merged records
+ *  from the survivors before it, which the select's count and scan passes leave as 64-bit prefixes
+ *  of 32-bit tile counts, and the fold writes every kept record by its rank, which the select's
+ *  write pass lists. The pack scans its value offsets per tile, which @c ustore_merge_offsets_apple
+ *  raises by the bytes of the tiles before, and the fold write hands every chain the rank of its
+ *  first kept record.
  */
 
 namespace unum {
@@ -206,7 +207,15 @@ inline bool survives(blocks_t blocks, thread located_key_slot<key_slot_type_> co
 
 #pragma region Merge
 
-/** One run of a merge as the host lays out @c merge_run , every pointer a host address. */
+/** The keys from @c start up to @c end , exclusive, which one range removal hides, as the host's
+ *  @c range_tombstone . */
+struct range_tombstone {
+    key128_t start;
+    key128_t end;
+};
+
+/** One run of a merge as the host lays out @c merge_run , every pointer a host address, its
+ *  last three words the host's @c range_tombstones_view . */
 template <typename key_slot_type_>
 struct merge_run {
     ulong cells;
@@ -216,7 +225,33 @@ struct merge_run {
     ulong assigned_stamp;
     ulong first;
     ulong key_slots_count;
+    ulong ranges;
+    ulong range_stamps;
+    ulong ranges_count;
 };
+
+/** Whether a range tombstone of @p runs hides the version of @p stored_key stamped @p stamp
+ *  that run @p run holds from every reader of @p stamps , as the host's @c hidden_by_range . */
+template <typename key_slot_type_>
+inline bool hidden_by_range(blocks_t blocks, device merge_run<key_slot_type_> const* runs, uint runs_count,
+                            uint upper_runs, key128_t stored_key, uint run, ulong stamp, compaction_stamps_t stamps) {
+    for (uint source = 0; source != runs_count; ++source) {
+        bool const own = source == run;
+        bool const newer = source < upper_runs && (run >= upper_runs || source > run);
+        if (!own && !newer) continue;
+        merge_run<key_slot_type_> const theirs = runs[source];
+        device range_tombstone const* const ranges = reach<range_tombstone const>(blocks, theirs.ranges);
+        device ulong const* const range_stamps = reach<ulong const>(blocks, theirs.range_stamps);
+        for (ulong index = 0; index != theirs.ranges_count && !(stored_key < ranges[index].start); ++index) {
+            ulong const removed = range_stamps[index];
+            if (!(stored_key < ranges[index].end) || removed > stamps.ceiling || removed > stamps.horizon) continue;
+            if (own && removed <= stamp) continue;
+            if (stamp >= removed || reader_interval(blocks, stamps, stamp) == reader_interval(blocks, stamps, removed))
+                return true;
+        }
+    }
+    return false;
+}
 
 /** The record at sorted @p position of @p run , the run's index being @p index , with its stamp
  *  and kind unpacked. */
@@ -254,7 +289,7 @@ struct merge_rank_arguments_t {
 
 /** Writes every record of the runs at its merged position with its survival flag: its rank
  *  in its own run plus a binary search into every other, the last of those of its key
- *  deciding its survival. */
+ *  deciding its survival. A record a range tombstone hides lands as a dropped removal. */
 template <typename key_slot_type_>
 inline void merge_rank(constant merge_rank_arguments_t& arguments, blocks_t blocks, uint thread_index, uint threads) {
     using record_t = located_key_slot<key_slot_type_>;
@@ -271,7 +306,7 @@ inline void merge_rank(constant merge_rank_arguments_t& arguments, blocks_t bloc
             else high = middle;
         }
         ulong const position = index - runs[run].first;
-        record_t const record = merge_record(blocks, runs[run], run, arguments.value_stride, position);
+        record_t record = merge_record(blocks, runs[run], run, arguments.value_stride, position);
         ulong rank = position;
         record_t previous = record;
         bool preceded = false;
@@ -300,9 +335,13 @@ inline void merge_rank(constant merge_rank_arguments_t& arguments, blocks_t bloc
                 (!preceded || order(previous, candidate)))
                 previous = candidate, preceded = true;
         }
+        bool const hidden = hidden_by_range(blocks, runs, runs_count, arguments.upper_runs, record.key_slot.stored_key,
+                                            run, record.stamp, arguments.stamps);
+        if (hidden) record.kind = delta_kind_t::remove_k;
+        bool const kept = !hidden &&
+                          survives(blocks, preceded ? &previous : nullptr, record, arguments.kind, arguments.stamps);
         merged[rank] = record;
-        flags[rank] = survives(blocks, preceded ? &previous : nullptr, record, arguments.kind, arguments.stamps) ? 1
-                                                                                                                 : 0;
+        flags[rank] = kept ? 1 : 0;
     }
 }
 
@@ -322,25 +361,23 @@ inline located_key_slot<key_slot_type_> merge_packed(device located_key_slot<key
     return low != replaced_count && replaced[low] == index ? replacements[low] : merged[index];
 }
 
-/** The parameters of @c ustore_merge_pack_* on Apple, which take the select's output where CUDA's
- *  take a chain. */
+/** The parameters of @c ustore_merge_pack_* on Apple, which take the select's scanned counts where
+ *  CUDA's take a chain. */
 struct merge_pack_arguments_t {
 
     /** The merged records, their flags and the folded records replacing some, as CUDA's
      *  pack reads them. */
     ulong merged;
     ulong flags;
+    ulong records_count;
     ulong replaced;
     ulong replacements;
     ulong replaced_count;
 
-    /** The merged index of every survivor in order, the select's output, 32-bit each. */
-    ulong selected;
-
-    /** The select's scanned counts, the last of which is the survivors' count. */
+    /** The survivors before every tile of the merged records, and in all after the last. */
     ulong counts;
 
-    /** Survivors each threadgroup packs, and the threadgroups, as the select tiles the records. */
+    /** Records each threadgroup packs, and the threadgroups, as the select tiles them. */
     uint tile;
     uint tiles;
 
@@ -356,9 +393,9 @@ struct merge_pack_arguments_t {
     ulong survivors_count;
 };
 
-/** Packs the survivors of tile @p group of the select's output, as CUDA's pack does after its
- *  chain: each at its rank with its value offset within the tile and whether it shares its key, and
- *  the tile's bytes after. */
+/** Packs the survivors of tile @p group of the merged records, as CUDA's pack does after its chain:
+ *  each at its rank from the survivors of the tiles before, with its value offset within the tile
+ *  and whether it shares its key, then the tile's bytes. */
 template <typename key_slot_type_>
 inline void merge_pack(constant merge_pack_arguments_t& arguments, blocks_t blocks, uint group, uint lane,
                        threadgroup ulong* simd_totals) {
@@ -367,34 +404,36 @@ inline void merge_pack(constant merge_pack_arguments_t& arguments, blocks_t bloc
     device uchar const* const flags = reach<uchar const>(blocks, arguments.flags);
     device ulong const* const replaced = reach<ulong const>(blocks, arguments.replaced);
     device record_t const* const replacements = reach<record_t const>(blocks, arguments.replacements);
-    device uint const* const selected = reach<uint const>(blocks, arguments.selected);
+    device ulong const* const counts = reach<ulong const>(blocks, arguments.counts);
     device record_t* const survivors = reach<record_t>(blocks, arguments.survivors);
     device ulong* const prefix = reach<ulong>(blocks, arguments.prefix);
     device uchar* const shares = reach<uchar>(blocks, arguments.shares);
-    uint const total = reach<uint const>(blocks, arguments.counts)[arguments.tiles];
     if (group == 0 && lane == 0) {
-        reach<ulong>(blocks, arguments.survivors_count)[0] = total;
+        reach<ulong>(blocks, arguments.survivors_count)[0] = counts[arguments.tiles];
         if (prefix != nullptr) prefix[0] = 0;
     }
-    uint const first = min(group * arguments.tile, total);
-    uint const end = first + min(total - first, arguments.tile);
+    ulong const first = min(ulong(group) * arguments.tile, arguments.records_count);
+    ulong const end = first + min(arguments.records_count - first, ulong(arguments.tile));
+    ulong kept_before = counts[group];
     ulong carried = 0;
-    for (uint base = first; base < end; base += block_threads_k) {
-        uint const into = base + lane;
-        bool const live = into < end;
-        uint const index = live ? selected[into] : 0;
-        record_t const record = merge_packed(merged, index, replaced, replacements, arguments.replaced_count);
+    for (ulong base = first; base < end; base += block_threads_k) {
+        ulong const index = base + lane;
+        bool const live = index < end && flags[index] != 0;
+        record_t const record = merge_packed(merged, live ? index : first, replaced, replacements,
+                                             arguments.replaced_count);
         ulong const size = live ? ulong(record.size) : 0;
-        block_scanned<ulong> const scan = block_exclusive(size, lane, simd_totals);
+        block_scanned<ulong> const kept_scan = block_exclusive(ulong(live ? 1 : 0), lane, simd_totals);
+        block_scanned<ulong> const bytes_scan = block_exclusive(size, lane, simd_totals);
+        ulong const into = kept_before + kept_scan.before;
         if (live) survivors[into] = record;
-        if (live && prefix != nullptr) prefix[into + 1] = carried + scan.before + size;
+        if (live && prefix != nullptr) prefix[into + 1] = carried + bytes_scan.before + size;
         // A survivor shares its key when a flagged record of the same key precedes it
         bool shared = false;
-        for (uint older = index;
+        for (ulong older = index;
              live && !shared && older-- != 0 && merged[older].key_slot.stored_key == merged[index].key_slot.stored_key;)
             shared = flags[older] != 0;
         if (live) shares[into] = shared ? 1 : 0;
-        carried += scan.total;
+        kept_before += kept_scan.total, carried += bytes_scan.total;
     }
     if (lane == 0) reach<ulong>(blocks, arguments.tile_bytes)[group] = carried;
 }
@@ -402,11 +441,10 @@ inline void merge_pack(constant merge_pack_arguments_t& arguments, blocks_t bloc
 /** The parameters of @c ustore_merge_offsets_apple . */
 struct merge_offsets_arguments_t {
 
-    /** The select's scanned counts, the last of which is the survivors' count. */
+    /** The survivors before every tile of the merged records, and in all after the last. */
     ulong counts;
 
-    /** Survivors each threadgroup offsets, and the threadgroups, as the pack tiled them. */
-    uint tile;
+    /** The threadgroups, one per tile, as the pack tiled the records. */
     uint tiles;
 
     /** The bytes of each tile's survivors and their value offsets within their tile, as the
@@ -498,6 +536,10 @@ struct strings_merge_run {
     ulong saved_kinds;
     ulong first;
     ulong count;
+    ulong range_stamps;
+    ulong range_offsets;
+    ulong range_tape;
+    ulong ranges_count;
 };
 
 /** Where a version lands in a merge of strings, and whether it survives. */
@@ -534,6 +576,52 @@ inline int strings_merge_order(blocks_t blocks, strings_merge_run first, ulong f
     return first_offset != first_end ? 1 : second_offset != second_end ? -1 : 0;
 }
 
+/** Orders the key at @p position of @p run against the @p length bytes at @p text , as strings
+ *  order: by their bytes, a prefix first. */
+inline int strings_merge_order(blocks_t blocks, strings_merge_run run, ulong position, device uchar const* text,
+                               uint length) {
+    device uint const* const offsets = reach<uint const>(blocks, run.key_offsets);
+    device uchar const* const keys = reach<uchar const>(blocks, run.keys);
+    uint offset = offsets[position];
+    uint const end = offsets[position + 1];
+    for (uint index = 0; offset != end && index != length; ++offset, ++index) {
+        uchar const key_byte = keys[offset];
+        uchar const text_byte = text[index];
+        if (key_byte != text_byte) return key_byte < text_byte ? -1 : 1;
+    }
+    uint const key_length = end - offsets[position];
+    return key_length == length ? 0 : key_length < length ? -1 : 1;
+}
+
+/** Whether a range tombstone of @p runs hides the version stamped @p stamp at @p position of run
+ *  @p run from every reader of @p stamps , as the host's @c strings_merge_hidden . */
+inline bool strings_merge_hidden(blocks_t blocks, device strings_merge_run const* runs, uint runs_count,
+                                 uint upper_runs, uint run, ulong position, ulong stamp, compaction_stamps_t stamps) {
+    strings_merge_run const own_run = runs[run];
+    for (uint holder = 0; holder != runs_count; ++holder) {
+        strings_merge_run const theirs = runs[holder];
+        bool const own = holder == run;
+        bool const newer = holder < upper_runs && (run >= upper_runs || holder > run);
+        if (!own && !newer) continue;
+        device ulong const* const range_stamps = reach<ulong const>(blocks, theirs.range_stamps);
+        device uint const* const range_offsets = reach<uint const>(blocks, theirs.range_offsets);
+        device uchar const* const range_tape = reach<uchar const>(blocks, theirs.range_tape);
+        for (ulong index = 0; index != theirs.ranges_count; ++index) {
+            ulong const removed = range_stamps[index];
+            if (removed > stamps.ceiling || removed > stamps.horizon || (own && removed <= stamp)) continue;
+            if (stamp < removed && reader_interval(blocks, stamps, stamp) != reader_interval(blocks, stamps, removed))
+                continue;
+            device uint const* const bounds = range_offsets + 2 * index;
+            if (strings_merge_order(blocks, own_run, position, range_tape + bounds[0], bounds[1] - bounds[0]) < 0)
+                continue;
+            if (bounds[2] == bounds[1] ||
+                strings_merge_order(blocks, own_run, position, range_tape + bounds[1], bounds[2] - bounds[1]) < 0)
+                return true;
+        }
+    }
+    return false;
+}
+
 /** The version at @p position of @p run as @c survives reads it: its head, run, kind and stamp. */
 inline located_key_slot<strings_merge_slot_t> strings_merge_record(blocks_t blocks, strings_merge_run run, uint index,
                                                                    ulong position) {
@@ -552,7 +640,8 @@ inline located_key_slot<strings_merge_slot_t> strings_merge_record(blocks_t bloc
 
 /** Where the version at @p position of run @p run lands in the merge of @p runs , and whether it
  *  survives: its own position plus, for every other run, how many of that run's versions order
- *  before it, the last of those of its key being the version before it. */
+ *  before it, the last of those of its key being the version before it. A version a range
+ *  tombstone hides does not survive. */
 inline strings_merge_verdict_t strings_merge_verdict(blocks_t blocks, device strings_merge_run const* runs,
                                                      uint runs_count, uint upper_runs, uint run, ulong position,
                                                      compaction_kind_t kind, compaction_stamps_t stamps) {
@@ -586,7 +675,8 @@ inline strings_merge_verdict_t strings_merge_verdict(blocks_t blocks, device str
     located_key_slot<strings_merge_slot_t> const record = strings_merge_record(blocks, own, run, position);
     located_key_slot<strings_merge_slot_t> const previous = strings_merge_record(blocks, runs[previous_run],
                                                                                  previous_run, previous_position);
-    return {rank, survives(blocks, preceded ? &previous : nullptr, record, kind, stamps)};
+    bool const hidden = strings_merge_hidden(blocks, runs, runs_count, upper_runs, run, position, record.stamp, stamps);
+    return {rank, !hidden && survives(blocks, preceded ? &previous : nullptr, record, kind, stamps)};
 }
 
 /** The parameters of @c ustore_merge_strings_rank , in CUDA order. */
@@ -673,24 +763,91 @@ inline bool chained_before(device half_edge_record_t const* records, uint first,
     return first > second;
 }
 
+/** Orders the indices of @p sorted, in threadgroup or device memory, at @p index and @p stride past
+ *  it, as one step of a bitonic sort of runs of @p size compares them, where @p index is the lower
+ *  of the pair. */
+template <typename sorted_type_>
+inline void bitonic_exchange(device half_edge_record_t const* records, sorted_type_ sorted, uint index, uint size,
+                             uint stride) {
+    uint const partner = index ^ stride;
+    if (partner <= index) return;
+    bool const ascending = (index & size) == 0;
+    uint const low = sorted[index], high = sorted[partner];
+    if (ascending ? chained_before(records, high, low) : chained_before(records, low, high))
+        sorted[index] = high, sorted[partner] = low;
+}
+
 /** One step of a bitonic sort of the @p width indices in @p sorted , comparing every pair @p stride
  *  apart within runs of @p size , each pair by one thread of the threadgroup. */
 inline void bitonic_step(device half_edge_record_t const* records, threadgroup uint* sorted, uint width, uint size,
                          uint stride, uint lane) {
-    for (uint index = lane; index < width; index += block_threads_k) {
-        uint const partner = index ^ stride;
-        if (partner <= index) continue;
-        bool const ascending = (index & size) == 0;
-        uint const low = sorted[index], high = sorted[partner];
-        if (ascending ? chained_before(records, high, low) : chained_before(records, low, high))
-            sorted[index] = high, sorted[partner] = low;
+    for (uint index = lane; index < width; index += block_threads_k)
+        bitonic_exchange(records, sorted, index, size, stride);
+}
+
+/** The chains a threadgroup sorts no more of in its memory, as the host's @c fold_spill_t lays
+ *  them out across threadgroups in device memory. */
+struct fold_spill_t {
+    ulong sorted;
+    ulong starts;
+    ulong chains;
+    uint count;
+    uint shared_width;
+};
+
+/** As @c bitonic_exchange , at @p index of every spilled index in @p sorted , in the slot of the
+ *  @p count slots @p starts names holding it, whose chain is wide enough for runs of @p size . */
+inline void spilled_exchange(device half_edge_record_t const* records, device uint* sorted, device ulong const* starts,
+                             uint count, ulong index, uint size, uint stride) {
+    uint slot = 0;
+    for (uint high = count; high - slot > 1;) {
+        uint const middle = slot + (high - slot) / 2;
+        if (starts[middle] <= index) slot = middle;
+        else high = middle;
     }
+    ulong const first = starts[slot];
+    if (starts[slot + 1] - first < size) return;
+    bitonic_exchange(records, sorted + first, uint(index - first), size, stride);
+}
+
+/** The parameters of @c ustore_fold_sort_step on Apple, in CUDA order. */
+struct fold_sort_step_arguments_t {
+    ulong records;
+    fold_spill_t spill;
+    uint size;
+    uint stride;
+};
+
+/** One step of the bitonic sort of every spilled chain, as CUDA's @c fold_sort_step does: a stride
+ *  at or above the threadgroup's threads spans the grid, and a shorter one finishes every stride
+ *  below it within tiles of two indices per thread. */
+inline void fold_sort_step(constant fold_sort_step_arguments_t& arguments, blocks_t blocks, uint group, uint groups,
+                           uint lane) {
+    device half_edge_record_t const* const records = reach<half_edge_record_t const>(blocks, arguments.records);
+    device uint* const sorted = reach<uint>(blocks, arguments.spill.sorted);
+    device ulong const* const starts = reach<ulong const>(blocks, arguments.spill.starts);
+    uint const count = arguments.spill.count;
+    ulong const total = starts[count];
+    if (arguments.stride >= block_threads_k) {
+        for (ulong index = ulong(group) * block_threads_k + lane; index < total;
+             index += ulong(groups) * block_threads_k)
+            spilled_exchange(records, sorted, starts, count, index, arguments.size, arguments.stride);
+        return;
+    }
+    uint const tile = 2 * block_threads_k;
+    for (ulong first = ulong(group) * tile; first < total; first += ulong(groups) * tile)
+        for (uint step = arguments.stride; step; step /= 2) {
+            for (uint offset = lane; offset < tile && first + offset < total; offset += block_threads_k)
+                spilled_exchange(records, sorted, starts, count, first + offset, arguments.size, step);
+            threadgroup_barrier(mem_flags::mem_device);
+        }
 }
 
 /** Whether the record at @p position of the sorted chain survives: the newest removal of the
  *  vertex, or the newest record of a half-edge newer than it that does not remove the
  *  half-edge behind it. */
-inline bool keeps_sorted(device half_edge_record_t const* records, threadgroup uint const* sorted, uint position,
+template <typename sorted_type_>
+inline bool keeps_sorted(device half_edge_record_t const* records, sorted_type_ sorted, uint position,
                          uint newest_removal, half_edge_operation_t newest_operation) {
     uint const index = sorted[position];
     device half_edge_record_t const& record = records[index];
@@ -703,11 +860,36 @@ inline bool keeps_sorted(device half_edge_record_t const* records, threadgroup u
     return leads && !hidden;
 }
 
+/** Keeps what survives of the chain of @p length records from @p start , whose record indices
+ *  @p sorted holds in order, as CUDA's @c keep_sorted_chain does, then flags the places of its span
+ *  it kept, so the select lists every kept record in order. */
+template <typename sorted_type_>
+inline void keep_sorted_chain(device half_edge_record_t const* records, sorted_type_ sorted, uint start, uint length,
+                              device uint* kept, device uint& kept_count, device uchar* flags, uint lane,
+                              threadgroup uint* simd_totals) {
+    uint const newest_removal = sorted[0];
+    half_edge_operation_t const newest_operation = record_operation(records[newest_removal]);
+    uint written = 0;
+    for (uint base = 0; base < length; base += block_threads_k) {
+        uint const position = base + lane;
+        bool const keeps = position < length &&
+                           keeps_sorted(records, sorted, position, newest_removal, newest_operation);
+        block_scanned<uint> const scan = block_exclusive(keeps ? 1u : 0u, lane, simd_totals);
+        if (keeps) kept[start + written + scan.before] = sorted[position];
+        written += scan.total;
+    }
+    if (lane == 0) kept_count = written;
+    for (uint position = lane; position < length; position += block_threads_k)
+        flags[start + position] = position < written ? 1 : 0;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+}
+
 /** The parameters of @c ustore_fold_chains on Apple: CUDA's, then the flags the select reads. */
 struct fold_chains_arguments_t {
     ulong records;
     ulong starts;
     uint chains_count;
+    fold_spill_t spill;
     ulong kept;
     ulong kept_counts;
 
@@ -715,8 +897,8 @@ struct fold_chains_arguments_t {
     ulong flags;
 };
 
-/** Composes chain @p group and every chain a grid's width past it, as CUDA's @c fold_chains does,
- *  then flags the places of its span it kept, so the select lists every kept record in order. */
+/** Composes chain @p group and every chain a grid's width past it, and keeps what survives of every
+ *  spilled chain, as CUDA's @c fold_chains does, flagging the places of each span it kept. */
 inline void fold_chains(constant fold_chains_arguments_t& arguments, blocks_t blocks, uint group, uint groups,
                         uint lane, threadgroup uint* sorted, threadgroup uint* simd_totals) {
     uint const padding = 0xFFFFFFFFu;
@@ -734,6 +916,7 @@ inline void fold_chains(constant fold_chains_arguments_t& arguments, blocks_t bl
         }
         uint width = 1;
         while (width < length) width *= 2;
+        if (width > arguments.spill.shared_width) continue;
         for (uint index = lane; index < width; index += block_threads_k)
             sorted[index] = index < length ? start + index : padding;
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -744,22 +927,15 @@ inline void fold_chains(constant fold_chains_arguments_t& arguments, blocks_t bl
                 bitonic_step(records, sorted, width, size, stride, lane);
                 threadgroup_barrier(mem_flags::mem_threadgroup);
             }
-
-        uint const newest_removal = sorted[0];
-        half_edge_operation_t const newest_operation = record_operation(records[newest_removal]);
-        uint written = 0;
-        for (uint base = 0; base < length; base += block_threads_k) {
-            uint const position = base + lane;
-            bool const keeps = position < length &&
-                               keeps_sorted(records, sorted, position, newest_removal, newest_operation);
-            block_scanned<uint> const scan = block_exclusive(keeps ? 1u : 0u, lane, simd_totals);
-            if (keeps) kept[start + written + scan.before] = sorted[position];
-            written += scan.total;
-        }
-        if (lane == 0) kept_counts[chain] = written;
-        for (uint position = lane; position < length; position += block_threads_k)
-            flags[start + position] = position < written ? 1 : 0;
-        threadgroup_barrier(mem_flags::mem_threadgroup);
+        keep_sorted_chain(records, sorted, start, length, kept, kept_counts[chain], flags, lane, simd_totals);
+    }
+    device uint* const spilled = reach<uint>(blocks, arguments.spill.sorted);
+    device ulong const* const slot_starts = reach<ulong const>(blocks, arguments.spill.starts);
+    device uint const* const slot_chains = reach<uint const>(blocks, arguments.spill.chains);
+    for (uint slot = group; slot < arguments.spill.count; slot += groups) {
+        uint const chain = slot_chains[slot];
+        keep_sorted_chain(records, spilled + slot_starts[slot], starts[chain], starts[chain + 1] - starts[chain], kept,
+                          kept_counts[chain], flags, lane, simd_totals);
     }
 }
 
@@ -796,7 +972,7 @@ inline void fold_write(constant fold_write_arguments_t& arguments, blocks_t bloc
     device half_edge_record_t* const composed = reach<half_edge_record_t>(blocks, arguments.composed);
     device ulong* const offsets = reach<ulong>(blocks, arguments.offsets);
     device uint const* const selected = reach<uint const>(blocks, arguments.selected);
-    uint const total = reach<uint const>(blocks, arguments.counts)[arguments.tiles];
+    uint const total = uint(reach<ulong const>(blocks, arguments.counts)[arguments.tiles]);
     uint const chains_count = arguments.chains_count;
     half_edge_record_t const removal = arguments.removal;
     for (uint rank = thread_index; rank < total; rank += threads) {
@@ -981,13 +1157,12 @@ kernel void ustore_merge_offsets_apple(constant merge_offsets_arguments_t& argum
     blocks_t const blocks = {table, table_count};
     device ulong const* const tile_bytes = reach<ulong const>(blocks, arguments.tile_bytes);
     device ulong* const prefix = reach<ulong>(blocks, arguments.prefix);
-    uint const total = reach<uint const>(blocks, arguments.counts)[arguments.tiles];
+    device ulong const* const counts = reach<ulong const>(blocks, arguments.counts);
     ulong partial = 0;
     for (uint tile = lane; tile < group; tile += block_threads_k) partial += tile_bytes[tile];
     ulong const before = block_exclusive(partial, lane, simd_totals).total;
-    uint const first = min(group * arguments.tile, total);
-    uint const end = first + min(total - first, arguments.tile);
-    for (uint into = first + lane; into < end; into += block_threads_k) prefix[into + 1] += before;
+    for (ulong into = counts[group] + lane; into < counts[group + 1]; into += block_threads_k)
+        prefix[into + 1] += before;
 }
 
 /** Gathers the cells of runs of fixed width key slots from the leaf rows of their key trees. */
@@ -1027,8 +1202,19 @@ kernel void ustore_merge_strings_rank(constant merge_strings_rank_arguments_t& a
 
 #pragma region Fold Kernels
 
+/** One step of the bitonic sort of every chain of a graph merge that spills past a threadgroup's
+ *  memory, across the grid, as CUDA's @c ustore_fold_sort_step . */
+kernel void ustore_fold_sort_step(constant fold_sort_step_arguments_t& arguments [[buffer(metal_arguments_slot_k)]],
+                                  device ustore_metal_block_t const* table [[buffer(metal_blocks_slot_k)]],
+                                  constant uint& table_count [[buffer(metal_blocks_count_slot_k)]],
+                                  uint group [[threadgroup_position_in_grid]], uint groups [[threadgroups_per_grid]],
+                                  uint lane [[thread_index_in_threadgroup]]) {
+    fold_sort_step(arguments, {table, table_count}, group, groups, lane);
+}
+
 /** Sorts, keeps, counts and flags the records of every chain of a graph merge, one threadgroup per
- *  chain, sorting in the threadgroup memory the host sizes for the longest chain. */
+ *  chain, sorting in the threadgroup memory the host sizes for the longest chain it fits, and
+ *  keeps, counts and flags those of every chain the steps before sorted. */
 kernel void ustore_fold_chains(constant fold_chains_arguments_t& arguments [[buffer(metal_arguments_slot_k)]],
                                device ustore_metal_block_t const* table [[buffer(metal_blocks_slot_k)]],
                                constant uint& table_count [[buffer(metal_blocks_count_slot_k)]],

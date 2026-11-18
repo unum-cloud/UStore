@@ -41,15 +41,14 @@ inline std::vector<std::string> vertex_run(reader_t const& reader, collection_t 
     std::string const prefix = bytes_of(vertex);
     std::string position = vertex_entry(vertex);
     bound_t kind = bound_t::inclusive_k;
-    std::string key;
-    std::string const* value = nullptr;
-    while (reader.seek(collection, position, kind, ustore_scan_ascending_k, key, value) &&
-           std::string_view(key).starts_with(prefix)) {
+    while (true) {
+        found_entry_t const found = reader.seek(collection, position, kind, ustore_scan_ascending_k);
+        if (!found.value || !std::string_view(found.key).starts_with(prefix)) break;
         // A transaction watching the vertex watches every edge it files, and its window for
         // the ones added
-        reader.record(collection, key);
-        run.push_back(key);
-        position = key, kind = bound_t::exclusive_k;
+        reader.record(collection, found.key);
+        run.push_back(found.key);
+        position = found.key, kind = bound_t::exclusive_k;
     }
     reader.record_window({bytes_of(collection.id), vertex_entry(vertex), half_edge(vertex, 3, {}, {}), true});
     return run;

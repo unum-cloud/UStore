@@ -266,14 +266,14 @@ status_t spawn_gpu_executor(gpu_drivers_t const& drivers, kernel_tables<cuda_mod
         if (device.vendor_ordinal >= gpu_devices_capacity_k)
             return {status_code_t::device_k, "The CUDA ordinal passes the devices UStore lists"};
         cuda_context_handle_t const context = drivers.cuda_contexts[device.vendor_ordinal];
-        expected<cuda_executor_t> spawned = cuda_executor_t::spawn(
-            drivers.cuda, context, ordinal, stream, scratch_limit, gds, cuda_kernels.table_of(ordinal, gpu_class));
+        expected<cuda_executor_t> spawned = cuda_executor_t::spawn(drivers.cuda, context, device, stream, scratch_limit,
+                                                                   gds, cuda_kernels.table_of(ordinal, gpu_class));
         if (!spawned) return spawned.status();
         into.template emplace<cuda_executor_t>(std::move(*spawned));
         return {};
     }
     if (device.vendor == gpu_vendor_t::amd_k) {
-        expected<hip_executor_t> spawned = hip_executor_t::spawn(drivers.hip, ordinal, stream, scratch_limit,
+        expected<hip_executor_t> spawned = hip_executor_t::spawn(drivers.hip, device, stream, scratch_limit,
                                                                  hip_kernels.table_of(ordinal, gpu_class));
         if (!spawned) return spawned.status();
         into.template emplace<hip_executor_t>(std::move(*spawned));
@@ -281,7 +281,7 @@ status_t spawn_gpu_executor(gpu_drivers_t const& drivers, kernel_tables<cuda_mod
     }
     if (device.vendor == gpu_vendor_t::apple_k) {
         expected<metal_executor_t> spawned = metal_executor_t::spawn(
-            drivers.metal, drivers.metal_devices.device(ordinal), ordinal, stream, scratch_limit,
+            drivers.metal, drivers.metal_devices.device(ordinal), device, stream, scratch_limit,
             metal_kernels.table_of(ordinal, gpu_class));
         if (!spawned) return spawned.status();
         into.template emplace<metal_executor_t>(std::move(*spawned));

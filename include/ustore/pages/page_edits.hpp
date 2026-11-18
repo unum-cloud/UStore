@@ -29,7 +29,7 @@
 
 namespace unum::ustore::pages {
 
-using utilities::string_of;
+using utilities::chars_of;
 
 /** The kind of an edit, named after the call that makes it and numbered as its serialized form spells it. */
 enum class modification_t : std::uint8_t {
@@ -110,9 +110,7 @@ constexpr bool closes(edit_t const& edit) noexcept {
 }
 
 /** The view of characters as a bytes run. */
-inline std::span<byte_t const> as_bytes(std::string_view chars) noexcept {
-    return {reinterpret_cast<byte_t const*>(chars.data()), chars.size()};
-}
+inline std::span<byte_t const> as_bytes(std::string_view chars) noexcept { return std::as_bytes(std::span {chars}); }
 
 #pragma region Constructors
 
@@ -252,7 +250,7 @@ inline expected<edit_t> decode_edit(std::span<byte_t const> bytes, std::size_t& 
         std::uint32_t const length = load_u32(at);
         at += 4;
         if (std::size_t(end - at) < length) return truncated;
-        edit.field = {reinterpret_cast<char const*>(at), length}, at += length;
+        edit.field = chars_of(bytes_of(at, length)), at += length;
     }
     if (carries_value(edit.modification)) {
         if (end - at < 4) return truncated;
@@ -303,7 +301,7 @@ expected<std::span<byte_t const>> encode_edits(std::span<edit_t const> edits, al
     std::size_t size = 0;
     for (edit_t const& edit : edits) {
         if (edit.field.size() > ~std::uint32_t(0) || edit.value.size() > ~std::uint32_t(0))
-            return status_t {status_code_t::invalid_argument_k, "An edit carries more than 4 GiB"};
+            return status_t {status_code_t::capacity_exhausted_k, "An edit carries more than 4 GiB"};
         size += encoded_size(edit);
     }
     byte_t* const block = size ? allocator.allocate(size) : nullptr;

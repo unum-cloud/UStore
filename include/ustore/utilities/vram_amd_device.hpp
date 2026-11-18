@@ -48,6 +48,7 @@ enum hip_device_attribute_t : int {
     hip_attribute_compute_capability_major_k = 23,
     hip_attribute_compute_capability_minor_k = 61,
     hip_attribute_multiprocessor_count_k = 63,
+    hip_attribute_shared_memory_per_block_optin_k = 75,
     hip_attribute_host_numa_id_k = 92,
 };
 
@@ -184,12 +185,14 @@ inline std::size_t list_amd_gpu_devices(hip_api_t const& api, std::span<gpu_devi
     int devices_count = 0;
     if (!api || api.get_device_count(&devices_count) != hip_success_k) return count;
     for (int ordinal = 0; ordinal != devices_count && count != into.size(); ++ordinal) {
-        int handle = 0, major = 0, minor = 0, compute_units = 0;
+        int handle = 0, major = 0, minor = 0, compute_units = 0, shared_memory_per_block = 0;
         std::size_t memory_bytes = 0;
         if (api.get_device(&handle, ordinal) != hip_success_k ||
             api.get_device_attribute(&major, hip_attribute_compute_capability_major_k, ordinal) != hip_success_k ||
             api.get_device_attribute(&minor, hip_attribute_compute_capability_minor_k, ordinal) != hip_success_k ||
             api.get_device_attribute(&compute_units, hip_attribute_multiprocessor_count_k, ordinal) != hip_success_k ||
+            api.get_device_attribute(&shared_memory_per_block, hip_attribute_shared_memory_per_block_optin_k,
+                                     ordinal) != hip_success_k ||
             api.get_device_memory(&memory_bytes, handle) != hip_success_k)
             continue;
         gpu_device_t& device = into[count++];
@@ -198,6 +201,7 @@ inline std::size_t list_amd_gpu_devices(hip_api_t const& api, std::span<gpu_devi
                   static_cast<std::uint32_t>(major),
                   static_cast<std::uint32_t>(minor),
                   static_cast<std::uint32_t>(compute_units),
+                  static_cast<std::uint32_t>(shared_memory_per_block),
                   static_cast<std::uint64_t>(memory_bytes)};
         api.get_device_name(device.name, static_cast<int>(sizeof(device.name)), handle);
     }
@@ -292,17 +296,19 @@ class hip_executor_t {
     /** The kernels this executor launches. */
     using function_t = hip_function_handle_t;
 
-    /** Binds HIP ordinal @p ordinal, and queues on @p borrowed, a @c hipStream_t of the caller's on
-     *  that device which outlives the executor, or on one of its own for null; its scratch never
-     *  grows past @p scratch_limit bytes, zero for no limit, and its launches find their kernels in
-     *  @p kernels, the device's table of the library's bundle, or none for null. */
-    static expected<hip_executor_t> spawn(hip_api_t const& api, int ordinal, void* borrowed, std::size_t scratch_limit,
+    /** Binds @p device, as the HIP listing reports it, and queues on @p borrowed, a @c hipStream_t
+     *  of the caller's on that device which outlives the executor, or on one of its own for null;
+     *  its scratch never grows past @p scratch_limit bytes, zero for no limit, and its launches
+     *  find their kernels in @p kernels, the device's table of the library's bundle, if any. */
+    static expected<hip_executor_t> spawn(hip_api_t const& api, gpu_device_t const& device, void* borrowed,
+                                          std::size_t scratch_limit,
                                           kernel_table<hip_module_t> const* kernels = nullptr) noexcept {
+        int const ordinal = static_cast<int>(device.vendor_ordinal);
         if (!api || api.set_device(ordinal) != hip_success_k)
             return status_t {status_code_t::device_k, "The HIP runtime refused the device"};
         hip_executor_t executor;
         executor.api_ = &api;
-        executor.device_ = ordinal;
+        executor.device_ = device;
         executor.scratch_limit_ = scratch_limit;
         executor.kernels_ = kernels;
         executor.stream_ = static_cast<hip_stream_handle_t>(borrowed);
@@ -330,7 +336,7 @@ class hip_executor_t {
     hip_executor_t(hip_executor_t const&) = delete;
     hip_executor_t& operator=(hip_executor_t const&) = delete;
     ~hip_executor_t() noexcept {
-        if (!api_ || api_->set_device(device_) != hip_success_k) return;
+        if (!api_ || api_->set_device(static_cast<int>(device_.vendor_ordinal)) != hip_success_k) return;
         api_->stream_synchronize(stream_);
         free_blocks(managed_.blocks, [this](std::uintptr_t address) noexcept { free_managed(address); });
         if (owned_stream_) api_->stream_destroy(owned_stream_);
@@ -338,13 +344,14 @@ class hip_executor_t {
 
     /** Waits until everything queued on the stream ran, reporting a failure among it as @c device_k. */
     status_t wait() noexcept {
-        if (api_->set_device(device_) != hip_success_k || !event_.record_and_wait(stream_))
+        if (api_->set_device(static_cast<int>(device_.vendor_ordinal)) != hip_success_k ||
+            !event_.record_and_wait(stream_))
             return {status_code_t::device_k, "The device failed a call queued on the executor"};
         return {};
     }
 
-    /** The HIP ordinal every call and arena of the executor uses. */
-    int device() const noexcept { return device_; }
+    /** The device every call and arena of the executor uses, as the HIP listing reports it. */
+    gpu_device_t const& device() const noexcept { return device_; }
 
     /** Bytes of scratch a call may take, zero for no limit. */
     std::size_t scratch_limit() const noexcept { return scratch_limit_; }
@@ -360,7 +367,7 @@ class hip_executor_t {
 
     /** Makes the device current on the calling thread, once per call, before any other entry below. */
     status_t bind() noexcept {
-        if (api_->set_device(device_) != hip_success_k)
+        if (api_->set_device(static_cast<int>(device_.vendor_ordinal)) != hip_success_k)
             return {status_code_t::device_k, "The HIP runtime refused the device"};
         return {};
     }
@@ -451,7 +458,7 @@ class hip_executor_t {
 
     hip_stream_handle_t stream_ = nullptr;
     hip_event_t event_;
-    int device_ = 0;
+    gpu_device_t device_ {};
     std::size_t scratch_limit_ = 0;
     kernel_table<hip_module_t> const* kernels_ = nullptr;
     pinned_bounce<hip_api_t> bounce_;

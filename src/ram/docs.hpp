@@ -38,12 +38,9 @@ struct documents_in_store {
 
     /** Reads the documents at @p places, appending their text to the scratch of @p view. */
     expected<json_documents_t> read(place_batch_t const& places, view_t const& view) const noexcept {
-        json_documents_t documents;
-        documents.count = places.count;
-        status_t const status = read_into_scratch<docs::document_pair_t>(source, places, view, documents.presences,
-                                                                         documents.tape, failure);
-        if (status.failed()) return status;
-        return documents;
+        auto const [documents, read_status] = read_into_scratch<docs::document_pair_t>(source, places, view, failure);
+        if (read_status.failed()) return read_status;
+        return json_documents_t {documents.tape(), documents.presences().get(), places.count};
     }
 
     /** Stages @p values as the whole text of the documents at @p places. */

@@ -226,11 +226,11 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources,
             else loop.count(1, width);
         }
     });
-    if (settings.filter.selects(insert_name)) print(inserted);
+    if (settings.regex_filter.selects(insert_name)) print(inserted);
     if (status_t const settled = settle(*database); settled.failed()) return settled;
 
     std::string const find_name = name_of("find");
-    if (settings.filter.selects(find_name))
+    if (settings.regex_filter.selects(find_name))
         print(run_threads(executor, settings, find_name, [&](loop_t& loop, std::size_t thread) noexcept {
             split_mix_generator_t random {stream_key(settings.seed, find_name, thread)};
             for ([[maybe_unused]] std::size_t call : loop) {
@@ -242,7 +242,7 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources,
         }));
 
     std::string const select_name = name_of("select");
-    if (settings.filter.selects(select_name))
+    if (settings.regex_filter.selects(select_name))
         print(run_threads(executor, settings, select_name, [&](loop_t& loop, std::size_t thread) noexcept {
             auto [reading, reading_status] = mount.channels().acquire(thread);
             st::vector<byte_t> value;
@@ -259,7 +259,7 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources,
         }));
 
     std::string const batch_name = name_of(fmt::format("select_batch/{}", batch_keys_k));
-    if (settings.filter.selects(batch_name))
+    if (settings.regex_filter.selects(batch_name))
         print(run_threads(executor, settings, batch_name, [&](loop_t& loop, std::size_t thread) noexcept {
             auto [reading, reading_status] = mount.channels().acquire(thread);
             std::array<stored_key_t, batch_keys_k> keys {};
@@ -280,7 +280,7 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources,
     // Each call reads the value under the cursor and steps past it, starting over once
     // the walk ends
     std::string const scan_name = name_of("scan");
-    if (settings.filter.selects(scan_name))
+    if (settings.regex_filter.selects(scan_name))
         print(run_threads(executor, settings, scan_name, [&](loop_t& loop, std::size_t thread) noexcept {
             auto [reading, reading_status] = mount.channels().acquire(thread);
             st::vector<byte_t> value;
@@ -301,7 +301,7 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources,
         }));
 
     std::string const remove_name = name_of("remove");
-    if (settings.filter.selects(remove_name)) {
+    if (settings.regex_filter.selects(remove_name)) {
         print(run_pass(executor, remove_name, population, [&](loop_t& loop, std::size_t) noexcept {
             for (std::size_t call : loop)
                 if (database->remove(call).failed()) loop.fail();

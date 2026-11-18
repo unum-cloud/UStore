@@ -1032,10 +1032,12 @@ struct values_arg_extractor<char const**> {
 /** One null-terminated string, repeated for every key. */
 template <>
 struct values_arg_extractor<char const*> {
+    char const* repeated = nullptr;
     strided_strings<char const*> strings;
 
-    ustore_strings_view_t view(char const* const& value) noexcept {
-        strings = strided_strings<char const*> {{&value, 0}};
+    ustore_strings_view_t view(char const* value) noexcept {
+        repeated = value;
+        strings = strided_strings<char const*> {{&repeated, 0}};
         return strings.view();
     }
 };

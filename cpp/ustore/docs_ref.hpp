@@ -210,12 +210,9 @@ class docs_ref {
     }
 
     template <typename values_argument_type_>
-    status_t write_(values_argument_type_&& values_argument, ustore_docs_modification_t modification,
+    status_t write_(values_argument_type_&& values, ustore_docs_modification_t modification,
                     ustore_docs_field_type_t type, ustore_durability_t durability) noexcept {
-        // An array decays into one pointer object, whose address an accessor can stride over
-        using values_t = std::decay_t<values_argument_type_>;
-        values_t const& values = values_argument;
-        values_arg_extractor<values_t> extractor;
+        values_arg_extractor<std::decay_t<values_argument_type_>> extractor;
         place_batch_t const places = places_();
         strided_strings<std::string_view> const fields {places.fields_begin};
         return docs_write_<ustore_completion_blocking_k>(receiver_, places, fields.view(), extractor.view(values), type,

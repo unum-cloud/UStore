@@ -1259,6 +1259,28 @@ void test_compactor_choice_follows_the_threshold() {
     expect_true(choose_compactor(compaction_placement_t::device_k, 0, 1) == compactor_choice_t::device_k);
 }
 
+/** The compactor of NVIDIA device zero, made once as an engine makes its own at open, or none where
+ *  the build or the machine carries no device. */
+struct device_zero_compactor_t {
+    gpu_drivers_t drivers;
+    kernel_tables<cuda_module_t> kernels;
+    expected<cuda_executor_t> executor = status_t {status_code_t::device_k, "No CUDA device zero"};
+    expected<cuda_compactor_t> compactor = status_t {status_code_t::device_k, "No CUDA device zero"};
+
+    device_zero_compactor_t() noexcept {
+        gpu_device_t device_zero;
+        gpu_class_t const gpu_class = list_nvidia_gpu_devices(drivers.cuda, {&device_zero, 1})
+                                          ? pick_gpu_class(drivers, device_zero, gpu_class_t::unknown_k)
+                                          : gpu_class_t::unknown_k;
+        if (drivers.retain_context(0) &&
+            kernels.load(drivers.cuda, drivers.cuda_contexts[0], 0, gpu_class, vram_kernel_names_k).succeeded())
+            executor = cuda_executor_t::spawn(drivers.cuda, drivers.cuda_contexts[0], device_zero, nullptr, 0,
+                                              ustore_gds_automatic_k, kernels.table_of(0, gpu_class));
+        if (executor) compactor = cuda_compactor_t::make(*executor);
+        else compactor = executor.status();
+    }
+};
+
 /** A merge on the host and the same merge on a device answer the same runs, key slot for key slot. */
 template <typename mount_type_>
 case_result_t test_both_compactors_agree(mount_type_ const& mount) {
@@ -1324,23 +1346,10 @@ case_result_t test_both_compactors_agree(mount_type_ const& mount) {
     if (!host_runs) return {};
     level_t const host = level_of<level_t>(*runs, 1, *host_runs);
 
-    // The device side runs on a compactor made once, as an engine makes its own at open, and a build without one
-    // refuses.
+    // The device side runs on a compactor made once, and a build without one refuses.
     request.placement = compaction_placement_t::device_k;
-    gpu_drivers_t drivers;
-    kernel_tables<cuda_module_t> kernels;
-    expected<cuda_executor_t> executor = status_t {status_code_t::device_k, "No CUDA device zero"};
-    gpu_device_t device_zero;
-    gpu_class_t const gpu_class = list_nvidia_gpu_devices(drivers.cuda, {&device_zero, 1})
-                                      ? pick_gpu_class(drivers, device_zero, gpu_class_t::unknown_k)
-                                      : gpu_class_t::unknown_k;
-    if (drivers.retain_context(0) &&
-        kernels.load(drivers.cuda, drivers.cuda_contexts[0], 0, gpu_class, vram_kernel_names_k).succeeded())
-        executor = cuda_executor_t::spawn(drivers.cuda, drivers.cuda_contexts[0], 0, nullptr, 0, ustore_gds_automatic_k,
-                                          kernels.table_of(0, gpu_class));
-    expected<cuda_compactor_t> compactor = executor ? cuda_compactor_t::make(*executor)
-                                                    : expected<cuda_compactor_t> {executor.status()};
-    if (compactor) request.compactor = std::addressof(*compactor);
+    device_zero_compactor_t device_zero;
+    if (device_zero.compactor) request.compactor = std::addressof(*device_zero.compactor);
     expected<st::vector<run_handle_t>> device_runs = merger_t::merge(
         *volume, *runs, reading->channel(), writing->channel(), request, last_write_fold_t {}, no_device_fold_t {});
     if (!device_runs) {
@@ -1631,11 +1640,12 @@ struct url_version_t {
 };
 
 /** Writes @p versions, ascending by URL, as one run of strings taken into @p runs, its values
- *  painted by stamp, answering whether @p into names it. */
+ *  painted by stamp and @p tombstones beside them, answering whether @p into names it. */
 template <typename types_type_>
 bool write_url_run(typename types_type_::run_pool_t& runs, typename types_type_::volume_t& volume,
                    io_channel_t& channel, std::span<url_version_t const> versions,
-                   st::vector<typename types_type_::run_handle_t>& into) {
+                   st::vector<typename types_type_::run_handle_t>& into,
+                   typename types_type_::sorted_run_t::range_tombstones_t const& tombstones = {}) {
     using key_slot_t = typename types_type_::key_slot_t;
     using sorted_run_t = typename types_type_::sorted_run_t;
     std::size_t const count = versions.size();
@@ -1670,7 +1680,8 @@ bool write_url_run(typename types_type_::run_pool_t& runs, typename types_type_:
     expected<sorted_run_t> run = sorted_run_t::write(
         volume, channel, uuid128_t {}, uuid_generator(), std::span<key_slot_t const> {key_slots},
         std::span<std::uint64_t const> {stamps}, std::span<std::uint8_t const> {kinds}, 0, {}, {}, key_slot_t::size,
-        key_tails_column_t {std::span<std::uint32_t const> {tail_offsets}, std::span<byte_t const> {tails}});
+        key_tails_column_t {std::span<std::uint32_t const> {tail_offsets}, std::span<byte_t const> {tails}},
+        tombstones);
     if (!expect_true(run.has_value())) return false;
     auto [taken, take_status] = runs.take(std::move(*run));
     if (!expect_true(take_status.succeeded())) return false;
@@ -1707,8 +1718,8 @@ void check_url_runs(typename types_type_::run_pool_t const& runs,
 }
 
 /** Ranks every version of @p sources by @c strings_merge_verdict, compiled for the host, as the
- *  device kernel ranks them, and compares the survivors in merged order with @p wanted, which the
- *  host merge wrote. */
+ *  device kernel ranks them under the sources' range tombstones, and compares the survivors in
+ *  merged order with @p wanted, which the host merge wrote. */
 template <typename sorted_run_type_>
 void check_device_ranking(std::span<sorted_run_type_ const* const> sources, std::uint32_t upper_runs,
                           compaction_kind_t kind, compaction_stamps_t const& stamps,
@@ -1717,9 +1728,13 @@ void check_device_ranking(std::span<sorted_run_type_ const* const> sources, std:
     for (sorted_run_type_ const* source : sources) records += source->population_count();
     st::vector<st::key128_t> heads;
     st::vector<st::vector<std::uint64_t>> saved;
+    st::vector<st::vector<std::uint32_t>> range_offsets;
+    st::vector<st::vector<byte_t>> range_tapes;
     st::vector<strings_merge_run> runs;
     expect_true(heads.resize(records) == st::status_t::success_k);
     expect_true(saved.resize(2 * sources.size()) == st::status_t::success_k);
+    expect_true(range_offsets.resize(sources.size()) == st::status_t::success_k);
+    expect_true(range_tapes.resize(sources.size()) == st::status_t::success_k);
     if (!expect_true(runs.resize(sources.size()) == st::status_t::success_k)) return;
     std::size_t first = 0;
     for (std::size_t index = 0; index != sources.size(); ++index) {
@@ -1745,6 +1760,20 @@ void check_device_ranking(std::span<sorted_run_type_ const* const> sources, std:
                                          first,
                                          count};
         first += count;
+
+        // The bounds of the run's range tombstones leave as a tape, as the compactor uploads them
+        typename sorted_run_type_::range_tombstones_t const& tombstones = source.range_tombstones();
+        st::vector<std::uint32_t>& offsets = range_offsets[index];
+        st::vector<byte_t>& tape = range_tapes[index];
+        for (std::size_t range = 0; range != tombstones.size(); ++range)
+            for (std::string_view const bound : {tombstones.range(range).start, tombstones.range(range).end}) {
+                expect_true(offsets.push_back(static_cast<std::uint32_t>(tape.size())) == st::status_t::success_k);
+                for (char const byte : bound)
+                    expect_true(tape.push_back(static_cast<byte_t>(byte)) == st::status_t::success_k);
+            }
+        if (!expect_true(offsets.push_back(static_cast<std::uint32_t>(tape.size())) == st::status_t::success_k)) return;
+        runs[index].range_stamps = tombstones.stamps().data(), runs[index].range_offsets = offsets.data();
+        runs[index].range_tape = tape.data(), runs[index].ranges_count = tombstones.size();
     }
 
     st::vector<strings_version_t> merged;
@@ -1930,6 +1959,63 @@ void test_strings_merges_match_reference(mount_type_ const& mount) {
     check_device_ranking<sorted_run_t>(std::span<sorted_run_t const* const> {all_sources}, std::uint32_t {upper_runs_k},
                                        compaction_kind_t::overlapping_into_intermediate_k, request.stamps,
                                        wanted_pinned);
+
+    // Range tombstones alone hide every older version from the readers above them
+    using range_tombstones_t = typename sorted_run_t::range_tombstones_t;
+    constexpr std::size_t hidden_first_k = 1000, hidden_end_k = 1300, hidden_tail_k = 5000;
+    char first_buffer[64], end_buffer[64], tail_buffer[64];
+    typename range_tombstones_t::range_t const ranges[] {
+        {url_of(hidden_first_k, first_buffer), url_of(hidden_end_k, end_buffer)},
+        {url_of(hidden_tail_k, tail_buffer), {}},
+    };
+    std::uint64_t const range_stamps[] {upper_stamp(upper_runs_k, 0), upper_stamp(upper_runs_k, 1)};
+    expected<range_tombstones_t> tombstones = range_tombstones_t::make(ranges, range_stamps);
+    if (!expect_true(tombstones.has_value())) return;
+    if (!write_url_run<types_t>(*runs, *volume, guard->channel(), {}, upper, *tombstones)) return;
+    st::vector<sorted_run_t const*> hidden_sources;
+    for (run_handle_t const& handle : upper)
+        expect_true(hidden_sources.push_back(runs->at(handle)) == st::status_t::success_k);
+    for (sorted_run_t const* source : lower_sources)
+        expect_true(hidden_sources.push_back(static_cast<sorted_run_t const*>(source)) == st::status_t::success_k);
+    device_zero_compactor_t device_zero;
+    request.upper = upper;
+    request.upper_order = lsm_level_order_t::overlapping_k;
+    auto const check_hidden = [&](lsm_level_depth_t depth, compaction_kind_t kind, std::uint64_t oldest_hidden,
+                                  std::span<url_version_t const> unhidden) {
+        st::vector<url_version_t> wanted_hidden;
+        for (url_version_t const& version : unhidden) {
+            bool const covered = (version.index >= hidden_first_k && version.index < hidden_end_k) ||
+                                 version.index >= hidden_tail_k;
+            if (covered && version.stamp >= oldest_hidden) continue;
+            expect_true(wanted_hidden.push_back(url_version_t {version}) == st::status_t::success_k);
+        }
+        expect_true(wanted_hidden.size() < unhidden.size());
+        request.depth = depth;
+        request.placement = compaction_placement_t::host_k;
+        request.compactor = {};
+        expected<st::vector<run_handle_t>> on_host = merger_t::merge(
+            *volume, *runs, reading->channel(), writing->channel(), request, last_write_fold_t {}, no_device_fold_t {});
+        expect_status(on_host, status_code_t::success_k);
+        if (!on_host) return;
+        check_url_runs<types_t>(*runs, *on_host, wanted_hidden, run_bytes_limit_k);
+        check_device_ranking<sorted_run_t>(std::span<sorted_run_t const* const> {hidden_sources},
+                                           std::uint32_t {upper_runs_k + 1}, kind, request.stamps, wanted_hidden);
+        runs->discard(*volume, *on_host);
+        if (!device_zero.compactor) return;
+        request.placement = compaction_placement_t::device_k;
+        request.compactor = std::addressof(*device_zero.compactor);
+        expected<st::vector<run_handle_t>> on_device = merger_t::merge(
+            *volume, *runs, reading->channel(), writing->channel(), request, last_write_fold_t {}, no_device_fold_t {});
+        expect_status(on_device, status_code_t::success_k);
+        if (!on_device) return;
+        check_url_runs<types_t>(*runs, *on_device, wanted_hidden, run_bytes_limit_k);
+        runs->discard(*volume, *on_device);
+    };
+    // A reader pinned below the upper stamps still reads the lower versions, hidden by no tombstone
+    check_hidden(lsm_level_depth_t::intermediate_k, compaction_kind_t::overlapping_into_intermediate_k,
+                 lower_stamps_k + 1, wanted_pinned);
+    request.stamps = {};
+    check_hidden(lsm_level_depth_t::bottom_k, compaction_kind_t::overlapping_into_bottom_k, 0, wanted);
 
     runs->discard(*volume, *once);
     runs->discard(*volume, *folded);

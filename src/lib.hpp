@@ -142,7 +142,7 @@ template <typename enum_type_, std::size_t count_>
 ustore_status_t value_in(enumerator_spelling<enum_type_> const (&names)[count_], ustore_bytes_view_t name,
                          enum_type_* value) noexcept {
     if (!value) return ustore_status_invalid_argument_k;
-    std::string_view const text = string_of(name);
+    std::string_view const text = chars_of(name);
     for (enumerator_spelling<enum_type_> const& spelling : names)
         if (spelling.name == text) return *value = spelling.value, ustore_status_success_k;
     return ustore_status_invalid_argument_k;
@@ -1727,7 +1727,7 @@ status_t open_from_root(arguments_type_& call, cpu_ceiling_t const& ceiling, vie
         if (!call.directory.length) return open_(call, ceiling, runner);
         char absolute[path_max_bytes_k];
         std::size_t length = 0;
-        std::string_view const named {reinterpret_cast<char const*>(call.directory.data), call.directory.length};
+        std::string_view const named = chars_of(call.directory);
         if (status_t const resolved = absolute_path_of(named, absolute, length); resolved.failed()) return resolved;
         arguments_type_ rooted = call;
         rooted.directory = {reinterpret_cast<std::uint8_t const*>(absolute), length};

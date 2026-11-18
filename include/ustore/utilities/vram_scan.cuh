@@ -90,30 +90,49 @@ struct block_scanned_t {
 
 #else
 
+/** Flags the select reads a byte each, as the merge ranks and the fold write them. */
+inline constexpr std::uint32_t select_byte_flags_k = 8;
+
 /**
- *  @brief Queues the select over the @p count byte @p flags on @p executor, listing the index of
- *      every flagged item into @p selected in item order.
+ *  @brief Queues the first two passes of the select over the @p count byte @p flags on
+ *      @p executor, which leave in @p counts the items flagged before every one of the @p tiles
+ *      tiles of @p tile items, a multiple of 256, and the total after the last.
  *
- *  @p counts receives the items flagged before every one of the @p tiles tiles of @p tile items,
- *  a multiple of 256, and the total after the last, so it holds @p tiles + 1 words, and
- *  @p selected holds @p count, both on the device.
+ *  Every tile counts in 32 bits and the scan widens the counts to 64-bit offsets, so @p counts
+ *  holds @p tiles + 1 words on the device.
+ *
+ *  @par Statuses:
+ *  - @c status_code_t::device_k The bundle holds no select, or the device refused a launch.
+ */
+inline status_t count_flagged(metal_executor_t& executor, std::uint8_t const* flags, std::uint64_t count,
+                              std::uint32_t tile, std::uint32_t tiles, std::uint64_t* counts) noexcept {
+    char const* const passes[] = {"ustore_select_count_apple", "ustore_select_scan_apple"};
+    unsigned const groups[] = {tiles, 1u};
+    // The select's scans assume threadgroups of 256 threads
+    for (std::size_t pass = 0; pass != 2; ++pass)
+        if (status_t const launched = launch(executor, executor.kernels()->function(passes[pass]), groups[pass], 256u,
+                                             0u, flags, count, tile, tiles, select_byte_flags_k, counts,
+                                             static_cast<std::uint32_t*>(nullptr));
+            launched.failed())
+            return launched;
+    return {};
+}
+
+/**
+ *  @brief Queues the select over the @p count byte @p flags on @p executor: the passes of
+ *      @c count_flagged, then a list of the index of every flagged item into @p selected in item
+ *      order, which holds @p count words on the device.
  *
  *  @par Statuses:
  *  - @c status_code_t::device_k The bundle holds no select, or the device refused a launch.
  */
 inline status_t select_flagged(metal_executor_t& executor, std::uint8_t const* flags, std::uint32_t count,
-                               std::uint32_t tile, std::uint32_t tiles, std::uint32_t* counts,
+                               std::uint32_t tile, std::uint32_t tiles, std::uint64_t* counts,
                                std::uint32_t* selected) noexcept {
-    constexpr std::uint32_t byte_flags_k = 8;
-    char const* const passes[] = {"ustore_select_count_apple", "ustore_select_scan_apple", "ustore_select_write_apple"};
-    unsigned const groups[] = {tiles, 1u, tiles};
-    // The select's scans assume threadgroups of 256 threads
-    for (std::size_t pass = 0; pass != 3; ++pass)
-        if (status_t const launched = launch(executor, executor.kernels()->function(passes[pass]), groups[pass], 256u,
-                                             0u, flags, count, tile, tiles, byte_flags_k, counts, selected);
-            launched.failed())
-            return launched;
-    return {};
+    if (status_t const counted = count_flagged(executor, flags, count, tile, tiles, counts); counted.failed())
+        return counted;
+    return launch(executor, executor.kernels()->function("ustore_select_write_apple"), tiles, 256u, 0u, flags,
+                  std::uint64_t {count}, tile, tiles, select_byte_flags_k, counts, selected);
 }
 
 #endif

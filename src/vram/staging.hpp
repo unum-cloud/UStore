@@ -45,7 +45,9 @@ template <gpu_executor_concept executor_type_>
 residence_t residence_of(gpu_drivers_t const& drivers, executor_type_ const& executor, void const* pointer) noexcept {
     if (!pointer) return residence_t::host_k;
     int const device = executor.device_of(pointer);
-    if (device >= 0) return device == executor.device() ? residence_t::executor_device_k : residence_t::other_device_k;
+    if (device >= 0)
+        return device == static_cast<int>(executor.device().vendor_ordinal) ? residence_t::executor_device_k
+                                                                            : residence_t::other_device_k;
     return utilities::on_another_vendor<executor_type_>(drivers, pointer) ? residence_t::other_device_k
                                                                           : residence_t::host_k;
 }
@@ -58,32 +60,35 @@ class input_stager {
     input_stager(gpu_drivers_t const& drivers, executor_type_& executor) noexcept
         : drivers_(drivers), executor_(executor) {}
 
-    /** Repoints @p data at a host copy of its @p bytes when they live on the executor's device. */
+    /** A host copy of the @p bytes at @p data where they live on the executor's device, else
+     *  @p data as it is. */
     template <typename element_type_>
-    void stage(element_type_ const*& data, std::size_t bytes) noexcept {
-        if (status_.failed() || !data || !bytes) return;
+    [[nodiscard]] element_type_ const* stage(element_type_ const* data, std::size_t bytes) noexcept {
+        if (status_.failed() || !data || !bytes) return data;
         residence_t const residence = residence_of(drivers_, executor_, data);
-        if (residence == residence_t::host_k) return;
+        if (residence == residence_t::host_k) return data;
         if (residence == residence_t::other_device_k) {
             status_ = {status_code_t::device_k, "An input lives on a device the executor does not compute on"};
-            return;
+            return data;
         }
         auto [copy, copy_status] = utilities::arena_allocate<byte_t>(executor_.bounce(), bytes);
         if (copy_status.failed()) {
             status_ = copy_status;
-            return;
+            return data;
         }
-        if ((status_ = executor_.pin_bounce()).failed()) return;
+        if ((status_ = executor_.pin_bounce()).failed()) return data;
         status_ = executor_.download_async(copy, reinterpret_cast<std::uintptr_t>(data));
-        data = reinterpret_cast<element_type_ const*>(copy.data());
         ++pending_;
+        return elements_of<element_type_>(copy).data();
     }
 
-    /** Repoints @p data at a host copy of its @p count elements, @p stride bytes apart or one repeated for zero. */
-    template <typename element_type_>
-    void stage(element_type_ const*& data, std::size_t stride, std::size_t count) noexcept {
+    /** Repoints the strided @p column at a host copy of its @p count elements, its stride apart or
+     *  one repeated for zero. */
+    template <typename strided_type_>
+    void stage(strided_type_& column, std::size_t count) noexcept {
         if (!count) return;
-        stage(data, stride ? stride * (count - 1) + sizeof(element_type_) : sizeof(element_type_));
+        std::size_t const element_bytes = sizeof(*column.data);
+        column.data = stage(column.data, column.stride ? column.stride * (count - 1) + element_bytes : element_bytes);
     }
 
     /** Repoints the tape of @p strings, @p count of them, at host copies, its offsets first, since they size its
@@ -104,10 +109,10 @@ class input_stager {
     template <typename tape_type_>
     void stage_tape(tape_type_& tape, std::size_t count) noexcept {
         if (!count) return;
-        stage(tape.offsets, (count + 1) * sizeof(*tape.offsets));
+        tape.offsets = stage(tape.offsets, (count + 1) * sizeof(*tape.offsets));
         if (pending_) status_ = finish();
         if (status_.failed() || !tape.offsets) return;
-        stage(tape.data, static_cast<std::size_t>(tape.offsets[count]));
+        tape.data = stage(tape.data, static_cast<std::size_t>(tape.offsets[count]));
     }
 
     gpu_drivers_t const& drivers_;
@@ -124,20 +129,14 @@ template <gpu_executor_concept executor_type_, typename arguments_type_>
 status_t stage_inputs(gpu_drivers_t const& drivers, executor_type_& executor, arguments_type_& arguments) noexcept {
     input_stager<executor_type_> stager {drivers, executor};
     std::size_t const count = static_cast<std::size_t>(arguments.count);
-    stager.stage(arguments.collections.data, arguments.collections.stride, count);
-    if constexpr (takes_keys_concept<arguments_type_>) stager.stage(arguments.keys.data, arguments.keys.stride, count);
-    if constexpr (takes_start_keys_concept<arguments_type_>)
-        stager.stage(arguments.start_keys.data, arguments.start_keys.stride, count);
-    if constexpr (takes_vertices_concept<arguments_type_>)
-        stager.stage(arguments.vertices.data, arguments.vertices.stride, count);
-    if constexpr (takes_roles_concept<arguments_type_>)
-        stager.stage(arguments.roles.data, arguments.roles.stride, count);
-    if constexpr (takes_elements_concept<arguments_type_>)
-        stager.stage(arguments.elements.data, arguments.elements.stride, count);
-    if constexpr (takes_offsets_concept<arguments_type_>)
-        stager.stage(arguments.offsets.data, arguments.offsets.stride, count);
-    if constexpr (takes_limits_concept<arguments_type_>)
-        stager.stage(arguments.limits.data, arguments.limits.stride, count);
+    stager.stage(arguments.collections, count);
+    if constexpr (takes_keys_concept<arguments_type_>) stager.stage(arguments.keys, count);
+    if constexpr (takes_start_keys_concept<arguments_type_>) stager.stage(arguments.start_keys, count);
+    if constexpr (takes_vertices_concept<arguments_type_>) stager.stage(arguments.vertices, count);
+    if constexpr (takes_roles_concept<arguments_type_>) stager.stage(arguments.roles, count);
+    if constexpr (takes_elements_concept<arguments_type_>) stager.stage(arguments.elements, count);
+    if constexpr (takes_offsets_concept<arguments_type_>) stager.stage(arguments.offsets, count);
+    if constexpr (takes_limits_concept<arguments_type_>) stager.stage(arguments.limits, count);
     if constexpr (takes_strings_concept<arguments_type_>) stager.stage(arguments.strings, count);
     if constexpr (takes_prefixes_concept<arguments_type_>) stager.stage(arguments.prefixes, count);
     if constexpr (takes_start_strings_concept<arguments_type_>) stager.stage(arguments.start_strings, count);
@@ -145,7 +144,8 @@ status_t stage_inputs(gpu_drivers_t const& drivers, executor_type_& executor, ar
     if constexpr (takes_typed_fields_concept<arguments_type_>) {
         std::size_t const fields_count = static_cast<std::size_t>(arguments.fields_count);
         stager.stage(arguments.fields, fields_count);
-        stager.stage(arguments.outputs_types, fields_count * sizeof(*arguments.outputs_types));
+        arguments.outputs_types = stager.stage(arguments.outputs_types,
+                                               fields_count * sizeof(*arguments.outputs_types));
     }
     else if constexpr (takes_fields_concept<arguments_type_>) stager.stage(arguments.fields, count);
     return stager.finish();

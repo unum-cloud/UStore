@@ -286,6 +286,10 @@ class database_transaction {
         return core_.state().deltas.can_fit(count, bytes);
     }
 
+    /** The shape that would have taken the last write this transaction refused for want of room,
+     *  zero deltas before any such refusal. */
+    [[nodiscard]] transaction_config_t wanted_shape() const noexcept { return core_.state().deltas.wanted_shape(); }
+
 #pragma endregion Catalog
 
 #pragma region Writes

@@ -80,10 +80,8 @@ inline sz_strings_view_t keys_of(std::span<held_row_t const> rows) noexcept {
 /** The delta of string @p row of @p rows, viewing the string and its key where @p rows keeps them. */
 inline string_delta_t string_delta_of(keyed_rows_t const& rows, std::size_t row) noexcept {
     return string_delta_t {
-        string_of(rows.values[row]),
-        delta_view_t {delta_kind_t::write_k,
-                      std::span<byte_t const> {reinterpret_cast<byte_t const*>(rows.keys[row].uuid.bytes),
-                                               sizeof(ustore_key_t)}}};
+        chars_of(rows.values[row]),
+        delta_view_t {delta_kind_t::write_k, bytes_of(rows.keys[row].uuid.bytes, sizeof(ustore_key_t))}};
 }
 
 #pragma endregion Deltas

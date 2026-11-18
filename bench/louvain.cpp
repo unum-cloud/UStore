@@ -682,7 +682,7 @@ int main(int argc, char** argv) {
 
     ustore_database_t handle = nullptr;
     ustore_outcome_t outcome {};
-    settings.engine.directory = settings.directory.data();
+    settings.engine.locate(settings.directory.data());
     open_engine(settings.engine, &handle, &outcome);
     if (outcome.status != ustore_status_success_k) {
         fmt::println(stderr, "Failed to open the database: {}", outcome.message ? outcome.message : "unknown");
@@ -701,7 +701,7 @@ int main(int argc, char** argv) {
 
     run_result_t memory_result;
     run_result_t stored_result;
-    if (settings.filter.selects("graph_upsert") || settings.filter.selects("louvain_over_ustore")) {
+    if (settings.regex_filter.selects("graph_upsert") || settings.regex_filter.selects("louvain_over_ustore")) {
         std::size_t const batch_size = settings.batch_size_upsert.value;
         std::span<edge_t const> const batches {staged.begin(), staged.end()};
         row_t const upserted = run_pass(
@@ -715,14 +715,14 @@ int main(int argc, char** argv) {
                     loop.count(batch.size(), batch.size() * sizeof(edge_t));
                 }
             });
-        if (settings.filter.selects("graph_upsert")) print(upserted);
+        if (settings.regex_filter.selects("graph_upsert")) print(upserted);
         if (upserted.skipped) return 1;
     }
-    if (settings.filter.selects("louvain_in_memory"))
+    if (settings.regex_filter.selects("louvain_in_memory"))
         print(run_pass(executor, "louvain_in_memory", 1, [&](loop_t& loop, std::size_t) noexcept {
             for ([[maybe_unused]] std::size_t call : loop) louvain_call(loop, memory_graph, settings, memory_result);
         }));
-    if (settings.filter.selects("louvain_over_ustore"))
+    if (settings.regex_filter.selects("louvain_over_ustore"))
         print(run_pass(executor, "louvain_over_ustore", 1, [&](loop_t& loop, std::size_t) noexcept {
             for ([[maybe_unused]] std::size_t call : loop) {
                 auto [stored, make_stored_graph_status] = stored_graph_t::make(graph);

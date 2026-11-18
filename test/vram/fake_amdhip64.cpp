@@ -120,10 +120,11 @@ __attribute__((visibility("default"))) int hipDeviceGet(int* device, int ordinal
 __attribute__((visibility("default"))) int hipDeviceGetAttribute(int* value, int attribute, int device) {
     if (device != 0) return invalid_device_k;
     switch (attribute) {
-    case 23: *value = 9; return success_k;   // compute capability major, gfx9
-    case 61: *value = 4; return success_k;   // compute capability minor, gfx942
-    case 63: *value = 304; return success_k; // compute units of an MI300X
-    case 92: *value = 0; return success_k;   // host NUMA node
+    case 23: *value = 9; return success_k;     // compute capability major, gfx9
+    case 61: *value = 4; return success_k;     // compute capability minor, gfx942
+    case 63: *value = 304; return success_k;   // compute units of an MI300X
+    case 75: *value = 65536; return success_k; // shared memory per block, opted in
+    case 92: *value = 0; return success_k;     // host NUMA node
     default: return invalid_value_k;
     }
 }

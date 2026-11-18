@@ -389,6 +389,9 @@ class lsm_level_merger {
 
         /** Value copy ranges filling this run's stored values section. */
         std::uint64_t copy_ranges_count = 0;
+
+        /** Where this run's folded values start in the compaction's folded bytes. */
+        std::uint64_t folded_first = 0;
     };
 
     /** One run a slice laid out, from its header and columns to the extent it is written to, until
@@ -538,7 +541,7 @@ class lsm_level_merger {
     /**
      *  @brief Merges runs of fixed-width keys through the compactor the request names, then gathers
      *      and writes their survivors as new runs, in slices the request's fan-out runs side by
-     *      side where the host merges.
+     *      side where the host merges, as it does every merge a device refuses.
      *
      *  Every slice compacts its share of every source and lays out the runs it cuts, on its own
      *  channels; the calling thread then names and allocates every run in key order, since a
@@ -562,7 +565,35 @@ class lsm_level_merger {
         std::size_t const upper_runs = request.upper.size();
         std::span<sorted_run_index_view<key_slot_t> const> const level_views {views};
         std::span<run_handle_t const> const source_runs {sources};
-        std::size_t const slices = slices_of_(request, level_views.first(upper_runs), level_views.subspan(upper_runs));
+        compaction_kind_t const kind = kind_of_(request.upper_order, request.depth);
+        // A fold reads its changes' values over a slice's channel, from their runs, one at a time
+        auto const value_reader = [&runs, &sources](io_channel_t& reading) noexcept {
+            return [&runs, &sources, &reading](located_key_slot<key_slot_t> const& record,
+                                               utilities::arena_allocator<byte_t>& arena,
+                                               std::span<byte_t const>& bytes) noexcept {
+                std::size_t const size = runs[sources[record.sorted_run].index].value_window(record.position).bytes;
+                byte_t* const into = size != 0 ? arena.allocate(size) : nullptr;
+                if (size != 0 && into == nullptr) return st::status_t::out_of_memory_heap_k;
+                if (runs[sources[record.sorted_run].index].read_value(reading, record.position, {into, size}).failed())
+                    return st::status_t::input_output_k;
+                bytes = {into, size};
+                return st::status_t::success_k;
+            };
+        };
+
+        // A device takes the merge whole, and one refusing it leaves the host to cut it into slices
+        st::status_t compacted = st::status_t::invalid_argument_k;
+        if (status_t const tracked = compact_on_device_(
+                kind, level_views.first(upper_runs), level_views.subspan(upper_runs), runs, source_runs,
+                bounds_of_(request), request.stamps, request.placement, request.compactor, fold, device_fold,
+                value_reader(reading_channel), request.buffers[0].output, compacted);
+            tracked.failed())
+            return tracked;
+        bool const refused = compacted == st::status_t::invalid_argument_k ||
+                             compacted == st::status_t::out_of_memory_heap_k ||
+                             compacted == st::status_t::capacity_exhausted_k;
+        if (compacted != st::status_t::success_k && !refused) return compaction_status(compacted);
+        std::size_t const slices = refused ? slices_of_(request, level_views) : 1;
         std::span<merge_buffers_t> const buffers = request.buffers.first(slices);
         if (slices != 1)
             if (status_t const cut = cut_slices_(level_views, buffers); cut.failed()) return cut;
@@ -578,23 +609,12 @@ class lsm_level_merger {
             merge_buffers_t& sliced = buffers[slice];
             std::span<sorted_run_index_view<key_slot_t> const> const shares =
                 slices == 1 ? level_views : std::span<sorted_run_index_view<key_slot_t> const> {sliced.slice_views};
-            // A fold reads the values of the changes it folds, from their runs, one at a time.
-            auto read_value = [&](located_key_slot<key_slot_t> const& record, utilities::arena_allocator<byte_t>& arena,
-                                  std::span<byte_t const>& bytes) noexcept {
-                std::size_t const size = runs[sources[record.sorted_run].index].value_window(record.position).bytes;
-                byte_t* const into = size != 0 ? arena.allocate(size) : nullptr;
-                if (size != 0 && into == nullptr) return st::status_t::out_of_memory_heap_k;
-                if (runs[sources[record.sorted_run].index].read_value(reading, record.position, {into, size}).failed())
-                    return st::status_t::input_output_k;
-                bytes = {into, size};
-                return st::status_t::success_k;
-            };
-            if (status_t const compacted = run_compaction_(
-                    kind_of_(request.upper_order, request.depth), shares.first(upper_runs), shares.subspan(upper_runs),
-                    runs, source_runs, bounds_of_(request), request.stamps, request.placement, request.compactor, fold,
-                    device_fold, read_value, sliced.output);
-                compacted.failed())
-                return compacted;
+            if (refused)
+                if (st::status_t const merged = host_compactor_t {}.compact(
+                        kind, shares.first(upper_runs), shares.subspan(upper_runs), bounds_of_(request), request.stamps,
+                        fold, value_reader(reading), sliced.output);
+                    merged != st::status_t::success_k)
+                    return compaction_status(merged);
             return lay_out_runs_(sliced, request);
         };
         if (status_t const laid = run_slices_(request.fan_out, slices, reading_channel, writing_channel, lay_out_slice);
@@ -773,9 +793,9 @@ class lsm_level_merger {
         }
     }
 
-    /** Lists the versions of @p sources that survive a merge of strings, in merged order: on the
-     *  device compactor where @p request places the merge, and by unions of their keys on the host
-     *  otherwise or where the device refuses it. */
+    /** Lists the versions of @p sources that survive a merge of strings, in merged order: ranked
+     *  and packed on the device compactor where @p request places the merge, and by unions of
+     *  their keys on the host otherwise or where the device refuses it. */
     static status_t strings_survivors_(run_pool_t const& runs, std::span<run_handle_t const> sources,
                                        merge_request_t const& request,
                                        st::vector<strings_version_t>& survivors) noexcept {
@@ -784,10 +804,7 @@ class lsm_level_merger {
         std::uint64_t records = 0;
         for (run_handle_t const source : sources) records += runs[source.index].population_count();
         std::size_t const devices = devices_of(request.compactor);
-        bool tombstoned = false;
-        for (run_handle_t const source : sources) tombstoned |= !runs[source.index].range_tombstones().empty();
-        // No device compaction reads range tombstones, so a merge carrying one runs here.
-        if (!tombstoned && choose_compactor(request.placement, devices, records) == compactor_choice_t::device_k) {
+        if (choose_compactor(request.placement, devices, records) == compactor_choice_t::device_k) {
             if (devices == 0) return {status_code_t::unsupported_k, "No device compactor serves this database"};
             // The device reads every run's heads by position, as no kit searches them.
             st::vector<st::immutable_splus_tree_view<st::key128_t>> heads;
@@ -800,9 +817,12 @@ class lsm_level_merger {
                     st::immutable_splus_tree_view<st::key128_t>::make(runs[sources[index].index].keys_bytes());
                 if (!viewed) return {status_code_t::internal_k, "A source run's heads read as no tree"};
                 heads[index] = *viewed;
-                views[index] = strings_run_view {
-                    &heads[index], runs[sources[index].index].key_offsets(), runs[sources[index].index].key_tape(),
-                    &runs[sources[index].index].stamps(), &runs[sources[index].index].kinds()};
+                views[index] = strings_run_view {&heads[index],
+                                                 runs[sources[index].index].key_offsets(),
+                                                 runs[sources[index].index].key_tape(),
+                                                 &runs[sources[index].index].stamps(),
+                                                 &runs[sources[index].index].kinds(),
+                                                 &runs[sources[index].index].range_tombstones()};
             }
             st::status_t const ranked = std::visit(
                 [&]<typename compactor_type_>(compactor_type_ const& device) noexcept {
@@ -1151,100 +1171,51 @@ class lsm_level_merger {
             run.content_id()};
     }
 
-    /** Counts the key slots @p upper and @p lower merge, and tells whether any of their runs
-     *  holds a change. */
-    [[nodiscard]] static std::uint64_t merged_count_(std::span<sorted_run_index_view<key_slot_t> const> upper,
-                                                     std::span<sorted_run_index_view<key_slot_t> const> lower,
-                                                     bool& changes) noexcept {
+    /** Counts the key slots @p upper and @p lower merge. */
+    [[nodiscard]] static std::uint64_t merged_count_(
+        std::span<sorted_run_index_view<key_slot_t> const> upper,
+        std::span<sorted_run_index_view<key_slot_t> const> lower) noexcept {
         std::uint64_t merged = 0;
-        changes = false;
-        for (std::size_t index = 0; index != upper.size(); ++index) {
-            merged += upper[index].key_slots_count;
-            changes |= holds_changes(upper[index].kinds);
-        }
-        for (std::size_t index = 0; index != lower.size(); ++index) {
-            merged += lower[index].key_slots_count;
-            changes |= holds_changes(lower[index].kinds);
-        }
+        for (sorted_run_index_view<key_slot_t> const& view : upper) merged += view.key_slots_count;
+        for (sorted_run_index_view<key_slot_t> const& view : lower) merged += view.key_slots_count;
         return merged;
     }
 
-    /** Compacts on the device compactor @p compactor names when @p placement asks for a device and
-     *  no run holds a change, or one does and @p device_fold composes changes, reading the sections
-     *  of @p sources, and on the calling thread otherwise, where runs carrying tails and merges
-     *  outgrowing the device's scratch merge. */
-    template <typename fold_type_, typename device_fold_type_, typename value_reader_type_>
-    static status_t run_compaction_(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_t> const> upper,
-                                    std::span<sorted_run_index_view<key_slot_t> const> lower, run_pool_t const& runs,
-                                    [[maybe_unused]] std::span<run_handle_t const> sources,
-                                    sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
-                                    compaction_placement_t placement, compactor_ref_t const& compactor,
-                                    fold_type_ const& fold, [[maybe_unused]] device_fold_type_ const& device_fold,
-                                    value_reader_type_&& read_value, compaction_output_t& output) noexcept {
-        constexpr bool device_folds_k = !std::same_as<device_fold_type_, no_device_fold_t>;
-        bool changes = false;
-        std::uint64_t const merged = merged_count_(upper, lower, changes);
-        std::size_t const devices = devices_of(compactor);
-        // No device compaction reads range tombstones, so a merge carrying one runs here.
-        bool const on_device = !carries_range_tombstones(upper, lower) &&
-                               choose_compactor(placement, devices, merged) == compactor_choice_t::device_k;
-        if (on_device && devices == 0)
-            return {status_code_t::unsupported_k, "No device compactor serves this database"};
-        // Without a device fold, only a merge holding no change runs the last-write compaction.
-        if (on_device && (device_folds_k || !changes)) {
-            st::vector<sorted_run_extents_t> extents;
-            if (extents.resize(sources.size()) != st::status_t::success_k)
-                return {status_code_t::out_of_memory_k, "A merge could not track where its runs sit"};
-            for (std::size_t index = 0; index != sources.size(); ++index)
-                extents[index] = extents_of_(runs[sources[index].index]);
-            st::status_t compacted = st::status_t::invalid_argument_k;
-            if (status_t const tracked = compact_on_device_(kind, upper, lower, extents, bounds, stamps, compactor,
-                                                            fold, device_fold, read_value, output, compacted);
-                tracked.failed())
-                return tracked;
-            if (compacted != st::status_t::invalid_argument_k && compacted != st::status_t::out_of_memory_heap_k)
-                return compaction_status(compacted);
-        }
-        return compaction_status(
-            host_compactor_t {}.compact(kind, upper, lower, bounds, stamps, fold, read_value, output));
-    }
-
-    /** Leaves @p compacted refusing, so the merge runs on the host, since no device compaction is
-     *  compiled for key slots carrying tails. */
-    template <typename fold_type_, typename device_fold_type_, typename value_reader_type_>
-    static status_t compact_on_device_(compaction_kind_t, std::span<sorted_run_index_view<key_slot_t> const>,
-                                       std::span<sorted_run_index_view<key_slot_t> const>,
-                                       std::span<sorted_run_extents_t const>, sorted_run_bounds_t const&,
-                                       compaction_stamps_t const&, compactor_ref_t const&, fold_type_ const&,
-                                       device_fold_type_ const&, value_reader_type_&, compaction_output_t&,
-                                       st::status_t&) noexcept
-        requires tailed_key_slot_concept<key_slot_t>
-    {
-        return {};
-    }
-
-    /** Compacts on the device compactor @p compactor names into @p compacted, through
-     *  @p device_fold where it composes changes and through the last-write fold otherwise;
-     *  fails only when it cannot track the runs. */
+    /** Compacts the whole merge into @p compacted on the device compactor @p compactor names when
+     *  @p placement asks for a device, reading the sections of @p sources, its chains of changes
+     *  composed by @p device_fold or folded on the host by @p fold, and leaves it refusing where no
+     *  device is asked for. Fails only where no device compactor serves a merge asking for one, or
+     *  runs go untracked. */
     template <typename fold_type_, typename device_fold_type_, typename value_reader_type_>
     static status_t compact_on_device_(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_t> const> upper,
-                                       std::span<sorted_run_index_view<key_slot_t> const> lower,
-                                       std::span<sorted_run_extents_t const> extents, sorted_run_bounds_t const& bounds,
-                                       compaction_stamps_t const& stamps, compactor_ref_t const& compactor,
-                                       fold_type_ const& fold, device_fold_type_ const& device_fold,
-                                       value_reader_type_& read_value, compaction_output_t& output,
-                                       st::status_t& compacted) noexcept {
+                                       std::span<sorted_run_index_view<key_slot_t> const> lower, run_pool_t const& runs,
+                                       std::span<run_handle_t const> sources, sorted_run_bounds_t const& bounds,
+                                       compaction_stamps_t const& stamps, compaction_placement_t placement,
+                                       compactor_ref_t const& compactor, fold_type_ const& fold,
+                                       device_fold_type_ const& device_fold, value_reader_type_&& read_value,
+                                       compaction_output_t& output, st::status_t& compacted) noexcept {
         constexpr bool device_folds_k = !std::same_as<device_fold_type_, no_device_fold_t>;
+        std::uint64_t const merged = merged_count_(upper, lower);
+        std::size_t const devices = devices_of(compactor);
+        bool const on_device = choose_compactor(placement, devices, merged) == compactor_choice_t::device_k;
+        if (on_device && devices == 0)
+            return {status_code_t::unsupported_k, "No device compactor serves this database"};
+        if (!on_device) return {};
+        st::vector<sorted_run_extents_t> extents;
+        if (extents.resize(sources.size()) != st::status_t::success_k)
+            return {status_code_t::out_of_memory_k, "A merge could not track where its runs sit"};
+        for (std::size_t index = 0; index != sources.size(); ++index)
+            extents[index] = extents_of_(runs[sources[index].index]);
         compacted = std::visit(
             [&]<typename compactor_type_>(compactor_type_ const& device) noexcept {
                 if constexpr (std::same_as<compactor_type_, host_compactor_t>) return st::status_t::invalid_argument_k;
                 else if constexpr (device_folds_k)
                     return device->compact(kind, upper, lower, extents, bounds, stamps, fold, device_fold, read_value,
                                            output);
-                // No run holds a change here, so the last-write compaction serves every fold
+                // One compaction compiled per key slot folds on the host through the borrowed fold
                 else
-                    return device->compact(kind, upper, lower, extents, bounds, stamps, utilities::last_write_fold_t {},
-                                           no_device_fold_t {}, located_value_reader<key_slot_t> {}, output);
+                    return device->compact(kind, upper, lower, extents, bounds, stamps, fold_ref_t {fold},
+                                           no_device_fold_t {}, read_value, output);
             },
             compactor);
         return {};
@@ -1312,23 +1283,14 @@ class lsm_level_merger {
                                         std::span<std::uint64_t const> {pieces_stamps});
     }
 
-    /** How many slices a merge of @p upper into @p lower runs in: as many as the request's fan-out
-     *  offers, where its tree keeps buffers for each and the largest source has a key for every
-     *  cut, and one where a device ranks the whole merge. */
+    /** How many slices the host merges @p views in: as many as the request's fan-out offers, where
+     *  its tree keeps buffers for each and the largest source has a key for every cut. */
     [[nodiscard]] static std::size_t slices_of_(merge_request_t const& request,
-                                                std::span<sorted_run_index_view<key_slot_t> const> upper,
-                                                std::span<sorted_run_index_view<key_slot_t> const> lower) noexcept {
+                                                std::span<sorted_run_index_view<key_slot_t> const> views) noexcept {
         std::size_t const offered = request.fan_out.slices();
         if (offered < 2 || request.buffers.size() < offered) return 1;
-        bool changes = false;
-        std::uint64_t const merged = merged_count_(upper, lower, changes);
-        std::size_t const devices = devices_of(request.compactor);
-        if (!carries_range_tombstones(upper, lower) &&
-            choose_compactor(request.placement, devices, merged) == compactor_choice_t::device_k)
-            return 1;
         std::uint64_t largest = 0;
-        for (sorted_run_index_view<key_slot_t> const& view : upper) largest = fu::max_of(largest, view.key_slots_count);
-        for (sorted_run_index_view<key_slot_t> const& view : lower) largest = fu::max_of(largest, view.key_slots_count);
+        for (sorted_run_index_view<key_slot_t> const& view : views) largest = fu::max_of(largest, view.key_slots_count);
         return largest < offered ? 1 : offered;
     }
 
@@ -1398,6 +1360,7 @@ class lsm_level_merger {
             planned.key_slots_count = cut.key_slots_count;
             planned.stored_values_bytes = cut.stored_values_bytes;
             planned.copy_ranges_count = cut.value_copy_ranges_count;
+            planned.folded_first = cut.folded_first;
             if (status_t const laid = lay_out_run_(buffers, planned, request); laid.failed()) return laid;
             planned.first_key_slot += planned.key_slots_count;
             planned.first_copy_range += planned.copy_ranges_count;
@@ -1840,7 +1803,8 @@ class lsm_level_merger {
         auto gather_range = [&](value_copy_range_t const& copied, std::uint64_t range_gathered, std::uint64_t taken,
                                 std::uint64_t gathered) noexcept -> status_t {
             if (copied.source_run == sources.size()) {
-                std::memcpy(room.data() + gathered, output.folded.data() + copied.source_begin + range_gathered,
+                std::memcpy(room.data() + gathered,
+                            output.folded.data() + planned.folded_first + copied.source_begin + range_gathered,
                             static_cast<std::size_t>(taken));
                 return {};
             }

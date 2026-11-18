@@ -167,7 +167,7 @@ void copy_path(ustore_bytes_view_t path, sz::string_t& copy, ustore_outcome_t* o
         *outcome = {ustore_status_invalid_argument_k, "Empty path specified"};
         return;
     }
-    if (copy.assign(sz::string_view_t {string_of(path)}) != sz::status_t::success_k)
+    if (copy.assign(sz::string_view_t {chars_of(path)}) != sz::status_t::success_k)
         *outcome = {ustore_status_out_of_memory_k, "Failed to copy the path"};
 }
 
@@ -482,7 +482,7 @@ void resolve_fields(ustore_strings_view_t const& strings, ustore_size_t count, s
             *outcome = {ustore_status_invalid_argument_k, "Fields must not be empty"};
             return;
         }
-        fields[index] = string_of(name);
+        fields[index] = chars_of(name);
     }
 }
 
@@ -725,9 +725,9 @@ void import_ndjson_edges(ustore_graph_import_t const& task, sz::string_view_t te
         json_document_t const document {yyjson_read(row.data(), row.size(), 0)};
         yyjson_val* const root = yyjson_doc_get_root(document.handle);
         edge_row_t edge {{}, {}, ustore_edge_id_default_k};
-        if (!yyjson_is_obj(root) || !read_key(root, string_of(task.source_id_field), edge.source) ||
-            !read_key(root, string_of(task.target_id_field), edge.target) ||
-            (task.edge_id_field.length && !read_key(root, string_of(task.edge_id_field), edge.edge))) {
+        if (!yyjson_is_obj(root) || !read_key(root, chars_of(task.source_id_field), edge.source) ||
+            !read_key(root, chars_of(task.target_id_field), edge.target) ||
+            (task.edge_id_field.length && !read_key(root, chars_of(task.edge_id_field), edge.edge))) {
             *task.outcome = {ustore_status_malformed_k,
                              "The input file holds a line without integer or UUID vertex or edge fields"};
             return;
@@ -746,10 +746,10 @@ void import_csv_edges(ustore_graph_import_t const& task, sz::string_view_t text)
     read_header(reader, field_list_t {}, names, columns, task.outcome);
     if (failed(task.outcome)) return;
 
-    std::size_t const source_column = column_index(names, columns, string_of(task.source_id_field));
-    std::size_t const target_column = column_index(names, columns, string_of(task.target_id_field));
+    std::size_t const source_column = column_index(names, columns, chars_of(task.source_id_field));
+    std::size_t const target_column = column_index(names, columns, chars_of(task.target_id_field));
     std::size_t const edge_column = task.edge_id_field.length
-                                        ? column_index(names, columns, string_of(task.edge_id_field))
+                                        ? column_index(names, columns, chars_of(task.edge_id_field))
                                         : (std::numeric_limits<std::size_t>::max)();
     if (source_column == columns.size() || target_column == columns.size() || edge_column == columns.size()) {
         *task.outcome = {ustore_status_malformed_k, "The CSV header lacks a vertex or edge column"};
@@ -801,7 +801,7 @@ void ustore_docs_import(ustore_docs_import_t* task_pointer) {
     st::vector<std::string_view> fields;
     resolve_fields(task.fields, task.fields_count, fields, task.outcome);
     if (failed(task.outcome)) return;
-    std::string_view const id_field = string_of(task.id_field);
+    std::string_view const id_field = chars_of(task.id_field);
     if (id_field.empty()) {
         *task.outcome = {ustore_status_invalid_argument_k, "Id field must be initialized"};
         return;
@@ -879,7 +879,7 @@ void ustore_docs_export(ustore_docs_export_t* task_pointer) {
         bits_view_t const present {presences};
         for (std::size_t index = 0; index != keys.size() && !failed(task.outcome); ++index) {
             if (!present[index]) continue;
-            sz::string_view_t document {string_of(tape_string(values, index))};
+            sz::string_view_t document {chars_of(tape_string(values, index))};
             while (document.size() != 0 && document[document.size() - 1] == '\n')
                 document = sz::string_view_t(document.data(), document.size() - 1);
             if (fields.size() != 0) {
@@ -948,9 +948,9 @@ void ustore_graph_export(ustore_graph_export_t* task_pointer) {
         *task.outcome = {ustore_status_uninitialized_k, "Database is uninitialized"};
         return;
     }
-    std::string_view const source_id_field = string_of(task.source_id_field);
-    std::string_view const target_id_field = string_of(task.target_id_field);
-    std::string_view const edge_id_field = string_of(task.edge_id_field);
+    std::string_view const source_id_field = chars_of(task.source_id_field);
+    std::string_view const target_id_field = chars_of(task.target_id_field);
+    std::string_view const edge_id_field = chars_of(task.edge_id_field);
     if (source_id_field.empty() || target_id_field.empty()) {
         *task.outcome = {ustore_status_invalid_argument_k, "Source and target id fields must be initialized"};
         return;
@@ -1048,7 +1048,7 @@ void ustore_graph_export(ustore_graph_export_t* task_pointer) {
 ustore_dataset_format_t ustore_dataset_format_of(ustore_bytes_view_t path, ustore_dataset_format_t asked) {
     using namespace unum::ustore;
     using namespace unum::ustore::tools;
-    return format_of(string_of(path), asked);
+    return format_of(chars_of(path), asked);
 }
 
 #pragma endregion C Interface

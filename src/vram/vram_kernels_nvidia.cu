@@ -8,12 +8,12 @@
 #include <stringzilla/cuda.cuh>           // `sz_lanes_any_cuda_`, `sz_shuffle_up_cuda_` & kin
 #include <stringzilla/strings/ampere.cuh> // `sz_u64_lanes_sum_ampere_`
 
-#include "ustore/blobs/vram_nvidia_compaction.cuh"     // `merge_rank`, `merge_pack`, `merge_place`
-#include "ustore/docs/vram_gather.cuh"                 // `gather_scalars`, `measure_texts`, `write_texts`
-#include "ustore/graph/vram_nvidia_adjacency_fold.cuh" // `fold_chains`, `fold_write`
-#include "ustore/utilities/tapes.cuh"                  // `tape_offsets_block`, `tape_gather_block`
-#include "ustore/utilities/vram_matching.cuh"          // `substrings_per_thread`, `matching_page_t` & kin
-#include "ustore/utilities/vram_nvidia_scan.cuh"       // `ampere_scan_t`
+#include "ustore/blobs/vram_nvidia_compaction.cuh" // `merge_rank`, `merge_pack`, `merge_place`
+#include "ustore/docs/vram_gather.cuh"             // `gather_scalars`, `measure_texts`, `write_texts`
+#include "ustore/graph/vram_adjacency_fold.cuh"    // `fold_chains`, `fold_write`
+#include "ustore/utilities/tapes.cuh"              // `tape_offsets_block`, `tape_gather_block`
+#include "ustore/utilities/vram_matching.cuh"      // `substrings_per_thread`, `matching_page_t` & kin
+#include "ustore/utilities/vram_nvidia_scan.cuh"   // `ampere_scan_t`
 
 using namespace unum::ustore::utilities;
 
@@ -211,18 +211,34 @@ extern "C" __global__ void __launch_bounds__(merge_block_threads_k)
     merge_strings_rank(runs, runs_count, upper_runs, records_count, kind, stamps, merged, flags);
 }
 
+/** Packs the flagged versions of a merge of runs of strings, one tile of @p tickets per block. */
+extern "C" __global__ void __launch_bounds__(merge_block_threads_k)
+    ustore_merge_strings_pack(strings_version_t const* merged, std::uint8_t const* flags, std::uint64_t records_count,
+                              std::uint64_t tickets, strings_version_t* survivors, std::uint64_t* chain) {
+    merge_strings_pack<merge_block_threads_k, ampere_scan_t>(merged, flags, records_count, tickets, survivors, chain);
+}
+
 #pragma endregion Merge Kernels
 
 #pragma region Fold Kernels
 
 using namespace unum::ustore::graph;
 
-/** Sorts, keeps and counts the records of every chain of a graph merge, one block per chain. */
+/** One step of the bitonic sort of every chain of a graph merge that spills past a block's shared
+ *  memory, across the grid. */
+extern "C" __global__ void __launch_bounds__(fold_block_threads_k)
+    ustore_fold_sort_step(half_edge_record_t const* records, fold_spill_t spill, std::uint32_t size,
+                          std::uint32_t stride) {
+    fold_sort_step<fold_block_threads_k>(records, spill, size, stride);
+}
+
+/** Sorts, keeps and counts the records of every chain of a graph merge, one block per chain, and
+ *  keeps and counts those of every chain the steps before sorted. */
 extern "C" __global__ void __launch_bounds__(fold_block_threads_k)
     ustore_fold_chains(half_edge_record_t const* records, std::uint32_t const* starts, std::uint32_t chains_count,
-                       std::uint32_t* kept, std::uint32_t* kept_counts) {
+                       fold_spill_t spill, std::uint32_t* kept, std::uint32_t* kept_counts) {
     extern __shared__ std::uint32_t sorted[];
-    fold_chains<fold_block_threads_k, ampere_scan_t>(records, starts, chains_count, sorted, kept, kept_counts);
+    fold_chains<fold_block_threads_k, ampere_scan_t>(records, starts, chains_count, spill, sorted, kept, kept_counts);
 }
 
 /** Writes the kept records of every chain of a graph merge back to back, one tile

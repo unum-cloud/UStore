@@ -102,7 +102,7 @@ case_result_t test_cursor_whole_walk(config_t const& config) {
         expect_success(outcome);
         expect_equal(written, fu::min_of<std::size_t>(2, 3 - first));
         for (std::size_t index = 0; index != written && first + index != prefixed.size(); ++index) {
-            expect_equal(string_of(tape_string(found, index)), prefixed[first + index]);
+            expect_equal(chars_of(tape_string(found, index)), prefixed[first + index]);
             expect_equal(values[index], prefixed_keys[first + index]);
         }
     }

@@ -364,7 +364,7 @@ case_result_t test_database_named_collections_list(config_t const& config) {
     // Every listed name resolves back to the identifier beside it, and the unnamed collection lists
     // an empty name
     for (std::size_t index = 0; index != written; ++index) {
-        std::string_view const name = string_of(tape_string(listed_names, index));
+        std::string_view const name = chars_of(tape_string(listed_names, index));
         if (name.empty()) {
             expect_true(ids[index] == unnamed && listed_modalities[index] == ustore_modality_strings_k);
             continue;
@@ -570,8 +570,8 @@ void test_database_batched_read_matches_single(config_t const& config) {
                 ++mismatches;
                 continue;
             }
-            std::string_view const batched = string_of(tape_string(tape, index));
-            std::string_view const single = string_of(tape_string(single_tape, 0));
+            std::string_view const batched = chars_of(tape_string(tape, index));
+            std::string_view const single = chars_of(tape_string(single_tape, 0));
             mismatches += batched != single || lengths[index] != single_lengths[0] ||
                           bits_view_t {presences}[index] != bits_view_t {single_presences}[0];
         }

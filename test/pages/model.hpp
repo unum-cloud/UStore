@@ -16,10 +16,14 @@
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
 
 #include <algorithm> // `std::find`
+#include <iterator>  // `std::back_inserter`
 #include <map>       // `std::map`
 #include <string>    // `std::string`
 #include <utility>   // `std::pair`
 #include <vector>    // `std::vector`
+
+#include <fmt/format.h> // `fmt::format`, `fmt::format_to`
+#include <fmt/ranges.h> // `fmt::join`
 
 #include "ustore/pages/element_tree.hpp" // `element_key_t`, `element_kind_t`
 #include "ustore/pages/page_edits.hpp"   // `modification_t`
@@ -29,12 +33,7 @@ namespace unum::ustore::test::pages {
 using namespace unum::ustore::pages;
 
 /** The 32 hexadecimal digits of @p key. */
-inline std::string hex(element_key_t const& key) {
-    static char const digits[] = "0123456789abcdef";
-    std::string result;
-    for (std::uint8_t byte : key.bytes) result += digits[byte >> 4], result += digits[byte & 15];
-    return result;
-}
+inline std::string hex(element_key_t const& key) { return fmt::format("{:02x}", fmt::join(key.bytes, "")); }
 
 /** One element of a fragment in preorder, with its depth below the fragment's root, starting at one. */
 struct node_spec_t {
@@ -197,9 +196,10 @@ struct model_page_t {
 
     void dump_element(element_key_t const& key, std::size_t depth, std::string& result) const {
         model_element_t const& element = elements.at(key);
-        result += std::string(depth * 2, ' ') + hex(key) + " " + std::to_string(int(element.kind)) + " <" +
-                  element.name + "> [" + element.text + "]";
-        for (auto const& [name, value] : element.attributes) result += " " + name + "=" + value;
+        fmt::format_to(std::back_inserter(result), "{:{}}{} {} <{}> [{}]", "", depth * 2, hex(key), int(element.kind),
+                       element.name, element.text);
+        for (auto const& [name, value] : element.attributes)
+            fmt::format_to(std::back_inserter(result), " {}={}", name, value);
         result += "\n";
         for (element_key_t const& child : element.children) dump_element(child, depth + 1, result);
     }

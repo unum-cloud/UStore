@@ -685,7 +685,7 @@ class lsm_tree {
      *  @param[in] cancellation The word the merge reads between blocks, or null for a merge nobody stops.
      *  @param[in] fold How the collection's changes compose and apply.
      *  @param[in] device_fold How a device composes the collection's changes, or @c no_device_fold_t where none does,
-     *      which keeps every merge holding a change on the host.
+     *      which leaves every chain of a device's merge for the host to fold.
      *  @param[in] published What to call once the merged set is current, which returns once no reader holds the set
      *      it replaced and before a consumed run is given back.
      *  @param[in] stamps Which older versions survive for readers and for a mount, and the floor the new runs count

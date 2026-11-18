@@ -269,8 +269,8 @@ void replay_round(std::span<operation_t const> operations, std::span<operation_t
     std::fill(latest.begin(), latest.end(), nullptr);
     for (operation_t const& operation : operations) {
         if (!operation.committed) continue;
-        operation_t const*& winner = latest[operation.key];
-        if (!winner || winner->stamp <= operation.stamp) winner = &operation;
+        operation_t const* const winner = latest[operation.key];
+        if (!winner || winner->stamp <= operation.stamp) latest[operation.key] = &operation;
     }
 }
 

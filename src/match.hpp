@@ -34,8 +34,8 @@
 
 #include "engine.hpp"              // `vendored_residency_t`, `residency_tables`, `view_t`
 #include "utilities/arguments.hpp" // `matches_patterns_concept`, `matches_filter_concept`, `answers_scores_concept`
-#include "utilities/batches.hpp"  // `strings_arg_t`, `validate_scan`
-#include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
+#include "utilities/batches.hpp"   // `strings_arg_t`, `validate_scan`
+#include "utilities/progress.hpp"  // `progress_t`, `progress_cancelled_k`
 
 namespace unum::ustore {
 using namespace unum::ustore::utilities;
@@ -652,7 +652,7 @@ status_t list_matched_strings(residency_tables<vendored_residency_t::host_k> con
         std::size_t const listed_count = offsets ? offsets[1] : 0;
         strings_arg_t const listed {listed_view};
         std::size_t const skipped = start_bound == start_bound_t::exclusive_k && listed_count &&
-                                    string_of(listed[0]) == string_of(start);
+                                    chars_of(listed[0]) == chars_of(start);
 
         ustore_key_t const* keys = nullptr;
         if (match.asks() && listed_count) {

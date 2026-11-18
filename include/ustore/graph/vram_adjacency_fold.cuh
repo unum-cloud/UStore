@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/graph/vram_nvidia_adjacency_fold.cuh
+ *  @file include/ustore/graph/vram_adjacency_fold.cuh
  *  @author Ash Vardanian
  *  @date October 25, 2026
  *  @brief The device tower of @c adjacency_fold_t, which composes the chains of half-edge changes of a whole merge at
@@ -13,6 +13,11 @@
  *  through one chained scan and writes the composed records. A record's place in its chain is its
  *  index among the gathered records, as the chains are gathered back to back, oldest first.
  *
+ *  A chain longer than the device's shared memory sorts spills: it runs the same bitonic network
+ *  across blocks in device memory before the first launch, one launch per stride at or above the
+ *  block's threads and one more for the strides below, and the first launch only keeps what
+ *  survives of it.
+ *
  *  An Apple device has no 64-bit atomics to chain with, so there the first launch also flags the
  *  places each chain kept, the select lists them in order, and the second writes every kept record
  *  at its rank; its kernels are the MSL of @c vram_compaction_apple.metal.
@@ -23,16 +28,17 @@
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
-#include <limits>      // `std::numeric_limits`
-#include <span>        // `std::span`
-#include <type_traits> // `std::is_same_v`
+#include <array>  // `std::array`
+#include <bit>    // `std::bit_ceil`, `std::countr_zero`
+#include <limits> // `std::numeric_limits`
+#include <span>   // `std::span`
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 #include <smashtable/shared.hpp>       // `st::status_t`
 
-#include "ustore/graph/adjacency_fold.hpp"             // `check_delta`, `save_delta`
-#include "ustore/graph/vram_nvidia_adjacency_fold.hpp" // `vram_nvidia_adjacency_fold_t`
-#include "ustore/utilities/vram_scan.cuh"              // `chain_ticket`, `chain_offset`, `select_flagged`
+#include "ustore/graph/adjacency_fold.hpp"      // `check_delta`, `save_delta`
+#include "ustore/graph/vram_adjacency_fold.hpp" // `vram_adjacency_fold_t`
+#include "ustore/utilities/vram_scan.cuh"       // `chain_ticket`, `chain_offset`, `select_flagged`
 
 #if !defined(__CUDACC__) && !defined(__HIP__)
 #include "ustore/utilities/vram_device.hpp" // `launch`, `carve`
@@ -43,10 +49,44 @@ namespace unum::ustore::graph {
 /** Threads of every block a fold launches. */
 inline constexpr unsigned fold_block_threads_k = 256;
 
+/** Shared memory a fold block holds beside its sort: the block scan's totals, a 64-bit word per
+ *  32 lanes, the most any vendor's scan kit keeps. */
+inline constexpr std::uint32_t fold_scan_bytes_k = fold_block_threads_k / 32 * sizeof(std::uint64_t);
+
 /** One record of a chain on the device, aligned so a copy moves it in three 16-byte words. */
 struct alignas(16) half_edge_record_t {
     byte_t bytes[half_edge_delta_bytes_k];
 };
+
+/** The chains a block sorts no more of in its shared memory, which sort across blocks in device
+ *  memory, each in the next power of two of its records, the longest first, so every one starts
+ *  at a multiple of its width. */
+struct fold_spill_t { // device-boundary
+
+    /** The record indices of every spilled chain from where its slot starts, the largest index
+     *  padding each past its chain. */
+    std::uint32_t* sorted = nullptr;
+
+    /** Where every slot starts in @c sorted, and the end of the last. */
+    std::uint64_t const* starts = nullptr;
+
+    /** The chain every slot sorts. */
+    std::uint32_t const* chains = nullptr;
+
+    /** Slots, one per spilled chain. */
+    std::uint32_t count = 0;
+
+    /** The widest chain a block sorts in its shared memory, past which chains spill. */
+    std::uint32_t shared_width = 0;
+};
+
+static_assert(sizeof(fold_spill_t) == 32, "A fold's spill is four words");
+
+/** Whether one block of @p device sorts a chain of @p width records in its shared memory, beside
+ *  the scan's totals. */
+inline bool fold_sort_fits(utilities::gpu_device_t const& device, std::uint32_t width) noexcept {
+    return std::uint64_t {width} * sizeof(std::uint32_t) + fold_scan_bytes_k <= device.shared_memory_per_block_bytes;
+}
 
 #if defined(__CUDACC__) || defined(__HIP__)
 
@@ -85,19 +125,64 @@ __device__ inline bool chained_before(half_edge_record_t const* records, std::ui
     return first > second;
 }
 
+/** Orders the indices of @p sorted at @p index and @p stride past it, as one step of a bitonic sort
+ *  of runs of @p size compares them, where @p index is the lower of the pair. */
+__device__ inline void bitonic_exchange(half_edge_record_t const* records, std::uint32_t* sorted, std::uint32_t index,
+                                        std::uint32_t size, std::uint32_t stride) noexcept {
+    std::uint32_t const partner = index ^ stride;
+    if (partner <= index) return;
+    bool const ascending = (index & size) == 0;
+    std::uint32_t const low = sorted[index], high = sorted[partner];
+    if (ascending ? chained_before(records, high, low) : chained_before(records, low, high))
+        sorted[index] = high, sorted[partner] = low;
+}
+
 /** One step of a bitonic sort of the @p width indices in @p sorted, comparing every pair @p stride
  *  apart within runs of @p size, each pair by one thread of the block. */
 template <unsigned block_threads_>
 __device__ void bitonic_step(half_edge_record_t const* records, std::uint32_t* sorted, std::uint32_t width,
                              std::uint32_t size, std::uint32_t stride) noexcept {
-    for (std::uint32_t index = threadIdx.x; index < width; index += block_threads_) {
-        std::uint32_t const partner = index ^ stride;
-        if (partner <= index) continue;
-        bool const ascending = (index & size) == 0;
-        std::uint32_t const low = sorted[index], high = sorted[partner];
-        if (ascending ? chained_before(records, high, low) : chained_before(records, low, high))
-            sorted[index] = high, sorted[partner] = low;
+    for (std::uint32_t index = threadIdx.x; index < width; index += block_threads_)
+        bitonic_exchange(records, sorted, index, size, stride);
+}
+
+/** As @c bitonic_exchange, at @p index of every spilled index, in the slot of @p spill holding it,
+ *  whose chain is wide enough for runs of @p size. */
+__device__ inline void spilled_exchange(half_edge_record_t const* records, fold_spill_t const& spill,
+                                        std::uint64_t index, std::uint32_t size, std::uint32_t stride) noexcept {
+    std::uint32_t slot = 0;
+    for (std::uint32_t high = spill.count; high - slot > 1;) {
+        std::uint32_t const middle = slot + (high - slot) / 2;
+        if (spill.starts[middle] <= index) slot = middle;
+        else high = middle;
     }
+    std::uint64_t const first = spill.starts[slot];
+    if (spill.starts[slot + 1] - first < size) return;
+    bitonic_exchange(records, spill.sorted + first, static_cast<std::uint32_t>(index - first), size, stride);
+}
+
+/** One step of the bitonic sort of every chain @p spill holds, comparing pairs @p stride apart
+ *  within runs of @p size: a stride at or above the block's threads spans the grid, and a shorter
+ *  one finishes every stride below it too, within tiles of two indices per thread, each one
+ *  block's, as a slot starts at a multiple of its width. */
+template <unsigned block_threads_>
+__device__ void fold_sort_step(half_edge_record_t const* records, fold_spill_t const& spill, std::uint32_t size,
+                               std::uint32_t stride) noexcept {
+    std::uint64_t const total = spill.starts[spill.count];
+    if (stride >= block_threads_) {
+        for (std::uint64_t index = std::uint64_t {blockIdx.x} * block_threads_ + threadIdx.x; index < total;
+             index += std::uint64_t {gridDim.x} * block_threads_)
+            spilled_exchange(records, spill, index, size, stride);
+        return;
+    }
+    constexpr std::uint32_t tile = 2 * block_threads_;
+    for (std::uint64_t first = std::uint64_t {blockIdx.x} * tile; first < total;
+         first += std::uint64_t {gridDim.x} * tile)
+        for (std::uint32_t step = stride; step; step /= 2) {
+            for (std::uint32_t offset = threadIdx.x; offset < tile && first + offset < total; offset += block_threads_)
+                spilled_exchange(records, spill, first + offset, size, step);
+            __syncthreads();
+        }
 }
 
 /** Whether the record at @p position of the sorted chain @p sorted survives: the newest removal of
@@ -117,14 +202,36 @@ __device__ inline bool keeps_sorted(half_edge_record_t const* records, std::uint
     return leads && !hidden;
 }
 
+/** Keeps what survives of the chain of @p length records from @p start, whose record indices
+ *  @p sorted holds in order: its newest removal of the vertex and the newest record of every
+ *  half-edge newer than that removal, unless it removes the half-edge behind such a removal; writes
+ *  the kept indices over the chain's span of @p kept and their count into @p kept_count. */
+template <unsigned block_threads_, typename scan_type_>
+__device__ void keep_sorted_chain(half_edge_record_t const* records, std::uint32_t const* sorted, std::uint32_t start,
+                                  std::uint32_t length, std::uint32_t* kept, std::uint32_t& kept_count) noexcept {
+    std::uint32_t const newest_removal = sorted[0];
+    half_edge_operation_t const newest_operation = record_operation(records[newest_removal]);
+    std::uint64_t written = 0;
+    for (std::uint32_t base = 0; base < length; base += block_threads_) {
+        std::uint32_t const position = base + threadIdx.x;
+        bool const keeps = position < length &&
+                           keeps_sorted(records, sorted, position, newest_removal, newest_operation);
+        utilities::block_scanned_t const scan = scan_type_::template block_exclusive<block_threads_>(keeps ? 1 : 0);
+        if (keeps) kept[start + written + scan.before] = sorted[position];
+        written += scan.total;
+    }
+    if (threadIdx.x == 0) kept_count = static_cast<std::uint32_t>(written);
+    __syncthreads();
+}
+
 /** Composes chain @c blockIdx.x of @p starts and every chain a grid's width past it: sorts the
- *  chain's record indices in @p sorted, shared memory for the next power of two of the chain's
- *  records, keeps its newest removal of the vertex and the newest record of every half-edge newer
- *  than that removal, unless it removes the half-edge behind such a removal, and writes the kept
- *  indices over the chain's span of @p kept and their count into @p kept_counts. */
+ *  record indices of a chain up to @c fold_spill_t::shared_width wide in @p sorted, shared memory
+ *  for that many, and keeps what survives as @c keep_sorted_chain does; then keeps what survives
+ *  of every chain @p spill sorted before. */
 template <unsigned block_threads_, typename scan_type_>
 __device__ void fold_chains(half_edge_record_t const* records, std::uint32_t const* starts, std::uint32_t chains_count,
-                            std::uint32_t* sorted, std::uint32_t* kept, std::uint32_t* kept_counts) noexcept {
+                            fold_spill_t const& spill, std::uint32_t* sorted, std::uint32_t* kept,
+                            std::uint32_t* kept_counts) noexcept {
     constexpr std::uint32_t padding = (std::numeric_limits<std::uint32_t>::max)();
     unsigned const thread = threadIdx.x;
     for (std::uint32_t chain = blockIdx.x; chain < chains_count; chain += gridDim.x) {
@@ -136,6 +243,7 @@ __device__ void fold_chains(half_edge_record_t const* records, std::uint32_t con
         }
         std::uint32_t width = 1;
         while (width < length) width *= 2;
+        if (width > spill.shared_width) continue;
         for (std::uint32_t index = thread; index < width; index += block_threads_)
             sorted[index] = index < length ? start + index : padding;
         __syncthreads();
@@ -146,20 +254,12 @@ __device__ void fold_chains(half_edge_record_t const* records, std::uint32_t con
                 bitonic_step<block_threads_>(records, sorted, width, size, stride);
                 __syncthreads();
             }
-
-        std::uint32_t const newest_removal = sorted[0];
-        half_edge_operation_t const newest_operation = record_operation(records[newest_removal]);
-        std::uint64_t written = 0;
-        for (std::uint32_t base = 0; base < length; base += block_threads_) {
-            std::uint32_t const position = base + thread;
-            bool const keeps = position < length &&
-                               keeps_sorted(records, sorted, position, newest_removal, newest_operation);
-            utilities::block_scanned_t const scan = scan_type_::template block_exclusive<block_threads_>(keeps ? 1 : 0);
-            if (keeps) kept[start + written + scan.before] = sorted[position];
-            written += scan.total;
-        }
-        if (thread == 0) kept_counts[chain] = static_cast<std::uint32_t>(written);
-        __syncthreads();
+        keep_sorted_chain<block_threads_, scan_type_>(records, sorted, start, length, kept, kept_counts[chain]);
+    }
+    for (std::uint32_t slot = blockIdx.x; slot < spill.count; slot += gridDim.x) {
+        std::uint32_t const chain = spill.chains[slot];
+        keep_sorted_chain<block_threads_, scan_type_>(records, spill.sorted + spill.starts[slot], starts[chain],
+                                                      starts[chain + 1] - starts[chain], kept, kept_counts[chain]);
     }
 }
 
@@ -219,12 +319,34 @@ struct fold_regions_t {
     /** A removal of the vertex as the composed records spell it. */
     half_edge_record_t removal {};
 
+    /** The chains sorting across blocks, the widest of them, zero for none, and their indices. */
+    fold_spill_t spill {};
+    std::uint32_t spilled_width = 0;
+    std::uint64_t spilled_indices = 0;
+
     std::uint32_t chains_count = 0;
     std::uint32_t records_count = 0;
 
-    /** The next power of two of the longest chain's records, which one block sorts. */
+    /** The next power of two of the longest chain one block sorts in shared memory. */
     std::uint32_t width = 0;
 };
+
+/** Queues the bitonic sort of every chain @p regions spills on @p executor, of any vendor, before
+ *  the first fold launch keeps what survives of them. */
+template <typename executor_type_>
+st::status_t launch_sort_steps(executor_type_& executor, fold_regions_t const& regions) noexcept {
+    unsigned const blocks_count = static_cast<unsigned>(
+        fu::min_of(utilities::divide_round_up(regions.spilled_indices, std::uint64_t {2 * fold_block_threads_k}),
+                   std::uint64_t {65535}));
+    // The launch of a stride below the block's threads finishes every stride below it
+    for (std::uint32_t size = 2; size <= regions.spilled_width; size *= 2)
+        for (std::uint32_t stride = size / 2; stride; stride = stride >= fold_block_threads_k ? stride / 2 : 0)
+            if (utilities::launch(executor, executor.kernels()->function("ustore_fold_sort_step"), blocks_count,
+                                  fold_block_threads_k, 0u, regions.records, regions.spill, size, stride)
+                    .failed())
+                return st::status_t::unknown_k;
+    return st::status_t::success_k;
+}
 
 /** Queues both fold launches over @p regions on @p executor, of an NVIDIA or an AMD device, the
  *  second handing every chain its offset through one chained scan. */
@@ -237,10 +359,12 @@ st::status_t launch_folds(executor_type_& executor, blocks_type_&, fold_regions_
                         sizeof(std::uint64_t))
             .failed())
         return status_t::unknown_k;
+    if (status_t const sorted = launch_sort_steps(executor, regions); sorted != status_t::success_k) return sorted;
     unsigned const blocks_count = regions.chains_count < 65535 ? regions.chains_count : 65535;
     if (utilities::launch(executor, executor.kernels()->function("ustore_fold_chains"), blocks_count,
                           fold_block_threads_k, static_cast<unsigned>(regions.width * sizeof(std::uint32_t)),
-                          regions.records, regions.starts, regions.chains_count, regions.kept, regions.kept_counts)
+                          regions.records, regions.starts, regions.chains_count, regions.spill, regions.kept,
+                          regions.kept_counts)
             .failed())
         return status_t::unknown_k;
     std::uint64_t const tickets = fu::min_of(
@@ -270,15 +394,16 @@ st::status_t launch_folds(utilities::metal_executor_t& executor, blocks_type_& b
     std::uint32_t const tiles = static_cast<std::uint32_t>(
         utilities::divide_round_up(std::uint64_t {regions.records_count}, std::uint64_t {tile}));
     auto const flags = utilities::carve<std::uint8_t>(blocks, executor, regions.records_count);
-    auto const counts = utilities::carve<std::uint32_t>(blocks, executor, std::size_t {tiles} + 1);
+    auto const counts = utilities::carve<std::uint64_t>(blocks, executor, std::size_t {tiles} + 1);
     auto const selected = utilities::carve<std::uint32_t>(blocks, executor, regions.records_count);
     if (!flags || !counts || !selected) return status_t::out_of_memory_heap_k;
+    if (status_t const sorted = launch_sort_steps(executor, regions); sorted != status_t::success_k) return sorted;
     unsigned const blocks_count = regions.chains_count < 65535 ? regions.chains_count : 65535;
     // Metal binds threadgroup memory in multiples of 16 bytes
     unsigned const sorted_bytes = utilities::round_up_to_multiple(regions.width * 4u, 16u);
     if (utilities::launch(executor, executor.kernels()->function("ustore_fold_chains"), blocks_count,
                           fold_block_threads_k, sorted_bytes, regions.records, regions.starts, regions.chains_count,
-                          regions.kept, regions.kept_counts, flags->data())
+                          regions.spill, regions.kept, regions.kept_counts, flags->data())
             .failed())
         return status_t::unknown_k;
     if (utilities::select_flagged(executor, static_cast<std::uint8_t const*>(flags->data()), regions.records_count,
@@ -292,18 +417,17 @@ st::status_t launch_folds(utilities::metal_executor_t& executor, blocks_type_& b
                           fold_block_threads_k, 0u, regions.records, regions.starts,
                           static_cast<std::uint32_t const*>(regions.kept), regions.chains_count, tiles, regions.removal,
                           regions.composed, regions.offsets, static_cast<std::uint32_t const*>(selected->data()),
-                          static_cast<std::uint32_t const*>(counts->data()))
+                          static_cast<std::uint64_t const*>(counts->data()))
             .failed())
         return status_t::unknown_k;
     return status_t::success_k;
 }
 
 template <typename executor_type_, typename blocks_type_>
-st::status_t vram_nvidia_adjacency_fold_t::compose(executor_type_& executor, blocks_type_& blocks,
-                                                   std::span<delta_view_t const> changes,
-                                                   std::span<std::uint64_t const> chain_starts,
-                                                   st::vector<byte_t>& composed,
-                                                   st::vector<std::uint64_t>& composed_offsets) const noexcept {
+st::status_t vram_adjacency_fold_t::compose(executor_type_& executor, blocks_type_& blocks,
+                                            std::span<delta_view_t const> changes,
+                                            std::span<std::uint64_t const> chain_starts, st::vector<byte_t>& composed,
+                                            st::vector<std::uint64_t>& composed_offsets) const noexcept {
     using st::status_t;
     auto const device_status = [](utilities::status_t const status) noexcept {
         return status.failed() ? status_t::unknown_k : status_t::success_k;
@@ -315,8 +439,15 @@ st::status_t vram_nvidia_adjacency_fold_t::compose(executor_type_& executor, blo
     if (status != status_t::success_k) return status;
     for (std::uint64_t& offset : composed_offsets) offset = 0;
 
+    // The widest chain one block sorts in its shared memory, past which chains spill
+    std::uint32_t shared_width = 1;
+    while (fold_sort_fits(executor.device(), shared_width * 2)) shared_width *= 2;
+
     std::uint64_t total = 0;
     std::uint64_t longest = 0;
+    // Spilled chains per width by its bits, which then name where the width's next one goes
+    std::array<std::uint32_t, 64> spilled_slots {};
+    std::uint32_t spilled_chains_count = 0;
     for (std::size_t chain = 0; chain != chains_count; ++chain) {
         std::uint64_t records = 0;
         for (std::uint64_t change = chain_starts[chain]; change != chain_starts[chain + 1]; ++change) {
@@ -329,17 +460,22 @@ st::status_t vram_nvidia_adjacency_fold_t::compose(executor_type_& executor, blo
         }
         total += records;
         longest = records > longest ? records : longest;
+        std::uint64_t const width = std::bit_ceil(records);
+        if (width > shared_width) ++spilled_slots[std::countr_zero(width)], ++spilled_chains_count;
     }
-    // A record's index is its place in its chain, so every index fits 32 bits, and a chain sorts
-    // in one block's memory, 64 KiB on NVIDIA and AMD devices and 32 KiB on Apple ones, so a merge
-    // with a longer one folds on the host
-    constexpr std::uint32_t fold_chain_records_max_k = std::is_same_v<executor_type_, utilities::metal_executor_t>
-                                                           ? 4096
-                                                           : 16384;
-    if (total > (std::numeric_limits<std::uint32_t>::max)()) return status_t::invalid_argument_k;
-    if (longest > fold_chain_records_max_k) return status_t::out_of_memory_heap_k;
+    // A record's index is its place among the gathered ones, the largest left for the padding
+    if (total > (std::numeric_limits<std::uint32_t>::max)()) return status_t::capacity_exhausted_k;
     if (total == 0) return status_t::success_k;
     if (!executor.kernels()) return status_t::invalid_argument_k;
+
+    // Every width starts where the wider ones end, so a spilled chain starts at a multiple of it
+    std::array<std::uint64_t, 64> spilled_firsts {};
+    std::uint64_t spilled_indices = 0;
+    for (std::uint32_t bits = 64, slots = 0; bits-- != 0;) {
+        std::uint32_t const chains_of_width = spilled_slots[bits];
+        spilled_slots[bits] = slots, spilled_firsts[bits] = spilled_indices;
+        slots += chains_of_width, spilled_indices += std::uint64_t {chains_of_width} << bits;
+    }
 
     // The chains gather back to back into the pinned bounce, which the device reads at the
     // bus's full speed
@@ -352,16 +488,33 @@ st::status_t vram_nvidia_adjacency_fold_t::compose(executor_type_& executor, blo
     std::uint32_t* const gathered_starts = bounce.template operator()<std::uint32_t>(chains_count + 1);
     half_edge_record_t* const downloaded = bounce.template operator()<half_edge_record_t>(records_count);
     std::uint64_t* const downloaded_offsets = bounce.template operator()<std::uint64_t>(chains_count + 1);
-    if (!gathered || !gathered_starts || !downloaded || !downloaded_offsets || executor.pin_bounce().failed())
+    std::uint32_t* const spilled_sorted = bounce.template operator()<std::uint32_t>(spilled_indices);
+    std::uint64_t* const spilled_starts = bounce.template operator()<std::uint64_t>(spilled_chains_count + 1);
+    std::uint32_t* const spilled_chains = bounce.template operator()<std::uint32_t>(spilled_chains_count);
+    if (!gathered || !gathered_starts || !downloaded || !downloaded_offsets || !spilled_starts ||
+        (spilled_chains_count != 0 && (!spilled_sorted || !spilled_chains)) || executor.pin_bounce().failed())
         return status_t::out_of_memory_heap_k;
+    constexpr std::uint32_t padding = (std::numeric_limits<std::uint32_t>::max)();
     std::uint32_t count = 0;
     for (std::size_t chain = 0; chain != chains_count; ++chain) {
         gathered_starts[chain] = count;
         for (std::uint64_t change = chain_starts[chain]; change != chain_starts[chain + 1]; ++change)
             for (std::size_t offset = 0; offset != changes[change].bytes.size(); offset += half_edge_delta_bytes_k)
                 std::memcpy(gathered[count++].bytes, changes[change].bytes.data() + offset, half_edge_delta_bytes_k);
+        std::uint32_t const length = count - gathered_starts[chain];
+        std::uint64_t const width = std::bit_ceil(std::uint64_t {length});
+        if (width <= shared_width) continue;
+        int const bits = std::countr_zero(width);
+        std::uint32_t const slot = spilled_slots[bits]++;
+        std::uint64_t const first = spilled_firsts[bits];
+        spilled_firsts[bits] += width;
+        spilled_chains[slot] = static_cast<std::uint32_t>(chain), spilled_starts[slot] = first;
+        for (std::uint64_t index = 0; index != width; ++index)
+            spilled_sorted[first + index] = index < length ? gathered_starts[chain] + static_cast<std::uint32_t>(index)
+                                                           : padding;
     }
     gathered_starts[chains_count] = count;
+    spilled_starts[spilled_chains_count] = spilled_indices;
 
     auto const device = [&]<typename element_type_>(std::size_t elements) noexcept {
         auto const carved = utilities::carve<element_type_>(blocks, executor, elements);
@@ -387,8 +540,28 @@ st::status_t vram_nvidia_adjacency_fold_t::compose(executor_type_& executor, blo
     save_delta(half_edge_delta_t::remove_vertex(), regions.removal.bytes);
     regions.chains_count = static_cast<std::uint32_t>(chains_count);
     regions.records_count = static_cast<std::uint32_t>(records_count);
-    regions.width = 1;
-    while (regions.width < longest) regions.width *= 2;
+    regions.width = static_cast<std::uint32_t>(fu::min_of(std::bit_ceil(longest), std::uint64_t {shared_width}));
+    regions.spill.count = spilled_chains_count;
+    regions.spill.shared_width = shared_width;
+    if (spilled_chains_count != 0) {
+        regions.spill.sorted = device.template operator()<std::uint32_t>(spilled_indices);
+        std::uint64_t* const spill_starts = device.template operator()<std::uint64_t>(spilled_chains_count + 1);
+        std::uint32_t* const spill_chains = device.template operator()<std::uint32_t>(spilled_chains_count);
+        if (!regions.spill.sorted || !spill_starts || !spill_chains) return status_t::out_of_memory_heap_k;
+        regions.spill.starts = spill_starts, regions.spill.chains = spill_chains;
+        regions.spilled_width = static_cast<std::uint32_t>(std::bit_ceil(longest));
+        regions.spilled_indices = spilled_indices;
+        std::span<std::uint32_t const> const sorted_indices {spilled_sorted, static_cast<std::size_t>(spilled_indices)};
+        std::span<std::uint64_t const> const slot_starts {spilled_starts, spilled_chains_count + std::size_t {1}};
+        std::span<std::uint32_t const> const slot_chains {spilled_chains, spilled_chains_count};
+        if ((status = device_status(executor.upload_async(reinterpret_cast<std::uintptr_t>(regions.spill.sorted),
+                                                          std::as_bytes(sorted_indices)))) != status_t::success_k ||
+            (status = device_status(executor.upload_async(reinterpret_cast<std::uintptr_t>(spill_starts),
+                                                          std::as_bytes(slot_starts)))) != status_t::success_k ||
+            (status = device_status(executor.upload_async(reinterpret_cast<std::uintptr_t>(spill_chains),
+                                                          std::as_bytes(slot_chains)))) != status_t::success_k)
+            return status;
+    }
     if ((status = launch_folds(executor, blocks, regions)) != status_t::success_k) return status;
 
     // Every chain keeps at most what it gathered, so the whole span comes back and the offsets say

@@ -31,18 +31,18 @@
 #include "ustore/ranges.hpp" // `strided`
 #include "ustore/strings.h"
 
-#include "ustore/blobs/nvme_database.hpp"              // `basic_database`, `lookup_result_t`
-#include "ustore/blobs/nvme_transactions.hpp"          // `watch_schedule_t`
-#include "ustore/blobs/nvme_tree.hpp"                  // `user_collection_config_t`, `validate`
-#include "ustore/blobs/vram_amd_compaction.hpp"        // `hip_compactor_t`
-#include "ustore/blobs/vram_apple_compaction.hpp"      // `metal_compactor_t`
-#include "ustore/blobs/vram_nvidia_compaction.hpp"     // `cuda_compactor_t`
-#include "ustore/docs/nvme_store.hpp"                  // `docs::nvme_store`
-#include "ustore/graph/nvme_store.hpp"                 // `graph::nvme_store`
-#include "ustore/graph/vram_nvidia_adjacency_fold.hpp" // `vram_nvidia_adjacency_fold_t`
-#include "ustore/pages/nvme_store.hpp"                 // `pages::nvme_store`
-#include "ustore/strings/nvme_store.hpp"               // `strings::nvme_store`, `nvme_transaction`, `strings_page_k`
-#include "ustore/utilities/blocking_files.hpp" // `directory_exists`, `join_path`, `path_max_bytes_k`, `remove_file`
+#include "ustore/blobs/nvme_database.hpp"          // `basic_database`, `lookup_result_t`
+#include "ustore/blobs/nvme_transactions.hpp"      // `watch_schedule_t`
+#include "ustore/blobs/nvme_tree.hpp"              // `user_collection_config_t`, `validate`
+#include "ustore/blobs/vram_amd_compaction.hpp"    // `hip_compactor_t`
+#include "ustore/blobs/vram_apple_compaction.hpp"  // `metal_compactor_t`
+#include "ustore/blobs/vram_nvidia_compaction.hpp" // `cuda_compactor_t`
+#include "ustore/docs/nvme_store.hpp"              // `docs::nvme_store`
+#include "ustore/graph/nvme_store.hpp"             // `graph::nvme_store`
+#include "ustore/graph/vram_adjacency_fold.hpp"    // `vram_adjacency_fold_t`
+#include "ustore/pages/nvme_store.hpp"             // `pages::nvme_store`
+#include "ustore/strings/nvme_store.hpp"           // `strings::nvme_store`, `nvme_transaction`, `strings_page_k`
+#include "ustore/utilities/blocking_files.hpp"     // `directory_exists`, `path_max_bytes_k`
 #include "ustore/utilities/nvme_mounts.hpp" // `resources_config_t`, `open_resources`, `mounted_storage`, `addresses_of`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `arena_copy`, `growing_strings`, `growth_status`
 
@@ -51,6 +51,8 @@
 #include "utilities/batches.hpp"  // `strings_arg_t`
 #include "utilities/outputs.hpp"  // `collection_list_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
+
+#include "nvme/compaction_variants.hpp" // the Apple compactor's instantiations, declared extern
 
 namespace unum::ustore::nvme {
 using namespace unum::ustore::blobs;
@@ -79,7 +81,7 @@ using sections_reader_of = ring_sections_reader<sections_disk_of<cpu_class_>, wa
 
 /** What composes the half-edge changes of a graph's merge on a device, whichever vendor's compactor
  *  runs it. */
-using graph_device_fold_t = graph::vram_nvidia_adjacency_fold_t;
+using graph_device_fold_t = graph::vram_adjacency_fold_t;
 
 /** The store of a blobs collection, and of the collections system collection, whose values follow
  *  @p value_layout_. */
@@ -338,8 +340,7 @@ class device_compaction {
             [&]<typename device_type_>(device_type_ const& device) noexcept {
                 if constexpr (!gpu_executor_concept<device_type_>) return false;
                 else {
-                    twin.vendor = device_type_::vendor_k;
-                    twin.vendor_ordinal = static_cast<std::uint32_t>(device.device());
+                    twin = device.device();
                     scratch_limit = device.scratch_limit();
                     return true;
                 }
@@ -865,7 +866,7 @@ expected<value_view_t> read_value(call_access<cpu_class_> const& access, collect
 template <cpu_class_t cpu_class_>
 status_t write_value(call_access<cpu_class_> const& access, collection_id_t collection, stored_key_t key,
                      value_view_t value) noexcept {
-    stored_value_view_t const bytes {reinterpret_cast<byte_t const*>(value.data()), value.size()};
+    stored_value_view_t const bytes {value};
     if (!access.transaction) {
         basic_database_of<cpu_class_>& store = *access.state.store;
         return value ? store.insert(collection, key, bytes) : store.remove(collection, key);
@@ -1091,10 +1092,16 @@ status_t commit_alone(database_state<cpu_class_>& state, ustore_arena_t scratch,
         call_access<cpu_class_> const access {state,        held.get(),         schedule, scratch,
                                               head_stamp_k, outside_executor_k, &strings};
         status_t const written = writes(access);
-        if (written == status_code_t::capacity_exhausted_k &&
-            shape.max_bytes < storage_limits_t::transaction_max_bytes_k) {
-            shape.max_bytes *= 2;
-            shape.max_deltas = fu::min_of(shape.max_deltas * 2, storage_limits_t::transaction_max_deltas_k);
+        // Only a refusal for room retries larger; a format's ceiling stands
+        transaction_config_t const wanted = held->wanted_shape();
+        bool const outgrew = wanted.max_bytes > shape.max_bytes || wanted.max_deltas > shape.max_deltas;
+        if (written == status_code_t::capacity_exhausted_k && outgrew &&
+            wanted.max_bytes <= storage_limits_t::transaction_max_bytes_k &&
+            wanted.max_deltas <= storage_limits_t::transaction_max_deltas_k) {
+            shape.max_bytes = fu::min_of(fu::max_of(shape.max_bytes * 2, wanted.max_bytes),
+                                         storage_limits_t::transaction_max_bytes_k);
+            shape.max_deltas = fu::min_of(fu::max_of(shape.max_deltas * 2, wanted.max_deltas),
+                                          storage_limits_t::transaction_max_deltas_k);
             continue;
         }
         if (written.failed()) return written;
@@ -2101,7 +2108,7 @@ status_t collection_find(ustore_collection_find_t const& arguments, strings_arg_
     for (std::size_t index = 0; index != arguments.count; ++index) {
         bool present = false;
         ustore_collection_id_t found;
-        if (status_t const looked = look_up_name(named, string_of(names[index]), found, present); looked.failed())
+        if (status_t const looked = look_up_name(named, chars_of(names[index]), found, present); looked.failed())
             return looked;
         // A drop unnames a collection before the store lets it go, so a name whose store is gone is a drop in flight
         ustore_modality_t modality {};
@@ -2191,7 +2198,7 @@ status_t transaction_rollback(ustore_transaction_rollback_t const&, view_t const
  *  directory 0 is the manifest's own directory, or the raw address it names, and a quota of zero
  *  takes the whole medium. */
 inline status_t read_directories(ustore_database_open_nvme_t const& arguments, resources_config_t& resources) noexcept {
-    if (sz::failed(resources.manifest.assign(string_view_t {string_of(arguments.directory)})))
+    if (sz::failed(resources.manifest.assign(string_view_t {chars_of(arguments.directory)})))
         return {status_code_t::out_of_memory_k, "Failed to copy the manifest path"};
     if (arguments.data_directories_count && !arguments.data_directories)
         return {status_code_t::invalid_argument_k, "Counted data directories are null"};
@@ -2199,7 +2206,7 @@ inline status_t read_directories(ustore_database_open_nvme_t const& arguments, r
         ustore_data_directory_t const& given = arguments.data_directories[index];
         if (!names_path(given.path)) return {status_code_t::invalid_argument_k, "A data directory needs a path"};
         data_directory_config_t directory;
-        if (sz::failed(directory.path.assign(string_view_t {string_of(given.path)})))
+        if (sz::failed(directory.path.assign(string_view_t {chars_of(given.path)})))
             return {status_code_t::out_of_memory_k, "Failed to copy a data directory"};
         directory.max_size = given.max_bytes;
         if (st::failed(resources.data_directories.push_back(std::move(directory))))
@@ -2233,11 +2240,10 @@ bool take_unless_zero(value_type_& value, ustore_size_t requested) noexcept {
     return true;
 }
 
-/** Reads the placement of the executor of @p arguments, the executor of their merges into @p compactions, null for
- *  host merges, and their own sizes, keeping the engine's default for every zero among them. */
+/** Reads the placement of the executor of @p arguments and their own sizes, keeping the engine's
+ *  default for every zero among them. */
 inline status_t read_options(ustore_database_open_nvme_t const& arguments, resources_config_t& resources,
-                             database_config_t& transactions, user_collection_config_t& collections,
-                             ustore_executor_handle_t const*& compactions) noexcept {
+                             database_config_t& transactions, user_collection_config_t& collections) noexcept {
     nvme_placement_t const placement = nvme_placement_of(arguments.executor);
     switch (placement.nvme.transport) {
     case ustore_transport_automatic_k: resources.io_transport = io_transport_t::automatic_k; break;
@@ -2247,7 +2253,6 @@ inline status_t read_options(ustore_database_open_nvme_t const& arguments, resou
     case ustore_transport_linux_spdk_k: resources.io_transport = io_transport_t::linux_spdk_k; break;
     default: return {status_code_t::invalid_argument_k, "Unknown transport"};
     }
-    compactions = arguments.compactions;
 
     // Every pool thread and the holding call keep a channel, and every other thread shares the rest
     resources.threads = placement.threads + 1;
@@ -2405,14 +2410,13 @@ status_t nvme_variant<cpu_class_>::open(ustore_database_open_nvme_t const& argum
         if (exists_status.failed()) return exists_status;
         if (!exists) return {status_code_t::not_found_k, "The manifest's directory doesn't exist"};
     }
-    ustore_executor_handle_t const* compactions = nullptr;
-    if (status_t const read = read_options(arguments, resources, transactions, collections, compactions); read.failed())
-        return read;
+    if (status_t const read = read_options(arguments, resources, transactions, collections); read.failed()) return read;
     auto [made, status] = make_handle<ustore_database_handle_t, database_state<cpu_class_>>(
         nvme_variant<cpu_class_>::engine_k);
     if (status.failed()) return status;
-    if (status_t const opened = open_state<cpu_class_>(
-            *made.state, resources, transactions, create_collection_config(collections), view.scratch, compactions);
+    if (status_t const opened = open_state<cpu_class_>(*made.state, resources, transactions,
+                                                       create_collection_config(collections), view.scratch,
+                                                       arguments.compactions);
         opened.failed())
         return opened;
     made.state->executor = nvme_placement_of(arguments.executor).executor;
@@ -2590,10 +2594,7 @@ status_t snapshot_save(ustore_snapshot_save_t const& arguments, view_t const& vi
     transactions.default_transaction = source.transaction_shape;
     user_collection_config_t collections = engine_collection_defaults();
     if (status_t const read = read_directories(saving, resources); read.failed()) return read;
-    // The saved copy merges on host threads, whatever device the source merges on
-    ustore_executor_handle_t const* host_merges = nullptr;
-    if (status_t const read = read_options(saving, resources, transactions, collections, host_merges); read.failed())
-        return read;
+    if (status_t const read = read_options(saving, resources, transactions, collections); read.failed()) return read;
     char directory[path_max_bytes_k];
     if (status_t const located = manifest_directory_of(resources, directory); located.failed()) return located;
     // A raw target names no directory, so a failed save there leaves nothing to remove

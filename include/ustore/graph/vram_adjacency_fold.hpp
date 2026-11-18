@@ -1,10 +1,10 @@
 /**
- *  @file include/ustore/graph/vram_nvidia_adjacency_fold.hpp
+ *  @file include/ustore/graph/vram_adjacency_fold.hpp
  *  @author Ash Vardanian
  *  @date November 1, 2026
  *  @brief The host face of the device fold of graph adjacency, which the tree and the engine pick
- *      for a graph's merges and whose @c compose @c vram_nvidia_adjacency_fold.cuh defines over
- *      the bundles' kernels.
+ *      for a graph's merges, whose @c compose launches the bundles' kernels as
+ *      @c vram_adjacency_fold.cuh defines it.
  */
 
 #pragma once
@@ -28,17 +28,18 @@ namespace unum::ustore::graph {
  *
  *  Host translation units name it, as the tree and the engine pick it for a graph's merges,
  *  whichever vendor's compactor runs them; its @c compose launches the bundles' kernels on the
- *  executor's device and is defined in @c vram_nvidia_adjacency_fold.cuh, which the unit of the
+ *  executor's device and is defined in @c vram_adjacency_fold.cuh, which the unit of the
  *  device compactors includes.
  */
-struct vram_nvidia_adjacency_fold_t {
+struct vram_adjacency_fold_t {
 
     /**
      *  @brief Composes chain @c c, the changes from @p chain_starts[c] to @p chain_starts[c + 1]
      *      oldest first, into the bytes of @p composed from @p composed_offsets[c] to
      *      @p composed_offsets[c + 1].
      *
-     *  The compose runs on the device of @p executor, in device memory carved off @p blocks.
+     *  The compose runs on the device of @p executor, in device memory carved off @p blocks; a
+     *  chain sorts in one block's shared memory where it fits, and across blocks otherwise.
      *
      *  @tparam executor_type_ The executor whose stream the device work queues on, as
      *      in @c utilities::cuda_executor_t, @c utilities::hip_executor_t or
@@ -49,8 +50,9 @@ struct vram_nvidia_adjacency_fold_t {
      *  @par Statuses:
      *  - @c status_code_t::invalid_argument_k A delta is no change, or carries a ragged or
      *    malformed record, which no compose reads.
-     *  - @c status_code_t::out_of_memory_heap_k A buffer could not grow, or a chain passes what
-     *    one block sorts on the device.
+     *  - @c status_code_t::capacity_exhausted_k The chains hold more records than 32-bit indices
+     *    count.
+     *  - @c status_code_t::out_of_memory_heap_k A buffer could not grow.
      */
     template <typename executor_type_, typename blocks_type_>
     st::status_t compose(executor_type_& executor, blocks_type_& blocks, std::span<delta_view_t const> changes,

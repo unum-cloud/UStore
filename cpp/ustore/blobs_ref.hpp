@@ -178,11 +178,8 @@ class blobs_ref {
                     ustore_durability_t durability = ustore_durability_buffered_k) noexcept
         requires writes_k
     {
-        // An array decays into one pointer object, whose address an accessor can stride over
-        using values_t = std::decay_t<values_argument_type_>;
-        values_t const& decayed = values;
-        values_arg_extractor<values_t> extractor;
-        return blobs_write_<ustore_completion_blocking_k>(receiver_, places_(), extractor.view(decayed), durability);
+        values_arg_extractor<std::decay_t<values_argument_type_>> extractor;
+        return blobs_write_<ustore_completion_blocking_k>(receiver_, places_(), extractor.view(values), durability);
     }
 
     /**

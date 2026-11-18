@@ -290,17 +290,17 @@ status_t write_many(database_t& database, place_batch_t const& places, strings_a
     return status_of(database.native->Write(options, &batch));
 }
 
-/** Appends @p value to @p outputs through a copy in @p scratch, since LevelDB hands it out of a buffer the next read
- *  reuses, or a missing value. */
-status_t append_staged(read_outputs_t& outputs, value_view_t value, ustore_arena_t scratch) noexcept {
+/** Places @p value as task @p task of @p outputs through a copy in @p scratch, since LevelDB hands
+ *  it out of a buffer the next read reuses, or a missing value. */
+status_t assign_staged(read_outputs_t& outputs, std::size_t task, value_view_t value, ustore_arena_t scratch) noexcept {
     if (!value) {
-        outputs.append_missing();
+        outputs.assign_missing(task);
         return {};
     }
     auto [staged, status] = arena_allocate<byte_t>(scratch, value.size());
     if (status.failed()) return status;
     if (!staged.empty()) std::memcpy(staged.data(), value.data(), value.size());
-    outputs.append(value_view_t {staged.data(), value.size()});
+    outputs.assign(task, value_view_t {staged.data(), value.size()});
     return {};
 }
 
@@ -373,7 +373,7 @@ status_t database_open(ustore_database_open_leveldb_t const& arguments, cpu_ceil
     if (!arguments.database) return {status_code_t::invalid_argument_k, "Need an output for the database"};
     if (!names_path(arguments.directory)) return {status_code_t::invalid_argument_k, "A database needs a directory"};
 
-    std::string const root(string_of(arguments.directory));
+    std::string const root(chars_of(arguments.directory));
     auto [root_exists, directory_exists_status] = directory_exists(root.c_str());
     if (directory_exists_status.failed()) return directory_exists_status;
     if (!root_exists) return {status_code_t::not_found_k, "Root isn't a directory"};
@@ -446,7 +446,7 @@ status_t snapshot_save(ustore_snapshot_save_t const& arguments, view_t const& vi
     if (!iterator->status().ok()) return status_of(iterator->status());
     progress_t progress {arguments.progress, arguments.progress_state, total};
 
-    std::string const path(string_of(arguments.path));
+    std::string const path(chars_of(arguments.path));
     native_t* saved_native = nullptr;
     native_status_t status = native_t::Open(database.options, path, &saved_native);
     if (!status.ok()) return {status_code_t::io_k, "Failed to create the saved database"};
@@ -614,7 +614,7 @@ status_t collection_find(ustore_collection_find_t const& arguments, strings_arg_
     std::string held;
     for (std::size_t index = 0; index != arguments.count; ++index) {
         native_status_t const status = database.native->Get(
-            options, string_key(names_collection_k, string_of(names[index]), key), &named);
+            options, string_key(names_collection_k, chars_of(names[index]), key), &named);
         if (status.IsNotFound()) {
             outputs.assign(index, ustore_collection_id_t {}, ustore_modality_t {}, false);
             continue;

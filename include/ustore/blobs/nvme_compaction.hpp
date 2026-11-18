@@ -10,11 +10,11 @@
  *  coalesced ranges every stored value moves in and the value offsets of every new run. Both
  *  compactors share the rules below. The device one composes chains of changes only through a
  *  device fold the caller passes, and folds on the host every chain reaching a write or a base,
- *  so without a device fold a merge of runs holding a change runs on the host. Every compiler
- *  sees the device compactors, one per vendor, which carve, copy and launch through their
- *  executors: their kernels compile into the library's bundles, and @c compaction.cpp
- *  instantiates their compaction for the engine's key slots, so a host TU calls them, and a
- *  device whose bundle carries no kernels makes no device compactor.
+ *  as it does every chain where no device fold is passed. Every compiler sees the device
+ *  compactors, one per vendor, which carve, copy and launch through their executors: their
+ *  kernels compile into the library's bundles, and @c compaction.cpp instantiates their
+ *  compaction for the engine's key slots, so a host TU calls them, and a device whose bundle
+ *  carries no kernels makes no device compactor.
  */
 
 #pragma once
@@ -101,7 +101,7 @@ struct key_tails_column_t {
         if (offsets.empty()) return {};
         std::size_t const begin = offsets[static_cast<std::size_t>(position)];
         std::size_t const end = offsets[static_cast<std::size_t>(position) + 1];
-        return utilities::string_of(bytes.subspan(begin, end - begin));
+        return utilities::chars_of(bytes.subspan(begin, end - begin));
     }
 };
 
@@ -174,6 +174,21 @@ struct range_tombstone {
     [[nodiscard]] constexpr bool covers(stored_key_type_ const& stored_key) const noexcept {
         return !(stored_key < start) && stored_key < end;
     }
+};
+
+/** The range tombstones of one source run as a merge reads them, on the host or on a device: both
+ *  columns of @c range_tombstones, borrowed. */
+template <typename stored_key_type_>
+struct range_tombstones_view { // device-boundary
+
+    /** Every tombstone's bounds, ascending by start. */
+    range_tombstone<stored_key_type_> const* ranges = nullptr;
+
+    /** The stamp of every tombstone, in the order of @c ranges. */
+    std::uint64_t const* stamps = nullptr;
+
+    /** Tombstones viewed. */
+    std::uint64_t count = 0;
 };
 
 /**
@@ -532,7 +547,7 @@ struct sorted_run_index_view {
     /** The saved tree of the run's keys, which a view without @c cells reads key slots through. */
     st::immutable_splus_tree_view<typename key_slot_type_::stored_key_t> const* keys = nullptr;
 
-    /** The run's range tombstones, or null for none, which only the host compactor reads. */
+    /** The run's range tombstones, or null for none, which a device uploads beside its keys. */
     blobs::range_tombstones<typename key_slot_type_::stored_key_t> const* range_tombstones = nullptr;
 
     /** The run's position the view starts at, which only a slice of a host merge moves off zero;
@@ -568,6 +583,9 @@ struct strings_run_view {
 
     /** The kind of every key in sorted order. */
     kinds_column_t const* kinds = nullptr;
+
+    /** The run's range tombstones, or null for none. */
+    blobs::range_tombstones<std::string_view> const* range_tombstones = nullptr;
 };
 
 /** The key slot at sorted @p position of the run @p view describes, from its cells or tree. */
@@ -638,7 +656,13 @@ struct compacted_sorted_run_t {
 
     /** Value copy ranges filling its stored values section, which follow those of the sorted runs before it. */
     std::uint64_t value_copy_ranges_count = 0;
+
+    /** Where its folded values start in the compaction's folded bytes, which its copy ranges
+     *  count from. */
+    std::uint64_t folded_first = 0;
 };
+
+static_assert(sizeof(compacted_sorted_run_t) == 32, "A compacted sorted run is four words");
 
 /** One range of stored value bytes a new sorted run copies, coalesced from the values of neighbouring survivors that
  *  sit back to back in one source. */
@@ -648,7 +672,8 @@ struct value_copy_range_t {
      *  past every source run names the compaction's folded bytes. */
     std::uint32_t source_run = 0;
 
-    /** Where the range starts inside the source run's values section, or inside the folded bytes. */
+    /** Where the range starts inside the source run's values section, or inside the folded bytes
+     *  past its new sorted run's @c compacted_sorted_run_t::folded_first. */
     std::uint32_t source_begin = 0;
 
     /** Bytes the range copies, never zero. */
@@ -929,7 +954,7 @@ constexpr bool survives(located_tailed_key_slot<key_slot_type_> const* previous,
     return survives(shares_key ? &previous->located : nullptr, current.located, kind, stamps);
 }
 
-/** Whether a source of @p upper or @p lower has a range tombstone, keeping a merge on the host. */
+/** Whether a source of @p upper or @p lower has a range tombstone to check its versions against. */
 template <typename key_slot_type_>
 bool carries_range_tombstones(std::span<sorted_run_index_view<key_slot_type_> const> upper,
                               std::span<sorted_run_index_view<key_slot_type_> const> lower) noexcept {
@@ -941,37 +966,35 @@ bool carries_range_tombstones(std::span<sorted_run_index_view<key_slot_type_> co
 }
 
 /**
- *  @brief Whether a range tombstone of the sources @p upper and @p lower hides @p record from every
- *      reader of @p stamps, so a merge drops it.
+ *  @brief Whether a range tombstone of a merge's sources hides the version of @p stored_key stamped
+ *      @p stamp that source @p run holds from every reader of @p stamps, so the merge drops it.
  *
- *  A tombstone of a newer source, or of the record's own source stamped above it, hides the
- *  record. A merge raises a version's stamp to its floor while a tombstone keeps its own, so a
- *  record of an older source stamped at or above the tombstone was raised past it, where no reader
+ *  A tombstone of a newer source, or of the version's own source stamped above it, hides the
+ *  version. A merge raises a version's stamp to its floor while a tombstone keeps its own, so a
+ *  version of an older source stamped at or above the tombstone was raised past it, where no reader
  *  tells the two apart; any other the tombstone hides from every reader once none reads between
  *  them. A tombstone above the horizon, which a mount may drop, or above the ceiling, which this
  *  merge drops, hides nothing.
+ *
+ *  @param[in] tombstones_of Called as <tt>tombstones_of(source)</tt> for the
+ *      @c range_tombstones_view of a source, the @p upper_count upper ones first.
  */
-template <typename key_slot_type_>
-bool hidden_by_range(std::span<sorted_run_index_view<key_slot_type_> const> upper,
-                     std::span<sorted_run_index_view<key_slot_type_> const> lower,
-                     located_key_slot<key_slot_type_> const& record, compaction_stamps_t const& stamps) noexcept {
-    std::size_t const upper_count = upper.size();
-    for (std::size_t source = 0; source != upper.size() + lower.size(); ++source) {
-        auto const* const tombstones = source < upper_count ? upper[source].range_tombstones
-                                                            : lower[source - upper_count].range_tombstones;
-        if (tombstones == nullptr || tombstones->empty()) continue;
-        bool const own = source == record.sorted_run;
-        bool const newer = source < upper_count && (record.sorted_run >= upper_count || source > record.sorted_run);
+template <typename stored_key_type_, typename tombstones_of_type_>
+constexpr bool hidden_by_range(tombstones_of_type_&& tombstones_of, std::uint32_t sources_count,
+                               std::uint32_t upper_count, stored_key_type_ const& stored_key, std::uint32_t run,
+                               std::uint64_t stamp, compaction_stamps_t const& stamps) noexcept {
+    for (std::uint32_t source = 0; source != sources_count; ++source) {
+        bool const own = source == run;
+        bool const newer = source < upper_count && (run >= upper_count || source > run);
         if (!own && !newer) continue;
-        auto const ranges = tombstones->ranges();
-        for (std::size_t index = 0; index != ranges.size() && !(record.key_slot.stored_key < ranges[index].start);
+        range_tombstones_view<stored_key_type_> const tombstones = tombstones_of(source);
+        for (std::uint64_t index = 0; index != tombstones.count && !(stored_key < tombstones.ranges[index].start);
              ++index) {
-            std::uint64_t const stamp = tombstones->stamp(index);
-            if (!ranges[index].covers(record.key_slot.stored_key) || stamp > stamps.ceiling || stamp > stamps.horizon)
+            std::uint64_t const removed = tombstones.stamps[index];
+            if (!tombstones.ranges[index].covers(stored_key) || removed > stamps.ceiling || removed > stamps.horizon)
                 continue;
-            if (own && stamp <= record.stamp) continue;
-            if (record.stamp >= stamp || reader_interval(stamps, record.stamp) == reader_interval(stamps, stamp))
-                return true;
+            if (own && removed <= stamp) continue;
+            if (stamp >= removed || reader_interval(stamps, stamp) == reader_interval(stamps, removed)) return true;
         }
     }
     return false;
@@ -1078,8 +1101,9 @@ st::status_t place_folded_value(std::span<byte_t const> bytes, std::uint64_t val
         if (!bytes.empty() && bytes.size() != value_stride) return status_t::invalid_argument_k;
         size = static_cast<std::size_t>(value_stride);
     }
+    // Every new run counts its folded values from its own first, so one value past 32 bits refuses
+    if (size > (std::numeric_limits<std::uint32_t>::max)()) return status_t::capacity_exhausted_k;
     std::size_t const location = folded.size();
-    if (location + size > (std::numeric_limits<std::uint32_t>::max)()) return status_t::capacity_exhausted_k;
     if (status_t const grown = folded.resize(location + size); grown != status_t::success_k) return grown;
     if (!bytes.empty()) std::memcpy(folded.data() + location, bytes.data(), bytes.size());
     if (bytes.size() != size) std::memset(folded.data() + location + bytes.size(), 0, size - bytes.size());
@@ -1107,24 +1131,24 @@ st::status_t place_folded_value(std::span<byte_t const> bytes, std::uint64_t, st
  *  @brief Appends to @p ranges where the value of @p survivor comes from, as a range of its own
  *      that @c coalesce_value_copies later joins with its neighbours, and nothing for a survivor
  *      holding no value bytes.
+ *
+ *  A survivor naming the run past every source has its value next in the folded bytes, which
+ *  @c coalesce_value_copies locates once it knows the new run holding it.
+ *
  *  @param[in] upper The upper LSM level's views, whose value offsets locate the values of
  *      a variable width.
  *  @param[in] lower The lower LSM level's views.
  *  @param[in] value_stride Bytes every value of a fixed-width layout takes, which locates its
  *      values by position.
- *  @param[in,out] folded_begin Where the next folded value starts in the folded bytes, which
- *      hold the folded values in survivor order, so a survivor naming the run past every source
- *      moves it on.
  */
 template <typename key_slot_type_, typename ranges_type_>
 st::status_t append_value_copy(located_key_slot<key_slot_type_> const& survivor,
                                std::span<sorted_run_index_view<key_slot_type_> const> upper,
                                std::span<sorted_run_index_view<key_slot_type_> const> lower, std::uint64_t value_stride,
-                               std::uint64_t& folded_begin, ranges_type_& ranges) noexcept {
+                               ranges_type_& ranges) noexcept {
     if (survivor.size == 0) return st::status_t::success_k;
-    std::uint64_t source_begin = folded_begin;
-    if (survivor.sorted_run == upper.size() + lower.size()) folded_begin += survivor.size;
-    else {
+    std::uint64_t source_begin = 0;
+    if (survivor.sorted_run != upper.size() + lower.size()) {
         sorted_run_index_view<key_slot_type_> const& view = survivor.sorted_run < upper.size()
                                                                 ? upper[survivor.sorted_run]
                                                                 : lower[survivor.sorted_run - upper.size()];
@@ -1142,31 +1166,42 @@ st::status_t append_value_copy(located_key_slot<key_slot_type_> const& survivor,
  *      survivors that sit back to back in one source, and counts each run's ranges into it.
  *
  *  A run's values take exactly its @c stored_values_bytes, so the ranges it starts with follow from
- *  those of the runs before it.
+ *  those of the runs before it. The folded bytes, which ranges naming @p folded_run read, hold the
+ *  folded values in survivor order, so every run notes where its own start and its ranges count
+ *  from there, as its value offsets count from its first key slot.
  */
 template <typename sorted_runs_type_, typename ranges_type_>
-st::status_t coalesce_value_copies(sorted_runs_type_& sorted_runs, ranges_type_& ranges) noexcept {
+st::status_t coalesce_value_copies(sorted_runs_type_& sorted_runs, ranges_type_& ranges,
+                                   std::uint32_t folded_run) noexcept {
     std::size_t taken = 0;
     std::size_t placed = 0;
+    std::uint64_t folded_begin = 0;
     for (std::size_t run = 0; run != sorted_runs.size(); ++run) {
         std::size_t const first_range = placed;
         std::uint64_t target = 0;
+        sorted_runs[run].folded_first = folded_begin;
         while (target < sorted_runs[run].stored_values_bytes && taken != ranges.size()) {
             value_copy_range_t const piece = ranges[taken++];
+            std::uint64_t source_begin = piece.source_begin;
+            if (piece.source_run == folded_run) {
+                source_begin = folded_begin - sorted_runs[run].folded_first;
+                folded_begin += piece.bytes;
+            }
             if (placed != first_range) {
                 value_copy_range_t& last = ranges[placed - 1];
                 std::uint64_t const extended = std::uint64_t {last.bytes} + piece.bytes;
                 if (last.source_run == piece.source_run &&
-                    last.source_begin + std::uint64_t {last.bytes} == piece.source_begin &&
+                    last.source_begin + std::uint64_t {last.bytes} == source_begin &&
                     extended <= (std::numeric_limits<std::uint32_t>::max)()) {
                     last.bytes = static_cast<std::uint32_t>(extended);
                     target += piece.bytes;
                     continue;
                 }
             }
+            // A run's folded values lie within its own, so their offsets fit where targets do
             if (target > (std::numeric_limits<std::uint32_t>::max)()) return st::status_t::capacity_exhausted_k;
-            ranges[placed++] = value_copy_range_t {piece.source_run, piece.source_begin, piece.bytes,
-                                                   static_cast<std::uint32_t>(target)};
+            ranges[placed++] = value_copy_range_t {piece.source_run, static_cast<std::uint32_t>(source_begin),
+                                                   piece.bytes, static_cast<std::uint32_t>(target)};
             target += piece.bytes;
         }
         sorted_runs[run].value_copy_ranges_count = placed - first_range;
@@ -1193,13 +1228,12 @@ st::status_t plan_value_copies(record_type_ const* survivors,
     ranges.clear();
     std::uint64_t survivors_count = 0;
     for (std::size_t run = 0; run != sorted_runs.size(); ++run) survivors_count += sorted_runs[run].key_slots_count;
-    std::uint64_t folded_begin = 0;
     for (std::uint64_t index = 0; index != survivors_count; ++index)
         if (st::status_t const appended = append_value_copy(located_of(survivors[index]), upper, lower, value_stride,
-                                                            folded_begin, ranges);
+                                                            ranges);
             appended != st::status_t::success_k)
             return appended;
-    return coalesce_value_copies(sorted_runs, ranges);
+    return coalesce_value_copies(sorted_runs, ranges, static_cast<std::uint32_t>(upper.size() + lower.size()));
 }
 
 /** Narrows @p taken, more key slots from @p first than fit @p target_bytes, to the most that fit,
@@ -1490,10 +1524,12 @@ struct host_compactor_t {
      *      answering an @c st::status_t, with any bytes it reads allocated from @c arena.
      *  @param[out] output The new sorted runs, their cells, stamps and kinds, their value offsets and value copy
      *      ranges, and the values a fold wrote.
-     *  @retval invalid_argument_k The bounds admit no sorted run, the LSM levels hold more than 2^32 sorted runs, a
-     *      variable-width view lacks its value offsets, or the fold refused a chain.
-     *  @retval capacity_exhausted_k A folded value outgrows its inline key slot or the 32-bit locations.
-     *  @retval out_of_memory_heap_k A buffer could not grow.
+     *
+     *  @par Statuses:
+     *  - @c invalid_argument_k The bounds admit no sorted run, the LSM levels hold more than 2^32
+     *    sorted runs, a variable-width view lacks its value offsets, or the fold refused a chain.
+     *  - @c capacity_exhausted_k A folded value outgrows its inline key slot or the 32-bit sizes.
+     *  - @c out_of_memory_heap_k A buffer could not grow.
      */
     template <typename key_slot_type_, utilities::fold_concept fold_type_, typename value_reader_type_,
               typename allocator_type_>
@@ -1592,8 +1628,14 @@ struct host_compactor_t {
         // tombstone stays with the new runs. Survival settles before any fold, so a fold sees every
         // version dropped behind its change.
         bool const tombstoned = carries_range_tombstones(upper, lower);
+        using stored_key_t = typename key_slot_type_::stored_key_t;
+        auto const tombstones_of = [&](std::uint32_t source) noexcept {
+            range_tombstones<stored_key_t> const* const tombstones = view_of(source).range_tombstones;
+            if (tombstones == nullptr) return range_tombstones_view<stored_key_t> {};
+            return range_tombstones_view<stored_key_t> {tombstones->ranges().data(), tombstones->stamps().data(),
+                                                        tombstones->size()};
+        };
         std::uint64_t survivors = 0;
-        std::uint64_t folded_begin = 0;
         // Folds the change at @p index onto the versions below it, when any composes with it.
         auto const fold_survivor = [&](record_t* versions, std::uint8_t const* kept, std::size_t count,
                                        std::size_t index, located_key_slot<key_slot_type_>& placed) noexcept {
@@ -1618,7 +1660,10 @@ struct host_compactor_t {
             std::uint8_t* const hidden = output.key_versions_hidden.data();
             for (std::size_t index = 0; index != count; ++index) {
                 located_key_slot<key_slot_type_>& version = located_of(versions[index]);
-                hidden[index] = tombstoned && hidden_by_range(upper, lower, version, stamps) ? 1 : 0;
+                hidden[index] = tombstoned &&
+                                hidden_by_range(tombstones_of, static_cast<std::uint32_t>(sorted_runs_count),
+                                                static_cast<std::uint32_t>(upper.size()), version.key_slot.stored_key,
+                                                version.sorted_run, version.stamp, stamps);
                 if (hidden[index]) version.kind = delta_kind_t::remove_k;
             }
             for (std::size_t index = 0; index != count; ++index)
@@ -1638,7 +1683,7 @@ struct host_compactor_t {
                                output.kinds[survivors]);
                 if constexpr (locates_k)
                     output.value_offsets[survivors + 1] = output.value_offsets[survivors] + placed.size;
-                if (status_t const appended = append_value_copy(placed, upper, lower, bounds.value_stride, folded_begin,
+                if (status_t const appended = append_value_copy(placed, upper, lower, bounds.value_stride,
                                                                 output.value_copy_ranges);
                     appended != status_t::success_k)
                     return appended;
@@ -1705,7 +1750,8 @@ struct host_compactor_t {
                 planned_first = end;
             }
         }
-        status = coalesce_value_copies(output.sorted_runs, output.value_copy_ranges);
+        status = coalesce_value_copies(output.sorted_runs, output.value_copy_ranges,
+                                       static_cast<std::uint32_t>(sorted_runs_count));
         if (status != status_t::success_k) return status;
 
         // The running sizes are the new runs' value offsets, which a variable width alone keeps
@@ -1718,9 +1764,77 @@ struct host_compactor_t {
 
 #pragma region Device
 
-/** The device fold of a collection no device composes the changes of, so a merge of runs holding a change runs on the
- *  host. */
+/** The device fold of a collection whose changes no device composes, so the host folds them. */
 struct no_device_fold_t {};
+
+/** A borrowed fold, called as @c host_compactor_t calls its own, so one device compaction compiled
+ *  per key slot folds on the host for a store of any fold. */
+class fold_ref_t {
+  public:
+
+    /** Borrows @p fold, which must outlive every call. */
+    template <utilities::fold_concept fold_type_>
+    explicit fold_ref_t(fold_type_ const& fold) noexcept
+        : fold_(&fold), apply_(&apply_through_<fold_type_>), compose_(&compose_through_<fold_type_>),
+          closes_(&closes_through_<fold_type_>) {}
+
+    /** The value @p base becomes once @p deltas apply, as the borrowed fold answers it. */
+    expected<std::span<byte_t const>> apply(std::span<byte_t const> base,
+                                            std::span<utilities::delta_view_t const> deltas,
+                                            utilities::arena_allocator<byte_t>& arena) const noexcept {
+        return apply_(fold_, base, deltas, arena);
+    }
+
+    /** One delta standing for @p deltas, as the borrowed fold answers it. */
+    expected<std::span<byte_t const>> compose(std::span<utilities::delta_view_t const> deltas,
+                                              utilities::arena_allocator<byte_t>& arena) const noexcept {
+        return compose_(fold_, deltas, arena);
+    }
+
+    /** Whether no delta older than @p delta matters, as the borrowed fold answers it. */
+    bool closes(utilities::delta_view_t const& delta) const noexcept { return closes_(fold_, delta); }
+
+  private:
+    using apply_t = expected<std::span<byte_t const>> (*)(void const*, std::span<byte_t const>,
+                                                          std::span<utilities::delta_view_t const>,
+                                                          utilities::arena_allocator<byte_t>&) noexcept;
+    using compose_t = expected<std::span<byte_t const>> (*)(void const*, std::span<utilities::delta_view_t const>,
+                                                            utilities::arena_allocator<byte_t>&) noexcept;
+    using closes_t = bool (*)(void const*, utilities::delta_view_t const&) noexcept;
+
+    template <typename fold_type_>
+    static expected<std::span<byte_t const>> apply_through_(void const* fold, std::span<byte_t const> base,
+                                                            std::span<utilities::delta_view_t const> deltas,
+                                                            utilities::arena_allocator<byte_t>& arena) noexcept {
+        return static_cast<fold_type_ const*>(fold)->apply(base, deltas, arena);
+    }
+
+    template <typename fold_type_>
+    static expected<std::span<byte_t const>> compose_through_(void const* fold,
+                                                              std::span<utilities::delta_view_t const> deltas,
+                                                              utilities::arena_allocator<byte_t>& arena) noexcept {
+        return static_cast<fold_type_ const*>(fold)->compose(deltas, arena);
+    }
+
+    template <typename fold_type_>
+    static bool closes_through_(void const* fold, utilities::delta_view_t const& delta) noexcept {
+        return static_cast<fold_type_ const*>(fold)->closes(delta);
+    }
+
+    /** The borrowed fold. */
+    void const* fold_ = nullptr;
+
+    /** Applies through the borrowed fold as its own type. */
+    apply_t apply_ = nullptr;
+
+    /** Composes through the borrowed fold as its own type. */
+    compose_t compose_ = nullptr;
+
+    /** Asks the borrowed fold as its own type. */
+    closes_t closes_ = nullptr;
+};
+
+static_assert(utilities::fold_concept<fold_ref_t>);
 
 /** A borrowed reader of the values a fold reads, called as @c host_compactor_t calls its own, so one device compaction
  *  compiled per key slot serves a reader of any type. */
@@ -2042,6 +2156,13 @@ struct merge_pack_regions {
     record_type_* survivors = nullptr;
     std::uint64_t* prefix = nullptr;
     std::uint8_t* shares = nullptr;
+};
+
+/** What the pack of one merge leaves on the device beside its regions. */
+struct packed_counts_t {
+
+    /** The device word the survivors' count lands in. */
+    std::uint64_t* counted = nullptr;
 };
 
 /** The device compactor of an NVIDIA device. */

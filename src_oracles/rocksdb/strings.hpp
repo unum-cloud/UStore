@@ -26,6 +26,7 @@
 #include "utilities/batches.hpp"  // `validate_choices`, `validate_direction`, `samples_of`, `sample_generator_t`
 #include "utilities/outputs.hpp"  // `strings_read_outputs_t`, `strings_scan_outputs_t`, `measure_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
+#include "utilities/slices.hpp"   // `for_task_slices`
 
 namespace unum::ustore::oracles::rocksdb {
 
@@ -90,7 +91,7 @@ status_t strings_write(ustore_strings_write_t const& arguments, strings_arg_t co
     for (std::size_t index = 0; index != arguments.count; ++index) {
         ustore_collection_id_t const collection = collections[index];
         column_t* const column = column_of(database, collection);
-        ::rocksdb::Slice const key {string_of(texts[index])};
+        ::rocksdb::Slice const key {chars_of(texts[index])};
         ::rocksdb::Slice const value = to_slice(values[index]);
         native_status_t const status = transaction ? buffer_write(*transaction, column, collection, key, value)
                                                    : batch.Put(column, key, value);
@@ -115,20 +116,20 @@ status_t remove_string_ranges(database_t& database, transaction_t* transaction,
     for (std::size_t index = 0; index != count; ++index) {
         ustore_collection_id_t const collection = collections[index];
         column_t* const column = column_of(database, collection);
-        std::string_view const end = string_of(ends[index]);
+        std::string_view const end = chars_of(ends[index]);
         std::unique_ptr<::rocksdb::Iterator> iterator {new_iterator(database, transaction, read_options, column)};
         if (!iterator) return {status_code_t::out_of_memory_k, "Failed to create a RocksDB iterator"};
 
         // Changing a transaction's batch under its iterator breaks it, so the range is listed first
         std::size_t const first = listed.size();
-        for (iterator->Seek(string_of(texts[index]));
+        for (iterator->Seek(chars_of(texts[index]));
              iterator->Valid() && string_before_end(iterator->key().ToStringView(), end, ustore_scan_ascending_k);
              iterator->Next())
             if (status_t const status = listed.push_back(bytes_of(iterator->key().ToStringView())); status.failed())
                 return status;
         if (!iterator->status().ok()) return status_of(iterator->status());
         for (std::size_t listed_index = first; listed_index != listed.size(); ++listed_index) {
-            ::rocksdb::Slice const key {string_of(listed[listed_index])};
+            ::rocksdb::Slice const key {chars_of(listed[listed_index])};
             native_status_t const status = transaction ? buffer_remove(*transaction, column, collection, key)
                                                        : batch.Delete(column, key);
             if (!status.ok()) return status_of(status);
@@ -170,7 +171,7 @@ status_t strings_remove(ustore_strings_remove_t const& arguments, strings_arg_t 
     for (std::size_t index = 0; index != arguments.count; ++index) {
         ustore_collection_id_t const collection = collections[index];
         column_t* const column = column_of(database, collection);
-        ::rocksdb::Slice const key {string_of(texts[index])};
+        ::rocksdb::Slice const key {chars_of(texts[index])};
         native_status_t const status = transaction ? buffer_remove(*transaction, column, collection, key)
                                                    : batch.Delete(column, key);
         if (!status.ok()) return status_of(status);
@@ -196,30 +197,41 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
 
     auto [outputs, outputs_status] = strings_read_outputs_t::make(arguments);
     if (outputs_status.failed()) return outputs_status;
-    ::rocksdb::PinnableSlice value;
-    for (std::size_t index = 0; index != arguments.count; ++index) {
-        ustore_collection_id_t const collection = collections[index];
-        column_t* const column = column_of(database, collection);
-        std::string_view const text = string_of(texts[index]);
-        ::rocksdb::Slice const key {text};
-        if (transaction && view.watch == ustore_watch_keys_k &&
-            st::failed(transaction->watched_strings.push_back(std::pair {collection, std::string(text)})))
-            return {status_code_t::out_of_memory_k, "Failed to watch a string"};
-        value.Reset();
-        native_status_t const status = transaction ? transaction->batch.GetFromBatchAndDB(
-                                                         database.native.get(), read_options, column, key, &value)
-                                                   : database.native->Get(read_options, column, key, &value);
-        if (status.IsNotFound()) {
-            outputs.assign_missing(index);
-            continue;
+    auto read_slice = [&](std::size_t first, std::size_t length, view_t const&) noexcept -> status_t {
+        ::rocksdb::PinnableSlice value;
+        for (std::size_t index = first; index != first + length; ++index) {
+            ustore_collection_id_t const collection = collections[index];
+            column_t* const column = column_of(database, collection);
+            std::string_view const text = chars_of(texts[index]);
+            ::rocksdb::Slice const key {text};
+            if (transaction && view.watch == ustore_watch_keys_k &&
+                st::failed(transaction->watched_strings.push_back(std::pair {collection, std::string(text)})))
+                return {status_code_t::out_of_memory_k, "Failed to watch a string"};
+            value.Reset();
+            native_status_t const status = transaction ? transaction->batch.GetFromBatchAndDB(
+                                                             database.native.get(), read_options, column, key, &value)
+                                                       : database.native->Get(read_options, column, key, &value);
+            if (status.IsNotFound()) {
+                outputs.assign_missing(index);
+                continue;
+            }
+            if (!status.ok()) return status_of(status);
+            if (value.size() != sizeof(ustore_key_t))
+                return {status_code_t::malformed_k, "The database holds a malformed strings entry"};
+            ustore_key_t found;
+            std::memcpy(&found, value.data(), sizeof(ustore_key_t));
+            outputs.assign_present(index, found);
         }
-        if (!status.ok()) return status_of(status);
-        if (value.size() != sizeof(ustore_key_t))
-            return {status_code_t::malformed_k, "The database holds a malformed strings entry"};
-        ustore_key_t found;
-        std::memcpy(&found, value.data(), sizeof(ustore_key_t));
-        outputs.assign_present(index, found);
-    }
+        return {};
+    };
+
+    // A transaction's reads join its watch set, so only a read outside one splits, at one snapshot
+    ::rocksdb::ManagedSnapshot pinned {database.native.get(),
+                                       read_options.snapshot ? nullptr : database.native->GetSnapshot()};
+    if (pinned.snapshot()) read_options.snapshot = pinned.snapshot();
+    status_t const read = transaction ? read_slice(0, arguments.count, view)
+                                      : for_task_slices(view, arguments.count, read_slice);
+    if (read.failed()) return read;
     outputs.finish(arguments);
     return {};
 }
@@ -247,9 +259,9 @@ status_t strings_scan(ustore_strings_scan_t const& arguments, strings_arg_t cons
     if (outputs_status.failed()) return outputs_status;
     progress_t progress {arguments.progress, arguments.progress_state, count};
     for (std::size_t task = 0; task != count; ++task) {
-        std::string_view const prefix = prefixes ? string_of(prefixes[task]) : std::string_view {};
-        std::string_view const start = starts ? string_of(starts[task]) : std::string_view {};
-        std::string_view const end = ends ? string_of(ends[task]) : std::string_view {};
+        std::string_view const prefix = prefixes ? chars_of(prefixes[task]) : std::string_view {};
+        std::string_view const start = starts ? chars_of(starts[task]) : std::string_view {};
+        std::string_view const end = ends ? chars_of(ends[task]) : std::string_view {};
         std::size_t const scan_end = outputs.size() + arguments.wanted;
         outputs.open_task(task);
 
@@ -346,8 +358,8 @@ status_t strings_measure(ustore_strings_measure_t const& arguments, strings_arg_
     auto [outputs, outputs_status] = measure_outputs_t::make(arguments);
     if (outputs_status.failed()) return outputs_status;
     for (std::size_t task = 0; task != arguments.count; ++task) {
-        std::string_view const start = starts ? string_of(starts[task]) : std::string_view {};
-        std::string_view const end = ends ? string_of(ends[task]) : std::string_view {};
+        std::string_view const start = starts ? chars_of(starts[task]) : std::string_view {};
+        std::string_view const end = ends ? chars_of(ends[task]) : std::string_view {};
         std::unique_ptr<::rocksdb::Iterator> iterator {
             new_iterator(database, transaction, read_options, column_of(database, collections[task]))};
         if (!iterator) return {status_code_t::out_of_memory_k, "Failed to create a RocksDB iterator"};

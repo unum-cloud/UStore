@@ -85,7 +85,7 @@ status_t gather_rows(keyed_rows_t const& rows, ustore_ingest_order_t order,
     for (std::size_t row = 0; row != rows.size(); ++row) {
         entry_t entry;
         if constexpr (std::is_same_v<entry_t, string_pair_t>) {
-            auto [key, key_status] = string_key_from(string_of(rows.values[row]));
+            auto [key, key_status] = string_key_from(chars_of(rows.values[row]));
             if (st::failed(key_status)) return translate(key_status);
             entry = entry_t {std::move(key), rows.keys[row]};
         }

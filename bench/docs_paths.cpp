@@ -350,7 +350,7 @@ int main(int argc, char** argv) {
         {"docs_read_text_subdocuments", read, resolver_t::subdocuments_k},
     };
     for (row_spec_t const& row : rows)
-        if (settings.filter.selects(row.name))
+        if (settings.regex_filter.selects(row.name))
             print(run_row(executor, settings, corpus, row.name, row.columns, row.resolver));
     return 0;
 }

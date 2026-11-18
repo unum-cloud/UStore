@@ -27,6 +27,7 @@
 #include <cstring> // `std::memcpy`
 
 #include <compare>     // `std::strong_ordering`
+#include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::unique_ptr`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`, `std::as_bytes`
@@ -850,8 +851,8 @@ class nvme_store {
      *  @brief Merges the shallowest level that is over its bounds into the level below it.
      *  @param[in,out] reading_channel The channel the merge gathers source values on, held by the calling thread.
      *  @param[in,out] writing_channel The channel the merge writes its new runs on, which is not @p reading_channel.
-     *  @param[in] compactor The compactor the database picked at open, which the tree passes over for runs carrying
-     *      tails, as no device compaction is compiled for them.
+     *  @param[in] compactor The compactor the database picked at open, whose device ranks the
+     *      versions of a merge and packs the ones that survive.
      *  @param[in] published What to call once the merged set is live and before a consumed run is dropped.
      *  @param[in] fan_out The threads a merge fans its slices out over, which a merge of strings
      *      runs as one.
@@ -1232,6 +1233,8 @@ class nvme_store {
     status_t drain_(std::span<stamped_delta_t const> versions, drained_t& drained) const noexcept {
         std::uint64_t tails_bytes = 0;
         for (stamped_delta_t const& version : versions) tails_bytes += tail_of(version.stored_key).size();
+        if (tails_bytes > (std::numeric_limits<std::uint32_t>::max)())
+            return {status_code_t::capacity_exhausted_k, "A flush's key tails outgrow what their offsets reach"};
         if (drained.key_slots.resize(versions.size()) != st::status_t::success_k ||
             drained.stamps.resize(versions.size()) != st::status_t::success_k ||
             drained.kinds.resize(versions.size()) != st::status_t::success_k ||

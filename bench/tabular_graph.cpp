@@ -373,7 +373,7 @@ int main(int argc, char** argv) {
     if (!list_files(settings, tabular)) return 1;
 
     ustore_outcome_t outcome {};
-    settings.engine.directory = settings.directory.data();
+    settings.engine.locate(settings.directory.data());
     open_engine(settings.engine, &tabular.database, &outcome);
     if (outcome.status != ustore_status_success_k) {
         fmt::println(stderr, "Failed to open the database: {}", outcome.message);
@@ -408,11 +408,15 @@ int main(int argc, char** argv) {
     std::string const docs_export_name = fmt::format("docs_export_{}", format);
     std::string const graph_import_name = fmt::format("graph_import_{}", format);
     std::string const graph_export_name = fmt::format("graph_export_{}", format);
-    if (settings.filter.selects(docs_import_name)) bench_docs_import(executor, tabular, settings, docs_import_name);
-    if (settings.filter.selects(docs_export_name)) bench_docs_export(executor, tabular, settings, docs_export_name);
+    if (settings.regex_filter.selects(docs_import_name))
+        bench_docs_import(executor, tabular, settings, docs_import_name);
+    if (settings.regex_filter.selects(docs_export_name))
+        bench_docs_export(executor, tabular, settings, docs_export_name);
     clear_collection(tabular.database, tabular.docs);
-    if (settings.filter.selects(graph_import_name)) bench_graph_import(executor, tabular, settings, graph_import_name);
-    if (settings.filter.selects(graph_export_name)) bench_graph_export(executor, tabular, settings, graph_export_name);
+    if (settings.regex_filter.selects(graph_import_name))
+        bench_graph_import(executor, tabular, settings, graph_import_name);
+    if (settings.regex_filter.selects(graph_export_name))
+        bench_graph_export(executor, tabular, settings, graph_export_name);
     clear_collection(tabular.database, tabular.graph);
 
     ustore_database_free(tabular.database);

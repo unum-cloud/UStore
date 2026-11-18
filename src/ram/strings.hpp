@@ -157,9 +157,9 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_strings_sca
                         if (!store) return store.status();
                         for (std::size_t task = first_task + first; task != first_task + end; ++task) {
                             strings_window_t const window {
-                                .prefix = prefixes ? string_of(prefixes[task]) : std::string_view {},
-                                .start = starts ? string_of(starts[task]) : std::string_view {},
-                                .end = ends ? string_of(ends[task]) : std::string_view {},
+                                .prefix = prefixes ? chars_of(prefixes[task]) : std::string_view {},
+                                .start = starts ? chars_of(starts[task]) : std::string_view {},
+                                .end = ends ? chars_of(ends[task]) : std::string_view {},
                                 .direction = arguments.direction,
                             };
                             sliced.outputs.open_task(task);
@@ -246,8 +246,8 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_strings_mea
                                     if (!store) return store.status();
                                     for (std::size_t task = first; task != end; ++task) {
                                         strings_window_t const window {
-                                            .start = starts ? string_of(starts[task]) : std::string_view {},
-                                            .end = ends ? string_of(ends[task]) : std::string_view {},
+                                            .start = starts ? chars_of(starts[task]) : std::string_view {},
+                                            .end = ends ? chars_of(ends[task]) : std::string_view {},
                                             .direction = arguments.direction,
                                         };
                                         window_measure_t measured;

@@ -437,7 +437,7 @@ class element_tree {
 
     status_t store(std::string_view bytes, string_span_t& span) noexcept {
         if (bytes.size() > ~std::uint32_t(0) - strings_.size())
-            return {status_code_t::invalid_argument_k, "A page outgrew 4 GiB of strings"};
+            return {status_code_t::capacity_exhausted_k, "A page outgrew 4 GiB of strings"};
         span.offset = std::uint32_t(strings_.size());
         span.length = std::uint32_t(bytes.size());
         if (status_t status = growth_status(strings_.resize(strings_.size() + bytes.size())); status.failed())
@@ -564,6 +564,8 @@ class element_tree {
                                    placement_t placement) noexcept {
         if (key.is_nil()) return status_t {status_code_t::invalid_argument_k, "An element key is Nil"};
         if (find(key) != no_element_k) return status_t {status_code_t::already_exists_k, "An element key is taken"};
+        if (elements_.size() >= no_element_k)
+            return status_t {status_code_t::capacity_exhausted_k, "A page outgrew 4 Gi elements"};
         element_t element;
         element.key = key;
         element.kind = kind;
@@ -591,6 +593,8 @@ class element_tree {
     status_t set_attribute(element_index_t index, std::string_view name, std::string_view value) noexcept {
         element_index_t const found = find_attribute(index, name);
         if (found != no_element_k) return store(value, attributes_[found].value);
+        if (attributes_.size() >= no_element_k)
+            return {status_code_t::capacity_exhausted_k, "A page outgrew 4 Gi attributes"};
         attribute_t attribute;
         if (status_t status = store(name, attribute.name); status.failed()) return status;
         if (status_t status = store(value, attribute.value); status.failed()) return status;
@@ -621,7 +625,7 @@ class element_tree {
             fu::min_of<std::uint64_t>(length, old.length - clamped_start));
         std::uint64_t const new_length = std::uint64_t(old.length) - clamped_length + bytes.size();
         if (new_length > ~std::uint32_t(0) - strings_.size())
-            return {status_code_t::invalid_argument_k, "A page outgrew 4 GiB of strings"};
+            return {status_code_t::capacity_exhausted_k, "A page outgrew 4 GiB of strings"};
         std::size_t const offset = strings_.size();
         if (status_t status = growth_status(strings_.resize(offset + new_length)); status.failed()) return status;
         char* target = strings_.data() + offset;
@@ -736,7 +740,7 @@ class element_tree {
         std::uint32_t count, attributes_count;
         std::uint64_t strings_length;
         measure(count, attributes_count, strings_length);
-        if (strings_length > ~std::uint32_t(0)) return {status_code_t::invalid_argument_k, "A page outgrew 4 GiB"};
+        if (strings_length > ~std::uint32_t(0)) return {status_code_t::capacity_exhausted_k, "A page outgrew 4 GiB"};
         if (target.size() != encoded_size()) return {status_code_t::invalid_argument_k, "A target of a wrong size"};
         byte_t* const records = target.data() + page_header_bytes_k;
         byte_t* const attributes = records + std::size_t(count) * page_record_bytes_k;

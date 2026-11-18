@@ -449,7 +449,7 @@ class xml_tokenizer {
      *  refusing past 4 GiB. */
     template <strings_kit_concept strings_kit_type_>
     status_t tokenize(std::string_view document) noexcept {
-        if (document.size() > ~std::uint32_t(0)) return {status_code_t::invalid_argument_k, "XML past 4 GiB"};
+        if (document.size() > ~std::uint32_t(0)) return {status_code_t::capacity_exhausted_k, "XML past 4 GiB"};
         document_ = document;
         tokens_.clear(), attributes_.clear();
         if (status_t status = split(); status.failed()) return status;

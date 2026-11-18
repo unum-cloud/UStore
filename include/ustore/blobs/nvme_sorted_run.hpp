@@ -1185,7 +1185,7 @@ class lsm_sorted_run {
     {
         std::size_t const begin = key_offsets_[static_cast<std::size_t>(position)];
         std::size_t const end = key_offsets_[static_cast<std::size_t>(position) + 1];
-        return utilities::string_of(std::span<byte_t const> {keys_}.subspan(begin, end - begin));
+        return utilities::chars_of(std::span<byte_t const> {keys_}.subspan(begin, end - begin));
     }
 
     /** One offset per string of a run of strings into @c key_tape and one past the last: an
@@ -1836,7 +1836,7 @@ class lsm_sorted_run {
     [[nodiscard]] static std::string_view key_of_(strings_sections_t const& sections, std::uint64_t position) noexcept {
         std::size_t const begin = sections.key_offsets[static_cast<std::size_t>(position)];
         std::size_t const end = sections.key_offsets[static_cast<std::size_t>(position) + 1];
-        return utilities::string_of(std::span<byte_t const> {sections.keys}.subspan(begin, end - begin));
+        return utilities::chars_of(std::span<byte_t const> {sections.keys}.subspan(begin, end - begin));
     }
 
     /** Stages the heads, the values, the key offsets, the key tape and the layers of a
@@ -1919,9 +1919,7 @@ class lsm_sorted_run {
         if (value_offsets.size_bytes() != offsets_bytes)
             return {status_code_t::internal_k, "A run's value offsets disagree with the key slots its header names"};
         return write_bytes_(writer, extent, sorted_run_layout_t::value_offsets_offset(header.key_slots_count),
-                            round_up_to_multiple(offsets_bytes, portable_alignment_k),
-                            std::span<byte_t const> {reinterpret_cast<byte_t const*>(value_offsets.data()),
-                                                     static_cast<std::size_t>(offsets_bytes)});
+                            round_up_to_multiple(offsets_bytes, portable_alignment_k), std::as_bytes(value_offsets));
     }
 
     /** Stages @p stamps, then @p kinds, as the trailer of the run @p header describes, which a flush and a merge both
@@ -2091,7 +2089,7 @@ class lsm_sorted_run {
         if (room == 0) return {status_code_t::capacity_exhausted_k, "A channel's streaming block holds no index page"};
 
         std::uint64_t const wanted = sorted_run_layout_t::index_bytes(header_.key_slots_count);
-        byte_t* const into = reinterpret_cast<byte_t*>(cells_.data());
+        byte_t* const into = bytes_of(cells_.data(), cells_.size()).data();
         for (std::uint64_t read = 0; read != section;) {
             std::uint64_t const chunk = room < section - read ? room : section - read;
             extent_t const piece = extent_.slice(sorted_run_layout_t::index_offset() + read, chunk);
@@ -2168,8 +2166,7 @@ class lsm_sorted_run {
                 st::status_t::success_k)
                 return {status_code_t::out_of_memory_k, "A run could not hold its value offsets"};
             if (status_t const read = read_bytes_(channel, sorted_run_layout_t::value_offsets_offset(count),
-                                                  std::span<byte_t> {reinterpret_cast<byte_t*>(value_offsets_.data()),
-                                                                     static_cast<std::size_t>(section)});
+                                                  bytes_of(value_offsets_.data(), value_offsets_.size()));
                 read.failed())
                 return read;
             // The section's last page is padded past the offsets, which the run keeps no copy of.
@@ -2261,7 +2258,7 @@ class lsm_sorted_run {
             sizeof(layers_header) + list_bytes + layers_header.trees_bytes != header_.layers_bytes ||
             layers_header.trees_bytes % sizeof(std::uint64_t) != 0)
             return {status_code_t::malformed_k, "A run's layers claim more bytes than they hold"};
-        byte_t const* const bytes = reinterpret_cast<byte_t const*>(words.data());
+        byte_t const* const bytes = bytes_of(words.data(), words.size()).data();
         if (layers_.resize(static_cast<std::size_t>(layers_header.layers_count)) != st::status_t::success_k ||
             layer_words_.resize(static_cast<std::size_t>(layers_header.trees_bytes / sizeof(std::uint64_t))) !=
                 st::status_t::success_k)
@@ -2367,7 +2364,8 @@ class lsm_sorted_run {
                 return {status_code_t::malformed_k, "A run's range tombstones outgrow their section"};
             std::memcpy(stamps.data(), saved.data(), stamps_bytes);
             std::size_t const tape_bytes = header_.range_tombstones_bytes - stamps_bytes - offsets_bytes;
-            char const* const tape = reinterpret_cast<char const*>(saved.data() + stamps_bytes + offsets_bytes);
+            std::string_view const tape = chars_of(
+                std::span<byte_t const> {saved.data() + stamps_bytes + offsets_bytes, tape_bytes});
             auto const offset_of = [&](std::size_t slot) noexcept {
                 std::uint32_t offset = 0;
                 std::memcpy(&offset, saved.data() + stamps_bytes + slot * sizeof(std::uint32_t), sizeof(offset));
@@ -2378,9 +2376,8 @@ class lsm_sorted_run {
                     return {status_code_t::malformed_k, "A run's range tombstones disagree with their tape"};
             for (std::size_t index = 0; index != count; ++index)
                 ranges[index] = range_t {
-                    std::string_view {tape + offset_of(2 * index), offset_of(2 * index + 1) - offset_of(2 * index)},
-                    std::string_view {tape + offset_of(2 * index + 1),
-                                      offset_of(2 * index + 2) - offset_of(2 * index + 1)}};
+                    tape.substr(offset_of(2 * index), offset_of(2 * index + 1) - offset_of(2 * index)),
+                    tape.substr(offset_of(2 * index + 1), offset_of(2 * index + 2) - offset_of(2 * index + 1))};
         }
         else {
             std::size_t const bounds_bytes = count * sizeof(range_t);

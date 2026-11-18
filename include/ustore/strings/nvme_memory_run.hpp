@@ -299,7 +299,7 @@ class sealed_deltas {
             st::key128_t const& head = heads_[middle];
             byte_t head_bytes[sizeof(st::key128_t)];
             head.to_bytes(head_bytes);
-            std::string_view const head_leading(reinterpret_cast<char const*>(head_bytes), leading.size());
+            std::string_view const head_leading = chars_of(bytes_of(head_bytes, leading.size()));
             std::strong_ordering const order = leading.empty()
                                                    ? std::strong_ordering::equal
                                                    : sz::string_view_t {head_leading} <=> sz::string_view_t {leading};

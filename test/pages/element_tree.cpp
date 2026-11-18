@@ -14,7 +14,7 @@
 #include <cstdint> // `std::uint32_t`
 #include <cstring> // `std::memcmp`, `std::memcpy`
 
-#include <iterator>    // `std::size`
+#include <iterator>    // `std::size`, `std::back_inserter`
 #include <memory>      // `std::unique_ptr`, `std::align`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
@@ -29,10 +29,12 @@
 #include "ustore/pages/markup.hpp"       // `import_xml`, `render_xml`, `find_xpath`
 
 #include "harness.hpp" // `expect_true`, `expect_equal`, `expect_status`, `run_test_case`
+#include "model.hpp"   // `hex`
 
 namespace unum::ustore::test {
 
 using namespace unum::ustore::pages;
+using namespace unum::ustore::test::pages;
 
 /** The widest StringZilla kernels this build compiled. */
 using strings_kit_t = utilities::strings_ladder<sz_capabilities_compiled_cpu_mask()>::strings_kit_t;
@@ -93,14 +95,6 @@ static std::string_view view_of(chars_t const& chars) noexcept { return {chars.b
 
 #pragma region Random Trees
 
-/** Hex of a key, for dumps. */
-std::string hex(element_key_t const& key) {
-    static char const digits[] = "0123456789abcdef";
-    std::string result;
-    for (std::uint8_t byte : key.bytes) result += digits[byte >> 4], result += digits[byte & 15];
-    return result;
-}
-
 /** Every element of @p tree in preorder: depth, key, placement, kind, name, text and attributes, one line each. */
 std::string dump(tree_t const& tree) {
     std::string result;
@@ -108,15 +102,13 @@ std::string dump(tree_t const& tree) {
     for (element_index_t at = root; at != no_element_k; at = tree.next_in_preorder(at, root)) {
         std::size_t depth = 0;
         for (element_index_t up = at; up != root; up = tree[up].parent) ++depth;
-        result += std::string(depth * 2, ' ');
-        result += hex(tree[at].key) + "@" + std::to_string(tree[at].placement.stamp) + "." +
-                  std::to_string(tree[at].placement.sequence) + " ";
-        result += std::to_string(int(tree[at].kind)) + " <" + std::string(tree.name(at)) + "> [" +
-                  std::string(tree.text(at)) + "]";
+        fmt::format_to(std::back_inserter(result), "{:{}}{}@{}.{} {} <{}> [{}]", "", depth * 2, hex(tree[at].key),
+                       tree[at].placement.stamp, tree[at].placement.sequence, int(tree[at].kind), tree.name(at),
+                       tree.text(at));
         for (element_index_t attribute = tree[at].first_attribute; attribute != no_element_k;
              attribute = tree.attribute(attribute).next)
-            result += " " + std::string(tree.string(tree.attribute(attribute).name)) + "=" +
-                      std::string(tree.string(tree.attribute(attribute).value));
+            fmt::format_to(std::back_inserter(result), " {}={}", tree.string(tree.attribute(attribute).name),
+                           tree.string(tree.attribute(attribute).value));
         result += "\n";
     }
     return result;
@@ -507,8 +499,9 @@ void test_xpath_spans() {
         expect_true(element != no_element_k);
         if (element == no_element_k) continue;
         element_index_t const identifier = tree.find_attribute(element, "id");
-        found.push_back(std::to_string(match.needle_index) + ":" + std::string(tree.name(element)) + ":" +
-                        (identifier == no_element_k ? "" : std::string(tree.string(tree.attribute(identifier).value))));
+        found.push_back(fmt::format(
+            "{}:{}:{}", match.needle_index, tree.name(element),
+            identifier == no_element_k ? std::string_view {} : tree.string(tree.attribute(identifier).value)));
     }
     std::vector<std::string> const wanted {"0:b:1", "0:b:2", "0:b:3", "1:i:"};
     expect_true(found == wanted);

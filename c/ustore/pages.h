@@ -129,7 +129,7 @@ typedef struct ustore_pages_import_t {
  *  missing, the values come in an unknown layout, the @c encoding is unknown, the @c transaction
  *  belongs to another engine or is staged, the @c durability or @c watch is unknown, a flushed
  *  import names a @c transaction, @c ustore_watch_none_k comes without one, one call imports past
- *  4 Gi tasks, a markup or a page is past 4 GiB, or a collection holds another modality.
+ *  4 Gi tasks, or a collection holds another modality.
  *
  *  - @c ustore_status_unsupported_k The executor computes on a device, the @c encoding is HTML,
  *    Markdown or JSON, or a DOCTYPE carries an internal subset.
@@ -138,8 +138,8 @@ typedef struct ustore_pages_import_t {
  *    collection admits.
  *  - @c ustore_status_write_conflict_k Concurrent commits kept conflicting, or a staged RocksDB
  *    transaction holds a page.
- *  - @c ustore_status_capacity_exhausted_k The pages outgrow the NVMe transaction's buffer, or every
- *    shared NVMe channel is taken.
+ *  - @c ustore_status_capacity_exhausted_k A markup or a page is past 4 GiB, the pages outgrow the
+ *    NVMe transaction's buffer, or every shared NVMe channel is taken.
  */
 USTORE_EXPORT void ustore_pages_import(ustore_pages_import_t* arguments);
 
@@ -204,11 +204,12 @@ typedef struct ustore_pages_insert_t {
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c arena, @c collections, @c keys or @c values are
- *    missing, the values come in an unknown layout, the @c encoding is unknown, the @c transaction
- *    belongs to another engine or is staged, the @c durability or @c watch is unknown, a flushed
- *    insert names a @c transaction, @c ustore_watch_none_k comes without one, one call edits past
- *    4 Gi tasks, a fragment or a page is past 4 GiB, or a collection holds another modality.
+ *  @c ustore_status_invalid_argument_k means the @c arena, @c collections, @c keys or @c values
+ *  are missing, the values come in an unknown layout, the @c encoding is unknown, the
+ *  @c transaction belongs to another engine or is staged, the @c durability or @c watch is
+ *  unknown, a flushed insert names a @c transaction, @c ustore_watch_none_k comes without one, one
+ *  call edits past 4 Gi tasks, or a collection holds another modality.
+ *
  *  - @c ustore_status_device_k The arena lives where another executor computes.
  *  - @c ustore_status_contended_k The arena or the @c transaction serves another call, the executor
  *    serves another call, or an NVMe value keeps changing size across reads.
@@ -222,8 +223,8 @@ typedef struct ustore_pages_insert_t {
  *    outgrows what its NVMe collection admits.
  *  - @c ustore_status_write_conflict_k Concurrent commits kept conflicting, or a staged RocksDB
  *    transaction holds a page.
- *  - @c ustore_status_capacity_exhausted_k The pages outgrow the NVMe transaction's buffer, or every
- *    shared NVMe channel is taken.
+ *  - @c ustore_status_capacity_exhausted_k A fragment or a page is past 4 GiB, the pages outgrow
+ *    the NVMe transaction's buffer, or every shared NVMe channel is taken.
  */
 USTORE_EXPORT void ustore_pages_insert(ustore_pages_insert_t* arguments);
 
@@ -284,8 +285,8 @@ typedef struct ustore_pages_remove_t {
  *  or @c elements are missing, the @c transaction belongs to another
  *  engine or is staged, the @c durability or @c watch is unknown, a
  *  flushed edit names a @c transaction, @c ustore_watch_none_k comes
- *  without one, one call edits past 4 Gi tasks, a page is past 4 GiB, or a
- *  collection holds a modality other than pages.
+ *  without one, one call edits past 4 Gi tasks, or a collection holds a
+ *  modality other than pages.
  *
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_not_found_k A collection or an edited page does not exist, or a collection
@@ -294,8 +295,8 @@ typedef struct ustore_pages_remove_t {
  *    collection admits.
  *  - @c ustore_status_write_conflict_k Concurrent commits kept conflicting, or a staged RocksDB
  *    transaction holds a page.
- *  - @c ustore_status_capacity_exhausted_k The pages outgrow the NVMe transaction's buffer, or every
- *    shared NVMe channel is taken.
+ *  - @c ustore_status_capacity_exhausted_k A page is past 4 GiB, the pages outgrow the NVMe
+ *    transaction's buffer, or every shared NVMe channel is taken.
  */
 USTORE_EXPORT void ustore_pages_remove(ustore_pages_remove_t* arguments);
 
@@ -357,8 +358,8 @@ typedef struct ustore_pages_move_t {
  *  or @c elements are missing, the @c transaction belongs to another
  *  engine or is staged, the @c durability or @c watch is unknown, a
  *  flushed edit names a @c transaction, @c ustore_watch_none_k comes
- *  without one, one call edits past 4 Gi tasks, a page is past 4 GiB, or a
- *  collection holds a modality other than pages.
+ *  without one, one call edits past 4 Gi tasks, or a collection holds a
+ *  modality other than pages.
  *
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_not_found_k A collection or an edited page does not exist, or a collection
@@ -367,8 +368,8 @@ typedef struct ustore_pages_move_t {
  *    collection admits.
  *  - @c ustore_status_write_conflict_k Concurrent commits kept conflicting, or a staged RocksDB
  *    transaction holds a page.
- *  - @c ustore_status_capacity_exhausted_k The pages outgrow the NVMe transaction's buffer, or every
- *    shared NVMe channel is taken.
+ *  - @c ustore_status_capacity_exhausted_k A page is past 4 GiB, the pages outgrow the NVMe
+ *    transaction's buffer, or every shared NVMe channel is taken.
  */
 USTORE_EXPORT void ustore_pages_move(ustore_pages_move_t* arguments);
 
@@ -433,7 +434,7 @@ typedef struct ustore_pages_splice_t {
  *  are missing, the values come in an unknown layout, the @c transaction belongs to
  *  another engine or is staged, the @c durability or @c watch is unknown, a flushed edit
  *  names a @c transaction, @c ustore_watch_none_k comes without one, one call edits past 4
- *  Gi tasks, a page is past 4 GiB, or a collection holds another modality.
+ *  Gi tasks, or a collection holds another modality.
  *
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_not_found_k A collection or an edited page does not exist, or a collection
@@ -442,8 +443,8 @@ typedef struct ustore_pages_splice_t {
  *    collection admits.
  *  - @c ustore_status_write_conflict_k Concurrent commits kept conflicting, or a staged RocksDB
  *    transaction holds a page.
- *  - @c ustore_status_capacity_exhausted_k The pages outgrow the NVMe transaction's buffer, or every
- *    shared NVMe channel is taken.
+ *  - @c ustore_status_capacity_exhausted_k A page is past 4 GiB, the pages outgrow the NVMe
+ *    transaction's buffer, or every shared NVMe channel is taken.
  */
 USTORE_EXPORT void ustore_pages_splice(ustore_pages_splice_t* arguments);
 
@@ -504,7 +505,7 @@ typedef struct ustore_pages_set_attributes_t {
  *    @c values are missing, the fields or values come in an unknown layout, the @c transaction
  *    belongs to another engine or is staged, the @c durability or @c watch is unknown, a flushed
  *    edit names a @c transaction, @c ustore_watch_none_k comes without one, one call edits past 4
- *    Gi tasks, a page is past 4 GiB, or a collection holds another modality.
+ *    Gi tasks, or a collection holds another modality.
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_not_found_k A collection or an edited page does not exist, or a collection
  *    was dropped meanwhile.
@@ -512,8 +513,8 @@ typedef struct ustore_pages_set_attributes_t {
  *    collection admits.
  *  - @c ustore_status_write_conflict_k Concurrent commits kept conflicting, or a staged RocksDB
  *    transaction holds a page.
- *  - @c ustore_status_capacity_exhausted_k The pages outgrow the NVMe transaction's buffer, or every
- *    shared NVMe channel is taken.
+ *  - @c ustore_status_capacity_exhausted_k A page is past 4 GiB, the pages outgrow the NVMe
+ *    transaction's buffer, or every shared NVMe channel is taken.
  */
 USTORE_EXPORT void ustore_pages_set_attributes(ustore_pages_set_attributes_t* arguments);
 
@@ -570,8 +571,8 @@ typedef struct ustore_pages_remove_attributes_t {
  *  - @c ustore_status_invalid_argument_k The @c collections, @c keys, @c elements or @c fields are
  *    missing, the fields come in an unknown layout, the @c transaction belongs to another engine or
  *    is staged, the @c durability or @c watch is unknown, a flushed edit names a @c transaction,
- *    @c ustore_watch_none_k comes without one, one call edits past 4 Gi tasks, a page is past 4
- *    GiB, or a collection holds another modality.
+ *    @c ustore_watch_none_k comes without one, one call edits past 4 Gi tasks, or a collection
+ *    holds another modality.
  *  - @c ustore_status_unsupported_k The executor computes on a device.
  *  - @c ustore_status_not_found_k A collection or an edited page does not exist, or a collection
  *    was dropped meanwhile.
@@ -579,8 +580,8 @@ typedef struct ustore_pages_remove_attributes_t {
  *    collection admits.
  *  - @c ustore_status_write_conflict_k Concurrent commits kept conflicting, or a staged RocksDB
  *    transaction holds a page.
- *  - @c ustore_status_capacity_exhausted_k The pages outgrow the NVMe transaction's buffer, or every
- *    shared NVMe channel is taken.
+ *  - @c ustore_status_capacity_exhausted_k A page is past 4 GiB, the pages outgrow the NVMe
+ *    transaction's buffer, or every shared NVMe channel is taken.
  */
 USTORE_EXPORT void ustore_pages_remove_attributes(ustore_pages_remove_attributes_t* arguments);
 

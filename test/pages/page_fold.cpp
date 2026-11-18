@@ -17,6 +17,7 @@
 #include <cstring> // `std::memcmp`
 
 #include <algorithm>   // `std::find`, `std::next_permutation`
+#include <iterator>    // `std::back_inserter`
 #include <memory>      // `std::unique_ptr`, `std::align`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
@@ -31,6 +32,13 @@
 
 #include "harness.hpp" // `expect_true`, `expect_equal`, `expect_status`, `run_test_case`
 #include "model.hpp"   // `model_page_t`, `model_edit_t`, `node_spec_t`, `hex`
+
+#if USTORE_OS_WINDOWS_
+#include <winsock2.h> // ahead of `<windows.h>`, which would pull in Winsock 1.1
+#include <windows.h>  // `VirtualAlloc`, `VirtualFree`
+#else
+#include <sys/mman.h> // `mmap`, `munmap`
+#endif
 
 namespace unum::ustore::test {
 
@@ -79,6 +87,36 @@ using bytes_allocator_t = test_allocator<byte_t>;
 using tree_t = element_tree<bytes_allocator_t>;
 using bytes_t = std::vector<byte_t>;
 
+#if USTORE_OS_WINDOWS_
+
+/** Reserves @p size bytes of address space that fault when touched, or none when it runs out. */
+std::span<byte_t> reserve_unreadable_bytes(std::size_t size) noexcept {
+    void* const reserved = ::VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_NOACCESS);
+    if (!reserved) return {};
+    return {static_cast<byte_t*>(reserved), size};
+}
+
+/** Releases what @c reserve_unreadable_bytes reserved. */
+void release_unreadable_bytes(std::span<byte_t> reserved) noexcept {
+    [[maybe_unused]] BOOL const released = ::VirtualFree(reserved.data(), 0, MEM_RELEASE);
+}
+
+#else
+
+/** Reserves @p size bytes of address space that fault when touched, or none when it runs out. */
+std::span<byte_t> reserve_unreadable_bytes(std::size_t size) noexcept {
+    void* const reserved = ::mmap(nullptr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (reserved == MAP_FAILED) return {};
+    return {static_cast<byte_t*>(reserved), size};
+}
+
+/** Releases what @c reserve_unreadable_bytes reserved. */
+void release_unreadable_bytes(std::span<byte_t> reserved) noexcept {
+    [[maybe_unused]] int const unmapped = ::munmap(reserved.data(), reserved.size());
+}
+
+#endif
+
 #pragma endregion Arenas
 
 #pragma region Reference Model
@@ -90,12 +128,12 @@ std::string dump_tree(tree_t const& tree) {
     for (element_index_t at = root; at != no_element_k; at = tree.next_in_preorder(at, root)) {
         std::size_t depth = 0;
         for (element_index_t up = at; up != root; up = tree[up].parent) ++depth;
-        result += std::string(depth * 2, ' ') + hex(tree[at].key) + " " + std::to_string(int(tree[at].kind)) + " <" +
-                  std::string(tree.name(at)) + "> [" + std::string(tree.text(at)) + "]";
+        fmt::format_to(std::back_inserter(result), "{:{}}{} {} <{}> [{}]", "", depth * 2, hex(tree[at].key),
+                       int(tree[at].kind), tree.name(at), tree.text(at));
         for (element_index_t attribute = tree[at].first_attribute; attribute != no_element_k;
              attribute = tree.attribute(attribute).next)
-            result += " " + std::string(tree.string(tree.attribute(attribute).name)) + "=" +
-                      std::string(tree.string(tree.attribute(attribute).value));
+            fmt::format_to(std::back_inserter(result), " {}={}", tree.string(tree.attribute(attribute).name),
+                           tree.string(tree.attribute(attribute).value));
         result += "\n";
     }
     return result;
@@ -104,7 +142,7 @@ std::string dump_tree(tree_t const& tree) {
 /** The dump of a dense page, or "absent" for a missing one. */
 std::string dump_page(expected<std::span<byte_t const>> const& page, test_arena_t& arena) {
     if (page.code() == status_code_t::not_found_k) return "absent\n";
-    if (!page) return "failed " + std::to_string(int(page.code())) + "\n";
+    if (!page) return fmt::format("failed {}\n", int(page.code()));
     tree_t tree {bytes_allocator_t(&arena)};
     if (tree.decode(*page).failed()) return "malformed\n";
     return dump_tree(tree);
@@ -321,7 +359,8 @@ std::vector<delta_view_t> deltas_of(std::vector<commit_t> const& commits, std::s
 
 #pragma region Cases
 
-/** Every kind of edit survives its serialized form, a chain reads back in order, and truncations are refused. */
+/** Every kind of edit survives its serialized form, a chain reads back in order, and truncations
+ *  and unread values past 4 GiB are refused. */
 void test_edit_codec() {
     split_mix_generator_t random {case_stream_key()};
     stream_generator_t generator(random);
@@ -341,7 +380,7 @@ void test_edit_codec() {
                 expect_true(edit.text_start == wanted.text_start && edit.text_length == wanted.text_length);
             if (carries_field(edit.modification)) expect_true(edit.field == wanted.field);
             if (edit.modification == modification_t::splice_k || edit.modification == modification_t::set_attributes_k)
-                expect_true(string_of(edit.value) == wanted.value);
+                expect_true(chars_of(edit.value) == wanted.value);
             if (edit.modification == modification_t::insert_k || edit.modification == modification_t::import_k) {
                 std::size_t minted = 0;
                 expect_true(for_each_minted_key(edit, [&](element_key_t const& key) {
@@ -366,6 +405,14 @@ void test_edit_codec() {
     unknown[0] = byte_t(7);
     expect_true(for_each_edit(unknown, [](edit_t const&) noexcept -> status_t { return {}; }).code ==
                 status_code_t::malformed_k);
+
+    test_arena_t arena;
+    bytes_allocator_t allocator(&arena);
+    std::span<byte_t> const unreadable = reserve_unreadable_bytes((std::size_t(1) << 32) + 1);
+    expect_true(!unreadable.empty());
+    edit_t const oversized = import_edit({}, mint_key(1, 0, 0), unreadable);
+    expect_status(encode_edits(std::span<edit_t const>(&oversized, 1), allocator), status_code_t::capacity_exhausted_k);
+    release_unreadable_bytes(unreadable);
 }
 
 /** Random streams folded edit by edit, commit by commit, and from random intermediate bases all match the model. */
@@ -489,7 +536,7 @@ void test_compose_shapes() {
     expect_true(count_of(attributes) == 2);
     std::vector<std::string> values;
     (void)for_each_edit(attributes, [&](edit_t const& edit) noexcept -> status_t {
-        values.push_back(std::string(edit.field) + "=" + std::string(string_of(edit.value)));
+        values.push_back(std::string(edit.field) + "=" + std::string(chars_of(edit.value)));
         return {};
     });
     expect_true(values == std::vector<std::string> {"id=c", "x=1"});
@@ -505,7 +552,7 @@ void test_compose_shapes() {
                           splice_edit({4, 0}, paragraph, 1, 1, "a")});
     expect_true(count_of(typed) == 1);
     (void)for_each_edit(typed, [&](edit_t const& edit) noexcept -> status_t {
-        expect_true(string_of(edit.value) == "Hay!" && edit.text_start == 0 && edit.text_length == 2);
+        expect_true(chars_of(edit.value) == "Hay!" && edit.text_start == 0 && edit.text_length == 2);
         expect_true(edit.placement == placement_t {4, 0});
         return {};
     });

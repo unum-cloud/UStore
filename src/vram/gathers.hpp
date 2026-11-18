@@ -320,7 +320,7 @@ expected<device_answer_t> gather_documents_on_device(ustore_docs_gather_t const&
     std::size_t const fields_count = arguments.fields_count, rows = arguments.count;
     auto [names, names_status] = arena_allocate<std::string_view>(view.scratch, fields_count);
     if (names_status.failed()) return names_status;
-    for (std::size_t field = 0; field != fields_count; ++field) names[field] = string_of(fields[field]);
+    for (std::size_t field = 0; field != fields_count; ++field) names[field] = chars_of(fields[field]);
     auto [walked, walked_status] = walk_documents(engine_of(arguments.database), whole_documents_of(arguments), names,
                                                   view, executor, *blocks);
     if (walked_status.failed()) return walked_status;

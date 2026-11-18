@@ -9,17 +9,21 @@
  *  A merge of sorted runs into new ones takes three launches. The rank kernel runs one thread per
  *  input record, which reads its record out of its run's cells and saved columns, finds its merged
  *  position as its rank in its own run plus a binary search into every other run, and writes it
- *  there with its survival verdict, so nothing sorts and no two runs merge pairwise. The pack
- *  kernel compacts the survivors in one chained scan, answering their count and their value offsets
- *  on the device. The place kernel writes every cell of the new runs, padding or survivor, with its
- *  stamp and its kind. The host waits three times: once to fold what survives where changes are
- *  pending, once for what plans the new runs, and once they are placed.
+ *  there with its survival verdict, so nothing sorts and no two runs merge pairwise. A run's range
+ *  tombstones upload beside its cells, and a record one of them hides lands as a dropped removal.
+ *  The pack kernel compacts the survivors in one chained scan, answering their count and their
+ *  value offsets on the device. The place kernel writes every cell of the new runs, padding or
+ *  survivor, with its stamp and its kind. The host waits three times: once to fold what survives
+ *  where changes are pending, once for what plans the new runs, and once they are placed. A merge
+ *  of strings ranks its versions by head and tape and packs the survivors the same way, so they
+ *  alone come back.
  *
  *  An Apple device has no 64-bit atomics to chain with, so there the pack follows the three passes
  *  of the select, listing the survivors in order, and a last launch adds the bytes of the tiles
  *  before each to its value offsets; its kernels are the MSL of @c vram_compaction_apple.metal,
- *  and @c metal_compactor_t queues them. The AMD bundle compiles these kernels with its own block
- *  scan, and @c vram_amd_compaction.hip queues them for @c hip_compactor_t.
+ *  and @c vram_apple_compaction.metal queues them for @c metal_compactor_t. The AMD bundle
+ *  compiles these kernels with its own block scan, and @c vram_amd_compaction.hip queues them for
+ *  the AMD compactor, @c hip_compactor_t.
  *
  *  Every device region a merge needs is carved off the compactor's own device blocks, rewound per
  *  merge, and every host buffer off the executor's pinned bounce. The kernels compile into the
@@ -67,6 +71,9 @@ struct merge_run {
 
     /** Key slots the run holds, whose cells sit in sorted order. */
     std::uint64_t key_slots_count = 0;
+
+    /** The run's range tombstones on the device, none for a run holding none. */
+    range_tombstones_view<typename key_slot_type_::stored_key_t> range_tombstones {};
 };
 
 /** The C names of the merge kernels the bundles export for @p key_slot_type_, none for a key slot
@@ -128,6 +135,9 @@ struct key_rows_gather {
 /** The C name of the kernel that ranks the versions of a merge of strings. */
 inline constexpr char const* merge_strings_rank_name_k = "ustore_merge_strings_rank";
 
+/** The C name of the kernel that packs the surviving versions of a merge of strings. */
+inline constexpr char const* merge_strings_pack_name_k = "ustore_merge_strings_pack";
+
 /** The value at @p index of a column saved as SmashTable saves a packed array: its count, base and width words, then
  *  the packed words. */
 template <typename value_type_>
@@ -170,6 +180,18 @@ struct strings_merge_run {
 
     /** Keys the run holds. */
     std::uint64_t count = 0;
+
+    /** The raw stamp of every range tombstone of the run, ascending by start. */
+    std::uint64_t const* range_stamps = nullptr;
+
+    /** Two offsets per range tombstone into @c range_tape, its start then its end, and one more. */
+    std::uint32_t const* range_offsets = nullptr;
+
+    /** The bounds of every range tombstone back to back, an empty end reaching past all strings. */
+    byte_t const* range_tape = nullptr;
+
+    /** Range tombstones the run holds. */
+    std::uint64_t ranges_count = 0;
 };
 
 /** The key slot a merge of strings judges survival on, whose stored key is a head. */
@@ -210,6 +232,46 @@ constexpr int strings_merge_order(strings_merge_run const& first, std::uint64_t 
     return first_offset != first_end ? 1 : second_offset != second_end ? -1 : 0;
 }
 
+/** Orders the key at @p position of @p run against the @p length bytes at @p text, as strings
+ *  order: by their bytes, a prefix first. */
+constexpr int strings_merge_order(strings_merge_run const& run, std::uint64_t position, byte_t const* text,
+                                  std::uint32_t length) noexcept {
+    std::uint32_t offset = run.key_offsets[position];
+    std::uint32_t const end = run.key_offsets[position + 1];
+    for (std::uint32_t index = 0; offset != end && index != length; ++offset, ++index) {
+        auto const key_byte = static_cast<unsigned char>(run.keys[offset]);
+        auto const text_byte = static_cast<unsigned char>(text[index]);
+        if (key_byte != text_byte) return key_byte < text_byte ? -1 : 1;
+    }
+    std::uint32_t const key_length = end - run.key_offsets[position];
+    return key_length == length ? 0 : key_length < length ? -1 : 1;
+}
+
+/** Whether a range tombstone of @p runs hides the version stamped @p stamp at @p position of run
+ *  @p run from every reader of @p stamps, as @c hidden_by_range decides it for fixed-width keys. */
+constexpr bool strings_merge_hidden(strings_merge_run const* runs, std::uint32_t runs_count, std::uint32_t upper_runs,
+                                    std::uint32_t run, std::uint64_t position, std::uint64_t stamp,
+                                    compaction_stamps_t const& stamps) noexcept {
+    for (std::uint32_t holder = 0; holder != runs_count; ++holder) {
+        strings_merge_run const& theirs = runs[holder];
+        bool const own = holder == run;
+        bool const newer = holder < upper_runs && (run >= upper_runs || holder > run);
+        if (!own && !newer) continue;
+        for (std::uint64_t index = 0; index != theirs.ranges_count; ++index) {
+            std::uint64_t const removed = theirs.range_stamps[index];
+            if (removed > stamps.ceiling || removed > stamps.horizon || (own && removed <= stamp)) continue;
+            if (stamp < removed && reader_interval(stamps, stamp) != reader_interval(stamps, removed)) continue;
+            std::uint32_t const* const bounds = theirs.range_offsets + 2 * index;
+            if (strings_merge_order(runs[run], position, theirs.range_tape + bounds[0], bounds[1] - bounds[0]) < 0)
+                continue;
+            if (bounds[2] == bounds[1] ||
+                strings_merge_order(runs[run], position, theirs.range_tape + bounds[1], bounds[2] - bounds[1]) < 0)
+                return true;
+        }
+    }
+    return false;
+}
+
 /** The version at @p position of @p run as @c survives reads it: its head, run, kind and stamp. */
 constexpr located_key_slot<strings_merge_slot_t> strings_merge_record(strings_merge_run const& run, std::uint32_t index,
                                                                       std::uint64_t position) noexcept {
@@ -231,7 +293,7 @@ constexpr located_key_slot<strings_merge_slot_t> strings_merge_record(strings_me
  *  versions order before it: the keys at or below its key for a run whose versions of a key come
  *  first, newer upper runs ahead of older ones and every upper run ahead of the lower ones, and the
  *  keys below it otherwise. The last of those of its key is the version before it, beside which it
- *  survives as @c survives decides, so the order is the host's.
+ *  survives as @c survives decides, unless a range tombstone hides it, so the order is the host's.
  */
 constexpr strings_merge_verdict_t strings_merge_verdict(strings_merge_run const* runs, std::uint32_t runs_count,
                                                         std::uint32_t upper_runs, std::uint32_t run,
@@ -267,7 +329,8 @@ constexpr strings_merge_verdict_t strings_merge_verdict(strings_merge_run const*
     located_key_slot<strings_merge_slot_t> const record = strings_merge_record(own, run, position);
     located_key_slot<strings_merge_slot_t> const previous = strings_merge_record(runs[previous_run], previous_run,
                                                                                  previous_position);
-    return {rank, survives(preceded ? &previous : nullptr, record, kind, stamps)};
+    bool const hidden = strings_merge_hidden(runs, runs_count, upper_runs, run, position, record.stamp, stamps);
+    return {rank, !hidden && survives(preceded ? &previous : nullptr, record, kind, stamps)};
 }
 
 #pragma endregion Strings Ranking
@@ -302,7 +365,8 @@ __device__ located_key_slot<key_slot_type_> merge_record(merge_run<key_slot_type
  *  A record's merged position is its sorted position in its own run plus, for every other run, how
  *  many of that run's records order before it, one binary search each; the run order of equal
  *  stored keys makes those counts exact. The record before it in merged order is the last of those,
- *  which decides its survival as @c survives does.
+ *  which decides its survival as @c survives does. A record a range tombstone hides lands as a
+ *  removal, flagged as dropped, which still closes the folds of the changes above it.
  */
 template <typename key_slot_type_>
 __device__ void merge_rank(merge_run<key_slot_type_> const* runs, std::uint32_t runs_count, std::uint32_t upper_runs,
@@ -321,7 +385,7 @@ __device__ void merge_rank(merge_run<key_slot_type_> const* runs, std::uint32_t 
             else high = middle;
         }
         std::uint64_t const position = index - runs[run].first;
-        record_t const record = merge_record(runs[run], run, value_stride, position);
+        record_t record = merge_record(runs[run], run, value_stride, position);
         std::uint64_t rank = position;
         record_t previous {};
         bool preceded = false;
@@ -347,8 +411,12 @@ __device__ void merge_rank(merge_run<key_slot_type_> const* runs, std::uint32_t 
             if (same_key(candidate, record) && (!preceded || order(previous, candidate)))
                 previous = candidate, preceded = true;
         }
+        bool const hidden = hidden_by_range(
+            [runs](std::uint32_t source) noexcept { return runs[source].range_tombstones; }, runs_count, upper_runs,
+            record.key_slot.stored_key, run, record.stamp, stamps);
+        if (hidden) record.kind = delta_kind_t::remove_k;
         merged[rank] = record;
-        flags[rank] = survives(preceded ? &previous : nullptr, record, kind, stamps) ? 1 : 0;
+        flags[rank] = !hidden && survives(preceded ? &previous : nullptr, record, kind, stamps) ? 1 : 0;
     }
 }
 
@@ -481,6 +549,33 @@ __device__ inline void merge_strings_rank(strings_merge_run const* runs, std::ui
                                                                       stamps);
         merged[verdict.rank] = strings_version_t {run, static_cast<std::uint32_t>(position)};
         flags[verdict.rank] = verdict.survives ? 1 : 0;
+    }
+}
+
+/** Compacts the flagged versions of @p merged into @p survivors in one chained scan, as
+ *  @c merge_pack compacts records: block @c t of @p tickets packs the @c t th tile, after the
+ *  survivors @p chain counts before it. */
+template <unsigned block_threads_, typename scan_type_>
+__device__ void merge_strings_pack(strings_version_t const* merged, std::uint8_t const* flags,
+                                   std::uint64_t records_count, std::uint64_t tickets, strings_version_t* survivors,
+                                   std::uint64_t* chain) noexcept {
+    using utilities::block_scanned_t;
+    std::uint64_t const ticket = utilities::chain_ticket(chain);
+    std::uint64_t const tile = utilities::divide_round_up(records_count, tickets);
+    std::uint64_t const first = ticket * tile < records_count ? ticket * tile : records_count;
+    std::uint64_t const end = first + tile < records_count ? first + tile : records_count;
+
+    std::uint64_t kept = 0;
+    for (std::uint64_t index = first + threadIdx.x; index < end; index += block_threads_) kept += flags[index] != 0;
+    std::uint64_t const kept_total = scan_type_::template block_exclusive<block_threads_>(kept).total;
+    std::uint64_t kept_before = utilities::chain_offset(chain, ticket, tickets, kept_total);
+
+    for (std::uint64_t base = first; base < end; base += block_threads_) {
+        std::uint64_t const index = base + threadIdx.x;
+        bool const flagged = index < end && flags[index] != 0;
+        block_scanned_t const kept_scan = scan_type_::template block_exclusive<block_threads_>(flagged ? 1 : 0);
+        if (flagged) survivors[kept_before + kept_scan.before] = merged[index];
+        kept_before += kept_scan.total;
     }
 }
 
@@ -633,6 +728,7 @@ constexpr std::size_t saved_words(sorted_run_index_view<key_slot_type_> const& v
  *  change through @c folded_versions, as the host compactor does. A surviving change whose older versions are all
  *  changes, and which the bottom level does not apply onto its empty base, becomes one chain that @p device_fold
  *  composes with every other such chain at once. Every other chain folds on the host through @c fold_versions.
+ *  With @c no_device_fold_t every chain of the merge folds there.
  */
 template <typename key_slot_type_, typename fold_type_, typename device_fold_type_, typename allocator_type_,
           utilities::gpu_executor_concept executor_type_>
@@ -647,6 +743,7 @@ st::status_t fold_survivors(executor_type_& executor, utilities::device_blocks_t
     using st::status_t;
     using st::vector;
     using record_t = located_key_slot<key_slot_type_>;
+    constexpr bool device_folds_k = !std::is_same_v<device_fold_type_, no_device_fold_t>;
 
     record_t* const records = carve_bounce<record_t>(executor, static_cast<std::size_t>(merged_count));
     std::uint8_t* const kept = carve_bounce<std::uint8_t>(executor, static_cast<std::size_t>(merged_count));
@@ -657,6 +754,10 @@ st::status_t fold_survivors(executor_type_& executor, utilities::device_blocks_t
     if (status != status_t::success_k) return status;
     status = executor_status(executor.wait());
     if (status != status_t::success_k) return status;
+    // A removal the pack drops, as a range tombstone makes one, still tells the folds its survival
+    for (std::uint64_t index = 0; index != merged_count; ++index)
+        if (!kept[index] && records[index].kind == delta_kind_t::remove_k)
+            kept[index] = survives(index != 0 ? records + index - 1 : nullptr, records[index], kind, stamps);
 
     utilities::local_arena_t arena;
     utilities::arena_allocator<byte_t> arena_bytes = arena.allocator();
@@ -687,7 +788,7 @@ st::status_t fold_survivors(executor_type_& executor, utilities::device_blocks_t
         for (std::uint64_t older = head + 1; older != versions.end; ++older)
             only_changes &= records[older].kind == delta_kind_t::change_k;
 
-        if (only_changes && !versions.applies) {
+        if (device_folds_k && only_changes && !versions.applies) {
             for (std::uint64_t version = versions.end; version != head; --version) {
                 std::span<byte_t const> bytes;
                 if ((status = value_of(records[version - 1], bytes)) != status_t::success_k) return status;
@@ -709,10 +810,11 @@ st::status_t fold_survivors(executor_type_& executor, utilities::device_blocks_t
 
     vector<byte_t> composed;
     vector<std::uint64_t> composed_offsets;
-    if (chain_starts.size() > 1) {
-        status = device_fold.compose(executor, blocks, changes, chain_starts, composed, composed_offsets);
-        if (status != status_t::success_k) return status;
-    }
+    if constexpr (device_folds_k)
+        if (chain_starts.size() > 1) {
+            status = device_fold.compose(executor, blocks, changes, chain_starts, composed, composed_offsets);
+            if (status != status_t::success_k) return status;
+        }
 
     // A folded value replaces its survivor's own: inline in the key slot, or in the compaction's folded bytes
     std::uint64_t* const folded_indices = carve_bounce<std::uint64_t>(executor, folds.size());
@@ -753,20 +855,22 @@ element_type_* cuda_compactor_t::carve_(std::size_t count) noexcept {
 }
 
 template <typename record_type_>
-st::status_t cuda_compactor_t::pack_(char const* name, merge_pack_regions<record_type_> const& regions,
-                                     std::uint64_t*& counted) noexcept {
+st::expected<packed_counts_t> cuda_compactor_t::pack_(char const* name,
+                                                      merge_pack_regions<record_type_> const& regions) noexcept {
     using st::status_t;
     std::uint64_t* const chains = carve_<std::uint64_t>(2);
     if (!chains) return status_t::out_of_memory_heap_k;
-    counted = chains;
     status_t const zeroed = executor_status(
         executor_->fill_async(reinterpret_cast<std::uintptr_t>(chains), byte_t {0}, 2 * sizeof(std::uint64_t)));
     if (zeroed != status_t::success_k) return zeroed;
     std::uint64_t const tickets = fu::min_of(
         divide_round_up(regions.records_count, std::uint64_t {merge_block_threads_k}), utilities::chain_blocks_max_k);
-    return launch_over(*executor_, name, tickets * merge_block_threads_k, tickets, regions.merged, regions.flags,
-                       regions.records_count, regions.replaced, regions.replacements, regions.replaced_count, tickets,
-                       regions.survivors, regions.prefix, regions.shares, chains);
+    status_t const launched = launch_over(*executor_, name, tickets * merge_block_threads_k, tickets, regions.merged,
+                                          regions.flags, regions.records_count, regions.replaced, regions.replacements,
+                                          regions.replaced_count, tickets, regions.survivors, regions.prefix,
+                                          regions.shares, chains);
+    if (launched != status_t::success_k) return launched;
+    return packed_counts_t {chains};
 }
 
 template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
@@ -789,18 +893,19 @@ st::status_t cuda_compactor_t::compact(compaction_kind_t kind,
 template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
           typename allocator_type_>
     requires compactable_key_slot_concept<key_slot_type_>
-st::status_t cuda_compactor_t::compact_on_device_(
-    compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_type_> const> upper,
-    std::span<sorted_run_index_view<key_slot_type_> const> lower, std::span<sorted_run_extents_t const> extents,
-    sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps, [[maybe_unused]] fold_type_ const& fold,
-    [[maybe_unused]] device_fold_type_ const& device_fold,
-    [[maybe_unused]] std::type_identity_t<located_value_reader<key_slot_type_>> read_value,
-    compaction_output<key_slot_type_, allocator_type_>& output) noexcept {
+st::status_t cuda_compactor_t::compact_on_device_(compaction_kind_t kind,
+                                                  std::span<sorted_run_index_view<key_slot_type_> const> upper,
+                                                  std::span<sorted_run_index_view<key_slot_type_> const> lower,
+                                                  std::span<sorted_run_extents_t const> extents,
+                                                  sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
+                                                  fold_type_ const& fold, device_fold_type_ const& device_fold,
+                                                  std::type_identity_t<located_value_reader<key_slot_type_>> read_value,
+                                                  compaction_output<key_slot_type_, allocator_type_>& output) noexcept {
     using st::status_t;
     using record_t = located_key_slot<key_slot_type_>;
     using view_t = sorted_run_index_view<key_slot_type_>;
     using names_t = merge_kernel_names<key_slot_type_>;
-    constexpr bool device_folds_k = !std::is_same_v<device_fold_type_, no_device_fold_t>;
+    using range_t = range_tombstone<typename key_slot_type_::stored_key_t>;
     constexpr bool locates_k = locates_stored_values_concept<key_slot_type_>;
     constexpr bool gathers_keys_k = !is_inline(key_slot_type_::value_layout_k);
     constexpr st::assume_uninitialized_t uninitialized {};
@@ -817,7 +922,7 @@ st::status_t cuda_compactor_t::compact_on_device_(
     };
 
     std::uint64_t merged_count = 0;
-    std::size_t saved_count = 0;
+    std::size_t saved_count = 0, ranges_count = 0;
     bool changes = false;
     sections_source_t const preferred = sections_ ? sections_source_t::volume_k : sections_source_t::memory_k;
     scratch_cursor_t sizing;
@@ -825,12 +930,10 @@ st::status_t cuda_compactor_t::compact_on_device_(
         view_t const& view = view_of(run);
         changes |= holds_changes(view.kinds);
         merged_count += view.key_slots_count;
+        if (view.range_tombstones != nullptr) ranges_count += view.range_tombstones->size();
         if (carve_sections(view, extents[run], preferred, sizing).source == sections_source_t::memory_k)
             saved_count += saved_words(view);
     }
-    // Without a device fold, changes fold on the host alone, where every merge
-    // holding one runs.
-    if (!device_folds_k && changes) return status_t::invalid_argument_k;
     output.folded.clear();
 
     if (executor_->bind().failed()) return status_t::unknown_k;
@@ -860,8 +963,10 @@ st::status_t cuda_compactor_t::compact_on_device_(
     std::uint64_t* const prefix = locates_k ? carve_<std::uint64_t>(records_count + 1) : nullptr;
     std::uint8_t* const shares = carve_<std::uint8_t>(records_count);
     key_rows_gather<key_slot_type_>* const gathers = carve_<key_rows_gather<key_slot_type_>>(sorted_runs_count);
+    range_t* const ranges = carve_<range_t>(ranges_count);
+    std::uint64_t* const range_stamps = carve_<std::uint64_t>(ranges_count);
     if ((sorted_runs_count && (!runs || !gathers)) || (saved_count && !saved_columns) ||
-        (stamps.pinned_count && !pinned) ||
+        (stamps.pinned_count && !pinned) || (ranges_count && (!ranges || !range_stamps)) ||
         (records_count && (!merged || !flags || !survivors || !shares || (locates_k && !prefix))))
         return status_t::out_of_memory_heap_k;
 
@@ -896,7 +1001,7 @@ st::status_t cuda_compactor_t::compact_on_device_(
     // through @c runs
     reads_.clear();
     scratch_cursor_t placing {sections_base};
-    std::size_t saved_offset = 0;
+    std::size_t saved_offset = 0, ranges_offset = 0;
     std::uint64_t first = 0;
     status_t status = status_t::success_k;
     for (std::uint64_t run = 0; run != sorted_runs_count; ++run) {
@@ -909,6 +1014,16 @@ st::status_t cuda_compactor_t::compact_on_device_(
         described.assigned_stamp = run_extents.assigned_stamp, described.first = first;
         described.key_slots_count = view.key_slots_count;
         first += view.key_slots_count;
+        // A run's range tombstones stay in memory wherever its sections sit, so they upload
+        if (view.range_tombstones != nullptr && !view.range_tombstones->empty()) {
+            std::size_t const count = view.range_tombstones->size();
+            described.range_tombstones = {ranges + ranges_offset, range_stamps + ranges_offset, count};
+            status = upload(*executor_, ranges + ranges_offset, view.range_tombstones->ranges().data(), count);
+            if (status != status_t::success_k) return status;
+            status = upload(*executor_, range_stamps + ranges_offset, view.range_tombstones->stamps().data(), count);
+            if (status != status_t::success_k) return status;
+            ranges_offset += count;
+        }
         if (sections.source == sections_source_t::volume_k) {
             if (!queue_section_reads(run_extents, sections)) return status_t::out_of_memory_heap_k;
             described.saved_stamps = sections.trailer;
@@ -937,14 +1052,14 @@ st::status_t cuda_compactor_t::compact_on_device_(
         if (view.key_slots_count == 0) continue;
         if (view.stamps != nullptr) {
             std::size_t const bytes = view.stamps->saved_bytes();
-            if (view.stamps->save({reinterpret_cast<byte_t*>(saved + saved_offset), bytes}) != status_t::success_k)
+            if (view.stamps->save(bytes_of(saved + saved_offset, bytes / sizeof(std::uint64_t))) != status_t::success_k)
                 return status_t::invalid_argument_k;
             described.saved_stamps = saved_columns + saved_offset;
             saved_offset += bytes / sizeof(std::uint64_t);
         }
         if (view.kinds != nullptr) {
             std::size_t const bytes = view.kinds->saved_bytes();
-            if (view.kinds->save({reinterpret_cast<byte_t*>(saved + saved_offset), bytes}) != status_t::success_k)
+            if (view.kinds->save(bytes_of(saved + saved_offset, bytes / sizeof(std::uint64_t))) != status_t::success_k)
                 return status_t::invalid_argument_k;
             described.saved_kinds = saved_columns + saved_offset;
             saved_offset += bytes / sizeof(std::uint64_t);
@@ -989,11 +1104,9 @@ st::status_t cuda_compactor_t::compact_on_device_(
         if (status != status_t::success_k) return status;
         std::span<std::uint64_t> indices;
         std::span<record_t> replacements;
-        if constexpr (device_folds_k)
-            if (changes)
-                status = fold_survivors(*executor_, blocks_, kind, stamps, sorted_runs_count, bounds.value_stride,
-                                        merged, flags, merged_count, fold, device_fold, read_value, output, indices,
-                                        replacements);
+        if (changes)
+            status = fold_survivors(*executor_, blocks_, kind, stamps, sorted_runs_count, bounds.value_stride, merged,
+                                    flags, merged_count, fold, device_fold, read_value, output, indices, replacements);
         if (status != status_t::success_k) return status;
         std::uint64_t* const replaced = carve_<std::uint64_t>(indices.size());
         record_t* const replacing = carve_<record_t>(replacements.size());
@@ -1002,12 +1115,10 @@ st::status_t cuda_compactor_t::compact_on_device_(
             return status;
         if ((status = upload(*executor_, replacing, replacements.data(), replacements.size())) != status_t::success_k)
             return status;
-        std::uint64_t* counted = nullptr;
-        status = pack_(names_t::pack_k,
-                       merge_pack_regions<record_t> {merged, flags, merged_count, replaced, replacing,
-                                                     std::uint64_t {indices.size()}, survivors, prefix, shares},
-                       counted);
-        if (status != status_t::success_k) return status;
+        auto [packed, pack_status] = pack_(
+            names_t::pack_k, merge_pack_regions<record_t> {merged, flags, merged_count, replaced, replacing,
+                                                           std::uint64_t {indices.size()}, survivors, prefix, shares});
+        if (pack_status != status_t::success_k) return pack_status;
 
         // What plans the new runs comes back at once, sized by the records, as only the
         // device counts survivors
@@ -1016,7 +1127,7 @@ st::status_t cuda_compactor_t::compact_on_device_(
         host_shares = carve_bounce<std::uint8_t>(*executor_, records_count);
         if (!selected || !host_shares || (locates_k && !prefixes) || executor_->pin_bounce().failed())
             return status_t::out_of_memory_heap_k;
-        if ((status = download(*executor_, selected, counted, 1)) != status_t::success_k) return status;
+        if ((status = download(*executor_, selected, packed.counted, 1)) != status_t::success_k) return status;
         if ((status = download(*executor_, prefixes, prefix, locates_k ? records_count + 1 : 0)) != status_t::success_k)
             return status;
         if ((status = download(*executor_, host_shares, shares, records_count)) != status_t::success_k) return status;

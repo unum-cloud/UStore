@@ -22,6 +22,7 @@
 #include "utilities/batches.hpp" // `validate_write`, `places_of`, `scans_of`, `measures_of`
 #include "utilities/outputs.hpp"  // `read_outputs_t`, `scan_outputs_t`, `measure_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
+#include "utilities/slices.hpp"   // `for_task_slices`
 
 namespace unum::ustore::oracles::leveldb {
 
@@ -93,13 +94,23 @@ status_t blobs_read(ustore_blobs_read_t const& arguments, view_t const& view) {
     if (outputs_status.failed()) return outputs_status;
 
     // Metadata and data come in one pass, as reading from disk is expensive
-    auto data_enumerator = [&](std::size_t, value_view_t value) noexcept -> status_t {
-        return append_staged(outputs, value, view.scratch);
+    auto read_slice = [&](std::size_t first, std::size_t length, view_t const& slice_view) noexcept -> status_t {
+        auto const offset = static_cast<std::ptrdiff_t>(first);
+        place_batch_t const slice {places.collections_begin + offset, places.keys_begin + offset, {}, length};
+        auto data_enumerator = [&](std::size_t task, value_view_t value) noexcept -> status_t {
+            return assign_staged(outputs, first + task, value, slice_view.scratch);
+        };
+        return length < iterator_read_threshold_k ? get_each(database, slice, options, data_enumerator)
+                                                  : seek_each(database, slice, options, data_enumerator);
     };
-    status_t const status = places.count < iterator_read_threshold_k
-                                ? get_each(database, places, options, data_enumerator)
-                                : seek_each(database, places, options, data_enumerator);
-    if (status.failed()) return status;
+
+    // Slices read one version, which a read outside a snapshot pins for itself
+    ::leveldb::Snapshot const* const pinned = options.snapshot ? nullptr : database.native->GetSnapshot();
+    if (pinned) options.snapshot = pinned;
+    status_t const read = for_task_slices(view, places.count, read_slice);
+    if (pinned) database.native->ReleaseSnapshot(pinned);
+    if (read.failed()) return read;
+    outputs.assigned(places.count);
     return outputs.finish(arguments);
 }
 

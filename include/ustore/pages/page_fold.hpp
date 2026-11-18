@@ -99,10 +99,10 @@ class page_state {
         }
         case modification_t::splice_k:
             if (element == no_element_k) return {};
-            return tree.splice(element, edit.text_start, edit.text_length, string_of(edit.value));
+            return tree.splice(element, edit.text_start, edit.text_length, chars_of(edit.value));
         case modification_t::set_attributes_k:
             if (element == no_element_k || tree[element].kind != element_kind_t::element_k) return {};
-            return tree.set_attribute(element, edit.field, string_of(edit.value));
+            return tree.set_attribute(element, edit.field, chars_of(edit.value));
         case modification_t::remove_attributes_k:
             if (element == no_element_k || tree[element].kind != element_kind_t::element_k) return {};
             tree.remove_attribute(element, edit.field);

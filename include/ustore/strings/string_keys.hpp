@@ -36,7 +36,7 @@ struct string_key_t {
     blob_t text;
 
     /** The bytes of the string. */
-    std::string_view view() const noexcept { return {reinterpret_cast<char const*>(text.data()), text.size()}; }
+    std::string_view view() const noexcept { return chars_of(bytes_of(text.data(), text.size())); }
 
     /** A copy owning bytes of its own, or why they could not be allocated, which the store asks of a key it
      *  records. */

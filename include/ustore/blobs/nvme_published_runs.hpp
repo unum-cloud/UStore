@@ -1436,7 +1436,7 @@ class published_runs {
      *      compactor.
      *  @param[in] fold What a change delta does, which composes the changes no reader tells apart.
      *  @param[in] device_fold What composes the changes of the merge on a device, or @c no_device_fold_t where nothing
-     *      does, which keeps every merge holding a change on the host.
+     *      does, which leaves every chain of a device's merge for the host to fold.
      *  @param[in] published What to call once the merged set is live and before a consumed run is dropped.
      *  @param[in] fan_out The threads a merge on the host fans its slices out over, or one slice on
      *      the calling thread.

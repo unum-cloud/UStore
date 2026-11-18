@@ -70,6 +70,10 @@ if (${USTORE_WITH_NVME})
         # skip
         if (storage_name_ STREQUAL "tree")
             target_sources(${storage_exe_} PRIVATE ${PROJECT_SOURCE_DIR}/src/vram/bundles.cpp ${ustore_vram_objects_})
+            # Source properties hold within the directory setting them, so the bundles' gates repeat here
+            set_source_files_properties(
+                ${PROJECT_SOURCE_DIR}/src/vram/bundles.cpp PROPERTIES COMPILE_DEFINITIONS "${ustore_gpu_gates_}"
+            )
         endif ()
         if (storage_name_ STREQUAL "tree" AND ustore_device_compaction_)
             list(APPEND storage_arguments_ --no-skips --transports memory,blocking,linux-uring)
@@ -139,10 +143,11 @@ add_executable(
 )
 target_include_directories(ustore_test_nvme_compaction_host PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_compile_features(ustore_test_nvme_compaction_host PRIVATE cxx_std_20)
-# A fold's scratch arena allocates on ForkUnion's memory domains, which the host compactor reaches
+# A fold's scratch arena allocates on ForkUnion's memory domains, which the host compactor reaches, and the docs fold
+# parses through yyjson
 target_link_libraries(
     ustore_test_nvme_compaction_host PRIVATE ustore_header smashtable::header forkunion::static stringzilla::header
-                                             fmt::fmt ustore_warnings
+                                             yyjson fmt::fmt ustore_warnings
 )
 add_test(NAME ustore_test_nvme_compaction_host COMMAND ustore_test_nvme_compaction_host)
 
@@ -195,7 +200,7 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(ustore_test_vram_fake_amd PRIVATE ustore::static fmt::fmt ustore_warnings)
     add_dependencies(ustore_test_vram_fake_amd ustore_fake_amdhip64)
     add_test(NAME ustore_test_vram_fake_amd COMMAND ustore_test_vram_fake_amd --engine ram --no-skips --filter
-                                                    "^vram\\.amd"
+                                                    "^test_vram_amd"
     )
     set_tests_properties(
         ustore_test_vram_fake_amd PROPERTIES ENVIRONMENT "LD_LIBRARY_PATH=${CMAKE_BINARY_DIR}/fake_amdhip64"

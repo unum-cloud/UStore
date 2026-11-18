@@ -117,7 +117,7 @@ struct read_columns_t {
     ustore_strings_view_t values {};
 
     /** The value of task @p index, empty for a missing key. */
-    std::string_view value(std::size_t index) const noexcept { return string_of(tape_string(values, index)); }
+    std::string_view value(std::size_t index) const noexcept { return chars_of(tape_string(values, index)); }
 };
 
 /** A blocking read of @p keys from @p collection into @p columns inside @p arena, finishing
@@ -259,7 +259,7 @@ struct pulled_keys_t {
     ustore_size_t written = 0;
 
     /** The value of key @p index. */
-    std::string_view value(std::size_t index) const noexcept { return string_of(tape_string(values, index)); }
+    std::string_view value(std::size_t index) const noexcept { return chars_of(tape_string(values, index)); }
 };
 
 /** A blocking pull of up to @p wanted keys and their values from @p cursor into @p pulled

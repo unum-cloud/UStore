@@ -410,14 +410,18 @@ static void test_deltas_read_back_per_collection() {
     expect_equal(resources->memory_constraint.used(), std::size_t {0});
 }
 
-/** Deltas holding as many keys as they admit refuse the next key with @c capacity_exhausted_k and keep the rest. */
+/** Deltas holding as many keys as they admit refuse the next key with @c capacity_exhausted_k,
+ *  keep the rest, and name the shape that key wanted, which a transaction of its own grows to
+ *  while any other refusal stands. */
 static void test_deltas_refuse_past_their_bound() {
     resources_shared_ptr_t const resources = std::make_shared<resources_t>(1ull << 20, 0);
     constexpr std::size_t bound_k = 8;
     transaction_deltas_t deltas(deltas_bytes_k, bound_k, resources);
     transaction_deltas_t::value_widths_t const widths {value_bytes_k, 0};
     for (stored_key_t key = 0; key != bound_k; ++key) expect_true(deltas.remove(collection_k, widths, key).succeeded());
+    expect_equal(deltas.wanted_shape().max_deltas, std::size_t {0});
     expect_status(deltas.remove(collection_k, widths, bound_k), status_code_t::capacity_exhausted_k);
+    expect_equal(deltas.wanted_shape().max_deltas, bound_k + 1);
     expect_equal(deltas.count(), bound_k);
     expect_true(deltas.lookup(collection_k, bound_k - 1) == lookup_result_t::removed_k);
     expect_true(deltas.lookup(collection_k, bound_k) == lookup_result_t::missing_k);

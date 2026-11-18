@@ -32,26 +32,22 @@ class column_uploader {
     column_uploader(utilities::device_blocks_t& blocks, executor_type_& executor) noexcept
         : blocks_(blocks), executor_(executor) {}
 
-    /** Moves the @p count elements @p column points to into the arena, leaving an empty column null as the host does,
-     *  and repoints it there. */
+    /** Moves the @p count elements @p column points to into the arena, answering where they
+     *  landed, or nothing for an empty column, which the host leaves null. */
     template <typename element_type_>
-    void move(element_type_ const*& column, std::size_t count) noexcept {
-        if (status_.failed() || !column) return;
-        if (!count) {
-            column = nullptr;
-            return;
-        }
+    [[nodiscard]] std::span<element_type_ const> move(element_type_ const* column, std::size_t count) noexcept {
+        if (status_.failed() || !column || !count) return {};
         auto [device, device_status] = utilities::carve<element_type_>(blocks_, executor_, count);
-        if ((status_ = device_status).failed()) return;
+        if ((status_ = device_status).failed()) return {};
         std::span<element_type_ const> const host {column, count};
         status_ = executor_.upload_async(reinterpret_cast<std::uintptr_t>(device.data()), std::as_bytes(host));
-        column = device.data();
+        return device;
     }
 
     /** Moves the column an output points to, where a null output was not asked for. */
     template <typename element_type_>
     void move_output(element_type_ const** output, std::size_t count) noexcept {
-        if (output) move(*output, count);
+        if (output) *output = move(*output, count).data();
     }
 
     /** Moves a tape of @p count strings, its offsets and then the bytes they span. */
@@ -77,8 +73,8 @@ class column_uploader {
     template <typename tape_type_>
     void move_tape(tape_type_& tape, std::size_t count) noexcept {
         std::size_t const bytes = tape.offsets ? static_cast<std::size_t>(tape.offsets[count]) : 0;
-        move(tape.data, bytes);
-        move(tape.offsets, count + 1);
+        tape.data = move(tape.data, bytes).data();
+        tape.offsets = move(tape.offsets, count + 1).data();
     }
 
     utilities::device_blocks_t& blocks_;
@@ -171,15 +167,14 @@ void output_columns(ustore_docs_gather_t const& arguments, uploader_type_& uploa
     std::span<ustore_docs_column_view_t> const views = uploader.copy_into_bounce(*arguments.columns, fields);
     for (std::size_t field = 0; field != views.size(); ++field) {
         ustore_docs_column_view_t& view = views[field];
-        uploader.move(view.validities, bitmap_bytes);
-        uploader.move(view.conversions, bitmap_bytes);
-        uploader.move(view.collisions, bitmap_bytes);
-        uploader.move(view.scalars, rows * docs::field_size_bytes(arguments.outputs_types[field]));
+        view.validities = uploader.move(view.validities, bitmap_bytes).data();
+        view.conversions = uploader.move(view.conversions, bitmap_bytes).data();
+        view.collisions = uploader.move(view.collisions, bitmap_bytes).data();
+        view.scalars =
+            uploader.move(view.scalars, rows * docs::field_size_bytes(arguments.outputs_types[field])).data();
         uploader.move(view.strings, rows);
     }
-    ustore_docs_column_view_t const* moved = views.data();
-    uploader.move(moved, views.size());
-    *arguments.columns = moved;
+    *arguments.columns = uploader.move(views.data(), views.size()).data();
 }
 
 /** Moves every output column of @p hosted, which a host verb wrote into @p executor's bounce, into @p blocks, the

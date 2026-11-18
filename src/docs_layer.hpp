@@ -65,7 +65,7 @@ using field_path_buffer_t = char[field_path_length_limit_k];
 
 /** The field of task @p index of @p fields, empty for a whole document and for every task without fields. */
 inline std::string_view field_of(strings_arg_t const& fields, std::size_t index) noexcept {
-    return fields ? string_of(fields[index]) : std::string_view {};
+    return fields ? chars_of(fields[index]) : std::string_view {};
 }
 
 /** Whether any of @p count tasks addresses a field rather than a whole document, which only parsing serves. */
@@ -287,7 +287,7 @@ inline status_t replay_deltas(document_state_t& document, std::span<json_delta_t
         if (document.exists() && whole && modification == modification_t::insert_k)
             return {status_code_t::already_exists_k, "Inserted document already exists"};
         if (!tree.mutable_handle) {
-            value_view_t const base = document.exists() ? value_view_t(string_of(document.bytes)) : value_view_t();
+            value_view_t const base = document.exists() ? value_view_t(chars_of(document.bytes)) : value_view_t();
             auto [parsed, parse_status] = json_parse(base, arena);
             if (parse_status.failed()) return parse_status;
             tree = parsed;
@@ -402,7 +402,7 @@ inline status_t gist_paths(yyjson_val* node, field_path_buffer_t& path, sorted_p
     if (status_t const status = exported_paths.push_back(bytes_of(leaf)); status.failed()) return status;
 
     // The column may move as it grows, leaving behind a copy that stays readable until the scratch rewinds
-    return growth_status(sorted_paths.insert(string_of(exported_paths[exported_paths.size() - 1])));
+    return growth_status(sorted_paths.insert(chars_of(exported_paths[exported_paths.size() - 1])));
 }
 
 #pragma endregion Gist
@@ -445,7 +445,7 @@ status_t write_documents(documents_type_ const& documents, ustore_docs_write_t c
                          strings_arg_t const& fields, strings_arg_t const& values, view_t const& view) noexcept {
     if (!arguments.count) return {};
     if (!values) return {status_code_t::invalid_argument_k, "No values were provided"};
-    std::string_view const id_field = string_of(arguments.id_field);
+    std::string_view const id_field = chars_of(arguments.id_field);
     if (!arguments.keys.data && id_field.empty())
         return {status_code_t::invalid_argument_k, "Documents without keys need an id field"};
 
@@ -596,7 +596,7 @@ status_t gather_documents(documents_type_ const& source, ustore_docs_gather_t co
     auto [field_names, names_status] = arena_allocate<std::string_view>(view.scratch, fields_count);
     if (names_status.failed()) return names_status;
     for (std::size_t field_index = 0; field_index != fields_count; ++field_index)
-        field_names[field_index] = string_of(fields[field_index]);
+        field_names[field_index] = chars_of(fields[field_index]);
     auto const cell_of = [docs_count](std::size_t cell) noexcept {
         return field_cell_t {cell % docs_count, cell / docs_count};
     };

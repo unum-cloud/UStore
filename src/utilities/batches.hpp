@@ -17,7 +17,7 @@
 #include "ustore/db.h"       // `ustore_ingest_append_t`, `ustore_collection_create_t`, `ustore_drop_mode_t`
 #include "ustore/ranges.hpp" // `strided_iterator`, `strided`, `place_batch_t`, `edges_view_t`, `tape_string`
 #include "ustore/status.hpp" // `status_t`, `expected`
-#include "ustore/types.hpp"  // `smallest_key_k`, `string_of`
+#include "ustore/types.hpp"  // `smallest_key_k`, `chars_of`
 
 #include "utilities/outputs.hpp" // `collection_find_outputs_t`
 
@@ -328,7 +328,7 @@ status_t validate_scan(arguments_type_ const& arguments) noexcept {
  *  an unnamed collection. */
 inline expected<std::string_view> validate_collection_create(ustore_collection_create_t const& arguments) noexcept {
     if (!arguments.collection) return status_t {status_code_t::invalid_argument_k, "Need an output for the collection"};
-    std::string_view const name = string_of(arguments.name);
+    std::string_view const name = chars_of(arguments.name);
     if (arguments.name.data && name.empty())
         return status_t {status_code_t::invalid_argument_k, "A name is never empty"};
     return name;

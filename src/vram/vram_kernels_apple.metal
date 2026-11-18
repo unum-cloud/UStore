@@ -1317,7 +1317,7 @@ struct select_arguments_t {
     ulong flags;
 
     /** Items flagged. */
-    uint count;
+    ulong count;
 
     /** Items each threadgroup of the counting and writing passes takes. */
     uint tile;
@@ -1329,7 +1329,7 @@ struct select_arguments_t {
      *  in the lowest bit, as the matching kernels mark. */
     uint flag_bits;
 
-    /** One count per tile and the total after them, which the scan turns into offsets. */
+    /** One count per tile and the total after them, which the scan turns into 64-bit offsets. */
     ulong counts;
 
     /** The index of every flagged item, in order, as many as the total counts. */
@@ -1337,14 +1337,14 @@ struct select_arguments_t {
 };
 
 /** Whether item @p index of @p flags is flagged. */
-inline bool flagged(device uchar const* flags, uint flag_bits, uint index) {
+inline bool flagged(device uchar const* flags, uint flag_bits, ulong index) {
     return flag_bits == 1 ? (flags[index / 8] >> (index % 8) & 1u) != 0 : flags[index] != 0;
 }
 
 /** The first item of tile @p tile and the one past its last. */
-inline uint2 select_tile(constant select_arguments_t& arguments, uint tile) {
-    uint const first = min(tile * arguments.tile, arguments.count);
-    return uint2(first, first + min(arguments.count - first, arguments.tile));
+inline ulong2 select_tile(constant select_arguments_t& arguments, uint tile) {
+    ulong const first = min(ulong(tile) * arguments.tile, arguments.count);
+    return ulong2(first, first + min(arguments.count - first, ulong(arguments.tile)));
 }
 
 #pragma endregion Select
@@ -1522,28 +1522,28 @@ kernel void ustore_select_count_apple(constant select_arguments_t& arguments [[b
     threadgroup uint simd_totals[block_simds_k];
     blocks_t const blocks = {table, table_count};
     device uchar const* const flags = reach<uchar const>(blocks, arguments.flags);
-    uint2 const range = select_tile(arguments, tile);
+    ulong2 const range = select_tile(arguments, tile);
     uint kept = 0;
-    for (uint index = range.x + lane; index < range.y; index += block_threads_k)
+    for (ulong index = range.x + lane; index < range.y; index += block_threads_k)
         kept += flagged(flags, arguments.flag_bits, index) ? 1 : 0;
     block_scanned<uint> const scan = block_exclusive(kept, lane, simd_totals);
-    if (lane == 0) reach<uint>(blocks, arguments.counts)[tile] = scan.total;
+    if (lane == 0) reach<ulong>(blocks, arguments.counts)[tile] = scan.total;
 }
 
-/** Scans the tiles' counts in place into the items flagged before each, and the total after the
- *  last, on one threadgroup, the middle pass of the select. */
+/** Scans the tiles' 32-bit counts in place into the 64-bit items flagged before each, and the total
+ *  after the last, on one threadgroup, the middle pass of the select. */
 kernel void ustore_select_scan_apple(constant select_arguments_t& arguments [[buffer(metal_arguments_slot_k)]],
                                      device ustore_metal_block_t const* table [[buffer(metal_blocks_slot_k)]],
                                      constant uint& table_count [[buffer(metal_blocks_count_slot_k)]],
                                      uint lane [[thread_index_in_threadgroup]]) {
-    threadgroup uint simd_totals[block_simds_k];
+    threadgroup ulong simd_totals[block_simds_k];
     blocks_t const blocks = {table, table_count};
-    device uint* const counts = reach<uint>(blocks, arguments.counts);
-    uint carried = 0;
+    device ulong* const counts = reach<ulong>(blocks, arguments.counts);
+    ulong carried = 0;
     for (uint base = 0; base < arguments.tiles; base += block_threads_k) {
         uint const index = base + lane;
-        uint const count = index < arguments.tiles ? counts[index] : 0;
-        block_scanned<uint> const scan = block_exclusive(count, lane, simd_totals);
+        ulong const count = index < arguments.tiles ? counts[index] : 0;
+        block_scanned<ulong> const scan = block_exclusive(count, lane, simd_totals);
         if (index < arguments.tiles) counts[index] = carried + scan.before;
         carried += scan.total;
     }
@@ -1561,13 +1561,13 @@ kernel void ustore_select_write_apple(constant select_arguments_t& arguments [[b
     blocks_t const blocks = {table, table_count};
     device uchar const* const flags = reach<uchar const>(blocks, arguments.flags);
     device uint* const selected = reach<uint>(blocks, arguments.selected);
-    uint2 const range = select_tile(arguments, tile);
-    uint before = reach<uint const>(blocks, arguments.counts)[tile];
-    for (uint base = range.x; base < range.y; base += block_threads_k) {
-        uint const index = base + lane;
+    ulong2 const range = select_tile(arguments, tile);
+    ulong before = reach<ulong const>(blocks, arguments.counts)[tile];
+    for (ulong base = range.x; base < range.y; base += block_threads_k) {
+        ulong const index = base + lane;
         bool const kept = index < range.y && flagged(flags, arguments.flag_bits, index);
         block_scanned<uint> const scan = block_exclusive(kept ? 1u : 0u, lane, simd_totals);
-        if (kept) selected[before + scan.before] = index;
+        if (kept) selected[before + scan.before] = uint(index);
         before += scan.total;
     }
 }

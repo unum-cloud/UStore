@@ -11,11 +11,11 @@
 #undef NDEBUG // ! A test's oracle must stay live in every build
 #define _POSIX_C_SOURCE 200809L
 
-#include <stdio.h>  // `fprintf`, `printf`, `stderr`, `snprintf`, `remove`
-#include <stdlib.h> // `mkdtemp`, `getenv`, `exit`, `strtod`, `strtoull`
-#include <string.h> // `memcmp`, `memset`, `strcmp`, `strncmp`, `strlen`, `strstr`
+#include <stdio.h>  // `printf`, `snprintf`, `fflush`, `remove`
+#include <stdlib.h> // `getenv`, `exit`, `strtod`, `strtoull`, `mkdtemp`
+#include <string.h> // `memcmp`, `memset`, `strcmp`, `strncmp`, `strlen`
 #include <time.h>   // `time`, `clock`
-#include <unistd.h> // `rmdir`
+#include <unistd.h> // `rmdir`, `write`, `STDERR_FILENO`
 
 #include <inttypes.h> // `PRIu64`
 #include <stdbool.h>  // `bool`
@@ -32,7 +32,6 @@ static size_t failed_cases = 0;
 static size_t skipped_cases = 0;
 static char const* current_case = NULL;
 static char const* program_name = "";
-static char const* test_filter = NULL;
 static uint64_t test_seed = 42;
 static double test_scale = 1.0;
 static bool refuse_skips = false;
@@ -47,11 +46,16 @@ static inline uint64_t split_mix_bits(uint64_t value) {
     return value ^ (value >> 31);
 }
 
+/** Writes @p text to the standard error through a raw @c write, which a signal handler may call. */
+static void write_text(char const* text) { (void)!write(STDERR_FILENO, text, strlen(text)); }
+
 /** Counts a failed check at @p file : @p line without stopping, so one run lists every mismatch. */
 static inline bool expect_at(bool is_met, char const* file, int line, char const* what) {
     if (is_met) return true;
     fflush(stdout);
-    fprintf(stderr, "  check failed at %s:%d\n    %s\n", file, line, what);
+    char message[512];
+    snprintf(message, sizeof message, "  check failed at %s:%d\n    %s\n", file, line, what);
+    write_text(message);
     ++failed_checks;
     return false;
 }
@@ -71,7 +75,9 @@ static inline char const* setting_text(int argc, char** argv, char const* variab
 
 /** Exits with one line naming a setting that does not parse, so a bad value never runs anything. */
 static inline void exit_unparsed(char const* variable, char const* text, char const* expected) {
-    fprintf(stderr, "%s=\"%s\" does not parse, expected %s\n", variable, text, expected);
+    char message[512];
+    snprintf(message, sizeof message, "%s=\"%s\" does not parse, expected %s\n", variable, text, expected);
+    write_text(message);
     exit(1);
 }
 
@@ -107,15 +113,13 @@ static inline bool read_flag_setting(int argc, char** argv, char const* variable
 static inline void start_test_run(int argc, char** argv) {
     program_name = argc != 0 ? argv[0] : "";
     read_test_settings(argc, argv);
-    printf("- Seed: %" PRIu64 ", scale: %g, filter: %s\n", test_seed, test_scale, test_filter ? test_filter : "none");
+    printf("- Seed: %" PRIu64 ", scale: %g\n", test_seed, test_scale);
 }
 
-/** Starts the case @p label unless the filter leaves it out, matched by substring. */
-static inline bool start_test_case(char const* label) {
-    if (test_filter && !strstr(label, test_filter)) return false;
+/** Starts the case @p label. */
+static inline void start_test_case(char const* label) {
     current_case = label;
     failed_checks_before_case = failed_checks;
-    return true;
 }
 
 /** Ends the case @ref start_test_case began: @p skip_reason when it skipped, NULL when it ran. */
@@ -132,8 +136,11 @@ static inline void finish_test_case(char const* skip_reason) {
     else {
         ++failed_cases;
         fflush(stdout);
-        fprintf(stderr, "- %s ... FAILED: %zu failed check(s)\n", current_case, failed);
-        fprintf(stderr, "  rerun: %s --seed %" PRIu64 " --filter '%s'\n", program_name, test_seed, current_case);
+        char message[512];
+        snprintf(message, sizeof message, "- %s ... FAILED: %zu failed check(s)\n", current_case, failed);
+        write_text(message);
+        snprintf(message, sizeof message, "  rerun: %s --seed %" PRIu64 "\n", program_name, test_seed);
+        write_text(message);
     }
     current_case = NULL;
 }
@@ -151,7 +158,6 @@ static inline int finish_test_run(void) {
 
 static void read_test_settings(int argc, char** argv) {
     test_seed = read_seed_setting(argc, argv, "USTORE_SEED", "--seed");
-    test_filter = setting_text(argc, argv, "USTORE_FILTER", "--filter");
     test_scale = read_real_setting(argc, argv, "USTORE_SCALE", "--scale", 1.0);
     refuse_skips = read_flag_setting(argc, argv, "USTORE_NO_SKIPS", "--no-skips", false);
 }
@@ -958,13 +964,18 @@ static void test_every_modality_round_trips(void) {
 
 int main(int argc, char** argv) {
     start_test_run(argc, argv);
-    if (start_test_case("test_enums_spell_and_parse_as_the_library_names_them"))
-        test_enums_spell_and_parse_as_the_library_names_them(), finish_test_case(NULL);
-    if (start_test_case("test_null_databases_refuse_as_uninitialized"))
-        test_null_databases_refuse_as_uninitialized(), finish_test_case(NULL);
-    if (start_test_case("test_engines_beyond_ram_are_refused"))
-        test_engines_beyond_ram_are_refused(), finish_test_case(NULL);
-    if (start_test_case("test_every_modality_round_trips")) test_every_modality_round_trips(), finish_test_case(NULL);
+    start_test_case("test_enums_spell_and_parse_as_the_library_names_them");
+    test_enums_spell_and_parse_as_the_library_names_them();
+    finish_test_case(NULL);
+    start_test_case("test_null_databases_refuse_as_uninitialized");
+    test_null_databases_refuse_as_uninitialized();
+    finish_test_case(NULL);
+    start_test_case("test_engines_beyond_ram_are_refused");
+    test_engines_beyond_ram_are_refused();
+    finish_test_case(NULL);
+    start_test_case("test_every_modality_round_trips");
+    test_every_modality_round_trips();
+    finish_test_case(NULL);
     return finish_test_run();
 }
 

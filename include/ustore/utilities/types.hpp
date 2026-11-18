@@ -793,18 +793,18 @@ inline ustore_bytes_view_t bytes_of(std::string_view text) noexcept {
 }
 
 /** The text @p bytes spell. */
-inline std::string_view string_of(ustore_bytes_view_t bytes) noexcept {
+inline std::string_view chars_of(ustore_bytes_view_t bytes) noexcept {
     return {reinterpret_cast<char const*>(bytes.data), static_cast<std::size_t>(bytes.length)};
 }
 
 /** The text @p bytes spell. */
-inline std::string_view string_of(std::span<byte_t const> bytes) noexcept {
+inline std::string_view chars_of(std::span<byte_t const> bytes) noexcept {
     return {reinterpret_cast<char const*>(bytes.data()), bytes.size()};
 }
 
 /** Whether @p bytes spell a path: some text with no NUL, where every system call would cut it. */
 inline bool names_path(ustore_bytes_view_t bytes) noexcept {
-    return bytes.length != 0 && string_of(bytes).find('\0') == std::string_view::npos;
+    return bytes.length != 0 && chars_of(bytes).find('\0') == std::string_view::npos;
 }
 
 /** A tape of 32-bit offsets, where string @c i spans @b [offsets[i],offsets[i+1]) of @p data. */
@@ -832,6 +832,31 @@ using bytes_span_t = std::span<byte_t>;
 
 /** Bytes a caller may only read. */
 using bytes_view_t = std::span<byte_t const>;
+
+/** The bytes behind @p count typed elements at @p data, read-only. */
+template <typename value_type_>
+bytes_view_t bytes_of(value_type_ const* data, std::size_t count) noexcept {
+    return std::as_bytes(std::span {data, count});
+}
+
+/** The bytes behind @p count typed elements at @p data, writable. */
+template <typename value_type_>
+bytes_span_t bytes_of(value_type_* data, std::size_t count) noexcept {
+    return std::as_writable_bytes(std::span {data, count});
+}
+
+/** The typed elements behind @p bytes, the inverse of @ref bytes_of and the one place a payload's
+ *  bytes are read back as its elements; a trailing partial element is left out. */
+template <typename element_type_>
+std::span<element_type_ const> elements_of(bytes_view_t bytes) noexcept {
+    return {reinterpret_cast<element_type_ const*>(bytes.data()), bytes.size() / sizeof(element_type_)};
+}
+
+/** The writable typed elements behind @p bytes, for a codec decoding straight into its slice. */
+template <typename element_type_>
+std::span<element_type_> elements_of(bytes_span_t bytes) noexcept {
+    return {reinterpret_cast<element_type_*>(bytes.data()), bytes.size() / sizeof(element_type_)};
+}
 
 /** A value, or the bytes of a string, owned so it outlives the call that wrote it. */
 using blob_t = st::vector<ustore_byte_t>;
@@ -1161,6 +1186,9 @@ struct gpu_device_t {
     /** Streaming multiprocessors or compute units. */
     std::uint32_t compute_units = 0;
 
+    /** Shared memory one block may hold, static and dynamic together, once its kernel opts in. */
+    std::uint32_t shared_memory_per_block_bytes = 0;
+
     /** Device memory in bytes. */
     std::uint64_t memory_bytes = 0;
 
@@ -1175,7 +1203,10 @@ inline constexpr std::size_t gpu_devices_capacity_k = 64;
 
 } // namespace utilities
 
-// The statuses every UStore call answers, in the namespace every SDK and engine opens
+/** The statuses and byte views every layer shares, in the namespace SDKs and engines open. */
+using utilities::bytes_of;
+using utilities::chars_of;
+using utilities::elements_of;
 using utilities::expected;
 using utilities::status_code_t;
 using utilities::status_t;

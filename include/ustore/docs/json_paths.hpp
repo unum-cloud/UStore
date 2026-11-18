@@ -164,12 +164,12 @@ struct json_documents_t {
         if (presences && !((presences[index / 8] >> (index % 8)) & 1u)) return {};
         if (tape.layout == ustore_strings_u64_tape_k) {
             std::uint64_t const* const offsets = tape.data.u64_tape.offsets;
-            return {reinterpret_cast<char const*>(tape.data.u64_tape.data) + offsets[index],
-                    static_cast<std::size_t>(offsets[index + 1] - offsets[index])};
+            return chars_of(bytes_of(tape.data.u64_tape.data + offsets[index],
+                                     static_cast<std::size_t>(offsets[index + 1] - offsets[index])));
         }
         std::uint32_t const* const offsets = tape.data.u32_tape.offsets;
-        return {reinterpret_cast<char const*>(tape.data.u32_tape.data) + offsets[index],
-                static_cast<std::size_t>(offsets[index + 1] - offsets[index])};
+        return chars_of(bytes_of(tape.data.u32_tape.data + offsets[index],
+                                 static_cast<std::size_t>(offsets[index + 1] - offsets[index])));
     }
 };
 

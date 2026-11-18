@@ -13,13 +13,12 @@
 #include <span>        // `std::span`
 #include <type_traits> // `std::type_identity_t`
 
-#include "ustore/blobs/nvme_compaction.hpp"            // `compaction_output`, `sorted_run_index_view`
-#include "ustore/blobs/vram_amd_compaction.hpp"        // `hip_compactor_t`
-#include "ustore/blobs/vram_nvidia_compaction.hpp"     // `cuda_compactor_t`
-#include "ustore/graph/adjacency_fold.hpp"             // `adjacency_fold_t`
-#include "ustore/graph/vram_nvidia_adjacency_fold.hpp" // `vram_nvidia_adjacency_fold_t`
-#include "ustore/utilities/folds.hpp"                  // `last_write_fold_t`
-#include "ustore/utilities/vram_device.hpp"            // `kernel_table`, `gpu_drivers_t`
+#include "ustore/blobs/nvme_compaction.hpp"        // `compaction_output`, `fold_ref_t`
+#include "ustore/blobs/vram_amd_compaction.hpp"    // `hip_compactor_t`
+#include "ustore/blobs/vram_nvidia_compaction.hpp" // `cuda_compactor_t`
+#include "ustore/graph/adjacency_fold.hpp"         // `adjacency_fold_t`
+#include "ustore/graph/vram_adjacency_fold.hpp"    // `vram_adjacency_fold_t`
+#include "ustore/utilities/vram_device.hpp"        // `kernel_table`, `gpu_drivers_t`
 
 #include "nvme/compaction_key_slots.hpp" // `inline_key_slot`, `fixed_width_key_slot`, `variable_width_key_slot`
 #include "vram/classes.hpp"              // `kernel_tables`
@@ -34,7 +33,6 @@ using blobs::cuda_compactor_t;
 using blobs::hip_compactor_t;
 using blobs::sorted_run_bounds_t;
 using st::key128_t;
-using utilities::last_write_fold_t;
 
 expected<cuda_compactor_t> cuda_compactor_t::make(utilities::cuda_executor_t&, device_sections_reader_t) noexcept {
     return status_t {status_code_t::unsupported_k, "The suite's host build carries no device compactor"};
@@ -80,90 +78,88 @@ using views_of = std::span<blobs::sorted_run_index_view<key_slot_type_> const>;
 template st::status_t blobs::cuda_compactor_t::compact(
     compaction_kind_t, views_of<test::nvme::inline_key_slot<std::uint64_t>>,
     views_of<test::nvme::inline_key_slot<std::uint64_t>>, std::span<blobs::sorted_run_extents_t const>,
-    sorted_run_bounds_t const&, compaction_stamps_t const&, last_write_fold_t const&, blobs::no_device_fold_t const&,
+    sorted_run_bounds_t const&, compaction_stamps_t const&, blobs::fold_ref_t const&, blobs::no_device_fold_t const&,
     blobs::located_value_reader<test::nvme::inline_key_slot<std::uint64_t>>,
     compaction_output<test::nvme::inline_key_slot<std::uint64_t>>&);
 template st::status_t blobs::cuda_compactor_t::compact(
     compaction_kind_t, views_of<test::nvme::fixed_width_key_slot<std::uint64_t>>,
     views_of<test::nvme::fixed_width_key_slot<std::uint64_t>>, std::span<blobs::sorted_run_extents_t const>,
-    sorted_run_bounds_t const&, compaction_stamps_t const&, last_write_fold_t const&, blobs::no_device_fold_t const&,
+    sorted_run_bounds_t const&, compaction_stamps_t const&, blobs::fold_ref_t const&, blobs::no_device_fold_t const&,
     blobs::located_value_reader<test::nvme::fixed_width_key_slot<std::uint64_t>>,
     compaction_output<test::nvme::fixed_width_key_slot<std::uint64_t>>&);
 template st::status_t blobs::cuda_compactor_t::compact(
     compaction_kind_t, views_of<test::nvme::variable_width_key_slot<std::uint64_t>>,
     views_of<test::nvme::variable_width_key_slot<std::uint64_t>>, std::span<blobs::sorted_run_extents_t const>,
-    sorted_run_bounds_t const&, compaction_stamps_t const&, last_write_fold_t const&, blobs::no_device_fold_t const&,
+    sorted_run_bounds_t const&, compaction_stamps_t const&, blobs::fold_ref_t const&, blobs::no_device_fold_t const&,
     blobs::located_value_reader<test::nvme::variable_width_key_slot<std::uint64_t>>,
     compaction_output<test::nvme::variable_width_key_slot<std::uint64_t>>&);
 template st::status_t blobs::cuda_compactor_t::compact(
     compaction_kind_t, views_of<test::nvme::inline_key_slot<key128_t>>, views_of<test::nvme::inline_key_slot<key128_t>>,
     std::span<blobs::sorted_run_extents_t const>, sorted_run_bounds_t const&, compaction_stamps_t const&,
-    last_write_fold_t const&, blobs::no_device_fold_t const&,
+    blobs::fold_ref_t const&, blobs::no_device_fold_t const&,
     blobs::located_value_reader<test::nvme::inline_key_slot<key128_t>>,
     compaction_output<test::nvme::inline_key_slot<key128_t>>&);
 template st::status_t blobs::cuda_compactor_t::compact(
     compaction_kind_t, views_of<test::nvme::fixed_width_key_slot<key128_t>>,
     views_of<test::nvme::fixed_width_key_slot<key128_t>>, std::span<blobs::sorted_run_extents_t const>,
-    sorted_run_bounds_t const&, compaction_stamps_t const&, last_write_fold_t const&, blobs::no_device_fold_t const&,
+    sorted_run_bounds_t const&, compaction_stamps_t const&, blobs::fold_ref_t const&, blobs::no_device_fold_t const&,
     blobs::located_value_reader<test::nvme::fixed_width_key_slot<key128_t>>,
     compaction_output<test::nvme::fixed_width_key_slot<key128_t>>&);
 template st::status_t blobs::cuda_compactor_t::compact(
     compaction_kind_t, views_of<test::nvme::variable_width_key_slot<key128_t>>,
     views_of<test::nvme::variable_width_key_slot<key128_t>>, std::span<blobs::sorted_run_extents_t const>,
-    sorted_run_bounds_t const&, compaction_stamps_t const&, last_write_fold_t const&, blobs::no_device_fold_t const&,
+    sorted_run_bounds_t const&, compaction_stamps_t const&, blobs::fold_ref_t const&, blobs::no_device_fold_t const&,
     blobs::located_value_reader<test::nvme::variable_width_key_slot<key128_t>>,
     compaction_output<test::nvme::variable_width_key_slot<key128_t>>&);
 template st::status_t blobs::cuda_compactor_t::compact(
     compaction_kind_t, views_of<test::nvme::variable_width_key_slot<key128_t>>,
     views_of<test::nvme::variable_width_key_slot<key128_t>>, std::span<blobs::sorted_run_extents_t const>,
     sorted_run_bounds_t const&, compaction_stamps_t const&, graph::adjacency_fold_t const&,
-    graph::vram_nvidia_adjacency_fold_t const&,
-    blobs::located_value_reader<test::nvme::variable_width_key_slot<key128_t>>,
+    graph::vram_adjacency_fold_t const&, blobs::located_value_reader<test::nvme::variable_width_key_slot<key128_t>>,
     compaction_output<test::nvme::variable_width_key_slot<key128_t>>&);
 
 /** The suite's key slots on an AMD device. */
 template st::status_t blobs::hip_compactor_t::compact(
     compaction_kind_t, views_of<test::nvme::inline_key_slot<std::uint64_t>>,
     views_of<test::nvme::inline_key_slot<std::uint64_t>>, std::span<blobs::sorted_run_extents_t const>,
-    sorted_run_bounds_t const&, compaction_stamps_t const&, last_write_fold_t const&, blobs::no_device_fold_t const&,
+    sorted_run_bounds_t const&, compaction_stamps_t const&, blobs::fold_ref_t const&, blobs::no_device_fold_t const&,
     blobs::located_value_reader<test::nvme::inline_key_slot<std::uint64_t>>,
     compaction_output<test::nvme::inline_key_slot<std::uint64_t>>&);
 template st::status_t blobs::hip_compactor_t::compact(
     compaction_kind_t, views_of<test::nvme::fixed_width_key_slot<std::uint64_t>>,
     views_of<test::nvme::fixed_width_key_slot<std::uint64_t>>, std::span<blobs::sorted_run_extents_t const>,
-    sorted_run_bounds_t const&, compaction_stamps_t const&, last_write_fold_t const&, blobs::no_device_fold_t const&,
+    sorted_run_bounds_t const&, compaction_stamps_t const&, blobs::fold_ref_t const&, blobs::no_device_fold_t const&,
     blobs::located_value_reader<test::nvme::fixed_width_key_slot<std::uint64_t>>,
     compaction_output<test::nvme::fixed_width_key_slot<std::uint64_t>>&);
 template st::status_t blobs::hip_compactor_t::compact(
     compaction_kind_t, views_of<test::nvme::variable_width_key_slot<std::uint64_t>>,
     views_of<test::nvme::variable_width_key_slot<std::uint64_t>>, std::span<blobs::sorted_run_extents_t const>,
-    sorted_run_bounds_t const&, compaction_stamps_t const&, last_write_fold_t const&, blobs::no_device_fold_t const&,
+    sorted_run_bounds_t const&, compaction_stamps_t const&, blobs::fold_ref_t const&, blobs::no_device_fold_t const&,
     blobs::located_value_reader<test::nvme::variable_width_key_slot<std::uint64_t>>,
     compaction_output<test::nvme::variable_width_key_slot<std::uint64_t>>&);
 template st::status_t blobs::hip_compactor_t::compact(
     compaction_kind_t, views_of<test::nvme::inline_key_slot<key128_t>>, views_of<test::nvme::inline_key_slot<key128_t>>,
     std::span<blobs::sorted_run_extents_t const>, sorted_run_bounds_t const&, compaction_stamps_t const&,
-    last_write_fold_t const&, blobs::no_device_fold_t const&,
+    blobs::fold_ref_t const&, blobs::no_device_fold_t const&,
     blobs::located_value_reader<test::nvme::inline_key_slot<key128_t>>,
     compaction_output<test::nvme::inline_key_slot<key128_t>>&);
 template st::status_t blobs::hip_compactor_t::compact(
     compaction_kind_t, views_of<test::nvme::fixed_width_key_slot<key128_t>>,
     views_of<test::nvme::fixed_width_key_slot<key128_t>>, std::span<blobs::sorted_run_extents_t const>,
-    sorted_run_bounds_t const&, compaction_stamps_t const&, last_write_fold_t const&, blobs::no_device_fold_t const&,
+    sorted_run_bounds_t const&, compaction_stamps_t const&, blobs::fold_ref_t const&, blobs::no_device_fold_t const&,
     blobs::located_value_reader<test::nvme::fixed_width_key_slot<key128_t>>,
     compaction_output<test::nvme::fixed_width_key_slot<key128_t>>&);
 template st::status_t blobs::hip_compactor_t::compact(
     compaction_kind_t, views_of<test::nvme::variable_width_key_slot<key128_t>>,
     views_of<test::nvme::variable_width_key_slot<key128_t>>, std::span<blobs::sorted_run_extents_t const>,
-    sorted_run_bounds_t const&, compaction_stamps_t const&, last_write_fold_t const&, blobs::no_device_fold_t const&,
+    sorted_run_bounds_t const&, compaction_stamps_t const&, blobs::fold_ref_t const&, blobs::no_device_fold_t const&,
     blobs::located_value_reader<test::nvme::variable_width_key_slot<key128_t>>,
     compaction_output<test::nvme::variable_width_key_slot<key128_t>>&);
 template st::status_t blobs::hip_compactor_t::compact(
     compaction_kind_t, views_of<test::nvme::variable_width_key_slot<key128_t>>,
     views_of<test::nvme::variable_width_key_slot<key128_t>>, std::span<blobs::sorted_run_extents_t const>,
     sorted_run_bounds_t const&, compaction_stamps_t const&, graph::adjacency_fold_t const&,
-    graph::vram_nvidia_adjacency_fold_t const&,
-    blobs::located_value_reader<test::nvme::variable_width_key_slot<key128_t>>,
+    graph::vram_adjacency_fold_t const&, blobs::located_value_reader<test::nvme::variable_width_key_slot<key128_t>>,
     compaction_output<test::nvme::variable_width_key_slot<key128_t>>&);
 
 } // namespace unum::ustore

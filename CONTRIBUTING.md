@@ -461,7 +461,8 @@ A failed check prints where it failed and the operands, and the case goes on, so
 UStore 1.0.0
 - Compiled for: …
 - This machine: …
-- Seed: 42, scale: 1, filter: none
+- Seed: 42, scale: 1
+- Filter: none
 - test_ring_holds_a_medium_in_flight(transport_t::memory_k) ... ok (0.12 s)
   check failed at test/nvme/ring.cpp:120
     expected 4, got 3
@@ -487,7 +488,7 @@ cargo test --features serde                                         # Rust, over
 pixi run test                                                       # Mojo, against the library on the loader path
 ```
 
-pytest prints `UStore <version> from <path>`, the capabilities of each engine and the same `- Seed: …, scale: …, filter: …` line in its header.
+pytest prints `UStore <version> from <path>`, the capabilities of each engine and the same `- Seed: …, scale: …` line in its header.
 
 ### Environment
 
@@ -497,7 +498,7 @@ A flag takes its value as `--name value` or `--name=value`, and a switch given a
 | Variable                     | Flag                    | Default               | Meaning                                                                       |
 | :--------------------------- | :---------------------- | :-------------------- | :---------------------------------------------------------------------------- |
 | `USTORE_SEED`                | `--seed`                | `42`                  | Seed every stream descends from, or `random` to draw one, which a run prints  |
-| `USTORE_FILTER`              | `--filter`              | unset                 | ECMAScript regex over case labels or pytest node ids, else a substring        |
+| `USTORE_FILTER`              | `--filter`              | unset                 | C++ only: ECMAScript regex over case labels and benchmark rows                |
 | `USTORE_SCALE`               | `--scale`               | `1`                   | Multiplier of every baseline iteration count, like `0.1` or `10`              |
 | `USTORE_NO_SKIPS`            | `--no-skips`            | off                   | Exits with 3 when any case skipped                                            |
 | `USTORE_TRAP_ON_FAILURE`     | `--trap-on-failure`     | off                   | Raises `SIGTRAP` at the first failed check                                    |
@@ -521,8 +522,8 @@ A flag takes its value as `--name value` or `--name=value`, and a switch given a
 | `USTORE_TRANSACTIONS`        | `--transactions`        | `1,2,…,10,20,50,100`  | Linearizability: transactions every thread commits between two checkpoints    |
 | `USTORE_WRITES_PER_KEY`      | `--writes-per-key`      | `4`                   | Linearizability: mean writes one key receives per round, sizing the key range |
 
-The Python suites read `USTORE_SEED`, `USTORE_FILTER` and `USTORE_SCALE`, the Rust tests read `USTORE_SEED`, and the Mojo suite reads none.
-A filter that does not compile as a regex matches as a substring, the C suites match substrings alone, and pytest matches node ids, alongside `-k`.
+The Python suites read `USTORE_SEED` and `USTORE_SCALE`, the Rust tests read `USTORE_SEED`, and the Mojo suite reads none.
+A C++ filter that does not compile as a regex stops the run, the C suites run every case, and pytest selects through its own `-k`.
 
 With a directory, a suite creates a unique `ustore-XXXXXX` directory under it, runs every case inside it, and removes it at exit, so parallel runs never share a database; without one, the cases that need persistence or files skip, naming the setting they need.
 CTest passes `test_data` inside the build directory as the directory, the engine suites get their engine, and the tools suite also gets the CLI it drives on that engine.
@@ -568,10 +569,12 @@ Where the step after a failed check would index or dereference past what it chec
 A case that cannot run returns `case_result_t::skipped(reason)`, and generators draw from `split_mix_generator_t {case_stream_key(index)}`.
 Waits go through `spin_until`, bounded by `wait_limit_k`, and loop counts through `scaled_iterations(baseline)`.
 
-A C case is bracketed by `start_test_case(label)`, which the filter may refuse, and `finish_test_case(skip_reason)`, and checks through the file-local `expect_`, `#undef`'d at the end of the file:
+A C case is bracketed by `start_test_case(label)` and `finish_test_case(skip_reason)`, and checks through the file-local `expect_`, `#undef`'d at the end of the file:
 
 ```c
-if (start_test_case("test_init_ram_starts_empty")) test_init_ram_starts_empty(), finish_test_case(NULL);
+start_test_case("test_init_ram_starts_empty");
+test_init_ram_starts_empty();
+finish_test_case(NULL);
 ```
 
 A Python test is `test_<subject>_<behaviour>`, a sentence with a one-line docstring, and asks for what it opens by fixture: `database`, `view` (the database or a transaction over it), `later` (a deferred view), `arena`, the `blobs`, `docs` and `graph` collections, `seed`, `rng` and `unraisable`.
@@ -678,7 +681,7 @@ CMAKE_ARGS="-DUSTORE_WITH_ROCKSDB=OFF" pip install .  # RAM and LevelDB
 pip install --group test . && python -X faulthandler -m pytest -x
 ```
 
-The suites read `USTORE_SEED`, `USTORE_FILTER` and `USTORE_SCALE` as [Environment](#environment) lists, and pytest prints them in its header, so a failing run reruns with the same values.
+The suites read `USTORE_SEED` and `USTORE_SCALE` as [Environment](#environment) lists, select through pytest's own `-k`, and pytest prints them in its header, so a failing run reruns with the same values.
 
 An engine is left out through `CMAKE_ARGS` or `--config-settings=cmake.define.USTORE_WITH_<ENGINE>=OFF`, while NVMe stays out until its sources build; the build reads no environment variable of its own.
 

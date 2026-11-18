@@ -398,8 +398,16 @@ bool print_json(json_t const& json, std::string& out) {
     case json_t::kind_t::boolean_k: out += json.boolean ? "true" : "false"; return true;
     case json_t::kind_t::number_k:
         switch (json.number) {
-        case json_t::number_t::unsigned_k: out += std::to_string(json.unsigned_value); return true;
-        case json_t::number_t::signed_k: out += std::to_string(json.signed_value); return true;
+        case json_t::number_t::unsigned_k: {
+            char digits[24];
+            out.append(digits, std::to_chars(digits, digits + sizeof(digits), json.unsigned_value).ptr);
+            return true;
+        }
+        case json_t::number_t::signed_k: {
+            char digits[24];
+            out.append(digits, std::to_chars(digits, digits + sizeof(digits), json.signed_value).ptr);
+            return true;
+        }
         default:
             if (!std::isfinite(json.real_value)) return false;
             out += print_real(json.real_value);
@@ -1352,8 +1360,11 @@ status_t gist_paths(json_t const& node, std::string& prefix, std::set<std::strin
         };
         for (auto const& [key, value] : node.members)
             if (status_t const status = descend(key, value); status.failed()) return status;
-        for (json_t const& item : node.items)
-            if (status_t const status = descend(std::to_string(index++), item); status.failed()) return status;
+        for (json_t const& item : node.items) {
+            char digits[24];
+            std::string_view const token {digits, std::to_chars(digits, digits + sizeof(digits), index++).ptr};
+            if (status_t const status = descend(token, item); status.failed()) return status;
+        }
         return {};
     }
     if (seen.insert(prefix).second) paths.push_back(prefix);

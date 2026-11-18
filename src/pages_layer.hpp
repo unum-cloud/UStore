@@ -417,7 +417,7 @@ status_t serve_import(ustore_pages_import_t const& arguments, strings_arg_t cons
     return edit_pages(
         arguments, view,
         [&](std::size_t task, pages::placement_t placement, touched_page_t& page) noexcept -> expected<pages::edit_t> {
-            std::string_view const markup = string_of(values[task]);
+            std::string_view const markup = chars_of(values[task]);
             pages::element_key_t const root = element_key_of(page.place.key);
             auto [dense, dense_status] = import_page_tree<strings_kit_type_>(encoding, markup, root, placement,
                                                                              allocator);
@@ -454,7 +454,7 @@ status_t serve_insert(ustore_pages_insert_t const& arguments, strings_arg_t cons
             };
             page_tree_t fragment {allocator};
             if (status_t const parsed = pages::import_markup<strings_kit_type_>(
-                    encoding, string_of(values[task]), pages::nil_key_k, placement, mint, fragment);
+                    encoding, chars_of(values[task]), pages::nil_key_k, placement, mint, fragment);
                 parsed.failed())
                 return parsed;
             auto [dense, dense_status] = fragment.encode(allocator);
@@ -508,7 +508,7 @@ status_t serve_splice(ustore_pages_splice_t const& arguments, strings_arg_t cons
     return edit_pages(
         arguments, view,
         [&](std::size_t task, pages::placement_t placement, touched_page_t&) noexcept -> expected<pages::edit_t> {
-            std::string_view const bytes = values ? string_of(values[task]) : std::string_view {};
+            std::string_view const bytes = values ? chars_of(values[task]) : std::string_view {};
             return pages::splice_edit(placement, task_element(arguments.elements, task),
                                       task_length(arguments.text_starts, task),
                                       task_length(arguments.text_lengths, task), bytes);
@@ -526,8 +526,8 @@ status_t serve_set_attributes(ustore_pages_set_attributes_t const& arguments, st
     return edit_pages(
         arguments, view,
         [&](std::size_t task, pages::placement_t placement, touched_page_t&) noexcept -> expected<pages::edit_t> {
-            return pages::set_attribute_edit(placement, task_element(arguments.elements, task), string_of(fields[task]),
-                                             string_of(values[task]));
+            return pages::set_attribute_edit(placement, task_element(arguments.elements, task), chars_of(fields[task]),
+                                             chars_of(values[task]));
         },
         land);
 }
@@ -543,7 +543,7 @@ status_t serve_remove_attributes(ustore_pages_remove_attributes_t const& argumen
         arguments, view,
         [&](std::size_t task, pages::placement_t placement, touched_page_t&) noexcept -> expected<pages::edit_t> {
             return pages::remove_attribute_edit(placement, task_element(arguments.elements, task),
-                                                string_of(fields[task]));
+                                                chars_of(fields[task]));
         },
         land);
 }

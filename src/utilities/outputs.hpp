@@ -21,7 +21,7 @@
 
 #include "ustore/ranges.hpp" // `bits_span_t`, `bytes_of`
 #include "ustore/status.hpp" // `expected`, `status_t`
-#include "ustore/types.hpp"  // `value_view_t`, `string_of`, `round_up_to_multiple`
+#include "ustore/types.hpp"  // `value_view_t`, `chars_of`, `round_up_to_multiple`
 
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `growing_strings`, `export_strings`
 
@@ -335,7 +335,7 @@ class strings_scan_outputs_t {
     std::size_t size() const noexcept { return strings_.size(); }
 
     /** The string at @p index. */
-    std::string_view operator[](std::size_t index) const noexcept { return string_of(strings_[index]); }
+    std::string_view operator[](std::size_t index) const noexcept { return chars_of(strings_[index]); }
 
     /** Appends @p text, failing when the scratch refuses. */
     status_t push(std::string_view text) noexcept { return strings_.push_back(bytes_of(text)); }

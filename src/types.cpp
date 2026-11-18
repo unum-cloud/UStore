@@ -481,7 +481,8 @@ void ustore_arena_init(ustore_arena_init_t* arguments) {
         std::visit(
             [&]<typename device_type_>(device_type_ const& device) noexcept {
                 if constexpr (gpu_executor_concept<device_type_>)
-                    arena->memory = typename device_type_::arena_blocks_t {.device = device.device()};
+                    arena->memory = typename device_type_::arena_blocks_t {
+                        .device = static_cast<int>(device.device().vendor_ordinal)};
                 else arena->memory = host_blocks_t {.memory_domain = executor->memory_domain};
             },
             executor->device);

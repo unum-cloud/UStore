@@ -2313,7 +2313,7 @@ void pull_feed(open_feed_t& feed, std::span<logged_change_t const> log, std::siz
         logged_change_t const& logged = log[first + feed.handed + index];
         expect_true(keys[index] == logged.key && stamps[index] == logged.stamp && kinds[index] == logged.kind);
         std::string const value = logged.kind == ustore_change_write_k ? fmt::format("v{}", logged.round) : "";
-        expect_true(string_of(tape_string(values, index)) == value);
+        expect_true(chars_of(tape_string(values, index)) == value);
     }
     feed.handed += count;
 }

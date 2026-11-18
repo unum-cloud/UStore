@@ -106,7 +106,7 @@ status_t init(ustore_database_init_ram_t const& arguments, cpu_ceiling_t ceiling
 
 status_t open(ustore_database_open_ram_t const& arguments, cpu_ceiling_t ceiling, view_t const&) noexcept {
     if (!names_path(arguments.directory)) return {status_code_t::invalid_argument_k, "A database needs a directory"};
-    return open_in(arguments, ceiling, string_of(arguments.directory));
+    return open_in(arguments, ceiling, chars_of(arguments.directory));
 }
 
 } // namespace unum::ustore::ram

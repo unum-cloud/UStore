@@ -880,7 +880,7 @@ store_status_t read_strings(view_type_ const& view, strings_arg_t const& texts, 
     for (std::size_t index = first; index != end; ++index) {
         auto const found = [&](string_pair_t const& pair) noexcept { outputs.assign_present(index, pair.mapped); };
         auto const missing = [&]() noexcept { outputs.assign_missing(index); };
-        auto [key, key_status] = string_key_from(string_of(texts[index]));
+        auto [key, key_status] = string_key_from(chars_of(texts[index]));
         if (st::failed(key_status)) return key_status;
         store_status_t const looked_up = view.find(key, found, missing);
         if (st::failed(looked_up)) return looked_up;
@@ -1085,7 +1085,7 @@ template <typename transaction_type_>
 store_status_t stage_strings(transaction_type_& transaction, strings_arg_t const& texts,
                              strided_iterator<ustore_key_t const> values, std::size_t first, std::size_t end) noexcept {
     for (std::size_t index = first; index != end; ++index) {
-        auto [key, key_status] = string_key_from(string_of(texts[index]));
+        auto [key, key_status] = string_key_from(chars_of(texts[index]));
         if (st::failed(key_status)) return key_status;
         store_status_t const staged = transaction.upsert(string_pair_t {std::move(key), values[index]});
         if (st::failed(staged)) return staged;
@@ -1098,7 +1098,7 @@ template <typename transaction_type_>
 store_status_t stage_string_removals(transaction_type_& transaction, strings_arg_t const& texts, std::size_t first,
                                      std::size_t end, ustore_watch_t watch) noexcept {
     for (std::size_t index = first; index != end; ++index) {
-        auto [key, key_status] = string_key_from(string_of(texts[index]));
+        auto [key, key_status] = string_key_from(chars_of(texts[index]));
         if (st::failed(key_status)) return key_status;
         store_status_t const erased = stage_erase(transaction, key, watch);
         if (st::failed(erased)) return erased;
@@ -1113,9 +1113,9 @@ store_status_t stage_string_range_removals(transaction_type_& transaction, strin
                                            strings_arg_t const& end_texts, std::size_t first,
                                            std::size_t end) noexcept {
     for (std::size_t index = first; index != end; ++index) {
-        auto [lower, lower_status] = string_key_from(string_of(texts[index]));
+        auto [lower, lower_status] = string_key_from(chars_of(texts[index]));
         if (st::failed(lower_status)) return lower_status;
-        std::string_view const end_text = string_of(end_texts[index]);
+        std::string_view const end_text = chars_of(end_texts[index]);
         if (end_text.empty()) {
             store_status_t const erased = transaction.erase_from(lower, st::no_op_t {});
             if (st::failed(erased)) return erased;
@@ -1871,14 +1871,14 @@ status_t read_values(database_state<cpu_class_, isolation_>& state, arguments_ty
 /**
  *  @brief Reads the documents or pages at @p places of collections whose stores hold @p entry_type_, refusing any
  *      other, through @p source watching as @p view asks, appending their bytes to its scratch.
- *  @param[out] presences The presence bits of the values read, in the scratch.
- *  @param[out] contents The values read, missing ones empty, in the scratch.
  *  @param[out] failure The failure of the stores, which a commit retries when it is a conflict.
+ *  @return The presence bits and the values read, missing ones empty, in the scratch.
  */
 template <typename entry_type_, typename source_type_>
-status_t read_into_scratch(source_type_& source, place_batch_t const& places, view_t const& view,
-                           ustore_octet_t const*& presences, ustore_strings_view_t& contents,
-                           store_status_t& failure) noexcept {
+expected<values_view_t> read_into_scratch(source_type_& source, place_batch_t const& places, view_t const& view,
+                                          store_status_t& failure) noexcept {
+    ustore_octet_t const* presences = nullptr;
+    ustore_strings_view_t contents {};
     ustore_blobs_read_t read {};
     read.count = places.count;
     read.presences = &presences;
@@ -1905,7 +1905,8 @@ status_t read_into_scratch(source_type_& source, place_batch_t const& places, vi
         return translate(runs);
     }
     outputs.assigned(places.size());
-    return outputs.finish(read);
+    if (status_t const status = outputs.finish(read); status.failed()) return status;
+    return values_view_t {places.count, presences, contents};
 }
 
 /** Implements the scan of collections whose stores hold @p entry_type_, refusing any other, as
@@ -2237,7 +2238,7 @@ template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_snapshot_save_t const& arguments,
                view_t const& view) noexcept {
     sz::string_t path;
-    if (path.assign(sz::string_view_t {string_of(arguments.path)}) != sz::status_t::success_k)
+    if (path.assign(sz::string_view_t {chars_of(arguments.path)}) != sz::status_t::success_k)
         return {status_code_t::out_of_memory_k, "Failed to copy the save path"};
     if (path.empty() || !names_directory(path.c_str()))
         return {status_code_t::not_found_k, "The save path isn't a directory"};
@@ -2340,7 +2341,7 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_collection_
         if (!named) return named.status();
         auto const collections = source.collections();
         for (std::size_t index = 0; index != arguments.count; ++index) {
-            auto [key, key_status] = string_key_from(string_of(names[index]));
+            auto [key, key_status] = string_key_from(chars_of(names[index]));
             if (st::failed(key_status)) return key_status;
             ustore_collection_id_t id {};
             bool present = false;

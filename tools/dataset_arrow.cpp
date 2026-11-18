@@ -1176,7 +1176,7 @@ void ustore_dataset_import(ustore_dataset_import_t* task_pointer) {
         return;
     }
 
-    std::string_view const name = task.collection_name.length ? string_of(task.collection_name)
+    std::string_view const name = task.collection_name.length ? chars_of(task.collection_name)
                                                               : metadata_value(state.schema.metadata, collection_key_k);
     if (name.empty()) {
         *task.outcome = {ustore_status_invalid_argument_k,
@@ -1318,7 +1318,7 @@ void ustore_dataset_export(ustore_dataset_export_t* task_pointer) {
                                            : listed_modality(task.database, snapshot, task.collection, task.outcome);
     std::array<ipc_key_value_t, 2> metadata {
         {{modality_key_k, failed(task.outcome) ? "" : ustore_modality_name(modality)},
-         {collection_key_k, string_of(task.collection_name)}}};
+         {collection_key_k, chars_of(task.collection_name)}}};
     ipc_schema_t const schema {export_fields(modality), std::span(metadata).first(task.collection_name.length ? 2 : 1)};
 
     output_descriptor_t output;

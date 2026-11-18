@@ -36,11 +36,7 @@ namespace unum::ustore::ram {
 template <typename source_type_>
 expected<values_view_t> read_page_trees(source_type_& source, place_batch_t const& places, view_t const& view,
                                         store_status_t& failure) noexcept {
-    ustore_octet_t const* presences = nullptr;
-    ustore_strings_view_t trees {};
-    status_t const status = read_into_scratch<pages::page_pair_t>(source, places, view, presences, trees, failure);
-    if (status.failed()) return status;
-    return values_view_t {places.count, presences, trees};
+    return read_into_scratch<pages::page_pair_t>(source, places, view, failure);
 }
 
 /** Lands an edit call on the pages stores of a transaction, reading the pages watched, as a

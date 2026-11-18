@@ -26,6 +26,7 @@
 #include "utilities/batches.hpp" // `validate_write`, `places_of`, `scans_of`, `measures_of`
 #include "utilities/outputs.hpp"  // `scan_outputs_t`, `measure_outputs_t`
 #include "utilities/progress.hpp" // `progress_t`, `progress_cancelled_k`
+#include "utilities/slices.hpp"   // `for_task_slices`
 
 namespace unum::ustore::oracles::rocksdb {
 
@@ -168,10 +169,18 @@ status_t blobs_read(ustore_blobs_read_t const& arguments, view_t const& view) {
     std::unique_ptr<native_status_t[]> statuses {new (std::nothrow) native_status_t[count]};
     if (!values || !statuses) return {status_code_t::out_of_memory_k, "Failed to allocate the batch"};
 
-    if (status_t const status = get_many(database, transaction, read_options, places, view.watch, values.get(),
-                                         statuses.get());
-        status.failed())
-        return status;
+    // A transaction's reads join its watch set, so only a read outside one splits, at one snapshot
+    ::rocksdb::ManagedSnapshot pinned {database.native.get(),
+                                       read_options.snapshot ? nullptr : database.native->GetSnapshot()};
+    if (pinned.snapshot()) read_options.snapshot = pinned.snapshot();
+    auto read_slice = [&](std::size_t first, std::size_t length, view_t const&) noexcept -> status_t {
+        auto const offset = static_cast<std::ptrdiff_t>(first);
+        place_batch_t const slice {places.collections_begin + offset, places.keys_begin + offset, {}, length};
+        return get_many(database, transaction, read_options, slice, view.watch, values.get() + first,
+                        statuses.get() + first);
+    };
+    status_t const read = transaction ? read_slice(0, count, view) : for_task_slices(view, count, read_slice);
+    if (read.failed()) return read;
     return export_values(arguments, values.get(), statuses.get(), view.scratch);
 }
 

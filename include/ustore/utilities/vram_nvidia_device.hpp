@@ -51,6 +51,7 @@ enum cuda_device_attribute_t : int {
     cuda_attribute_multiprocessor_count_k = 16,
     cuda_attribute_compute_capability_major_k = 75,
     cuda_attribute_compute_capability_minor_k = 76,
+    cuda_attribute_shared_memory_per_block_optin_k = 97,
     cuda_attribute_host_numa_id_k = 134,
 };
 
@@ -193,12 +194,14 @@ inline std::size_t list_nvidia_gpu_devices(cuda_api_t const& api, std::span<gpu_
     int devices_count = 0;
     if (!api || api.get_device_count(&devices_count) != cuda_success_k) return count;
     for (int ordinal = 0; ordinal != devices_count && count != into.size(); ++ordinal) {
-        int handle = 0, major = 0, minor = 0, compute_units = 0;
+        int handle = 0, major = 0, minor = 0, compute_units = 0, shared_memory_per_block = 0;
         std::size_t memory_bytes = 0;
         if (api.get_device(&handle, ordinal) != cuda_success_k ||
             api.get_device_attribute(&major, cuda_attribute_compute_capability_major_k, handle) != cuda_success_k ||
             api.get_device_attribute(&minor, cuda_attribute_compute_capability_minor_k, handle) != cuda_success_k ||
             api.get_device_attribute(&compute_units, cuda_attribute_multiprocessor_count_k, handle) != cuda_success_k ||
+            api.get_device_attribute(&shared_memory_per_block, cuda_attribute_shared_memory_per_block_optin_k,
+                                     handle) != cuda_success_k ||
             api.get_device_memory(&memory_bytes, handle) != cuda_success_k)
             continue;
         gpu_device_t& device = into[count++];
@@ -207,6 +210,7 @@ inline std::size_t list_nvidia_gpu_devices(cuda_api_t const& api, std::span<gpu_
                   static_cast<std::uint32_t>(major),
                   static_cast<std::uint32_t>(minor),
                   static_cast<std::uint32_t>(compute_units),
+                  static_cast<std::uint32_t>(shared_memory_per_block),
                   static_cast<std::uint64_t>(memory_bytes)};
         api.get_device_name(device.name, static_cast<int>(sizeof(device.name)), handle);
     }
@@ -307,21 +311,22 @@ class cuda_executor_t {
     /** The kernels this executor launches. */
     using function_t = cuda_function_handle_t;
 
-    /** Binds CUDA ordinal @p ordinal through @p context, its retained primary context, and queues
-     *  on @p borrowed, a @c cudaStream_t of the caller's on that device which outlives the
-     *  executor, or on one of its own for null; its scratch never grows past @p scratch_limit
-     *  bytes, zero for no limit, bytes move between the drives and the device as @p gds asks, and
-     *  its launches find their kernels in @p kernels, the device's table of the library's bundle,
-     *  or none for null. */
-    static expected<cuda_executor_t> spawn(cuda_api_t const& api, cuda_context_handle_t context, int ordinal,
-                                           void* borrowed, std::size_t scratch_limit, ustore_gds_t gds,
+    /** Binds @p device, as the CUDA listing reports it, through @p context, its retained primary
+     *  context, and queues on @p borrowed, a @c cudaStream_t of the caller's on that device which
+     *  outlives the executor, or on one of its own for null; its scratch never grows past
+     *  @p scratch_limit bytes, zero for no limit, bytes move between the drives and the device as
+     *  @p gds asks, and its launches find their kernels in @p kernels, the device's table of the
+     *  library's bundle, or none for null. */
+    static expected<cuda_executor_t> spawn(cuda_api_t const& api, cuda_context_handle_t context,
+                                           gpu_device_t const& device, void* borrowed, std::size_t scratch_limit,
+                                           ustore_gds_t gds,
                                            kernel_table<cuda_module_t> const* kernels = nullptr) noexcept {
         if (!api || !context || api.set_current_context(context) != cuda_success_k)
             return status_t {status_code_t::device_k, "The CUDA driver refused the device"};
         cuda_executor_t executor;
         executor.api_ = &api;
         executor.context_ = context;
-        executor.device_ = ordinal;
+        executor.device_ = device;
         executor.scratch_limit_ = scratch_limit;
         executor.gds_ = gds;
         executor.kernels_ = kernels;
@@ -335,7 +340,7 @@ class cuda_executor_t {
         if (!executor.event_) return status_t {status_code_t::device_k, "Failed to create an event on the device"};
         // The bounce stays on node zero where the driver places the device on no NUMA node
         int handle = 0, numa_node = -1;
-        if (api.get_device(&handle, ordinal) != cuda_success_k ||
+        if (api.get_device(&handle, static_cast<int>(device.vendor_ordinal)) != cuda_success_k ||
             api.get_device_attribute(&numa_node, cuda_attribute_host_numa_id_k, handle) != cuda_success_k ||
             numa_node < 0)
             numa_node = 0;
@@ -364,8 +369,8 @@ class cuda_executor_t {
         return {};
     }
 
-    /** The CUDA ordinal every call and arena of the executor uses. */
-    int device() const noexcept { return device_; }
+    /** The device every call and arena of the executor uses, as the CUDA listing reports it. */
+    gpu_device_t const& device() const noexcept { return device_; }
 
     /** Bytes of scratch a call may take, zero for no limit. */
     std::size_t scratch_limit() const noexcept { return scratch_limit_; }
@@ -476,7 +481,7 @@ class cuda_executor_t {
 
     cuda_stream_handle_t stream_ = nullptr;
     cuda_event_t event_;
-    int device_ = 0;
+    gpu_device_t device_ {};
     std::size_t scratch_limit_ = 0;
     ustore_gds_t gds_ = ustore_gds_automatic_k;
     kernel_table<cuda_module_t> const* kernels_ = nullptr;

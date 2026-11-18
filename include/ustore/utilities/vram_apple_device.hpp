@@ -185,8 +185,8 @@ struct metal_devices_t {
     /** The retained @c id<MTLDevice> of every listed device. */
     void* handles[gpu_devices_capacity_k] = {};
 
-    /** What the listing reports of every device: its family as the architecture's major, its cores
-     *  and the working set Metal recommends. */
+    /** What the listing reports of every device: its family as the architecture's major, its cores,
+     *  its threadgroup memory and the working set Metal recommends. */
     gpu_device_t listed[gpu_devices_capacity_k] = {};
 
     std::size_t count = 0;
@@ -212,6 +212,7 @@ struct metal_devices_t {
                      family,
                      0,
                      apple_core_count_of(api, device),
+                     static_cast<std::uint32_t>(metal_send<std::size_t>(api, device, "maxThreadgroupMemoryLength")),
                      metal_send<std::uint64_t>(api, device, "recommendedMaxWorkingSetSize")};
             char const* const name = metal_send<char const*>(api, metal_send(api, device, "name"), "UTF8String");
             if (name) std::strncpy(entry.name, name, sizeof(entry.name) - 1);
@@ -436,25 +437,25 @@ class metal_executor_t {
     /** The kernels this executor launches. */
     using function_t = metal_function_handle_t;
 
-    /** Binds Apple ordinal @p ordinal, @p device its @c id<MTLDevice>, and commits to @p borrowed,
-     *  an @c id<MTLCommandQueue> of the caller's on that device which outlives the executor, or to
-     *  one of its own for null; its scratch never grows past @p scratch_limit bytes, zero for no
-     *  limit, and its launches find their kernels in @p kernels, the device's table of the
-     *  library's bundle, or none for null. */
-    static expected<metal_executor_t> spawn(metal_api_t const& api, void* device, int ordinal, void* borrowed,
-                                            std::size_t scratch_limit,
+    /** Binds @p device, as the Metal listing reports it, @p handle its @c id<MTLDevice>, and
+     *  commits to @p borrowed, an @c id<MTLCommandQueue> of the caller's on that device which
+     *  outlives the executor, or to one of its own for null; its scratch never grows past
+     *  @p scratch_limit bytes, zero for no limit, and its launches find their kernels in
+     *  @p kernels, the device's table of the library's bundle, or none for null. */
+    static expected<metal_executor_t> spawn(metal_api_t const& api, void* handle, gpu_device_t const& device,
+                                            void* borrowed, std::size_t scratch_limit,
                                             kernel_table<metal_module_t> const* kernels = nullptr) noexcept {
-        if (!api || !device) return status_t {status_code_t::device_k, "Metal refused the device"};
+        if (!api || !handle) return status_t {status_code_t::device_k, "Metal refused the device"};
         if constexpr (!STRINGZILLA_TARGET_METAL)
             return status_t {status_code_t::device_k, "The library compiled no Metal layer"};
         metal_executor_t executor;
         executor.api_ = &api;
-        executor.device_ = ordinal;
+        executor.device_ = device;
         executor.scratch_limit_ = scratch_limit;
         executor.kernels_ = kernels;
         executor.queue_ = borrowed;
         if (!borrowed) {
-            executor.owned_queue_ = metal_send(api, device, "newCommandQueue");
+            executor.owned_queue_ = metal_send(api, handle, "newCommandQueue");
             if (!executor.owned_queue_) return status_t {status_code_t::device_k, "Failed to create a queue"};
             executor.queue_ = executor.owned_queue_;
         }
@@ -485,8 +486,8 @@ class metal_executor_t {
         return {};
     }
 
-    /** The Apple ordinal every call and arena of the executor uses. */
-    int device() const noexcept { return device_; }
+    /** The device every call and arena of the executor uses, as the Metal listing reports it. */
+    gpu_device_t const& device() const noexcept { return device_; }
 
     /** Bytes of scratch a call may take, zero for no limit. */
     std::size_t scratch_limit() const noexcept { return scratch_limit_; }
@@ -580,7 +581,7 @@ class metal_executor_t {
     void* owned_queue_ = nullptr;
 
     void* queue_ = nullptr;
-    int device_ = 0;
+    gpu_device_t device_ {};
     std::size_t scratch_limit_ = 0;
     kernel_table<metal_module_t> const* kernels_ = nullptr;
     ustore_arena_handle_t bounce_ {};

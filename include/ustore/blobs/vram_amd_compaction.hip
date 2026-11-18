@@ -33,20 +33,22 @@ element_type_* hip_compactor_t::carve_(std::size_t count) noexcept {
 }
 
 template <typename record_type_>
-st::status_t hip_compactor_t::pack_(char const* name, merge_pack_regions<record_type_> const& regions,
-                                    std::uint64_t*& counted) noexcept {
+st::expected<packed_counts_t> hip_compactor_t::pack_(char const* name,
+                                                     merge_pack_regions<record_type_> const& regions) noexcept {
     using st::status_t;
     std::uint64_t* const chains = carve_<std::uint64_t>(2);
     if (!chains) return status_t::out_of_memory_heap_k;
-    counted = chains;
     status_t const zeroed = executor_status(
         executor_->fill_async(reinterpret_cast<std::uintptr_t>(chains), byte_t {0}, 2 * sizeof(std::uint64_t)));
     if (zeroed != status_t::success_k) return zeroed;
     std::uint64_t const tickets = fu::min_of(
         divide_round_up(regions.records_count, std::uint64_t {merge_block_threads_k}), utilities::chain_blocks_max_k);
-    return launch_over(*executor_, name, tickets * merge_block_threads_k, tickets, regions.merged, regions.flags,
-                       regions.records_count, regions.replaced, regions.replacements, regions.replaced_count, tickets,
-                       regions.survivors, regions.prefix, regions.shares, chains);
+    status_t const launched = launch_over(*executor_, name, tickets * merge_block_threads_k, tickets, regions.merged,
+                                          regions.flags, regions.records_count, regions.replaced, regions.replacements,
+                                          regions.replaced_count, tickets, regions.survivors, regions.prefix,
+                                          regions.shares, chains);
+    if (launched != status_t::success_k) return launched;
+    return packed_counts_t {chains};
 }
 
 template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
@@ -69,18 +71,19 @@ st::status_t hip_compactor_t::compact(compaction_kind_t kind,
 template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
           typename allocator_type_>
     requires compactable_key_slot_concept<key_slot_type_>
-st::status_t hip_compactor_t::compact_on_device_(
-    compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_type_> const> upper,
-    std::span<sorted_run_index_view<key_slot_type_> const> lower, std::span<sorted_run_extents_t const> extents,
-    sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps, [[maybe_unused]] fold_type_ const& fold,
-    [[maybe_unused]] device_fold_type_ const& device_fold,
-    [[maybe_unused]] std::type_identity_t<located_value_reader<key_slot_type_>> read_value,
-    compaction_output<key_slot_type_, allocator_type_>& output) noexcept {
+st::status_t hip_compactor_t::compact_on_device_(compaction_kind_t kind,
+                                                 std::span<sorted_run_index_view<key_slot_type_> const> upper,
+                                                 std::span<sorted_run_index_view<key_slot_type_> const> lower,
+                                                 std::span<sorted_run_extents_t const> extents,
+                                                 sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps,
+                                                 fold_type_ const& fold, device_fold_type_ const& device_fold,
+                                                 std::type_identity_t<located_value_reader<key_slot_type_>> read_value,
+                                                 compaction_output<key_slot_type_, allocator_type_>& output) noexcept {
     using st::status_t;
     using record_t = located_key_slot<key_slot_type_>;
     using view_t = sorted_run_index_view<key_slot_type_>;
     using names_t = merge_kernel_names<key_slot_type_>;
-    constexpr bool device_folds_k = !std::is_same_v<device_fold_type_, no_device_fold_t>;
+    using range_t = range_tombstone<typename key_slot_type_::stored_key_t>;
     constexpr bool locates_k = locates_stored_values_concept<key_slot_type_>;
     constexpr bool gathers_keys_k = !is_inline(key_slot_type_::value_layout_k);
     constexpr st::assume_uninitialized_t uninitialized {};
@@ -97,7 +100,7 @@ st::status_t hip_compactor_t::compact_on_device_(
     };
 
     std::uint64_t merged_count = 0;
-    std::size_t saved_count = 0;
+    std::size_t saved_count = 0, ranges_count = 0;
     bool changes = false;
     sections_source_t const preferred = sections_ ? sections_source_t::volume_k : sections_source_t::memory_k;
     scratch_cursor_t sizing;
@@ -105,12 +108,10 @@ st::status_t hip_compactor_t::compact_on_device_(
         view_t const& view = view_of(run);
         changes |= holds_changes(view.kinds);
         merged_count += view.key_slots_count;
+        if (view.range_tombstones != nullptr) ranges_count += view.range_tombstones->size();
         if (carve_sections(view, extents[run], preferred, sizing).source == sections_source_t::memory_k)
             saved_count += saved_words(view);
     }
-    // Without a device fold, changes fold on the host alone, where every merge
-    // holding one runs.
-    if (!device_folds_k && changes) return status_t::invalid_argument_k;
     output.folded.clear();
 
     if (executor_->bind().failed()) return status_t::unknown_k;
@@ -140,8 +141,10 @@ st::status_t hip_compactor_t::compact_on_device_(
     std::uint64_t* const prefix = locates_k ? carve_<std::uint64_t>(records_count + 1) : nullptr;
     std::uint8_t* const shares = carve_<std::uint8_t>(records_count);
     key_rows_gather<key_slot_type_>* const gathers = carve_<key_rows_gather<key_slot_type_>>(sorted_runs_count);
+    range_t* const ranges = carve_<range_t>(ranges_count);
+    std::uint64_t* const range_stamps = carve_<std::uint64_t>(ranges_count);
     if ((sorted_runs_count && (!runs || !gathers)) || (saved_count && !saved_columns) ||
-        (stamps.pinned_count && !pinned) ||
+        (stamps.pinned_count && !pinned) || (ranges_count && (!ranges || !range_stamps)) ||
         (records_count && (!merged || !flags || !survivors || !shares || (locates_k && !prefix))))
         return status_t::out_of_memory_heap_k;
 
@@ -176,7 +179,7 @@ st::status_t hip_compactor_t::compact_on_device_(
     // through @c runs
     reads_.clear();
     scratch_cursor_t placing {sections_base};
-    std::size_t saved_offset = 0;
+    std::size_t saved_offset = 0, ranges_offset = 0;
     std::uint64_t first = 0;
     status_t status = status_t::success_k;
     for (std::uint64_t run = 0; run != sorted_runs_count; ++run) {
@@ -189,6 +192,16 @@ st::status_t hip_compactor_t::compact_on_device_(
         described.assigned_stamp = run_extents.assigned_stamp, described.first = first;
         described.key_slots_count = view.key_slots_count;
         first += view.key_slots_count;
+        // A run's range tombstones stay in memory wherever its sections sit, so they upload
+        if (view.range_tombstones != nullptr && !view.range_tombstones->empty()) {
+            std::size_t const count = view.range_tombstones->size();
+            described.range_tombstones = {ranges + ranges_offset, range_stamps + ranges_offset, count};
+            status = upload(*executor_, ranges + ranges_offset, view.range_tombstones->ranges().data(), count);
+            if (status != status_t::success_k) return status;
+            status = upload(*executor_, range_stamps + ranges_offset, view.range_tombstones->stamps().data(), count);
+            if (status != status_t::success_k) return status;
+            ranges_offset += count;
+        }
         if (sections.source == sections_source_t::volume_k) {
             if (!queue_section_reads(run_extents, sections)) return status_t::out_of_memory_heap_k;
             described.saved_stamps = sections.trailer;
@@ -217,14 +230,14 @@ st::status_t hip_compactor_t::compact_on_device_(
         if (view.key_slots_count == 0) continue;
         if (view.stamps != nullptr) {
             std::size_t const bytes = view.stamps->saved_bytes();
-            if (view.stamps->save({reinterpret_cast<byte_t*>(saved + saved_offset), bytes}) != status_t::success_k)
+            if (view.stamps->save(bytes_of(saved + saved_offset, bytes / sizeof(std::uint64_t))) != status_t::success_k)
                 return status_t::invalid_argument_k;
             described.saved_stamps = saved_columns + saved_offset;
             saved_offset += bytes / sizeof(std::uint64_t);
         }
         if (view.kinds != nullptr) {
             std::size_t const bytes = view.kinds->saved_bytes();
-            if (view.kinds->save({reinterpret_cast<byte_t*>(saved + saved_offset), bytes}) != status_t::success_k)
+            if (view.kinds->save(bytes_of(saved + saved_offset, bytes / sizeof(std::uint64_t))) != status_t::success_k)
                 return status_t::invalid_argument_k;
             described.saved_kinds = saved_columns + saved_offset;
             saved_offset += bytes / sizeof(std::uint64_t);
@@ -269,11 +282,9 @@ st::status_t hip_compactor_t::compact_on_device_(
         if (status != status_t::success_k) return status;
         std::span<std::uint64_t> indices;
         std::span<record_t> replacements;
-        if constexpr (device_folds_k)
-            if (changes)
-                status = fold_survivors(*executor_, blocks_, kind, stamps, sorted_runs_count, bounds.value_stride,
-                                        merged, flags, merged_count, fold, device_fold, read_value, output, indices,
-                                        replacements);
+        if (changes)
+            status = fold_survivors(*executor_, blocks_, kind, stamps, sorted_runs_count, bounds.value_stride, merged,
+                                    flags, merged_count, fold, device_fold, read_value, output, indices, replacements);
         if (status != status_t::success_k) return status;
         std::uint64_t* const replaced = carve_<std::uint64_t>(indices.size());
         record_t* const replacing = carve_<record_t>(replacements.size());
@@ -282,12 +293,10 @@ st::status_t hip_compactor_t::compact_on_device_(
             return status;
         if ((status = upload(*executor_, replacing, replacements.data(), replacements.size())) != status_t::success_k)
             return status;
-        std::uint64_t* counted = nullptr;
-        status = pack_(names_t::pack_k,
-                       merge_pack_regions<record_t> {merged, flags, merged_count, replaced, replacing,
-                                                     std::uint64_t {indices.size()}, survivors, prefix, shares},
-                       counted);
-        if (status != status_t::success_k) return status;
+        auto [packed, pack_status] = pack_(
+            names_t::pack_k, merge_pack_regions<record_t> {merged, flags, merged_count, replaced, replacing,
+                                                           std::uint64_t {indices.size()}, survivors, prefix, shares});
+        if (pack_status != status_t::success_k) return pack_status;
 
         // What plans the new runs comes back at once, sized by the records, as only the
         // device counts survivors
@@ -296,7 +305,7 @@ st::status_t hip_compactor_t::compact_on_device_(
         host_shares = carve_bounce<std::uint8_t>(*executor_, records_count);
         if (!selected || !host_shares || (locates_k && !prefixes) || executor_->pin_bounce().failed())
             return status_t::out_of_memory_heap_k;
-        if ((status = download(*executor_, selected, counted, 1)) != status_t::success_k) return status;
+        if ((status = download(*executor_, selected, packed.counted, 1)) != status_t::success_k) return status;
         if ((status = download(*executor_, prefixes, prefix, locates_k ? records_count + 1 : 0)) != status_t::success_k)
             return status;
         if ((status = download(*executor_, host_shares, shares, records_count)) != status_t::success_k) return status;

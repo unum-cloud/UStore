@@ -339,7 +339,7 @@ void construct_docs(executor_t& executor, twitter_settings_t const& settings, tw
                     ustore_collection_id_t collection, std::size_t batch_size, ustore_durability_t durability) {
     std::string const name = fmt::format("construct_docs{}/{}",
                                          durability == ustore_durability_flushed_k ? "_flushed" : "", batch_size);
-    if (!settings.filter.selects(name)) return;
+    if (!settings.regex_filter.selects(name)) return;
     st::vector<keyed_document_t> documents;
     if (!flatten(twitter.documents, documents)) return print(row_t {.name = name, .skipped = "no memory for batches"});
     std::span<keyed_document_t const> const staged {documents.begin(), documents.end()};
@@ -359,7 +359,7 @@ void construct_docs(executor_t& executor, twitter_settings_t const& settings, tw
 void construct_blobs(executor_t& executor, twitter_settings_t const& settings, twitter_t const& twitter,
                      std::size_t batch_size) {
     std::string const name = fmt::format("construct_blobs/{}", batch_size);
-    if (!settings.filter.selects(name)) return;
+    if (!settings.regex_filter.selects(name)) return;
     st::vector<keyed_document_t> documents;
     if (!flatten(twitter.documents, documents)) return print(row_t {.name = name, .skipped = "no memory for batches"});
     std::span<keyed_document_t const> const staged {documents.begin(), documents.end()};
@@ -386,7 +386,7 @@ void construct_blobs(executor_t& executor, twitter_settings_t const& settings, t
 void construct_graph(executor_t& executor, twitter_settings_t const& settings, twitter_t const& twitter,
                      std::size_t batch_size) {
     std::string const name = fmt::format("construct_graph/{}", batch_size);
-    if (!settings.filter.selects(name)) return;
+    if (!settings.regex_filter.selects(name)) return;
     st::vector<edge_t> edges;
     if (!flatten(twitter.edges, edges)) return print(row_t {.name = name, .skipped = "no memory for batches"});
     std::span<edge_t const> const staged {edges.begin(), edges.end()};
@@ -491,7 +491,7 @@ void sample(executor_t& executor, twitter_settings_t const& settings, twitter_t 
             sample_read_t read, std::span<std::size_t const> batch_sizes) {
     for (std::size_t const batch_size : batch_sizes) {
         std::string const name = fmt::format("{}/{}", stem, batch_size);
-        if (!settings.filter.selects(name)) continue;
+        if (!settings.regex_filter.selects(name)) continue;
         print(run_threads(executor, settings, name, [&](loop_t& loop, std::size_t thread) noexcept {
             tweet_batches_t batches;
             if (!batches.draw(twitter, batch_size, stream_key(settings.seed, name, thread)))
@@ -768,7 +768,7 @@ int main(int argc, char** argv) {
     }
 
     ustore_outcome_t outcome {};
-    settings.engine.directory = settings.directory.data();
+    settings.engine.locate(settings.directory.data());
     open_engine(settings.engine, &twitter.database, &outcome);
     if (outcome.status != ustore_status_success_k) {
         fmt::println(stderr, "Failed to open the database: {}", outcome.message);

@@ -36,6 +36,13 @@
 
 #include "harness.hpp" // `run_test_case`, `expect_true`, `expect_status`, `split_mix_generator_t`, `scratch_directory_t`
 
+#if USTORE_OS_WINDOWS_
+#include <winsock2.h> // ahead of `<windows.h>`, which would pull in Winsock 1.1
+#include <windows.h>  // `VirtualAlloc`, `VirtualFree`
+#else
+#include <sys/mman.h> // `mmap`, `munmap`
+#endif
+
 using namespace unum::ustore;
 using namespace unum::ustore::test;
 using namespace unum::ustore::docs;
@@ -117,7 +124,7 @@ class reference_t {
         read.presences = &presences, read.values = &values, read.arena = arena;
         ustore_docs_read(&read);
         if (status_t {outcome}.failed() || !presences || !(presences[0] & 1)) return std::nullopt;
-        return std::string(string_of(tape_string(values, 0)));
+        return std::string(chars_of(tape_string(values, 0)));
     }
 };
 
@@ -347,7 +354,7 @@ std::span<byte_t const> base_of(std::optional<std::string> const& base) noexcept
 pending_t change_of(std::span<json_delta_t const> deltas, ustore_arena_t arena) {
     auto [chain, status] = encode_deltas(deltas, arena);
     expect_true(status.succeeded());
-    return {delta_kind_t::change_k, std::string(string_of(chain))};
+    return {delta_kind_t::change_k, std::string(chars_of(chain))};
 }
 
 /** The store delta @p delta becomes, as the glue logs it: writes and removals as deltas of their own. */
@@ -378,7 +385,7 @@ struct outcome_t {
 
 outcome_t outcome_of(expected<std::span<byte_t const>> const& result) {
     if (!result) return {result.status().code, {}};
-    return {status_code_t::success_k, std::string(string_of(*result))};
+    return {status_code_t::success_k, std::string(chars_of(*result))};
 }
 
 /** Holds when @p actual matches @p wanted ; otherwise fails a check, printing both and
@@ -388,11 +395,42 @@ bool expect_outcome(outcome_t const& actual, outcome_t const& wanted, std::strin
                        wanted.bytes, status_name(actual.code), actual.bytes);
 }
 
+#if USTORE_OS_WINDOWS_
+
+/** Reserves @p size bytes of address space that fault when touched, or none when it runs out. */
+std::span<byte_t> reserve_unreadable_bytes(std::size_t size) noexcept {
+    void* const reserved = ::VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_NOACCESS);
+    if (!reserved) return {};
+    return {static_cast<byte_t*>(reserved), size};
+}
+
+/** Releases what @c reserve_unreadable_bytes reserved. */
+void release_unreadable_bytes(std::span<byte_t> reserved) noexcept {
+    [[maybe_unused]] BOOL const released = ::VirtualFree(reserved.data(), 0, MEM_RELEASE);
+}
+
+#else
+
+/** Reserves @p size bytes of address space that fault when touched, or none when it runs out. */
+std::span<byte_t> reserve_unreadable_bytes(std::size_t size) noexcept {
+    void* const reserved = ::mmap(nullptr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (reserved == MAP_FAILED) return {};
+    return {static_cast<byte_t*>(reserved), size};
+}
+
+/** Releases what @c reserve_unreadable_bytes reserved. */
+void release_unreadable_bytes(std::span<byte_t> reserved) noexcept {
+    [[maybe_unused]] int const unmapped = ::munmap(reserved.data(), reserved.size());
+}
+
+#endif
+
 #pragma endregion Chains
 
 #pragma region Cases
 
-/** Deltas encode and decode in chains, refuse truncations and unknown modifications, and close as documented. */
+/** Deltas encode and decode in chains, refuse truncations, unknown modifications and unread values
+ *  past 4 GiB, and close as documented. */
 void test_json_fold_codec() {
     auto [arena, arena_status] = arena_t::make();
     expect_true(arena_status.succeeded());
@@ -419,7 +457,7 @@ void test_json_fold_codec() {
                                                   [](json_delta_t const&) noexcept { return status_t {}; });
         expect_true(truncated.succeeded() == (boundaries == 1));
     }
-    std::string unknown(string_of(chain.first(encoded_size(deltas[0]))));
+    std::string unknown(chars_of(chain.first(encoded_size(deltas[0]))));
     unknown[sizeof(std::uint64_t)] = 9;
     expect_status(for_each_delta(bytes_of_text(unknown), [](json_delta_t const&) noexcept { return status_t {}; }),
                   status_code_t::malformed_k);
@@ -437,6 +475,13 @@ void test_json_fold_codec() {
     expect_true(!closes_chain({0, delta_modification_t::merge_k, "", "1"}));
     expect_true(fold.closes({delta_kind_t::write_k, {}}) && fold.closes({delta_kind_t::remove_k, {}}));
     expect_true(!fold.closes({delta_kind_t::change_k, bytes_of_text(unknown)}));
+
+    std::span<byte_t> const unreadable = reserve_unreadable_bytes((std::size_t(1) << 32) + 1);
+    expect_true(!unreadable.empty());
+    json_delta_t const oversized {0, delta_modification_t::upsert_k, "a", chars_of(unreadable)};
+    expect_status(encode_deltas(std::span<json_delta_t const>(&oversized, 1), arena),
+                  status_code_t::capacity_exhausted_k);
+    release_unreadable_bytes(unreadable);
 }
 
 /** The fold of @p deltas over @p base composed, and the count of records the composition left. */
@@ -641,7 +686,7 @@ void test_json_fold_reference(config_t const& config) {
                     records_before += delta.kind != delta_kind_t::change_k ? 1
                                                                            : count_records(bytes_of_text(delta.bytes));
                 records_after += count_records(chain);
-                pending.assign(1, {delta_kind_t::change_k, std::string(string_of(chain))});
+                pending.assign(1, {delta_kind_t::change_k, std::string(chars_of(chain))});
                 ++compositions;
             }
             if (random.below(25) == 0) base = stored, pending.clear();
@@ -649,7 +694,7 @@ void test_json_fold_reference(config_t const& config) {
     }
     fmt::println("  {} modifications checked, {} refused, {} compositions took {} records to {}", checked, refused,
                  compositions, records_before, records_after);
-    for (auto const& [code, count] : refusals) fmt::println("  {} refused with {}", count, status_name(code));
+    for (auto const& [code, count] : refusals) fmt::println(stderr, "  {} refused with {}", count, status_name(code));
     expect_true(refusals.size() == 4);
     expect_true(refused * 20 > checked && refused * 10 < checked * 7);
     expect_true(records_after * 3 < records_before * 2);

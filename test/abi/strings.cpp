@@ -247,7 +247,7 @@ struct scan_results_t {
 
     /** The string found at @p index. */
     [[nodiscard]] std::string_view operator[](std::size_t index) const noexcept {
-        return string_of(tape_string(strings, index));
+        return chars_of(tape_string(strings, index));
     }
 };
 
@@ -780,7 +780,7 @@ void test_strings_cursor_descending_end(config_t const& config) {
             expect_success(outcome);
             expect_equal(static_cast<std::size_t>(written), count);
             for (std::size_t index = 0; index != written && index != count; ++index)
-                expect_equal(string_of(tape_string(found, index)), pinned[first + index]);
+                expect_equal(chars_of(tape_string(found, index)), pinned[first + index]);
             first += count;
         }
         ustore_strings_cursor_free(cursor);
@@ -887,10 +887,10 @@ void test_strings_sample(config_t const& config) {
             std::size_t const count = offsets[1] - offsets[0];
             expect_equal(count, wanted < range_strings_k.size() ? wanted : range_strings_k.size());
             for (std::size_t index = 0; index != count; ++index) {
-                std::string_view const text = string_of(tape_string(drawn, offsets[0] + index));
+                std::string_view const text = chars_of(tape_string(drawn, offsets[0] + index));
                 expect_true(std::find(range_strings_k.begin(), range_strings_k.end(), text) != range_strings_k.end());
                 for (std::size_t earlier = 0; earlier != index; ++earlier)
-                    expect_true(string_of(tape_string(drawn, offsets[0] + earlier)) != text);
+                    expect_true(chars_of(tape_string(drawn, offsets[0] + earlier)) != text);
             }
         }
     }

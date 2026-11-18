@@ -800,7 +800,7 @@ status_t export_strings(ustore_arena_t arena, std::size_t count, std::size_t tot
             count,
             [&](std::size_t index) noexcept {
                 ustore_bytes_view_t const string = strings(index);
-                return tape_source_t {reinterpret_cast<byte_t const*>(string.data), string.length};
+                return tape_source_t {bytes_of(string.data, string.length).data(), string.length};
             },
             offsets, bytes);
         if constexpr (std::is_same_v<offset_type_, std::uint32_t>) tape = u32_tape(bytes.data(), offsets.data());

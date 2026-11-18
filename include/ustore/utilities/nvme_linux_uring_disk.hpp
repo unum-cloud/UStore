@@ -610,27 +610,27 @@ class linux_uring_files_disk {
         std::size_t const room = credit < seats ? credit : seats;
         std::size_t const taking = requests.size() < room ? requests.size() : room;
 
-        linux_uring_sqe_t* linked = nullptr;
+        submission_chain_t chain;
         std::size_t queued = 0;
         bool chain_broken = false;
         for (std::size_t index = 0; index != taking; ++index) {
             request_t const& request = requests[index];
             if (chain_broken) {
-                unlink_(linked);
+                chain.unlink();
                 push_local_(*slot, base, cancelled_completion_(request.token));
                 chain_broken = chains_next_(request);
                 continue;
             }
             status_t const defect = inspect_(request);
             if (defect.failed()) {
-                unlink_(linked);
+                chain.unlink();
                 push_local_(*slot, base, failed_completion_(request.token, defect));
                 chain_broken = chains_next_(request);
                 continue;
             }
             if (request.kind == request_kind_t::deallocate_k) {
-                bool const chained_into = linked != nullptr;
-                unlink_(linked);
+                bool const chained_into = chain.linked != nullptr;
+                chain.unlink();
                 status_t const deallocated = chained_into
                                                  ? status_t {status_code_t::invalid_argument_k,
                                                              "A deallocation runs at submission, outside chains"}
@@ -644,11 +644,11 @@ class linux_uring_files_disk {
             build_(entry, request, ring.pinning);
             borrow_(request);
             track_(*slot, base, request);
-            linked = chains_next_(request) ? &entry : nullptr;
+            chain.linked = chains_next_(request) ? &entry : nullptr;
             ++queued;
             chain_broken = false;
         }
-        unlink_(linked);
+        chain.unlink();
 
         if (queued != 0) {
             atomic_reference_<unsigned> {*ring.submission_tail}.store(static_cast<unsigned>(published + queued),
@@ -911,6 +911,20 @@ class linux_uring_files_disk {
 
         /** The medium the request borrowed, given back when its completion is completed. */
         medium_reference_t medium;
+    };
+
+    /** The chain one submission queues, held by its last entry while it links to the next one. */
+    struct submission_chain_t {
+
+        /** The last entry queued, while it links to the next request, or null. */
+        linux_uring_sqe_t* linked = nullptr;
+
+        /** Drops the link from @c linked, as the request that would have followed it never came. */
+        void unlink() noexcept {
+            if (!linked) return;
+            linked->entry_flags = static_cast<std::uint8_t>(linked->entry_flags & ~linux_uring_entry_io_link_k);
+            linked = nullptr;
+        }
     };
 
     /** Entries the availability probe asks for, which is the smallest ring the kernel rounds up to. */
@@ -1410,13 +1424,6 @@ class linux_uring_files_disk {
             entry.opcode = request.kind == request_kind_t::read_k ? read_unpinned : write_unpinned;
             return;
         }
-    }
-
-    /** Drops the link from @p linked, since the request that would have followed it never arrived. */
-    static void unlink_(linux_uring_sqe_t*& linked) noexcept {
-        if (!linked) return;
-        linked->entry_flags = static_cast<std::uint8_t>(linked->entry_flags & ~linux_uring_entry_io_link_k);
-        linked = nullptr;
     }
 
     /** Takes @p count entries the kernel would not accept back out of the queue and fails them. */

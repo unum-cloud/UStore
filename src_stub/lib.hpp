@@ -555,6 +555,12 @@ struct entry_t {
     std::string value;
 };
 
+/** The entry a seek finds: its key, and its value, null when no entry is left. */
+struct found_entry_t {
+    std::string key;
+    std::string const* value = nullptr;
+};
+
 /** What one call reads: a database at a stamp, overlaid with a transaction's writes, recording
  *  what it reads when the transaction watches. Its caller holds the database lock. */
 struct reader_t {
@@ -611,8 +617,8 @@ struct reader_t {
 
     /** The first key at or past @p bound in @p direction, as @p kind says, that this reader
      *  sees, with its value. */
-    bool seek(collection_t const& collection, std::string const& bound, bound_t kind, ustore_scan_direction_t direction,
-              std::string& key, std::string const*& value) const {
+    found_entry_t seek(collection_t const& collection, std::string const& bound, bound_t kind,
+                       ustore_scan_direction_t direction) const {
         overlay_t const* const pending = overlay(collection);
         bool const descending = direction == ustore_scan_descending_k;
         std::string cursor = bound;
@@ -638,16 +644,10 @@ struct reader_t {
                 auto it = start_of(*pending, cursor, cursor_kind, direction);
                 if (valid(*pending, it)) over_key = &it->first, over = &it->second;
             }
-            if (!base_key && !over_key) return false;
+            if (!base_key && !over_key) return {};
             bool take_over = over_key && (!base_key || (descending ? *over_key >= *base_key : *over_key <= *base_key));
-            if (!take_over) {
-                key = *base_key, value = base_value;
-                return true;
-            }
-            if (over->present) {
-                key = *over_key, value = &over->value;
-                return true;
-            }
+            if (!take_over) return {*base_key, base_value};
+            if (over->present) return {*over_key, &over->value};
             // A pending removal hides the base key it shadows, so the walk resumes past it
             cursor = *over_key, cursor_kind = bound_t::exclusive_k;
         }
@@ -1094,14 +1094,12 @@ inline bool fetch(reader_t const& reader, collection_t const& collection, walk_t
                   std::vector<entry_t>& listed) {
     listed.clear();
     while (listed.size() < limit) {
-        std::string key;
-        std::string const* value = nullptr;
-        if (!reader.seek(collection, walk.position, walk.kind, walk.direction, key, value)) return false;
-        if (walk.past_end(key)) return false;
-        walk.position = key, walk.kind = bound_t::exclusive_k;
-        if (walk.accept && !walk.accept(key, walk.context)) continue;
-        reader.record(collection, key);
-        listed.push_back({std::move(key), value ? *value : std::string {}});
+        found_entry_t found = reader.seek(collection, walk.position, walk.kind, walk.direction);
+        if (!found.value || walk.past_end(found.key)) return false;
+        walk.position = found.key, walk.kind = bound_t::exclusive_k;
+        if (walk.accept && !walk.accept(found.key, walk.context)) continue;
+        reader.record(collection, found.key);
+        listed.push_back({std::move(found.key), *found.value});
     }
     return true;
 }

@@ -38,9 +38,9 @@ inline expected<std::span<string_task_t>> string_tasks(view_t const& view,
     auto [tasks, allocate_status] = arena_allocate<string_task_t>(view.scratch, count);
     if (allocate_status.failed()) return allocate_status;
     for (std::size_t index = 0; index != count; ++index)
-        tasks[index] = values ? string_task_t {collections[index], string_of(texts[index]), delta_kind_t::write_k,
+        tasks[index] = values ? string_task_t {collections[index], chars_of(texts[index]), delta_kind_t::write_k,
                                                values[index].uuid}
-                              : string_task_t {collections[index], string_of(texts[index])};
+                              : string_task_t {collections[index], chars_of(texts[index])};
     return tasks;
 }
 
@@ -94,13 +94,13 @@ status_t strings_remove(ustore_strings_remove_t const& arguments, strings_arg_t 
             return resolved;
         std::size_t bytes = 0;
         for (std::size_t index = 0; index != arguments.count; ++index)
-            bytes += string_of(texts[index]).size() + string_of(end_texts[index]).size();
+            bytes += chars_of(texts[index]).size() + chars_of(end_texts[index]).size();
         return serve_write(
             state, view, arguments.durability, arguments.count, bytes, watch_schedule_t::never_k,
             [&](call_access<cpu_class_> const& access) noexcept -> status_t {
                 for (std::size_t index = 0; index != arguments.count; ++index)
-                    if (status_t const removed = remove_string_range(
-                            access, collections[index], string_of(texts[index]), string_of(end_texts[index]));
+                    if (status_t const removed = remove_string_range(access, collections[index], chars_of(texts[index]),
+                                                                     chars_of(end_texts[index]));
                         removed.failed())
                         return removed;
                 return {};
@@ -118,7 +118,7 @@ status_t read_strings(call_access<cpu_class_> const& access, collection_id_t col
     transaction_stamp_t const watch_stamp = watch_stamp_of(access);
     return visit_strings(access, collection, [&](auto const& store, auto const& reading) noexcept -> status_t {
         for (std::size_t index = first; index != last; ++index) {
-            std::string_view const text = string_of(texts[index]);
+            std::string_view const text = chars_of(texts[index]);
             ustore_key_t value;
             std::span<byte_t, sizeof(ustore_uuid_t)> const bytes = std::as_writable_bytes(std::span {value.uuid.bytes});
             delta_view_t own_delta;
@@ -206,9 +206,9 @@ status_t strings_scan(ustore_strings_scan_t const& arguments, strings_arg_t cons
                                                      access.strings, access.reading};
         for (std::size_t task = first_task; task != first_task + length; ++task) {
             strings_window_t const window {
-                .prefix = prefixes ? string_of(prefixes[task]) : std::string_view {},
-                .start = starts ? string_of(starts[task]) : std::string_view {},
-                .end = ends ? string_of(ends[task]) : std::string_view {},
+                .prefix = prefixes ? chars_of(prefixes[task]) : std::string_view {},
+                .start = starts ? chars_of(starts[task]) : std::string_view {},
+                .end = ends ? chars_of(ends[task]) : std::string_view {},
                 .direction = arguments.direction,
             };
             sliced.outputs.open_task(task);
@@ -301,8 +301,8 @@ status_t strings_measure(ustore_strings_measure_t const& arguments, strings_arg_
     if (status_t const one = read_at_one_state(access, collections, arguments.count, held); one.failed()) return one;
     for (std::size_t task = 0; task != arguments.count; ++task) {
         strings_window_t const window {
-            .start = starts ? string_of(starts[task]) : std::string_view {},
-            .end = ends ? string_of(ends[task]) : std::string_view {},
+            .start = starts ? chars_of(starts[task]) : std::string_view {},
+            .end = ends ? chars_of(ends[task]) : std::string_view {},
             .direction = arguments.direction,
         };
         std::size_t cardinality = 0;

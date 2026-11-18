@@ -45,6 +45,30 @@ It links into the process that uses it, with no server to deploy, and the in-mem
 - __Batches with strides__ — every call takes arrays of keys, values and collections, laid out as structures of arrays or arrays of structures.
 - __Sampling as a primitive__ — `ustore_blobs_sample` draws random keys from a collection, next to read, write and scan.
 
+## Performance
+
+Items per second from `ustore_bench_twitter` over 100,000 generated tweets, indexed as 200,000 documents and 500,000 edges.
+Every row runs 16 threads pinned to the 8 P-cores of an Intel Core i9-13950HX, and the disk engines share one PCIe 4 NVMe SSD under ext4.
+
+| Engine      | Blob writes | Blob reads | Doc writes | Doc reads | Graph writes | Two-hop walks |
+| :---------- | ----------: | ---------: | ---------: | --------: | -----------: | ------------: |
+| UStore RAM  |       765 k |     5.25 M |      502 k |    12.3 M |        107 k |        4.64 M |
+| UStore NVMe |      99.4 k |     67.5 k |     19.7 k |     562 k |       35.3 k |         139 k |
+| RocksDB     |       242 k |      880 k |      279 k |     946 k |        641 k |        30.3 M |
+| LevelDB     |      17.9 k |      427 k |          … |         … |            … |             … |
+
+Blob reads fetch one key per call, while every other column moves batches of 128 keys, and writes commit as transactions of one batch each.
+Graph batches that conflict under 16 writers fail without a retry, from 1,102 on `ram` to 2,572 on RocksDB, so the walks cover graphs of different sizes.
+The LevelDB engine served the blob rows alone in this run.
+
+```sh
+cmake --preset release -D USTORE_WITH_NVME=ON
+cmake --build --preset release --target ustore_bench_twitter
+build_release/build/bin/ustore_bench_twitter --engine nvme --directory /mnt/nvme/ustore --max-tweets 100000 --threads 16
+```
+
+The [benchmark guide](https://github.com/unum-cloud/UStore/blob/main/bench/README.md) covers the other workloads, compaction on the GPU, and the unit economics.
+
 ## Quickstart
 
 UStore builds with CMake against StringZilla, ForkUnion and SmashTable, pulled as git submodules.
