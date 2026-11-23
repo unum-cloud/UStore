@@ -140,7 +140,14 @@ status_t pull(engine_t const& engine, ustore_changes_cursor_next_t const& argume
 
 } // namespace unum::ustore
 
-status_t open_ingest(ustore_ingest_init_t const& arguments) noexcept {
+/** Refuses an ingest call on an executor computing on a device, as changes run on the host. */
+status_t refuse_device_ingests(view_t const& runner) noexcept {
+    if (residency_of(runner.executor) != vendored_residency_t::host_k)
+        return {status_code_t::unsupported_k, "Ingests run on host executors"};
+    return {};
+}
+
+status_t open_ingest(ustore_ingest_init_t& arguments, view_t const& runner) noexcept {
     if (!arguments.ingest) return {status_code_t::invalid_argument_k, "Need an output for the ingest"};
     *arguments.ingest = nullptr;
     ustore_database_t const database = arguments.database;
@@ -151,13 +158,18 @@ status_t open_ingest(ustore_ingest_init_t const& arguments) noexcept {
         return {status_code_t::read_only_k, "The database was opened read-only"};
     engine_t const& engine = engine_of(database);
     if (!engine.database->ingest_init) return {status_code_t::unsupported_k, "The engine ingests nothing"};
-    auto* const ingest = new (std::nothrow) ustore_ingest_handle_t {.engine = &engine, .database = database};
+    if (status_t const refused = refuse_device_ingests(runner); refused.failed()) return refused;
+    if (status_t const seeded = reserve_scratches(runner, 0); seeded.failed()) return seeded;
+    fu_memory_domain_id_t const memory_domain = runner.executor ? runner.executor->memory_domain : 0;
+    auto* const ingest = new (std::nothrow)
+        ustore_ingest_handle_t {.engine = &engine,
+                                .database = database,
+                                .kept = {.memory = host_blocks_t {.memory_domain = memory_domain}}};
     if (!ingest) return {status_code_t::out_of_memory_k, "Failed to allocate the ingest"};
     *arguments.ingest = ingest;
-    if (status_t const opened = engine.database->ingest_init(arguments, view_t {.scratch = &ingest->scratch});
-        opened.failed()) {
+    if (status_t const opened = engine.database->ingest_init(arguments, runner); opened.failed()) {
         *arguments.ingest = nullptr;
-        arena_free_blocks(ingest->scratch);
+        arena_free_blocks(ingest->kept);
         delete ingest;
         return opened;
     }
@@ -174,40 +186,53 @@ void close_ingest(ustore_ingest_t ingest) noexcept {
     floor_atomic_ref<std::uint32_t> {ingest->database->open_ingests}.fetch_sub(1, std::memory_order_acq_rel);
 }
 
-status_t append_ingest(ustore_ingest_append_t const& arguments) noexcept {
-    ustore_ingest_t const ingest = arguments.ingest;
-    if (!ingest || !ingest->state) return {status_code_t::invalid_argument_k, "The ingest is missing or finished"};
-    arena_rewind(&ingest->scratch);
-    strings_arg_t values;
-    if (status_t const gathered = gather_strings({arguments.values, arguments.count}, &ingest->scratch, values);
-        gathered.failed())
-        return gathered;
-    return ingest->engine->database->ingest_append(arguments, values, view_t {.scratch = &ingest->scratch});
+/** Bytes the @p count strings of a tape in @p values span, or zero for an accessor or no tape. */
+std::size_t tape_bytes(ustore_strings_view_t const& values, std::size_t count) noexcept {
+    if (!count) return 0;
+    if (values.layout == ustore_strings_u64_tape_k && values.data.u64_tape.offsets)
+        return values.data.u64_tape.offsets[count] - values.data.u64_tape.offsets[0];
+    if (values.layout == ustore_strings_u32_tape_k && values.data.u32_tape.offsets)
+        return values.data.u32_tape.offsets[count] - values.data.u32_tape.offsets[0];
+    return 0;
 }
 
-status_t finish_ingest(ustore_ingest_finish_t const& arguments) noexcept {
+status_t append_ingest(ustore_ingest_append_t& arguments, view_t const& runner) noexcept {
+    ustore_ingest_t const ingest = arguments.ingest;
+    if (!ingest->state) return {status_code_t::invalid_argument_k, "The ingest is finished"};
+    if (status_t const refused = refuse_device_ingests(runner); refused.failed()) return refused;
+    // Each thread parses its share of the values into its scratch, about twice their bytes
+    std::size_t const threads = runner.executor ? runner.executor->scratches.size() : 1;
+    std::size_t const bytes = tape_bytes(arguments.values, arguments.count);
+    if (status_t const seeded = reserve_scratches(runner, 2 * bytes / threads); seeded.failed()) return seeded;
+    strings_arg_t values;
+    if (status_t const gathered = gather_strings({arguments.values, arguments.count}, runner.scratch, values);
+        gathered.failed())
+        return gathered;
+    return ingest->engine->database->ingest_append(arguments, values, runner);
+}
+
+status_t finish_ingest(ustore_ingest_finish_t& arguments, view_t const& runner) noexcept {
     if (arguments.commit_stamp) *arguments.commit_stamp = 0;
     ustore_ingest_t const ingest = arguments.ingest;
-    if (!ingest || !ingest->state) return {status_code_t::invalid_argument_k, "The ingest is missing or finished"};
+    if (!ingest->state) return {status_code_t::invalid_argument_k, "The ingest is finished"};
+    if (status_t const refused = refuse_device_ingests(runner); refused.failed()) return refused;
     status_t landed {status_code_t::invalid_argument_k, "Unknown durability"};
-    arena_rewind(&ingest->scratch);
+    if (status_t const seeded = reserve_scratches(runner, 0); seeded.failed()) {
+        close_ingest(ingest);
+        return seeded;
+    }
     if (arguments.durability == ustore_durability_buffered_k || arguments.durability == ustore_durability_flushed_k)
-        landed = ingest->engine->database->ingest_finish(arguments, view_t {.scratch = &ingest->scratch});
+        landed = ingest->engine->database->ingest_finish(arguments, runner);
     close_ingest(ingest);
     return landed;
 }
 
-/** Serves @p arguments holding the ingest's claim and counting the call, so a second call is
- *  contended and a free waits. */
-template <auto serve_, typename arguments_type_>
-status_t on_ingest(arguments_type_ const& arguments) noexcept {
-    if (!arguments.ingest) return {status_code_t::invalid_argument_k, "The ingest is missing"};
-    if (!take(arguments.ingest->claim)) return {status_code_t::contended_k, "The ingest serves another call"};
-    std::array<std::uint32_t*, 3> const named_calls = raise_named_calls(arguments);
-    status_t const status = serve_(arguments);
-    release(arguments.ingest->claim);
-    lower_named_calls(named_calls);
-    return status;
+/** Claims the ingest @p arguments feed, then runs them as every call runs, on their executor and
+ *  with their completion. */
+template <typename arguments_type_, auto serve_>
+void route_ingest(arguments_type_* arguments) noexcept {
+    if (status_t const claimed = take_claims(*arguments); claimed.failed()) return finish(*arguments->outcome, claimed);
+    dispatch<arguments_type_, serve_>(arguments);
 }
 
 void ustore_database_describe(ustore_database_describe_t* arguments) { route(arguments); }
@@ -227,12 +252,14 @@ void ustore_transaction_init(ustore_transaction_init_t* arguments) { route(argum
 void ustore_transaction_stage(ustore_transaction_stage_t* arguments) { route(arguments); }
 void ustore_transaction_commit(ustore_transaction_commit_t* arguments) { route(arguments); }
 void ustore_transaction_rollback(ustore_transaction_rollback_t* arguments) { route(arguments); }
-void ustore_ingest_init(ustore_ingest_init_t* arguments) { finish(*arguments->outcome, open_ingest(*arguments)); }
+void ustore_ingest_init(ustore_ingest_init_t* arguments) {
+    route_ingest<ustore_ingest_init_t, &open_ingest>(arguments);
+}
 void ustore_ingest_append(ustore_ingest_append_t* arguments) {
-    finish(*arguments->outcome, on_ingest<&append_ingest>(*arguments));
+    route_ingest<ustore_ingest_append_t, &append_ingest>(arguments);
 }
 void ustore_ingest_finish(ustore_ingest_finish_t* arguments) {
-    finish(*arguments->outcome, on_ingest<&finish_ingest>(*arguments));
+    route_ingest<ustore_ingest_finish_t, &finish_ingest>(arguments);
 }
 
 ustore_view_t ustore_transaction_view(ustore_transaction_t transaction, ustore_watch_t watch) {
@@ -298,7 +325,7 @@ void ustore_ingest_free(ustore_ingest_t ingest) {
     wait_named_calls(ingest->named_calls);
     if (ingest->state) close_ingest(ingest);
     ustore_database_t const database = ingest->database;
-    arena_free_blocks(ingest->scratch);
+    arena_free_blocks(ingest->kept);
     delete ingest;
     release_hold(database);
 }
@@ -329,22 +356,26 @@ void ustore_database_free(ustore_database_t database) {
 
 #if !USTORE_WITH_ROCKSDB
 void ustore_database_open_rocksdb(ustore_database_open_rocksdb_t* arguments) {
-    finish(*arguments->outcome, {status_code_t::unsupported_k, "This build carries no RocksDB engine"});
+    finish(*arguments->outcome, {status_code_t::unsupported_k, "This build holds no RocksDB engine"});
 }
 
 void ustore_database_view_rocksdb(ustore_database_view_rocksdb_t* arguments) {
-    finish(*arguments->outcome, {status_code_t::unsupported_k, "This build carries no RocksDB engine"});
+    finish(*arguments->outcome, {status_code_t::unsupported_k, "This build holds no RocksDB engine"});
 }
 #endif
 
 #if !USTORE_WITH_LEVELDB
 void ustore_database_open_leveldb(ustore_database_open_leveldb_t* arguments) {
-    finish(*arguments->outcome, {status_code_t::unsupported_k, "This build carries no LevelDB engine"});
+    finish(*arguments->outcome, {status_code_t::unsupported_k, "This build holds no LevelDB engine"});
 }
 #endif
 
 #if !USTORE_WITH_NVME
 void ustore_database_open_nvme(ustore_database_open_nvme_t* arguments) {
-    finish(*arguments->outcome, {status_code_t::unsupported_k, "This build carries no NVMe engine"});
+    finish(*arguments->outcome, {status_code_t::unsupported_k, "This build holds no NVMe engine"});
+}
+
+void ustore_database_view_nvme(ustore_database_view_nvme_t* arguments) {
+    finish(*arguments->outcome, {status_code_t::unsupported_k, "This build holds no NVMe engine"});
 }
 #endif

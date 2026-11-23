@@ -59,7 +59,7 @@ struct page_task_t {
 /** What a read of a missing page or element answers in @c pages_client_t::read. */
 constexpr std::string_view page_absent_k = "<absent>";
 
-/** Whether an insertion's elements carry the keys the caller gave, or take the keys the call
+/** Whether an insertion's elements hold the keys the caller gave, or take the keys the call
  *  mints. */
 enum class key_source_t : bool { given_k, minted_k };
 

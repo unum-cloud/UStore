@@ -162,7 +162,7 @@ struct ustore_executor_handle_t {
     ustore_size_t threads = 1;
 
     /** The thread running the deferred calls of an executor owning its threads, absent for a
-     *  lent pool, whose deferred calls run at submission. */
+     *  caller's pool, whose deferred calls run at submission. */
     std::thread worker;
 
     /** The deferred call the worker runs next, null while it waits, or the stop job once the

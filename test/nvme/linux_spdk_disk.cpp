@@ -32,10 +32,13 @@
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::move`
 
+#include <smashtable/basic_vector.hpp> // `st::vector`
+
 #include "ustore/utilities/types.hpp" // `expected`
 
-#include "ustore/utilities/nvme_linux_spdk_disk.hpp" // `linux_spdk_disk_t`, `linux_spdk_environment_t`, `linux_spdk_probe_t`
-#include "ustore/utilities/nvme_ring.hpp"            // `ring_concept`, `queue_pair_t`
+#include "ustore/utilities/nvme_disks.hpp"           // `blocking_queue_t`
+#include "ustore/utilities/nvme_linux_spdk_disk.hpp" // `linux_spdk_disk_t`, `linux_spdk_queue_t`, `linux_spdk_probe_t`
+#include "ustore/utilities/nvme_ring.hpp"            // `disk_concept`, `queue_ref_t`
 
 #include "nvme/ring_cases.hpp" // `ring_cases`, `ring_edge_t`, every transport-independent result
 
@@ -56,7 +59,7 @@ using linux_spdk_environment_t = linux_spdk_environment<atomic_reference, waiter
 
 #pragma region Fixtures
 
-static_assert(ring_concept<linux_spdk_disk_t>, "The SPDK transport is a ring in every configuration");
+static_assert(disk_concept<linux_spdk_disk_t>, "The SPDK transport is a ring in every configuration");
 
 /** A PCIe address no machine answers at, since function seven of device 31 on bus 255 is empty. */
 constexpr char const* absent_address_k = "0000:ff:1f.7";
@@ -64,9 +67,6 @@ constexpr char const* absent_address_k = "0000:ff:1f.7";
 /** A fabric transport ID of the shape the rig exports, which the probe passes without a file to read. */
 constexpr char const* fabric_address_k =
     "trtype:TCP adrfam:IPv4 traddr:127.0.0.1 trsvcid:4420 subnqn:nqn.2026-09.io.ustore:malloc";
-
-/** Leases the mount asks for, which the target may lower to the queue pairs it grants. */
-[[maybe_unused]] constexpr std::uint16_t spdk_queue_pairs_k = 4;
 
 /** The settings this suite adds to the shared ones, each a <tt>--flag</tt> or a @c
  *  USTORE_ variable. */
@@ -344,29 +344,46 @@ void test_spdk_identifies_the_controller(linux_spdk_disk_t& disk, std::string_vi
     if (!wanted.empty()) expect_true(std::string_view {identity.serial} == wanted);
 }
 
-/** What the disk reports is the namespace's sector, the queue pair shape the mount asked for,
- *  and sixteen targets. */
+/** What the disk reports is the namespace's sector, the queue's depth ceiling, the controller's
+ *  queue pairs, and sixteen targets. */
 void test_spdk_reports_the_namespace(linux_spdk_disk_t& disk) {
-    ring_capabilities_t const limits = disk.capabilities();
+    disk_capabilities_t const limits = disk.capabilities();
     fmt::println("  sector {} bytes, transfer up to {} bytes, {} queue pairs of {}", limits.offset_alignment,
                  limits.max_transfer_bytes, limits.queue_pairs_limit, limits.depth_limit);
     expect_true(std::has_single_bit(limits.offset_alignment) && limits.offset_alignment <= block_bytes_k);
     expect_equal(limits.length_granularity, limits.offset_alignment);
     expect_equal(limits.memory_alignment, std::uint64_t {portable_alignment_k});
     expect_true(limits.max_transfer_bytes >= block_bytes_k);
-    expect_equal(limits.depth_limit, queue_pair_depth_k);
-    expect_true(limits.queue_pairs_limit >= 1 && limits.queue_pairs_limit <= spdk_queue_pairs_k);
+    expect_equal(limits.depth_limit, std::uint32_t {16384});
+    expect_true(limits.queue_pairs_limit >= 1);
     expect_equal(limits.media_limit, std::uint16_t {16});
     expect_true(!limits.reaches_gpu_memory);
 }
 
-/** A second disk on @p address shares the process's connection, and a namespace one disk
- *  registered is refused to the other until it is given back. */
+/** Shares of every connection the process holds, read while no other thread opens or closes one. */
+[[nodiscard]] std::uint32_t spdk_holders() noexcept {
+    std::uint32_t holders = 0;
+    for (linux_spdk_attachment_t const& record : linux_spdk_process().attachments.records()) holders += record.holders;
+    return holders;
+}
+
+/** A second disk on @p address shares the process's connection and a queue's queue pair, and a
+ *  namespace one disk registered is refused to the other until it is given back. */
 void test_spdk_shares_the_controller(linux_spdk_disk_t& disk, linux_spdk_environment_t const& environment,
                                      char const* address, linux_spdk_disk_config_t const& config) {
     expected<linux_spdk_disk_t> second = linux_spdk_disk_t::open(environment, address, config);
     expect_status(second, status_code_t::success_k);
     if (!second) return;
+    {
+        auto [queue, make_queue_status] = linux_spdk_queue_t::make(queue_pair_depth_k, {});
+        expect_status(make_queue_status, status_code_t::success_k);
+        queue_ref_t const queue_pair {queue, queue_id_t {0}};
+        std::uint32_t const unpaired = spdk_holders();
+        expect_status(disk.register_media(queue_pair), status_code_t::success_k);
+        expect_equal(spdk_holders(), unpaired + 1);
+        expect_status(second->register_media(queue_pair), status_code_t::success_k);
+        expect_equal(spdk_holders(), unpaired + 1);
+    }
     expected<registered_medium_t> held = disk.register_medium(volume_request("1"));
     expect_true(held.has_value());
     if (held) {
@@ -393,7 +410,14 @@ void test_spdk_reconnects_after_release(linux_spdk_disk_t& disk, linux_spdk_envi
                                         char const* address, linux_spdk_disk_config_t const& config,
                                         std::string_view serial) {
     expect_equal(spdk_connections(), std::size_t {1});
-    disk.release();
+    {
+        auto [queue, make_queue_status] = linux_spdk_queue_t::make(queue_pair_depth_k, {});
+        expect_status(make_queue_status, status_code_t::success_k);
+        queue_ref_t const queue_pair {queue, queue_id_t {0}};
+        expect_status(disk.register_media(queue_pair), status_code_t::success_k);
+        disk.release();
+        expect_equal(spdk_connections(), std::size_t {1}, "a queue's pair keeps its controller attached");
+    }
     expect_equal(spdk_connections(), std::size_t {0});
     expected<linux_spdk_disk_t> fresh = linux_spdk_disk_t::open(environment, address, config);
     expect_status(fresh, status_code_t::success_k);
@@ -407,6 +431,49 @@ void test_spdk_reconnects_after_release(linux_spdk_disk_t& disk, linux_spdk_envi
     expect_equal(spdk_connections(), std::size_t {0});
 }
 
+/** A blocking queue is refused, since a namespace has no file a positioned transfer could name. */
+void test_spdk_refuses_a_blocking_queue(linux_spdk_disk_t& disk) {
+    auto [queue, make_queue_status] = blocking_queue_t::make(queue_pair_depth_k, {});
+    expect_status(make_queue_status, status_code_t::success_k);
+    queue_ref_t const queue_pair {queue, queue_id_t {0}};
+    std::array<request_t, 1> requests {};
+    expect_status(disk.register_media(queue_pair), status_code_t::unsupported_k);
+    expect_true(disk.submit(queue_pair, std::span<request_t const> {requests}) == status_code_t::unsupported_k);
+}
+
+/** A request naming @c queue_range_k moves bytes through the queue's own unregistered blocks. */
+void test_spdk_moves_through_the_queue_range(linux_spdk_disk_t& disk, medium_options_t const& request) {
+    st::vector<byte_t, linux_spdk_dma_allocator<byte_t>> blocks;
+    expect_true(blocks.resize(2 * block_bytes_k) == st::status_t::success_k);
+    if (blocks.size() != 2 * block_bytes_k) return;
+    std::span<byte_t> const range {blocks};
+    auto [queue, make_queue_status] = linux_spdk_queue_t::make(queue_pair_depth_k, range);
+    expect_status(make_queue_status, status_code_t::success_k);
+    queue_ref_t const queue_pair {queue, queue_id_t {0}};
+    expect_status(disk.register_media(queue_pair), status_code_t::success_k);
+    expected<registered_medium_t> registered = disk.register_medium(request);
+    if (!expect_true(registered.has_value())) return;
+
+    paint(range.first(block_bytes_k), 3);
+    paint(range.subspan(block_bytes_k), 0);
+    memory_reference_t const source {registered_memory_id_t::queue_range_k, 0, 0};
+    memory_reference_t const destination {registered_memory_id_t::queue_range_k, 0, block_bytes_k};
+    extent_t const extent {0, block_bytes_k};
+    std::array<request_t, 1> write {write_request(registered->reference(), extent, source, queue_pair.token(0))};
+    expect_true(disk.submit(queue_pair, std::span<request_t const> {write}) == std::size_t {1});
+    std::array<completion_t, polling_room_k> completions {};
+    expect_true(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions}, 1) ==
+                std::size_t {1});
+    expect_true(completions[0].completed_in_full());
+    std::array<request_t, 1> read {read_request(registered->reference(), extent, destination, queue_pair.token(1))};
+    expect_true(disk.submit(queue_pair, std::span<request_t const> {read}) == std::size_t {1});
+    expect_true(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions}, 1) ==
+                std::size_t {1});
+    expect_true(completions[0].completed_in_full());
+    expect_true(same_bytes(range.first(block_bytes_k), range.subspan(block_bytes_k)));
+    expect_true(disk.unregister_medium(*registered).succeeded());
+}
+
 /** Connects to @p address, checks what the controller says it is, and runs the ring contract over it. */
 void spdk_transport(char const* address, std::string_view serial) {
     expected<linux_spdk_environment_t> environment = linux_spdk_environment_t::acquire(
@@ -415,8 +482,6 @@ void spdk_transport(char const* address, std::string_view serial) {
     if (!environment) return;
 
     linux_spdk_disk_config_t config;
-    config.queue_pairs_limit = spdk_queue_pairs_k;
-    config.depth_limit = queue_pair_depth_k;
     config.registered_memory_limit = 4;
     expected<linux_spdk_disk_t> disk = linux_spdk_disk_t::open(*environment, address, config);
     run_test_case("linux_spdk_disk_t::open", [&] { expect_status(disk, status_code_t::success_k); });
@@ -424,6 +489,7 @@ void spdk_transport(char const* address, std::string_view serial) {
 
     run_test_case("test_spdk_identifies_the_controller", test_spdk_identifies_the_controller, *disk, serial);
     run_test_case("test_spdk_reports_the_namespace", test_spdk_reports_the_namespace, *disk);
+    run_test_case("test_spdk_refuses_a_blocking_queue", test_spdk_refuses_a_blocking_queue, *disk);
 
     expected<registered_medium_t> registered = disk->register_medium(volume_request("1"));
     if (registered && registered->capacity() == volume_bytes_k)
@@ -438,6 +504,8 @@ void spdk_transport(char const* address, std::string_view serial) {
                   test_ring_holds_a_medium_in_flight<linux_spdk_disk_t>, *disk, volume_request("1"));
     run_test_case("test_ring_keeps_what_it_flushed<linux_spdk_disk_t>",
                   test_ring_keeps_what_it_flushed<linux_spdk_disk_t>, *disk, volume_request("1"));
+    run_test_case("test_spdk_moves_through_the_queue_range", test_spdk_moves_through_the_queue_range, *disk,
+                  volume_request("1"));
     run_test_case("test_spdk_shares_the_controller", test_spdk_shares_the_controller, *disk, *environment, address,
                   config);
     run_test_case("test_spdk_reconnects_after_release", test_spdk_reconnects_after_release, *disk, *environment,
@@ -471,27 +539,25 @@ void spdk_suite(linux_spdk_suite_flags_t const& flags) {
 
 #pragma region Refusals
 
-/** Every entry point answers @c unsupported_k in a build that carries no driver, and nothing crashes. */
+/** Every entry point answers @c unsupported_k in a build that holds no driver,
+ *  and nothing crashes. */
 void test_spdk_refuses_without_the_option() {
     expect_status(linux_spdk_environment_t::acquire(linux_spdk_environment_config_t {}), status_code_t::unsupported_k);
 
     linux_spdk_disk_config_t config;
-    config.queue_pairs_limit = 4;
-    config.depth_limit = 8;
     config.registered_memory_limit = 4;
     expected<linux_spdk_disk_t> disk = linux_spdk_disk_t::open(linux_spdk_environment_t {}, absent_address_k, config);
     expect_status(disk, status_code_t::unsupported_k);
 
     linux_spdk_disk_t empty;
-    queue_pair_t queue_pair;
+    queue_ref_t queue_pair;
     registered_memory_t registered_memory;
     registered_medium_t descriptor;
     std::array<byte_t, 4096> buffer {};
     std::array<request_t, 1> requests {};
     std::array<completion_t, 1> completions {};
-    expect_status(empty.acquire_queue_pair(std::uint32_t {8}), status_code_t::unsupported_k);
-    expect_status(empty.bind_queue_pair(queue_pair), status_code_t::unsupported_k);
-    expect_status(empty.release_queue_pair(queue_pair), status_code_t::unsupported_k);
+    expect_status(linux_spdk_queue_t::make(8, {}), status_code_t::unsupported_k);
+    expect_status(empty.register_media(queue_pair), status_code_t::unsupported_k);
     expect_true(empty.register_memory(std::span<byte_t> {buffer}, memory_space_t::host_k) ==
                 status_code_t::unsupported_k);
     expect_status(empty.unregister_memory(registered_memory), status_code_t::unsupported_k);
@@ -504,14 +570,15 @@ void test_spdk_refuses_without_the_option() {
     expect_equal(empty.outstanding(queue_pair), std::size_t {0});
     empty.cancel(queue_pair);
 
-    ring_capabilities_t const reported = empty.capabilities();
+    disk_capabilities_t const reported = empty.capabilities();
     expect_equal(reported.depth_limit, std::uint32_t {0});
     expect_equal(reported.queue_pairs_limit, std::uint16_t {0});
     expect_true(!reported.reaches_gpu_memory);
     expect_equal(std::strlen(empty.identity().serial), std::size_t {0});
 }
 
-/** Checks the refusals, and reports that the transport itself needs a build that carries the driver. */
+/** Checks the refusals, and reports that the transport itself needs a build that
+ *  holds the driver. */
 void spdk_suite(linux_spdk_suite_flags_t const&) {
     run_test_case("test_spdk_refuses_without_the_option", test_spdk_refuses_without_the_option);
     run_test_case("linux_spdk_disk_t::open",

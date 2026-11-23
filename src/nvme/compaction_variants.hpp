@@ -6,7 +6,7 @@
  *      per key slot layout it stores, and one with the graph's device fold per graph key slot.
  *
  *  An explicit instantiation needs the definition it instantiates, so @c compaction.cpp includes
- *  this list after it. The bundles carry merge kernels for the engine's key slots alone, so the
+ *  this list after it. The bundles hold merge kernels for the engine's key slots alone, so the
  *  suites' key slots instantiate a compaction that refuses every merge, which the tree then runs
  *  on the host.
  */

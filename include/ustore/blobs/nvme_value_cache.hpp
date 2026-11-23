@@ -45,7 +45,7 @@ using utilities::resource_constraint;
  *  Neither ever waits, a probe writes nothing, and a displaced version is simply overwritten, so
  *  nothing is freed until the cache is. Every word moves atomically, so a probe racing a fill
  *  copies a torn version it then drops rather than racing on memory. The words are charged to the
- *  budget the cache was made with, which is borrowed and must outlive the cache.
+ *  budget the cache was made with, which is viewed and must outlive the cache.
  *
  *  @tparam atomic_reference_ The reference every word of a slot and the budget are owned through.
  */

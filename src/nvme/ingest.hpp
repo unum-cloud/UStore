@@ -22,7 +22,8 @@
 #include <cstddef> // `std::size_t`
 #include <cstring> // `std::memcmp`
 
-#include <new>         // `std::nothrow`
+#include <memory>      // `std::destroy_at`
+#include <new>         // placement `new`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <type_traits> // `std::is_same_v`
@@ -35,9 +36,10 @@
 #include "ustore/db.h" // `ustore_ingest_init_t`, `ustore_ingest_append_t`, `ustore_ingest_finish_t`
 
 #include "ustore/strings/nvme_memory_run.hpp" // `sort_unique_strings`, `keep_t`
-#include "ustore/utilities/ram_buffers.hpp"   // `arena_copy`, `arena_free_blocks`, `growth_status`
+#include "ustore/utilities/ram_buffers.hpp"   // `arena_allocate`, `arena_copy`, `arena_allocator`, `growth_status`
 
-#include "ingest_layer.hpp"      // `ingest_value_parser`, `ingest_values_of`
+#include "ingest_layer.hpp"      // `parse_ingest_values`, `ingest_values_of`
+#include "pages_layer.hpp"       // `clock_stamp`
 #include "database.hpp"          // `database_state`, `look_up`, `stored_of`, `compact_due`
 #include "graph.hpp"             // `vertex_delta_t`, `vertex_chain_t`, `chain_by_vertex`, `deltas_of_edge`
 #include "utilities/batches.hpp" // `keyed_rows_t`, `keyed_rows_of`, `ingest_edges_of`
@@ -90,82 +92,77 @@ inline string_delta_t string_delta_of(keyed_rows_t const& rows, std::size_t row)
 
 #pragma region Ingest Paths
 
-/** An arena of host pages an ingest copies the bytes it holds into, freed with the ingest. */
-struct kept_bytes_t {
-    ustore_arena_handle_t arena {};
-
-    kept_bytes_t() noexcept = default;
-    kept_bytes_t(kept_bytes_t const&) = delete;
-    kept_bytes_t& operator=(kept_bytes_t const&) = delete;
-    ~kept_bytes_t() noexcept { arena_free_blocks(arena); }
-};
+/** A sequence an ingest keeps from one append to the next, on the arena that holds the ingest
+ *  for its life. */
+template <typename value_type_>
+using kept_vector = st::vector<value_type_, arena_allocator<value_type_>>;
 
 /** A sorted ingest of blobs, documents or pages, every append handed to the store, which lays it out as it arrives. */
-template <strings_kit_concept strings_kit_type_>
-struct sorted_keyed_ingest {
-    explicit sorted_keyed_ingest(ingest_values_t values) noexcept : value_parser(values) {}
+struct sorted_keyed_ingest_t {
+    explicit sorted_keyed_ingest_t(ingest_values_t values) noexcept : lands_as(values) {}
 
-    ingest_value_parser<strings_kit_type_> value_parser;
+    /** What the rows land as. */
+    ingest_values_t lands_as;
 
-    /** The deltas of the append being handed over. */
-    st::vector<keyed_delta_t> deltas;
+    /** Where the next page parsed is placed, its sequence counting the pages parsed so far. */
+    pages::placement_t placement {clock_stamp(), 0};
 };
 
-/** An unsorted ingest of blobs, documents or pages, every key and value copied and held until the finish. */
-template <strings_kit_concept strings_kit_type_>
-struct held_keyed_ingest {
-    explicit held_keyed_ingest(ingest_values_t values) noexcept : value_parser(values) {}
+/** An unsorted ingest of blobs, documents or pages, every key and value copied into the
+ *  ingest's arena and held until the finish. */
+struct held_keyed_ingest_t {
+    held_keyed_ingest_t(ingest_values_t values, ustore_arena_t kept) noexcept
+        : lands_as(values), kept(kept), keys({kept}), values({kept}) {}
 
-    ingest_value_parser<strings_kit_type_> value_parser;
-    kept_bytes_t kept;
+    /** What the rows land as. */
+    ingest_values_t lands_as;
+
+    /** Where the next page parsed is placed, its sequence counting the pages parsed so far. */
+    pages::placement_t placement {clock_stamp(), 0};
+
+    /** The arena the ingest lives in, which the values are copied into. */
+    ustore_arena_t kept;
 
     /** The keys of every row in the order they came, and their values at the same places. */
-    st::vector<held_row_t> keys;
-    st::vector<std::span<byte_t const>> values;
-
-    /** The rows in key order, the last of every key, as the finish hands them over. */
-    st::vector<keyed_delta_t> deltas;
+    kept_vector<held_row_t> keys;
+    kept_vector<std::span<byte_t const>> values;
 };
 
 /** A sorted ingest of strings, every append handed to the store, which lays it out as it arrives. */
-struct sorted_strings_ingest_t {
+struct sorted_strings_ingest_t {};
 
-    /** The deltas of the append being handed over. */
-    st::vector<string_delta_t> deltas;
-};
-
-/** An unsorted ingest of strings, every string and its key copied and held until the finish. */
+/** An unsorted ingest of strings, every string and its key copied into the ingest's arena and
+ *  held until the finish. */
 struct held_strings_ingest_t {
-    kept_bytes_t kept;
-    st::vector<string_delta_t> deltas;
+    explicit held_strings_ingest_t(ustore_arena_t kept) noexcept : kept(kept), deltas({kept}) {}
+
+    /** The arena the ingest lives in, which the strings and their keys are copied into. */
+    ustore_arena_t kept;
+
+    kept_vector<string_delta_t> deltas;
 };
 
 /** An ingest of edges in either order, the two half-edge records of every edge held until the finish. */
 struct held_edges_ingest_t {
-    st::vector<vertex_delta_t> records;
+    explicit held_edges_ingest_t(ustore_arena_t kept) noexcept : records({kept}) {}
 
-    /** One change per vertex, carrying the records of every edge it ends, as the finish hands them over. */
-    st::vector<keyed_delta_t> deltas;
+    kept_vector<vertex_delta_t> records;
 };
 
 /** What an ingest holds until the finish, picked at its init by the modality and the order. */
-template <strings_kit_concept strings_kit_type_>
-using ingest_path = std::variant<sorted_keyed_ingest<strings_kit_type_>, held_keyed_ingest<strings_kit_type_>,
-                                 sorted_strings_ingest_t, held_strings_ingest_t, held_edges_ingest_t>;
+using ingest_path_t = std::variant<sorted_keyed_ingest_t, held_keyed_ingest_t, sorted_strings_ingest_t,
+                                   held_strings_ingest_t, held_edges_ingest_t>;
 
-/** The path an ingest of @p modality in @p order takes, parsing values through
- *  @p strings_kit_type_. */
-template <strings_kit_concept strings_kit_type_>
-ingest_path<strings_kit_type_> ingest_path_of(ustore_modality_t modality, ustore_ingest_order_t order) noexcept {
-    using ingest_path_t = ingest_path<strings_kit_type_>;
+/** The path an ingest of @p modality in @p order takes, keeping what it holds in @p kept. */
+inline ingest_path_t ingest_path_of(ustore_modality_t modality, ustore_ingest_order_t order,
+                                    ustore_arena_t kept) noexcept {
     bool const sorted = order == ustore_ingest_sorted_k;
-    if (modality == ustore_modality_graph_k) return ingest_path_t {std::in_place_type<held_edges_ingest_t>};
+    if (modality == ustore_modality_graph_k) return ingest_path_t {std::in_place_type<held_edges_ingest_t>, kept};
     if (modality == ustore_modality_strings_k && sorted)
         return ingest_path_t {std::in_place_type<sorted_strings_ingest_t>};
-    if (modality == ustore_modality_strings_k) return ingest_path_t {std::in_place_type<held_strings_ingest_t>};
-    if (sorted)
-        return ingest_path_t {std::in_place_type<sorted_keyed_ingest<strings_kit_type_>>, ingest_values_of(modality)};
-    return ingest_path_t {std::in_place_type<held_keyed_ingest<strings_kit_type_>>, ingest_values_of(modality)};
+    if (modality == ustore_modality_strings_k) return ingest_path_t {std::in_place_type<held_strings_ingest_t>, kept};
+    if (sorted) return ingest_path_t {std::in_place_type<sorted_keyed_ingest_t>, ingest_values_of(modality)};
+    return ingest_path_t {std::in_place_type<held_keyed_ingest_t>, ingest_values_of(modality), kept};
 }
 
 /** An ingest under way: its database and collection, the claim and runs the store keeps for it, and its path. */
@@ -174,56 +171,62 @@ struct ingest_state {
     database_state<cpu_class_>& database;
     ustore_collection_id_t collection;
     typename basic_database_of<cpu_class_>::ingest_t database_ingest;
-    ingest_path<typename nvme_variant<cpu_class_>::strings_kit_t> path;
+    ingest_path_t path;
 
     ~ingest_state() noexcept { database.store->drop_ingest(database_ingest); }
 };
 
-/** Hands the rows of a sorted append of blobs, documents or pages to the store, which lays them out for its runs. */
-template <cpu_class_t cpu_class_, strings_kit_concept strings_kit_type_>
-status_t write_deltas(ingest_state<cpu_class_>& ingest, sorted_keyed_ingest<strings_kit_type_>& path,
-                      keyed_rows_t const& rows) noexcept {
-    path.value_parser.rewind();
-    if (status_t const sized = growth_status(path.deltas.resize(rows.size())); sized.failed()) return sized;
-    for (std::size_t row = 0; row != rows.size(); ++row) {
-        auto [value, value_status] = path.value_parser(rows, row);
-        if (value_status.failed()) return value_status;
-        path.deltas[row] = keyed_delta_t {stored_of(rows.keys[row].uuid), delta_view_t {delta_kind_t::write_k, value}};
-    }
-    return ingest.database.store->write_ingest(ingest.database_ingest, std::span<keyed_delta_t const> {path.deltas});
+/** Hands the rows of a sorted append of blobs, documents or pages to the store, which lays them
+ *  out for its runs, their values parsed over the slices of @p view. */
+template <cpu_class_t cpu_class_>
+status_t write_deltas(ingest_state<cpu_class_>& ingest, sorted_keyed_ingest_t& path, keyed_rows_t const& rows,
+                      view_t const& view) noexcept {
+    using strings_kit_t = typename nvme_variant<cpu_class_>::strings_kit_t;
+    auto [values, values_status] = parse_ingest_values<strings_kit_t>(path.lands_as, rows, path.placement, view);
+    if (values_status.failed()) return values_status;
+    auto [deltas, deltas_status] = arena_allocate<keyed_delta_t>(view.scratch, rows.size());
+    if (deltas_status.failed()) return deltas_status;
+    for (std::size_t row = 0; row != rows.size(); ++row)
+        new (&deltas[row])
+            keyed_delta_t {stored_of(rows.keys[row].uuid), delta_view_t {delta_kind_t::write_k, values[row]}};
+    status_t const written = ingest.database.store->write_ingest(
+        ingest.database_ingest, std::span<keyed_delta_t const> {deltas}, nvme_queues_of(view));
+    if (written.succeeded()) path.placement.sequence += static_cast<std::uint32_t>(rows.size());
+    return written;
 }
 
-/** Holds the rows of an unsorted append of blobs, documents or pages, their values copied, until the finish. */
+/** Holds the rows of an unsorted append of blobs, documents or pages until the finish, their
+ *  values parsed over the slices of @p view and copied. */
 template <strings_kit_concept strings_kit_type_>
-status_t hold_deltas(held_keyed_ingest<strings_kit_type_>& path, keyed_rows_t const& rows) noexcept {
-    path.value_parser.rewind();
+status_t hold_deltas(held_keyed_ingest_t& path, keyed_rows_t const& rows, view_t const& view) noexcept {
+    auto [values, values_status] = parse_ingest_values<strings_kit_type_>(path.lands_as, rows, path.placement, view);
+    if (values_status.failed()) return values_status;
     std::size_t const before = path.keys.size();
     status_t status = growth_status(path.keys.reserve(before + rows.size()));
     if (status.succeeded()) status = growth_status(path.values.reserve(before + rows.size()));
     for (std::size_t row = 0; status.succeeded() && row != rows.size(); ++row) {
-        auto [value, value_status] = path.value_parser(rows, row);
-        if ((status = value_status).failed()) break;
-        auto [kept, kept_status] = arena_copy<byte_t>(&path.kept.arena, value);
+        auto [kept, kept_status] = arena_copy<byte_t>(path.kept, values[row]);
         if ((status = kept_status).failed()) break;
         [[maybe_unused]] st::status_t placed = path.keys.push_back(st::assume_reserved, held_row_t {rows.keys[row]});
         placed = path.values.push_back(st::assume_reserved, std::span<byte_t const> {kept});
     }
     while (status.failed() && path.keys.size() != before) path.keys.pop_back(), path.values.pop_back();
+    if (status.succeeded()) path.placement.sequence += static_cast<std::uint32_t>(rows.size());
     return status;
 }
 
 /** Orders the held rows of @p path by key through @p strings_kit_type_, keeping the last of every
- *  key, as its deltas. */
+ *  key, as deltas carved in @p scratch. */
 template <strings_kit_concept strings_kit_type_>
-status_t order_held_deltas(held_keyed_ingest<strings_kit_type_>& path) noexcept {
-    st::vector<sz_size_t> permutation;
-    if (status_t const sized = growth_status(permutation.resize(path.keys.size())); sized.failed()) return sized;
+expected<std::span<keyed_delta_t>> order_held_deltas(held_keyed_ingest_t& path, ustore_arena_t scratch) noexcept {
+    auto [permutation, permutation_status] = arena_allocate<sz_size_t>(scratch, path.keys.size());
+    if (permutation_status.failed()) return permutation_status;
     sz_strings_view_t const keys = keys_of(std::span<held_row_t const> {path.keys});
     if (sz_status_t const sorted = strings_kit_type_::sort_order(&keys, 0, sz_false_k, nullptr, permutation.data(),
                                                                  nullptr);
         sorted != sz_success_k)
-        return {sorted == sz_bad_alloc_k ? status_code_t::out_of_memory_k : status_code_t::internal_k,
-                sz_status_name(sorted)};
+        return status_t {sorted == sz_bad_alloc_k ? status_code_t::out_of_memory_k : status_code_t::internal_k,
+                         sz_status_name(sorted)};
     // The later of two equal keys is the larger position, whatever the sort's stability.
     std::size_t kept = 0;
     for (std::size_t index = 0; index != permutation.size(); ++index) {
@@ -235,20 +238,24 @@ status_t order_held_deltas(held_keyed_ingest<strings_kit_type_>& path) noexcept 
         }
         permutation[kept++] = given;
     }
-    if (status_t const sized = growth_status(path.deltas.resize(kept)); sized.failed()) return sized;
+    auto [deltas, deltas_status] = arena_allocate<keyed_delta_t>(scratch, kept);
+    if (deltas_status.failed()) return deltas_status;
     for (std::size_t index = 0; index != kept; ++index)
-        path.deltas[index] = keyed_delta_t {stored_of(path.keys[permutation[index]].key.uuid),
+        new (&deltas[index]) keyed_delta_t {stored_of(path.keys[permutation[index]].key.uuid),
                                             delta_view_t {delta_kind_t::write_k, path.values[permutation[index]]}};
-    return {};
+    return deltas;
 }
 
-/** Hands the strings of a sorted append to the store, which lays them out for its runs. */
+/** Hands the strings of a sorted append to the store, which lays them out for its runs, their
+ *  deltas carved in @p scratch. */
 template <cpu_class_t cpu_class_>
-status_t write_strings(ingest_state<cpu_class_>& ingest, sorted_strings_ingest_t& path,
-                       keyed_rows_t const& rows) noexcept {
-    if (status_t const sized = growth_status(path.deltas.resize(rows.size())); sized.failed()) return sized;
-    for (std::size_t row = 0; row != rows.size(); ++row) path.deltas[row] = string_delta_of(rows, row);
-    return ingest.database.store->write_ingest(ingest.database_ingest, std::span<string_delta_t const> {path.deltas});
+status_t write_strings(ingest_state<cpu_class_>& ingest, keyed_rows_t const& rows, ustore_arena_t scratch,
+                       nvme_queues_ref_t queues) noexcept {
+    auto [deltas, deltas_status] = arena_allocate<string_delta_t>(scratch, rows.size());
+    if (deltas_status.failed()) return deltas_status;
+    for (std::size_t row = 0; row != rows.size(); ++row) new (&deltas[row]) string_delta_t {string_delta_of(rows, row)};
+    return ingest.database.store->write_ingest(ingest.database_ingest, std::span<string_delta_t const> {deltas},
+                                               queues);
 }
 
 /** Holds the strings of an unsorted append, each string and its key copied, until the finish. */
@@ -257,8 +264,8 @@ inline status_t hold_strings(held_strings_ingest_t& path, keyed_rows_t const& ro
     status_t status = growth_status(path.deltas.reserve(before + rows.size()));
     for (std::size_t row = 0; status.succeeded() && row != rows.size(); ++row) {
         string_delta_t const given = string_delta_of(rows, row);
-        auto [text, text_status] = arena_copy<char>(&path.kept.arena, std::span<char const> {given.stored_key});
-        auto [key, key_status] = arena_copy<byte_t>(&path.kept.arena, given.delta.bytes);
+        auto [text, text_status] = arena_copy<char>(path.kept, std::span<char const> {given.stored_key});
+        auto [key, key_status] = arena_copy<byte_t>(path.kept, given.delta.bytes);
         status = text_status.failed() ? text_status : key_status;
         if (status.failed()) break;
         [[maybe_unused]] st::status_t const placed = path.deltas.push_back(
@@ -292,34 +299,37 @@ inline status_t hold_edges(held_edges_ingest_t& path, ustore_collection_id_t con
 }
 
 /** Writes what an unsorted ingest or a graph held as runs: the rows in key order, the strings in their order, or one
- *  change per vertex carrying the half-edges of every edge it ends, chained in @p scratch. */
+ *  change per vertex holding the half-edges of every edge it ends, chained in @p scratch. */
 template <cpu_class_t cpu_class_, typename path_type_>
-status_t write_held(ingest_state<cpu_class_>& ingest, path_type_& path, ustore_arena_t scratch) noexcept {
+status_t write_held(ingest_state<cpu_class_>& ingest, path_type_& path, ustore_arena_t scratch,
+                    nvme_queues_ref_t queues) noexcept {
     using strings_kit_t = typename nvme_variant<cpu_class_>::strings_kit_t;
     if constexpr (std::is_same_v<path_type_, held_strings_ingest_t>) {
         auto [kept, sort_status] = strings::sort_unique_strings(std::span<string_delta_t> {path.deltas},
                                                                 strings_kit_t::sort_order, strings::keep_t::last_k,
-                                                                path.deltas.get_allocator());
+                                                                arena_allocator<string_delta_t> {scratch});
         if (sort_status.failed()) return sort_status;
         return ingest.database.store->write_ingest(ingest.database_ingest,
-                                                   std::span<string_delta_t const> {path.deltas.data(), kept});
+                                                   std::span<string_delta_t const> {path.deltas.data(), kept}, queues);
     }
     else if constexpr (std::is_same_v<path_type_, held_edges_ingest_t>) {
         st::vector<vertex_chain_t, arena_allocator<vertex_chain_t>> chains {{scratch}};
         if (status_t const chained = chain_by_vertex(std::span<vertex_delta_t> {path.records}, scratch, chains);
             chained.failed())
             return chained;
-        if (status_t const sized = growth_status(path.deltas.resize(chains.size())); sized.failed()) return sized;
+        auto [deltas, deltas_status] = arena_allocate<keyed_delta_t>(scratch, chains.size());
+        if (deltas_status.failed()) return deltas_status;
         for (std::size_t index = 0; index != chains.size(); ++index)
-            path.deltas[index] = keyed_delta_t {stored_of(chains[index].vertex.uuid),
+            new (&deltas[index]) keyed_delta_t {stored_of(chains[index].vertex.uuid),
                                                 delta_view_t {delta_kind_t::change_k, chains[index].records}};
-        return ingest.database.store->write_ingest(ingest.database_ingest,
-                                                   std::span<keyed_delta_t const> {path.deltas});
+        return ingest.database.store->write_ingest(ingest.database_ingest, std::span<keyed_delta_t const> {deltas},
+                                                   queues);
     }
-    else if constexpr (std::is_same_v<path_type_, held_keyed_ingest<strings_kit_t>>) {
-        if (status_t const ordered = order_held_deltas(path); ordered.failed()) return ordered;
-        return ingest.database.store->write_ingest(ingest.database_ingest,
-                                                   std::span<keyed_delta_t const> {path.deltas});
+    else if constexpr (std::is_same_v<path_type_, held_keyed_ingest_t>) {
+        auto [deltas, order_status] = order_held_deltas<strings_kit_t>(path, scratch);
+        if (order_status.failed()) return order_status;
+        return ingest.database.store->write_ingest(ingest.database_ingest, std::span<keyed_delta_t const> {deltas},
+                                                   queues);
     }
     else return {};
 }
@@ -329,19 +339,20 @@ template <cpu_class_t cpu_class_>
 status_t ingest_init(ustore_ingest_init_t const& arguments, view_t const& view) noexcept {
     using any_collection_id_t = typename basic_database_of<cpu_class_>::any_collection_id_t;
     database_state<cpu_class_>& database = database_state_of<cpu_class_>(arguments);
-    auto [entry, look_up_status] = look_up(database, view.scratch, arguments.collection);
+    auto [entry, look_up_status] = look_up(database, view.scratch, nvme_queues_of(view), arguments.collection);
     if (look_up_status.failed()) return look_up_status;
     if (entry.modality < ustore_modality_blobs_k || entry.modality > ustore_modality_pages_k)
         return {status_code_t::unsupported_k, "NVMe ingests no such collection"};
-    ingest_state<cpu_class_>* const ingest = new (std::nothrow) ingest_state<cpu_class_> {
-        .database = database,
-        .collection = arguments.collection,
-        .path = ingest_path_of<typename nvme_variant<cpu_class_>::strings_kit_t>(entry.modality, arguments.order)};
-    if (!ingest) return {status_code_t::out_of_memory_k, "Failed to allocate the ingest"};
+    auto [room, room_status] = arena_allocate<ingest_state<cpu_class_>>(&(*arguments.ingest)->kept, 1);
+    if (room_status.failed()) return room_status;
+    ingest_state<cpu_class_>* const ingest = new (room.data())
+        ingest_state<cpu_class_> {.database = database,
+                                  .collection = arguments.collection,
+                                  .path = ingest_path_of(entry.modality, arguments.order, &(*arguments.ingest)->kept)};
     status_t const begun = database.store->begin_ingest(any_collection_id_t {arguments.collection},
                                                         ingest->database_ingest);
     if (begun.failed()) {
-        delete ingest;
+        std::destroy_at(ingest);
         return begun;
     }
     (*arguments.ingest)->state = ingest;
@@ -352,20 +363,22 @@ status_t ingest_init(ustore_ingest_init_t const& arguments, view_t const& view) 
  *  append as runs and holding any other until the finish. */
 template <cpu_class_t cpu_class_, typename path_type_>
 status_t append_rows(ingest_state<cpu_class_>& ingest, path_type_& path, ustore_ingest_append_t const& arguments,
-                     strings_arg_t const& values) noexcept {
+                     strings_arg_t const& values, view_t const& view) noexcept {
     using strings_kit_t = typename nvme_variant<cpu_class_>::strings_kit_t;
     auto [rows, rows_status] = utilities::keyed_rows_of(arguments, values);
     if (rows_status.failed() || !rows.size()) return rows_status;
-    if constexpr (std::is_same_v<path_type_, sorted_keyed_ingest<strings_kit_t>>)
-        return write_deltas(ingest, path, rows);
-    else if constexpr (std::is_same_v<path_type_, held_keyed_ingest<strings_kit_t>>) return hold_deltas(path, rows);
-    else if constexpr (std::is_same_v<path_type_, sorted_strings_ingest_t>) return write_strings(ingest, path, rows);
+    if constexpr (std::is_same_v<path_type_, sorted_keyed_ingest_t>) return write_deltas(ingest, path, rows, view);
+    else if constexpr (std::is_same_v<path_type_, held_keyed_ingest_t>)
+        return hold_deltas<strings_kit_t>(path, rows, view);
+    else if constexpr (std::is_same_v<path_type_, sorted_strings_ingest_t>)
+        return write_strings(ingest, rows, view.scratch, nvme_queues_of(view));
     else return hold_strings(path, rows);
 }
 
 /** Implements @c ustore_ingest_append, writing a sorted append as runs and holding any other until the finish. */
 template <cpu_class_t cpu_class_>
-status_t ingest_append(ustore_ingest_append_t const& arguments, strings_arg_t const& values, view_t const&) noexcept {
+status_t ingest_append(ustore_ingest_append_t const& arguments, strings_arg_t const& values,
+                       view_t const& view) noexcept {
     ingest_state<cpu_class_>& ingest = *state_of<ingest_state<cpu_class_>>(arguments.ingest);
     return std::visit(
         [&]<typename path_type_>(path_type_& path) noexcept -> status_t {
@@ -374,7 +387,7 @@ status_t ingest_append(ustore_ingest_append_t const& arguments, strings_arg_t co
                 if (edges_status.failed()) return edges_status;
                 return hold_edges(path, ingest.collection, edges);
             }
-            else return append_rows(ingest, path, arguments, values);
+            else return append_rows(ingest, path, arguments, values, view);
         },
         ingest.path);
 }
@@ -384,21 +397,24 @@ template <cpu_class_t cpu_class_>
 status_t ingest_finish(ustore_ingest_finish_t const& arguments, view_t const& view) noexcept {
     ingest_state<cpu_class_>& ingest = *state_of<ingest_state<cpu_class_>>(arguments.ingest);
     status_t const wrote = std::visit(
-        [&]<typename path_type_>(path_type_& path) noexcept { return write_held(ingest, path, view.scratch); },
+        [&]<typename path_type_>(path_type_& path) noexcept {
+            return write_held(ingest, path, view.scratch, nvme_queues_of(view));
+        },
         ingest.path);
     if (wrote.failed()) return wrote;
-    ingest_outcome_t const landed = ingest.database.store->publish_ingest(ingest.database_ingest, arguments.durability);
+    ingest_outcome_t const landed = ingest.database.store->publish_ingest(ingest.database_ingest, arguments.durability,
+                                                                          nvme_queues_of(view));
     if (landed.stamp == invalid_transaction_stamp_k) return landed.status;
     if (arguments.commit_stamp) *arguments.commit_stamp = landed.stamp;
     // The ingest has landed, so a compaction it left due is met again by the next write making room
-    [[maybe_unused]] status_t const compacted = compact_due(ingest.database);
+    [[maybe_unused]] status_t const compacted = compact_due(ingest.database, view);
     return landed.status;
 }
 
 /** Implements @c ustore_ingest_free, dropping every run never published and giving the claim back. */
 template <cpu_class_t cpu_class_>
 void ingest_free(ustore_ingest_t handle) noexcept {
-    delete state_of<ingest_state<cpu_class_>>(handle);
+    std::destroy_at(state_of<ingest_state<cpu_class_>>(handle));
 }
 
 #pragma endregion Ingest Paths

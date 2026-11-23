@@ -8,6 +8,7 @@
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
+#include <cstdio>  // `std::snprintf`
 #include <cstring> // `std::memcpy`
 
 #include <algorithm>   // `std::find`, `std::reverse`
@@ -20,7 +21,18 @@
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/types.h" // `ustore_executor_for_ram_t`, `ustore_arena_init_t`, `ustore_version`
+#include "ustore/types.h" // `ustore_executor_for_ram_t`, `ustore_arena_init_t`, `ustore_version`, `USTORE_OS_LINUX_`
+
+#if USTORE_OS_LINUX_
+#include <dirent.h>        // `fdopendir`, `readdir`, `closedir`
+#include <fcntl.h>         // `open`, `openat`, `O_DIRECTORY`
+#include <sys/stat.h>      // `stat`, `S_ISBLK`
+#include <sys/sysmacros.h> // `gnu_dev_major`, `gnu_dev_minor`
+#include <unistd.h>        // `read`, `close`, `faccessat`
+#endif
+
+#include "ustore/utilities/blocking_files.hpp" // `path_max_bytes_k`
+#include "ustore/utilities/nvme_volume.hpp"    // `parse_data_address`, `data_address_kind_t`
 
 #include "lib.hpp" // `ustore_executor_handle_t`, `finish`, `wait_while_claimed`, `runs_holding_call`, `enumerator_spelling`
 
@@ -139,8 +151,8 @@ constexpr enumerator_spelling<ustore_phase_t> phase_names_k[] {
 /** How a pool spawned here treats the thread spawning it: apart from its workers, or as its only thread in a build
  *  without OS threads. */
 caller_exclusivity_t spawned_exclusivity() noexcept {
-    return executor_t::spawns_threads() ? caller_exclusivity_t::caller_exclusive_k
-                                        : caller_exclusivity_t::caller_inclusive_k;
+    return ram_executor_t::spawns_threads() ? caller_exclusivity_t::caller_exclusive_k
+                                            : caller_exclusivity_t::caller_inclusive_k;
 }
 
 /** Explains why an executor could not have its threads. */
@@ -150,8 +162,6 @@ status_t pool_failure(st::status_t status) noexcept {
     case st::status_t::invalid_argument_k: return {status_code_t::invalid_argument_k, "The pool holds no threads"};
     case st::status_t::operation_not_permitted_k:
         return {status_code_t::unsupported_k, "The system refused to start the threads"};
-    case st::status_t::operation_would_block_k:
-        return {status_code_t::contended_k, "The lent pool runs its lender's dispatch"};
     default: return {status_code_t::internal_k, "ForkUnion failed for an unknown reason"};
     }
 }
@@ -174,7 +184,7 @@ status_t read_memory_domains(ustore_ram_options_t const& options, topology_t con
         bool known = false;
         for (std::size_t candidate = 0; candidate != available && !known; ++candidate)
             known = topology.memory_domain(candidate) == named;
-        if (!known) return {status_code_t::invalid_argument_k, "No memory domain carries the identifier"};
+        if (!known) return {status_code_t::invalid_argument_k, "No memory domain holds the identifier"};
         domains[index] = named;
     }
     return {};
@@ -193,26 +203,136 @@ std::size_t cores_near(topology_t const& topology, std::span<fu_memory_domain_id
     return cores;
 }
 
-nvme_placement_t nvme_placement_of(ustore_executor_t executor) noexcept {
-    nvme_placement_t placement;
-    ustore_nvme_options_t const* const nvme = executor ? std::get_if<ustore_nvme_options_t>(&executor->device)
-                                                       : nullptr;
-    if (!nvme) return placement;
-    placement.nvme = *nvme;
-    placement.threads = view_of(executor->pool).threads_count();
-    placement.executor = executor;
-    return placement;
+/** What an NVMe executor spawns by: the fewest hardware queues of any disk under its paths, zero
+ *  when none answers, and the memory domain every one of them sits nearest, or -1 when they differ
+ *  or none is known. */
+struct nvme_media_shape_t {
+    std::size_t fewest_queues = 0;
+    fu_memory_domain_id_t memory_domain = -1;
+};
+
+#if USTORE_OS_LINUX_
+
+/** Hardware queues the disk at the sysfs directory @p disk spreads CPUs over: the entries of its
+ *  @c mq/. */
+std::size_t sysfs_hardware_queues(int disk) noexcept {
+    int const listed = ::openat(disk, "mq", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (listed < 0) return 0;
+    DIR* const entries = ::fdopendir(listed);
+    if (!entries) return ::close(listed), 0u;
+    std::size_t queues = 0;
+    for (struct dirent const* entry = ::readdir(entries); entry; entry = ::readdir(entries))
+        queues += entry->d_name[0] != '.';
+    ::closedir(entries);
+    return queues;
+}
+
+/** The memory domain nearest the PCI function behind the disk at the sysfs directory @p disk, as
+ *  its controller's @c device/address names it; -1 off PCI or tied to no domain. */
+fu_memory_domain_id_t sysfs_memory_domain(int disk) noexcept {
+    int const attribute = ::openat(disk, "device/address", O_RDONLY | O_CLOEXEC);
+    if (attribute < 0) return -1;
+    char bus_id[32] = {};
+    ssize_t const length = ::read(attribute, bus_id, sizeof(bus_id) - 1);
+    ::close(attribute);
+    if (length <= 0) return -1;
+    if (bus_id[length - 1] == '\n') bus_id[length - 1] = 0;
+    return topology_t::memory_domain_of_pci(bus_id);
+}
+
+/** The shape of the whole disk under @p location, a directory, a file or a block device: a
+ *  partition's parent or a file's disk through @c st_dev; zeros where no disk backs it. */
+nvme_media_shape_t disk_shape_of(std::string_view location) noexcept {
+    char path[utilities::path_max_bytes_k];
+    if (location.size() >= sizeof(path)) return {};
+    std::memcpy(path, location.data(), location.size());
+    path[location.size()] = '\0';
+    struct stat description;
+    if (::stat(path, &description) != 0) return {};
+    dev_t const device = S_ISBLK(description.st_mode) ? description.st_rdev : description.st_dev;
+    // The longest path the root spells with 32-bit majors and minors
+    char sysfs[sizeof("/sys/dev/block/4294967295:4294967295")];
+    std::snprintf(sysfs, sizeof(sysfs), "/sys/dev/block/%u:%u", static_cast<unsigned>(::gnu_dev_major(device)),
+                  static_cast<unsigned>(::gnu_dev_minor(device)));
+    int disk = ::open(sysfs, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (disk >= 0 && ::faccessat(disk, "partition", F_OK, 0) == 0) {
+        int const partition = std::exchange(disk, -1);
+        disk = ::openat(partition, "..", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        ::close(partition);
+    }
+    if (disk < 0) return {};
+    nvme_media_shape_t const shape {sysfs_hardware_queues(disk), sysfs_memory_domain(disk)};
+    ::close(disk);
+    return shape;
+}
+
+#else
+
+/** Answers zeros, since only Linux reports the disk under a path. */
+nvme_media_shape_t disk_shape_of(std::string_view) noexcept { return {}; }
+
+#endif
+
+/** The shape of the media under @p paths, data directories, raw media or SPDK namespaces as a
+ *  database's open names them; an SPDK controller reports its memory domain but no queues before
+ *  the driver attaches it. */
+nvme_media_shape_t nvme_media_shape(std::span<ustore_bytes_view_t const> paths) noexcept {
+    nvme_media_shape_t shape;
+    for (std::size_t position = 0; position != paths.size(); ++position) {
+        std::string_view const named {reinterpret_cast<char const*>(paths[position].data), paths[position].length};
+        auto [address, parse_status] = utilities::parse_data_address(named);
+        nvme_media_shape_t disk;
+        if (parse_status.succeeded() && address.kind == utilities::data_address_kind_t::spdk_k) {
+            auto [bus_id, bus_id_status] = utilities::pci_address_parsed(address.location);
+            if (bus_id_status.succeeded()) disk.memory_domain = topology_t::memory_domain_of_pci(bus_id.text);
+        }
+        else if (parse_status.succeeded()) disk = disk_shape_of(address.location);
+        if (disk.fewest_queues && (!shape.fewest_queues || disk.fewest_queues < shape.fewest_queues))
+            shape.fewest_queues = disk.fewest_queues;
+        shape.memory_domain = !position || shape.memory_domain == disk.memory_domain ? disk.memory_domain : -1;
+    }
+    return shape;
 }
 
 } // namespace unum::ustore
 
-/** Makes in @p made the executor running calls on @p pool, refusing a lent pool its lender keeps
- *  busy. Each pool thread's scratch lives on its local memory domain of @p topology when @p domains
- *  hold it, and on the first of them otherwise; the call's scratch and every arena the executor
- *  makes live where pool thread 0's does. */
-static status_t make_executor(std::variant<executor_t, lent_pool_t> pool, topology_t const& topology,
-                              std::span<fu_memory_domain_id_t const> domains, ustore_executor_t& made) noexcept {
-    std::size_t const threads = view_of(pool).threads_count();
+/** The queue set that @p options describe, one ring pair per entry of @p memory_domains on that
+ *  domain, its transport probed when automatic and every zero size taking the engine's default. */
+static expected<utilities::nvme_queues_t> make_nvme_queues(
+    ustore_nvme_options_t const& options, std::span<fu_memory_domain_id_t const> memory_domains) noexcept {
+    using utilities::io_transport_t;
+    utilities::io_channel_config_t channels;
+    bool const fits = take_unless_zero(channels.depth, options.queue_depth) &&
+                      take_unless_zero(channels.request_buffer_bytes, options.request_buffer_bytes) &&
+                      take_unless_zero(channels.request_buffers_count, options.request_buffers_count) &&
+                      take_unless_zero(channels.stream_buffer_bytes, options.stream_buffer_bytes) &&
+                      take_unless_zero(channels.stream_buffers_count, options.stream_buffers_count);
+    if (!fits) return status_t {status_code_t::invalid_argument_k, "An NVMe option exceeds its range"};
+    io_transport_t wanted = io_transport_t::automatic_k;
+    switch (options.transport) {
+    case ustore_transport_automatic_k: wanted = io_transport_t::automatic_k; break;
+    case ustore_transport_blocking_k: wanted = io_transport_t::blocking_k; break;
+    case ustore_transport_linux_uring_k: wanted = io_transport_t::linux_uring_k; break;
+    case ustore_transport_linux_aio_k: wanted = io_transport_t::linux_aio_k; break;
+    case ustore_transport_linux_spdk_k: wanted = io_transport_t::linux_spdk_k; break;
+    default: return status_t {status_code_t::invalid_argument_k, "Unknown transport"};
+    }
+    using linux_uring_t = utilities::linux_uring_files_disk<fu::standard_atomic_ref, fu::standard_yield_t>;
+    using linux_aio_t = utilities::linux_aio_files_disk<fu::standard_atomic_ref, fu::standard_yield_t>;
+    auto [transport, transport_status] = utilities::probed_transport(wanted, linux_uring_t::probe(),
+                                                                     linux_aio_t::probe());
+    if (transport_status.failed()) return transport_status;
+    return utilities::nvme_queues_t::make(transport, channels, memory_domains);
+}
+
+/** Makes in @p made the executor running calls on @p pool. Each pool thread's scratch lives on its
+ *  local memory domain of @p topology when @p domains hold it, and on the first of them otherwise;
+ *  the call's scratch and every arena the executor makes live where pool thread 0's does. */
+static status_t make_executor(ram_executor_t pool, topology_t const& topology,
+                              std::span<fu_memory_domain_id_t const> domains, std::size_t scratch_limit,
+                              ustore_executor_t& made) noexcept {
+    std::size_t const bytes_limit = scratch_limit ? scratch_limit : scratch_limit_default_k;
+    std::size_t const threads = pool.threads_count();
     ustore_executor_handle_t* const executor = new (std::nothrow) ustore_executor_handle_t {std::move(pool)};
     if (!executor) return {status_code_t::out_of_memory_k, "Failed to allocate the executor"};
     if (st::failed(executor->scratches.resize(threads + 1))) {
@@ -224,14 +344,15 @@ static status_t make_executor(std::variant<executor_t, lent_pool_t> pool, topolo
     auto place_scratch = [&](std::size_t thread, std::size_t compute_domain) noexcept {
         fu_memory_domain_id_t const local = topology.memory_domain_near(compute_domain);
         fu_memory_domain_id_t const placed = serves(domains, local) ? local : domains.front();
-        executor->scratches[thread].memory = host_blocks_t {.memory_domain = placed};
+        executor->scratches[thread].memory = host_blocks_t {.memory_domain = placed, .bytes_limit = bytes_limit};
         if (thread == 0) executor->memory_domain = placed;
     };
-    if (st::status_t const placed = view_of(executor->pool).for_threads(place_scratch); st::failed(placed)) {
+    if (st::status_t const placed = executor->pool.for_threads(place_scratch); st::failed(placed)) {
         delete executor;
         return pool_failure(placed);
     }
-    executor->scratches.back().memory = host_blocks_t {.memory_domain = executor->memory_domain};
+    executor->scratches.back().memory = host_blocks_t {.memory_domain = executor->memory_domain,
+                                                       .bytes_limit = bytes_limit};
     made = executor;
     return {};
 }
@@ -314,51 +435,38 @@ void ustore_executor_for_ram(ustore_executor_for_ram_t* arguments) {
     if (status_t const status = read_memory_domains(arguments->ram, *topology, domains); status.failed())
         return finish(outcome, status);
     std::size_t threads = arguments->threads;
-    if (!executor_t::spawns_threads()) {
+    if (!ram_executor_t::spawns_threads()) {
         if (threads > 1) return finish(outcome, {status_code_t::unsupported_k, "This build spawns no threads"});
         threads = 1;
     }
     else if (!threads) threads = fu::max_of<std::size_t>(cores_near(*topology, domains) * 7 / 8, 1);
     // ForkUnion spawns near one memory domain or across every one, so naming several but not all takes the machine
     bool const near_one = domains.size() == 1 && topology->memory_domains_count() > 1;
-    st::expected<executor_t> pool = near_one ? executor_t::make_near(*topology, domains[0], threads,
-                                                                     spawned_exclusivity(), allowed)
-                                             : executor_t::make(*topology, threads, spawned_exclusivity(), allowed);
+    st::expected<ram_executor_t> pool = near_one
+                                            ? ram_executor_t::make_near(*topology, domains[0], threads,
+                                                                        spawned_exclusivity(), allowed)
+                                            : ram_executor_t::make(*topology, threads, spawned_exclusivity(), allowed);
     if (!pool) return finish(outcome, pool_failure(pool.status()));
-    finish(outcome, make_executor(std::move(*pool), *topology, domains, *arguments->executor));
-}
-
-void ustore_executor_on_pool(ustore_executor_on_pool_t* arguments) {
-    ustore_outcome_t& outcome = *arguments->outcome;
-    if (!arguments->executor)
-        return finish(outcome, {status_code_t::invalid_argument_k, "The call needs an output for the executor"});
-    *arguments->executor = nullptr;
-    st::expected<lent_pool_t> pool = lent_pool_t::borrow(arguments->pool);
-    if (!pool) return finish(outcome, pool_failure(pool.status()));
-    st::expected<topology_t> topology = topology_t::make();
-    if (!topology) return finish(outcome, pool_failure(topology.status()));
-    st::vector<fu_memory_domain_id_t> domains;
-    if (status_t const status = read_memory_domains(arguments->ram, *topology, domains); status.failed())
-        return finish(outcome, status);
-    finish(outcome, make_executor(*pool, *topology, domains, *arguments->executor));
+    finish(outcome,
+           make_executor(std::move(*pool), *topology, domains, arguments->scratch_limit, *arguments->executor));
 }
 
 /** Makes in @p made an executor of @p threads host threads spread over the whole machine, as the
- *  NVMe and VRAM executors take, treating its caller as @p exclusivity says, allowed the ForkUnion
- *  capabilities in @p allowed, whose scratch lives near each thread. */
+ *  VRAM executor takes, treating its caller as @p exclusivity says, using only the capabilities in
+ *  @p allowed, whose scratch of @p scratch_limit bytes lives near each thread. */
 static status_t spawn_across_machine(std::size_t threads, caller_exclusivity_t exclusivity, fu_capabilities_t allowed,
-                                     ustore_executor_t& made) noexcept {
+                                     std::size_t scratch_limit, ustore_executor_t& made) noexcept {
     st::expected<topology_t> topology = topology_t::make();
     if (!topology) return pool_failure(topology.status());
     st::vector<fu_memory_domain_id_t> domains;
     if (status_t const status = read_memory_domains({}, *topology, domains); status.failed()) return status;
-    if (!executor_t::spawns_threads()) {
+    if (!ram_executor_t::spawns_threads()) {
         if (threads > 1) return {status_code_t::unsupported_k, "This build spawns no threads"};
         threads = 1;
     }
-    st::expected<executor_t> pool = executor_t::make(*topology, threads, exclusivity, allowed);
+    st::expected<ram_executor_t> pool = ram_executor_t::make(*topology, threads, exclusivity, allowed);
     if (!pool) return pool_failure(pool.status());
-    return make_executor(std::move(*pool), *topology, domains, made);
+    return make_executor(std::move(*pool), *topology, domains, scratch_limit, made);
 }
 
 void ustore_executor_for_nvme(ustore_executor_for_nvme_t* arguments) {
@@ -368,20 +476,59 @@ void ustore_executor_for_nvme(ustore_executor_for_nvme_t* arguments) {
     *arguments->executor = nullptr;
     if (arguments->nvme.transport > ustore_transport_linux_spdk_k)
         return finish(outcome, {status_code_t::invalid_argument_k, "Unknown transport"});
+    if (arguments->nvme.paths_count && !arguments->nvme.paths)
+        return finish(outcome, {status_code_t::invalid_argument_k, "Paths with a count need their views"});
     auto const [ceiling, pick_status] = pick_cpu_ceiling(arguments->cpu_class_ceiling);
     if (pick_status.failed()) return finish(outcome, pick_status);
+    st::expected<topology_t> topology = topology_t::make();
+    if (!topology) return finish(outcome, pool_failure(topology.status()));
+    st::vector<fu_memory_domain_id_t> domains;
+    if (status_t const status = read_memory_domains(arguments->ram, *topology, domains); status.failed())
+        return finish(outcome, status);
+
+    // Named domains win; else drives on one domain of several keep their threads and staging there
+    std::span<ustore_bytes_view_t const> const paths {arguments->nvme.paths,
+                                                      static_cast<std::size_t>(arguments->nvme.paths_count)};
+    nvme_media_shape_t const shape = nvme_media_shape(paths);
+    bool const named = arguments->ram.memory_domains && arguments->ram.memory_domains_count;
+    fu_memory_domain_id_t const near_domain = named                                  ? domains.front()
+                                              : topology->memory_domains_count() > 1 ? shape.memory_domain
+                                                                                     : fu_memory_domain_id_t {-1};
     std::size_t threads = arguments->threads;
-    // Every thread pins a channel of 12 MB by default, so the derived count stays as low as the NVMe mount keeps its
-    // own
-    if (!threads)
-        if (st::expected<std::size_t> const cores = executor_t::logical_cores_count(); cores)
-            threads = std::clamp<std::size_t>(*cores / 2, 1, 8);
+    if (!ram_executor_t::spawns_threads()) {
+        if (threads > 1) return finish(outcome, {status_code_t::unsupported_k, "This build spawns no threads"});
+        threads = 1;
+    }
+    else if (!threads) {
+        std::size_t const cores = near_domain != -1 ? cores_near(*topology, {&near_domain, 1})
+                                                    : topology->logical_cores_count();
+        // Without queues to count, the count stays as low as a mount keeps, as each pins 12 MB
+        threads = shape.fewest_queues ? fu::min_of(shape.fewest_queues, cores)
+                                      : std::clamp<std::size_t>(cores / 2, 1, 8);
+        threads = fu::max_of<std::size_t>(threads, 1);
+    }
+    fu_capabilities_t const allowed = forkunion_allowed_of(ceiling);
+    st::expected<ram_executor_t> pool = near_domain != -1
+                                            ? ram_executor_t::make_near(*topology, near_domain, threads,
+                                                                        spawned_exclusivity(), allowed)
+                                            : ram_executor_t::make(*topology, threads, spawned_exclusivity(), allowed);
+    if (!pool) return finish(outcome, pool_failure(pool.status()));
     ustore_executor_t made = nullptr;
-    if (status_t const status = spawn_across_machine(fu::max_of<std::size_t>(threads, 1), spawned_exclusivity(),
-                                                     forkunion_allowed_of(ceiling), made);
+    if (status_t const status = make_executor(std::move(*pool), *topology, domains, arguments->scratch_limit, made);
         status.failed())
         return finish(outcome, status);
-    made->device = arguments->nvme;
+
+    // A ring pair per pool thread and one for the holding call, each on its scratch's domain;
+    // the queue set resolves an automatic transport once, as a database open does
+    st::vector<fu_memory_domain_id_t> staging_domains;
+    if (staging_domains.resize(made->scratches.size()) != st::status_t::success_k)
+        return ustore_executor_free(made),
+               finish(outcome, {status_code_t::out_of_memory_k, "Failed to copy the threads' memory domains"});
+    for (std::size_t thread = 0; thread != made->scratches.size(); ++thread)
+        staging_domains[thread] = host_blocks_of(&made->scratches[thread])->memory_domain;
+    auto [queues, queues_status] = make_nvme_queues(arguments->nvme, staging_domains);
+    if (queues_status.failed()) return ustore_executor_free(made), finish(outcome, queues_status);
+    made->device.emplace<utilities::nvme_queues_t>(std::move(queues));
     *arguments->executor = made;
     finish(outcome, {});
 }
@@ -395,7 +542,7 @@ void ustore_executor_for_vram(ustore_executor_for_vram_t* arguments) {
         return finish(outcome, {status_code_t::invalid_argument_k, "Unknown GPUDirect Storage mode"});
     std::span<gpu_device_t const> const devices = gpu_devices();
     if (arguments->device < 0 || static_cast<std::size_t>(arguments->device) >= devices.size())
-        return finish(outcome, {status_code_t::device_k, "No GPU carries the ordinal"});
+        return finish(outcome, {status_code_t::device_k, "No GPU holds the ordinal"});
     gpu_device_t const& device = devices[static_cast<std::size_t>(arguments->device)];
     if (device.vendor != gpu_vendor_t::nvidia_k && arguments->gds == ustore_gds_direct_k)
         return finish(outcome, {status_code_t::device_k, "GPUDirect Storage reaches NVIDIA devices alone"});
@@ -411,7 +558,7 @@ void ustore_executor_for_vram(ustore_executor_for_vram_t* arguments) {
     // The caller is the one host thread: it stages, feeds the device and waits on it
     ustore_executor_t made = nullptr;
     if (status_t const status = spawn_across_machine(1, caller_exclusivity_t::caller_inclusive_k, fu_capabilities_all_k,
-                                                     made);
+                                                     0, made);
         status.failed())
         return finish(outcome, status);
     if (status_t const status = runtime.spawn(device, gpu_class, arguments->stream, arguments->scratch_limit,
@@ -454,10 +601,8 @@ void ustore_executor_drain(ustore_executor_drain_t* arguments) {
         return finish(outcome, {status_code_t::contended_k, "A callback cannot drain the executor running it"});
     wait_while_claimed(executor->holding_call.claim);
     join_delegated(*executor);
-    // A lent pool keeps its lender's mood, and every dispatch wakes a parked pool
-    if (executor_t* const owned = std::get_if<executor_t>(&executor->pool);
-        owned && arguments->mood == ustore_mood_parked_k)
-        owned->park();
+    // Every dispatch wakes a parked pool
+    if (arguments->mood == ustore_mood_parked_k) executor->pool.park();
     finish(outcome, {});
 }
 

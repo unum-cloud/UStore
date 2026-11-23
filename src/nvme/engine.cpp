@@ -2,13 +2,13 @@
  *  @file src/nvme/engine.cpp
  *  @author Ash Vardanian
  *  @date July 10, 2023
- *  @brief The open of the NVMe engine, which picks the variant of <tt>src/nvme/variants.hpp</tt>
- *      the running CPU admits.
+ *  @brief The open and the view of the NVMe engine, which pick the variant of
+ *      <tt>src/nvme/variants.hpp</tt> the running CPU admits.
  *
  *  Every CPU class this build compiled has a variant, its calls instantiated in
  *  <tt>src/nvme/variants_&lt;class&gt;.cpp</tt> with the class's atomic reference and waiter. An open walks the
  *  classes newest first and takes the first one its ceiling fits, ending on the serial floor, and
- *  every handle the variant hands out carries its table, so a call reaches the class it was opened
+ *  every handle the variant hands out holds its table, so a call reaches the class it was opened
  *  with through that one pointer.
  */
 
@@ -53,7 +53,23 @@ extern template struct nvme_variant<cpu_class_t::monoversioned_k>;
 /** Implements @c ustore_database_open_nvme with the newest class @p ceiling fits, each lineage newest first. */
 status_t open(ustore_database_open_nvme_t const& arguments, cpu_ceiling_t ceiling, view_t const& view) noexcept {
     return open_fitting_rung(cpu_ladder_t {}, ceiling, [&]<cpu_class_t cpu_class_>() noexcept {
-        return nvme_variant<cpu_class_>::open(arguments, view);
+        return nvme_variant<cpu_class_>::open(arguments, access_t::read_write_k, view);
+    });
+}
+
+/** Implements @c ustore_database_view_nvme as a read-only open of the same options. */
+status_t view(ustore_database_view_nvme_t const& arguments, cpu_ceiling_t ceiling, view_t const& view) noexcept {
+    ustore_database_open_nvme_t const opening {.database = arguments.database,
+                                               .executor = arguments.executor,
+                                               .directory = arguments.directory,
+                                               .data_directories = arguments.data_directories,
+                                               .data_directories_count = arguments.data_directories_count,
+                                               .memory_limit = arguments.memory_limit,
+                                               .collection_concurrency_limit = arguments.collection_concurrency_limit,
+                                               .collection_cache_limit = arguments.collection_cache_limit,
+                                               .cpu_class_ceiling = arguments.cpu_class_ceiling};
+    return open_fitting_rung(cpu_ladder_t {}, ceiling, [&]<cpu_class_t cpu_class_>() noexcept {
+        return nvme_variant<cpu_class_>::open(opening, access_t::read_only_k, view);
     });
 }
 
@@ -64,5 +80,6 @@ using namespace unum::ustore::nvme;
 #pragma region C ABI
 
 void ustore_database_open_nvme(ustore_database_open_nvme_t* arguments) { route_init<&nvme::open>(arguments); }
+void ustore_database_view_nvme(ustore_database_view_nvme_t* arguments) { route_init<&nvme::view>(arguments); }
 
 #pragma endregion C ABI

@@ -96,7 +96,8 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_strings_rea
     if (outputs_status.failed()) return outputs_status;
 
     store_status_t const read = with_source(state, view, [&]<typename source_type_>(source_type_& source) noexcept {
-        auto read_slice = [&](std::size_t first_task, std::size_t length, view_t const&) noexcept -> status_t {
+        auto read_slice = [&](std::size_t first_task, std::size_t length, std::size_t,
+                              view_t const&) noexcept -> status_t {
             status_t sliced;
             store_status_t const runs = for_each_run(
                 source, collections + static_cast<std::ptrdiff_t>(first_task), length, sliced,
@@ -115,7 +116,7 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_strings_rea
         // A transaction's reads join its watch set, so only a reader at one stamp splits the batch
         if constexpr (std::is_same_v<source_type_, reader_source<cpu_class_, isolation_>>)
             outcome = for_task_slices(view, arguments.count, read_slice);
-        else outcome = read_slice(0, arguments.count, view);
+        else outcome = read_slice(0, arguments.count, 0, view);
         return store_status_t::success_k;
     });
     if (status_t const status = reported(read, outcome); status.failed()) return status;
@@ -142,8 +143,9 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_strings_sca
 
     status_t outcome;
     store_status_t const walked = with_source(state, view, [&]<typename source_type_>(source_type_& source) noexcept {
-        auto scan_slice = [&](std::size_t first_task, std::size_t length, view_t const& slice) noexcept -> status_t {
-            strings_scan_slice_t& sliced = slices[slice.thread_index];
+        auto scan_slice = [&](std::size_t first_task, std::size_t length, std::size_t run,
+                              view_t const& slice) noexcept -> status_t {
+            strings_scan_slice_t& sliced = slices[run];
             sliced = {first_task, length, outputs.slice_in(slice.scratch)};
             status_t slice_outcome;
             store_status_t const runs = for_each_run(
@@ -178,7 +180,7 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_strings_sca
         // A transaction's reads join its watch set, so only a reader at one stamp splits the batch
         if constexpr (std::is_same_v<source_type_, reader_source<cpu_class_, isolation_>>)
             outcome = for_task_slices(view, arguments.count, scan_slice);
-        else outcome = scan_slice(0, arguments.count, view);
+        else outcome = scan_slice(0, arguments.count, 0, view);
         return store_status_t::success_k;
     });
     if (status_t const status = reported(walked, outcome); status.failed()) return status;

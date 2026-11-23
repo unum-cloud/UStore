@@ -95,7 +95,7 @@ struct vertex_read_t {
 /** Whether @p key of @p collection held a vertex at the stamp @p access reads committed values at. */
 template <cpu_class_t cpu_class_>
 bool committed_vertex(call_access<cpu_class_> const& access, collection_id_t collection, stored_key_t key) noexcept {
-    return access.state.store->contains(collection, key, read_stamp_of(access), access.thread_index);
+    return access.state.store->contains(collection, key, read_stamp_of(access), access.queues.thread_index);
 }
 
 /** Whether @p key of @p collection holds a vertex as @p access sees it, its own writes included. */
@@ -136,10 +136,10 @@ status_t read_vertices(call_access<cpu_class_> const& access, collection_id_t co
         if (value.size() < end && grown.succeeded()) grown = growth_status(value.resize(end));
         if (grown.succeeded() && !bytes.empty()) std::memcpy(value.data() + offset, bytes.data(), bytes.size());
     };
-    if (status_t const read = with_reading(access, collection, access.thread_index,
+    if (status_t const read = with_reading(access, collection, access.queues.thread_index,
                                            [&](collection_reading_of<cpu_class_> const& reading) noexcept {
                                                return access.state.store->select(reading, access.scratch, keys, results,
-                                                                                 sink, access.thread_index);
+                                                                                 sink, access.queues);
                                            });
         read.failed())
         return read;
@@ -193,7 +193,7 @@ struct vertex_delta_t {
     std::size_t sequence = 0;
 };
 
-/** The records of one vertex, serialized back to back in batch order, which one change carries. */
+/** The records of one vertex, serialized back to back in batch order, which one change holds. */
 struct vertex_chain_t {
     ustore_collection_id_t collection;
     ustore_key_t vertex;
@@ -327,9 +327,10 @@ status_t graph_read_edges(ustore_graph_read_edges_t const& arguments, view_t con
     if (adjacencies_status.failed()) return adjacencies_status;
     auto [firsts, firsts_status] = arena_allocate<std::size_t>(view.scratch, count);
     if (firsts_status.failed()) return firsts_status;
-    auto measure_slice = [&](std::size_t first, std::size_t length, view_t const& slice) noexcept -> status_t {
+    auto measure_slice = [&](std::size_t first, std::size_t length, std::size_t,
+                             view_t const& slice) noexcept -> status_t {
         call_access<cpu_class_> const sliced_access {state,          access.transaction, access.schedule,
-                                                     slice.scratch,  access.stamp,       thread_index_of(state, slice),
+                                                     slice.scratch,  access.stamp,       nvme_queues_of(slice),
                                                      access.strings, access.reading};
         if (status_t const read = read_task_vertices(sliced_access, collections + static_cast<std::ptrdiff_t>(first),
                                                      keys.subspan(first, length), reads.subspan(first, length));
@@ -350,7 +351,7 @@ status_t graph_read_edges(ustore_graph_read_edges_t const& arguments, view_t con
         return {};
     };
     // A transaction's reads join its watch set, so only a read at one stamp splits the batch
-    status_t const measured = access.transaction ? measure_slice(0, count, view)
+    status_t const measured = access.transaction ? measure_slice(0, count, 0, view)
                                                  : for_task_slices(view, count, measure_slice);
     if (measured.failed()) return measured;
     std::size_t exported = 0;
@@ -367,7 +368,7 @@ status_t graph_read_edges(ustore_graph_read_edges_t const& arguments, view_t con
     auto [tape, tape_status] = arena_allocate<ustore_key_t>(arguments.arena, 3 * exported);
     if (tape_status.failed()) return tape_status;
     // Adjacencies only read views the first pass took, so the fill splits inside transactions too
-    auto fill_slice = [&](std::size_t first, std::size_t length, view_t const&) noexcept -> status_t {
+    auto fill_slice = [&](std::size_t first, std::size_t length, std::size_t, view_t const&) noexcept -> status_t {
         for (std::size_t index = first; index != first + length; ++index) {
             if (!reads[index].present) continue;
             ustore_key_t* written = tape.data() + 3 * firsts[index];

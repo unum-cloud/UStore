@@ -10,7 +10,7 @@
  *  Level zero takes one run per flush of the memory runs, so its runs overlap and only their age
  *  tells which version of a key is current: a lookup walks them newest first and a scan merges them
  *  by smallest key. Every deeper level is written by a merge, so its runs are disjoint and
- *  ascending and a lookup is a binary search over their bounds. Both shapes carry remove deltas;
+ *  ascending and a lookup is a binary search over their bounds. Both shapes hold remove deltas;
  *  only the bottom level may forget one, which is a property of the merge that writes it rather
  *  than of the level that holds it.
  *
@@ -43,6 +43,7 @@
 #include <cstdint> // `std::uint8_t`, `std::int32_t`, `std::int64_t`, `std::uint32_t`, `std::uint64_t`
 #include <cstring> // `std::memcmp`, `std::memcpy`, `std::memmove`, `std::memset`
 
+#include <algorithm>   // `std::sort`
 #include <chrono>      // `std::chrono::system_clock`
 #include <concepts>    // `std::invocable`, `std::same_as`, `std::unsigned_integral`
 #include <limits>      // `std::numeric_limits`
@@ -66,7 +67,7 @@
 #include "ustore/blobs/vram_nvidia_compaction.hpp" // `cuda_compactor_t`
 #include "ustore/utilities/nvme_channels.hpp"      // `io_channel_t`, `basic_read_pipeline`
 #include "ustore/utilities/nvme_mounts.hpp"        // `resources_config_t`
-#include "ustore/utilities/nvme_ring.hpp"          // `extent_t`, `ring_concept`, `portable_alignment_k`
+#include "ustore/utilities/nvme_ring.hpp"          // `extent_t`, `disk_concept`, `portable_alignment_k`
 #include "ustore/utilities/nvme_slots.hpp"         // `slot_bytes_k`, `slot_payload_offset_k`
 #include "ustore/utilities/nvme_volume.hpp"        // `medium_extent_t`
 #include "ustore/utilities/ram_buffers.hpp"        // `constrained_allocator`, `resource_constraint`
@@ -75,6 +76,7 @@
 namespace unum::ustore::blobs {
 
 using utilities::constrained_allocator;
+using utilities::disk_concept;
 using utilities::fields_storage_requirements;
 using utilities::load;
 using utilities::load_fields;
@@ -82,7 +84,6 @@ using utilities::medium_reference_t;
 using utilities::pooled_buffer_t;
 using utilities::resource_constraint;
 using utilities::resources_config_t;
-using utilities::ring_concept;
 using utilities::save;
 using utilities::save_fields;
 using utilities::serializable_concept;
@@ -105,11 +106,11 @@ struct collection_ids_t {
     /** The name users address the collection by. */
     collection_alphanumeric_id_t name;
 
-    /** The UUID its schema, every commit and the C ABI carry. */
+    /** The UUID its schema, every commit and the C ABI hold. */
     collection_id_t id;
 };
 
-/** The canonical text of @p identifier, as a schema document carries it. */
+/** The canonical text of @p identifier, as a schema document holds it. */
 inline expected<string_t> uuid_to_string(uuid128_t const& identifier) noexcept {
     char text[uuid128_t::printed_length_k] = {};
     identifier.print(text);
@@ -152,7 +153,7 @@ struct lsm_tree_run_record_t {
     /** The level the run belongs to, zero being the level flushes land on. */
     std::uint32_t level_number = 0;
 
-    /** The run's own identifier, which its header also carries and which a manifest
+    /** The run's own identifier, which its header also holds and which a manifest
      *  may leave zero. */
     uuid128_t content_id {};
 
@@ -219,7 +220,7 @@ class lsm_tree {
     /** One immutable run of a level. */
     using sorted_run_t = typename level_t::sorted_run_t;
 
-    /** The range tombstones one run carries. */
+    /** The range tombstones one run holds. */
     using range_tombstones_t = typename sorted_run_t::range_tombstones_t;
 
     /** The database's pool every run of this tree lives in. */
@@ -240,7 +241,8 @@ class lsm_tree {
     /** The word a caller raises to stop a merge. */
     using cancellation_t = compaction_cancellation<atomic_reference_>;
 
-    /** What one slice of a merge writes into, which the database lends every merge it claims. */
+    /** What one slice of a merge writes into, which the database owns and every merge
+     *  it claims uses. */
     using merge_buffers_t = typename merger_t::merge_buffers_t;
 
     /** The pipeline a batched read refills. */
@@ -285,7 +287,7 @@ class lsm_tree {
             return counted;
         }
 
-        /** The newest stamp any run carries, which a mount resumes its stamps above. */
+        /** The newest stamp any run holds, which a mount resumes its stamps above. */
         [[nodiscard]] std::uint64_t newest_stamp() const noexcept {
             std::uint64_t newest = 0;
             for (std::size_t number = 0; number != size(); ++number)
@@ -381,7 +383,8 @@ class lsm_tree {
     [[nodiscard]] run_pool_t& runs() const noexcept { return *runs_; }
 
     /**
-     *  @brief Whether @p taken carries @p stored_key, and whether the key slot holding it locates a value.
+     *  @brief Whether @p taken holds @p stored_key, and whether the key slot holding it
+     *      locates a value.
      *  @param[in] taken The level set the lookup runs against.
      *  @param[in] stored_key The key to look for.
      *  @param[out] position Where the key sits, which is meaningless when the answer is @c missing_k.
@@ -405,116 +408,164 @@ class lsm_tree {
 #pragma region Batched Reads
 
     /**
-     *  @brief Looks @p stored_keys up in @p taken and reads their values, refilling the channel as reads retire.
-     *  @param[in,out] channel The channel the reads are submitted and completed on, held by the calling thread.
-     *  @param[in] taken The level set every lookup runs against.
-     *  @param[in] stored_keys The keys to read, in any order and with any number of misses among them.
-     *  @param[out] results What every key was, which separates a miss from a removed value.
-     *  @param[in] sink Called as @c sink(request, offset, bytes) for every key that locates a value.
-     *  @param[in] stamp The stamp a reader is pinned at, which sees the newest version at or below it.
-     *  @return Success, or the first failure any of the blocks reported.
+     *  @brief Reads the values at @p positions of @p taken, where a lookup of the same levels found
+     *      them, merging values whose blocks are the same or adjacent into one read of up to one
+     *      request block of @p channel, refilling the channel as reads retire.
+     *  @param[in,out] channel The channel the reads go through, held by the calling thread.
+     *  @param[in] taken The level set the positions point into.
+     *  @param[in] positions Where every value sits, in any order, each of a key holding a value.
+     *  @param[in] scratch Where the values' order and the reads are carved, rewound by the caller.
+     *  @param[in] sink Called as <tt>sink(request, offset, bytes)</tt> while the channel owns the block.
+     *  @return How many reads the values took, or the first failure any of the blocks reported.
      *
-     *  @note A value larger than one block arrives as several calls, each carrying the bytes of the value
-     *      before it, and a key whose value is present and empty is reported once with no bytes.
+     *  @note A value larger than one block arrives as several calls, each holding the bytes of the
+     *      value before it, and an empty value is reported once with no bytes.
      */
     template <typename sink_type_>
-    status_t read_values([[maybe_unused]] io_channel_t& channel, level_set_t const& taken,
-                         std::span<stored_key_t const> stored_keys, std::span<lookup_result_t> results,
-                         sink_type_&& sink, std::uint64_t stamp = limit<std::uint64_t>::max_k) const noexcept
+    expected<std::size_t> read_located(io_channel_t&, level_set_t const& taken,
+                                       std::span<lsm_tree_position_t const> positions, ustore_arena_t,
+                                       sink_type_&& sink) const noexcept
         requires holds_values_inline_k
     {
-        if (results.size() != stored_keys.size())
-            return {status_code_t::invalid_argument_k, "A batched read answers one result per key"};
-        for (std::size_t request = 0; request != stored_keys.size(); ++request) {
-            lsm_tree_position_t position;
-            results[request] = find(taken, stored_keys[request], position, stamp);
-            if (results[request] != lookup_result_t::written_k) continue;
+        for (std::size_t request = 0; request != positions.size(); ++request) {
+            lsm_tree_position_t const& position = positions[request];
             key_slot_t const& slot = taken.level(position.level_number).key_slot(position.level_position);
             sink(request, std::uint64_t {0}, std::span<byte_t const> {slot.data, slot.size});
         }
-        return {};
+        return std::size_t {0};
     }
 
-    /** As @c read_values above, for values held in blocks, which the channel reads in turn. */
+    /** As @c read_located above, for values held in blocks, which the channel reads in turn. */
     template <typename sink_type_>
-    status_t read_values(io_channel_t& channel, level_set_t const& taken, std::span<stored_key_t const> stored_keys,
-                         std::span<lookup_result_t> results, sink_type_&& sink,
-                         std::uint64_t stamp = limit<std::uint64_t>::max_k) const noexcept {
-        if (results.size() != stored_keys.size())
-            return {status_code_t::invalid_argument_k, "A batched read answers one result per key"};
+    expected<std::size_t> read_located(io_channel_t& channel, level_set_t const& taken,
+                                       std::span<lsm_tree_position_t const> positions, ustore_arena_t scratch,
+                                       sink_type_&& sink) const noexcept {
         std::uint64_t const block_bytes = round_down_to_multiple(channel.requests().buffer_bytes(),
                                                                  portable_alignment_k);
         if (block_bytes == 0)
-            return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
+            return status_t {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
+        if (positions.size() > (std::numeric_limits<std::uint32_t>::max)())
+            return status_t {status_code_t::invalid_argument_k, "A batched read takes at most 2^32 values"};
 
-        if (stored_keys.size() > (std::numeric_limits<std::uint32_t>::max)())
-            return {status_code_t::invalid_argument_k, "A batched read takes at most 2^32 keys"};
+        // Every value is ordered by its run, numbered across the levels, and its place in the run
+        struct located_value_t {
+            std::uint64_t offset = 0;
+            std::uint32_t run = 0;
+            std::uint32_t request = 0;
+        };
+        // One read covers the values from its first in that order up to the next read's first
+        struct located_read_t {
+            std::uint64_t offset = 0;
+            std::uint32_t length = 0;
+            std::uint32_t first = 0;
+        };
+        static_assert(sizeof(located_value_t) == 16 && sizeof(located_read_t) == 16);
+        auto const window_of = [&](std::uint32_t request) noexcept {
+            lsm_tree_position_t const& position = positions[request];
+            return taken.level(position.level_number).value_window(position.level_position);
+        };
+        auto [located, located_status] = utilities::arena_allocate<located_value_t>(scratch, positions.size());
+        if (located_status.failed()) return located_status;
+        std::size_t located_count = 0;
+        std::size_t reads_bound = 0;
+        for (std::size_t request = 0; request != positions.size(); ++request) {
+            value_window_t const window = window_of(static_cast<std::uint32_t>(request));
+            if (window.extent.length == 0) {
+                sink(request, std::uint64_t {0}, std::span<byte_t const> {});
+                continue;
+            }
+            std::uint32_t run = positions[request].level_position.run_index;
+            for (std::uint32_t number = 0; number != positions[request].level_number; ++number)
+                run += static_cast<std::uint32_t>(taken.level(number).size());
+            located[located_count++] = {window.extent.offset, run, static_cast<std::uint32_t>(request)};
+            reads_bound += static_cast<std::size_t>(divide_round_up(window.extent.length, block_bytes));
+        }
+        std::span<located_value_t> const ordered = located.first(located_count);
+        std::sort(ordered.begin(), ordered.end(), [](located_value_t const& left, located_value_t const& right) {
+            return left.run != right.run ? left.run < right.run : left.offset < right.offset;
+        });
+
+        auto [reads, reads_status] = utilities::arena_allocate<located_read_t>(scratch, reads_bound);
+        if (reads_status.failed()) return reads_status;
+        std::size_t reads_count = 0;
+        std::uint64_t open_begin = 0;
+        std::uint64_t open_end = 0;
+        std::size_t open_first = located_count;
+        auto const close_open = [&]() noexcept {
+            if (open_first != located_count)
+                reads[reads_count++] = {open_begin, static_cast<std::uint32_t>(open_end - open_begin),
+                                        static_cast<std::uint32_t>(open_first)};
+            open_first = located_count;
+        };
+        for (std::size_t index = 0; index != located_count; ++index) {
+            extent_t const extent = window_of(ordered[index].request).extent;
+            std::uint64_t const extent_end = extent.offset + extent.length;
+            std::uint64_t const merged_end = extent_end > open_end ? extent_end : open_end;
+            bool const joins = open_first != located_count && ordered[index].run == ordered[open_first].run &&
+                               extent.offset <= open_end && merged_end - open_begin <= block_bytes;
+            if (joins) {
+                open_end = merged_end;
+                continue;
+            }
+            close_open();
+            if (extent.length <= block_bytes) {
+                open_begin = extent.offset, open_end = extent_end, open_first = index;
+                continue;
+            }
+            // A value wider than a block reads alone, block after block
+            for (std::uint64_t at = 0; at < extent.length; at += block_bytes)
+                reads[reads_count++] = {extent.offset + at,
+                                        static_cast<std::uint32_t>(fu::min_of(block_bytes, extent.length - at)),
+                                        static_cast<std::uint32_t>(index)};
+        }
+        close_open();
+
         std::span<read_piece_t> const pieces = channel.read_pieces();
         std::size_t const depth = pieces.size();
-
-        auto [reader_channel, reader_channel_status] = channel.acquire();
-        if (reader_channel_status.failed()) return reader_channel_status;
-        read_pipeline_t reader {volume_->disk(), std::move(reader_channel), medium_reference_t {}};
-        status_t first;
+        read_pipeline_t reader {volume_->disk(), channel, medium_reference_t {}};
+        status_t first_failure;
+        // A block hands every value it covers its share, wherever the value starts and ends
         auto adapter = [&](completed_buffer_t const& completed) noexcept {
-            read_piece_t const& piece = pieces[completed.tag % depth];
+            std::size_t const read_index = pieces[completed.tag % depth].request;
             if (status_t const whole = require_completed_in_full(completed); whole.failed()) {
-                if (first.succeeded()) first = whole;
+                if (first_failure.succeeded()) first_failure = whole;
                 return;
             }
-            sink(piece.request, piece.offset, completed.bytes.subspan(piece.skipped, piece.carried));
+            located_read_t const& read = reads[read_index];
+            std::size_t const next_first = read_index + 1 != reads_count ? reads[read_index + 1].first : located_count;
+            std::size_t const end = next_first > read.first ? next_first : read.first + 1;
+            for (std::size_t index = read.first; index != end; ++index) {
+                value_window_t const window = window_of(ordered[index].request);
+                std::uint64_t const value_begin = window.extent.offset + window.skipped;
+                std::uint64_t const first = fu::max_of(value_begin, read.offset);
+                std::uint64_t const last = fu::min_of(value_begin + window.bytes, read.offset + read.length);
+                if (first >= last) continue;
+                sink(std::size_t {ordered[index].request}, first - value_begin,
+                     completed.bytes.subspan(static_cast<std::size_t>(first - read.offset),
+                                             static_cast<std::size_t>(last - first)));
+            }
         };
 
-        std::size_t request = 0;
-        std::uint64_t chunk = 0;
+        std::size_t next = 0;
         request_tag_t tag = 0;
-        value_window_t window;
-        medium_reference_t medium;
-        while (request != stored_keys.size() || reader.outstanding() != 0) {
-            while (request != stored_keys.size() && reader.can_enqueue()) {
-                if (chunk == 0 && !locate_value_(taken, stored_keys[request], stamp, request, results[request], sink,
-                                                 window, medium)) {
-                    ++request;
-                    continue;
-                }
-                std::uint64_t const at = chunk * block_bytes;
-                std::uint64_t const room = window.extent.length - at;
-                std::uint64_t const length = block_bytes < room ? block_bytes : room;
-                pieces[tag % depth] = piece_of_(window, request, at, length);
-                extent_t const piece {window.extent.offset + at, length};
-                status_t const queued = reader.enqueue_read(medium, piece, tag);
+        while (next != reads_count || reader.outstanding() != 0) {
+            while (next != reads_count && reader.can_enqueue()) {
+                lsm_tree_position_t const& position = positions[ordered[reads[next].first].request];
+                medium_reference_t const medium =
+                    taken.level(position.level_number).run(position.level_position.run_index).extent().medium;
+                pieces[tag % depth] = read_piece_t {.request = static_cast<std::uint32_t>(next)};
+                status_t const queued = reader.enqueue_read(medium, extent_t {reads[next].offset, reads[next].length},
+                                                            tag);
                 if (queued.failed() && reader.outstanding() == 0) return queued;
                 if (queued.failed()) break;
-                ++tag;
-                if (at + length == window.extent.length) {
-                    ++request;
-                    chunk = 0;
-                }
-                else ++chunk;
+                ++tag, ++next;
             }
             if (status_t const flushed = reader.submit(); flushed.failed()) return flushed;
             auto [polled, wait_completions_status] = reader.wait_completions(adapter);
             if (wait_completions_status.failed()) return wait_completions_status;
         }
-        return first;
-    }
-
-    /** Looks @p stored_key up in @p taken into @p result, @p window and @p medium, answering
-     *  whether its value has bytes to read; a present empty value reaches @p sink as @p request. */
-    template <typename sink_type_>
-    bool locate_value_(level_set_t const& taken, stored_key_t const& stored_key, std::uint64_t stamp,
-                       std::size_t request, lookup_result_t& result, sink_type_& sink, value_window_t& window,
-                       medium_reference_t& medium) const noexcept {
-        lsm_tree_position_t position;
-        lookup_result_t const found = find(taken, stored_key, position, stamp);
-        result = found;
-        level_t const& level = taken.level(position.level_number);
-        window = found == lookup_result_t::written_k ? level.value_window(position.level_position) : value_window_t {};
-        if (window.extent.length == 0 && found == lookup_result_t::written_k)
-            sink(request, std::uint64_t {0}, std::span<byte_t const> {});
-        if (window.extent.length == 0) return false;
-        medium = level.run(position.level_position.run_index).extent().medium;
-        return true;
+        if (first_failure.failed()) return first_failure;
+        return reads_count;
     }
 
 #pragma endregion Batched Reads
@@ -582,13 +633,13 @@ class lsm_tree {
      *  @brief Opens the runs @p runs names and publishes them as the level set of this tree.
      *  @param[in,out] channel The channel every run's header and index is read on, held by the calling thread.
      *  @param[in] runs The runs in the order their levels hold them, which is oldest first on level
-     *      zero, each carrying the stamp an ingest assigned it or zero.
+     *      zero, each holding the stamp an ingest assigned it or zero.
      *  @param[in] published What to call once the restored set is current, as a flush does.
      *  @return Success, or the status that stopped it with the empty level set still current and
      *      every run left on the volume.
      *
      *  @note Only a tree still holding the one empty level @c mount built takes these, so a reopen
-     *      adopts what the medium carries and no call ever merges two level sets into one.
+     *      adopts what the medium holds and no call ever merges two level sets into one.
      */
     status_t restore(io_channel_t& channel, std::span<lsm_tree_run_record_t const> runs,
                      lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {}) noexcept {
@@ -678,7 +729,7 @@ class lsm_tree {
      *  @param[in,out] reading_channel The channel the merge gathers source values on, held by the calling thread.
      *  @param[in,out] writing_channel The channel the merge writes its new runs on, which is not @p reading_channel.
      *  @param[in,out] buffers What each slice writes into, one per slice of @p fan_out or more,
-     *      lent by the owner that serializes merges.
+     *      owned by the owner that serializes merges.
      *  @param[in] placement Where the compaction runs, which a collection leaves automatic.
      *  @param[in] compactor The compactor the database picked at open: the calling thread, or its warm device
      *      compactor.
@@ -792,21 +843,6 @@ class lsm_tree {
 
 #pragma region Private Methods
 
-    /** The piece of @p window that the block at @p at of @p length carries, for @p request. */
-    [[nodiscard]] static read_piece_t piece_of_(value_window_t const& window, std::size_t request, std::uint64_t at,
-                                                std::uint64_t length) noexcept {
-        std::uint64_t const wanted_first = window.skipped;
-        std::uint64_t const wanted_last = window.skipped + window.bytes;
-        std::uint64_t const first = at > wanted_first ? at : wanted_first;
-        std::uint64_t const last = at + length < wanted_last ? at + length : wanted_last;
-        read_piece_t piece;
-        piece.request = static_cast<std::uint32_t>(request);
-        piece.skipped = static_cast<std::uint32_t>(first - at);
-        piece.carried = static_cast<std::uint32_t>(last > first ? last - first : 0);
-        piece.offset = static_cast<std::uint32_t>(first - wanted_first);
-        return piece;
-    }
-
     /** Takes the right to publish, which only one thread holds at a time. */
     [[nodiscard]] bool claim_compaction_() noexcept {
         std::int32_t idle = static_cast<std::int32_t>(compaction_state_t::idle_k);
@@ -903,9 +939,9 @@ class lsm_tree {
             [[maybe_unused]] st::status_t const pushed = next.levels_.push_back(
                 level_t::of(*runs_, static_cast<std::uint32_t>(index), order));
             if (index >= source.size()) continue;
-            if (status_t const carried = next.levels_[index].carry(source.level(index), consumed); carried.failed()) {
+            if (status_t const held = next.levels_[index].inherit_runs(source.level(index), consumed); held.failed()) {
                 next.levels_.clear();
-                return carried;
+                return held;
             }
         }
         if (!placed.empty()) {
@@ -1149,7 +1185,7 @@ class lsm_tree {
         request.cancellation = cancellation;
         request.stamps = stamps;
         if (buffers.size() < fan_out.slices())
-            return status_t {status_code_t::invalid_argument_k, "A merge is lent buffers for every slice"};
+            return status_t {status_code_t::invalid_argument_k, "A merge needs buffers for every slice"};
         request.buffers = buffers.first(fan_out.slices());
         request.fan_out = fan_out;
 

@@ -113,7 +113,7 @@ inline bool directory_exists(std::string const& path) noexcept {
     return ::stat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode);
 }
 
-/** Whether @p text carries a NUL byte, which no path the system opens may hold. */
+/** Whether @p text holds a NUL byte, which no path the system opens may hold. */
 inline bool holds_nul(std::string_view text) noexcept { return text.find('\0') != std::string_view::npos; }
 
 #pragma endregion Bytes
@@ -467,7 +467,7 @@ inline void prune(std::vector<version_t>& history, stamp_t oldest) {
 
 #pragma region Views
 
-/** The tags a view carries in the low bits of its parent's pointer. */
+/** The tags a view holds in the low bits of its parent's pointer. */
 enum class view_tag_t : std::uintptr_t { snapshot_k = 1, watching_k = 2, unwatched_k = 3 };
 
 /** The parent a view names, decoded: the head, a snapshot, or a transaction and its watch. */
@@ -1283,7 +1283,7 @@ inline bool refuse_write_keys(call_t& call, ustore_keys_view_t keys, std::size_t
     return false;
 }
 
-/** Refuses a name or a path carrying a length without bytes, which is never read through null. */
+/** Refuses a name or a path holding a length without bytes, which is never read through null. */
 inline bool refuse_unbacked(call_t& call, ustore_bytes_view_t bytes) noexcept {
     if (bytes.length && !bytes.data)
         return call.stop(ustore_status_invalid_argument_k, "A run of bytes with a length needs its bytes");
@@ -1296,9 +1296,9 @@ inline bool refuse_collections(call_t& call, ustore_collections_view_t collectio
     return false;
 }
 
-/** Gives @p progress one report, answering whether the call carries on. */
-inline bool carries_on(ustore_progress_callback_t progress, void* state, std::size_t finished,
-                       std::size_t total) noexcept {
+/** Gives @p progress one report, answering whether the call continues. */
+inline bool keeps_going(ustore_progress_callback_t progress, void* state, std::size_t finished,
+                        std::size_t total) noexcept {
     return !progress || progress(finished, total, state) == ustore_continue_k;
 }
 
@@ -1434,8 +1434,8 @@ void run_deferred(void* state) noexcept {
  *  The submission claims the executor, the arena and the transaction the call names, so a second
  *  call finds them contended from the moment the first returns. A call meeting any of them held
  *  runs in place instead, where its arguments are checked first and the contention refused in the
- *  ruled order. A lent pool and a call made from the worker itself, from a callback of the call it
- *  runs, also run in place.
+ *  ruled order. A caller's pool and a call made from the worker itself, from a callback of the call
+ *  it runs, also run in place.
  */
 template <auto verb_, typename arguments_type_>
 bool submitted(arguments_type_* arguments) noexcept {

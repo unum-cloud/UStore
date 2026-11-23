@@ -78,7 +78,7 @@ struct compiled_match<vendored_residency_t::host_k> {
     /** The substrings engine scoring what @c matcher selected, or null for a match without weights. */
     sz_substrings_engine_t* scorer = nullptr;
 
-    /** One weight per substring pattern, borrowed from the call, read when @c scorer scores. */
+    /** One weight per substring pattern, viewed from the call, read when @c scorer scores. */
     float const* weights = nullptr;
 
     /** Whether the match reads the values of the keys it narrows. */
@@ -202,9 +202,9 @@ struct compiled_match<residency_> {
     bool matches_everything() const noexcept { return !reads_values() && host.matches_everything(); }
 };
 
-/** Whether @p arguments_type_ is a scan or cursor init carrying a match. */
+/** Whether @p arguments_type_ is a scan or cursor init holding a match. */
 template <typename arguments_type_>
-concept carries_match = requires(arguments_type_ const& arguments) { arguments.predicate; };
+concept has_match = requires(arguments_type_ const& arguments) { arguments.predicate; };
 
 /** Whether the patterns of a call match everything. */
 inline bool matches_everything(ustore_patterns_t const& patterns) noexcept {
@@ -386,13 +386,18 @@ status_t run_steps(plan_type_& plan, view_t const& view, progress_t& progress) n
 
 #pragma region Keyed Listings
 
-/** Reads into @p values the values of @p keys of @p collection through the host verbs of @p engine, as the scan of
- *  @p scan_type_ matches them: blobs as stored, documents whole, pages rendered as XML. */
+/** Reads into @p values the values of the @p listed keys of @p collection that @p picked names,
+ *  through the host verbs of @p engine, as the scan of @p scan_type_ matches them: blobs as
+ *  stored, documents whole and pages rendered as XML. */
 template <typename scan_type_>
 status_t read_page_values(residency_tables<vendored_residency_t::host_k> const& engine, ustore_database_t database,
-                          ustore_collection_id_t const& collection, std::span<ustore_key_t const> keys,
-                          ustore_arena_t page, view_t const& view, strings_arg_t& values) noexcept {
+                          ustore_collection_id_t const& collection, std::span<ustore_key_t const> listed,
+                          std::span<std::uint32_t const> picked, ustore_arena_t page, view_t const& view,
+                          strings_arg_t& values) noexcept {
     values = {};
+    auto [keys, keys_status] = arena_allocate<ustore_key_t>(page, picked.size());
+    if (keys_status.failed()) return keys_status;
+    for (std::size_t index = 0; index != picked.size(); ++index) keys[index] = listed[picked[index]];
     if constexpr (std::is_same_v<scan_type_, ustore_blobs_scan_t>) {
         ustore_blobs_read_t const read {.database = database,
                                         .count = keys.size(),
@@ -466,7 +471,10 @@ status_t list_matched_keys(residency_tables<vendored_residency_t::host_k> const&
                                .keys = &listed,
                                .arena = page,
                                .wanted = wanted};
-        if (status_t const status = scan_verb(scan, page_view); status.failed()) return status;
+        status_t scanned;
+        if constexpr (std::is_same_v<scan_type_, ustore_docs_scan_t>) scanned = scan_verb(scan, nullptr, page_view);
+        else scanned = scan_verb(scan, page_view);
+        if (scanned.failed()) return scanned;
         std::size_t const listed_count = offsets ? offsets[1] : 0;
         std::span<ustore_key_t const> const keys {listed, listed_count};
 
@@ -482,15 +490,14 @@ status_t list_matched_keys(residency_tables<vendored_residency_t::host_k> const&
         if (status_t const status = match.ask(ustore_predicate_cheap_k, keys, candidates, page); status.failed())
             return status;
         if (match.reads_values() && candidates.count) {
-            auto [asked, asked_status] = arena_allocate<ustore_key_t>(page, candidates.count);
-            if (asked_status.failed()) return asked_status;
-            for (std::size_t index = 0; index != candidates.count; ++index) asked[index] = keys[indices[index]];
-            strings_arg_t values;
-            if (status_t const status = read_page_values<scan_type_>(engine, database, collection, asked, page,
-                                                                     page_view, values);
-                status.failed())
+            std::span<std::uint32_t const> const picked {indices.data(), candidates.count};
+            strings_arg_t candidate_values;
+            if (status_t const gathered = read_page_values<scan_type_>(engine, database, collection, keys, picked, page,
+                                                                       page_view, candidate_values);
+                gathered.failed())
+                return gathered;
+            if (status_t const status = match.select(candidate_values, candidates, page); status.failed())
                 return status;
-            if (status_t const status = match.select(values, candidates, page); status.failed()) return status;
         }
         if (status_t const status = match.ask(ustore_predicate_expensive_k, keys, candidates, page); status.failed())
             return status;

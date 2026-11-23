@@ -353,9 +353,9 @@ static std::optional<bytes_t> value_at_head(std::span<run_t const* const> runs, 
     return value;
 }
 
-/** Commits of writes, removals and changes, every other one lending its bytes, merge four runs of a
- *  tier at a time up to tier three, each merge copying only the values it folded and freeing the
- *  runs it took the buffers of, and every key reads back as the model. */
+/** Commits of writes, removals and changes, every other one handing over its bytes, merge four runs
+ *  of a tier at a time up to tier three, each merge copying only the values it folded and freeing
+ *  the runs it took the buffers of, and every key reads back as the model. */
 static void test_merges_keep_values_intact() {
     constexpr std::size_t fan_in_k = 4;
     constexpr std::size_t commits_count_k = fan_in_k * fan_in_k * fan_in_k;
@@ -390,26 +390,29 @@ static void test_merges_keep_values_intact() {
             else if (kind == delta_kind_t::write_k || !modelled) modelled = payload;
             else modelled->insert(modelled->end(), payload.begin(), payload.end());
         }
-        // Every other commit lends its bytes, as a transaction of one collection does, to the run.
-        sealed_t::buffer_t lent;
+        // Every other commit hands over its bytes, as a transaction of one collection does,
+        // to the run.
+        sealed_t::buffer_t caller_buffer;
         if (stamp % 2 == 0) {
             std::size_t filled = 0;
             for (keyed_delta_t const& delta : deltas) filled += delta.delta.bytes.size();
-            if (!expect_true(lent.resize(filled) == st::status_t::success_k)) return;
+            if (!expect_true(caller_buffer.resize(filled) == st::status_t::success_k)) return;
             filled = 0;
             for (keyed_delta_t& delta : deltas) {
                 std::size_t const size = delta.delta.bytes.size();
                 if (size == 0) continue;
-                std::memcpy(lent.data() + filled, delta.delta.bytes.data(), size);
-                delta.delta.bytes = std::span<byte_t const> {lent.data() + filled, size};
+                std::memcpy(caller_buffer.data() + filled, delta.delta.bytes.data(), size);
+                delta.delta.bytes = std::span<byte_t const> {caller_buffer.data() + filled, size};
                 filled += size;
             }
         }
-        byte_t const* const lent_bytes = lent.data();
-        expected<sealed_t> sealed = sealed_t::seal(deltas, {}, {}, std::span<byte_t const> {lent});
+        byte_t const* const caller_buffer_front = caller_buffer.data();
+        expected<sealed_t> sealed = sealed_t::seal(deltas, {}, {}, std::span<byte_t const> {caller_buffer});
         if (!expect_true(sealed.has_value())) return;
-        sealed->adopt(lent);
-        if (!expect_true(lent_bytes == nullptr || (lent.empty() && sealed->bases().front() == lent_bytes))) return;
+        sealed->adopt(caller_buffer);
+        if (!expect_true(caller_buffer_front == nullptr ||
+                         (caller_buffer.empty() && sealed->bases().front() == caller_buffer_front)))
+            return;
         expected<run_t> stamped = run_t::stamped(std::move(*sealed), stamp);
         if (!expect_true(stamped.has_value())) return;
         runs.push_back(std::make_unique<run_t>(std::move(*stamped)));
@@ -476,7 +479,6 @@ static void test_readers_against_one_publisher() {
 
     st::commit_order_t order;
     epoch_domain_t epochs;
-    expect_true(epochs.reserve_threads(1).succeeded());
     std::size_t alive {0};
     auto held = [&]() noexcept {
         held_view_t* const made = new held_view_t {};

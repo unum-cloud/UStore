@@ -6,7 +6,7 @@
  *
  *  Every case creates an inline, a fixed-width and a variable-width collection, writes a band of keys into them
  *  through one or two transactions, and checks what the database and each transaction answer afterwards. The
- *  suite builds as plain C++ over the device compactor wherever the build carries one.
+ *  suite builds as plain C++ over the device compactor wherever the build holds one.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
@@ -41,7 +41,7 @@ using namespace unum::ustore::utilities;
 
 /** The numbers every case mounts with: channels for a compaction to hold two, and one for every thread a case
  *  spawns. */
-constexpr fixture_config_t transaction_config_k {.shared_io_channels = 8};
+constexpr fixture_config_t transaction_config_k {.queues_threads = 8};
 
 /** Keys every case writes into each collection. */
 constexpr std::size_t population_k = 1000;
@@ -85,7 +85,7 @@ struct database_types {
         /** The volume of the database. */
         volume_t volume;
 
-        /** The database, destroyed before the mount it borrows. */
+        /** The database, destroyed before the mount it views. */
         std::unique_ptr<database_t> store;
     };
 };
@@ -182,7 +182,7 @@ using value_buffer_t = std::array<byte_t, variable_width_max_k>;
     return owned;
 }
 
-/** A collection ID minted for a case, which no other collection of any database carries. */
+/** A collection ID minted for a case, which no other collection of any database holds. */
 [[nodiscard]] collection_id_t minted_collection_id() noexcept {
     collection_id_t collection_id;
     std::memcpy(collection_id.uuid.bytes, uuid_generator().bytes, sizeof(collection_id.uuid.bytes));
@@ -219,16 +219,19 @@ using key_filter_t = bool (*)(stored_key_t) noexcept;
 /** The keys of the second half and the last key of the first, so it overlaps @c first_half by one. */
 [[nodiscard]] bool second_half_and_one(stored_key_t key) noexcept { return key + 1 >= population_k / 2; }
 
-/** Writes the keys @p filter picks into the collection of @p shape through @p writer, a database or a transaction,
- *  watching them through @p watch_schedule_ when it is a transaction. */
-template <watch_schedule_t watch_schedule_ = watch_schedule_t::default_k, typename writer_type_>
-void insert_keys(writer_type_& writer, collections_t const& named, shape_t shape, key_filter_t filter) noexcept {
+/** Writes the keys @p filter picks into the collection of @p shape through @p writer, a database
+ *  or a transaction, watching them through @p watch_schedule_ when it is a transaction; a database
+ *  writes on the one @p queues given. */
+template <watch_schedule_t watch_schedule_ = watch_schedule_t::default_k, typename writer_type_,
+          typename... queues_types_>
+void insert_keys(writer_type_& writer, collections_t const& named, shape_t shape, key_filter_t filter,
+                 queues_types_... queues) noexcept {
     value_buffer_t buffer {};
     for (stored_key_t key = 0; key != population_k; ++key) {
         if (!filter(key)) continue;
         stored_value_view_t const value = value_of(shape, key, buffer);
         if constexpr (watch_schedule_ == watch_schedule_t::default_k)
-            expect_true(writer.insert(named[shape], key, value).succeeded());
+            expect_true(writer.insert(named[shape], key, value, queues...).succeeded());
         else expect_true(writer.template insert<watch_schedule_>(named[shape], key, value).succeeded());
     }
 }
@@ -245,23 +248,25 @@ void remove_keys(writer_type_& writer, collections_t const& named, shape_t shape
     }
 }
 
-/** Checks that @p store carries exactly the keys @p filter picks in the collection of @p shape, key by key and in one
- *  batch, each with every byte of its value. */
+/** Checks that @p store holds exactly the keys @p filter picks in the collection of @p shape, key
+ *  by key and in one batch, each with every byte of its value, reading on @p queues. */
 template <typename database_type_>
-void check_database(database_type_& store, collections_t const& named, shape_t shape, key_filter_t filter) {
+void check_database(database_type_& store, nvme_queues_ref_t queues, collections_t const& named, shape_t shape,
+                    key_filter_t filter) {
     std::size_t mismatches = 0;
     value_buffer_t buffer {};
     for (stored_key_t key = 0; key != population_k; ++key) {
         stored_value_size_t size = 0;
         if (!filter(key)) {
             expect_true(!store.contains(named[shape], key));
-            expect_true(store.stored_value_size(named[shape], key, size).failed());
+            expect_true(store.stored_value_size(named[shape], key, size, head_stamp_k, queues).failed());
             continue;
         }
         expect_true(store.contains(named[shape], key));
-        expect_true(store.stored_value_size(named[shape], key, size).succeeded());
+        expect_true(store.stored_value_size(named[shape], key, size, head_stamp_k, queues).succeeded());
         expect_equal(std::size_t {size}, width_of(shape, key));
-        expect_true(store.select(named[shape], key, std::span<byte_t> {buffer}, size).succeeded());
+        expect_true(
+            store.select(named[shape], key, std::span<byte_t> {buffer}, size, head_stamp_k, queues).succeeded());
         expect_equal(std::size_t {size}, width_of(shape, key));
         mismatches += mismatches_in(shape, key, 0, std::span<byte_t const> {buffer.data(), size});
     }
@@ -281,9 +286,10 @@ void check_database(database_type_& store, collections_t const& named, shape_t s
         arrived[request] += bytes.size();
         mismatches += mismatches_in(shape, keys[request], offset, bytes);
     };
-    expect_true(
-        store.select(named[shape], std::span<stored_key_t const> {keys}, std::span<lookup_result_t> {results}, sink)
-            .succeeded());
+    expect_true(store
+                    .select(named[shape], std::span<stored_key_t const> {keys}, std::span<lookup_result_t> {results},
+                            sink, head_stamp_k, queues)
+                    .succeeded());
     for (std::size_t index = 0; index != population_k; ++index) {
         stored_key_t const key = keys[index];
         if (!filter(key)) {
@@ -297,9 +303,10 @@ void check_database(database_type_& store, collections_t const& named, shape_t s
 }
 
 /** Checks that @p transaction sees exactly the keys @p filter picks in the collection of @p shape, reading each one
- *  through the watch schedule @p watch_schedule_. */
+ *  on @p queues through the watch schedule @p watch_schedule_. */
 template <watch_schedule_t watch_schedule_ = watch_schedule_t::default_k, typename transaction_type_>
-void check_transaction(transaction_type_& transaction, collections_t const& named, shape_t shape, key_filter_t filter) {
+void check_transaction(transaction_type_& transaction, nvme_queues_ref_t queues, collections_t const& named,
+                       shape_t shape, key_filter_t filter) {
     std::size_t mismatches = 0;
     value_buffer_t buffer {};
     for (stored_key_t key = 0; key != population_k; ++key) {
@@ -309,10 +316,11 @@ void check_transaction(transaction_type_& transaction, collections_t const& name
             continue;
         }
         expect_true(transaction.contains(named[shape], key));
-        expect_true(transaction.stored_value_size(named[shape], key, size).succeeded());
+        expect_true(transaction.stored_value_size(named[shape], key, size, queues).succeeded());
         expect_equal(std::size_t {size}, width_of(shape, key));
-        expect_true(transaction.template select<watch_schedule_>(named[shape], key, stored_value_span_t {buffer}, size)
-                        .succeeded());
+        expect_true(
+            transaction.template select<watch_schedule_>(named[shape], key, stored_value_span_t {buffer}, size, queues)
+                .succeeded());
         expect_equal(std::size_t {size}, width_of(shape, key));
         mismatches += mismatches_in(shape, key, 0, std::span<byte_t const> {buffer.data(), size});
     }
@@ -321,20 +329,20 @@ void check_transaction(transaction_type_& transaction, collections_t const& name
 
 /** Checks every collection of @p store against one filter per shape, in the order of @c every_shape_k. */
 template <typename database_type_>
-void check_every_database(database_type_& store, collections_t const& named, key_filter_t inline_filter,
-                          key_filter_t fixed_filter, key_filter_t variable_filter) {
-    check_database(store, named, shape_t::inline_k, inline_filter);
-    check_database(store, named, shape_t::fixed_k, fixed_filter);
-    check_database(store, named, shape_t::variable_k, variable_filter);
+void check_every_database(database_type_& store, nvme_queues_ref_t queues, collections_t const& named,
+                          key_filter_t inline_filter, key_filter_t fixed_filter, key_filter_t variable_filter) {
+    check_database(store, queues, named, shape_t::inline_k, inline_filter);
+    check_database(store, queues, named, shape_t::fixed_k, fixed_filter);
+    check_database(store, queues, named, shape_t::variable_k, variable_filter);
 }
 
 /** Checks every collection @p transaction sees against one filter per shape, in the order of @c every_shape_k. */
 template <typename transaction_type_>
-void check_every_transaction(transaction_type_& transaction, collections_t const& named, key_filter_t inline_filter,
-                             key_filter_t fixed_filter, key_filter_t variable_filter) {
-    check_transaction(transaction, named, shape_t::inline_k, inline_filter);
-    check_transaction(transaction, named, shape_t::fixed_k, fixed_filter);
-    check_transaction(transaction, named, shape_t::variable_k, variable_filter);
+void check_every_transaction(transaction_type_& transaction, nvme_queues_ref_t queues, collections_t const& named,
+                             key_filter_t inline_filter, key_filter_t fixed_filter, key_filter_t variable_filter) {
+    check_transaction(transaction, queues, named, shape_t::inline_k, inline_filter);
+    check_transaction(transaction, queues, named, shape_t::fixed_k, fixed_filter);
+    check_transaction(transaction, queues, named, shape_t::variable_k, variable_filter);
 }
 
 #pragma endregion Shape
@@ -356,25 +364,26 @@ expected<std::unique_ptr<typename database_types<typename mount_type_::fixture_t
     stack->fixture = std::move(fixture);
 
     {
-        auto [guard, acquire_status] = stack->fixture->channels.acquire();
+        auto [guard, acquire_status] = stack->fixture->channel(0);
         if (acquire_status.failed()) return acquire_status;
-        auto [volume, mount_volume_status] = stack->fixture->mount_volume(guard.channel());
+        auto [volume, mount_volume_status] = stack->fixture->mount_volume(*guard);
         if (mount_volume_status.failed()) return mount_volume_status;
         stack->volume = std::move(volume);
     }
 
     stack->store = std::unique_ptr<database_t> {new (std::nothrow) database_t {stack->fixture->resources}};
     if (!stack->store) return status_t {status_code_t::out_of_memory_k, "The database did not fit"};
-    if (status_t const mounted = stack->store->mount(stack->volume, stack->fixture->channels, test_database_config());
+    if (status_t const mounted = stack->store->mount(stack->volume, nvme_queues_ref_t {&stack->fixture->queues, 0},
+                                                     test_database_config());
         mounted.failed())
         return mounted;
     return stack;
 }
 
-/** Creates the three collections of every case in @p store, answering their IDs, and whether every
- *  one was created. */
+/** Creates the three collections of every case in @p store on @p queues, answering their IDs, and
+ *  whether every one was created. */
 template <typename database_type_>
-bool create_collections(database_type_& store, collections_t& named) {
+bool create_collections(database_type_& store, nvme_queues_ref_t queues, collections_t& named) {
     bool created_all = true;
     for (shape_t const shape : every_shape_k) {
         collection_id_t const collection_id = minted_collection_id();
@@ -382,7 +391,8 @@ bool create_collections(database_type_& store, collections_t& named) {
         collection_config_t const config = collection_config_of(shape);
         value_layout_t const layout = resolve_value_layout(config.lsm_tree.lsm_level_0.sorted_run.value_size);
         status_t const created = store.create_collection(collection_id, string_view_t {name},
-                                                         static_cast<std::uint16_t>(layout), config);
+                                                         static_cast<std::uint16_t>(layout), config,
+                                                         collection_invalid_id_k, queues);
         created_all = expect_true(created.succeeded()) && created_all;
         named.ids[static_cast<std::size_t>(shape)] = collection_id;
     }
@@ -403,13 +413,14 @@ void test_create_transaction(mount_type_ const& mount) {
     expect_status(stack, status_code_t::success_k);
     if (!stack) return;
     auto& store = *(*stack)->store;
+    nvme_queues_ref_t const queues {&(*stack)->fixture->queues, 0};
 
     expected<transaction_unique_ptr_t> first = store.create_transaction();
     expect_true(first.has_value());
     if (!first) return;
     (*first)->rollback();
-    expect_true((*first)->commit().succeeded());
-    expect_true((*first)->commit().succeeded());
+    expect_true((*first)->commit(queues).succeeded());
+    expect_true((*first)->commit(queues).succeeded());
     (*first)->rollback();
 
     // A live transaction pins the stamp it started at, and gives it back when it dies.
@@ -433,15 +444,16 @@ void test_create_transactions(mount_type_ const& mount) {
     expect_status(stack, status_code_t::success_k);
     if (!stack) return;
     auto& store = *(*stack)->store;
+    nvme_queues_ref_t const queues {&(*stack)->fixture->queues, 0};
 
     expected<transaction_unique_ptr_t> first = store.create_transaction();
     expected<transaction_unique_ptr_t> second = store.create_transaction();
     expect_true(first.has_value());
     if (!expect_true(second.has_value())) return;
-    expect_true((*first)->commit().succeeded());
-    expect_status((*second)->commit(), status_code_t::success_k);
-    expect_true((*first)->commit().succeeded());
-    expect_status((*second)->commit(), status_code_t::success_k);
+    expect_true((*first)->commit(queues).succeeded());
+    expect_status((*second)->commit(queues), status_code_t::success_k);
+    expect_true((*first)->commit(queues).succeeded());
+    expect_status((*second)->commit(queues), status_code_t::success_k);
 }
 
 /** Writes stay in the transaction until it commits, a rollback drops them, and a commit makes them visible. */
@@ -454,8 +466,9 @@ void test_insert_by_one_transaction(mount_type_ const& mount) {
     expect_status(stack, status_code_t::success_k);
     if (!stack) return;
     auto& store = *(*stack)->store;
+    nvme_queues_ref_t const queues {&(*stack)->fixture->queues, 0};
     collections_t named;
-    create_collections(store, named);
+    create_collections(store, queues, named);
     expected<transaction_unique_ptr_t> created = store.create_transaction();
     if (!expect_true(created.has_value())) return;
     auto& transaction = **created;
@@ -468,30 +481,30 @@ void test_insert_by_one_transaction(mount_type_ const& mount) {
     // Written, but not yet committed.
     insert_keys(transaction, named, shape_t::inline_k, first_half);
     insert_keys(transaction, named, shape_t::fixed_k, first_half);
-    check_every_database(store, named, no_key, no_key, no_key);
-    check_transaction(transaction, named, shape_t::variable_k, no_key);
+    check_every_database(store, queues, named, no_key, no_key, no_key);
+    check_transaction(transaction, queues, named, shape_t::variable_k, no_key);
 
-    expect_true(transaction.commit().succeeded());
-    check_every_database(store, named, first_half, first_half, no_key);
-    check_every_transaction(transaction, named, first_half, first_half, no_key);
+    expect_true(transaction.commit(queues).succeeded());
+    check_every_database(store, queues, named, first_half, first_half, no_key);
+    check_every_transaction(transaction, queues, named, first_half, first_half, no_key);
 
     // The transaction sees its own second band over the committed first one, and the database does not.
     insert_keys(transaction, named, shape_t::inline_k, second_half);
     insert_keys(transaction, named, shape_t::fixed_k, second_half);
     insert_keys(transaction, named, shape_t::variable_k, every_key);
-    check_every_database(store, named, first_half, first_half, no_key);
-    check_every_transaction(transaction, named, every_key, every_key, every_key);
+    check_every_database(store, queues, named, first_half, first_half, no_key);
+    check_every_transaction(transaction, queues, named, every_key, every_key, every_key);
 
     transaction.rollback();
-    check_every_database(store, named, first_half, first_half, no_key);
-    check_every_transaction(transaction, named, first_half, first_half, no_key);
+    check_every_database(store, queues, named, first_half, first_half, no_key);
+    check_every_transaction(transaction, queues, named, first_half, first_half, no_key);
 
     insert_keys(transaction, named, shape_t::inline_k, second_half);
     insert_keys(transaction, named, shape_t::fixed_k, second_half);
     insert_keys(transaction, named, shape_t::variable_k, every_key);
-    expect_true(transaction.commit().succeeded());
-    check_every_database(store, named, every_key, every_key, every_key);
-    check_every_transaction(transaction, named, every_key, every_key, every_key);
+    expect_true(transaction.commit(queues).succeeded());
+    check_every_database(store, queues, named, every_key, every_key, every_key);
+    check_every_transaction(transaction, queues, named, every_key, every_key, every_key);
 
     // A collection the database never created takes no write.
     value_buffer_t buffer {};
@@ -511,21 +524,22 @@ void test_insert_by_two_transactions(mount_type_ const& mount) {
     expect_status(stack, status_code_t::success_k);
     if (!stack) return;
     auto& store = *(*stack)->store;
+    nvme_queues_ref_t const queues {&(*stack)->fixture->queues, 0};
     collections_t named;
-    create_collections(store, named);
+    create_collections(store, queues, named);
     expected<transaction_unique_ptr_t> first = store.create_transaction();
     expected<transaction_unique_ptr_t> second = store.create_transaction();
     expect_true(first.has_value());
     if (!expect_true(second.has_value())) return;
 
-    check_every_database(store, named, no_key, no_key, no_key);
+    check_every_database(store, queues, named, no_key, no_key, no_key);
     for (shape_t const shape : every_shape_k) {
         insert_keys(**first, named, shape, first_half);
         insert_keys(**second, named, shape, second_half);
     }
-    expect_true((*first)->commit().succeeded());
-    expect_status((*second)->commit(), status_code_t::success_k);
-    check_every_database(store, named, every_key, every_key, every_key);
+    expect_true((*first)->commit(queues).succeeded());
+    expect_status((*second)->commit(queues), status_code_t::success_k);
+    check_every_database(store, queues, named, every_key, every_key, every_key);
 }
 
 /** Of two transactions writing overlapping bands, the second to commit conflicts and lands nothing. */
@@ -538,8 +552,9 @@ void test_insert_by_two_intersected_transactions(mount_type_ const& mount) {
     expect_status(stack, status_code_t::success_k);
     if (!stack) return;
     auto& store = *(*stack)->store;
+    nvme_queues_ref_t const queues {&(*stack)->fixture->queues, 0};
     collections_t named;
-    create_collections(store, named);
+    create_collections(store, queues, named);
     expected<transaction_unique_ptr_t> first = store.create_transaction();
     expected<transaction_unique_ptr_t> second = store.create_transaction();
     expect_true(first.has_value());
@@ -551,9 +566,9 @@ void test_insert_by_two_intersected_transactions(mount_type_ const& mount) {
     insert_keys(**second, named, shape_t::inline_k, second_half_and_one);
     insert_keys(**second, named, shape_t::variable_k, second_half);
 
-    expect_true((*first)->commit().succeeded());
-    expect_status((*second)->commit(), status_code_t::write_conflict_k);
-    check_every_database(store, named, first_half, every_key, first_half);
+    expect_true((*first)->commit(queues).succeeded());
+    expect_status((*second)->commit(queues), status_code_t::write_conflict_k);
+    check_every_database(store, queues, named, first_half, every_key, first_half);
 }
 
 /** A transaction's removals land with its commit and vanish with its rollback. */
@@ -566,8 +581,9 @@ void test_remove_by_one_transaction(mount_type_ const& mount) {
     expect_status(stack, status_code_t::success_k);
     if (!stack) return;
     auto& store = *(*stack)->store;
+    nvme_queues_ref_t const queues {&(*stack)->fixture->queues, 0};
     collections_t named;
-    create_collections(store, named);
+    create_collections(store, queues, named);
     expected<transaction_unique_ptr_t> created = store.create_transaction();
     if (!expect_true(created.has_value())) return;
     auto& transaction = **created;
@@ -575,15 +591,15 @@ void test_remove_by_one_transaction(mount_type_ const& mount) {
     insert_keys(transaction, named, shape_t::inline_k, first_half);
     insert_keys(transaction, named, shape_t::fixed_k, every_key);
     insert_keys(transaction, named, shape_t::variable_k, first_half);
-    expect_true(transaction.commit().succeeded());
+    expect_true(transaction.commit(queues).succeeded());
 
     for (shape_t const shape : every_shape_k) remove_keys(transaction, named, shape, second_half);
-    expect_true(transaction.commit().succeeded());
-    check_every_database(store, named, first_half, first_half, first_half);
+    expect_true(transaction.commit(queues).succeeded());
+    check_every_database(store, queues, named, first_half, first_half, first_half);
 
     for (shape_t const shape : every_shape_k) remove_keys(transaction, named, shape, first_half);
     transaction.rollback();
-    check_every_database(store, named, first_half, first_half, first_half);
+    check_every_database(store, queues, named, first_half, first_half, first_half);
 }
 
 /** Two transactions removing disjoint halves both commit, and the database is left empty. */
@@ -596,10 +612,11 @@ void test_remove_by_two_transactions(mount_type_ const& mount) {
     expect_status(stack, status_code_t::success_k);
     if (!stack) return;
     auto& store = *(*stack)->store;
+    nvme_queues_ref_t const queues {&(*stack)->fixture->queues, 0};
     collections_t named;
-    create_collections(store, named);
+    create_collections(store, queues, named);
     // The population lands first, since a head write is a commit a transaction started before it would watch.
-    for (shape_t const shape : every_shape_k) insert_keys(store, named, shape, every_key);
+    for (shape_t const shape : every_shape_k) insert_keys(store, named, shape, every_key, queues);
     expected<transaction_unique_ptr_t> first = store.create_transaction();
     expected<transaction_unique_ptr_t> second = store.create_transaction();
     expect_true(first.has_value());
@@ -609,9 +626,9 @@ void test_remove_by_two_transactions(mount_type_ const& mount) {
         remove_keys(**first, named, shape, first_half);
         remove_keys(**second, named, shape, second_half);
     }
-    expect_true((*first)->commit().succeeded());
-    expect_status((*second)->commit(), status_code_t::success_k);
-    check_every_database(store, named, no_key, no_key, no_key);
+    expect_true((*first)->commit(queues).succeeded());
+    expect_status((*second)->commit(queues), status_code_t::success_k);
+    check_every_database(store, queues, named, no_key, no_key, no_key);
 }
 
 /** Of two transactions removing overlapping bands, the second to commit conflicts and removes nothing. */
@@ -624,10 +641,11 @@ void test_remove_by_two_intersected_transactions(mount_type_ const& mount) {
     expect_status(stack, status_code_t::success_k);
     if (!stack) return;
     auto& store = *(*stack)->store;
+    nvme_queues_ref_t const queues {&(*stack)->fixture->queues, 0};
     collections_t named;
-    create_collections(store, named);
+    create_collections(store, queues, named);
     // The population lands first, since a head write is a commit a transaction started before it would watch.
-    for (shape_t const shape : every_shape_k) insert_keys(store, named, shape, every_key);
+    for (shape_t const shape : every_shape_k) insert_keys(store, named, shape, every_key, queues);
     expected<transaction_unique_ptr_t> first = store.create_transaction();
     expected<transaction_unique_ptr_t> second = store.create_transaction();
     expect_true(first.has_value());
@@ -638,9 +656,9 @@ void test_remove_by_two_intersected_transactions(mount_type_ const& mount) {
     remove_keys(**second, named, shape_t::fixed_k, second_half);
     remove_keys(**second, named, shape_t::variable_k, second_half_and_one);
 
-    expect_true((*first)->commit().succeeded());
-    expect_status((*second)->commit(), status_code_t::write_conflict_k);
-    check_every_database(store, named, second_half, second_half, second_half);
+    expect_true((*first)->commit(queues).succeeded());
+    expect_status((*second)->commit(queues), status_code_t::write_conflict_k);
+    check_every_database(store, queues, named, second_half, second_half, second_half);
 }
 
 /** Two transactions on two threads, writing different collections, both commit and both land whole. */
@@ -653,22 +671,23 @@ void test_insert_by_two_concurrent_transactions(mount_type_ const& mount) {
     expect_status(stack, status_code_t::success_k);
     if (!stack) return;
     auto& store = *(*stack)->store;
+    nvme_queues_ref_t const queues {&(*stack)->fixture->queues, 0};
     collections_t named;
-    if (!create_collections(store, named)) return;
+    if (!create_collections(store, queues, named)) return;
 
-    auto const writer = [&](std::span<shape_t const> shapes) noexcept {
+    auto const writer = [&](std::span<shape_t const> shapes, nvme_queues_ref_t writer_queues) noexcept {
         expected<transaction_unique_ptr_t> transaction = store.create_transaction();
         if (!expect_true(transaction.has_value())) return;
         for (shape_t const shape : shapes) insert_keys(**transaction, named, shape, every_key);
-        expect_true((*transaction)->commit().succeeded());
+        expect_true((*transaction)->commit(writer_queues).succeeded());
     };
     std::array<shape_t, 1> const fixed_only {shape_t::fixed_k};
     std::array<shape_t, 2> const the_others {shape_t::inline_k, shape_t::variable_k};
-    std::thread first {[&]() noexcept { writer(fixed_only); }};
-    std::thread second {[&]() noexcept { writer(the_others); }};
+    std::thread first {[&]() noexcept { writer(fixed_only, nvme_queues_ref_t {queues.queues, 1}); }};
+    std::thread second {[&]() noexcept { writer(the_others, nvme_queues_ref_t {queues.queues, 2}); }};
     first.join();
     second.join();
-    check_every_database(store, named, every_key, every_key, every_key);
+    check_every_database(store, queues, named, every_key, every_key, every_key);
 }
 
 /** Every watch schedule refuses or admits the commit it promises to, for writes, reads and explicit watches. */
@@ -681,9 +700,10 @@ void test_watch_transactions(mount_type_ const& mount) {
     expect_status(stack, status_code_t::success_k);
     if (!stack) return;
     auto& store = *(*stack)->store;
+    nvme_queues_ref_t const queues {&(*stack)->fixture->queues, 0};
     collections_t named;
-    create_collections(store, named);
-    for (shape_t const shape : every_shape_k) insert_keys(store, named, shape, every_key);
+    create_collections(store, queues, named);
+    for (shape_t const shape : every_shape_k) insert_keys(store, named, shape, every_key, queues);
     expected<transaction_unique_ptr_t> first_created = store.create_transaction();
     expected<transaction_unique_ptr_t> second_created = store.create_transaction();
     expect_true(first_created.has_value());
@@ -698,16 +718,16 @@ void test_watch_transactions(mount_type_ const& mount) {
         expect_true(first.insert(named[shape_t::inline_k], key, value_of(shape_t::inline_k, key, buffer)).succeeded());
     for (stored_key_t key = population_k / 2; key != population_k; ++key)
         expect_true(second.insert(named[shape_t::inline_k], key, value_of(shape_t::inline_k, key, buffer)).succeeded());
-    expect_true(first.commit().succeeded());
-    expect_status(second.commit(), status_code_t::write_conflict_k);
+    expect_true(first.commit(queues).succeeded());
+    expect_status(second.commit(queues), status_code_t::write_conflict_k);
     second.rollback();
 
     // A watched read of a key another transaction then writes and commits: the reader conflicts.
     expect_true(
         first.insert(named[shape_t::fixed_k], stored_key_t {0}, value_of(shape_t::fixed_k, 0, buffer)).succeeded());
-    check_transaction(second, named, shape_t::fixed_k, every_key);
-    expect_true(first.commit().succeeded());
-    expect_status(second.commit(), status_code_t::write_conflict_k);
+    check_transaction(second, queues, named, shape_t::fixed_k, every_key);
+    expect_true(first.commit(queues).succeeded());
+    expect_status(second.commit(queues), status_code_t::write_conflict_k);
     second.rollback();
 
     // Unwatched writes overlapping on one key: both commit.
@@ -721,23 +741,23 @@ void test_watch_transactions(mount_type_ const& mount) {
                         .template insert<watch_schedule_t::never_k>(named[shape_t::variable_k], key,
                                                                     value_of(shape_t::variable_k, key, buffer))
                         .succeeded());
-    expect_true(first.commit().succeeded());
-    expect_true(second.commit().succeeded());
+    expect_true(first.commit(queues).succeeded());
+    expect_true(second.commit(queues).succeeded());
 
     // An unwatched write beside an unwatched read: both commit.
     expect_true(first
                     .template insert<watch_schedule_t::never_k>(named[shape_t::variable_k], stored_key_t {0},
                                                                 value_of(shape_t::variable_k, 0, buffer))
                     .succeeded());
-    check_transaction<watch_schedule_t::never_k>(second, named, shape_t::variable_k, every_key);
-    expect_true(first.commit().succeeded());
-    expect_true(second.commit().succeeded());
+    check_transaction<watch_schedule_t::never_k>(second, queues, named, shape_t::variable_k, every_key);
+    expect_true(first.commit(queues).succeeded());
+    expect_true(second.commit(queues).succeeded());
 
     // An explicit watch checked now fails at once, and one checked on commit refuses the commit.
     second.rollback();
     expect_true(first.insert(named[shape_t::variable_k], stored_key_t {0}, value_of(shape_t::variable_k, 0, buffer))
                     .succeeded());
-    expect_true(first.commit().succeeded());
+    expect_true(first.commit(queues).succeeded());
     expect_true(second
                     .template watch_more<watch_schedule_t::now_k>(named[shape_t::variable_k],
                                                                   std::span<stored_key_t const> {zero})
@@ -746,37 +766,39 @@ void test_watch_transactions(mount_type_ const& mount) {
                     .template watch_more<watch_schedule_t::on_commit_k>(named[shape_t::variable_k],
                                                                         std::span<stored_key_t const> {zero})
                     .succeeded());
-    expect_status(second.commit(), status_code_t::write_conflict_k);
+    expect_status(second.commit(queues), status_code_t::write_conflict_k);
     second.rollback();
 
     // A watch scoped from the operation ignores a commit that landed before it.
     expect_true(first.insert(named[shape_t::variable_k], stored_key_t {0}, value_of(shape_t::variable_k, 0, buffer))
                     .succeeded());
-    expect_true(first.commit().succeeded());
+    expect_true(first.commit(queues).succeeded());
     expect_true(second
                     .template watch_more<watch_schedule_t::on_commit_since_operation_k>(
                         named[shape_t::variable_k], std::span<stored_key_t const> {zero})
                     .succeeded());
-    expect_true(second.commit().succeeded());
+    expect_true(second.commit(queues).succeeded());
 
     // A read scoped from the operation pins the stamp it read at past a flush, and a later commit
     // of the key refuses.
-    expect_true(store.insert(named[shape_t::variable_k], stored_key_t {0}, value_of(shape_t::variable_k, 1, buffer))
-                    .succeeded());
+    expect_true(
+        store.insert(named[shape_t::variable_k], stored_key_t {0}, value_of(shape_t::variable_k, 1, buffer), queues)
+            .succeeded());
     stored_value_size_t size = 0;
     expect_true(second
                     .template select<watch_schedule_t::on_commit_since_operation_k>(
-                        named[shape_t::variable_k], stored_key_t {0}, stored_value_span_t {buffer}, size)
+                        named[shape_t::variable_k], stored_key_t {0}, stored_value_span_t {buffer}, size, queues)
                     .succeeded());
     expect_equal(mismatches_in(shape_t::variable_k, 1, 0, std::span<byte_t const> {buffer.data(), size}),
                  std::size_t {0});
     transaction_stamp_t const pinned_stamp = store.ledger().published();
     expect_equal(store.ledger().newest_reader(), pinned_stamp);
-    expect_true(store.insert(named[shape_t::variable_k], stored_key_t {0}, value_of(shape_t::variable_k, 0, buffer))
-                    .succeeded());
-    expect_true(store.flush().succeeded());
+    expect_true(
+        store.insert(named[shape_t::variable_k], stored_key_t {0}, value_of(shape_t::variable_k, 0, buffer), queues)
+            .succeeded());
+    expect_true(store.flush(queues).succeeded());
     expect_equal(store.ledger().newest_reader(), pinned_stamp);
-    expect_status(second.commit(), status_code_t::write_conflict_k);
+    expect_status(second.commit(queues), status_code_t::write_conflict_k);
 }
 
 /** A staged transaction commits whole, a rolled-back one lands nothing, and a dropped one lands nothing either. */
@@ -789,25 +811,26 @@ void test_stage_and_commit(mount_type_ const& mount) {
     expect_status(stack, status_code_t::success_k);
     if (!stack) return;
     auto& store = *(*stack)->store;
+    nvme_queues_ref_t const queues {&(*stack)->fixture->queues, 0};
     collections_t named;
-    create_collections(store, named);
+    create_collections(store, queues, named);
     expected<transaction_unique_ptr_t> created = store.create_transaction();
     if (!expect_true(created.has_value())) return;
 
     for (shape_t const shape : every_shape_k) insert_keys(**created, named, shape, first_half);
-    expect_true((*created)->stage().succeeded());
-    expect_true((*created)->commit().succeeded());
-    check_every_transaction(**created, named, first_half, first_half, first_half);
+    expect_true((*created)->stage(queues).succeeded());
+    expect_true((*created)->commit(queues).succeeded());
+    check_every_transaction(**created, queues, named, first_half, first_half, first_half);
 
     for (shape_t const shape : every_shape_k) insert_keys(**created, named, shape, second_half);
-    expect_true((*created)->stage().succeeded());
+    expect_true((*created)->stage(queues).succeeded());
     (*created)->rollback();
-    check_every_transaction(**created, named, first_half, first_half, first_half);
+    check_every_transaction(**created, queues, named, first_half, first_half, first_half);
 
     for (shape_t const shape : every_shape_k) insert_keys(**created, named, shape, second_half);
-    expect_true((*created)->stage().succeeded());
+    expect_true((*created)->stage(queues).succeeded());
     created = status_t {status_code_t::cancelled_k};
-    check_every_database(store, named, first_half, first_half, first_half);
+    check_every_database(store, queues, named, first_half, first_half, first_half);
 }
 
 /** Twenty transactions started together, each writing its own band of fifty keys with watches, all commit: validation
@@ -822,10 +845,11 @@ void test_disjoint_bands_never_conflict(mount_type_ const& mount) {
     expect_status(stack, status_code_t::success_k);
     if (!stack) return;
     auto& store = *(*stack)->store;
+    nvme_queues_ref_t const queues {&(*stack)->fixture->queues, 0};
     collections_t named;
-    if (!create_collections(store, named)) return;
+    if (!create_collections(store, queues, named)) return;
     // Every key is present first, so each band rewrites keys the others read nothing of.
-    for (shape_t const shape : every_shape_k) insert_keys(store, named, shape, every_key);
+    for (shape_t const shape : every_shape_k) insert_keys(store, named, shape, every_key, queues);
 
     // Each transaction buffers its own band alone, so twenty of them fit the budget one whole case's shape takes.
     std::size_t const band_keys = population_k / bands_k;
@@ -844,7 +868,7 @@ void test_disjoint_bands_never_conflict(mount_type_ const& mount) {
         for (stored_key_t key = band * band_keys; key != (band + 1) * band_keys; ++key) {
             stored_value_size_t size = 0;
             expect_true(transactions[band]
-                            ->select(named[shape_t::fixed_k], key, stored_value_span_t {buffer}, size)
+                            ->select(named[shape_t::fixed_k], key, stored_value_span_t {buffer}, size, queues)
                             .succeeded());
             expect_true(transactions[band]
                             ->insert(named[shape_t::fixed_k], key, value_of(shape_t::fixed_k, key, buffer))
@@ -852,9 +876,9 @@ void test_disjoint_bands_never_conflict(mount_type_ const& mount) {
         }
     std::size_t conflicts = 0;
     for (std::size_t band = 0; band != bands_k; ++band)
-        conflicts += transactions[band]->commit() == status_code_t::write_conflict_k;
+        conflicts += transactions[band]->commit(queues) == status_code_t::write_conflict_k;
     expect_equal(conflicts, std::size_t {0});
-    check_every_database(store, named, every_key, every_key, every_key);
+    check_every_database(store, queues, named, every_key, every_key, every_key);
 }
 
 /** A transaction reads what it started at, past a later commit of the key, a flush and a merge alike, and a watch on
@@ -868,9 +892,10 @@ void test_reads_at_start(mount_type_ const& mount) {
     expect_status(stack, status_code_t::success_k);
     if (!stack) return;
     auto& store = *(*stack)->store;
+    nvme_queues_ref_t const queues {&(*stack)->fixture->queues, 0};
     collections_t named;
-    create_collections(store, named);
-    for (shape_t const shape : every_shape_k) insert_keys(store, named, shape, every_key);
+    create_collections(store, queues, named);
+    for (shape_t const shape : every_shape_k) insert_keys(store, named, shape, every_key, queues);
     expected<transaction_unique_ptr_t> reader = store.create_transaction();
     if (!expect_true(reader.has_value())) return;
 
@@ -878,21 +903,23 @@ void test_reads_at_start(mount_type_ const& mount) {
     value_buffer_t buffer {};
     for (stored_key_t key = 0; key != population_k; ++key) {
         stored_value_view_t const value = value_of(shape_t::fixed_k, key + 1, buffer);
-        expect_true(store.insert(named[shape_t::fixed_k], key, value).succeeded());
+        expect_true(store.insert(named[shape_t::fixed_k], key, value, queues).succeeded());
     }
-    check_transaction(**reader, named, shape_t::fixed_k, every_key);
-    expect_true(store.flush().succeeded());
-    check_transaction(**reader, named, shape_t::fixed_k, every_key);
-    for (std::size_t pass = 0; pass != 4 && store.needs_compaction(); ++pass) expect_true(store.compact().succeeded());
-    check_transaction(**reader, named, shape_t::fixed_k, every_key);
-    expect_status((*reader)->commit(), status_code_t::write_conflict_k);
+    check_transaction(**reader, queues, named, shape_t::fixed_k, every_key);
+    expect_true(store.flush(queues).succeeded());
+    check_transaction(**reader, queues, named, shape_t::fixed_k, every_key);
+    for (std::size_t pass = 0; pass != 4 && store.needs_compaction(); ++pass)
+        expect_true(store.compact({}, queues).succeeded());
+    check_transaction(**reader, queues, named, shape_t::fixed_k, every_key);
+    expect_status((*reader)->commit(queues), status_code_t::write_conflict_k);
 
     // Started again, it reads the head, and with the pin gone a merge keeps the newest version alone.
     (*reader)->rollback();
     std::size_t mismatches = 0;
     for (stored_key_t key = 0; key != population_k; ++key) {
         stored_value_size_t size = 0;
-        expect_true((*reader)->select(named[shape_t::fixed_k], key, stored_value_span_t {buffer}, size).succeeded());
+        expect_true(
+            (*reader)->select(named[shape_t::fixed_k], key, stored_value_span_t {buffer}, size, queues).succeeded());
         mismatches += mismatches_in(shape_t::fixed_k, key + 1, 0, std::span<byte_t const> {buffer.data(), size});
     }
     expect_equal(mismatches, std::size_t {0});
@@ -909,32 +936,35 @@ void test_range_watches_catch_phantoms(mount_type_ const& mount) {
     expect_status(stack, status_code_t::success_k);
     if (!stack) return;
     auto& store = *(*stack)->store;
+    nvme_queues_ref_t const queues {&(*stack)->fixture->queues, 0};
     collections_t named;
-    create_collections(store, named);
-    insert_keys(store, named, shape_t::inline_k, first_half);
+    create_collections(store, queues, named);
+    insert_keys(store, named, shape_t::inline_k, first_half, queues);
     expected<transaction_unique_ptr_t> walker = store.create_transaction();
     if (!expect_true(walker.has_value())) return;
     value_buffer_t buffer {};
 
     // A phantom inside the walked range refuses the walker, even with the key absent before.
     expect_true((*walker)->watch_range(named[shape_t::inline_k], stored_key_t {600}, stored_key_t {700}).succeeded());
-    expect_true(store.insert(named[shape_t::inline_k], 650, value_of(shape_t::inline_k, 650, buffer)).succeeded());
+    expect_true(
+        store.insert(named[shape_t::inline_k], 650, value_of(shape_t::inline_k, 650, buffer), queues).succeeded());
     expect_true((*walker)->insert(named[shape_t::inline_k], 0, value_of(shape_t::inline_k, 0, buffer)).succeeded());
-    expect_status((*walker)->commit(), status_code_t::write_conflict_k);
+    expect_status((*walker)->commit(queues), status_code_t::write_conflict_k);
     (*walker)->rollback();
 
     // One landing past the range, and one after the flush that moved the range into a run, leave it alone.
     expect_true((*walker)->watch_range(named[shape_t::inline_k], stored_key_t {600}, stored_key_t {700}).succeeded());
-    expect_true(store.flush().succeeded());
-    expect_true(store.insert(named[shape_t::inline_k], 701, value_of(shape_t::inline_k, 701, buffer)).succeeded());
+    expect_true(store.flush(queues).succeeded());
+    expect_true(
+        store.insert(named[shape_t::inline_k], 701, value_of(shape_t::inline_k, 701, buffer), queues).succeeded());
     expect_true((*walker)->insert(named[shape_t::inline_k], 0, value_of(shape_t::inline_k, 0, buffer)).succeeded());
-    expect_true((*walker)->commit().succeeded());
+    expect_true((*walker)->commit(queues).succeeded());
 
     // A removal inside the range is a commit landing there too.
     expect_true((*walker)->watch_range(named[shape_t::inline_k], stored_key_t {600}, stored_key_t {700}).succeeded());
-    expect_true(store.remove(named[shape_t::inline_k], 650).succeeded());
+    expect_true(store.remove(named[shape_t::inline_k], 650, queues).succeeded());
     expect_true((*walker)->insert(named[shape_t::inline_k], 0, value_of(shape_t::inline_k, 0, buffer)).succeeded());
-    expect_status((*walker)->commit(), status_code_t::write_conflict_k);
+    expect_status((*walker)->commit(queues), status_code_t::write_conflict_k);
 }
 
 /** A transaction watching a key for existence commits over a change delta folded onto the key
@@ -949,10 +979,11 @@ void test_existence_watches_pass_changes(mount_type_ const& mount) {
     expect_status(stack, status_code_t::success_k);
     if (!stack) return;
     auto& store = *(*stack)->store;
+    nvme_queues_ref_t const queues {&(*stack)->fixture->queues, 0};
     collections_t named;
-    create_collections(store, named);
-    insert_keys(store, named, shape_t::fixed_k, first_half);
-    expect_true(store.flush().succeeded());
+    create_collections(store, queues, named);
+    insert_keys(store, named, shape_t::fixed_k, first_half, queues);
+    expect_true(store.flush(queues).succeeded());
     any_collection_id_t const id = named[shape_t::fixed_k];
     expected<transaction_unique_ptr_t> watcher = store.create_transaction();
     expected<transaction_unique_ptr_t> changer = store.create_transaction();
@@ -964,7 +995,7 @@ void test_existence_watches_pass_changes(mount_type_ const& mount) {
         expect_true((*watcher)->watch_existence(id, std::span<stored_key_t const> {&edited, 1}).succeeded());
         meddle();
         expect_true((*watcher)->insert(id, 1, value_of(shape_t::fixed_k, 1, buffer)).succeeded());
-        status_t const committed = (*watcher)->commit();
+        status_t const committed = (*watcher)->commit(queues);
         if (committed.failed()) (*watcher)->rollback();
         return committed;
     };
@@ -973,15 +1004,16 @@ void test_existence_watches_pass_changes(mount_type_ const& mount) {
     status_t const changed_status = watch_and_commit([&] {
         expect_true(
             (*changer)->change(id, edited, value_of(shape_t::fixed_k, 2, buffer), last_write_fold_t {}).succeeded());
-        expect_true((*changer)->commit().succeeded());
+        expect_true((*changer)->commit(queues).succeeded());
     });
     expect_true(changed_status.succeeded());
 
     // A whole write and a removal since the watch each refuse it.
     status_t const written_status = watch_and_commit(
-        [&] { expect_true(store.insert(id, edited, value_of(shape_t::fixed_k, 3, buffer)).succeeded()); });
+        [&] { expect_true(store.insert(id, edited, value_of(shape_t::fixed_k, 3, buffer), queues).succeeded()); });
     expect_status(written_status, status_code_t::write_conflict_k);
-    status_t const removed_status = watch_and_commit([&] { expect_true(store.remove(id, edited).succeeded()); });
+    status_t const removed_status = watch_and_commit(
+        [&] { expect_true(store.remove(id, edited, queues).succeeded()); });
     expect_status(removed_status, status_code_t::write_conflict_k);
 }
 

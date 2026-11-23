@@ -24,15 +24,15 @@
  *  runs the call, before the engine sees it, so every engine reads tapes and accessors alike.
  *
  *  An executor serves one call at a time, held from its claim to its end, and a second call from
- *  any thread finishes contended, so nothing queues. A blocking call, and every call on a lent or
+ *  any thread finishes contended, so nothing queues. A blocking call, and every call on a
  *  caller-inclusive pool, runs on the calling thread, and a VRAM executor's one host thread is its
- *  caller, which stages, feeds the device and waits on it. A deferred call on an owned
- *  caller-exclusive pool is copied into the executor and dispatched to pool thread 0, which serves
- *  it in the caller's place while the other threads return at once, so polling alone finishes it.
- *  Inside the call every fork of the pool forks the other threads, so a verb splits its batch the
- *  same way in both modes. A call ends in one order: its own claims and handle counts, the executor
- *  claim, then the message and the status with release ordering, so a caller seeing it final may
- *  submit again or free at once. The next call, a drain or a free first joins that dispatch.
+ *  caller, which stages, feeds the device and waits on it. A deferred call on a caller-exclusive
+ *  pool is copied into the executor and dispatched to pool thread 0, which serves it in the
+ *  caller's place while the other threads return at once, so polling alone finishes it. Inside the
+ *  call every fork of the pool forks the other threads, so a verb splits its batch the same way in
+ *  both modes. A call ends in one order: its own claims and handle counts, the executor claim, then
+ *  the message and the status with release ordering, so a caller seeing it final may submit again
+ *  or free at once. The next call, a drain or a free first joins that dispatch.
  *
  *  Every executor call raises the count of its database, of the transaction, snapshot or cursor it
  *  names, and of its arena at its claim, and lowers them at its end, so freeing any of those
@@ -65,7 +65,7 @@
 
 #include "ustore/utilities/blocking_files.hpp" // `absolute_path_of`, `path_max_bytes_k`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_rewind`, `arena_page_bytes_k`
-#include "ustore/utilities/ram_device.hpp"  // `executor_t`, `lent_pool_t`, `claim_t`
+#include "ustore/utilities/ram_device.hpp"  // `claim_t`
 
 #include "engine.hpp"             // `engine_t`, `ustore_*_handle_t`, `view_t`, `host_verbs`, `floor_atomic_ref`
 #include "match.hpp"              // `compiled_match`, `compile_match`, `scan_matched`, `exhausted_t`
@@ -126,7 +126,7 @@ struct enumerator_spelling {
     std::string_view name;
 };
 
-/** The spelling of @p value in @p names, or "unrecognized" for a value no enumerator carries. */
+/** The spelling of @p value in @p names, or "unrecognized" for a value no enumerator holds. */
 template <typename enum_type_, std::size_t count_>
 char const* name_in(enumerator_spelling<enum_type_> const (&names)[count_], enum_type_ const& value) noexcept {
     // A C caller may pass any integer, which C++ may not load as the enum, so its bits are read in place instead
@@ -137,7 +137,7 @@ char const* name_in(enumerator_spelling<enum_type_> const (&names)[count_], enum
 }
 
 /** Writes to @p value the enumerator of @p names spelled @p name, or refuses a name none
- *  carries. */
+ *  holds. */
 template <typename enum_type_, std::size_t count_>
 ustore_status_t value_in(enumerator_spelling<enum_type_> const (&names)[count_], ustore_bytes_view_t name,
                          enum_type_* value) noexcept {
@@ -328,11 +328,11 @@ inline bool decode_view(ustore_view_t view, view_t& decoded) noexcept {
     return false;
 }
 
-/** The transaction a call carries, or null. */
-inline ustore_transaction_t carried(ustore_transaction_t transaction) noexcept { return transaction; }
+/** The transaction a call holds, or null. */
+inline ustore_transaction_t held(ustore_transaction_t transaction) noexcept { return transaction; }
 
 /** The transaction a call reuses, or null for one it opens afresh. */
-inline ustore_transaction_t carried(ustore_transaction_t const* transaction) noexcept {
+inline ustore_transaction_t held(ustore_transaction_t const* transaction) noexcept {
     return transaction ? *transaction : nullptr;
 }
 
@@ -341,7 +341,7 @@ inline ustore_snapshot_t viewed(ustore_snapshot_t snapshot) noexcept { return sn
 
 /** Whether a call reads through or reuses a transaction. */
 template <typename arguments_type_>
-concept carries_transaction_concept = requires(arguments_type_ const& arguments) { carried(arguments.transaction); };
+concept has_transaction_concept = requires(arguments_type_ const& arguments) { held(arguments.transaction); };
 
 /** Whether a call reads through a snapshot, or answers a new one. */
 template <typename arguments_type_>
@@ -353,7 +353,7 @@ template <typename arguments_type_>
 bool decode_call(arguments_type_ const& arguments, view_t& view) noexcept {
     if constexpr (reads_view_concept<arguments_type_>)
         if (!decode_view(arguments.view, view)) return false;
-    if constexpr (carries_transaction_concept<arguments_type_>) view.transaction = carried(arguments.transaction);
+    if constexpr (has_transaction_concept<arguments_type_>) view.transaction = held(arguments.transaction);
     if constexpr (names_watch_concept<arguments_type_>) view.watch = arguments.watch;
     if constexpr (reads_snapshot_concept<arguments_type_>) view.snapshot = viewed(arguments.snapshot);
     return true;
@@ -546,7 +546,7 @@ inline void clear_outputs(ustore_strings_cursor_next_t const& arguments) noexcep
 }
 
 inline void clear_outputs(ustore_docs_cursor_next_t const& arguments) noexcept {
-    clear(arguments.keys), clear(arguments.values), clear(arguments.written);
+    clear(arguments.batches), clear(arguments.batches_count);
 }
 
 inline void clear_outputs(ustore_pages_cursor_next_t const& arguments) noexcept {
@@ -747,7 +747,8 @@ struct strings_window_t {
 status_t pull(engine_t const& engine, ustore_blobs_cursor_next_t const& arguments, ustore_blobs_cursor_handle_t& cursor,
               view_t const& view) noexcept;
 
-/** Pulls the next page of a walk over documents, as the blobs pull does, reading whole documents when asked. */
+/** Pulls the next keys of a walk over documents as batches of rows with the columns of the cursor,
+ *  one per task of the executor, which a host engine splits the pull into. */
 status_t pull(engine_t const& engine, ustore_docs_cursor_next_t const& arguments, ustore_docs_cursor_handle_t& cursor,
               view_t const& view) noexcept;
 
@@ -906,7 +907,7 @@ ustore_arena_t arena_of(arguments_type_ const& arguments) noexcept {
     else return nullptr;
 }
 
-/** The transaction @p arguments carry through their view or their transaction, or null. */
+/** The transaction @p arguments hold through their view or their transaction, or null. */
 template <typename arguments_type_>
 ustore_transaction_t transaction_of(arguments_type_ const& arguments) noexcept {
     view_t view;
@@ -938,7 +939,7 @@ std::array<std::uint32_t*, 3> named_calls_of(arguments_type_ const& arguments) n
 template <typename arguments_type_>
     requires one_of<arguments_type_, ustore_database_init_ram_t, ustore_database_open_ram_t,
                     ustore_database_open_rocksdb_t, ustore_database_view_rocksdb_t, ustore_database_open_leveldb_t,
-                    ustore_database_open_nvme_t>
+                    ustore_database_open_nvme_t, ustore_database_view_nvme_t>
 std::array<std::uint32_t*, 3> named_calls_of(arguments_type_ const&) noexcept {
     return {};
 }
@@ -959,10 +960,11 @@ inline void lower_named_calls(std::array<std::uint32_t*, 3> const& counts) noexc
         if (count) floor_atomic_ref<std::uint32_t> {*count}.fetch_sub(1, std::memory_order_release);
 }
 
-/** The claim of the cursor @p arguments pull, or null for a call naming none. */
+/** The claim of the cursor @p arguments pull or of the ingest they feed, or null for neither. */
 template <typename arguments_type_>
 claim_t* handle_claim_of(arguments_type_ const& arguments) noexcept {
     if constexpr (walks_cursor_concept<arguments_type_>) return &arguments.cursor->cursor.claim;
+    else if constexpr (feeds_ingest_concept<arguments_type_>) return &arguments.ingest->claim;
     else return nullptr;
 }
 
@@ -992,24 +994,55 @@ inline bool arena_serves(ustore_executor_handle_t const* executor, ustore_arena_
 template <typename arguments_type_>
 concept pulls_cursor_concept = requires(arguments_type_ const& arguments) { arguments.cursor; };
 
-/** Claims the arena, the cursor and the transaction of @p arguments, holding none when one
- *  serves another call, and refusing a call that needs an arena or a cursor and names none, or
- *  whose arena lives where its executor does not compute. */
+/** Whether @p arguments_type_ names its keys through one keys view. */
+template <typename arguments_type_>
+concept views_keys_concept = requires(arguments_type_ const& arguments) { arguments.keys.data; };
+
+/** Whether an input of @p arguments lies inside @p arena, which the call rewinds before it
+ *  reads it: their keys or the bytes and offsets of their ragged inputs. */
+template <typename arguments_type_>
+bool reads_from_arena(arguments_type_ const& arguments, ustore_arena_t arena) noexcept {
+    if constexpr (views_keys_concept<arguments_type_>)
+        if (arena_holds(arena, arguments.keys.data)) return true;
+    if constexpr (gathers_ragged_inputs_concept<arguments_type_>)
+        for (ragged_input_t const& input : ragged_inputs(arguments)) {
+            ustore_strings_view_t const& view = input.view;
+            if (view.layout == ustore_strings_u32_tape_k &&
+                (arena_holds(arena, view.data.u32_tape.data) || arena_holds(arena, view.data.u32_tape.offsets)))
+                return true;
+            if (view.layout == ustore_strings_u64_tape_k &&
+                (arena_holds(arena, view.data.u64_tape.data) || arena_holds(arena, view.data.u64_tape.offsets)))
+                return true;
+        }
+    return false;
+}
+
+/** Claims the arena, the cursor or ingest and the transaction of @p arguments, holding none when
+ *  one serves another call, and refusing a call that needs an arena, a cursor or an ingest and
+ *  names none, whose arena lives where its executor does not compute, or whose inputs lie inside
+ *  the arena it rewinds. */
 template <typename arguments_type_>
 status_t take_claims(arguments_type_ const& arguments) noexcept {
     if constexpr (pulls_cursor_concept<arguments_type_>)
         if (!arguments.cursor) return {status_code_t::invalid_argument_k, "The call needs a cursor"};
+    if constexpr (feeds_ingest_concept<arguments_type_>)
+        if (!arguments.ingest) return {status_code_t::invalid_argument_k, "The ingest is missing"};
     ustore_arena_t const arena = arena_of(arguments);
     if constexpr (fills_arena_concept<arguments_type_>) {
         if (!arena) return {status_code_t::invalid_argument_k, "The call needs an arena for its outputs"};
         if (!arena_serves(arguments.executor, arena))
             return {status_code_t::device_k, "The arena lives where another executor computes"};
         if (!take(arena->claim)) return {status_code_t::contended_k, "The arena serves another call"};
+        if (reads_from_arena(arguments, arena)) {
+            release(arena->claim);
+            return {status_code_t::invalid_argument_k, "An input lies inside the arena the call rewinds"};
+        }
     }
     claim_t* const handle = handle_claim_of(arguments);
     if (handle && !take(*handle)) {
         if (arena) release(arena->claim);
-        return {status_code_t::contended_k, "The cursor serves another pull"};
+        return {status_code_t::contended_k, feeds_ingest_concept<arguments_type_> ? "The ingest serves another call"
+                                                                                  : "The cursor serves another pull"};
     }
     ustore_transaction_t const transaction = transaction_of(arguments);
     if (transaction && !take(transaction->claim)) {
@@ -1527,12 +1560,15 @@ status_t open_device_call(arguments_type_ const& arguments, executor_type_& exec
     return {};
 }
 
-/** Rewinds every scratch the call @p runner serves may fill: each pool thread's and the call's own,
- *  as slices keep their scratch from one fork to the next, or the one made for a call alone. */
-inline void rewind_scratches(view_t const& runner) noexcept {
-    if (runner.executor)
-        for (ustore_arena_handle_t& scratch : runner.executor->scratches) arena_rewind(&scratch);
-    else arena_rewind(runner.scratch);
+/** Rewinds every scratch the call @p runner serves may fill, each pool thread's and the call's own,
+ *  as slices keep their scratch from one fork to the next, or the one made for a call alone, and
+ *  seeds each at @p bytes_per_thread, refusing a seed past the executor's @c scratch_limit. */
+inline status_t reserve_scratches(view_t const& runner, std::size_t bytes_per_thread) noexcept {
+    if (!runner.executor) return reserve(*host_blocks_of(runner.scratch), bytes_per_thread);
+    for (ustore_arena_handle_t& scratch : runner.executor->scratches)
+        if (status_t const seeded = reserve(*host_blocks_of(&scratch), bytes_per_thread); seeded.failed())
+            return seeded;
+    return {};
 }
 
 /** Scans what @p match narrows for @p arguments at @p residency_, on the host or on a device. */
@@ -1577,7 +1613,7 @@ status_t serve_modality(engine_t const& engine, ustore_database_t database, argu
     if (!verbs) return status_t {status_code_t::unsupported_k, "The engine keeps no collections of that modality"};
     auto const verb = verbs->*verb_slot<arguments_type_>::template verb<residency_>;
     if (!verb) return status_t {status_code_t::unsupported_k, "The engine does not implement this call"};
-    if constexpr (carries_match<arguments_type_>) {
+    if constexpr (has_match<arguments_type_>) {
         auto [match, match_status] = compile_match(arguments, runner.scratch, database->ceiling.strings, executor...);
         if (match_status.failed()) return match_status;
         if (!match.matches_everything())
@@ -1590,7 +1626,12 @@ status_t serve_modality(engine_t const& engine, ustore_database_t database, argu
                                            arguments, pinned, executor...);
                                    });
     }
-    return call_staged(verb, arguments, view, executor...);
+    // A scan of documents called through the C ABI lists keys alone
+    if constexpr (std::is_same_v<arguments_type_, ustore_docs_scan_t> && residency_ == vendored_residency_t::host_k)
+        return call_staged([verb](ustore_docs_scan_t const& scan,
+                                  view_t const& scan_view) noexcept { return verb(scan, nullptr, scan_view); },
+                           arguments, view);
+    else return call_staged(verb, arguments, view, executor...);
 }
 
 /** Serves @p arguments on the engine of their database, in the scratch and on the executor thread
@@ -1633,7 +1674,7 @@ status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept 
         return {status_code_t::invalid_argument_k, "The view reads another database"};
 
     if constexpr (fills_arena_concept<arguments_type_>) arena_rewind(arguments.arena);
-    rewind_scratches(runner);
+    if (status_t const seeded = reserve_scratches(runner, 0); seeded.failed()) return seeded;
     return visit_residency(view, [&]<typename... executors_types_>(executors_types_&... executor) noexcept -> status_t {
         constexpr vendored_residency_t residency_k = vendored_residency_of<executors_types_...>;
         if constexpr (residency_k != vendored_residency_t::host_k)
@@ -1655,18 +1696,16 @@ status_t serve(arguments_type_ const& arguments, view_t const& runner) noexcept 
 
 #pragma region Routing
 
-/** Whether deferred calls on @p executor are delegated to its pool thread 0: an owned
- *  caller-exclusive pool has one of its own, while a lent pool's dispatches and joins stay its
- *  lender's, and an inclusive pool, as every VRAM executor's is, needs its caller to run. */
+/** Whether deferred calls on @p executor are delegated to its pool thread 0: a caller-exclusive
+ *  pool has one of its own, while an inclusive one, as a VRAM executor's is, runs on its caller. */
 inline bool delegates(ustore_executor_handle_t const& executor) noexcept {
-    executor_t const* const owned = std::get_if<executor_t>(&executor.pool);
-    return owned && owned->view().caller_exclusivity() == caller_exclusivity_t::caller_exclusive_k;
+    return executor.pool.view().caller_exclusivity() == caller_exclusivity_t::caller_exclusive_k;
 }
 
 /** Waits until the dispatch of the last call delegated on @p executor has left pool thread 0, or
  *  returns at once on a pool that never delegates. */
 inline void join_delegated(ustore_executor_handle_t const& executor) noexcept {
-    if (delegates(executor)) std::get_if<executor_t>(&executor.pool)->view().unsafe_join(0);
+    if (delegates(executor)) executor.pool.view().unsafe_join(0);
 }
 
 /** Whether the calling thread serves the body of the call holding @p executor, so waiting on the
@@ -1680,6 +1719,40 @@ inline bool runs_holding_call(ustore_executor_handle_t& executor) noexcept {
 inline view_t call_view(ustore_executor_handle_t& executor) noexcept {
     std::size_t const thread_index = executor.scratches.size() - 1;
     return view_t {.scratch = &executor.scratches[thread_index], .executor = &executor, .thread_index = thread_index};
+}
+
+/** Refuses @p executor, or its absence, on a database admitting @p admission, before the router
+ *  claims it. */
+inline status_t admit_executor(executor_admission_t admission, ustore_executor_handle_t const* executor) noexcept {
+    if (admission == executor_admission_t::any_executor_k) return {};
+    if (!executor)
+        return admission == executor_admission_t::nvme_executor_k
+                   ? status_t {status_code_t::invalid_argument_k, "A call on an SPDK database names its NVMe executor"}
+                   : status_t {};
+    if (std::holds_alternative<nvme_queues_t>(executor->device)) return {};
+    bool const computes_on_device = !std::holds_alternative<std::monostate>(executor->device);
+    if (computes_on_device && admission == executor_admission_t::no_ram_executor_k) return {};
+    return {status_code_t::device_k, "An NVMe database needs an NVMe executor"};
+}
+
+/** Refuses the executor @p arguments name for the database they address, by what that database
+ *  admits. */
+template <typename arguments_type_>
+status_t admit_executor(arguments_type_ const& arguments) noexcept {
+    ustore_database_t const database = database_of(arguments);
+    return database ? admit_executor(database->admitted_executors, arguments.executor) : status_t {};
+}
+
+/** An init names no database yet, so an NVMe open admits what a database on files does, and every
+ *  other open any. */
+template <typename arguments_type_>
+    requires one_of<arguments_type_, ustore_database_init_ram_t, ustore_database_open_ram_t,
+                    ustore_database_open_rocksdb_t, ustore_database_view_rocksdb_t, ustore_database_open_leveldb_t,
+                    ustore_database_open_nvme_t, ustore_database_view_nvme_t>
+status_t admit_executor(arguments_type_ const& arguments) noexcept {
+    if constexpr (one_of<arguments_type_, ustore_database_open_nvme_t, ustore_database_view_nvme_t>)
+        return admit_executor(executor_admission_t::no_ram_executor_k, arguments.executor);
+    else return {};
 }
 
 /** Ends the call holding @p executor: its claims and handle counts, the executor claim, then its
@@ -1758,16 +1831,18 @@ void run(call_type_* call, view_t const& runner) noexcept {
     finish(*call->outcome, status);
 }
 
-/** Runs @p call on the calling thread over a scratch made for it alone, as a call without an
- *  executor keeping scratch needs: its first page lies on the stack, so a small call allocates
- *  nothing, and the blocks it grows into are freed once the call is final. */
+/** Runs @p call on the calling thread over a scratch made for it alone and empty queues, as a call
+ *  without an executor keeping either needs: the scratch's first page lies on the stack, and the
+ *  blocks it grows into, like the blocks an NVMe path gives the queues on its first read or write,
+ *  are freed once the call is final. */
 template <typename call_type_, status_t (*serve_)(call_type_&, view_t const&) noexcept>
 void run_alone(call_type_* call) noexcept {
     alignas(arena_alignment_k) byte_t page[arena_page_bytes_k];
     arena_block_t* const first = new (page) arena_block_t {nullptr, sizeof(page), sizeof(arena_block_t)};
     ustore_arena_handle_t scratch {.memory = host_blocks_t {.newest = first}};
+    nvme_queues_t queues;
     std::array<std::uint32_t*, 3> const named_calls = raise_named_calls(*call);
-    run<call_type_, serve_>(call, view_t {.scratch = &scratch});
+    run<call_type_, serve_>(call, view_t {.scratch = &scratch, .queues = &queues});
     lower_named_calls(named_calls);
     arena_free_blocks(scratch, first);
 }
@@ -1789,6 +1864,7 @@ void serve_delegated(void* context, std::size_t thread, std::size_t) noexcept {
 template <typename call_type_, status_t (*serve_)(call_type_&, view_t const&) noexcept>
 void dispatch(call_type_* call) noexcept {
     ustore_executor_handle_t* const executor = call->executor;
+    if (status_t const refused = admit_executor(*call); refused.failed()) return refuse(*call, refused);
     if (!executor) return run_alone<call_type_, serve_>(call);
     holding_call_t& holding = executor->holding_call;
     if (!take(holding.claim)) return refuse(*call, {status_code_t::contended_k, "Another call holds the executor"});
@@ -1800,15 +1876,21 @@ void dispatch(call_type_* call) noexcept {
     if (call->completion == ustore_completion_blocking_k || !delegates(*executor)) {
         floor_atomic_ref<std::thread::id> {holding.body_thread}.store(std::this_thread::get_id(),
                                                                       std::memory_order_relaxed);
-        holding.recorded = serve_(*call, call_view(*executor));
+        {
+            // A VRAM executor holds no NVMe queues, so an NVMe path builds them here for this call
+            nvme_queues_t queues;
+            view_t view = call_view(*executor);
+            view.queues = &queues;
+            holding.recorded = serve_(*call, view);
+        }
         return end_call(*executor);
     }
     holding.delegated_arguments.template emplace<call_type_>(*call);
     // Thread 0 may end the call before this returns, so the token stays local; joins pass zero
     fu_generation_t generation = 0;
-    [[maybe_unused]] st::status_t const dispatched =
-        view_of(executor->pool).unsafe_for_threads(&serve_delegated<call_type_, serve_>, executor, generation);
-    assert(!st::failed(dispatched) && "An owned pool is idle once joined under the executor claim");
+    [[maybe_unused]] st::status_t const dispatched = executor->pool.view().unsafe_for_threads(
+        &serve_delegated<call_type_, serve_>, executor, generation);
+    assert(!st::failed(dispatched) && "The pool is idle once joined under the executor claim");
 }
 
 /** Leaves the outputs of @p arguments null or zero and claims what they hold, then dispatches them
@@ -1887,7 +1969,8 @@ inline status_t serve_compaction(ustore_database_compact_t& arguments, view_t co
     void* engine_plan = arguments.plan && *arguments.plan ? (*arguments.plan)->engine_plan : nullptr;
     if (!engine_plan) {
         if (!take(database->compaction)) return {status_code_t::contended_k, "Another compaction holds the database"};
-        rewind_scratches(runner);
+        if (status_t const seeded = reserve_scratches(runner, 0); seeded.failed())
+            return release(database->compaction), seeded;
         expected<void*> const opened = verbs.compact_plan_open(arguments, runner);
         if (!opened) return release(database->compaction), opened.status();
         engine_plan = *opened;
@@ -2086,6 +2169,9 @@ struct ustore_docs_cursor_handle_t {
 
     /** The verbs and the match of the residency the walk computes at. */
     cursor_engines<docs_verbs> engine;
+
+    /** The columns every pull gathers, copied into @c cursor.compiled at init. */
+    docs_columns_t columns;
 };
 
 /** What @c ustore_pages_cursor_t points to: a walk over the keys of one pages collection, resumed

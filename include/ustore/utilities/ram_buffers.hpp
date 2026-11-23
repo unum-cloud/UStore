@@ -36,7 +36,7 @@
 #include <forkunion/atomics.hpp> // `std::memory_order_acquire`, `std::memory_order_release`
 #include <forkunion/forkunion.h>
 #include <smashtable/basic_vector.hpp> // `st::vector`
-#include <smashtable/shared.hpp>       // `st::default_allocator`
+#include <smashtable/shared.hpp>       // `st::default_allocator`, `st::assume_uninitialized`
 #include <stringzilla/capabilities.h>  // `sz_capability_t`, `sz_cap_serial_k`
 #include <stringzilla/find.h>          // `sz_find_byteset_serial`
 #include <stringzilla/hash.h>          // `sz_hash_serial`
@@ -76,6 +76,10 @@ struct ustore_arena_handle_t {
         /** The memory domain every block lives on: one its executor serves, or zero for calls on the calling
          *  thread. */
         fu_memory_domain_id_t memory_domain;
+
+        /** Bytes every block may span together, which an executor's scratch takes from its
+         *  @c scratch_limit, or zero for no bound, as every other arena keeps. */
+        std::size_t bytes_limit;
     };
 
     /** One run of device memory, which the host bumps without touching it. */
@@ -182,7 +186,8 @@ inline void* arena_bump(arena_block_t& block, std::size_t length, std::size_t al
 
 /** Carves @p count uninitialized elements off @p blocks at a multiple of @p alignment, opening a block once the newest
  *  one is full: the first spans the allocation rounded up to a page, so a one-off arena of a small call takes one
- *  page, and every later one at least doubles the newest. */
+ *  page, and every later one at least doubles the newest, refusing a block that would make the
+ *  chain span more than its @c bytes_limit in all. */
 template <typename element_type_>
 expected<std::span<element_type_>> carve(host_blocks_t& blocks, std::size_t count,
                                          std::size_t alignment = arena_alignment_k) noexcept {
@@ -194,6 +199,10 @@ expected<std::span<element_type_>> carve(host_blocks_t& blocks, std::size_t coun
         std::size_t const grown = newest ? newest->capacity * arena_growth_factor_k : 0;
         std::size_t const capacity = round_up_to_multiple(fu::max_of(grown, length + alignment + sizeof(arena_block_t)),
                                                           arena_page_bytes_k);
+        std::size_t spanned = capacity;
+        for (arena_block_t const* block = newest; block; block = block->previous) spanned += block->capacity;
+        if (blocks.bytes_limit && spanned > blocks.bytes_limit)
+            return status_t {status_code_t::out_of_memory_k, "The scratch would outgrow its limit"};
         void* memory = nullptr;
         if (fu_allocate_on_domain_id(blocks.memory_domain, capacity, &memory) != fu_success_k || !memory)
             return status_t {status_code_t::out_of_memory_k, "Failed to allocate arena memory"};
@@ -248,7 +257,7 @@ expected<std::span<element_type_>> arena_allocate(ustore_arena_t arena, std::siz
 inline expected<std::span<ustore_octet_t>> arena_allocate_bits(ustore_arena_t arena, std::size_t count) noexcept {
     auto [bits, status] = arena_allocate<ustore_octet_t>(arena, divide_round_up(count, bits_in_byte_k));
     if (status.failed()) return status;
-    // An empty span may carry a null pointer, which `memset` must not receive even for zero bytes
+    // An empty span may hold a null pointer, which `memset` must not receive even for zero bytes
     if (!bits.empty()) std::memset(bits.data(), 0, bits.size());
     return bits;
 }
@@ -297,15 +306,40 @@ inline void rewind(host_blocks_t& blocks) noexcept {
     newest->used = sizeof(arena_block_t);
 }
 
+/** Whether @p pointer lies inside a host block of @p arena, as an earlier call's output does. */
+inline bool arena_holds(ustore_arena_t arena, void const* pointer) noexcept {
+    host_blocks_t const* const blocks = host_blocks_of(arena);
+    if (!blocks || !pointer) return false;
+    auto const address = reinterpret_cast<std::uintptr_t>(pointer);
+    for (arena_block_t const* block = blocks->newest; block; block = block->previous) {
+        auto const begin = reinterpret_cast<std::uintptr_t>(block);
+        if (address >= begin && address < begin + block->capacity) return true;
+    }
+    return false;
+}
+
+/** Rewinds @p blocks and seeds their newest block at @p bytes at least, so a call carving that much
+ *  opens no block, answering out_of_memory when the seed would pass their @c bytes_limit. */
+inline status_t reserve(host_blocks_t& blocks, std::size_t bytes) noexcept {
+    rewind(blocks);
+    arena_block_t const* const newest = blocks.newest;
+    if (!bytes || (newest && newest->capacity - newest->used >= bytes)) return {};
+    auto [seeded, status] = carve<byte_t>(blocks, bytes, arena_alignment_k);
+    if (status.failed()) return status;
+    // The older blocks stay until the next rewind, as the oldest may be a page the caller owns
+    blocks.newest->used = sizeof(arena_block_t);
+    return {};
+}
+
 /** Rewinds the host memory of @p arena, leaving device runs to their executor, which frees them in stream order. */
 inline void arena_rewind(ustore_arena_t arena) noexcept {
     if (host_blocks_t* const blocks = host_blocks_of(arena)) rewind(*blocks);
 }
 
-/** Frees every block of @p blocks newer than @p borrowed, their first block when the caller lent it, leaving them
- *  empty, as a scratch is freed with the executor or the call keeping it. */
-inline void free_blocks(host_blocks_t& blocks, arena_block_t const* borrowed = nullptr) noexcept {
-    for (arena_block_t* block = std::exchange(blocks.newest, nullptr); block != borrowed;) {
+/** Frees every block of @p blocks newer than @p viewed, their first block when the caller owns it,
+ *  leaving them empty, as a scratch is freed with the executor or the call keeping it. */
+inline void free_blocks(host_blocks_t& blocks, arena_block_t const* viewed = nullptr) noexcept {
+    for (arena_block_t* block = std::exchange(blocks.newest, nullptr); block != viewed;) {
         arena_block_t* const freed = std::exchange(block, block->previous);
         fu_free_on_domain_id(blocks.memory_domain, freed, freed->capacity);
     }
@@ -318,10 +352,10 @@ void free_blocks(device_blocks_t& blocks, free_type_&& free) noexcept {
     blocks.count = 0, blocks.used = 0;
 }
 
-/** Frees every host block of @p arena newer than @p borrowed, leaving it empty; the runs of an arena on a device are
- *  freed through their vendor's driver, which the host library never reaches. */
-inline void arena_free_blocks(ustore_arena_handle_t& arena, arena_block_t const* borrowed = nullptr) noexcept {
-    if (host_blocks_t* const blocks = std::get_if<host_blocks_t>(&arena.memory)) free_blocks(*blocks, borrowed);
+/** Frees every host block of @p arena newer than @p viewed, leaving it empty; the runs of an arena
+ *  on a device are freed through their vendor's driver, which the host library never reaches. */
+inline void arena_free_blocks(ustore_arena_handle_t& arena, arena_block_t const* viewed = nullptr) noexcept {
+    if (host_blocks_t* const blocks = std::get_if<host_blocks_t>(&arena.memory)) free_blocks(*blocks, viewed);
 }
 
 /**
@@ -564,7 +598,7 @@ class resource_constraint {
  *  @brief An allocator that charges a named budget, and refuses once the budget is spent.
  *
  *  Exhaustion answers @c nullptr, which is what every container here already checks, so a budget
- *  reaches a caller as a status rather than as an exception. The budget is borrowed, never owned.
+ *  reaches a caller as a status rather than as an exception. The budget is viewed, never owned.
  *
  *  @tparam atomic_reference_ The reference the budget owns its word through.
  */
@@ -627,7 +661,7 @@ class constrained_allocator {
     /** The budget this allocator charges, or null while it names none. */
     constraint_t* constraint_pointer() const noexcept { return constraint_; }
 
-    /** The allocator the charged bytes come from, which a rebinding conversion carries over. */
+    /** The allocator the charged bytes come from, which a rebinding conversion holds over. */
     base_allocator_t const& base() const noexcept { return base_; }
 
     template <typename other_type_, typename other_base_type_>
@@ -826,13 +860,22 @@ class growing_strings {
     growing_strings() noexcept = default;
     explicit growing_strings(allocator_type_ const& allocator) noexcept : offsets_(allocator), bytes_(allocator) {}
 
+    /** Makes room for @p count more strings of @p bytes in all, so appending them moves nothing. */
+    status_t reserve(std::size_t count, std::size_t bytes) noexcept {
+        std::size_t const offsets = offsets_.empty() ? count + 1 : offsets_.size() + count;
+        if (status_t const status = growth_status(offsets_.reserve(offsets)); status.failed()) return status;
+        return growth_status(bytes_.reserve(bytes_.size() + bytes));
+    }
+
     /** Appends a copy of @p string, which moves with the bytes as the column grows. */
     status_t push_back(ustore_bytes_view_t string) noexcept {
         if (offsets_.empty())
             if (status_t const status = growth_status(offsets_.emplace_back(ustore_length_t {0})); status.failed())
                 return status;
         std::size_t const offset = bytes_.size();
-        if (status_t const status = growth_status(bytes_.resize(offset + string.length)); status.failed())
+        // The copy below writes every new byte, so the growth leaves them unwritten
+        if (status_t const status = growth_status(bytes_.resize(st::assume_uninitialized, offset + string.length));
+            status.failed())
             return status;
         if (string.length) std::memcpy(bytes_.data() + offset, string.data, string.length);
         return growth_status(offsets_.emplace_back(static_cast<ustore_length_t>(bytes_.size())));
@@ -1034,7 +1077,7 @@ struct powervsx_strings_kit_t {
 };
 #endif
 
-/** Names the six slots every strings kit carries. */
+/** Names the six slots every strings kit holds. */
 template <typename strings_kit_type_>
 concept strings_kit_concept = requires {
     { strings_kit_type_::capability_k } -> std::convertible_to<sz_capability_t>;

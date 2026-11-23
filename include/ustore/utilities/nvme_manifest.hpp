@@ -8,7 +8,7 @@
  *  The manifest is written last, as the commit record: a run the manifest does not name is a crash
  *  leftover. On a filesystem a file is named by its @c path, relative to the data directory its
  *  @c medium names; on raw media it is named by @c medium and @c offset. Each run's own header
- *  carries everything needed to read it, so a run lifted out of the set still describes itself.
+ *  holds everything needed to read it, so a run lifted out of the set still describes itself.
  *
  *  @code{.json}
  *  {"__metadata__": {"format": "ustore", "version": "1"},
@@ -47,7 +47,7 @@ namespace unum::ustore::utilities {
  *  @brief yyjson's allocator over a byte allocator of the database, so a manifest is charged
  *      to its budget.
  *
- *  yyjson frees without a size, so every block carries its size in a header one
+ *  yyjson frees without a size, so every block holds its size in a header one
  *  maximal alignment long.
  */
 template <typename allocator_type_>
@@ -59,7 +59,7 @@ class json_allocator {
     json_allocator(json_allocator const&) = delete;
     json_allocator& operator=(json_allocator const&) = delete;
 
-    /** The table yyjson calls, which borrows this adapter. */
+    /** The table yyjson calls, which views this adapter. */
     [[nodiscard]] yyjson_alc table() noexcept { return yyjson_alc {&allocate_, &reallocate_, &deallocate_, this}; }
 
   private:
@@ -282,7 +282,7 @@ struct manifest_t {
     /** The name the database is opened by, which prefixes every run file. */
     string_t database;
 
-    /** The database's own ID, minted at its first open, which every slot it holds carries. */
+    /** The database's own ID, minted at its first open, which every slot it holds holds. */
     uuid128_t id;
 
     /** How many manifests the database has published, this one included. */
@@ -320,7 +320,7 @@ struct manifest_t {
         return {};
     }
 
-    /** The run ID @p name carries when it is a run file of this database, or a
+    /** The run ID @p name holds when it is a run file of this database, or a
      *  zero ID otherwise. */
     [[nodiscard]] uuid128_t run_of(std::string_view name) const noexcept {
         if (name.size() != file_name_length()) return uuid128_t {};

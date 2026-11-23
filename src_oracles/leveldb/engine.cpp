@@ -35,7 +35,7 @@
  *  A block stores the bytes a key shares with its predecessor once, so the leading UUID costs little on disk.
  */
 
-#include "docs_layer.hpp"   // `docs_write_over_blobs`, `docs_read_over_blobs`, `docs_gist_over_blobs`
+#include "docs_layer.hpp"   // `docs_write_over_blobs`, `docs_read_over_blobs`, `docs_scan_over_blobs`
 #include "graph_layer.hpp"  // `graph_read_edges_over_blobs`, `graph_write_edges_over_blobs`
 #include "pages_layer.hpp"  // `pages_import_over_blobs`, `pages_read_over_blobs`
 #include "engine.hpp"       // `engine_t`, `guarded`, `remove_over_blobs`, `scan_over_blobs`, `measure_over_blobs`
@@ -106,7 +106,7 @@ docs_verbs<vendored_residency_t::host_k> const docs_verbs_k {
     .gist = &docs_gist_over_blobs<values_verbs_k, &resolve_modality>,
     .gather = &docs_gather_over_blobs<strings_kit_t, values_verbs_k, &resolve_modality>,
     .remove = &remove_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_docs_k>,
-    .scan = &scan_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_docs_k>,
+    .scan = &docs_scan_over_blobs<strings_kit_t, values_verbs_k, &resolve_modality>,
     .sample = &sample_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_docs_k>,
     .measure = &measure_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_docs_k>,
 };

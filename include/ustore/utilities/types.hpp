@@ -178,7 +178,7 @@ struct [[nodiscard]] status_t {
     /** What went wrong, or @c status_code_t::success_k. */
     status_code_t code = status_code_t::success_k;
 
-    /** Static detail the code cannot carry, never freed. */
+    /** Static detail the code cannot hold, never freed. */
     char const* message = nullptr;
 
     constexpr status_t() noexcept = default;
@@ -221,7 +221,7 @@ class [[nodiscard]] expected {
 
   public:
 
-    /** A failure; a success that carries no value reads as @c status_code_t::internal_k. */
+    /** A failure; a success that holds no value reads as @c status_code_t::internal_k. */
     constexpr expected(status_t status) noexcept
         : status_(status.succeeded() ? status_t {status_code_t::internal_k, "An expected value is missing"} : status) {}
 
@@ -297,7 +297,8 @@ class [[nodiscard]] expected {
     }
 };
 
-/** Whether @p result carries @p code, which is @c status_code_t::success_k exactly when it holds a value. */
+/** Whether @p result holds @p code, which is @c status_code_t::success_k exactly when it
+ *  holds a value. */
 template <typename value_type_>
 constexpr bool operator==(expected<value_type_> const& result, status_code_t code) noexcept {
     return result.code() == code;
@@ -476,7 +477,7 @@ enum class uuid_variant_t : std::uint8_t {
     /** The @c 0xxx pattern of the Apollo Network Computing System. */
     network_computing_system_k,
 
-    /** The @c 10xx pattern of RFC 4122, which every identifier this engine mints carries. */
+    /** The @c 10xx pattern of RFC 4122, which every identifier this engine mints holds. */
     rfc_k,
 
     /** The @c 110x pattern of the Component Object Model. */
@@ -721,7 +722,8 @@ inline ustore_vertex_role_t invert(ustore_vertex_role_t role) noexcept {
 
 #pragma region Variable Length Views
 
-/** The length a missing value carries, which no stored value reaches, so a view tells it apart from an empty one. */
+/** The length a missing value holds, which no stored value reaches, so a view tells it apart from
+ *  an empty one. */
 inline constexpr ustore_length_t missing_length_k = (std::numeric_limits<ustore_length_t>::max)();
 
 /** A view of a stored value that tells a missing value apart from an empty one. */
@@ -1010,8 +1012,8 @@ inline status_t load(string_t& text, bytes_view_t source) noexcept {
  *      else @p floor_type_, in one closing @c >::type and no nested @c std::conditional_t pile.
  *
  *  Every kit states its own needs: @c capability_k, the capability it runs under,
- *  and @c compiled_k, whether this build carries its body. A kit whose target this
- *  build cannot carry is a stub of those two members alone, so naming it in a
+ *  and @c compiled_k, whether this build holds its body. A kit whose target this
+ *  build cannot hold is a stub of those two members alone, so naming it in a
  *  ladder never needs its body. @p capabilities_ is the capability set the kits
  *  state theirs in.
  */
@@ -1135,7 +1137,7 @@ struct edge_hash_t {
  *  devices at once and loads where none is installed. */
 enum class gpu_vendor_t : std::uint32_t {
 
-    /** No vendor, as a device no driver reports carries. */
+    /** No vendor, as a device no driver reports holds. */
     unknown_k = ustore_gpu_vendor_unknown_k,
 
     /** NVIDIA, through the CUDA driver. */

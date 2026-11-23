@@ -16,7 +16,7 @@
  *  unified Metal allocator, which StringZilla's own device engines read too, and the address the
  *  host hands around is its host address. A launch binds the kernel's arguments packed as one
  *  struct and the device's table of live blocks, which turns every host address the arguments
- *  carry, embedded ones included, into a device one. The layer reaching that allocator and its
+ *  hold, embedded ones included, into a device one. The layer reaching that allocator and its
  *  registry compiles where StringZilla's Metal kernels do, @c STRINGZILLA_TARGET_METAL, and every
  *  other build refuses Apple executors with @c device_k.
  */
@@ -185,6 +185,10 @@ struct metal_devices_t {
     /** The retained @c id<MTLDevice> of every listed device. */
     void* handles[gpu_devices_capacity_k] = {};
 
+    /** The @c id<MTLCommandQueue> opened for every listed device, Metal's stand-in for a per-thread
+     *  default stream, which an executor given no queue commits to. */
+    void* queues[gpu_devices_capacity_k] = {};
+
     /** What the listing reports of every device: its family as the architecture's major, its cores
      *  and the working set Metal recommends. */
     gpu_device_t listed[gpu_devices_capacity_k] = {};
@@ -206,6 +210,7 @@ struct metal_devices_t {
             std::uint32_t const family = apple_family_of(api, device);
             if (!family) continue;
             handles[count] = metal_send(api, device, "retain");
+            queues[count] = metal_send(api, device, "newCommandQueue");
             gpu_device_t& entry = listed[count];
             entry = {gpu_vendor_t::apple_k,
                      static_cast<std::uint32_t>(count),
@@ -224,6 +229,11 @@ struct metal_devices_t {
     /** The @c id<MTLDevice> listed at @p ordinal, or null past the listing. */
     void* device(int ordinal) const noexcept {
         return ordinal >= 0 && static_cast<std::size_t>(ordinal) < count ? handles[ordinal] : nullptr;
+    }
+
+    /** The queue opened for the device listed at @p ordinal, or null past the listing. */
+    void* queue(int ordinal) const noexcept {
+        return ordinal >= 0 && static_cast<std::size_t>(ordinal) < count ? queues[ordinal] : nullptr;
     }
 };
 
@@ -436,15 +446,16 @@ class metal_executor_t {
     /** The kernels this executor launches. */
     using function_t = metal_function_handle_t;
 
-    /** Binds Apple ordinal @p ordinal, @p device its @c id<MTLDevice>, and commits to @p borrowed,
-     *  an @c id<MTLCommandQueue> of the caller's on that device which outlives the executor, or to
-     *  one of its own for null; its scratch never grows past @p scratch_limit bytes, zero for no
-     *  limit, and its launches find their kernels in @p kernels, the device's table of the
+    /** Binds Apple ordinal @p ordinal and commits to @p queue, an @c id<MTLCommandQueue> of the
+     *  caller's on that device, which the caller releases after freeing the executor, or to
+     *  @p default_queue, the one the process opened for the device when listing it, for null,
+     *  creating and releasing none; its scratch never grows past @p scratch_limit bytes, zero for
+     *  no limit, and its launches find their kernels in @p kernels, the device's table of the
      *  library's bundle, or none for null. */
-    static expected<metal_executor_t> spawn(metal_api_t const& api, void* device, int ordinal, void* borrowed,
+    static expected<metal_executor_t> spawn(metal_api_t const& api, void* default_queue, int ordinal, void* queue,
                                             std::size_t scratch_limit,
                                             kernel_table<metal_module_t> const* kernels = nullptr) noexcept {
-        if (!api || !device) return status_t {status_code_t::device_k, "Metal refused the device"};
+        if (!api || !(queue || default_queue)) return status_t {status_code_t::device_k, "Metal refused the device"};
         if constexpr (!STRINGZILLA_TARGET_METAL)
             return status_t {status_code_t::device_k, "The library compiled no Metal layer"};
         metal_executor_t executor;
@@ -452,12 +463,7 @@ class metal_executor_t {
         executor.device_ = ordinal;
         executor.scratch_limit_ = scratch_limit;
         executor.kernels_ = kernels;
-        executor.queue_ = borrowed;
-        if (!borrowed) {
-            executor.owned_queue_ = metal_send(api, device, "newCommandQueue");
-            if (!executor.owned_queue_) return status_t {status_code_t::device_k, "Failed to create a queue"};
-            executor.queue_ = executor.owned_queue_;
-        }
+        executor.queue_ = queue ? queue : default_queue;
         executor.bounce_.memory = host_blocks_t {.newest = nullptr, .memory_domain = 0};
         return executor;
     }
@@ -474,7 +480,6 @@ class metal_executor_t {
         metal_synchronize(queue_);
         free_blocks(managed_.blocks, [this](std::uintptr_t address) noexcept { free_managed(address); });
         arena_free_blocks(bounce_);
-        if (owned_queue_) metal_send<void>(*api_, owned_queue_, "release");
     }
 
     /** Waits until everything committed to the queue ran, reporting a failure among it
@@ -491,7 +496,7 @@ class metal_executor_t {
     /** Bytes of scratch a call may take, zero for no limit. */
     std::size_t scratch_limit() const noexcept { return scratch_limit_; }
 
-    /** The @c id<MTLCommandQueue> every call commits to, owned or borrowed. */
+    /** The @c id<MTLCommandQueue> every call commits to, the caller's or the device's default. */
     void* stream() const noexcept { return queue_; }
 
     /** The runtime table every call goes through. */
@@ -569,15 +574,12 @@ class metal_executor_t {
     metal_executor_t() noexcept = default;
 
     void swap(metal_executor_t& other) noexcept {
-        std::swap(api_, other.api_), std::swap(owned_queue_, other.owned_queue_), std::swap(queue_, other.queue_);
+        std::swap(api_, other.api_), std::swap(queue_, other.queue_);
         std::swap(device_, other.device_), std::swap(scratch_limit_, other.scratch_limit_);
         std::swap(kernels_, other.kernels_), std::swap(bounce_, other.bounce_), std::swap(managed_, other.managed_);
     }
 
     metal_api_t const* api_ = nullptr;
-
-    /** The queue made here and released with the executor, null when the caller lent @c queue_. */
-    void* owned_queue_ = nullptr;
 
     void* queue_ = nullptr;
     int device_ = 0;

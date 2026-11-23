@@ -253,6 +253,7 @@ class device_match {
     bool reads_values() const noexcept { return match_.reads_values(); }
     bool scores() const noexcept { return match_.host.scores(); }
     bool asks() const noexcept { return match_.host.asks(); }
+    bool matches_everything() const noexcept { return match_.matches_everything(); }
 
     status_t ask(ustore_predicate_cost_t phase, std::span<ustore_key_t const> keys, candidates_t& candidates,
                  ustore_arena_t work) const noexcept {

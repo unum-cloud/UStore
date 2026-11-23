@@ -258,7 +258,7 @@ struct json_cell_t {
     json_number_t number {};
 };
 
-/** Longest number token a read parses; longer spellings carry digits no 64-bit number keeps. */
+/** Longest number token a read parses; longer spellings hold digits no 64-bit number keeps. */
 constexpr std::size_t json_number_length_limit_k = 64;
 
 /** Reads the number @p token spells exactly, as yyjson reads one inside a document, or a malformed cell. */

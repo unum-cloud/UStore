@@ -31,7 +31,7 @@ endif ()
 set(ustore_rocm_codes_)
 set(ustore_amd_unit_codes_)
 foreach (architecture_ IN LISTS ustore_rocm_architectures_)
-    # `rocm_agent_enumerator` lists the host CPU too, as gfx000, and a processor once per GPU carrying it
+    # `rocm_agent_enumerator` lists the host CPU too, as gfx000, and a processor once per GPU holding it
     if (NOT architecture_ STREQUAL "gfx000" AND NOT "--offload-arch=${architecture_}" IN_LIST ustore_rocm_codes_)
         list(APPEND ustore_rocm_codes_ --offload-arch=${architecture_})
         list(APPEND ustore_amd_unit_codes_ ${architecture_})
@@ -116,7 +116,7 @@ if (USTORE_CUDA_ARCH AND NOT CMAKE_CUDA_COMPILER)
     )
 endif ()
 if (USTORE_CUDA_ARCH AND CMAKE_CUDA_COMPILER)
-    # The library's kernels need only plain codes, which cover Ampere through Blackwell: `all` carries a cubin per
+    # The library's kernels need only plain codes, which cover Ampere through Blackwell: `all` holds a cubin per
     # generation and the floor's PTX for every later GPU, `native` the code of each visible GPU, and a named code its
     # cubin alone.
     if (USTORE_CUDA_ARCH STREQUAL "all")
@@ -207,8 +207,8 @@ function (ustore_gpu_class class_ target_macro_ vendor_ source_)
 endfunction ()
 
 # Settles the classes of @p vendor_: a configured code no class names stops the configure, as the oldest class's own PTX
-# already carries NVIDIA's later GPUs. A class holding codes is kept, its codes turned into the flags of its bundle's
-# device pass, but a monoversioned build keeps only the newest one, which carries every kernel. Each class gets its
+# already holds NVIDIA's later GPUs. A class holding codes is kept, its codes turned into the flags of its bundle's
+# device pass, but a monoversioned build keeps only the newest one, which holds every kernel. Each class gets its
 # vendor's gates, 1 for itself and 0 for the others, which its unit reads its class from.
 function (ustore_gpu_vendor vendor_)
     set(classes_ ${ustore_${vendor_}_classes_})
@@ -321,7 +321,7 @@ if (USTORE_METAL_ARCH AND NOT USTORE_METAL_ARCH MATCHES "^(all|apple7|apple9|app
 endif ()
 
 # The Apple classes, one per Metal generation, whose kernels travel as MSL source the class unit `src/vram/<source_>`
-# embeds and a device compiles at the first spawn of the class, so no Metal toolchain builds them and a class carries
+# embeds and a device compiles at the first spawn of the class, so no Metal toolchain builds them and a class holds
 # no flags. A class is kept for `all` or its own @p family_, and a monoversioned build keeps only the newest kept one.
 # Each class gets the Apple gates, 1 for itself and 0 for the others, which its unit reads its class from.
 set(ustore_apple_classes_)

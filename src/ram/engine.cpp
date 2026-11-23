@@ -8,7 +8,7 @@
  *  picks: key UUIDs mapped onto values for blobs, onto JSON text for documents and onto dense
  *  element trees for pages, strings mapped onto 16-byte keys for strings, and the half-edges of a
  *  graph. Documents and pages are edited in place, each edit reading, modifying and writing them
- *  back inside one transaction. No stored key carries its collection. The @c _collections system
+ *  back inside one transaction. No stored key holds its collection. The @c _collections system
  *  collection maps every collection's UUID onto its name and its store, whose kind says its
  *  modality, and the @c _names system collection, a store of the strings kind, maps every name onto
  *  its collection's UUID. Every store is built into one commit order, so a transaction spanning any
@@ -21,7 +21,7 @@
  *  in <tt>src/ram/variants_&lt;class&gt;.cpp</tt> with the class's atomic reference and waiter, which the
  *  partition locks own their words through. An open walks the classes newest first and takes the
  *  first one its ceiling fits, ending on the serial floor, and every handle the variant hands out
- *  carries its table.
+ *  holds its table.
  */
 
 #include <string_view> // `std::string_view`
@@ -79,12 +79,13 @@ extern template struct ram_variant<cpu_class_t::monoversioned_k, isolation_t::sn
 extern template struct ram_variant<cpu_class_t::monoversioned_k, isolation_t::strict_serializable_k>;
 #endif // USTORE_TARGET_MONOVERSIONED
 
-/** Opens a database of @p cpu_class_ at @p isolation into @p database. */
+/** Opens a database of @p cpu_class_ at @p isolation into @p database, of @p memory_limit bytes. */
 template <cpu_class_t cpu_class_>
-status_t open_as(ustore_database_t* database, ustore_isolation_t isolation, std::string_view directory) noexcept {
+status_t open_as(ustore_database_t* database, ustore_isolation_t isolation, std::string_view directory,
+                 std::size_t memory_limit) noexcept {
     if (isolation == ustore_isolation_snapshot_k)
-        return ram_variant<cpu_class_, isolation_t::snapshot_k>::open(database, directory);
-    return ram_variant<cpu_class_, isolation_t::strict_serializable_k>::open(database, directory);
+        return ram_variant<cpu_class_, isolation_t::snapshot_k>::open(database, directory, memory_limit);
+    return ram_variant<cpu_class_, isolation_t::strict_serializable_k>::open(database, directory, memory_limit);
 }
 
 /** Opens the database @p arguments describe into their output, which stays null unless the open succeeds, with the
@@ -96,7 +97,7 @@ status_t open_in(arguments_type_ const& arguments, cpu_ceiling_t ceiling, std::s
         arguments.isolation != ustore_isolation_snapshot_k)
         return {status_code_t::invalid_argument_k, "Unknown isolation"};
     return open_fitting_rung(cpu_ladder_t {}, ceiling, [&]<cpu_class_t cpu_class_>() noexcept {
-        return open_as<cpu_class_>(arguments.database, arguments.isolation, directory);
+        return open_as<cpu_class_>(arguments.database, arguments.isolation, directory, arguments.memory_limit);
     });
 }
 

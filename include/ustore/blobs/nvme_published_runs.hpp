@@ -9,10 +9,11 @@
  *  The ledger pins the stamps readers and views hold, announces readers in its epochs, and lands every commit through
  *  one flat-combining sequencer, so a reader at a published stamp sees every commit at or below it whole.
  *
- *  Every store of the NVMe engine owns one, whatever its keys: @c blobs::nvme_store with memory runs of fixed keys,
- *  and @c strings::nvme_store with memory runs of whole strings, whose runs carry tails. A store keeps its own reads,
- *  seals, watches and drain, and hands the drain to @c published_runs::flush, which lists the memory runs it writes
- *  out and the versions that survive, and publishes whatever level set the drain's tree flush made current.
+ *  Every store of the NVMe engine owns one, whatever its keys: @c blobs::nvme_store with memory
+ *  runs of fixed keys, and @c strings::nvme_store with memory runs of whole strings, whose runs
+ *  hold tails. A store keeps its own reads, seals, watches and drain, and hands the drain to
+ *  @c published_runs::flush, which lists the memory runs it writes out and the versions that
+ *  survive, and publishes whatever level set the drain's tree flush made current.
  *
  *  Whoever replaces a view holds the ledger's leader word, a commit for its swap, and a merge, a
  *  flush or a compaction only around its own; letting the word go, it waits until every reader that
@@ -48,7 +49,7 @@
 namespace unum::ustore::blobs {
 
 using utilities::constrained_allocator;
-using utilities::outside_executor_k;
+using utilities::nvme_queues_ref_t;
 using utilities::resource_constraint;
 
 /** One object the thread holding the leader word unpublished, linked inside the object's own room until that thread
@@ -317,7 +318,7 @@ class commit_ledger {
      *  @note A thread already holding the leader word waits on itself here, as a staged transaction's would.
      */
     expected<transaction_stamp_t> submit(commit_request_t& request) noexcept {
-        // A resubmitted request still carries the refusal it came back with, which would return
+        // A resubmitted request still holds the refusal it came back with, which would return
         // it at once.
         request.outcome = commit_outcome_t::pending_k;
         atomic_reference_<commit_request_t*> const pending {pending_};
@@ -722,12 +723,12 @@ class pinned_snapshot {
     /** The stamp every read through this snapshot answers at. */
     [[nodiscard]] transaction_stamp_t stamp() const noexcept { return stamp_; }
 
-    /** The store read, borrowed and outliving the snapshot. */
+    /** The store read, owned by the caller and outliving the snapshot. */
     [[nodiscard]] store_t& store() const noexcept { return *store_; }
 
   private:
 
-    /** The store read, borrowed and outliving the snapshot. */
+    /** The store read, owned by the caller and outliving the snapshot. */
     store_t* store_ = nullptr;
 
     /** The pin that keeps every version at the stamp. */
@@ -784,22 +785,26 @@ class maintenance_claim {
         guard(guard const&) = delete;
         guard& operator=(guard const&) = delete;
 
-        /** Takes @p owner's claim, parked while another caller holds it. */
-        explicit guard(owner_type_& owner) noexcept : owner_(&owner) { owner.claim_.take(); }
+        /** Takes @p owner's claim, parked while another caller holds it, for a holder on @p
+         *  queue set, which maintains on release whatever commits left due. */
+        explicit guard(owner_type_& owner, nvme_queues_ref_t queues = {}) noexcept : owner_(&owner), queues_(queues) {
+            owner.claim_.take();
+        }
 
         /** Takes @p owner's claim if no caller holds it, or answers a guard holding nothing. */
-        [[nodiscard]] static guard taken_if_free(owner_type_& owner) noexcept {
+        [[nodiscard]] static guard taken_if_free(owner_type_& owner, nvme_queues_ref_t queues = {}) noexcept {
             guard taken;
-            if (owner.claim_.take_if_free()) taken.owner_ = &owner;
+            if (owner.claim_.take_if_free()) taken.owner_ = &owner, taken.queues_ = queues;
             return taken;
         }
 
-        guard(guard&& other) noexcept : owner_(std::exchange(other.owner_, nullptr)) {}
+        guard(guard&& other) noexcept : owner_(std::exchange(other.owner_, nullptr)), queues_(other.queues_) {}
 
         guard& operator=(guard&& other) noexcept {
             if (this == &other) return *this;
             release_();
             owner_ = std::exchange(other.owner_, nullptr);
+            queues_ = other.queues_;
             return *this;
         }
 
@@ -812,11 +817,14 @@ class maintenance_claim {
 
         /** Hands the claim back through the owner, which only a guard holding it does. */
         void release_() noexcept {
-            if (owner_) std::exchange(owner_, nullptr)->release_claim_();
+            if (owner_) std::exchange(owner_, nullptr)->release_claim_(queues_);
         }
 
         /** The owner whose claim this guard holds, null once moved from or never taken. */
         owner_type_* owner_ = nullptr;
+
+        /** The queue set of the holder, which the maintenance after the release runs on. */
+        nvme_queues_ref_t queues_;
     };
 
     /** Takes the claim, parked on each epoch it finds held until that holder lets it go, counted
@@ -916,7 +924,7 @@ struct memory_shape_t {
  *  runs with no lock. A merge folds F runs of one tier into one run of the next tier, and a flush writes the memory
  *  runs of one view as one run of level zero, each with no lock held, then takes the leader word only to publish a
  *  view without exactly those runs. Merges, flushes, compactions and truncations are serialized by the store's owner.
- *  The volume, the budget and the ledger are borrowed and must outlive the runs.
+ *  The volume, the budget and the ledger are viewed and must outlive the runs.
  *
  *  @tparam memory_run_type_ The memory run a commit publishes, @c blobs::memory_run or @c strings::memory_run.
  *  @tparam atomic_reference_ The reference the published view, the budget and the ledger own their words through.
@@ -943,7 +951,7 @@ class published_runs {
     /** The tree the flushed writes live in. */
     using tree_t = lsm_tree<key_slot_t, volume_t, atomic_reference_, waiter_type_, row_kit_type_>;
 
-    /** What one slice of a merge of that tree writes into, lent by the owner of the store. */
+    /** What one slice of a merge of that tree writes into, owned by the owner of the store. */
     using merge_buffers_t = typename tree_t::merge_buffers_t;
 
     /** One level set of that tree, which a view names. */
@@ -955,7 +963,7 @@ class published_runs {
     /** The database's pool the runs of that tree live in. */
     using run_pool_t = typename tree_t::run_pool_t;
 
-    /** The stamps the store's writes carry and its readers pin. */
+    /** The stamps the store's writes hold and its readers pin. */
     using ledger_t = commit_ledger<atomic_reference_, waiter_type_>;
 
     /** One stamp a reader or a view holds against the ledger. */
@@ -970,7 +978,7 @@ class published_runs {
     /** The memory runs one view names, newest first. */
     using memory_view_t = collection_view<memory_run_t>;
 
-    /** One version a merge or a flush carries over from a memory run. */
+    /** One version a merge or a flush holds over from a memory run. */
     using stamped_delta_t = stamped_delta<typename memory_run_t::stored_key_t>;
 
     /** Everything a reader of the store needs, which nothing changes once it is published. */
@@ -1048,10 +1056,12 @@ class published_runs {
 
     /**
      *  @brief Mounts an empty tree over @p volume and publishes a view naming it alone.
-     *  @param[in,out] volume The volume every run lands on, borrowed and outliving the runs.
+     *  @param[in,out] volume The volume every run lands on, owned by the caller and
+     *      outliving the runs.
      *  @param[in] config The bounds of the memory runs and the shape of the tree below.
      *  @param[in,out] constraint The budget the memory runs are charged to.
-     *  @param[in,out] ledger The stamps the store's writes carry and its readers pin, outliving the runs.
+     *  @param[in,out] ledger The stamps the store's writes hold and its readers pin,
+     *      outliving the runs.
      *  @param[in,out] runs The database's pool the tree's runs live in, outliving the store.
      */
     status_t mount(volume_t& volume, collection_config_t const& config, constraint_t& constraint, ledger_t& ledger,
@@ -1095,10 +1105,11 @@ class published_runs {
     /** The bounds the store was mounted with. */
     [[nodiscard]] collection_config_t const& config() const noexcept { return config_; }
 
-    /** The budget the memory runs are charged to, borrowed and outliving the runs. */
+    /** The budget the memory runs are charged to, owned by the caller and outliving the runs. */
     [[nodiscard]] constraint_t& constraint() const noexcept { return *constraint_; }
 
-    /** The stamps the store's writes carry and its readers pin, borrowed and outliving the runs. */
+    /** The stamps the store's writes hold and its readers pin, owned by the caller and outliving
+     *  the runs. */
     [[nodiscard]] ledger_t& ledger() const noexcept { return *ledger_; }
 
     /** The tree the flushed writes live in, which a database compacts and names in its schema under its writer. */
@@ -1109,7 +1120,7 @@ class published_runs {
 
     /** Announces the calling executor thread @p thread_index in the ledger's epochs until the answer dies, which keeps
      *  every view loaded meanwhile and the runs it names readable. */
-    [[nodiscard]] reader_t enter(std::size_t thread_index = outside_executor_k) const noexcept {
+    [[nodiscard]] reader_t enter(std::size_t thread_index = 0) const noexcept {
         return ledger_->epochs().enter(thread_index);
     }
 
@@ -1464,13 +1475,14 @@ class published_runs {
     }
 
     /**
-     *  @brief Publishes @p runs, written at stamp zero, as one commit of their own, stamped with the stamp the commit
-     *      draws and placed so no shallower level holds a key of theirs, once the store holds no memory run.
+     *  @brief Publishes @p runs, written at stamp zero, as one commit of their own, stamped with
+     *      the stamp the commit draws and placed so no shallower level holds a key of theirs, once
+     *      the store holds no memory run.
      *  @param[in,out] runs The runs in ascending order of their keys, emptied: moved into the tree,
      *      or given back.
      *  @param[in] flush Called as @c flush() before every attempt, writing the memory runs out as the store does.
-     *  @return The stamp every version of @p runs carries, the stamp published for no runs, or the status that stopped
-     *      it, @c contended_k once memory runs kept reappearing.
+     *  @return The stamp every version of @p runs holds, the stamp published for no runs, or the
+     *      status that stopped it, @c contended_k once memory runs kept reappearing.
      *  @note The owner serializes it with flushes, compactions and truncations of the store, and the calling thread is
      *      inside no epoch.
      */
@@ -1527,7 +1539,7 @@ class published_runs {
 
 #pragma region Private Types
 
-    /** The versions one merge carries over, before and after they are sorted into a run's order. */
+    /** The versions one merge holds over, before and after they are sorted into a run's order. */
     using stamped_deltas_t = st::vector<stamped_delta_t, constrained_allocator<stamped_delta_t, atomic_reference_>>;
 
     /** The order the store published its memory runs in, threaded through their records. */
@@ -1551,7 +1563,7 @@ class published_runs {
         memory_run_record_t() noexcept = default;
         memory_run_record_t(memory_run_record_t&& other) noexcept : run(std::move(other.run)) {}
 
-        /** Carries the run alone, so a record keeps its generation and its place in the order. */
+        /** Holds the run alone, so a record keeps its generation and its place in the order. */
         memory_run_record_t& operator=(memory_run_record_t&& other) noexcept {
             run = std::move(other.run);
             return *this;
@@ -1621,7 +1633,8 @@ class published_runs {
         view_t* next_view = nullptr;
     };
 
-    /** Publishes the view of an ingest under the stamp its commit drew, which the ingested runs carry already. */
+    /** Publishes the view of an ingest under the stamp its commit drew, which the ingested
+     *  runs hold already. */
     static void publish_ingest_view_(void* context, transaction_stamp_t) noexcept {
         ingest_publication_t& ingestion = *static_cast<ingest_publication_t*>(context);
         published_runs& owner = *ingestion.owner;
@@ -1921,7 +1934,8 @@ class published_runs {
     /** The budget the memory runs are charged to, null until the runs are mounted. */
     constraint_t* constraint_ = nullptr;
 
-    /** The stamps the store's writes carry and its readers pin, borrowed and outliving the runs. */
+    /** The stamps the store's writes hold and its readers pin, owned by the caller and
+     *  outliving the runs. */
     ledger_t* ledger_ = nullptr;
 
     /** The tree the flushed writes live in. */

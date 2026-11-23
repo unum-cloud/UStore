@@ -8,7 +8,7 @@ Date: September 18, 2026
 from uuid import UUID
 
 import pytest
-from base import ENGINES, NEEDS_SNAPSHOTS, keys
+from base import ENGINES, NEEDS_SNAPSHOTS, executor_for, keys
 
 import ustore
 from ustore import Modality
@@ -100,10 +100,10 @@ def test_list_answers_every_identifier(database, arena, count: int):
     assert created <= set(database.collection_list(arena))
 
 
-def test_a_deferred_find_answers_once_waited(database):
+def test_a_deferred_find_answers_once_waited(database, engine: str):
     """A deferred find answers the identifier, or raises NotFoundError naming the name, once waited."""
     people = database.collection_create("people", modality=Modality.BLOBS)
-    with ustore.Executor.for_ram(1) as executor:
+    with executor_for(engine, 1) as executor:
         later, arena = database.deferred(executor), ustore.Arena(executor)
         assert later.collection_find("people", arena).wait() == people
         missing = later.collection_find("nobody", arena)
@@ -111,10 +111,10 @@ def test_a_deferred_find_answers_once_waited(database):
             missing.wait()
 
 
-def test_a_deferred_list_answers_once_waited(database):
+def test_a_deferred_list_answers_once_waited(database, engine: str):
     """A deferred listing holds a created collection once waited."""
     people = database.collection_create("people", modality=Modality.BLOBS)
-    with ustore.Executor.for_ram(1) as executor:
+    with executor_for(engine, 1) as executor:
         assert people in database.deferred(executor).collection_list(ustore.Arena(executor)).wait()
 
 
@@ -270,7 +270,7 @@ def test_compact_keeps_the_data_unless_cancelled(database):
     assert database.get(63, collection="people") == b"w" * 64
 
 
-def test_compact_plans_stay_live_until_finished(database):
+def test_compact_plans_stay_live_until_finished(database, engine: str):
     """A plan a stop leaves live continues deferred to its end, finishes once, and a second finish is refused."""
     database.collection_create("people", modality=Modality.BLOBS)
     database.collection_create("places", modality=Modality.BLOBS)
@@ -278,7 +278,7 @@ def test_compact_plans_stay_live_until_finished(database):
     database.write(list(range(64)), b"w" * 64, collection="people")
     plan = ustore.CompactPlan()
     assert plan.phase is ustore.Phase.NONE
-    with ustore.Executor.for_ram(1) as executor:
+    with executor_for(engine, 1) as executor:
         with pytest.raises(ustore.CancelledError):
             database.on(executor).compact(progress=lambda finished, total: False, plan=plan)
         assert plan.phase is not ustore.Phase.DONE
@@ -291,12 +291,12 @@ def test_compact_plans_stay_live_until_finished(database):
     assert database.get(63, collection="people") == b"w" * 64
 
 
-def test_flush_keeps_the_data_blocking_or_deferred(database):
+def test_flush_keeps_the_data_blocking_or_deferred(database, engine: str):
     """A flush, blocking or deferred, keeps what was written."""
     database.collection_create("people", modality=Modality.BLOBS)
     database.set(1, b"kept", collection="people")
     database.flush()
-    with ustore.Executor.for_ram(1) as executor:
+    with executor_for(engine, 1) as executor:
         database.deferred(executor).flush().wait()
     assert database.get(1, collection="people") == b"kept"
 

@@ -5,8 +5,8 @@
  *  @brief The edit record of every page call of <tt>c/ustore/pages.h</tt> and its serialized delta form.
  *
  *  An edit is one task of one call, stamped with its commit and its position inside it. It names
- *  its element, parent and anchor by key, and carries what it needs to apply without reading
- *  anything else: an import or an insertion carries its parsed fragment in the dense form of
+ *  its element, parent and anchor by key, and holds what it needs to apply without reading
+ *  anything else: an import or an insertion holds its parsed fragment in the dense form of
  *  <tt>element_tree.hpp</tt>, keys already minted, so applying never parses markup and replaying always
  *  lands the same keys.
  *
@@ -87,18 +87,18 @@ struct edit_t {
     std::span<byte_t const> value {};
 };
 
-/** Whether edits of @p modification carry a parent and an anchor. */
-constexpr bool carries_position(modification_t modification) noexcept {
+/** Whether edits of @p modification hold a parent and an anchor. */
+constexpr bool has_position(modification_t modification) noexcept {
     return modification == modification_t::insert_k || modification == modification_t::move_k;
 }
 
-/** Whether edits of @p modification carry an attribute name. */
-constexpr bool carries_field(modification_t modification) noexcept {
+/** Whether edits of @p modification hold an attribute name. */
+constexpr bool has_field(modification_t modification) noexcept {
     return modification == modification_t::set_attributes_k || modification == modification_t::remove_attributes_k;
 }
 
-/** Whether edits of @p modification carry a value. */
-constexpr bool carries_value(modification_t modification) noexcept {
+/** Whether edits of @p modification hold a value. */
+constexpr bool has_value(modification_t modification) noexcept {
     return modification == modification_t::import_k || modification == modification_t::insert_k ||
            modification == modification_t::splice_k || modification == modification_t::set_attributes_k;
 }
@@ -184,10 +184,10 @@ inline constexpr std::size_t edit_header_bytes_k = 1 + 8 + 4 + 16;
 /** Bytes of the serialized form of @p edit. */
 constexpr std::size_t encoded_size(edit_t const& edit) noexcept {
     std::size_t size = edit_header_bytes_k;
-    if (carries_position(edit.modification)) size += 32;
+    if (has_position(edit.modification)) size += 32;
     if (edit.modification == modification_t::splice_k) size += 16;
-    if (carries_field(edit.modification)) size += 4 + edit.field.size();
-    if (carries_value(edit.modification)) size += 4 + edit.value.size();
+    if (has_field(edit.modification)) size += 4 + edit.field.size();
+    if (has_value(edit.modification)) size += 4 + edit.value.size();
     return size;
 }
 
@@ -198,7 +198,7 @@ inline std::size_t encode_into(edit_t const& edit, byte_t* target) noexcept {
     store_u64(at, edit.placement.stamp), at += 8;
     store_u32(at, edit.placement.sequence), at += 4;
     store_key(at, edit.element), at += 16;
-    if (carries_position(edit.modification)) {
+    if (has_position(edit.modification)) {
         store_key(at, edit.parent), at += 16;
         store_key(at, edit.anchor), at += 16;
     }
@@ -206,11 +206,11 @@ inline std::size_t encode_into(edit_t const& edit, byte_t* target) noexcept {
         store_u64(at, edit.text_start), at += 8;
         store_u64(at, edit.text_length), at += 8;
     }
-    if (carries_field(edit.modification)) {
+    if (has_field(edit.modification)) {
         store_u32(at, std::uint32_t(edit.field.size())), at += 4;
         if (!edit.field.empty()) std::memcpy(at, edit.field.data(), edit.field.size()), at += edit.field.size();
     }
-    if (carries_value(edit.modification)) {
+    if (has_value(edit.modification)) {
         store_u32(at, std::uint32_t(edit.value.size())), at += 4;
         if (!edit.value.empty()) std::memcpy(at, edit.value.data(), edit.value.size()), at += edit.value.size();
     }
@@ -237,7 +237,7 @@ inline expected<edit_t> decode_edit(std::span<byte_t const> bytes, std::size_t& 
     edit.placement.stamp = load_u64(at), at += 8;
     edit.placement.sequence = load_u32(at), at += 4;
     edit.element = load_key(at), at += 16;
-    if (carries_position(edit.modification)) {
+    if (has_position(edit.modification)) {
         if (end - at < 32) return truncated;
         edit.parent = load_key(at), at += 16;
         edit.anchor = load_key(at), at += 16;
@@ -247,14 +247,14 @@ inline expected<edit_t> decode_edit(std::span<byte_t const> bytes, std::size_t& 
         edit.text_start = load_u64(at), at += 8;
         edit.text_length = load_u64(at), at += 8;
     }
-    if (carries_field(edit.modification)) {
+    if (has_field(edit.modification)) {
         if (end - at < 4) return truncated;
         std::uint32_t const length = load_u32(at);
         at += 4;
         if (std::size_t(end - at) < length) return truncated;
         edit.field = {reinterpret_cast<char const*>(at), length}, at += length;
     }
-    if (carries_value(edit.modification)) {
+    if (has_value(edit.modification)) {
         if (end - at < 4) return truncated;
         std::uint32_t const length = load_u32(at);
         at += 4;
@@ -303,7 +303,7 @@ expected<std::span<byte_t const>> encode_edits(std::span<edit_t const> edits, al
     std::size_t size = 0;
     for (edit_t const& edit : edits) {
         if (edit.field.size() > ~std::uint32_t(0) || edit.value.size() > ~std::uint32_t(0))
-            return status_t {status_code_t::invalid_argument_k, "An edit carries more than 4 GiB"};
+            return status_t {status_code_t::invalid_argument_k, "An edit holds more than 4 GiB"};
         size += encoded_size(edit);
     }
     byte_t* const block = size ? allocator.allocate(size) : nullptr;

@@ -2,7 +2,7 @@
  *  @file src/nvme/docs.hpp
  *  @author Ash Vardanian
  *  @date October 20, 2026
- *  @brief The document writes of the C ABI over the docs stores of
+ *  @brief The document writes and the docs scan of the C ABI over the docs stores of
  *      <tt>include/ustore/docs/nvme_store.hpp</tt>, for the NVMe engine's table.
  *
  *  These calls build on the accesses, the writes and the collection lookups of
@@ -12,7 +12,7 @@
  *  one @c json_delta_t to the document's change delta, after replaying it over the document as
  *  the transaction sees it, read and watched. A modification that would fail answers as the
  *  read-modify-write of <tt>src/docs_layer.hpp</tt> does and never lands, and a commit that changed the
- *  document since conflicts, so no change delta carries a @c json_delta_t that fails.
+ *  document since conflicts, so no change delta holds a @c json_delta_t that fails.
  *
  *  The tasks of one call on one document apply in task order, each seeing the ones before it, and a call whose tasks
  *  leave a document known whole, past a whole upsert or over a document of no bytes, writes that document, since a
@@ -36,6 +36,7 @@
 
 #include "docs_layer.hpp" // `document_deltas_t`, `group_document_deltas`
 
+#include "blobs.hpp"    // `scan_values`
 #include "database.hpp" // `call_access`, `resolve_runs`, `read_value`, `write_value`, `serve_write`
 
 namespace unum::ustore::nvme {
@@ -127,6 +128,18 @@ status_t docs_write(ustore_docs_write_t const& arguments, strings_arg_t const& f
                                    return written;
                            return {};
                        });
+}
+
+/** Implements the docs scan, which lists keys alone, or splits the one range of a cursor's pull
+ *  over the executor's threads into the batches @p batches names, when it is not null. */
+template <cpu_class_t cpu_class_>
+status_t docs_scan(ustore_docs_scan_t const& arguments, docs_batches_t* batches, view_t const& view) noexcept {
+    if (status_t const resolved = resolve_modality<cpu_class_>(arguments.database, arguments.collections,
+                                                               arguments.count, ustore_modality_docs_k, view);
+        resolved.failed())
+        return resolved;
+    if (!batches) return scan_values<cpu_class_>(blobs_scan_of(arguments), view);
+    return scan_values<cpu_class_>(blobs_scan_of(arguments), *batches, view);
 }
 
 } // namespace unum::ustore::nvme

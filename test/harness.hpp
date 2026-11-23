@@ -676,7 +676,7 @@ inline bool expect_near(double actual, double wanted, double tolerance,
     return "unrecognized";
 }
 
-/** Holds when @p status carries @p wanted ; otherwise counts a failed check and prints both by
+/** Holds when @p status holds @p wanted ; otherwise counts a failed check and prints both by
  *  name. */
 inline bool expect_status(status_t status, status_code_t wanted,
                           std::source_location where = std::source_location::current()) noexcept {
@@ -687,7 +687,7 @@ inline bool expect_status(status_t status, status_code_t wanted,
     return false;
 }
 
-/** The same check on the status an @c expected carries, so a refusal is checked without unpacking
+/** The same check on the status an @c expected holds, so a refusal is checked without unpacking
  *  it. */
 template <typename value_type_>
 bool expect_status(expected<value_type_> const& actual, status_code_t wanted,
@@ -819,11 +819,23 @@ inline std::string save_target(config_t const& config, std::string const& path) 
     return fmt::format("{}/ustore.ustore.json", path);
 }
 
+/** Opens the engine @p options name into @p database on an executor of one thread spawned for the
+ *  open and freed after it, which holds the transport of @c nvme, as the cases run their own
+ *  calls on the calling thread. */
+inline void open_on_own_executor(engine_options_t options, ustore_database_t* database,
+                                 ustore_outcome_t* outcome) noexcept {
+    options.threads.value = 1;
+    ustore_executor_t executor = nullptr;
+    spawn_executor(options, &executor, outcome);
+    if (outcome->status == ustore_status_success_k) open_engine(options, executor, database, outcome);
+    ustore_executor_free(executor);
+}
+
 /** Opens the engine @p config names through the C ABI. */
 inline expected<ustore_database_t> open_raw(config_t const& config) noexcept {
     ustore_database_t database = nullptr;
     ustore_outcome_t outcome {};
-    open_engine(config.options(), &database, &outcome);
+    open_on_own_executor(config.options(), &database, &outcome);
     if (status_t const status {outcome}; status.failed()) return status;
     return database;
 }

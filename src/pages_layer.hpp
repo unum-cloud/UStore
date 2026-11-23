@@ -94,14 +94,14 @@ inline ustore_key_t key_of(pages::element_key_t const& element) noexcept {
     return key;
 }
 
-/** The element key at @p index of @p keys, Nil where they carry no data. */
+/** The element key at @p index of @p keys, Nil where they hold no data. */
 inline pages::element_key_t task_element(ustore_keys_view_t keys, std::size_t index) noexcept {
     if (!keys.data) return pages::nil_key_k;
     strided_iterator<ustore_key_t const> const column = strided(keys);
     return element_key_of(column[static_cast<std::ptrdiff_t>(index)]);
 }
 
-/** The length at @p index of @p lengths, zero where they carry no data. */
+/** The length at @p index of @p lengths, zero where they hold no data. */
 inline std::uint64_t task_length(ustore_lengths_view_t lengths, std::size_t index) noexcept {
     if (!lengths.data) return 0;
     strided_iterator<ustore_length_t const> const column = strided(lengths);

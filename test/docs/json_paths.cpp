@@ -485,21 +485,22 @@ void compare_device_rows(json_documents_t const& documents, std::span<std::strin
             expect_true(false, "device {} differs for field '{}' of document {}: {}", what, fields[field], row,
                         documents[row]);
         };
-        // An output a lane refused leaves the whole call to the host, while others still compare
-        auto const settle = [&](std::uint32_t lane_refused) {
-            any_refused |= lane_refused;
-            if (walk_refused || lane_refused) ++device_rows_tally.left_to_host;
-            return !walk_refused && !lane_refused && status.succeeded();
+        // An output a queue set refused leaves the whole call to the host, while
+        // others still compare
+        auto const settle = [&](std::uint32_t queues_refused) {
+            any_refused |= queues_refused;
+            if (walk_refused || queues_refused) ++device_rows_tally.left_to_host;
+            return !walk_refused && !queues_refused && status.succeeded();
         };
         for (ustore_docs_field_type_t const type : gathered_types_k) {
-            std::uint32_t lane_refused = 0;
+            std::uint32_t queues_refused = 0;
             std::size_t const width = field_size_bytes(type);
             std::memset(bitmaps.data(), 0xA5, bitmaps.size());
             if (width) {
                 gather_scalars_t const column {bitmaps.data(), scalars.data(), stride, type, path_of(field)};
                 for (std::uint32_t first = 0; first < rows; first += gather_lane_rows_k)
-                    lane_refused |= gather_scalar_rows(page, column, first);
-                if (!settle(lane_refused)) continue;
+                    queues_refused |= gather_scalar_rows(page, column, first);
+                if (!settle(queues_refused)) continue;
                 for (std::size_t row = 0; row != rows; ++row) {
                     ustore_byte_t expected_cell[uuid_bytes_k] = {};
                     conversion_t const expected = gather_on_host(type, host_cell(row), expected_cell);
@@ -521,10 +522,10 @@ void compare_device_rows(json_documents_t const& documents, std::span<std::strin
                 texts.presences = column ? nullptr : presences.data();
                 texts.lengths = column ? nullptr : lengths.data();
                 texts.measured = measured.data();
-                lane_refused = 0;
+                queues_refused = 0;
                 for (std::uint32_t first = 0; first < rows; first += gather_lane_rows_k)
-                    lane_refused |= measure_text_rows(page, texts, first);
-                if (!settle(lane_refused)) continue;
+                    queues_refused |= measure_text_rows(page, texts, first);
+                if (!settle(queues_refused)) continue;
                 // The tape kernels' scan, on the host
                 text_offsets[0] = 0;
                 for (std::size_t row = 0; row != rows; ++row)

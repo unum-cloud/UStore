@@ -209,7 +209,7 @@ constexpr decimal_t read_decimal(std::string_view text, decimal_grammar_t gramma
     // JSON spells a zero integer part alone, never with leading zeros
     if (json && text.size() - position > 1 && text[position] == '0' && is_digit(text[position + 1])) return decimal;
 
-    // Leading zeros carry no digit, and digits past 64 bits only mark the decimal too precise
+    // Leading zeros add no digit, and digits past 64 bits only mark the decimal too precise
     unsigned significant = 0;
     std::size_t integer_digits = 0, fraction_digits = 0;
     for (; position != text.size() && is_digit(text[position]); ++position, ++integer_digits) {

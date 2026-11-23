@@ -2,7 +2,7 @@
  *  @file src/utilities/arguments.hpp
  *  @author Ash Vardanian
  *  @date November 16, 2026
- *  @brief The members the argument structures of the C ABI may carry, named as concepts for the
+ *  @brief The members the argument structures of the C ABI may hold, named as concepts for the
  *      code that branches on them at compile time.
  */
 
@@ -72,21 +72,21 @@ concept answers_scores_concept = requires(arguments_type_ const& arguments) { ar
 
 #pragma region Outputs
 
-/** Whether a call carries keys, which a pull writes as the keys it walked. */
+/** Whether a call holds keys, which a pull writes as the keys it walked. */
 template <typename arguments_type_>
-concept carries_keys_concept = requires(arguments_type_ const& arguments) { arguments.keys; };
+concept has_keys_concept = requires(arguments_type_ const& arguments) { arguments.keys; };
 
-/** Whether a call carries strings, which a pull writes as the strings it walked. */
+/** Whether a call holds strings, which a pull writes as the strings it walked. */
 template <typename arguments_type_>
-concept carries_strings_concept = requires(arguments_type_ const& arguments) { arguments.strings; };
+concept has_strings_concept = requires(arguments_type_ const& arguments) { arguments.strings; };
 
-/** Whether a call carries values in a strings layout, which a pull writes as the values it read. */
+/** Whether a call holds values in a strings layout, which a pull writes as the values it read. */
 template <typename arguments_type_>
-concept carries_ragged_values_concept = requires(arguments_type_ const& arguments) { arguments.values->layout; };
+concept has_ragged_values_concept = requires(arguments_type_ const& arguments) { arguments.values->layout; };
 
-/** Whether a call carries values of any kind, which a pull writes as the values it read. */
+/** Whether a call holds values of any kind, which a pull writes as the values it read. */
 template <typename arguments_type_>
-concept carries_values_concept = requires(arguments_type_ const& arguments) { arguments.values; };
+concept has_values_concept = requires(arguments_type_ const& arguments) { arguments.values; };
 
 #pragma endregion Outputs
 

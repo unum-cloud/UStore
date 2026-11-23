@@ -21,7 +21,7 @@
 
 #include "ustore/ustore.hpp"
 
-#include "ustore/utilities/ram_device.hpp" // `caller_exclusivity_t`, `executor_t`
+#include "ustore/utilities/ram_device.hpp" // `caller_exclusivity_t`, `ram_executor_t`
 
 #include "harness.hpp" // `run_test_case`, `expect_true`, `split_mix_generator_t`
 
@@ -188,7 +188,7 @@ void verify_batch(blobs_collection_t& collection, arena_t& arena, keys_view_t ke
 
 /** Runs one round: every thread writes every batch, then the main thread checks what they left
  *  and clears it. */
-void run_round(atomicity_run_t& run, executor_t& executor, batches_t const& batches) {
+void run_round(atomicity_run_t& run, ram_executor_t& executor, batches_t const& batches) {
     std::span<writer_slot_t> const slots {run.slots.data(), batches.threads_count};
     auto writer = [&](std::size_t thread) noexcept { write_round(slots[thread], run.collection, batches, thread); };
     expect_true(st::succeeded(executor.for_threads(writer)));
@@ -215,7 +215,7 @@ void run_round(atomicity_run_t& run, executor_t& executor, batches_t const& batc
  *  @param[in] checkpoints Most rounds to run.
  *  @param[in] slice Time after which no further round starts; the first round always runs.
  */
-void insert_atomic_isolated(atomicity_run_t& run, executor_t& executor, batches_t const& batches,
+void insert_atomic_isolated(atomicity_run_t& run, ram_executor_t& executor, batches_t const& batches,
                             std::size_t checkpoints, std::chrono::nanoseconds slice) {
     auto const deadline = std::chrono::steady_clock::now() + slice;
     std::size_t const failed_before = test_run.failed_checks.load();
@@ -229,7 +229,7 @@ void insert_atomic_isolated(atomicity_run_t& run, executor_t& executor, batches_
 /** Runs every batch size on one pool of @p threads threads. */
 void inserts_on_threads(atomicity_run_t& run, atomicity_options_t const& options, std::size_t threads,
                         round_deletes_t deletes, std::chrono::nanoseconds slice) {
-    auto maybe_executor = executor_t::make(threads, caller_exclusivity_t::caller_inclusive_k);
+    auto maybe_executor = ram_executor_t::make(threads, caller_exclusivity_t::caller_inclusive_k);
     if (!expect_true(maybe_executor.has_value())) return;
     for (std::size_t const batch_size : options.batch_sizes.view()) {
         std::span<ustore_key_t const> const keys {run.keys.data(), run.keys.size() / batch_size * batch_size};

@@ -139,6 +139,24 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_docs_measur
     return measure_keys<docs::document_pair_t>(state, arguments, view);
 }
 
+/** Implements the docs scan, which lists keys alone, or fills the one batch of a cursor's pull on
+ *  the calling thread when @p batches is not null, reading the documents of the listed keys at the
+ *  view the listing read. */
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t docs_scan(ustore_docs_scan_t const& arguments, docs_batches_t* batches, view_t const& view) noexcept {
+    if (!batches) return serve_database<cpu_class_, isolation_, ustore_docs_scan_t>(arguments, view);
+    return fill_one_batch<typename ram_variant<cpu_class_, isolation_>::strings_kit_t>(
+        arguments, *batches,
+        [](ustore_docs_scan_t const& listing, view_t const& listing_view) noexcept {
+            return serve_database<cpu_class_, isolation_, ustore_docs_scan_t>(listing, listing_view);
+        },
+        [](ustore_docs_read_t const& reading, view_t const& reading_view) noexcept {
+            return serve_database<cpu_class_, isolation_, ustore_docs_read_t, strings_arg_t>(reading, strings_arg_t {},
+                                                                                             reading_view);
+        },
+        view);
+}
+
 #pragma endregion Document Calls
 
 #pragma region Table
@@ -150,7 +168,7 @@ docs_verbs<vendored_residency_t::host_k> const ram_variant<cpu_class_, isolation
     .gist = &serve_database<cpu_class_, isolation_, ustore_docs_gist_t>,
     .gather = &serve_database<cpu_class_, isolation_, ustore_docs_gather_t, strings_arg_t>,
     .remove = &serve_database<cpu_class_, isolation_, ustore_docs_remove_t>,
-    .scan = &serve_database<cpu_class_, isolation_, ustore_docs_scan_t>,
+    .scan = &docs_scan<cpu_class_, isolation_>,
     .sample = &serve_database<cpu_class_, isolation_, ustore_docs_sample_t>,
     .measure = &serve_database<cpu_class_, isolation_, ustore_docs_measure_t>,
 };

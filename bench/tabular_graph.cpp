@@ -221,7 +221,7 @@ void clear_collection(ustore_database_t database, ustore_collection_id_t collect
 }
 
 /** Imports every listed file as documents, each thread over its own contiguous share of the files. */
-void bench_docs_import(executor_t& executor, tabular_t const& tabular, tabular_graph_settings_t const& settings,
+void bench_docs_import(ram_executor_t& executor, tabular_t const& tabular, tabular_graph_settings_t const& settings,
                        std::string_view name) {
     print(run_pass(executor, name, tabular.files.size(), [&](loop_t& loop, std::size_t) noexcept {
         ustore_outcome_t outcome {};
@@ -242,7 +242,7 @@ void bench_docs_import(executor_t& executor, tabular_t const& tabular, tabular_g
 }
 
 /** Imports every listed file as a graph, each thread over its own contiguous share of the files. */
-void bench_graph_import(executor_t& executor, tabular_t const& tabular, tabular_graph_settings_t const& settings,
+void bench_graph_import(ram_executor_t& executor, tabular_t const& tabular, tabular_graph_settings_t const& settings,
                         std::string_view name) {
     print(run_pass(executor, name, tabular.files.size(), [&](loop_t& loop, std::size_t) noexcept {
         ustore_outcome_t outcome {};
@@ -265,7 +265,7 @@ void bench_graph_import(executor_t& executor, tabular_t const& tabular, tabular_
 }
 
 /** Exports the documents once from every thread, each into its own file. */
-void bench_docs_export(executor_t& executor, tabular_t const& tabular, tabular_graph_settings_t const& settings,
+void bench_docs_export(ram_executor_t& executor, tabular_t const& tabular, tabular_graph_settings_t const& settings,
                        std::string_view name) {
     print(run_pass(executor, name, executor.threads_count(), [&](loop_t& loop, std::size_t thread) noexcept {
         sz::string_t output;
@@ -291,7 +291,7 @@ void bench_docs_export(executor_t& executor, tabular_t const& tabular, tabular_g
 }
 
 /** Exports the graph once from every thread, each into its own file. */
-void bench_graph_export(executor_t& executor, tabular_t const& tabular, tabular_graph_settings_t const& settings,
+void bench_graph_export(ram_executor_t& executor, tabular_t const& tabular, tabular_graph_settings_t const& settings,
                         std::string_view name) {
     print(run_pass(executor, name, executor.threads_count(), [&](loop_t& loop, std::size_t thread) noexcept {
         sz::string_t output;
@@ -374,7 +374,7 @@ int main(int argc, char** argv) {
 
     ustore_outcome_t outcome {};
     settings.engine.directory = settings.directory.data();
-    open_engine(settings.engine, &tabular.database, &outcome);
+    open_engine(settings.engine, nullptr, &tabular.database, &outcome);
     if (outcome.status != ustore_status_success_k) {
         fmt::println(stderr, "Failed to open the database: {}", outcome.message);
         return 1;
@@ -396,13 +396,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    auto maybe_executor = executor_t::make(settings.threads.value, caller_exclusivity_t::caller_inclusive_k);
+    auto maybe_executor = ram_executor_t::make(settings.threads.value, caller_exclusivity_t::caller_inclusive_k);
     if (!maybe_executor) {
         fmt::println(stderr, "Failed to spawn {} threads", settings.threads.value);
         ustore_database_free(tabular.database);
         return 1;
     }
-    executor_t& executor = *maybe_executor;
+    ram_executor_t& executor = *maybe_executor;
     std::string_view const format = format_as(selected_format(settings));
     std::string const docs_import_name = fmt::format("docs_import_{}", format);
     std::string const docs_export_name = fmt::format("docs_export_{}", format);

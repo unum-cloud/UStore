@@ -5,8 +5,9 @@
  *  @brief A page as an ordered tree of elements keyed by 16-byte keys, its dense serialized form, and a view that
  *      addresses subtrees of that form by element key without decoding it.
  *
- *  Every element carries a key, a kind, a name, ordered attributes and a run of text, and the order of siblings is the
- *  content. The root element's key is the page key, its name is empty, and it renders as its content only.
+ *  Every element holds a key, a kind, a name, ordered attributes and a run of text, and the order
+ *  of siblings is the content. The root element's key is the page key, its name is empty, and it
+ *  renders as its content only.
  *
  *  Siblings follow a replicated growable array: an element lands after its anchor, past every sibling placed later
  *  than itself, so edits applied in commit order put the newest of concurrent insertions after one anchor first, and

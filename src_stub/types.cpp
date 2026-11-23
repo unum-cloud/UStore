@@ -6,9 +6,9 @@
  *      set, the version, executors and arenas.
  *
  *  An executor of its own threads keeps one worker, which runs its deferred calls one at a time,
- *  while a blocking call runs on its caller and a lent pool runs every call at submission. A call
- *  meeting a running one on its executor finishes contended. No GPU is ever listed, so a VRAM
- *  executor is refused for the ordinal no device carries. The one CPU class is serial, so any known
+ *  while a blocking call runs on its caller and a caller's pool runs every call at submission. A
+ *  call meeting a running one on its executor finishes contended. No GPU is ever listed, so a VRAM
+ *  executor is refused for the ordinal no device holds. The one CPU class is serial, so any known
  *  CPU class ceiling picks it and only a value no class takes is refused.
  */
 #include <sys/stat.h> // `stat` - the memory domains the system lists
@@ -29,7 +29,7 @@ struct spelling {
     std::string_view name;
 };
 
-/** The spelling of @p value in @p names, or "unrecognized" for a value no enumerator carries. */
+/** The spelling of @p value in @p names, or "unrecognized" for a value no enumerator holds. */
 template <typename enum_type_, std::size_t count_>
 char const* name_in(spelling<enum_type_> const (&names)[count_], enum_type_ value) noexcept {
     // A C caller may pass any integer, which C++ may not load as the enum, so its bits are read
@@ -40,7 +40,7 @@ char const* name_in(spelling<enum_type_> const (&names)[count_], enum_type_ valu
     return "unrecognized";
 }
 
-/** Writes to @p value the enumerator @p names spells as @p name, or refuses a name none carries. */
+/** Writes to @p value the enumerator @p names spells as @p name, or refuses a name none holds. */
 template <typename enum_type_, std::size_t count_>
 ustore_status_t value_in(spelling<enum_type_> const (&names)[count_], ustore_bytes_view_t name,
                          enum_type_* value) noexcept {
@@ -239,13 +239,13 @@ std::size_t memory_domains_count() noexcept {
     return count ? count : 1;
 }
 
-/** Refuses memory domains no domain of this machine carries. */
+/** Refuses memory domains no domain of this machine holds. */
 bool refuse_memory_domains(call_t& call, ustore_ram_options_t const& options) noexcept {
     if (!options.memory_domains || !options.memory_domains_count) return false;
     std::size_t const available = memory_domains_count();
     for (std::size_t index = 0; index != options.memory_domains_count; ++index)
         if (options.memory_domains[index] < 0 || static_cast<std::size_t>(options.memory_domains[index]) >= available)
-            return call.stop(ustore_status_invalid_argument_k, "No memory domain carries the identifier");
+            return call.stop(ustore_status_invalid_argument_k, "No memory domain holds the identifier");
     return false;
 }
 
@@ -364,18 +364,6 @@ void ustore_executor_for_ram(ustore_executor_for_ram_t* arguments) {
     *arguments->executor = executor;
 }
 
-void ustore_executor_on_pool(ustore_executor_on_pool_t* arguments) {
-    call_t call(arguments->outcome);
-    if (arguments->executor) *arguments->executor = nullptr;
-    if (!arguments->executor)
-        return call.refuse(ustore_status_invalid_argument_k, "The call needs an output for the executor");
-    if (!arguments->pool) return call.refuse(ustore_status_invalid_argument_k, "The call needs a pool to borrow");
-    if (refuse_memory_domains(call, arguments->ram)) return;
-    auto* const executor = new (std::nothrow) ustore_executor_handle_t {};
-    if (!executor) return call.refuse(ustore_status_out_of_memory_k, "Failed to allocate the executor");
-    *arguments->executor = executor;
-}
-
 void ustore_executor_for_nvme(ustore_executor_for_nvme_t* arguments) {
     call_t call(arguments->outcome);
     if (arguments->executor) *arguments->executor = nullptr;
@@ -383,7 +371,10 @@ void ustore_executor_for_nvme(ustore_executor_for_nvme_t* arguments) {
         return call.refuse(ustore_status_invalid_argument_k, "The call needs an output for the executor");
     if (std::string_view(ustore_transport_name(arguments->nvme.transport)) == "unrecognized")
         return call.refuse(ustore_status_invalid_argument_k, "Unknown transport");
-    if (refuse_cpu_class_ceiling(call, arguments->cpu_class_ceiling)) return;
+    if (arguments->nvme.paths_count && !arguments->nvme.paths)
+        return call.refuse(ustore_status_invalid_argument_k, "Paths with a count need their views");
+    if (refuse_memory_domains(call, arguments->ram) || refuse_cpu_class_ceiling(call, arguments->cpu_class_ceiling))
+        return;
     auto* const executor = new (std::nothrow) ustore_executor_handle_t {};
     if (!executor) return call.refuse(ustore_status_out_of_memory_k, "Failed to allocate the executor");
     executor->for_nvme = true;
@@ -404,7 +395,7 @@ void ustore_executor_for_vram(ustore_executor_for_vram_t* arguments) {
         std::string_view(ustore_gpu_class_name(arguments->gpu_class_ceiling)) == "unrecognized")
         return call.refuse(ustore_status_invalid_argument_k, "Unknown GPU class ceiling");
     // The stand-in drives no GPU, so it lists none and no ordinal names a device
-    call.refuse(ustore_status_device_k, "No GPU carries the ordinal");
+    call.refuse(ustore_status_device_k, "No GPU holds the ordinal");
 }
 
 void ustore_gpu_devices(ustore_gpu_devices_t* arguments) {

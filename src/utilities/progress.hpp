@@ -2,8 +2,8 @@
  *  @file src/utilities/progress.hpp
  *  @author Ash Vardanian
  *  @date October 13, 2026
- *  @brief The one reporter of a call's progress, which serializes its callbacks and carries a cancellation to every
- *      thread of the call, and the ticks and driver of a plan's phases.
+ *  @brief The one reporter of a call's progress, which serializes its callbacks and holds a
+ *      cancellation to every thread of the call, and the ticks and driver of a plan's phases.
  */
 
 #pragma once
@@ -57,9 +57,9 @@ class progress_t {
         if (!reporting.compare_exchange_strong(observed, reporting_t::reporting_k, std::memory_order_acquire,
                                                std::memory_order_acquire))
             return observed != reporting_t::cancelled_k;
-        bool const carries_on = callback_(finished.load(std::memory_order_relaxed), total_, state_) != ustore_cancel_k;
-        reporting.store(carries_on ? reporting_t::idle_k : reporting_t::cancelled_k, std::memory_order_release);
-        return carries_on;
+        bool const keeps_going = callback_(finished.load(std::memory_order_relaxed), total_, state_) != ustore_cancel_k;
+        reporting.store(keeps_going ? reporting_t::idle_k : reporting_t::cancelled_k, std::memory_order_release);
+        return keeps_going;
     }
 };
 
@@ -93,7 +93,7 @@ struct progress_ticks_t {
 template <typename owner_type_>
 struct indexed_range {
 
-    /** What the positions are read from; borrowed, never owned. */
+    /** What the positions are read from; viewed, never owned. */
     owner_type_ const* owner = nullptr;
 
     /** Positions the range covers, from zero. */
@@ -164,8 +164,8 @@ status_t run_plan(void* plan, view_t const& runner, progress_ticks_t& ticks) noe
                 if (ran.failed() && failed_once.compare_exchange_strong(unfailed, true, std::memory_order_acq_rel))
                     first = ran;
             };
-            if (st::failed(view_of(executor->pool).for_n_dynamic(tasks.size(), run_task)))
-                return {status_code_t::contended_k, "The lent pool runs its lender's dispatch"};
+            if (st::failed(executor->pool.view().for_n_dynamic(tasks.size(), run_task)))
+                return {status_code_t::internal_k, "The executor's idle pool refused a fork"};
             if (first.failed()) return first;
         }
         std::size_t const completed = typed.completed(), total = typed.total();

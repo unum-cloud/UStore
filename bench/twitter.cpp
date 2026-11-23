@@ -59,7 +59,7 @@ namespace unum::ustore::bench {
 
 /** Half the logical cores this process may run on, at least one. */
 [[nodiscard]] std::size_t half_the_cores() noexcept {
-    auto const cores = executor_t::logical_cores_count();
+    auto const cores = ram_executor_t::logical_cores_count();
     return cores && *cores > 1 ? *cores / 2 : 1;
 }
 
@@ -283,7 +283,8 @@ constexpr std::string_view tweet_template_k =
 }
 
 /** Maps up to @c max_input_files_total NDJSON files from the dataset directory and indexes them on @p executor. */
-[[nodiscard]] bool load_dataset(twitter_settings_t const& settings, executor_t& executor, twitter_t& twitter) noexcept {
+[[nodiscard]] bool load_dataset(twitter_settings_t const& settings, ram_executor_t& executor,
+                                twitter_t& twitter) noexcept {
     fmt::println("Will search for .ndjson files...");
     std::error_code error;
     std::filesystem::directory_iterator listing {std::filesystem::path {settings.dataset}, error};
@@ -335,7 +336,7 @@ constexpr std::string_view tweet_template_k =
 
 /** Upserts the documents into @p collection in transactional batches of @p batch_size committed as
  *  @p durability asks, each thread over its own share of batches. */
-void construct_docs(executor_t& executor, twitter_settings_t const& settings, twitter_t const& twitter,
+void construct_docs(ram_executor_t& executor, twitter_settings_t const& settings, twitter_t const& twitter,
                     ustore_collection_id_t collection, std::size_t batch_size, ustore_durability_t durability) {
     std::string const name = fmt::format("construct_docs{}/{}",
                                          durability == ustore_durability_flushed_k ? "_flushed" : "", batch_size);
@@ -356,7 +357,7 @@ void construct_docs(executor_t& executor, twitter_settings_t const& settings, tw
 
 /** Writes the documents' JSON bodies as blobs at the head in batches of @p batch_size, each thread
  *  over its own share of batches. */
-void construct_blobs(executor_t& executor, twitter_settings_t const& settings, twitter_t const& twitter,
+void construct_blobs(ram_executor_t& executor, twitter_settings_t const& settings, twitter_t const& twitter,
                      std::size_t batch_size) {
     std::string const name = fmt::format("construct_blobs/{}", batch_size);
     if (!settings.filter.selects(name)) return;
@@ -383,7 +384,7 @@ void construct_blobs(executor_t& executor, twitter_settings_t const& settings, t
 }
 
 /** Upserts the edges in transactional batches of @p batch_size, each thread over its own share of batches. */
-void construct_graph(executor_t& executor, twitter_settings_t const& settings, twitter_t const& twitter,
+void construct_graph(ram_executor_t& executor, twitter_settings_t const& settings, twitter_t const& twitter,
                      std::size_t batch_size) {
     std::string const name = fmt::format("construct_graph/{}", batch_size);
     if (!settings.filter.selects(name)) return;
@@ -425,7 +426,7 @@ struct tweet_batches_t {
     /** @c batches_count_k batches of @c batch_size keys, back to back. */
     st::vector<ustore_key_t> keys;
 
-    /** Keys one read carries. */
+    /** Keys one read holds. */
     std::size_t batch_size = 0;
 
     /** Arena every read of this thread reuses, which holds every output that scales with the read. */
@@ -487,8 +488,8 @@ struct tweet_batches_t {
 using sample_read_t = void (*)(twitter_t const&, tweet_batches_t&, loop_t&, std::size_t) noexcept;
 
 /** Samples @p read on every thread once per batch size, each thread drawing its own keys above its loop. */
-void sample(executor_t& executor, twitter_settings_t const& settings, twitter_t const& twitter, std::string_view stem,
-            sample_read_t read, std::span<std::size_t const> batch_sizes) {
+void sample(ram_executor_t& executor, twitter_settings_t const& settings, twitter_t const& twitter,
+            std::string_view stem, sample_read_t read, std::span<std::size_t const> batch_sizes) {
     for (std::size_t const batch_size : batch_sizes) {
         std::string const name = fmt::format("{}/{}", stem, batch_size);
         if (!settings.filter.selects(name)) continue;
@@ -747,12 +748,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    auto maybe_executor = executor_t::make(settings.threads.value, caller_exclusivity_t::caller_inclusive_k);
+    auto maybe_executor = ram_executor_t::make(settings.threads.value, caller_exclusivity_t::caller_inclusive_k);
     if (!maybe_executor) {
         fmt::println(stderr, "Failed to spawn {} threads", settings.threads.value);
         return 1;
     }
-    executor_t& executor = *maybe_executor;
+    ram_executor_t& executor = *maybe_executor;
     twitter_t twitter;
     bool const indexed = settings.dataset.empty() ? generate_dataset(settings, twitter)
                                                   : load_dataset(settings, executor, twitter);
@@ -769,7 +770,7 @@ int main(int argc, char** argv) {
 
     ustore_outcome_t outcome {};
     settings.engine.directory = settings.directory.data();
-    open_engine(settings.engine, &twitter.database, &outcome);
+    open_engine(settings.engine, nullptr, &twitter.database, &outcome);
     if (outcome.status != ustore_status_success_k) {
         fmt::println(stderr, "Failed to open the database: {}", outcome.message);
         return 1;

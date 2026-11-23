@@ -14,7 +14,7 @@
  *  header, the cells, the value offsets, the values and the trailer of stamps and kinds, or the
  *  sections of a run of strings, into one extent and polls them all; the flush belongs to the
  *  publication of the manifest that names the run. A delta's kind tells a removal, an empty value
- *  and a fold's change apart, so no size or location carries a sentinel.
+ *  and a fold's change apart, so no size or location holds a sentinel.
  *
  *  A cell holds a fixed-width key and nothing of the value it names, which the cell's sorted
  *  position locates: by stride for fixed-width values, and through the value offsets column
@@ -112,7 +112,7 @@ using utilities::request_tag_t;
 
 #pragma region Vocabulary
 
-/** The word the first eight bytes of a sorted run carry. */
+/** The word the first eight bytes of a sorted run hold. */
 inline constexpr std::uint64_t sorted_run_magic_k = magic_of("USTORERN");
 
 /** The layout the engine writes, which a run of another version is not opened by. */
@@ -156,7 +156,7 @@ struct sorted_run_header_t {
     /** The stamp every stamp of the run was raised to at least, which its column counts from. */
     std::uint64_t stamps_floor = 0;
 
-    /** The newest stamp any key slot of the run carries, or the floor for a run of none. */
+    /** The newest stamp any key slot of the run holds, or the floor for a run of none. */
     std::uint64_t newest_stamp = 0;
 
     /** Bytes the saved kinds column takes in the trailer, right after the stamps and before their alignment padding. */
@@ -301,12 +301,12 @@ struct strings_sections_t {
     st::vector<std::uint64_t> layers;
 };
 
-/** A run's extent allocated, with the header and the columns it will carry laid out:
+/** A run's extent allocated, with the header and the columns it will hold laid out:
  *  what @c reserve hands @c write_sections and then @c open, so only the first needs
  *  the maintenance claim. */
 struct sorted_run_reservation_t {
 
-    /** The header the run will carry, from which every offset of its sections follows. */
+    /** The header the run will hold, from which every offset of its sections follows. */
     sorted_run_header_t header {};
 
     /** The extent allocated for the run, durable once a manifest naming it is published. */
@@ -336,8 +336,8 @@ struct sorted_run_reservation_t {
  *  @brief Where the header, the index, the value offsets, the stored values and the trailer of a
  *      sorted run of fixed-width keys sit inside its extent, each section on a page boundary.
  *
- *  Every offset follows from the counts the header carries, so a header never carries the offsets, and a reader
- *  cannot be told a position its own arithmetic disagrees with.
+ *  Every offset follows from the counts the header holds, so a header never holds the offsets, and
+ *  a reader cannot be told a position its own arithmetic disagrees with.
  */
 template <typename key_slot_type_>
 class sorted_run_layout {
@@ -349,11 +349,11 @@ class sorted_run_layout {
     /** How the values of a run of these key slots are stored. */
     static constexpr value_layout_t value_layout_k = key_slot_t::value_layout_k;
 
-    /** Whether the values sit in the key slots themselves, so the run carries no values section. */
+    /** Whether the values sit in the key slots themselves, so the run holds no values section. */
     static constexpr bool holds_values_inline_k = is_inline(value_layout_k);
 
     /** Whether the run locates its values through a value offsets column, which only variable widths need. */
-    static constexpr bool carries_value_offsets_k = is_variable_width(value_layout_k);
+    static constexpr bool has_value_offsets_k = is_variable_width(value_layout_k);
 
     /** Whether the run saves its cells, needed for inline values alone; the tree holds the keys. */
     static constexpr bool keeps_cells_k = holds_values_inline_k;
@@ -385,7 +385,7 @@ class sorted_run_layout {
 
     /** Bytes the value offsets take: one per key slot and one past the last, none without the column. */
     [[nodiscard]] static constexpr std::uint64_t value_offsets_bytes(std::uint64_t key_slots_count) noexcept {
-        return carries_value_offsets_k ? (key_slots_count + 1) * sizeof(stored_value_offset_t) : 0;
+        return has_value_offsets_k ? (key_slots_count + 1) * sizeof(stored_value_offset_t) : 0;
     }
 
     /** Bytes the saved S+ tree of @p key_slots_count keys takes. */
@@ -606,7 +606,7 @@ concept gathered_values_concept = requires(values_type_ const& values, std::uint
  *  @brief One immutable run of key slots and the values they locate, held as one extent
  *      of one volume.
  *
- *  The run borrows the volume, and owns only its index, its columns, and for strings its key
+ *  The run views the volume, and owns only its index, its columns, and for strings its key
  *  tape and layers. Every call that moves bytes takes the channel the calling thread holds,
  *  since a queue pair belongs to one thread while it is held and a run outlives every thread
  *  that ever reads it.
@@ -630,7 +630,7 @@ class lsm_sorted_run {
     /** The key the run orders its key slots by. */
     using stored_key_t = typename key_slot_t::stored_key_t;
 
-    /** The range tombstones the run carries at its end, over whole strings for a run of strings. */
+    /** The range tombstones the run holds at its end, over whole strings for a run of strings. */
     using range_tombstones_t =
         std::conditional_t<tailed_key_slot_concept<key_slot_t>, blobs::range_tombstones<std::string_view>,
                            blobs::range_tombstones<stored_key_t>>;
@@ -657,7 +657,7 @@ class lsm_sorted_run {
     static constexpr bool holds_values_inline_k = is_inline(value_layout_k);
 
     /** Whether the run locates its values through a value offsets column, which only variable widths need. */
-    static constexpr bool carries_value_offsets_k = sorted_run_layout_t::carries_value_offsets_k;
+    static constexpr bool has_value_offsets_k = sorted_run_layout_t::has_value_offsets_k;
 
     /** Whether the run keeps its cells, needed for inline values alone; the tree holds the keys. */
     static constexpr bool keeps_cells_k = sorted_run_layout_t::keeps_cells_k;
@@ -751,10 +751,11 @@ class lsm_sorted_run {
      *  @brief Writes a whole run into a fresh extent of @p volume, which is @c reserve,
      *      @c write_sections and @c open in a row; the run is durable once a manifest naming
      *      it is published.
-     *  @param[in,out] volume The volume the extent is allocated on, borrowed and outliving the run.
+     *  @param[in,out] volume The volume the extent is allocated on, owned by the caller and
+     *      outliving the run.
      *  @param[in,out] channel The channel the sections are queued on, held by the calling thread.
      *  @param[in] collection The collection writing the run, which its header keeps.
-     *  @param[in] content_id The identifier the run is named by, which no other run carries.
+     *  @param[in] content_id The identifier the run is named by, which no other run holds.
      *  @param[in] key_slots The key slots in ascending order of their keys, the versions of one key newest first, which
      *      the index is laid from.
      *  @param[in] stamps The stamp of every key slot, in the same order.
@@ -769,7 +770,7 @@ class lsm_sorted_run {
      *      of a fixed-width run, kept for a reader.
      *  @param[in] tails The tails of the keys the key slots' heads cut short, in the same order, which key slots of
      *      one head order by; none for a run of whole keys.
-     *  @param[in] tombstones The range tombstones the run carries, none for a run of strings.
+     *  @param[in] tombstones The range tombstones the run holds, none for a run of strings.
      *  @return The run, opened again from the volume, or the status that stopped the write with its
      *      extent given back.
      */
@@ -901,9 +902,7 @@ class lsm_sorted_run {
             return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than a run's header"};
         medium_extent_t const& extent = reservation.extent;
         sorted_run_header_t const& header = reservation.header;
-        auto [writer_channel, writer_channel_status] = channel.acquire();
-        if (writer_channel_status.failed()) return writer_channel_status;
-        write_pipeline_t writer {volume.disk(), std::move(writer_channel), extent.medium};
+        write_pipeline_t writer {volume.disk(), channel, extent.medium};
 
         std::uint64_t const head_bytes = sorted_run_layout_t::header_bytes();
         auto [head, acquire_buffer_or_poll_status] = writer.acquire_buffer_or_poll();
@@ -950,10 +949,10 @@ class lsm_sorted_run {
     }
 
     /**
-     *  @brief Reads the header, the whole index, the value offsets and the trailer of the run
-     *      at @p extent, or every section of a run of strings, which is everything a run
-     *      keeps in memory.
-     *  @param[in,out] volume The volume the run reads through afterwards, borrowed and outliving it.
+     *  @brief Reads the header, the whole index, the value offsets and the trailer of the run at @p
+     *      extent, or every section of a run of strings, which is everything a run keeps in memory.
+     *  @param[in,out] volume The volume the run reads through afterwards, owned by the caller
+     *      and outliving it.
      *  @param[in,out] channel The channel the header and the index are read on, held by the calling thread.
      *  @param[in] extent Where the run lies, as an allocation or a manifest handed it over.
      *  @return The run, or @c status_code_t::malformed_k for an extent shorter than the
@@ -980,7 +979,7 @@ class lsm_sorted_run {
     /**
      *  @brief The run a merge just wrote at @p extent, built from what the merge still holds rather
      *      than read back from the volume, which leaves it as @c open would.
-     *  @param[in,out] volume The volume the run reads through afterwards, borrowed
+     *  @param[in,out] volume The volume the run reads through afterwards, viewed
      *      and outliving it.
      *  @param[in] extent Where the merge wrote the run.
      *  @param[in] header The header the merge wrote.
@@ -1038,7 +1037,7 @@ class lsm_sorted_run {
     /** Where the run lies, which a manifest names and a volume deallocates. */
     [[nodiscard]] medium_extent_t const& extent() const noexcept { return extent_; }
 
-    /** The sorted cells of a run whose cells carry values, which a compaction reads in place. */
+    /** The sorted cells of a run whose cells hold values, which a compaction reads in place. */
     [[nodiscard]] std::span<key_slot_t const> cells() const noexcept
         requires keeps_cells_k
     {
@@ -1079,13 +1078,13 @@ class lsm_sorted_run {
     /** The kind of every key slot in sorted order, which a compaction reads in place. */
     [[nodiscard]] kinds_column_t const& kinds() const noexcept { return kinds_; }
 
-    /** The newest stamp any key slot or range tombstone of the run carries, which a check of what
+    /** The newest stamp any key slot or range tombstone of the run holds, which a check of what
      *  changed since a stamp skips by. */
     [[nodiscard]] std::uint64_t newest_stamp() const noexcept {
         return fu::max_of(header_.newest_stamp, range_tombstones_.newest_stamp());
     }
 
-    /** The range tombstones the run carries, ascending by start. */
+    /** The range tombstones the run holds, ascending by start. */
     [[nodiscard]] range_tombstones_t const& range_tombstones() const noexcept { return range_tombstones_; }
 
     /** Whether the run holds a key slot or a range tombstone, so its bounds name keys. */
@@ -1097,7 +1096,7 @@ class lsm_sorted_run {
     [[nodiscard]] std::uint64_t stamps_floor() const noexcept { return header_.stamps_floor; }
 
     /** The stamp @c assign_stamp gave every version of a run its extent stamps zero, or zero for a
-     *  run that carries its own stamps, which a schema records beside the run. */
+     *  run that holds its own stamps, which a schema records beside the run. */
     [[nodiscard]] std::uint64_t assigned_stamp() const noexcept { return assigned_stamp_; }
 
     /** Bytes the stamps column takes in memory, which is all a run spends on its stamps. */
@@ -1278,7 +1277,7 @@ class lsm_sorted_run {
     }
 
     /**
-     *  @brief Whether the run carries @p stored_key, and whether that key slot locates a value.
+     *  @brief Whether the run holds @p stored_key, and whether that key slot locates a value.
      *  @param[in] stored_key The key to look for.
      *  @param[out] position Where the key sits, or @c population_count when the run holds no such key.
      */
@@ -1340,6 +1339,14 @@ class lsm_sorted_run {
         }
     }
 
+    /** Bytes the values of the key slots at sorted positions @b [first,last) take, read off the
+     *  value offsets in O(1), or at most that many where every value is as wide as the widest. */
+    [[nodiscard]] std::uint64_t value_bytes_between(std::uint64_t first, std::uint64_t last) const noexcept {
+        if constexpr (tailed_k) return (last - first) * strings_layout_t::value_bytes_k;
+        else if constexpr (has_value_offsets_k) return value_begin_(last) - value_begin_(first);
+        else return (last - first) * header_.value_max_size;
+    }
+
     /** Where the values of the key slots at sorted positions @b [begin,end) sit, with the value offsets locating them,
      *  as one read of each section asks for them; empty for values held inline. */
     [[nodiscard]] value_tape_window_t value_tape_window(std::uint64_t, std::uint64_t) const noexcept
@@ -1352,7 +1359,7 @@ class lsm_sorted_run {
     [[nodiscard]] value_tape_window_t value_tape_window(std::uint64_t begin, std::uint64_t end) const noexcept {
         value_tape_window_t window;
         std::uint64_t const count = header_.key_slots_count;
-        if constexpr (carries_value_offsets_k) {
+        if constexpr (has_value_offsets_k) {
             std::uint64_t const first = sorted_run_layout_t::value_offsets_offset(count) +
                                         begin * sizeof(stored_value_offset_t);
             std::uint64_t const aligned = round_down_to_multiple(first, portable_alignment_k);
@@ -1382,7 +1389,7 @@ class lsm_sorted_run {
      *  @brief Gives every version of a run written at stamp zero the stamp @p stamp, in memory
      *      alone, which an ingest does once its commit draws the stamp and a mount does again from
      *      the manifest, as the extent keeps its zeros.
-     *  @return Success, @c invalid_argument_k for a zero @p stamp or a run carrying stamps of its
+     *  @return Success, @c invalid_argument_k for a zero @p stamp or a run holding stamps of its
      *      own, or @c out_of_memory_k with the run unchanged.
      */
     status_t assign_stamp(std::uint64_t stamp) noexcept {
@@ -1409,7 +1416,7 @@ class lsm_sorted_run {
      *  @param[in] sink Called as @c sink(request, offset, bytes) while the channel still owns the block.
      *  @return Success, or the first failure any of the blocks reported.
      *
-     *  @note A value larger than one block arrives as several calls, each carrying the bytes of the
+     *  @note A value larger than one block arrives as several calls, each holding the bytes of the
      *      value before it, and a key slot that locates nothing is reported once with no bytes.
      */
     template <typename sink_type_>
@@ -1467,14 +1474,14 @@ class lsm_sorted_run {
     /** Where the value of the key slot at sorted @p position starts inside the values section, which for @p position
      *  at @c population_count is the section's end. */
     [[nodiscard]] std::uint64_t value_begin_(std::uint64_t position) const noexcept {
-        if constexpr (carries_value_offsets_k) return value_offsets_[static_cast<std::size_t>(position)];
+        if constexpr (has_value_offsets_k) return value_offsets_[static_cast<std::size_t>(position)];
         else return position * header_.value_max_size;
     }
 
     /** Where the value of the key slot at sorted @p position ends inside the values section, at its start for a
      *  removal of a fixed width, whose stride holds no value. */
     [[nodiscard]] std::uint64_t value_end_(std::uint64_t position) const noexcept {
-        if constexpr (carries_value_offsets_k) return value_offsets_[static_cast<std::size_t>(position) + 1];
+        if constexpr (has_value_offsets_k) return value_offsets_[static_cast<std::size_t>(position) + 1];
         else {
             std::uint64_t const begin = value_begin_(position);
             return kind(position) == delta_kind_t::remove_k ? begin : begin + header_.value_max_size;
@@ -1488,7 +1495,7 @@ class lsm_sorted_run {
     static status_t check_values_(std::uint64_t stored_values_bytes,
                                   std::span<stored_value_offset_t const> value_offsets, std::size_t key_slots_count,
                                   stored_value_size_t value_max_size) noexcept {
-        if constexpr (carries_value_offsets_k) {
+        if constexpr (has_value_offsets_k) {
             if (value_offsets.size() != key_slots_count + 1 || value_offsets.front() != 0 ||
                 value_offsets.back() != stored_values_bytes)
                 return {status_code_t::invalid_argument_k,
@@ -1506,7 +1513,7 @@ class lsm_sorted_run {
                                                      : std::uint64_t {key_slots_count} * value_max_size;
             if (stored_values_bytes != expected_bytes)
                 return {status_code_t::invalid_argument_k,
-                        holds_values_inline_k ? "An inline run carries no stored values"
+                        holds_values_inline_k ? "An inline run holds no stored values"
                                               : "A fixed-width run takes one value of its width per key slot"};
             return {};
         }
@@ -1536,9 +1543,7 @@ class lsm_sorted_run {
         std::span<read_piece_t> const pieces = channel.read_pieces();
         std::size_t const depth = pieces.size();
 
-        auto [reader_channel, reader_channel_status] = channel.acquire();
-        if (reader_channel_status.failed()) return reader_channel_status;
-        read_pipeline_t reader {volume_->disk(), std::move(reader_channel), extent_.medium};
+        read_pipeline_t reader {volume_->disk(), channel, extent_.medium};
         status_t first;
         auto adapter = [&](completed_buffer_t const& completed) noexcept {
             read_piece_t const& piece = pieces[completed.tag % depth];
@@ -1546,7 +1551,7 @@ class lsm_sorted_run {
                 if (first.succeeded()) first = whole;
                 return;
             }
-            sink(piece.request, piece.offset, completed.bytes.subspan(piece.skipped, piece.carried));
+            sink(piece.request, piece.offset, completed.bytes.subspan(piece.skipped, piece.held));
         };
 
         std::size_t request = 0;
@@ -1584,7 +1589,7 @@ class lsm_sorted_run {
         return first;
     }
 
-    /** The piece of @p window that the block at @p at of @p length carries, for @p request. */
+    /** The piece of @p window that the block at @p at of @p length holds, for @p request. */
     [[nodiscard]] static read_piece_t piece_of_(value_window_t const& window, std::size_t request, std::uint64_t at,
                                                 std::uint64_t length) noexcept {
         std::uint64_t const wanted_first = window.skipped;
@@ -1594,7 +1599,7 @@ class lsm_sorted_run {
         read_piece_t piece;
         piece.request = static_cast<std::uint32_t>(request);
         piece.skipped = static_cast<std::uint32_t>(first - at);
-        piece.carried = static_cast<std::uint32_t>(last > first ? last - first : 0);
+        piece.held = static_cast<std::uint32_t>(last > first ? last - first : 0);
         piece.offset = static_cast<std::uint32_t>(first - wanted_first);
         return piece;
     }
@@ -1637,13 +1642,12 @@ class lsm_sorted_run {
             std::uint64_t const chunk = block_bytes < room ? block_bytes : room;
             std::span<byte_t> const payload = block.bytes().first(static_cast<std::size_t>(chunk));
             std::uint64_t const left = bytes.size() > written ? bytes.size() - written : 0;
-            std::uint64_t const carried = left < chunk ? left : chunk;
+            std::uint64_t const held = left < chunk ? left : chunk;
             if constexpr (gathered_values_concept<bytes_type_>) {
-                if (carried != 0) bytes.gather(written, payload.first(static_cast<std::size_t>(carried)));
+                if (held != 0) bytes.gather(written, payload.first(static_cast<std::size_t>(held)));
             }
-            else if (carried != 0)
-                std::memcpy(payload.data(), bytes.data() + written, static_cast<std::size_t>(carried));
-            std::memset(payload.data() + carried, 0, static_cast<std::size_t>(chunk - carried));
+            else if (held != 0) std::memcpy(payload.data(), bytes.data() + written, static_cast<std::size_t>(held));
+            std::memset(payload.data() + held, 0, static_cast<std::size_t>(chunk - held));
             if (status_t const queued = writer.enqueue_write(std::move(block), extent.slice(offset + written, chunk));
                 queued.failed())
                 return queued;
@@ -2005,9 +2009,7 @@ class lsm_sorted_run {
         extent_t const piece = extent_.slice(0, head_bytes);
         if (piece.length != head_bytes) return {status_code_t::malformed_k, "The run is shorter than its header"};
 
-        auto [reader_channel, reader_channel_status] = channel.acquire();
-        if (reader_channel_status.failed()) return reader_channel_status;
-        read_pipeline_t reader {volume_->disk(), std::move(reader_channel), extent_.medium};
+        read_pipeline_t reader {volume_->disk(), channel, extent_.medium};
         if (status_t const offered = reader.enqueue_read(piece, 0); offered.failed()) return offered;
         if (status_t const flushed = reader.submit(); flushed.failed()) return flushed;
 
@@ -2034,7 +2036,7 @@ class lsm_sorted_run {
             return {status_code_t::malformed_k, "The run's tree rows match no tree of this build"};
         if (tailed_k != (header.layers_bytes >= sizeof(head_layers_header_t)))
             return {status_code_t::malformed_k, "The run's layers do not match its key slots"};
-        if (carries_value_offsets_k && header.stored_values_bytes > (std::numeric_limits<stored_value_offset_t>::max)())
+        if (has_value_offsets_k && header.stored_values_bytes > (std::numeric_limits<stored_value_offset_t>::max)())
             return {status_code_t::malformed_k, "The run claims more values than its offsets reach"};
         if (is_fixed(value_layout_k) && header.stored_values_bytes != header.key_slots_count * header.value_max_size)
             return {status_code_t::malformed_k, "The run's values are not one width per key slot"};
@@ -2128,9 +2130,7 @@ class lsm_sorted_run {
         std::uint64_t const section = into.size();
         std::uint64_t const block = round_down_to_multiple(channel.requests().buffer_bytes(), portable_alignment_k);
         if (block == 0) return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than one page"};
-        auto [reader_channel, reader_channel_status] = channel.acquire();
-        if (reader_channel_status.failed()) return reader_channel_status;
-        read_pipeline_t reader {volume_->disk(), std::move(reader_channel), extent_.medium};
+        read_pipeline_t reader {volume_->disk(), channel, extent_.medium};
         status_t moved;
         auto sink = [&](completed_buffer_t const& completed) noexcept {
             if (status_t const whole = require_completed_in_full(completed); whole.failed()) {
@@ -2159,7 +2159,7 @@ class lsm_sorted_run {
     /** Reads the value offsets whole into owned memory, refusing any its header disagrees with, which a run finding
      *  its values by stride or holding them inline has none of. */
     status_t read_value_offsets_(io_channel_t& channel) noexcept {
-        if constexpr (!carries_value_offsets_k) return {};
+        if constexpr (!has_value_offsets_k) return {};
         else {
             std::uint64_t const count = header_.key_slots_count;
             std::uint64_t const section = round_up_to_multiple(sorted_run_layout_t::value_offsets_bytes(count),
@@ -2312,7 +2312,7 @@ class lsm_sorted_run {
         if (!column)
             return column.status() == st::status_t::out_of_memory_heap_k
                        ? status_t {status_code_t::out_of_memory_k, "A run could not hold its stamps"}
-                       : status_t {status_code_t::malformed_k, "A run carries a stamp past its newest"};
+                       : status_t {status_code_t::malformed_k, "A run holds a stamp past its newest"};
         stamps_ = std::move(*column);
 
         st::expected<st::immutable_packed_array_view<std::uint8_t>> kinds =
@@ -2338,7 +2338,7 @@ class lsm_sorted_run {
         if (!kinds_column)
             return kinds_column.status() == st::status_t::out_of_memory_heap_k
                        ? status_t {status_code_t::out_of_memory_k, "A run could not hold its kinds"}
-                       : status_t {status_code_t::malformed_k, "A run carries a kind no delta has"};
+                       : status_t {status_code_t::malformed_k, "A run holds a kind no delta has"};
         kinds_ = std::move(*kinds_column);
         return {};
     }
@@ -2421,7 +2421,7 @@ class lsm_sorted_run {
     /** The header of the run, from which every offset inside the extent follows. */
     sorted_run_header_t header_ {};
 
-    /** The sorted cells, read whole at open for a run whose cells carry values, none otherwise. */
+    /** The sorted cells, read whole at open for a run whose cells hold values, none otherwise. */
     st::vector<key_slot_t> cells_;
 
     /** One offset per key slot into the values section and one past the last, read whole at open, none for a run
@@ -2458,10 +2458,10 @@ class lsm_sorted_run {
     st::vector<std::uint64_t> layer_words_;
 
     /** The stamp @c assign_stamp gave the run, zero while its stamps are the ones
-     *  its extent carries. */
+     *  its extent holds. */
     std::uint64_t assigned_stamp_ = 0;
 
-    /** The range tombstones the run carries, read whole at open. */
+    /** The range tombstones the run holds, read whole at open. */
     range_tombstones_t range_tombstones_;
 
 #pragma endregion Private Members

@@ -7,7 +7,7 @@
  *
  *  Every row of the input becomes a blob keyed by the molecule's InChIKey UUID, holding its
  *  fingerprints back to back, and a string, its SMILES, mapping onto that UUID. The input is one
- *  Arrow IPC stream whose batches carry @c key as 16-byte fixed-size binary, @c smiles as binary,
+ *  Arrow IPC stream whose batches hold @c key as 16-byte fixed-size binary, @c smiles as binary,
  *  and @c fingerprints as fixed-size binary, read through the project's own codec. The database is
  *  opened through the C ABI alone, so one source measures every layout the library has shipped.
  *
@@ -341,13 +341,13 @@ int main(int argc, char** argv) {
     fmt::println("- loaded {} rows, {:.2f} GB of keys, SMILES and fingerprints", rows,
                  static_cast<double>(ingested_bytes) / 1e9);
 
-    auto maybe_executor = executor_t::make(static_cast<std::size_t>(settings.threads.value),
-                                           caller_exclusivity_t::caller_inclusive_k);
+    auto maybe_executor = ram_executor_t::make(static_cast<std::size_t>(settings.threads.value),
+                                               caller_exclusivity_t::caller_inclusive_k);
     if (!maybe_executor) {
         fmt::println(stderr, "Failed to spawn {} threads", settings.threads.value);
         return 1;
     }
-    executor_t& executor = *maybe_executor;
+    ram_executor_t& executor = *maybe_executor;
 
     // Every thread writes its share of batches into both collections; a sampler tracks the space.
     ustore_database_t database = nullptr;
@@ -474,7 +474,7 @@ int main(int argc, char** argv) {
     ustore_database_describe(&describe);
 
     // Point reads of random keys of the ingest, while a sampler reads the depth the drives see.
-    auto blobs_reads = [&](executor_t& readers, std::string const& name, std::size_t batch) {
+    auto blobs_reads = [&](ram_executor_t& readers, std::string const& name, std::size_t batch) {
         if (!settings.filter.selects(name)) return;
         std::atomic<bool> reading {true}, reported {false};
         std::uint64_t depth_sum = 0, depth_samples = 0, depth_peak = 0;
@@ -518,7 +518,7 @@ int main(int argc, char** argv) {
     };
     for (std::size_t const batch : {std::size_t {32}, std::size_t {1024}})
         blobs_reads(executor, fmt::format("pubchem_blobs_read_batch{}", batch), batch);
-    auto maybe_readers = executor_t::make(32, caller_exclusivity_t::caller_inclusive_k);
+    auto maybe_readers = ram_executor_t::make(32, caller_exclusivity_t::caller_inclusive_k);
     if (maybe_readers) blobs_reads(*maybe_readers, "pubchem_blobs_read_single_32_threads", 1);
     for (std::size_t const depth : {std::size_t {32}, std::size_t {1024}}) {
         std::string const strings_name = fmt::format("pubchem_strings_read_batch{}", depth);

@@ -85,16 +85,16 @@ status_t commit_page_edits(arguments_type_ const& arguments, view_t const& view,
     }
     // The buffer starts at one edit header per task and doubles past it when the edits outgrow it
     std::size_t const bytes = arguments.count * pages::edit_header_bytes_k;
-    if (status_t const committed = commit_alone(state, view.scratch, arguments.count, bytes,
-                                                watch_schedule_t::on_commit_k,
-                                                [&](call_access<cpu_class_> const& access) noexcept -> status_t {
-                                                    auto [edited, edits_status] = edits();
-                                                    if (edits_status.failed()) return edits_status;
-                                                    return land_page_edits(access, edited);
-                                                });
+    if (status_t const committed = commit_one_collection(
+            state, view.scratch, nvme_queues_of(view), arguments.count, bytes, watch_schedule_t::on_commit_k,
+            [&](call_access<cpu_class_> const& access) noexcept -> status_t {
+                auto [edited, edits_status] = edits();
+                if (edits_status.failed()) return edits_status;
+                return land_page_edits(access, edited);
+            });
         committed.failed())
         return committed;
-    return settle(state, arguments.durability);
+    return settle(state, arguments.durability, nvme_queues_of(view));
 }
 
 /** Implements @c ustore_pages_import, writing every imported page whole. */

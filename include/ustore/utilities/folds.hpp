@@ -45,13 +45,13 @@ constexpr bool removes(delta_kind_t kind) noexcept {
     return kind == delta_kind_t::remove_k || kind == delta_kind_t::remove_range_k;
 }
 
-/** One delta of a key: its kind and the bytes it carries. */
+/** One delta of a key: its kind and the bytes it holds. */
 struct delta_view_t {
 
     /** What the delta does to the value. */
     delta_kind_t kind = delta_kind_t::write_k;
 
-    /** The bytes the delta carries, empty for a removal. */
+    /** The bytes the delta holds, empty for a removal. */
     std::span<byte_t const> bytes;
 };
 

@@ -424,7 +424,7 @@ st::status_t metal_compactor_t::compact(compaction_kind_t kind,
                                         fold_type_ const& fold, device_fold_type_ const& device_fold,
                                         std::type_identity_t<located_value_reader<key_slot_type_>> read_value,
                                         compaction_output<key_slot_type_, allocator_type_>& output) noexcept {
-    // A key slot the bundles carry no kernels for merges on the host.
+    // A key slot the bundles hold no kernels for merges on the host.
     if constexpr (merge_kernel_names<key_slot_type_>::exported_k)
         return compact_on_device_(kind, upper, lower, extents, bounds, stamps, fold, device_fold, read_value, output);
     else return st::status_t::invalid_argument_k;

@@ -43,7 +43,7 @@ using namespace unum::ustore::utilities;
 constexpr std::size_t worker_threads_k = 4;
 
 /** The numbers every case mounts with: three channels for the stack and one for every worker thread. */
-constexpr fixture_config_t stress_config_k {.shared_io_channels = 3 + worker_threads_k + 1};
+constexpr fixture_config_t stress_config_k {.queues_threads = 3 + worker_threads_k + 1};
 
 /** Bytes every value takes: one counter, which names the commit that wrote it. */
 constexpr std::size_t value_bytes_k = 8;
@@ -56,7 +56,6 @@ using inline_slot_t = key_slot<stored_key_t, value_layout_t::inline_12_bytes_k>;
 template <typename fixture_type_>
 struct stress_stack {
     using fixture_t = fixture_type_;
-    using guard_t = typename fixture_t::guard_t;
     using volume_t = typename fixture_t::volume_t;
     using database_t = basic_single_collection_database<
         stored_key_t, volume_t, atomic_reference, waiter_t,
@@ -66,19 +65,19 @@ struct stress_stack {
     std::unique_ptr<fixture_t> fixture;
 
     /** The channel the database writes, flushes and commits on. */
-    guard_t writing;
+    io_channel_t* writing = nullptr;
 
     /** The second channel a compaction writes its new runs on. */
-    guard_t merging;
+    io_channel_t* merging = nullptr;
 
     /** The channel the calling thread reads on. */
-    guard_t reading;
+    io_channel_t* reading = nullptr;
 
     /** The volume every run and blob lands on, pinned so a database may point at it. */
     std::unique_ptr<volume_t> volume;
 
     /** The channel of the calling thread, which every read of this stack takes. */
-    [[nodiscard]] io_channel_t& channel() noexcept { return reading.channel(); }
+    [[nodiscard]] io_channel_t& channel() noexcept { return *reading; }
 };
 
 /** The database shape every case opens, whose small memory runs flush many times under the threads. */
@@ -100,7 +99,7 @@ void write_counter(std::uint64_t counter, std::span<byte_t> into) noexcept {
         into[index] = static_cast<byte_t>((counter >> (index * 8)) & 0xFFull);
 }
 
-/** The counter @p from carries, which is zero for a span shorter than one. */
+/** The counter @p from holds, which is zero for a span shorter than one. */
 [[nodiscard]] std::uint64_t read_counter(std::span<byte_t const> from) noexcept {
     if (from.size() < value_bytes_k) return 0;
     std::uint64_t counter = 0;
@@ -125,17 +124,17 @@ expected<std::unique_ptr<stress_stack<typename mount_type_::fixture_t>>> make_st
     if (mount_status.failed()) return mount_status;
     stack->fixture = std::move(fixture);
 
-    auto [writing, acquire_writing_status] = stack->fixture->channels.acquire();
+    auto [writing, acquire_writing_status] = stack->fixture->channel(0);
     if (acquire_writing_status.failed()) return acquire_writing_status;
     stack->writing = std::move(writing);
-    auto [merging, acquire_merging_status] = stack->fixture->channels.acquire();
+    auto [merging, acquire_merging_status] = stack->fixture->channel(1);
     if (acquire_merging_status.failed()) return acquire_merging_status;
     stack->merging = std::move(merging);
-    auto [reading, acquire_reading_status] = stack->fixture->channels.acquire();
+    auto [reading, acquire_reading_status] = stack->fixture->channel(2);
     if (acquire_reading_status.failed()) return acquire_reading_status;
     stack->reading = std::move(reading);
 
-    expected<volume_t> volume = stack->fixture->mount_volume(stack->writing.channel());
+    expected<volume_t> volume = stack->fixture->mount_volume(*stack->writing);
     if (!volume) return volume.status();
     stack->volume = std::unique_ptr<volume_t> {new (std::nothrow) volume_t {std::move(*volume)}};
     if (!stack->volume) return status_t {status_code_t::out_of_memory_k, "The volume did not fit"};
@@ -145,14 +144,14 @@ expected<std::unique_ptr<stress_stack<typename mount_type_::fixture_t>>> make_st
 /** Opens the database every case drives over the volume and the channels of @p stack. */
 template <typename stack_type_>
 expected<typename stack_type_::database_t::database_unique_ptr_t> open_over(stack_type_& stack) noexcept {
-    return stack_type_::database_t::open(*stack.volume, stack.writing.channel(), stack.merging.channel(),
-                                         stress_config(), stack.fixture->resources);
+    return stack_type_::database_t::open(*stack.volume, *stack.writing, *stack.merging, stress_config(),
+                                         stack.fixture->resources);
 }
 
 /**
  *  @brief Reads @p keys through one batched select of @p reader, the database itself or a transaction over it.
- *  @param[out] present Whether every key carries a value.
- *  @param[out] counters The counter every present key carries.
+ *  @param[out] present Whether every key holds a value.
+ *  @param[out] counters The counter every present key holds.
  */
 template <typename reader_type_>
 status_t read_counters(reader_type_& reader, io_channel_t& channel, std::span<stored_key_t const> keys,
@@ -186,12 +185,11 @@ status_t read_counters(reader_type_& reader, io_channel_t& channel, std::span<st
  *
  *  Every thread writes the same chunks in turn, each chunk with a counter naming the thread and the
  *  chunk, and rolls back and writes again a chunk a conflict refused. A batched read excludes the
- *  write path, so a chunk read whole must carry one counter, whichever commit landed last.
+ *  write path, so a chunk read whole must hold one counter, whichever commit landed last.
  */
 template <typename mount_type_>
 void test_chunks_land_whole(mount_type_ const& mount) {
     using stack_t = stress_stack<typename mount_type_::fixture_t>;
-    using guard_t = typename stack_t::guard_t;
     using database_t = typename stack_t::database_t;
     constexpr std::size_t chunks_k = 10;
     constexpr std::size_t keys_per_chunk_k = 100;
@@ -207,7 +205,7 @@ void test_chunks_land_whole(mount_type_ const& mount) {
     std::array<std::thread, worker_threads_k> workers;
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker)
         workers[worker] = std::thread {[&, worker]() noexcept {
-            expected<guard_t> guard = (*stack)->fixture->channels.acquire();
+            expected<io_channel_t*> guard = (*stack)->fixture->channel(3 + worker);
             expect_true(guard.has_value());
             if (!guard) return;
             expected<typename database_t::transaction_unique_ptr_t> changing = (*store)->create_transaction();
@@ -236,9 +234,8 @@ void test_chunks_land_whole(mount_type_ const& mount) {
                 }
                 expect_true(committed);
 
-                expect_true(
-                    read_counters(**store, guard->channel(), std::span<stored_key_t const> {keys}, present, counters)
-                        .succeeded());
+                expect_true(read_counters(**store, **guard, std::span<stored_key_t const> {keys}, present, counters)
+                                .succeeded());
                 for (std::size_t index = 0; index != present.size(); ++index) {
                     expect_true(present[index]);
                     expect_equal(counters[index], counters[0]);
@@ -282,7 +279,7 @@ struct record_t {
     /** The keys it touched, in the order it touched them. */
     st::vector<stored_key_t> keys;
 
-    /** Whether a read found each key carrying a value. */
+    /** Whether a read found each key holding a value. */
     st::vector<bool> present;
 
     /** The counter written under each key, or the one a read found there. */
@@ -305,7 +302,6 @@ struct record_order_t {
 template <typename mount_type_>
 void test_transactions_replay_in_commit_order(mount_type_ const& mount) {
     using stack_t = stress_stack<typename mount_type_::fixture_t>;
-    using guard_t = typename stack_t::guard_t;
     using database_t = typename stack_t::database_t;
     constexpr std::size_t keys_k = 512;
     constexpr std::size_t transactions_k = 100;
@@ -324,7 +320,7 @@ void test_transactions_replay_in_commit_order(mount_type_ const& mount) {
     std::array<std::thread, worker_threads_k> workers;
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker)
         workers[worker] = std::thread {[&, worker]() noexcept {
-            expected<guard_t> guard = (*stack)->fixture->channels.acquire();
+            expected<io_channel_t*> guard = (*stack)->fixture->channel(3 + worker);
             expect_true(guard.has_value());
             if (!guard) return;
             expected<typename database_t::transaction_unique_ptr_t> changing = (*store)->create_transaction();
@@ -349,7 +345,7 @@ void test_transactions_replay_in_commit_order(mount_type_ const& mount) {
                 }
 
                 if (kind == record_t::kind_t::read_k) {
-                    expect_true(read_counters(**changing, guard->channel(), std::span<stored_key_t const> {record.keys},
+                    expect_true(read_counters(**changing, **guard, std::span<stored_key_t const> {record.keys},
                                               record.present, record.counters)
                                     .succeeded());
                 }

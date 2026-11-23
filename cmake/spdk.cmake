@@ -8,7 +8,7 @@ if (NOT USTORE_SPDK_ROOT)
     message(FATAL_ERROR "USTORE_WITH_LINUX_SPDK needs USTORE_SPDK_ROOT, an SPDK tree with a finished build")
 endif ()
 if (NOT EXISTS "${USTORE_SPDK_ROOT}/include/spdk/nvme.h")
-    message(FATAL_ERROR "USTORE_SPDK_ROOT=${USTORE_SPDK_ROOT} carries no include/spdk/nvme.h")
+    message(FATAL_ERROR "USTORE_SPDK_ROOT=${USTORE_SPDK_ROOT} holds no include/spdk/nvme.h")
 endif ()
 
 find_package(PkgConfig REQUIRED)

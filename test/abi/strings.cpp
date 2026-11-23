@@ -4,9 +4,9 @@
  *  @date September 16, 2026
  *  @brief Unit tests of the strings modality, which maps variable-length strings onto keys of other collections.
  *
- *  Every case runs against a fresh collection of the strings modality. Strings carry explicit lengths
- *  throughout, so a zero byte inside one is stored and read back like any other, and every string maps onto a
- *  key the case derives from an integer.
+ *  Every case runs against a fresh collection of the strings modality. Strings hold explicit
+ *  lengths throughout, so a zero byte inside one is stored and read back like any other, and every
+ *  string maps onto a key the case derives from an integer.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
@@ -296,7 +296,7 @@ void expect_scan(fixture_t& fixture, std::string_view prefix, std::span<std::str
     for (std::size_t index = 0; index != wanted.size(); ++index) expect_equal(results[index], wanted[index]);
 }
 
-/** Short strings order exactly as their text, whatever byte values they carry. */
+/** Short strings order exactly as their text, whatever byte values they hold. */
 void test_strings_short_ordering(config_t const& config) {
     fixture_t fixture {config};
     if (!fixture.ready()) return;
@@ -517,8 +517,9 @@ void test_strings_shared_heads(config_t const& config) {
     return outcome;
 }
 
-/** Every modality shares one namespace of collection names, so a name a blobs collection carries is refused for a
- *  strings collection, and a name a strings collection carries is refused for a blobs collection. */
+/** Every modality shares one namespace of collection names, so a name a blobs collection
+ *  holds is refused for a strings collection, and a name a strings collection holds is
+ *  refused for a blobs collection. */
 void test_strings_name_taken_across_modalities(config_t const& config) {
     fixture_t fixture {config};
     if (!fixture.ready()) return;

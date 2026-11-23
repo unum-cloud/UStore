@@ -8,8 +8,9 @@
 
 #include "ustore/docs.h" // `ustore_docs_field_type_t`, `ustore_docs_modification_t`
 
-#include "engine.hpp" // `engine_t`, `docs_verbs<vendored_residency_t::host_k>`
-#include "lib.hpp"    // `route`, `open_cursor`, `free_cursor`, `enumerator_spelling`, `name_in`, `value_in`
+#include "docs_layer.hpp" // `docs_batches_t`, `json_documents_t`
+#include "engine.hpp"     // `engine_t`, `docs_verbs<vendored_residency_t::host_k>`
+#include "lib.hpp"        // `route`, `open_cursor`, `free_cursor`, `enumerator_spelling`, `name_in`, `value_in`
 
 namespace unum::ustore {
 
@@ -37,39 +38,122 @@ constexpr enumerator_spelling<ustore_docs_modification_t> docs_modification_name
 
 #pragma endregion Names
 
-/** Pulls the next page of @p cursor as @c pull does, narrowing through @p match, the walk's own
- *  match or the face a device pull shows it. */
+/** Copies the fields and column types @p arguments name into the arena @p cursor compiled its
+ *  match in, refusing missing fields and unknown types, so every pull gathers them as they
+ *  were at init. */
+status_t copy_columns(ustore_docs_cursor_init_t const& arguments, ustore_docs_cursor_handle_t& cursor) noexcept {
+    std::size_t const count = arguments.fields_count;
+    if (!count) return {};
+    ustore_arena_t const compiled = &cursor.cursor.compiled;
+    strings_arg_t fields;
+    if (status_t const gathered = gather_strings({arguments.fields, count}, compiled, fields); gathered.failed())
+        return gathered;
+    if (!fields || !arguments.columns_types)
+        return {status_code_t::invalid_argument_k, "Need the fields to gather and the types of their columns"};
+    auto [types, types_status] = arena_allocate<ustore_docs_field_type_t>(compiled, count);
+    if (types_status.failed()) return types_status;
+    auto [names, names_status] = arena_allocate<std::string_view>(compiled, count);
+    if (names_status.failed()) return names_status;
+    for (std::size_t field = 0; field != count; ++field) {
+        types[field] = arguments.columns_types[field];
+        bool known = false;
+        for (enumerator_spelling<ustore_docs_field_type_t> const& spelling : docs_field_type_names_k)
+            known = known || spelling.value == types[field];
+        if (!known) return {status_code_t::invalid_argument_k, "Unknown type of a column"};
+        std::string_view const name = string_of(fields[field]);
+        auto [copied, copied_status] = arena_copy<char>(compiled, std::span<char const> {name});
+        if (copied_status.failed()) return copied_status;
+        names[field] = std::string_view {copied.begin(), copied.end()};
+    }
+    cursor.columns = {names, types};
+    return {};
+}
+
+/** Fills @p batches with one batch of @p survivors, the keys a device pull's match kept, reading
+ *  their whole documents through the host verbs of @p engine when a column gathers. */
+status_t fill_survivors(engine_t const& engine, ustore_docs_cursor_next_t const& arguments,
+                        ustore_docs_cursor_handle_t const& cursor, keyed_survivors_t const& survivors,
+                        docs_batches_t& batches, view_t const& view) noexcept {
+    auto read_documents = [&](std::span<std::uint32_t const> picked, json_documents_t& documents) noexcept {
+        if (!engine.host.docs->read)
+            return status_t {status_code_t::unsupported_k, "The engine does not read documents"};
+        auto [keys, keys_status] = arena_allocate<ustore_key_t>(view.scratch, picked.size());
+        if (keys_status.failed()) return keys_status;
+        for (std::size_t index = 0; index != picked.size(); ++index) keys[index] = survivors[picked[index]];
+        documents = {};
+        documents.count = picked.size();
+        ustore_docs_read_t const read {.database = arguments.database,
+                                       .count = picked.size(),
+                                       .collections = {&cursor.cursor.collection, 0},
+                                       .keys = {keys.data(), sizeof(ustore_key_t)},
+                                       .presences = &documents.presences,
+                                       .values = &documents.tape,
+                                       .arena = view.scratch};
+        return engine.host.docs->read(read, strings_arg_t {}, view);
+    };
+    std::span<ustore_key_t const> const kept {survivors.begin(), survivors.end()};
+    return batches.fill_one<strings_kit_of<cpu_ladder_floor_k>>(kept, read_documents, view.scratch);
+}
+
+/**
+ *  @brief Pulls the next keys of @p cursor as @c pull does, narrowing through @p match, the walk's
+ *      own match or the face a device pull shows it.
+ *
+ *  A host pull hands the engine's docs scan the batches to fill, which an NVMe engine splits over
+ *  its executor's threads and every other engine fills on the calling thread; a device pull lists
+ *  its survivors first and fills one batch with them. A pull whose range kept no row moves on to
+ *  the next range, so only the walk's end hands out none.
+ */
 template <typename match_type_>
 status_t pull_through(engine_t const& engine, ustore_docs_cursor_next_t const& arguments,
                       ustore_docs_cursor_handle_t& cursor, match_type_ const& match, view_t const& view) noexcept {
-    if (!arguments.keys || !arguments.written)
-        return {status_code_t::invalid_argument_k, "Need outputs for the keys and the count written"};
-    if (arguments.values && !engine.host.docs->read)
-        return {status_code_t::unsupported_k, "The engine does not implement this call"};
-    keyed_survivors_t survivors {arena_allocator<ustore_key_t> {view.scratch}};
-    std::variant<ustore_key_t, exhausted_t> resume;
-    if (status_t const status = list_cursor_keys<ustore_docs_scan_t>(
-            engine, arguments.database, cursor, match, arguments.wanted, arguments.arena, view, survivors, resume);
-        status.failed())
-        return status;
-    match.rewind_page(arguments.arena);
-    std::size_t const written = survivors.size();
-    if (written && arguments.values) {
-        ustore_docs_read_t const read {.database = arguments.database,
-                                       .count = written,
-                                       .collections = {&cursor.cursor.collection, 0},
-                                       .keys = {survivors.data(), sizeof(ustore_key_t)},
-                                       .values = arguments.values,
-                                       .arena = arguments.arena};
-        if (status_t const status = engine.host.docs->read(read, strings_arg_t {}, view); status.failed())
-            return status;
+    if (!arguments.batches || !arguments.batches_count)
+        return {status_code_t::invalid_argument_k, "Need outputs for the batches and their count"};
+    constexpr bool host_k = std::is_same_v<match_type_, compiled_match<vendored_residency_t::host_k>>;
+    docs_batches_t batches {.columns = cursor.columns,
+                            .arena = arguments.arena,
+                            .strings = arguments.database->ceiling.strings,
+                            .resume = cursor.position};
+    if constexpr (host_k) batches.match = match.matches_everything() ? nullptr : &match;
+    ustore_key_t const* const end = cursor.end_key ? std::addressof(*cursor.end_key) : nullptr;
+    for (ustore_key_t const* start = std::get_if<ustore_key_t>(&batches.resume); start && arguments.wanted;
+         start = std::get_if<ustore_key_t>(&batches.resume)) {
+        match.rewind_page(arguments.arena);
+        ustore_key_t const from = *start;
+        if constexpr (host_k) {
+            ustore_length_t const* offsets = nullptr;
+            ustore_key_t const* keys = nullptr;
+            ustore_docs_scan_t const scan {.database = arguments.database,
+                                           .count = 1,
+                                           .collections = {&cursor.cursor.collection, 0},
+                                           .start_keys = {&from, 0},
+                                           .end_keys = {end, 0},
+                                           .direction = cursor.cursor.direction,
+                                           .offsets = &offsets,
+                                           .keys = &keys,
+                                           .arena = arguments.arena,
+                                           .wanted = arguments.wanted};
+            if (status_t const status = engine.host.docs->scan(scan, &batches, view); status.failed()) return status;
+        }
+        else {
+            keyed_survivors_t survivors {arena_allocator<ustore_key_t> {view.scratch}};
+            std::variant<ustore_key_t, exhausted_t> resume;
+            if (status_t const status = list_matched_keys<ustore_docs_scan_t>(
+                    engine.host, arguments.database, cursor.cursor.collection, from, end, cursor.cursor.direction,
+                    arguments.wanted, match, arguments.arena, view, survivors, resume);
+                status.failed())
+                return status;
+            match.rewind_page(arguments.arena);
+            if (status_t const status = fill_survivors(engine, arguments, cursor, survivors, batches, view);
+                status.failed())
+                return status;
+            batches.resume = resume;
+        }
+        if (batches.rows()) break;
     }
-    auto [keys, keys_status] = arena_copy<ustore_key_t>(arguments.arena, survivors);
-    if (keys_status.failed()) return keys_status;
     if (!progress_t {arguments.progress, arguments.progress_state, 1}.advance(1)) return progress_cancelled_k;
-    cursor.position = resume;
-    *arguments.keys = keys.data();
-    *arguments.written = written;
+    cursor.position = batches.resume;
+    batches.finish(arguments.batches, arguments.batches_count);
     return {};
 }
 
@@ -94,6 +178,11 @@ void ustore_docs_cursor_next(ustore_docs_cursor_next_t* arguments) { route(argum
 void ustore_docs_cursor_init(ustore_docs_cursor_init_t* arguments) {
     auto [cursor, status] = open_cursor<ustore_docs_cursor_handle_t, docs_verbs, ustore_docs_scan_t>(*arguments);
     if (status.failed()) return finish(*arguments->outcome, status);
+    if (status_t const copied = copy_columns(*arguments, *cursor); copied.failed()) {
+        free_cursor(cursor);
+        *arguments->cursor = nullptr;
+        return finish(*arguments->outcome, copied);
+    }
     cursor->position = arguments->start_key;
     *arguments->cursor = cursor;
     finish(*arguments->outcome, {});

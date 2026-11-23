@@ -44,7 +44,7 @@ using namespace unum::ustore::utilities;
 
 /** The numbers every case mounts with: channels for a compaction to hold two, the case one, and every worker thread
  *  one. */
-constexpr fixture_config_t scdb_config_k {.shared_io_channels = 8};
+constexpr fixture_config_t scdb_config_k {.queues_threads = 8};
 
 /** Threads the concurrency cases drive the database on. */
 constexpr std::size_t worker_threads_k = 4;
@@ -60,7 +60,6 @@ using variable_slot_t = key_slot<stored_key_t, value_layout_t::variable_width_k>
 template <typename fixture_type_>
 struct scdb_types {
     using fixture_t = fixture_type_;
-    using guard_t = typename fixture_t::guard_t;
     using volume_t = typename fixture_t::volume_t;
     using variable_database_t = basic_single_collection_database<
         stored_key_t, volume_t, atomic_reference, waiter_t,
@@ -75,19 +74,19 @@ struct scdb_types {
         std::unique_ptr<fixture_t> fixture;
 
         /** The channel the database writes, flushes and commits on. */
-        guard_t writing;
+        io_channel_t* writing = nullptr;
 
         /** The second channel a compaction writes its new runs on. */
-        guard_t merging;
+        io_channel_t* merging = nullptr;
 
         /** The channel the calling thread reads on. */
-        guard_t reading;
+        io_channel_t* reading = nullptr;
 
         /** The volume every run and blob lands on, pinned so a database may point at it. */
         std::unique_ptr<volume_t> volume;
 
         /** The channel of the calling thread, which every read of this stack takes. */
-        [[nodiscard]] io_channel_t& channel() noexcept { return reading.channel(); }
+        [[nodiscard]] io_channel_t& channel() noexcept { return *reading; }
     };
 };
 
@@ -120,7 +119,7 @@ void write_counter(std::uint64_t counter, std::span<byte_t> into) noexcept {
         into[index] = static_cast<byte_t>((counter >> (index * 8)) & 0xFFull);
 }
 
-/** The counter @p from carries, which is zero for a span shorter than one. */
+/** The counter @p from holds, which is zero for a span shorter than one. */
 [[nodiscard]] std::uint64_t read_counter(std::span<byte_t const> from) noexcept {
     if (from.size() < counter_bytes_k) return 0;
     std::uint64_t counter = 0;
@@ -147,17 +146,17 @@ expected<std::unique_ptr<typename scdb_types<typename mount_type_::fixture_t>::s
     if (mount_status.failed()) return mount_status;
     stack->fixture = std::move(fixture);
 
-    auto [writing, acquire_writing_status] = stack->fixture->channels.acquire();
+    auto [writing, acquire_writing_status] = stack->fixture->channel(0);
     if (acquire_writing_status.failed()) return acquire_writing_status;
     stack->writing = std::move(writing);
-    auto [merging, acquire_merging_status] = stack->fixture->channels.acquire();
+    auto [merging, acquire_merging_status] = stack->fixture->channel(1);
     if (acquire_merging_status.failed()) return acquire_merging_status;
     stack->merging = std::move(merging);
-    auto [reading, acquire_reading_status] = stack->fixture->channels.acquire();
+    auto [reading, acquire_reading_status] = stack->fixture->channel(2);
     if (acquire_reading_status.failed()) return acquire_reading_status;
     stack->reading = std::move(reading);
 
-    expected<volume_t> volume = stack->fixture->mount_volume(stack->writing.channel());
+    expected<volume_t> volume = stack->fixture->mount_volume(*stack->writing);
     if (!volume) return volume.status();
     stack->volume = std::unique_ptr<volume_t> {new (std::nothrow) volume_t {std::move(*volume)}};
     if (!stack->volume) return status_t {status_code_t::out_of_memory_k, "The volume did not fit"};
@@ -171,11 +170,10 @@ expected<typename database_type_::database_unique_ptr_t> open_over(
     stack_type_& stack, single_collection_database_config_t const& config) noexcept {
     using volume_t = typename std::remove_reference_t<decltype(*stack.volume)>;
     *stack.volume = volume_t {};
-    auto [volume, mount_status] = stack.fixture->mount_volume(stack.writing.channel());
+    auto [volume, mount_status] = stack.fixture->mount_volume(*stack.writing);
     if (mount_status.failed()) return mount_status;
     *stack.volume = std::move(volume);
-    return database_type_::open(*stack.volume, stack.writing.channel(), stack.merging.channel(), config,
-                                stack.fixture->resources);
+    return database_type_::open(*stack.volume, *stack.writing, *stack.merging, config, stack.fixture->resources);
 }
 
 #pragma endregion Fixtures
@@ -572,12 +570,11 @@ case_result_t test_reopen_agrees_on_its_schema(mount_type_ const& mount) {
  *  @brief A reader passing over every key sees the whole of a commit or none of it.
  *
  *  Every pass is one batched select, which holds the read path for all of its keys, so a pass that
- *  carried two versions at once would be a commit landing in the middle of a reader.
+ *  held two versions at once would be a commit landing in the middle of a reader.
  */
 template <typename mount_type_>
 void test_commit_lands_all_or_nothing(mount_type_ const& mount) {
     using types_t = scdb_types<typename mount_type_::fixture_t>;
-    using guard_t = typename types_t::guard_t;
     using variable_database_t = typename types_t::variable_database_t;
     using stack_t = typename types_t::stack_t;
     constexpr std::size_t keys_k = 48;
@@ -601,7 +598,7 @@ void test_commit_lands_all_or_nothing(mount_type_ const& mount) {
     if (!expect_true((*store)->flush().succeeded())) return;
 
     std::thread writer {[&]() noexcept {
-        expected<guard_t> guard = (*stack)->fixture->channels.acquire();
+        expected<io_channel_t*> guard = (*stack)->fixture->channel(3);
         expect_true(guard.has_value());
         if (!guard) return;
 
@@ -625,15 +622,15 @@ void test_commit_lands_all_or_nothing(mount_type_ const& mount) {
     std::size_t passes = 0;
     st::vector<stored_key_t> keys;
     st::vector<lookup_result_t> results;
-    st::vector<byte_t> carried;
+    st::vector<byte_t> held;
     expect_true(keys.resize(keys_k) == st::status_t::success_k);
     expect_true(results.resize(keys_k) == st::status_t::success_k);
-    expect_true(carried.resize(keys_k * value_bytes_k) == st::status_t::success_k);
+    expect_true(held.resize(keys_k * value_bytes_k) == st::status_t::success_k);
     for (stored_key_t key = 0; key != keys_k; ++key) keys[static_cast<std::size_t>(key)] = key;
 
     auto sink = [&](std::size_t request, std::uint64_t offset, std::span<byte_t const> bytes) noexcept {
         for (std::size_t index = 0; index != bytes.size(); ++index)
-            carried[request * value_bytes_k + static_cast<std::size_t>(offset) + index] = bytes[index];
+            held[request * value_bytes_k + static_cast<std::size_t>(offset) + index] = bytes[index];
     };
     while (passes != 400) {
         expect_true((*store)
@@ -646,7 +643,7 @@ void test_commit_lands_all_or_nothing(mount_type_ const& mount) {
             for (std::size_t request = 0; request != keys_k; ++request) {
                 std::size_t same = 0;
                 for (std::size_t index = 0; index != value_bytes_k; ++index)
-                    same += carried[request * value_bytes_k + index] == painted(version, index);
+                    same += held[request * value_bytes_k + index] == painted(version, index);
                 matching += same == value_bytes_k;
             }
             versions_seen += matching != 0;
@@ -715,7 +712,7 @@ void test_conflict_keeps_its_changes(mount_type_ const& mount) {
     expect_true((*second)->select((*stack)->channel(), contested_k, std::span<byte_t> {seen}, size).succeeded());
     expect_equal(read_counter(std::span<byte_t const> {seen}), std::uint64_t {202});
 
-    // The database still carries only what the winner wrote.
+    // The database still holds only what the winner wrote.
     expect_true((*store)->select((*stack)->channel(), contested_k, std::span<byte_t> {seen}, size).succeeded());
     expect_equal(read_counter(std::span<byte_t const> {seen}), std::uint64_t {101});
 
@@ -810,7 +807,6 @@ void test_rollback_and_renew_behave(mount_type_ const& mount) {
 template <typename mount_type_>
 void test_transactions_serialize_under_threads(mount_type_ const& mount) {
     using types_t = scdb_types<typename mount_type_::fixture_t>;
-    using guard_t = typename types_t::guard_t;
     using variable_database_t = typename types_t::variable_database_t;
     using stack_t = typename types_t::stack_t;
     constexpr std::size_t keys_k = 4;
@@ -835,7 +831,7 @@ void test_transactions_serialize_under_threads(mount_type_ const& mount) {
     std::array<std::thread, worker_threads_k> workers;
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker)
         workers[worker] = std::thread {[&, worker]() noexcept {
-            expected<guard_t> guard = (*stack)->fixture->channels.acquire();
+            expected<io_channel_t*> guard = (*stack)->fixture->channel(3 + worker);
             expect_true(guard.has_value());
             if (!guard) return;
 
@@ -849,8 +845,7 @@ void test_transactions_serialize_under_threads(mount_type_ const& mount) {
                 stored_key_t const key = static_cast<stored_key_t>((round + worker) % keys_k);
                 for (std::size_t attempt = 0; attempt != 256; ++attempt) {
                     stored_value_size_t size = 0;
-                    if (!expect_true(
-                            (*changing)->select(guard->channel(), key, std::span<byte_t> {seen}, size).succeeded()))
+                    if (!expect_true((*changing)->select(**guard, key, std::span<byte_t> {seen}, size).succeeded()))
                         break;
                     write_counter(read_counter(std::span<byte_t const> {seen}) + 1, std::span<byte_t> {raised});
                     if (!expect_true((*changing)->insert(key, std::span<byte_t const> {raised}).succeeded())) break;
@@ -893,7 +888,6 @@ void test_transactions_serialize_under_threads(mount_type_ const& mount) {
 template <typename mount_type_>
 void test_snapshot_sees_its_moment(mount_type_ const& mount) {
     using types_t = scdb_types<typename mount_type_::fixture_t>;
-    using guard_t = typename types_t::guard_t;
     using variable_database_t = typename types_t::variable_database_t;
     using stack_t = typename types_t::stack_t;
     constexpr std::size_t bytes_k = 700;
@@ -925,7 +919,7 @@ void test_snapshot_sees_its_moment(mount_type_ const& mount) {
     expect_equal((*store)->memory_deltas_count(), std::size_t {8});
 
     std::thread writer {[&]() noexcept {
-        expected<guard_t> guard = (*stack)->fixture->channels.acquire();
+        expected<io_channel_t*> guard = (*stack)->fixture->channel(3);
         expect_true(guard.has_value());
         if (!guard) return;
         for (stored_key_t key = 0; key != 8; ++key)
@@ -951,7 +945,7 @@ void test_snapshot_sees_its_moment(mount_type_ const& mount) {
     writer.join();
     expect_true((*store)->find(stored_key_t {100}, missing) == lookup_result_t::written_k);
 
-    // The database itself moved on, and every key of it now carries the newer bytes.
+    // The database itself moved on, and every key of it now holds the newer bytes.
     for (stored_key_t key = 0; key != 8; ++key) {
         stored_value_size_t size = 0;
         expect_true((*store)->select((*stack)->channel(), key, std::span<byte_t> {into}, size).succeeded());

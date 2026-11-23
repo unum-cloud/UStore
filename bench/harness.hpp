@@ -4,9 +4,10 @@
  *  @date September 30, 2026
  *  @brief Timed loops, latency histograms, result rows and the flags every benchmark shares.
  *
- *  A row runs one body on every thread of an @c executor_t, each thread iterating its own @c loop_t
- *  in a range-for, and folds the loops into one @c row_t. Setup above the range-for stays untimed.
- *  Every call lands in its thread's latency histogram, so p50, p99 and p99.9 cost no shared writes.
+ *  A row runs one body on every thread of an @c ram_executor_t, each thread iterating its own
+ *  @c loop_t in a range-for, and folds the loops into one @c row_t. Setup above the range-for
+ *  stays untimed. Every call lands in its thread's latency histogram, so p50, p99 and p99.9
+ *  cost no shared writes.
  *
  *  Every benchmark takes these settings beside its own, each a <tt>--flag</tt> overriding its
  *  <tt>USTORE_</tt> variable, and echoes them all as "- Name: value" before its rows:
@@ -46,7 +47,7 @@
 
 #include <smashtable/basic_vector.hpp>
 
-#include "ustore/utilities/ram_device.hpp" // `executor_t`
+#include "ustore/utilities/ram_device.hpp" // `ram_executor_t`
 
 #include "arguments.hpp"
 
@@ -419,7 +420,7 @@ class loop_t {
  *  @param[in] body Called as `body(loop, thread)` on each thread; setup above its loop stays untimed.
  */
 template <typename body_type_>
-[[nodiscard]] row_t run_threads(executor_t& executor, bench_settings_t const& settings, std::string_view name,
+[[nodiscard]] row_t run_threads(ram_executor_t& executor, bench_settings_t const& settings, std::string_view name,
                                 body_type_&& body) noexcept {
     st::vector<loop_t> loops;
     if (st::failed(loops.resize(executor.threads_count()))) return {.name = name, .skipped = "no memory for loops"};
@@ -437,7 +438,7 @@ template <typename body_type_>
  *  @param[in] body Called as `body(loop, thread)` on each thread; setup above its loop stays untimed.
  */
 template <typename body_type_>
-[[nodiscard]] row_t run_pass(executor_t& executor, std::string_view name, std::size_t count,
+[[nodiscard]] row_t run_pass(ram_executor_t& executor, std::string_view name, std::size_t count,
                              body_type_&& body) noexcept {
     st::vector<loop_t> loops;
     std::size_t const threads = executor.threads_count();

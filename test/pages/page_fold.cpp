@@ -335,11 +335,11 @@ void test_edit_codec() {
             expect_true(edit.modification == wanted.modification);
             expect_true(edit.placement == placement_t {wanted.stamp, wanted.sequence});
             expect_true(edit.element == wanted.element);
-            if (carries_position(edit.modification))
+            if (has_position(edit.modification))
                 expect_true(edit.parent == wanted.parent && edit.anchor == wanted.anchor);
             if (edit.modification == modification_t::splice_k)
                 expect_true(edit.text_start == wanted.text_start && edit.text_length == wanted.text_length);
-            if (carries_field(edit.modification)) expect_true(edit.field == wanted.field);
+            if (has_field(edit.modification)) expect_true(edit.field == wanted.field);
             if (edit.modification == modification_t::splice_k || edit.modification == modification_t::set_attributes_k)
                 expect_true(string_of(edit.value) == wanted.value);
             if (edit.modification == modification_t::insert_k || edit.modification == modification_t::import_k) {

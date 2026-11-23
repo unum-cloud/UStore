@@ -116,9 +116,9 @@ def test_blobs_copy_out_of_a_one_off_arena(database, arena):
     gc.collect()
     assert poster == b"first"
     assert batch == [b"first", b"second"]
-    borrowed = database.read([1, 2], arena, collection="posters")
-    assert isinstance(borrowed[0], memoryview)
-    assert [bytes(value) for value in borrowed] == batch
+    viewed = database.read([1, 2], arena, collection="posters")
+    assert isinstance(viewed[0], memoryview)
+    assert [bytes(value) for value in viewed] == batch
 
 
 def test_deleting_removes_and_never_creates(database):

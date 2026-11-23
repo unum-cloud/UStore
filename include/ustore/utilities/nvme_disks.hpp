@@ -53,7 +53,6 @@
 
 #include <bit>      // `std::has_single_bit`
 #include <concepts> // `std::same_as`
-#include <limits>   // `std::numeric_limits`
 #include <span>     // `std::span`
 #include <utility>  // `std::move`
 
@@ -61,7 +60,7 @@
 #include <smashtable/basic_vector.hpp>     // `st::vector`
 
 #include "ustore/utilities/blocking_files.hpp" // `native_file_t`, `open_native_file`, `native_file_event_t`
-#include "ustore/utilities/nvme_ring.hpp" // `request_t`, `completion_t`, `queue_pair_t`, `extent_t`, `is_address_aligned`
+#include "ustore/utilities/nvme_ring.hpp" // `request_t`, `completion_t`, `queue_ref_t`, `extent_t`, `is_address_aligned`
 #include "ustore/utilities/ram_buffers.hpp" // `aligned_allocator`, `constrained_allocator`, `resource_constraint`
 #include "ustore/utilities/types.hpp"       // `status_t`, `status_code_t`, `expected`, `byte_t`
 
@@ -75,46 +74,36 @@ namespace unum::ustore::utilities {
  *  @brief The moves a transport implements, from which @c basic_disk builds a whole ring.
  *
  *  Every call is synchronous and thread-safe for distinct extents, which positioned reads and
- *  writes are on every platform. Media sit in a table sized once by @c reserve_media and filled at
- *  the slot the disk names, so registering one never moves the table under a reader of another.
- *  A transfer names the lane of the queue pair polling it, below the count @c reserve_queue_pairs
- *  sized, so a device keeps whatever each polling thread waits on without allocating once warm.
- *  Asynchrony is the ring's business, not the device's, so a device that already has a queue of its
- *  own implements the ring directly instead of satisfying this.
+ *  writes are on every platform. Media sit in a table sized once by @c reserve_media and filled
+ *  at the slot the disk names, so registering one never moves the table under a reader of
+ *  another. A transfer names the event of the queue polling it, which the queue's thread owns, so
+ *  a device keeps nothing per polling thread. Asynchrony is the ring's business, not the
+ *  device's, so a device that already has a queue of its own implements the ring directly instead
+ *  of satisfying this.
  */
 template <typename device_type_>
 concept block_device_concept = requires(device_type_& device, device_type_ const& constant, medium_options_t medium,
-                                        std::uint16_t index, std::uint16_t lane, std::size_t count, extent_t extent,
-                                        std::span<byte_t> destination, std::span<byte_t const> source) {
+                                        std::uint16_t index, native_file_event_t const& event, std::size_t count,
+                                        extent_t extent, std::span<byte_t> destination,
+                                        std::span<byte_t const> source) {
     { device.reserve_media(count) } -> std::same_as<status_t>;
-    { device.reserve_queue_pairs(count) } -> std::same_as<status_t>;
     { device.open_medium(index, medium) } -> std::same_as<status_t>;
     { device.close_medium(index) } -> std::same_as<status_t>;
-    { device.read_extent(index, extent, destination, lane) } -> std::same_as<expected<std::uint64_t>>;
-    { device.write_extent(index, extent, source, lane) } -> std::same_as<expected<std::uint64_t>>;
+    { device.read_extent(index, extent, destination, event) } -> std::same_as<expected<std::uint64_t>>;
+    { device.write_extent(index, extent, source, event) } -> std::same_as<expected<std::uint64_t>>;
     { device.flush(index) } -> std::same_as<status_t>;
     { device.deallocate_extent(index, extent) } -> std::same_as<status_t>;
     { constant.capacity(index) } -> std::same_as<std::uint64_t>;
     { constant.logical_block_bytes(index) } -> std::same_as<std::uint64_t>;
-    { constant.capabilities() } -> std::same_as<ring_capabilities_t>;
+    { constant.capabilities() } -> std::same_as<disk_capabilities_t>;
 };
-
-/** The thread index a caller outside every executor reads with, past any executor's threads, so it shares the
- *  channels and the epoch slots threads of no executor take. */
-inline constexpr std::size_t outside_executor_k = (std::numeric_limits<std::size_t>::max)();
 
 #pragma endregion Devices
 
 #pragma region Configuration
 
-/** What a mount fixes about a disk's ring before any queue pair queue pairs a share of it. */
+/** What a mount fixes about a disk's ring before any queue holds it. */
 struct disk_config_t {
-
-    /** Leases the ring hands out at once, bounded on a real controller by its queue-pair count. */
-    std::uint16_t queue_pairs_limit = 1;
-
-    /** Requests one queue pair may keep in flight, which is the credit a queue pair spends and polls back. */
-    queue_depth_t depth_limit = 64;
 
     /** Memory ranges the disk pins at once, which a transport registering one arena keeps at one. */
     std::uint16_t registered_memory_limit = 8;
@@ -125,15 +114,172 @@ struct disk_config_t {
 
 #pragma endregion Configuration
 
+#pragma region Queue
+
+/**
+ *  @brief One queue of the positioned-I/O floor, owned by a thread: the requests it submitted, the
+ *      completions its poll performed, and the event a Windows transfer of that thread waits on.
+ *
+ *  The queue knows no disk. A call names it through a @c queue_ref_t to whichever disk it reads,
+ *  and that disk's poll performs the requests on the thread owning the queue, so the queue pays for
+ *  its own I/O. Every file disk serves it besides its own queue, which is how a call without an
+ *  executor reads through no ring at all.
+ */
+class blocking_queue_t {
+  public:
+
+    blocking_queue_t() noexcept = default;
+    blocking_queue_t(blocking_queue_t const&) = delete;
+    blocking_queue_t& operator=(blocking_queue_t const&) = delete;
+    blocking_queue_t(blocking_queue_t&&) noexcept = default;
+    blocking_queue_t& operator=(blocking_queue_t&&) noexcept = default;
+
+    /**
+     *  @brief A queue of @p depth requests whose own blocks are @p range.
+     *  @param[in] depth Requests the queue keeps in flight at once.
+     *  @param[in] range The thread's blocks, which requests naming @c queue_range_k
+     *      address, or empty.
+     */
+    static expected<blocking_queue_t> make(queue_depth_t depth, std::span<byte_t> range) noexcept {
+        if (depth == 0) return status_t {status_code_t::invalid_argument_k, "A queue keeps a request in flight"};
+        blocking_queue_t queue;
+        if (queue.pending_.resize(depth) != st::status_t::success_k ||
+            queue.ready_.resize(depth) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "A queue could not size its windows"};
+        auto [event, make_event_status] = native_file_event_t::make();
+        if (make_event_status.failed()) return make_event_status;
+        queue.event_ = std::move(event);
+        queue.depth_ = depth;
+        queue.pinned_staging_ = range;
+        return queue;
+    }
+
+    /** Requests the queue keeps in flight at once. */
+    [[nodiscard]] queue_depth_t depth() const noexcept { return depth_; }
+
+    /** The thread's blocks, which a request naming @c queue_range_k addresses. */
+    [[nodiscard]] std::span<byte_t> range() const noexcept { return pinned_staging_; }
+
+    /** What a Windows transfer of this queue waits on. */
+    [[nodiscard]] native_file_event_t const& event() const noexcept { return event_; }
+
+    /** Requests submitted and not yet polled. */
+    [[nodiscard]] std::size_t outstanding() const noexcept { return pending_count_ + ready_count_; }
+
+    /** Takes as much of @p requests as the queue has credit for, handing each one taken to @p
+     *  view. */
+    template <typename view_type_>
+    std::size_t take(std::span<request_t const> requests, view_type_&& view) noexcept {
+        std::size_t const room = depth_ - outstanding();
+        std::size_t const taking = requests.size() < room ? requests.size() : room;
+        for (std::size_t index = 0; index != taking; ++index) {
+            pending_[pending_count_ + index] = requests[index];
+            view(requests[index]);
+        }
+        pending_count_ += static_cast<std::uint32_t>(taking);
+        return taking;
+    }
+
+    /** Performs every pending request through @p perform, gives each one's view back through @p
+     *  restore, and moves the completions into @p into, oldest first. */
+    template <typename perform_type_, typename restore_type_>
+    std::size_t poll(std::span<completion_t> into, perform_type_&& perform, restore_type_&& restore) noexcept {
+        perform_pending_(perform, restore);
+        std::size_t const moving = into.size() < ready_count_ ? into.size() : ready_count_;
+        for (std::size_t index = 0; index != moving; ++index) into[index] = ready_[(ready_first_ + index) % depth_];
+        ready_first_ = static_cast<std::uint32_t>((ready_first_ + moving) % depth_);
+        ready_count_ -= static_cast<std::uint32_t>(moving);
+        return moving;
+    }
+
+    /** Performs and discards everything outstanding, and forgets a cancellation, so the queue
+     *  starts afresh. */
+    template <typename perform_type_, typename restore_type_>
+    void drain(perform_type_&& perform, restore_type_&& restore) noexcept {
+        perform_pending_(perform, restore);
+        ready_first_ = 0;
+        ready_count_ = 0;
+        cancelled_ = 0;
+    }
+
+    /** Stops the requests that have not started, which the next poll reports cancelled. */
+    void cancel() noexcept { cancelled_ = 1; }
+
+  private:
+
+    /** The completion a request gets when its queue cancelled it, or a chain ahead of it was cut.
+     *  */
+    [[nodiscard]] static completion_t cancelled_completion_(request_t const& request) noexcept {
+        completion_t completion;
+        completion.token = request.token;
+        completion.state = completion_state_t::cancelled_k;
+        completion.status = {status_code_t::uninitialized_k, "The queue_pair cancelled this request"};
+        return completion;
+    }
+
+    /**
+     *  @brief Performs everything submitted in submission order, staging the completions
+     *      for the poll.
+     *
+     *  Every request runs on the thread that polls it, so a chain gets the ordering it was promised
+     *  and nothing here forks: a pool dispatch admits one caller at a time, so fanning a batch out
+     *  here would serialize two queues against each other.
+     */
+    template <typename perform_type_, typename restore_type_>
+    void perform_pending_(perform_type_& perform, restore_type_& restore) noexcept {
+        std::uint32_t const count = pending_count_;
+        bool chain_broken = false;
+        for (std::uint32_t index = 0; index != count; ++index) {
+            request_t const& request = pending_[index];
+            completion_t const completion = cancelled_ != 0 || chain_broken ? cancelled_completion_(request)
+                                                                            : perform(request);
+            ready_[(ready_first_ + ready_count_ + index) % depth_] = completion;
+            restore(request);
+            chain_broken = request.chaining == request_chaining_t::chained_k &&
+                           (chain_broken || completion.state != completion_state_t::completed_k);
+        }
+        ready_count_ += count;
+        pending_count_ = 0;
+    }
+
+    /** Zero while the queue wants its requests, one once it has cancelled them until its drain. */
+    std::int32_t cancelled_ = 0;
+
+    /** Requests the queue keeps in flight at once. */
+    queue_depth_t depth_ = 0;
+
+    /** Requests submitted and not yet performed, at the front of @c pending_. */
+    std::uint32_t pending_count_ = 0;
+
+    /** Where the oldest unreaped completion sits inside @c ready_. */
+    std::uint32_t ready_first_ = 0;
+
+    /** Completions performed and not yet polled. */
+    std::uint32_t ready_count_ = 0;
+
+    /** The submitted requests. */
+    st::vector<request_t> pending_;
+
+    /** The performed completions, read as a circle. */
+    st::vector<completion_t> ready_;
+
+    /** What a Windows transfer of this queue waits on, empty elsewhere. */
+    native_file_event_t event_;
+
+    /** The thread's blocks, which a request naming @c queue_range_k addresses. */
+    std::span<byte_t> pinned_staging_;
+};
+
+#pragma endregion Queue
+
 #pragma region Disk
 
 /**
  *  @brief Turns a positioned-I/O device into the submission and completion ring callers drive.
  *
- *  Depth is partitioned rather than pooled: every queue pair reserves @c depth_limit requests of
- *  its own, so one queue pair that stops polling cannot starve another, and a full ring is always
- *  the queue pair's own doing. Completions are routed by the queue pair bits of their token and
- *  never appear in another queue pair's poll.
+ *  Depth is partitioned rather than pooled: every queue keeps its own depth of requests, so one
+ *  queue that stops polling cannot starve another, and a full ring is always the queue's own doing.
+ *  A completion lands only in the queue that submitted its request.
  *
  *  Ordering between two submitted requests is never promised. Two writes may reach the medium in
  *  either order, and a flush covers only what the queue pair has already completed, so
@@ -141,7 +287,8 @@ struct disk_config_t {
  *  says so with @c request_chaining_t::chained_k, which runs the chain in submission order and
  *  cuts it with @c cancelled_k at the first short or failed result.
  *
- *  @tparam atomic_reference_ The reference the claim, cancellation and in-flight words are owned through.
+ *  @tparam atomic_reference_ The reference the claim, cancellation and in-submitted words
+ *      are owned through.
  *  @tparam waiter_type_ What a core does while another thread takes or vacates a record of
  *      the same pool.
  */
@@ -153,6 +300,9 @@ class basic_disk {
     /** The budget the disk's pools are charged to. */
     using constraint_t = resource_constraint<atomic_reference_>;
 
+    /** The queue a thread owns for this transport. */
+    using queue_t = blocking_queue_t;
+
     basic_disk(basic_disk const&) = delete;
     basic_disk& operator=(basic_disk const&) = delete;
     basic_disk(basic_disk&&) noexcept = default;
@@ -161,108 +311,54 @@ class basic_disk {
     /**
      *  @brief Mounts @p device behind a ring shaped by @p config.
      *  @param[in] device The transport, moved in and owned by the disk from here on.
-     *  @param[in] config Leases, per-queue pair depth, and the pinned ranges and media the ring holds.
-     *  @param[in,out] constraint The budget the queue pair, range and medium pools are charged to,
+     *  @param[in] config The pinned ranges and media the ring holds.
+     *  @param[in,out] constraint The budget the range and medium pools are charged to,
      *      outliving the disk.
      */
     static expected<basic_disk> make(device_type_&& device, disk_config_t const& config,
                                      constraint_t& constraint) noexcept {
-        if (config.queue_pairs_limit == 0 || config.depth_limit == 0)
-            return status_t {status_code_t::invalid_argument_k, "A ring needs a queue pair and a request of depth"};
-        if (config.queue_pairs_limit == static_cast<std::uint16_t>(queue_pair_id_t::unallocated_k) ||
-            config.registered_memory_limit == static_cast<std::uint16_t>(registered_memory_id_t::unregistered_k) ||
+        if (config.registered_memory_limit >= static_cast<std::uint16_t>(registered_memory_id_t::queue_range_k) ||
             config.media_limit == static_cast<std::uint16_t>(registered_medium_id_t::unregistered_k))
-            return status_t {status_code_t::invalid_argument_k, "A ring keeps one identifier for an empty handle"};
+            return status_t {status_code_t::invalid_argument_k,
+                             "A ring keeps its last identifiers for special handles"};
         if (config.media_limit == 0)
             return status_t {status_code_t::invalid_argument_k, "A ring needs a medium to move bytes against"};
 
-        std::size_t const window = static_cast<std::size_t>(config.queue_pairs_limit) * config.depth_limit;
-        basic_disk disk {std::move(device), config};
+        basic_disk disk {std::move(device)};
         allocator_t const allocator {constraint};
-        if (status_t const made = make_pool_(disk.queue_pairs_, config.queue_pairs_limit, allocator); made.failed())
-            return made;
         if (status_t const made = make_pool_(disk.registered_memories_, config.registered_memory_limit, allocator);
             made.failed())
             return made;
         if (status_t const made = make_pool_(disk.media_, config.media_limit, allocator); made.failed()) return made;
         if (status_t const reserved = disk.device_.reserve_media(config.media_limit); reserved.failed())
             return reserved;
-        if (status_t const reserved = disk.device_.reserve_queue_pairs(config.queue_pairs_limit); reserved.failed())
-            return reserved;
-        if (status_t const sized = size_(disk.pending_, window); sized.failed()) return sized;
-        if (status_t const sized = size_(disk.ready_, window); sized.failed()) return sized;
         disk.capabilities_ = disk.device_.capabilities();
-        disk.capabilities_.depth_limit = config.depth_limit;
-        disk.capabilities_.queue_pairs_limit = config.queue_pairs_limit;
         disk.capabilities_.media_limit = config.media_limit;
         return disk;
     }
 
     /** What this disk accepts, fixed at mount so no request pays to ask the transport again. */
-    [[nodiscard]] ring_capabilities_t capabilities() const noexcept { return capabilities_; }
+    [[nodiscard]] disk_capabilities_t capabilities() const noexcept { return capabilities_; }
 
     /** The transport underneath, for a caller that needs what only the transport knows. */
     [[nodiscard]] device_type_ const& device() const noexcept { return device_; }
 
-#pragma region Queue Pairs
+#pragma region Queues
 
-    /**
-     *  @brief Takes a queue pair on @p depth requests of the ring for the calling thread.
-     *  @param[in] depth Requests this queue pair may keep in flight, at most the mount's limit.
-     *  @return The queue pair, or @c capacity_exhausted_k when every queue pair is already out.
-     */
-    expected<queue_pair_t> acquire_queue_pair(queue_depth_t depth) noexcept {
-        if (depth == 0 || depth > depth_limit_)
-            return status_t {status_code_t::invalid_argument_k, "A queue pair asks for more depth than the ring has"};
-        std::uint16_t const index = take_(queue_pairs_, queue_pairs_claim_);
-        if (index == queue_pair_pool_t::absent_k)
-            return status_t {status_code_t::capacity_exhausted_k, "Every queue pair of this ring is already held"};
-        queue_pair_record_t& record = queue_pairs_[index];
-        record.cancelled = 0;
-        record.depth = depth;
-        record.pending_count = 0;
-        record.ready_first = 0;
-        record.ready_count = 0;
-        return queue_pair_t {handle_of_(queue_pairs_, index), depth};
-    }
-
-    /**
-     *  @brief Binds @p queue pair to the calling thread, which is how a moved queue pair changes hands.
-     *  @param[in] queue_pair The queue pair this thread has just taken over, with nothing outstanding on it.
-     *
-     *  @note A queue pair with work in flight cannot be handed over, since the requests were issued from
-     *      a thread that is no longer the one that would poll them.
-     */
-    status_t bind_queue_pair(queue_pair_t const& queue_pair) noexcept {
-        queue_pair_record_t* const record = record_of_(queue_pair);
-        if (!record) return {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
-        if (record->pending_count != 0 || record->ready_count != 0)
-            return {status_code_t::invalid_argument_k, "Drain the queue pair before handing it over"};
+    /** Checks @p queue_pair names a queue of this transport, which needs nothing held, since a
+     *  request names its medium by this disk's slot and the device reads that slot at the poll. */
+    status_t register_media(queue_ref_t const& queue_pair) noexcept {
+        if (!queue_of_(queue_pair)) return {status_code_t::invalid_argument_k, "The queue is of another transport"};
         return {};
     }
 
-    /**
-     *  @brief Takes @p queue pair back once it has nothing outstanding, and empties the handle.
-     *  @param[in,out] queue_pair The queue pair to return, surrendered on success and untouched on failure.
-     */
-    status_t release_queue_pair(queue_pair_t& queue_pair) noexcept {
-        queue_pair_record_t* const record = record_of_(queue_pair);
-        if (!record) return {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
-        if (record->pending_count != 0 || record->ready_count != 0)
-            return {status_code_t::invalid_argument_k, "Drain the queue pair before releasing it"};
-        record->depth = 0;
-        vacate_(queue_pairs_, queue_pairs_claim_, static_cast<std::uint16_t>(queue_pair.id()));
-        queue_pair.surrender();
-        return {};
+    /** Requests @p queue_pair has submitted and not yet completed, which its credit bounds. */
+    [[nodiscard]] std::size_t outstanding(queue_ref_t const& queue_pair) const noexcept {
+        blocking_queue_t const* const queue = queue_of_(queue_pair);
+        return queue ? queue->outstanding() : 0;
     }
 
-    /** Requests @p queue pair has submitted and not yet completed, which its credit bounds. */
-    [[nodiscard]] std::size_t outstanding(queue_pair_t const& queue_pair) const noexcept {
-        queue_pair_record_t const* const record = record_of_(queue_pair);
-        return record ? record->pending_count + record->ready_count : 0;
-    }
-
-#pragma endregion Queue Pairs
+#pragma endregion Queues
 
 #pragma region Registrations
 
@@ -349,23 +445,14 @@ class basic_disk {
      *      oversized transfer - is reported on that one request's completion, which is where a real
      *      ring reports it and where a batch of many keeps its other entries.
      */
-    expected<std::size_t> submit(queue_pair_t const& queue_pair, std::span<request_t const> requests) noexcept {
-        queue_pair_record_t* const record = record_of_(queue_pair);
-        if (!record) return status_t {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
+    expected<std::size_t> submit(queue_ref_t const& queue_pair, std::span<request_t const> requests) noexcept {
+        blocking_queue_t* const queue = queue_of_(queue_pair);
+        if (!queue) return status_t {status_code_t::invalid_argument_k, "The queue is of another transport"};
         for (request_t const& request : requests)
-            if (request.token.queue_pair() != queue_pair.id() || request.token.generation() != queue_pair.generation())
-                return status_t {status_code_t::invalid_argument_k, "A request carries another queue pair's token"};
+            if (request.token.queue_pair() != queue_pair.id())
+                return status_t {status_code_t::invalid_argument_k, "A request holds another queue pair's token"};
 
-        std::size_t const room = record->depth - (record->pending_count + record->ready_count);
-        std::size_t const taking = requests.size() < room ? requests.size() : room;
-        std::uint32_t const base = window_of_(queue_pair.id());
-        for (std::size_t index = 0; index != taking; ++index) {
-            request_t const& request = requests[index];
-            pending_[base + record->pending_count + index] = request;
-            borrow_(request);
-        }
-        record->pending_count += static_cast<std::uint32_t>(taking);
-        return taking;
+        return queue->take(requests, [&](request_t const& request) noexcept { count_request_on_slots_(request); });
     }
 
     /**
@@ -374,69 +461,37 @@ class basic_disk {
      *  @param[out] into Room for completions, which bounds how many one call moves.
      *  @return How many completions were moved, which is zero when the queue pair submitted nothing.
      */
-    expected<std::size_t> poll_completions(queue_pair_t const& queue_pair, std::span<completion_t> into) noexcept {
-        queue_pair_record_t* const record = record_of_(queue_pair);
-        if (!record) return status_t {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
-        std::uint32_t const base = window_of_(queue_pair.id());
-        perform_(*record, base, static_cast<std::uint16_t>(queue_pair.id()));
-
-        std::size_t const moving = into.size() < record->ready_count ? into.size() : record->ready_count;
-        for (std::size_t index = 0; index != moving; ++index)
-            into[index] = ready_[base + (record->ready_first + index) % record->depth];
-        record->ready_first = static_cast<std::uint32_t>((record->ready_first + moving) % record->depth);
-        record->ready_count -= static_cast<std::uint32_t>(moving);
-        return moving;
+    expected<std::size_t> poll_completions(queue_ref_t const& queue_pair, std::span<completion_t> into) noexcept {
+        blocking_queue_t* const queue = queue_of_(queue_pair);
+        if (!queue) return status_t {status_code_t::invalid_argument_k, "The queue is of another transport"};
+        return queue->poll(
+            into, [&](request_t const& request) noexcept { return perform_one_(*queue, request); },
+            [&](request_t const& request) noexcept { uncount_request_on_slots_(request); });
     }
 
     /**
      *  @brief Stops @p queue pair's requests that have not started, which the next poll reports cancelled.
      *  @param[in] queue_pair The queue pair to stop, whose started requests still run to their own end.
      */
-    void cancel(queue_pair_t const& queue_pair) noexcept {
-        queue_pair_record_t* const record = record_of_(queue_pair);
-        if (!record) return;
-        cancelled_(*record).store(1, std::memory_order_release);
+    void cancel(queue_ref_t const& queue_pair) noexcept {
+        if (blocking_queue_t* const queue = queue_of_(queue_pair); queue) queue->cancel();
     }
 
     /**
      *  @brief Finishes and discards everything @p queue pair has outstanding, so its buffers may be freed.
      *  @param[in] queue_pair The queue pair to empty, which may be cancelled or still running.
      */
-    status_t drain(queue_pair_t const& queue_pair) noexcept {
-        queue_pair_record_t* const record = record_of_(queue_pair);
-        if (!record) return {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
-        std::uint32_t const base = window_of_(queue_pair.id());
-        perform_(*record, base, static_cast<std::uint16_t>(queue_pair.id()));
-        record->ready_first = 0;
-        record->ready_count = 0;
+    status_t drain(queue_ref_t const& queue_pair) noexcept {
+        blocking_queue_t* const queue = queue_of_(queue_pair);
+        if (!queue) return {status_code_t::invalid_argument_k, "The queue is of another transport"};
+        queue->drain([&](request_t const& request) noexcept { return perform_one_(*queue, request); },
+                     [&](request_t const& request) noexcept { uncount_request_on_slots_(request); });
         return {};
     }
 
 #pragma endregion Ring
 
   private:
-
-    /** One queue pair's share of the ring: its credit, its window and the word that stops it. */
-    struct queue_pair_record_t {
-
-        /** Stepped every time the record is vacated, so a stale token routes nowhere. */
-        queue_pair_generation_t generation = 0;
-
-        /** Zero while the queue pair wants its requests, one once it has cancelled them. */
-        std::int32_t cancelled = 0;
-
-        /** Requests this queue pair may keep in flight, fixed when the queue pair was taken. */
-        queue_depth_t depth = 0;
-
-        /** Requests submitted and not yet performed, at the front of the window. */
-        std::uint32_t pending_count = 0;
-
-        /** Where this queue pair's oldest unreaped completion sits inside its window. */
-        std::uint32_t ready_first = 0;
-
-        /** Completions performed and not yet completed. */
-        std::uint32_t ready_count = 0;
-    };
 
     /** One pinned memory range, and the count of requests the device may still be writing into it. */
     struct registered_memory_record_t {
@@ -471,20 +526,10 @@ class basic_disk {
     /** The allocator every pool of the disk is charged through. */
     using allocator_t = constrained_allocator<byte_t, atomic_reference_>;
 
-    using queue_pair_pool_t = st::basic_fixed_pool<queue_pair_record_t, std::uint16_t, allocator_t>;
     using registered_memory_pool_t = st::basic_fixed_pool<registered_memory_record_t, std::uint16_t, allocator_t>;
     using registered_medium_pool_t = st::basic_fixed_pool<registered_medium_record_t, std::uint16_t, allocator_t>;
 
-    basic_disk(device_type_&& device, disk_config_t const& config) noexcept
-        : device_(std::move(device)), depth_limit_(config.depth_limit) {}
-
-    /** Grows @p elements to @p count default slots, reporting an allocation failure as a status. */
-    template <typename element_type_>
-    static status_t size_(st::vector<element_type_>& elements, std::size_t count) noexcept {
-        if (elements.resize(count) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A ring could not allocate its slots"};
-        return {};
-    }
+    explicit basic_disk(device_type_&& device) noexcept : device_(std::move(device)) {}
 
     /** Makes @p pool of @p capacity free records charged through @p allocator. */
     template <typename pool_type_>
@@ -522,10 +567,6 @@ class basic_disk {
         return disk_handle_t {handle.index, handle.generation};
     }
 
-    static atomic_reference_<std::int32_t> cancelled_(queue_pair_record_t& record) noexcept {
-        return atomic_reference_<std::int32_t> {record.cancelled};
-    }
-
     static atomic_reference_<std::int32_t> in_flight_(registered_memory_record_t& record) noexcept {
         return atomic_reference_<std::int32_t> {record.in_flight};
     }
@@ -534,17 +575,8 @@ class basic_disk {
         return atomic_reference_<std::int32_t> {record.in_flight};
     }
 
-    /** Where one queue pair's requests and completions sit inside the shared windows. */
-    [[nodiscard]] std::uint32_t window_of_(queue_pair_id_t id) const noexcept {
-        return static_cast<std::uint32_t>(id) * depth_limit_;
-    }
-
-    [[nodiscard]] queue_pair_record_t* record_of_(queue_pair_t const& queue_pair) noexcept {
-        return queue_pairs_.at({static_cast<std::uint16_t>(queue_pair.id()), queue_pair.generation()});
-    }
-
-    [[nodiscard]] queue_pair_record_t const* record_of_(queue_pair_t const& queue_pair) const noexcept {
-        return queue_pairs_.at({static_cast<std::uint16_t>(queue_pair.id()), queue_pair.generation()});
+    [[nodiscard]] static blocking_queue_t* queue_of_(queue_ref_t const& queue_pair) noexcept {
+        return queue_pair.template queue<blocking_queue_t>();
     }
 
     [[nodiscard]] registered_memory_record_t* resolve_(memory_reference_t place) noexcept {
@@ -556,7 +588,7 @@ class basic_disk {
     }
 
     /** Marks the range and the medium of @p request as live, so neither can be taken back under it. */
-    void borrow_(request_t const& request) noexcept {
+    void count_request_on_slots_(request_t const& request) noexcept {
         if (registered_memory_record_t* const record = resolve_(request.buffer); record)
             in_flight_(*record).store_add(1, std::memory_order_acquire);
         if (registered_medium_record_t* const record = resolve_(request.medium); record)
@@ -564,31 +596,16 @@ class basic_disk {
     }
 
     /** Releases both once the device is done with the bytes of @p request. */
-    void restore_(request_t const& request) noexcept {
+    void uncount_request_on_slots_(request_t const& request) noexcept {
         if (registered_memory_record_t* const record = resolve_(request.buffer); record)
             in_flight_(*record).store_sub(1, std::memory_order_release);
         if (registered_medium_record_t* const record = resolve_(request.medium); record)
             in_flight_(*record).store_sub(1, std::memory_order_release);
     }
 
-    /** Where inside the shared completion window the @p index -th fresh completion of a queue pair goes. */
-    [[nodiscard]] static std::size_t ready_place_(queue_pair_record_t const& record, std::uint32_t base,
-                                                  std::size_t index) noexcept {
-        return base + (record.ready_first + record.ready_count + index) % record.depth;
-    }
-
-    /** The completion a request gets when its queue pair cancelled it, or a chain ahead of it was cut. */
-    [[nodiscard]] static completion_t cancelled_completion_(request_t const& request) noexcept {
-        completion_t completion;
-        completion.token = request.token;
-        completion.state = completion_state_t::cancelled_k;
-        completion.status = {status_code_t::uninitialized_k, "The queue_pair cancelled this request"};
-        return completion;
-    }
-
-    /** Resolves a request's buffer and performs it on the device for the queue pair in @p lane,
-     *  reporting every defect per request. */
-    [[nodiscard]] completion_t perform_one_(request_t const& request, std::uint16_t lane) noexcept {
+    /** Resolves a request's buffer and performs it on the device for @p queue, reporting every
+     *  defect per request. */
+    [[nodiscard]] completion_t perform_one_(blocking_queue_t const& queue, request_t const& request) noexcept {
         completion_t completion;
         completion.token = request.token;
         registered_medium_record_t const* const medium = resolve_(request.medium);
@@ -607,19 +624,22 @@ class basic_disk {
             return completion;
         }
 
-        ring_capabilities_t const& limits = capabilities_;
+        disk_capabilities_t const& limits = capabilities_;
         registered_memory_record_t const* const slot = resolve_(request.buffer);
-        if (!slot) {
+        bool const own = request.buffer.memory_id == registered_memory_id_t::queue_range_k;
+        if (!slot && !own) {
             completion.state = completion_state_t::failed_k;
             completion.status = {status_code_t::invalid_argument_k, "The request names no registered range"};
             return completion;
         }
-        if (request.buffer.offset > slot->length || request.extent.length > slot->length - request.buffer.offset) {
+        byte_t* const base = own ? queue.range().data() : slot->base;
+        std::uint64_t const length = own ? queue.range().size() : slot->length;
+        if (request.buffer.offset > length || request.extent.length > length - request.buffer.offset) {
             completion.state = completion_state_t::failed_k;
             completion.status = {status_code_t::invalid_argument_k, "The request runs past its registered range"};
             return completion;
         }
-        byte_t* const address = slot->base + request.buffer.offset;
+        byte_t* const address = base + request.buffer.offset;
         if (!is_address_aligned(address, limits.memory_alignment) ||
             !request.extent.aligned_to(limits.offset_alignment) ||
             (request.extent.length % limits.length_granularity) != 0) {
@@ -635,8 +655,8 @@ class basic_disk {
 
         std::span<byte_t> const buffer {address, static_cast<std::size_t>(request.extent.length)};
         auto [moved, move_status] = request.kind == request_kind_t::read_k
-                                        ? device_.read_extent(slot_index, request.extent, buffer, lane)
-                                        : device_.write_extent(slot_index, request.extent, buffer, lane);
+                                        ? device_.read_extent(slot_index, request.extent, buffer, queue.event())
+                                        : device_.write_extent(slot_index, request.extent, buffer, queue.event());
         if (move_status.failed()) {
             completion.state = completion_state_t::failed_k;
             completion.status = move_status;
@@ -648,47 +668,11 @@ class basic_disk {
         return completion;
     }
 
-    /**
-     *  @brief Performs everything one queue pair has submitted, and stages the completions for its poll.
-     *
-     *  Every request runs on the thread that polls it, in submission order, so a chain gets
-     *  the ordering it was promised and nothing here forks. Depth comes from queue pairs
-     *  rather than threads:
-     *  a pool dispatch blocks until all its threads return and admits one caller at a time, so
-     *  fanning a batch out here would serialize two queue pairs against each other, and a batch
-     *  issued from inside a background job would fork a pool that is already forked.
-     */
-    void perform_(queue_pair_record_t& record, std::uint32_t base, std::uint16_t lane) noexcept {
-        std::uint32_t const count = record.pending_count;
-        if (count == 0) return;
-
-        bool const cancelled = cancelled_(record).load(std::memory_order_acquire) != 0;
-        bool chain_broken = false;
-        for (std::uint32_t index = 0; index != count; ++index) {
-            request_t const& request = pending_[base + index];
-            completion_t const completion = cancelled || chain_broken ? cancelled_completion_(request)
-                                                                      : perform_one_(request, lane);
-            ready_[ready_place_(record, base, index)] = completion;
-            restore_(request);
-            chain_broken = request.chaining == request_chaining_t::chained_k &&
-                           (chain_broken || completion.state != completion_state_t::completed_k);
-        }
-
-        record.ready_count += count;
-        record.pending_count = 0;
-    }
-
     /** The transport this disk moves bytes through, owned here. */
     device_type_ device_;
 
     /** What this disk accepts, read from the transport once at mount. */
-    ring_capabilities_t capabilities_;
-
-    /** Requests one queue pair may keep in flight, and the stride of every queue pair's window. */
-    queue_depth_t depth_limit_ = 0;
-
-    /** One record per queue pair the ring hands out. */
-    queue_pair_pool_t queue_pairs_;
+    disk_capabilities_t capabilities_;
 
     /** One record per memory range the ring pins. */
     registered_memory_pool_t registered_memories_;
@@ -696,20 +680,11 @@ class basic_disk {
     /** One record per medium the ring registers. */
     registered_medium_pool_t media_;
 
-    /** Zero while no thread takes or vacates a queue pair record, one while one does. */
-    std::int32_t queue_pairs_claim_ = 0;
-
     /** Zero while no thread takes or vacates a range record, one while one does. */
     std::int32_t registered_memories_claim_ = 0;
 
     /** Zero while no thread takes or vacates a medium record, one while one does. */
     std::int32_t media_claim_ = 0;
-
-    /** Every queue pair's submitted requests, in windows of @c depth_limit_. */
-    st::vector<request_t> pending_;
-
-    /** Every queue pair's performed completions, in windows of @c depth_limit_ read as a circle. */
-    st::vector<completion_t> ready_;
 };
 
 #pragma endregion Disk
@@ -759,9 +734,6 @@ class memory_device_t {
         return {};
     }
 
-    /** Succeeds without work, since a copy in memory waits on nothing. */
-    status_t reserve_queue_pairs(std::size_t) noexcept { return {}; }
-
     /**
      *  @brief Allocates a volume of @c request.length bytes in slot @p index, which no write grows.
      *  @param[in] index The empty slot the disk took for the medium.
@@ -789,7 +761,7 @@ class memory_device_t {
 
     /** Reads @p extent of @p index into @p destination, answering the prefix inside the volume. */
     expected<std::uint64_t> read_extent(std::uint16_t index, extent_t extent, std::span<byte_t> destination,
-                                        std::uint16_t) noexcept {
+                                        native_file_event_t const&) noexcept {
         if (index >= volumes_.size() || volumes_[index].empty())
             return status_t {status_code_t::invalid_argument_k, "The medium is not this device's"};
         storage_t& volume = volumes_[index];
@@ -802,7 +774,7 @@ class memory_device_t {
 
     /** Writes @p source at @p extent of @p index, answering the prefix that fit. */
     expected<std::uint64_t> write_extent(std::uint16_t index, extent_t extent, std::span<byte_t const> source,
-                                         std::uint16_t) noexcept {
+                                         native_file_event_t const&) noexcept {
         if (index >= volumes_.size() || volumes_[index].empty())
             return status_t {status_code_t::invalid_argument_k, "The medium is not this device's"};
         storage_t& volume = volumes_[index];
@@ -839,8 +811,8 @@ class memory_device_t {
     }
 
     /** What this transport accepts, which is the alignment the mount asked it to demand. */
-    [[nodiscard]] ring_capabilities_t capabilities() const noexcept {
-        ring_capabilities_t reported;
+    [[nodiscard]] disk_capabilities_t capabilities() const noexcept {
+        disk_capabilities_t reported;
         reported.memory_alignment = alignment_;
         reported.offset_alignment = alignment_;
         reported.length_granularity = alignment_;
@@ -1043,13 +1015,12 @@ class blocking_files_device_t {
     blocking_files_device_t& operator=(blocking_files_device_t const&) = delete;
 
     blocking_files_device_t(blocking_files_device_t&& other) noexcept
-        : files_(std::move(other.files_)), events_(std::move(other.events_)), buffering_(other.buffering_) {}
+        : files_(std::move(other.files_)), buffering_(other.buffering_) {}
 
     blocking_files_device_t& operator=(blocking_files_device_t&& other) noexcept {
         if (this == &other) return *this;
         close_all_();
         files_ = std::move(other.files_);
-        events_ = std::move(other.events_);
         buffering_ = other.buffering_;
         return *this;
     }
@@ -1073,18 +1044,6 @@ class blocking_files_device_t {
     status_t reserve_media(std::size_t count) noexcept {
         if (files_.resize(count, invalid_native_file_k) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A device could not track its media"};
-        return {};
-    }
-
-    /** Makes one event per queue pair, once, so a polling thread waits on its own transfers. */
-    status_t reserve_queue_pairs(std::size_t count) noexcept {
-        if (events_.resize(count) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A device could not track its queue pairs"};
-        for (native_file_event_t& event : events_) {
-            auto [made, make_status] = native_file_event_t::make();
-            if (make_status.failed()) return make_status;
-            event = std::move(made);
-        }
         return {};
     }
 
@@ -1116,24 +1075,24 @@ class blocking_files_device_t {
         return close_native_file(std::exchange(files_[index], invalid_native_file_k));
     }
 
-    /** Reads @p extent of @p index into @p destination for the queue pair in @p lane, answering
-     *  the prefix that arrived. */
+    /** Reads @p extent of @p index into @p destination, waiting on the polling queue's @p event,
+     *  answering the prefix that arrived. */
     expected<std::uint64_t> read_extent(std::uint16_t index, extent_t extent, std::span<byte_t> destination,
-                                        std::uint16_t lane) noexcept {
-        if (index >= files_.size() || files_[index] == invalid_native_file_k || lane >= events_.size())
+                                        native_file_event_t const& event) noexcept {
+        if (index >= files_.size() || files_[index] == invalid_native_file_k)
             return status_t {status_code_t::invalid_argument_k, "The medium is not this device's"};
         return read_native_file(files_[index], extent.offset,
-                                destination.first(static_cast<std::size_t>(extent.length)), events_[lane]);
+                                destination.first(static_cast<std::size_t>(extent.length)), event);
     }
 
-    /** Writes @p source at @p extent of @p index for the queue pair in @p lane, answering the
-     *  prefix that landed. */
+    /** Writes @p source at @p extent of @p index, waiting on the polling queue's @p event,
+     *  answering the prefix that landed. */
     expected<std::uint64_t> write_extent(std::uint16_t index, extent_t extent, std::span<byte_t const> source,
-                                         std::uint16_t lane) noexcept {
-        if (index >= files_.size() || files_[index] == invalid_native_file_k || lane >= events_.size())
+                                         native_file_event_t const& event) noexcept {
+        if (index >= files_.size() || files_[index] == invalid_native_file_k)
             return status_t {status_code_t::invalid_argument_k, "The medium is not this device's"};
         return write_native_file(files_[index], extent.offset, source.first(static_cast<std::size_t>(extent.length)),
-                                 events_[lane]);
+                                 event);
     }
 
     /** Makes every write @p index has already answered durable. */
@@ -1170,8 +1129,8 @@ class blocking_files_device_t {
     }
 
     /** What this transport accepts, which unbuffered access tightens to the portable alignment. */
-    [[nodiscard]] ring_capabilities_t capabilities() const noexcept {
-        ring_capabilities_t reported;
+    [[nodiscard]] disk_capabilities_t capabilities() const noexcept {
+        disk_capabilities_t reported;
         std::uint64_t const alignment = buffering_ == file_buffering_t::unbuffered_k ? portable_alignment_k : 1;
         reported.memory_alignment = alignment;
         reported.offset_alignment = alignment;
@@ -1193,9 +1152,6 @@ class blocking_files_device_t {
 
     /** One entry per slot the disk may register, @c invalid_native_file_k where a slot is free. */
     st::vector<native_file_t> files_;
-
-    /** One event per queue pair, which each polling thread's transfers wait on. */
-    st::vector<native_file_event_t> events_;
 
     /** Whether the page cache stands in the path, which fixes the reported alignments. */
     file_buffering_t buffering_ = file_buffering_t::buffered_k;

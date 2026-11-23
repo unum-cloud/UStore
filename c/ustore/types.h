@@ -22,7 +22,7 @@
  *  such as @c outputs_type, and @c mode, and last @c progress and @c progress_state. A verb
  *  that creates a handle names that output first.
  *
- *  Structures carry no size or version field, so they grow source-compatibly only: initialize them
+ *  Structures hold no size or version field, so they grow source-compatibly only: initialize them
  *  by designator, which zeroes every field left out, and expect the major version to change whenever
  *  one does. A @c NULL pointer only ever means its pointee's own default, apart from the outcome,
  *  and choices between behaviours are enums named for what they choose.
@@ -40,8 +40,8 @@
  *  which runs it there, forks included, and finishes it, so polling alone sees it final. A deferred
  *  call on a caller-inclusive executor, whose threads need their caller, or on a VRAM executor,
  *  whose caller stages and feeds its devices, runs at submission and is final on return. Submission
- *  copies the structure; everything it points to stays borrowed until final, and @c outcome->status
- *  reads @c ustore_status_deferred_k until then.
+ *  copies the structure; everything it points to must stay allocated and unchanged until the call
+ *  is final, and @c outcome->status reads @c ustore_status_deferred_k until then.
  *
  *  A call lets go of its arena and of the handles it names, then of its executor, and only then
  *  stores the message and the final status with release ordering. A caller that reads the status
@@ -71,8 +71,9 @@
  *  every binding stays one verb per operation rather than a twin per output style. Every byte has
  *  one owner, and each owner picks where its bytes live once, when it is created.
  *
- *  Callers lend memory, never a way to allocate it: no allocator callback crosses the interface,
- *  and every pointer a caller passes is an input, classified through the driver once per call.
+ *  The caller allocates every buffer a call reads or writes, and frees it after the call is final;
+ *  no allocator callback crosses the interface, and every pointer a caller passes is an input,
+ *  classified through the driver once per call.
  *  Payload belongs to the handle, placed by its constructor, as @c ustore_database_open_nvme places
  *  it on its drives. Scratch and staging belong to the executor, placed at its creation and grown
  *  to a high-water mark. Every output whose length scales with the call lands in an arena:
@@ -81,17 +82,15 @@
  *  handles, stay caller fields, and a call that fails zeroes the scalars among them and leaves the
  *  handles @c NULL.
  *
- *  Executors make arenas. @c ustore_arena_init places one where its executor
- *  computes, decided once, and a @c NULL executor makes host pages for calls on
- *  the calling thread. A call rewinds the arena it is given, invalidating the
- *  previous call's outputs, and writes views into it, and any verb may reuse
- *  any arena its executor made, one call at a time. Blocking calls borrow the
- *  arena; deferred calls hold it until final. Shorthand with no place for an
- *  arena, such as @c db[key] or @c key @c in @c db, makes a one-off arena
- *  through @c ustore_arena_init and frees it with its result: slower than
- *  reuse, and stateless.
+ *  Executors make arenas. @c ustore_arena_init places one where its executor computes, decided
+ *  once, and a @c NULL executor makes host pages for calls on the calling thread. A call rewinds
+ *  the arena it is given, invalidating the previous call's outputs, and writes views into it, and
+ *  any verb may reuse any arena its executor made, one call at a time. A blocking call uses the
+ *  arena until it returns, and a deferred one until final. Shorthand with no place for an arena,
+ *  such as @c db[key] or @c key @c in @c db, makes a one-off arena through @c ustore_arena_init and
+ *  frees it with its result: slower than reuse, and stateless.
  *
- *  Outputs are views the call writes, so none carries a capacity or a stride for the caller to
+ *  Outputs are views the call writes, so none holds a capacity or a stride for the caller to
  *  pick, and an arena keeps its high-water mark, so a steady loop allocates once. The library
  *  stages only to change a layout or to make pageable memory DMA-able.
  *
@@ -109,16 +108,17 @@
  *
  *  @section types_shapes Shapes
  *
- *  A verb's @c count is its batch axis, so a single operation is a batch of one. Every input takes one of three
- *  shapes. One run of bytes, a @c ustore_bytes_view_t, carries a path, a name or a request. A strided run of
- *  fixed-width elements, such as a @c ustore_keys_view_t, carries one element per task with a byte stride, as BLAS
- *  does, so callers that pack arguments into arrays of structures pass them without copies, and a zero stride
- *  repeats the first element for every task. A ragged batch, a @c ustore_strings_view_t, carries one string per task
- *  as an Apache Arrow tape of 32-bit or 64-bit offsets, or through an accessor over any other shape, so a tape read
- *  back is written again as it is. A zeroed view of any shape stands for the input's default.
+ *  A verb's @c count is its batch axis, so a single operation is a batch of one. Every input takes
+ *  one of three shapes. One run of bytes, a @c ustore_bytes_view_t, holds a path, a name or a
+ *  request. A strided run of fixed-width elements, such as a @c ustore_keys_view_t, holds one
+ *  element per task with a byte stride, as BLAS does, so callers that pack arguments into arrays of
+ *  structures pass them without copies, and a zero stride repeats the first element for every task.
+ *  A ragged batch, a @c ustore_strings_view_t, holds one string per task as an Apache Arrow tape of
+ *  32-bit or 64-bit offsets, or through an accessor over any other shape, so a tape read back is
+ *  written again as it is. A zeroed view of any shape stands for the input's default.
  *
- *  Outputs take three shapes too, written packed into the arena, so none carries a capacity or
- *  a stride. Fixed-width outputs are arrays, such as presence bits, keys, identifiers, degrees
+ *  Outputs take three shapes too, written packed into the arena, so none holds a capacity or a
+ *  stride. Fixed-width outputs are arrays, such as presence bits, keys, identifiers, degrees
  *  and bounds. Ragged bytes are a @c ustore_strings_view_t the call writes as a tape, with
  *  32-bit offsets while its bytes fit in 4 GiB and 64-bit beyond. Ragged keys are packed, split
  *  by task through @c count + 1 offsets, as every offset array holds one more entry than the
@@ -257,8 +257,8 @@ extern "C" {
 /** An unsigned count or size, 64 bits wide on every platform. */
 typedef uint64_t ustore_size_t;
 
-/** A borrowed run of bytes and its length, never null-terminated by contract, so a caller holding a
- *  string without a terminator passes its own storage. */
+/** A run of bytes the caller owns and its length, never null-terminated by contract, so a caller
+ *  holding a string without a terminator passes its own storage. */
 typedef struct ustore_bytes_view_t {
 
     /** First byte of the run. */
@@ -342,7 +342,7 @@ typedef struct ustore_strings_view_t {
 /**
  *  @brief What went wrong, in one vocabulary shared by every engine and binding.
  *
- *  Shared statuses carry USearch's numbers, leaving 3, 4, 5, 11 and 13 unused, and UStore's own
+ *  Shared statuses hold USearch's numbers, leaving 3, 4, 5, 11 and 13 unused, and UStore's own
  *  start at 18. Statuses fall into five categories: resources, input, state, interruptions and
  *  defects. Any verb that allocates, binds a device or touches a file may also return a resources
  *  status; any verb taking a progress callback may return an interruption. A verb's own block lists
@@ -350,7 +350,7 @@ typedef struct ustore_strings_view_t {
  */
 typedef enum ustore_status_t {
 
-    /** The call succeeded; @c message carries nothing. */
+    /** The call succeeded; @c message holds nothing. */
     ustore_status_success_k = 0,
 
     /** A deferred call that has not finished; the one status that is never final. */
@@ -389,7 +389,7 @@ typedef enum ustore_status_t {
     /** The engine or build does not implement what the call asks for, like io_uring on a kernel without it. */
     ustore_status_unsupported_k = 16,
 
-    /** An argument is null, contradicts another one, or carries a choice the call does not
+    /** An argument is null, contradicts another one, or holds a choice the call does not
      *  accept, like a collection of another modality, a name reserved for a system collection,
      *  or a batch of strings in an unknown layout. The outcome itself is never @c NULL: it is
      *  where this status lands. */
@@ -424,7 +424,7 @@ typedef struct ustore_outcome_t {
     /** What went wrong, @c ustore_status_success_k, or @c ustore_status_deferred_k until a deferred call finishes. */
     ustore_status_t status;
 
-    /** Static detail the status cannot carry. */
+    /** Static detail the status cannot hold. */
     char const* message;
 
 } ustore_outcome_t;
@@ -465,17 +465,17 @@ typedef enum ustore_completion_t {
 } ustore_completion_t;
 
 /** The canonical lowercase spelling of a status, such as "out-of-memory", in static storage, or "unrecognized" for
- *  a value no status carries. */
+ *  a value no status holds. */
 USTORE_EXPORT char const* ustore_status_name(ustore_status_t status);
 
 /** Reads a status back from its canonical spelling, or fails with
  *  @c ustore_status_invalid_argument_k. */
 USTORE_EXPORT ustore_status_t ustore_status_from_name(ustore_bytes_view_t name, ustore_status_t* status);
 
-/** Whether the call a progress callback watches carries on or unwinds. */
+/** Whether the call a progress callback watches continues or unwinds. */
 typedef enum ustore_continuation_t {
 
-    /** Carry on to the next unit of work. */
+    /** Continue to the next unit of work. */
     ustore_continue_k = 0,
 
     /** Stop, publish nothing, and report @c ustore_status_cancelled_k. */
@@ -518,7 +518,7 @@ typedef enum ustore_phase_t {
 } ustore_phase_t;
 
 /** The canonical spelling of a plan's phase, as @c ustore_phase_merge_k spells "merge", or
- *  "unrecognized" for a value no phase carries. */
+ *  "unrecognized" for a value no phase holds. */
 USTORE_EXPORT char const* ustore_phase_name(ustore_phase_t phase);
 
 /** Reads a plan's phase back from its canonical spelling, or fails with
@@ -585,7 +585,7 @@ USTORE_EXPORT ustore_status_t ustore_case_sensitivity_from_name(ustore_bytes_vie
  *      call or once per cursor.
  *
  *  A zeroed structure matches everything. Patterns that fail to compile refuse the call
- *  with @c ustore_status_invalid_argument_k, carrying StringZilla's message.
+ *  with @c ustore_status_invalid_argument_k, holding StringZilla's message.
  */
 typedef struct ustore_patterns_t {
 
@@ -726,8 +726,9 @@ USTORE_EXPORT ustore_status_t ustore_cpu_class_from_name(ustore_bytes_view_t nam
  */
 typedef struct ustore_ram_options_t {
 
-    /** Identifiers of the memory domains, copied by the call, where @c NULL derives every domain the process may
-     *  allocate on, and an identifier no domain carries is refused with @c ustore_status_invalid_argument_k. */
+    /** Identifiers of the memory domains, copied by the call, where @c NULL derives every
+     *  domain the process may allocate on, and an identifier no domain holds is refused
+     *  with @c ustore_status_invalid_argument_k. */
     int32_t const* memory_domains;
 
     /** Entries of @c memory_domains, where zero derives as @c NULL does. */
@@ -744,16 +745,21 @@ typedef struct ustore_executor_for_ram_t {
     /** Output for the outcome, final on return. */
     ustore_outcome_t* outcome;
 
-    /** The memory domains the executor serves; copied, not borrowed. */
+    /** The memory domains the executor serves; copied at creation, so the caller may free it once
+     *  the call returns. */
     ustore_ram_options_t ram;
 
     /** Threads to spawn, interleaved across the compute domains local to @c ram, where zero takes 7/8 of the cores
-     *  those domains carry, rounded down and at least one. */
+     *  those domains hold, rounded down and at least one. */
     ustore_size_t threads;
 
     /** The newest CPU class the threads may confine their waits and atomics to; a class the CPU
      *  lacks narrows the pick rather than refusing it, and zero sets no ceiling. */
     ustore_cpu_class_t cpu_class_ceiling;
+
+    /** The ceiling on each thread's scratch, which every call's staging carves from, past which a
+     *  call answers @c ustore_status_out_of_memory_k; zero takes 16 GiB. */
+    ustore_size_t scratch_limit;
 
 } ustore_executor_for_ram_t;
 
@@ -775,43 +781,6 @@ typedef struct ustore_executor_for_ram_t {
  *    @c cpu_class_ceiling on this CPU, or the operating system denies ForkUnion an operation.
  */
 USTORE_EXPORT void ustore_executor_for_ram(ustore_executor_for_ram_t* arguments);
-
-/** The arguments of @c ustore_executor_on_pool. */
-typedef struct ustore_executor_on_pool_t {
-
-    /** Output for the new executor, which the caller frees with @c ustore_executor_free; @c NULL on failure. */
-    ustore_executor_t* executor;
-
-    /** Output for the outcome, final on return. */
-    ustore_outcome_t* outcome;
-
-    /** The memory domains the executor serves, keeping the scratch of each thread and its arenas there; copied, not
-     *  borrowed. */
-    ustore_ram_options_t ram;
-
-    /** The ForkUnion @c fu_pool_t to borrow; it must outlive the executor, and keeps its lender's mood. */
-    void* pool;
-
-} ustore_executor_on_pool_t;
-
-/**
- *  @brief Creates an executor for the RAM, RocksDB and LevelDB engines over a ForkUnion pool it borrows, so several
- *      libraries in one process share one set of threads.
- *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
- *
- *  A dispatch on a pool that runs another is refused, so a call finding the pool running its
- *  lender's dispatch finishes @c ustore_status_contended_k rather than forking over the lender, and
- *  so does the creation. The lender keeps the dispatches and joins of its pool, so a deferred call
- *  runs at submission on the calling thread and is final when it returns.
- *
- *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c executor output is @c NULL, a memory domain
- *    identifier names no domain, or ForkUnion refuses the @c pool or another argument.
- *  - @c ustore_status_unsupported_k The process may allocate on no memory domain, or the operating
- *    system denies ForkUnion an operation.
- *  - @c ustore_status_contended_k The @c pool runs its lender's dispatch.
- */
-USTORE_EXPORT void ustore_executor_on_pool(ustore_executor_on_pool_t* arguments);
 
 /** How the NVMe engine moves bytes between its files and memory. */
 typedef enum ustore_transport_t {
@@ -845,16 +814,15 @@ USTORE_EXPORT ustore_status_t ustore_transport_from_name(ustore_bytes_view_t nam
  *  @brief How the threads of an NVMe executor move bytes between the drives and memory, where every zero size or count
  *      keeps the engine's default.
  *
- *  Every thread of the executor keeps a channel of its own, and the threads outside it share @c shared_io_channels
- *  more. A channel is one queue pair of @c queue_depth submissions over pinned request and streaming buffers.
+ *  Every thread of the executor, and the call holding it, keeps a reading and a writing channel of
+ *  its own, with the media of every database its calls touch registered on it, so no channel is
+ *  shared between queue sets. A channel is one queue pair of @c queue_depth submissions over the
+ *  thread's pinned request and streaming buffers.
  */
 typedef struct ustore_nvme_options_t {
 
     /** How bytes move between the files and memory. */
     ustore_transport_t transport;
-
-    /** I/O channels the threads outside the executor share. */
-    ustore_size_t shared_io_channels;
 
     /** Submissions a channel holds at once. */
     ustore_size_t queue_depth;
@@ -871,6 +839,16 @@ typedef struct ustore_nvme_options_t {
     /** Streaming buffers of each channel. */
     ustore_size_t stream_buffers_count;
 
+    /** The data directories, raw media or SPDK namespaces of the databases the executor will open,
+     *  spelled as @c ustore_database_open_nvme names them and read only during the call: the memory
+     *  domain they share places the threads and their staging unless
+     *  @c ustore_executor_for_nvme_t::ram names domains, and their fewest hardware queues give the
+     *  default thread count; @c NULL derives nothing from the media. */
+    ustore_bytes_view_t const* paths;
+
+    /** Entries of @c paths. */
+    ustore_size_t paths_count;
+
 } ustore_nvme_options_t;
 
 /** The arguments of @c ustore_executor_for_nvme. */
@@ -882,28 +860,46 @@ typedef struct ustore_executor_for_nvme_t {
     /** Output for the outcome, final on return. */
     ustore_outcome_t* outcome;
 
-    /** How the databases it opens move bytes; copied, not borrowed. */
+    /** How the databases it opens move bytes, and where their media sit; copied at creation, so the
+     *  caller may free it once the call returns. */
     ustore_nvme_options_t nvme;
 
-    /** Threads to spawn, each owning one submission ring, where zero derives them from the cores. */
+    /** The memory domains its threads and their staging live on, the first of them placing the
+     *  threads; with none named, the domain the @c nvme paths share on a machine of several. The
+     *  executor reads nothing else of the RAM options. */
+    ustore_ram_options_t ram;
+
+    /** Threads to spawn, each owning one submission ring, where zero takes the fewest hardware
+     *  queues of any disk under the @c nvme paths, capped by the cores, or half the cores and at
+     *  most eight when no disk reports its queues. */
     ustore_size_t threads;
 
     /** The newest CPU class the threads may confine their waits and atomics to; a class the CPU
      *  lacks narrows the pick rather than refusing it, and zero sets no ceiling. */
     ustore_cpu_class_t cpu_class_ceiling;
 
+    /** The ceiling on each thread's scratch, which every call's staging carves from, past which a
+     *  call answers @c ustore_status_out_of_memory_k; zero takes 16 GiB. */
+    ustore_size_t scratch_limit;
+
 } ustore_executor_for_nvme_t;
 
 /**
- *  @brief Creates an executor for the NVMe engine, whose every thread submits and polls its own I/O ring.
+ *  @brief Creates an executor for the NVMe engine, whose every thread drives its own I/O ring.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
- *  A database @c ustore_database_open_nvme opens on it moves bytes as @c nvme names, which the open reads once, so the
- *  executor may be freed before the databases it opened. Where its merges run is the open's own @c compactions.
+ *  A database @c ustore_database_open_nvme opens on it moves bytes as @c nvme names, which the open
+ *  reads once, so the executor may be freed before the databases it opened. Where its merges run is
+ *  the open's own @c compactions. Its threads pin to the first cores the calling thread may run on,
+ *  so a caller making several executors narrows its affinity to each one's cores first, or they all
+ *  share the same cores. Every call on an NVMe database names an NVMe executor or none: a RAM
+ *  executor answers @c ustore_status_device_k, and a call naming none runs over blocking queues
+ *  made for it alone, which an SPDK database refuses with @c ustore_status_invalid_argument_k.
  *
  *  @par Statuses:
  *  - @c ustore_status_invalid_argument_k The @c executor output is @c NULL, the transport is
- *    unknown, the ceiling names no CPU class, or ForkUnion refuses an argument.
+ *    unknown, @c paths is @c NULL with a nonzero count, a memory domain identifier names no
+ *    domain, the ceiling names no CPU class, or ForkUnion refuses an argument.
  *  - @c ustore_status_unsupported_k The process may allocate on no memory domain, several threads
  *    are asked of a build without them, no class this build compiled fits under the
  *    @c cpu_class_ceiling on this CPU, or the operating system denies ForkUnion an operation.
@@ -960,7 +956,7 @@ USTORE_EXPORT ustore_status_t ustore_gpu_vendor_from_name(ustore_bytes_view_t na
  *  a device takes its vendor's newest class whose code it runs. */
 typedef enum ustore_gpu_class_t {
 
-    /** No class, which a listed device carries when this build compiled no code that runs on it. */
+    /** No class, which a listed device holds when this build compiled no code that runs on it. */
     ustore_gpu_class_unknown_k = 0,
 
     // NVIDIA
@@ -1073,13 +1069,15 @@ typedef struct ustore_executor_for_vram_t {
     /** Output for the outcome, final on return. */
     ustore_outcome_t* outcome;
 
-    /** The UStore ordinal of the device every call and arena of this executor uses, its position in the listing of
-     *  @c ustore_gpu_devices; an ordinal no device carries is refused with @c ustore_status_device_k. */
+    /** The UStore ordinal of the device every call and arena of this executor uses, its
+     *  position in the listing of @c ustore_gpu_devices; an ordinal no device holds is
+     *  refused with @c ustore_status_device_k. */
     int32_t device;
 
-    /** The @b optional borrowed stream on @c device, a @c cudaStream_t on NVIDIA, a @c hipStream_t
-     *  on AMD and an @c id<MTLCommandQueue> on Apple, which must outlive the executor; @c NULL
-     *  creates one. One stream per device is the whole design. */
+    /** The stream on @c device to order work on, a @c cudaStream_t on NVIDIA, a @c hipStream_t on
+     *  AMD and an @c id<MTLCommandQueue> on Apple, which the caller destroys after freeing the
+     *  executor; @c NULL orders work on the device's per-thread default stream, or on Apple on the
+     *  queue the process opened for the device. The executor creates and destroys no stream. */
     void* stream;
 
     /** The @b optional ceiling on the device scratch a call or a merge takes; zero lets scratch grow as calls ask. */
@@ -1095,7 +1093,8 @@ typedef struct ustore_executor_for_vram_t {
 } ustore_executor_for_vram_t;
 
 /**
- *  @brief Opens one submission stream on @c device, or borrows the caller's, fed by its caller.
+ *  @brief Orders work on one stream on @c device, the caller's or the device's default one, fed
+ *      by its caller.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  Every call queues on that stream from the calling thread, which waits on it there, so a deferred
@@ -1112,8 +1111,8 @@ typedef struct ustore_executor_for_vram_t {
  *  - @c ustore_status_unsupported_k No class this build compiled serves the device at or under
  *    the @c gpu_class_ceiling, the process may allocate on no memory domain, or the operating
  *    system denies ForkUnion an operation.
- *  - @c ustore_status_device_k No device carries the ordinal, its driver refuses a stream or an
- *    event, or @c ustore_gds_direct_k names a device other than NVIDIA.
+ *  - @c ustore_status_device_k No device holds the ordinal, its driver refuses an event, or
+ *    @c ustore_gds_direct_k names a device other than NVIDIA.
  */
 USTORE_EXPORT void ustore_executor_for_vram(ustore_executor_for_vram_t* arguments);
 
@@ -1136,8 +1135,6 @@ typedef struct ustore_executor_drain_t {
  *      executor-level failures, and contention from a callback of the call it would wait on.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
- *  A borrowed pool keeps its lender's mood.
- *
  *  @par Statuses:
  *  - @c ustore_status_invalid_argument_k The @c mood is unknown.
  *  - @c ustore_status_contended_k A callback on the thread serving the holding call drains it.
@@ -1145,8 +1142,8 @@ typedef struct ustore_executor_drain_t {
 USTORE_EXPORT void ustore_executor_drain(ustore_executor_drain_t* arguments);
 
 /**
- *  @brief Waits until no call holds the executor, releases its scratch and streams, returns a
- *      borrowed pool and frees it; @c NULL is safe, and it cannot fail, so takes no outcome.
+ *  @brief Waits until no call holds the executor and its device ran the work queued on its stream,
+ *      releases its scratch and frees it; @c NULL is safe, and it cannot fail, so takes no outcome.
  *  @param[in,out] executor The executor to be freed; invalid afterwards.
  *
  *  Arenas it made stay valid, each keeping its memory until freed.
@@ -1169,9 +1166,9 @@ USTORE_EXPORT void ustore_executor_free(ustore_executor_t executor);
  *  inputs point into the arena it is about to rewind. An arena serves one call at a time, so a
  *  second call naming it finishes @c ustore_status_contended_k, and a deferred one does so at
  *  submission. A call whose executor computes on host threads given an arena on a device, or on
- *  another device than the arena's, reports @c ustore_status_device_k. A blocking call borrows the
- *  arena until it returns, and a deferred one holds it until final. A call that fails, is
- *  cancelled, or has nothing to report leaves its outputs @c NULL.
+ *  another device than the arena's, reports @c ustore_status_device_k. A blocking call uses the
+ *  arena until it returns, and a deferred one until final. A call that fails, is cancelled, or has
+ *  nothing to report leaves its outputs @c NULL.
  */
 typedef struct ustore_arena_handle_t* ustore_arena_t;
 

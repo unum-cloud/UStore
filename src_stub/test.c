@@ -158,7 +158,7 @@ static void read_test_settings(int argc, char** argv) {
 
 #define expect_(condition) expect_at((condition), __FILE__, __LINE__, #condition)
 
-/** Holds when @p outcome carries @p wanted ; otherwise counts a failed check at @p file : @p
+/** Holds when @p outcome holds @p wanted ; otherwise counts a failed check at @p file : @p
  *  line naming both. */
 static bool expect_status_at(ustore_outcome_t outcome, ustore_status_t wanted, char const* file, int line) {
     if (outcome.status == wanted) return true;

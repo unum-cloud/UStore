@@ -62,7 +62,7 @@ endif ()
 # ForkUnion's C ABI, linked statically into every engine and suite
 ustore_sibling(
     forkunion FETCHCONTENT_SOURCE_DIR_FORKUNION https://github.com/ashvardanian/ForkUnion.git
-    2105dd71bbbe3e22c92cf4a4f332a579abb8b780
+    6bd10ce124b3804719ca297ac61092ac5773d627
 )
 
 # SmashTable's containers, header-only

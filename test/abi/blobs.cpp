@@ -23,7 +23,7 @@
 
 #include "ustore/ustore.hpp"
 
-#include "ustore/utilities/ram_device.hpp" // `caller_exclusivity_t`, `executor_t`
+#include "ustore/utilities/ram_device.hpp" // `caller_exclusivity_t`, `ram_executor_t`
 
 #include "abi/fixture.hpp" // `check_length`, `check_equalities`, `round_trip`, `triplet_t`
 #include "harness.hpp"     // `run_test_case`, `expect_true`, `expect_equal`, `expect_status`, `spin_until`
@@ -118,7 +118,7 @@ void test_database_clear_collection_by_clearing_database(config_t const& config)
  *  blocking or deferred. */
 void test_database_describe(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    auto [executor, executor_status] = executor_handle_t::for_ram({.threads = 2});
+    auto [executor, executor_status] = spawn_executor_handle();
     if (!expect_true(open_status.succeeded() && executor_status.succeeded())) return;
 
     auto [description, describe_status] = database.on().describe();
@@ -132,7 +132,7 @@ void test_database_describe(config_t const& config) {
  *  collections drops it. */
 case_result_t test_database_clear_modes(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    auto [executor, executor_status] = executor_handle_t::for_ram({.threads = 2});
+    auto [executor, executor_status] = spawn_executor_handle();
     if (!expect_true(open_status.succeeded() && executor_status.succeeded())) return {};
     expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
     auto [kept, create_status] = database.on().create("kept");
@@ -152,7 +152,7 @@ case_result_t test_database_clear_modes(config_t const& config) {
  *  deferred alike, and the data still reads. */
 void test_database_compact(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    auto [executor, executor_status] = executor_handle_t::for_ram({.threads = 2});
+    auto [executor, executor_status] = spawn_executor_handle();
     if (!expect_true(open_status.succeeded() && executor_status.succeeded())) return;
     expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
     auto [collection, create_status] = database.on().create("blobs");
@@ -257,7 +257,7 @@ void test_database_named_collections(config_t const& config) {
     if (!expect_true(open_status.succeeded())) return;
     expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
 
-    // A missing collection can't be dropped, and the empty name carries none
+    // A missing collection can't be dropped, and the empty name holds none
     expect_true(!*database.on().contains("unknown"));
     expect_true(database.on().drop("unknown").failed());
     expect_true(database.on().drop("").failed());
@@ -300,7 +300,7 @@ case_result_t test_database_named_collections_race(config_t const& config) {
         else if (create_status == status_code_t::already_exists_k)
             fu::standard_atomic_ref<std::size_t> {refused}.store_add(1, std::memory_order_relaxed);
     };
-    auto maybe_executor = executor_t::make(threads_count, caller_exclusivity_t::caller_inclusive_k);
+    auto maybe_executor = ram_executor_t::make(threads_count, caller_exclusivity_t::caller_inclusive_k);
     expect_true(maybe_executor.has_value());
     if (!maybe_executor) return {};
     expect_true(st::succeeded(maybe_executor->for_threads(task)));
@@ -859,7 +859,7 @@ case_result_t test_database_save_progress(config_t const& config) {
     expect_true(scratch_directory_t::recreate(blocking_directory.c_str()));
     expect_true(scratch_directory_t::recreate(deferred_directory.c_str()));
     auto [database, open_status] = open_database<database_t>(config);
-    auto [executor, executor_status] = executor_handle_t::for_ram({.threads = 2});
+    auto [executor, executor_status] = spawn_executor_handle();
     if (!expect_true(open_status.succeeded() && executor_status.succeeded())) return {};
     if (!database.on().supports_snapshots()) return case_result_t::skipped(needs_snapshots_k);
     expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
@@ -947,7 +947,7 @@ case_result_t test_database_snapshot_with_threads(config_t const& config) {
         }
     };
 
-    auto maybe_executor = executor_t::make(2, caller_exclusivity_t::caller_inclusive_k);
+    auto maybe_executor = ram_executor_t::make(2, caller_exclusivity_t::caller_inclusive_k);
     if (!expect_true(maybe_executor.has_value())) return {};
     expect_true(st::succeeded(maybe_executor->for_threads(task)));
     return {};
@@ -1192,7 +1192,7 @@ void resize_values(resizing_writer_t& writer) noexcept {
  *  one stamp, so all of one result come from one commit. */
 void test_blobs_read_one_stamp_under_resizes(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    st::expected<executor_t> writing_thread = executor_t::make(1, caller_exclusivity_t::caller_exclusive_k);
+    st::expected<ram_executor_t> writing_thread = ram_executor_t::make(1, caller_exclusivity_t::caller_exclusive_k);
     auto [arena, arena_status] = arena_t::make();
     if (!expect_true(open_status.succeeded() && writing_thread.has_value() && arena_status.succeeded())) return;
     auto [collection, collection_status] = create_collection(database, "one_stamp.blobs", ustore_modality_blobs_k);
@@ -1261,7 +1261,7 @@ void swap_halves(swapping_writer_t& writer) noexcept {
  *  halves of the keys in each commit, lists and reads at one stamp, so it keeps one half. */
 case_result_t test_blobs_filtered_scan_one_stamp_under_swaps(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    st::expected<executor_t> writing_thread = executor_t::make(1, caller_exclusivity_t::caller_exclusive_k);
+    st::expected<ram_executor_t> writing_thread = ram_executor_t::make(1, caller_exclusivity_t::caller_exclusive_k);
     auto [arena, arena_status] = arena_t::make();
     if (!expect_true(open_status.succeeded() && writing_thread.has_value() && arena_status.succeeded())) return {};
     if (!database.on().supports_transactions()) return case_result_t::skipped(needs_transactions_k);
@@ -1338,6 +1338,151 @@ void test_blobs_cursor_descending_end(config_t const& config) {
 
 #pragma endregion Bounded Ranges
 
+/** A sample of one key is uniform over the present keys of runs that overlap, hold removals and
+ *  hold several versions of a key: a chi-square over 20 000 samples stays under its 0.001 bound;
+ *  and a sample as wide as the present keys holds every one of them. */
+void test_blobs_sample_uniform(config_t const& config) {
+    auto [database, open_status] = open_database<database_t>(config);
+    if (!expect_true(open_status.succeeded())) return;
+    auto [blobs, blobs_status] = create_collection(database, "sample_uniform", ustore_modality_blobs_k);
+    if (!expect_true(blobs_status.succeeded())) return;
+    std::array<ustore_key_t, 72> const keys = keys_of_integers<72>(0);
+    std::span<ustore_key_t const> const all {keys};
+    ustore_outcome_t outcome {};
+    auto const flush = [&]() noexcept {
+        ustore_database_flush_t flush {.database = database, .outcome = &outcome};
+        ustore_database_flush(&flush);
+    };
+    auto const remove = [&](std::span<ustore_key_t const> removed) noexcept {
+        ustore_blobs_remove_t remove {};
+        remove.database = database;
+        remove.outcome = &outcome;
+        remove.count = removed.size();
+        remove.collections = {&blobs, 0};
+        remove.keys = {removed.data(), sizeof(ustore_key_t)};
+        ustore_blobs_remove(&remove);
+        expect_success(outcome);
+    };
+    // Flushed runs overlap on 16 to 47 and remove 0 to 7; memory adds 64 to 71, removes 40 to 43
+    write_text(database, blobs, all.subspan(0, 48), "older");
+    flush();
+    write_text(database, blobs, all.subspan(16, 48), "newer");
+    flush();
+    remove(all.subspan(0, 8));
+    flush();
+    write_text(database, blobs, all.subspan(64, 8), "fresh");
+    remove(all.subspan(40, 4));
+    auto const present = [](std::size_t key) noexcept { return key >= 8 && !(key >= 40 && key < 44); };
+
+    constexpr std::size_t samples_k = 20000;
+    std::array<std::size_t, 72> hits {};
+    auto [arena, arena_status] = arena_t::make();
+    if (!expect_true(arena_status.succeeded())) return;
+    for (std::size_t round = 0; round != samples_k; ++round) {
+        ustore_length_t const* offsets = nullptr;
+        ustore_key_t const* sampled = nullptr;
+        ustore_blobs_sample_t sample {};
+        sample.database = database;
+        sample.outcome = &outcome;
+        sample.count = 1;
+        sample.collections = {&blobs, 0};
+        sample.offsets = &offsets;
+        sample.keys = &sampled;
+        sample.arena = arena;
+        sample.wanted = 1;
+        ustore_blobs_sample(&sample);
+        if (!expect_success(outcome) || !expect_equal(offsets[1], ustore_length_t {1})) return;
+        std::size_t const key = static_cast<std::size_t>(*uuid_to_integer(sampled[0].uuid));
+        if (!expect_true(key < hits.size() && present(key), "sampled key {}", key)) return;
+        ++hits[key];
+    }
+    std::size_t present_count = 0;
+    for (std::size_t key = 0; key != hits.size(); ++key) present_count += present(key);
+    double const expected = static_cast<double>(samples_k) / static_cast<double>(present_count);
+    double chi_square = 0;
+    for (std::size_t key = 0; key != hits.size(); ++key)
+        if (present(key))
+            chi_square += (static_cast<double>(hits[key]) - expected) * (static_cast<double>(hits[key]) - expected) /
+                          expected;
+    // The 0.999 quantile of chi-square at 59 degrees of freedom, after Wilson and Hilferty
+    expect_true(chi_square < 98.4, "chi-square {} over {} present keys", chi_square, present_count);
+
+    // A sample as wide as the present keys, narrower than their versions, holds every present key
+    ustore_length_t const* offsets = nullptr;
+    ustore_key_t const* sampled = nullptr;
+    ustore_blobs_sample_t sample {};
+    sample.database = database;
+    sample.outcome = &outcome;
+    sample.count = 1;
+    sample.collections = {&blobs, 0};
+    sample.offsets = &offsets;
+    sample.keys = &sampled;
+    sample.arena = arena;
+    sample.wanted = present_count;
+    ustore_blobs_sample(&sample);
+    if (!expect_success(outcome) || !expect_equal(offsets[1], static_cast<ustore_length_t>(present_count))) return;
+    std::array<bool, 72> seen {};
+    for (ustore_length_t index = 0; index != offsets[1]; ++index) {
+        std::size_t const key = static_cast<std::size_t>(*uuid_to_integer(sampled[index].uuid));
+        if (!expect_true(key < seen.size() && present(key) && !seen[key], "sampled key {}", key)) return;
+        seen[key] = true;
+    }
+}
+
+/** A batch in shuffled order, split over an executor's slices, lands every value, missing key and
+ *  window at its own request index, whatever order the read takes its keys in. */
+void test_blobs_read_shuffled(config_t const& config) {
+    auto [database, open_status] = open_database<database_t>(config);
+    if (!expect_true(open_status.succeeded())) return;
+    auto [blobs, blobs_status] = create_collection(database, "read_shuffled", ustore_modality_blobs_k);
+    if (!expect_true(blobs_status.succeeded())) return;
+    auto [executor, executor_status] = spawn_executor();
+    if (!expect_true(executor_status.succeeded())) return;
+    auto [arena, arena_status] = arena_t::make();
+    if (!expect_true(arena_status.succeeded())) return ustore_executor_free(executor);
+
+    // Keys from 384 up are never written, and every value is its own index spelled out
+    constexpr std::size_t written_k = 384;
+    constexpr std::size_t count_k = 512;
+    std::array<ustore_key_t, written_k> const written = keys_of_integers<written_k>(0);
+    std::array<std::array<char, 16>, written_k> texts {};
+    std::array<std::string_view, written_k> values {};
+    for (std::size_t index = 0; index != written_k; ++index)
+        values[index] = {texts[index].data(), fmt::format_to_n(texts[index].data(), 16, "v{}", index).size};
+    strided_strings<std::string_view> const values_strings {{values.data(), sizeof(std::string_view)}};
+    ustore_outcome_t outcome {};
+    ustore_blobs_write_t write {};
+    write.database = database;
+    write.outcome = &outcome;
+    write.count = written_k;
+    write.collections = {&blobs, 0};
+    write.keys = {written.data(), sizeof(ustore_key_t)};
+    write.values = values_strings.view();
+    ustore_blobs_write(&write);
+    expect_success(outcome);
+
+    // A stride coprime with the count shuffles the keys, and odd requests skip their first byte
+    std::array<ustore_key_t, count_k> keys {};
+    std::array<ustore_length_t, count_k> offsets {};
+    for (std::size_t request = 0; request != count_k; ++request) {
+        keys[request] = key_from_integer(request * 197 % count_k);
+        offsets[request] = static_cast<ustore_length_t>(request % 2);
+    }
+    read_columns_t columns;
+    ustore_blobs_read_t read = read_of(database, blobs, keys, columns, arena, outcome);
+    read.executor = executor;
+    read.offsets = {offsets.data(), sizeof(ustore_length_t)};
+    ustore_blobs_read(&read);
+    if (expect_success(outcome))
+        for (std::size_t request = 0; request != count_k; ++request) {
+            std::size_t const key = request * 197 % count_k;
+            bool const present = (columns.presences[request / 8] >> (request % 8)) & 1u;
+            if (!expect_equal(present, key < written_k, "request {}", request) || !present) continue;
+            expect_equal(columns.value(request), values[key].substr(request % 2), "request {}", request);
+        }
+    ustore_executor_free(executor);
+}
+
 int main(int argc, char** argv) {
     start_test_run(argc, argv);
 
@@ -1413,5 +1558,7 @@ int main(int argc, char** argv) {
                   test_blobs_filtered_scan_one_stamp_under_swaps, config);
     run_test_case(engine_label_t {"test_blobs_cursor_descending_end"}.c_str(), test_blobs_cursor_descending_end,
                   config);
+    run_test_case(engine_label_t {"test_blobs_sample_uniform"}.c_str(), test_blobs_sample_uniform, config);
+    run_test_case(engine_label_t {"test_blobs_read_shuffled"}.c_str(), test_blobs_read_shuffled, config);
     return finish_test_run();
 }

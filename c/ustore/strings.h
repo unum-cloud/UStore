@@ -261,8 +261,8 @@ typedef struct ustore_strings_scan_t {
     /** Output for the found strings as a tape inside @c arena, scan after scan. */
     ustore_strings_view_t* strings;
 
-    /** Optional output for one BM25 score per listed string when @c patterns carry weights, inside @c arena; @c NULL
-     *  skips them. */
+    /** Optional output for one BM25 score per listed string when @c patterns hold weights, inside
+     *  @c arena; @c NULL skips them. */
     float const** scores;
 
     /** Rewound by this call, then holding every output it writes; @c NULL is refused. */

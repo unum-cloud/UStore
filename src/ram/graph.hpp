@@ -51,8 +51,9 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_read_
 
     status_t outcome;
     store_status_t const exported = with_source(state, view, [&]<typename source_type_>(source_type_& source) noexcept {
-        auto export_slice = [&](std::size_t first_task, std::size_t length, view_t const& slice) noexcept -> status_t {
-            edges_tape_t& edges = slices_edges[slice.thread_index];
+        auto export_slice = [&](std::size_t first_task, std::size_t length, std::size_t run,
+                                view_t const& slice) noexcept -> status_t {
+            edges_tape_t& edges = slices_edges[run];
             edges = edges_tape_t {{slice.scratch}};
             st::vector<half_edge_t, arena_allocator<half_edge_t>> walked {{slice.scratch}};
             status_t slice_outcome;
@@ -74,7 +75,7 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_read_
         // A transaction's reads join its watch set, so only a reader at one stamp splits the batch
         if constexpr (std::is_same_v<source_type_, reader_source<cpu_class_, isolation_>>)
             outcome = for_task_slices(view, arguments.count, export_slice);
-        else outcome = export_slice(0, arguments.count, view);
+        else outcome = export_slice(0, arguments.count, 0, view);
         return store_status_t::success_k;
     });
     if (status_t const status = reported(exported, outcome); status.failed()) return status;

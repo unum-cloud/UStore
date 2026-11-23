@@ -43,7 +43,7 @@
 #include "ustore/utilities/blocking_files.hpp" // `replace_file_durably`, `read_file`, `list_directory`, `temporary_path_of`
 #include "ustore/utilities/nvme_channels.hpp"  // `io_channel_t`, `basic_read_pipeline`, `basic_write_pipeline`
 #include "ustore/utilities/nvme_manifest.hpp"  // `manifest_t`, `manifest_file_t`
-#include "ustore/utilities/nvme_ring.hpp"      // `extent_t`, `ring_concept`, `registered_medium_t`
+#include "ustore/utilities/nvme_ring.hpp"      // `extent_t`, `disk_concept`, `registered_medium_t`
 #include "ustore/utilities/nvme_slots.hpp"     // `slot_t`, `slot_owner_block_t`, `slot_bytes_k`
 #include "ustore/utilities/types.hpp"          // `status_t`, `status_code_t`, `expected`, `uuid128_t`
 
@@ -67,7 +67,7 @@ struct medium_extent_t {
     /** The volume's record of the placement: a slot on raw media, a run file on a filesystem. */
     placement_handle_t placement;
 
-    /** The part of the run @p offset bytes in, as the extent a request carries. */
+    /** The part of the run @p offset bytes in, as the extent a request holds. */
     [[nodiscard]] constexpr extent_t slice(std::uint64_t offset, std::uint64_t bytes) const noexcept {
         extent_t const inside = extent_t {offset, bytes}.clipped_to(extent.length);
         return extent_t {extent.offset + inside.offset, inside.length};
@@ -190,6 +190,10 @@ struct volume_config_t {
     /** Run files a directory volume keeps registered at once, which bounds the runs
      *  of the database. */
     std::size_t runs_capacity = 0;
+
+    /** How the mount treats the media: @c read_only_k changes nothing on them, neither creating
+     *  a directory or a manifest nor sweeping leftovers nor taking the lock a writer takes. */
+    medium_access_t access = medium_access_t::create_read_write_k;
 };
 
 #pragma endregion Placement
@@ -202,9 +206,7 @@ struct volume_config_t {
 template <typename disk_type_, typename waiter_type_>
 status_t write_extent(disk_type_& disk, io_channel_t& channel, medium_extent_t const& extent,
                       std::span<byte_t const> bytes) noexcept {
-    auto [writer_channel, writer_channel_status] = channel.acquire();
-    if (writer_channel_status.failed()) return writer_channel_status;
-    basic_write_pipeline<disk_type_, waiter_type_> writer {disk, std::move(writer_channel), extent.medium};
+    basic_write_pipeline<disk_type_, waiter_type_> writer {disk, channel, extent.medium};
     std::uint64_t const total = round_up_to_multiple<std::uint64_t>(bytes.size(), portable_alignment_k);
     if (total > extent.extent.length) return {status_code_t::invalid_argument_k, "The bytes outgrow their extent"};
     for (std::uint64_t written = 0; written != total;) {
@@ -214,10 +216,10 @@ status_t write_extent(disk_type_& disk, io_channel_t& channel, medium_extent_t c
         if (room == 0) return {status_code_t::capacity_exhausted_k, "A channel's block holds no page"};
         std::uint64_t const chunk = total - written < room ? total - written : room;
         std::uint64_t const left = bytes.size() - written;
-        std::uint64_t const carried = left < chunk ? left : chunk;
+        std::uint64_t const held = left < chunk ? left : chunk;
         std::span<byte_t> const target = block.bytes();
-        std::memcpy(target.data(), bytes.data() + written, static_cast<std::size_t>(carried));
-        std::memset(target.data() + carried, 0, static_cast<std::size_t>(chunk - carried));
+        std::memcpy(target.data(), bytes.data() + written, static_cast<std::size_t>(held));
+        std::memset(target.data() + held, 0, static_cast<std::size_t>(chunk - held));
         if (status_t const queued = writer.enqueue_write(std::move(block), extent.slice(written, chunk));
             queued.failed())
             return queued;
@@ -232,16 +234,14 @@ status_t write_extent(disk_type_& disk, io_channel_t& channel, medium_extent_t c
 template <typename disk_type_>
 status_t read_extent(disk_type_& disk, io_channel_t& channel, medium_extent_t const& extent,
                      std::span<byte_t> into) noexcept {
-    auto [reader_channel, reader_channel_status] = channel.acquire();
-    if (reader_channel_status.failed()) return reader_channel_status;
-    basic_read_pipeline<disk_type_> reader {disk, std::move(reader_channel), extent.medium};
+    basic_read_pipeline<disk_type_> reader {disk, channel, extent.medium};
     std::uint64_t const block_bytes = round_down_to_multiple<std::uint64_t>(channel.requests().buffer_bytes(),
                                                                             portable_alignment_k);
     if (block_bytes == 0) return {status_code_t::capacity_exhausted_k, "A channel's block holds no page"};
-    status_t carried;
+    status_t held;
     auto sink = [&](completed_buffer_t const& completed) noexcept {
         if (status_t const whole = require_completed_in_full(completed); whole.failed()) {
-            carried = whole;
+            held = whole;
             return;
         }
         std::uint64_t const begin = completed.tag * block_bytes;
@@ -260,7 +260,7 @@ status_t read_extent(disk_type_& disk, io_channel_t& channel, medium_extent_t co
         if (status_t const submitted = reader.submit(); submitted.failed()) return submitted;
     }
     if (status_t const polled = reader.poll_all_completions(sink); polled.failed()) return polled;
-    return carried;
+    return held;
 }
 
 #pragma endregion Extent Bytes
@@ -442,7 +442,7 @@ class basic_slot_allocator {
  *  @tparam allocator_type_ The byte allocator the run-file pool and the manifest are charged to.
  */
 template <typename disk_type_, typename waiter_type_, typename allocator_type_>
-    requires ring_concept<disk_type_>
+    requires disk_concept<disk_type_>
 class basic_directory_volume {
   public:
 
@@ -478,9 +478,13 @@ class basic_directory_volume {
     /**
      *  @brief Opens every directory of @p config, reads the manifest when there is one, and unlinks
      *      every run file of this database the manifest does not name, which a crash left behind.
+     *
+     *  A read-only mount creates no directory, takes no lock, needs a manifest and sweeps nothing.
+     *
      *  @return The volume, @c invalid_argument_k for an address that names no directory,
-     *      @c contended_k while another mount holds the manifest's directory, or @c malformed_k for
-     *      a manifest of another database or one naming a directory this mount did not list.
+     *      @c contended_k while another mount holds the manifest's directory, @c not_found_k for a
+     *      read-only mount without a manifest, or @c malformed_k for a manifest of another database
+     *      or one naming a directory this mount did not list.
      */
     static expected<basic_directory_volume> mount(disk_type_& disk, [[maybe_unused]] io_channel_t& channel,
                                                   volume_config_t const& config, allocator_type_ allocator) noexcept {
@@ -497,14 +501,18 @@ class basic_directory_volume {
             directory.quota = address.byte_limit;
             if (sz::failed(directory.path.assign(string_view_t {address.location})))
                 return status_t {status_code_t::out_of_memory_k, "No room for a data directory's path"};
-            if (status_t const made = create_directories(directory.path.c_str()); made.failed()) return made;
+            if (config.access != medium_access_t::read_only_k)
+                if (status_t const made = create_directories(directory.path.c_str()); made.failed()) return made;
             [[maybe_unused]] st::status_t const placed = volume.directories_.push_back(st::assume_reserved,
                                                                                        std::move(directory));
         }
-        // A second mount would sweep the first one's unpublished runs as leftovers.
-        auto [locked, lock_status] = file_lock_t::acquire(volume.directories_[0].path.c_str());
-        if (lock_status.failed()) return lock_status;
-        volume.lock_ = std::move(locked);
+        // A second mount would sweep the first one's unpublished runs as leftovers, while a reader
+        // opens only the runs the manifest names
+        if (config.access != medium_access_t::read_only_k) {
+            auto [locked, lock_status] = file_lock_t::acquire(volume.directories_[0].path.c_str());
+            if (lock_status.failed()) return lock_status;
+            volume.lock_ = std::move(locked);
+        }
         // The records grow in chunks that never move, so a small database pays for few of them.
         auto [files, make_status] = run_files_t::make(1, config.runs_capacity, allocator);
         if (make_status != st::status_t::success_k)
@@ -517,7 +525,8 @@ class basic_directory_volume {
         if (status_t const named = volume.manifest_path_(path); named.failed()) return named;
         st::vector<char> text;
         status_t const read = read_file(path, text);
-        if (read == status_code_t::not_found_k) volume.manifest_.id = uuid_generator();
+        if (read == status_code_t::not_found_k && config.access != medium_access_t::read_only_k)
+            volume.manifest_.id = uuid_generator();
         else if (read.failed()) return read;
         else if (status_t const parsed = volume.manifest_.parse(text, allocator); parsed.failed()) return parsed;
         if (volume.manifest_.database != config.database || volume.manifest_.placement != manifest_placement_t::paths_k)
@@ -525,7 +534,8 @@ class basic_directory_volume {
         for (manifest_file_t const& file : volume.manifest_.files)
             if (file.medium >= volume.directories_.size())
                 return status_t {status_code_t::malformed_k, "The manifest names a data directory this mount lacks"};
-        if (status_t const swept = volume.sweep_leftovers_(); swept.failed()) return swept;
+        if (config.access != medium_access_t::read_only_k)
+            if (status_t const swept = volume.sweep_leftovers_(); swept.failed()) return swept;
         return volume;
     }
 
@@ -601,10 +611,7 @@ class basic_directory_volume {
                 run_file_t* const file = run_files_.at(handle_of_(handle));
                 if (!file || file->data_directory != index) continue;
                 gained = true;
-                auto [writer_channel, writer_channel_status] = channel.acquire();
-                if (writer_channel_status.failed()) return writer_channel_status;
-                basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, std::move(writer_channel),
-                                                                       file->medium.reference()};
+                basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, channel, file->medium.reference()};
                 if (status_t const durable = writer.make_durable(); durable.failed()) return durable;
             }
             if (gained)
@@ -826,7 +833,7 @@ class basic_directory_volume {
  *  flush leaves the old generation in force.
  */
 template <typename disk_type_, typename waiter_type_, typename allocator_type_>
-    requires ring_concept<disk_type_>
+    requires disk_concept<disk_type_>
 class basic_slotted_volume {
   public:
 
@@ -878,6 +885,8 @@ class basic_slotted_volume {
         if (config.data_directories.empty() ||
             config.data_directories.size() > (std::numeric_limits<std::uint16_t>::max)())
             return status_t {status_code_t::invalid_argument_k, "A volume spans one to 65,535 data directories"};
+        if (config.access == medium_access_t::read_only_k)
+            return status_t {status_code_t::unsupported_k, "Raw media mount read-write alone"};
         basic_slotted_volume volume {disk, allocator};
         if (volume.media_.reserve(config.data_directories.size()) != st::status_t::success_k)
             return status_t {status_code_t::out_of_memory_k, "No room for the raw media"};
@@ -972,10 +981,7 @@ class basic_slotted_volume {
         std::uint64_t const regions = first.base + slot_payload_offset_k;
         std::uint64_t const idle = manifest_owner_.manifest_offset == regions ? regions + manifest_region_bytes_k
                                                                               : regions;
-        auto [writer_channel, writer_channel_status] = channel.acquire();
-        if (writer_channel_status.failed()) return writer_channel_status;
-        basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, std::move(writer_channel),
-                                                               first.medium.reference()};
+        basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, channel, first.medium.reference()};
         if (status_t const written = write_bytes_(writer, idle, std::as_bytes(json), first.block_bytes);
             written.failed())
             return written;
@@ -1117,9 +1123,7 @@ class basic_slotted_volume {
         slot_owner_block_t found {};
         // The reader gives the queue pair back before the writer or the manifest load takes it.
         {
-            auto [reader_channel, reader_channel_status] = channel.acquire();
-            if (reader_channel_status.failed()) return reader_channel_status;
-            basic_read_pipeline<disk_type_> reader {*disk_, std::move(reader_channel), first.medium.reference()};
+            basic_read_pipeline<disk_type_> reader {*disk_, channel, first.medium.reference()};
             if (status_t const read = read_owner_blocks_(
                     reader, first, 0, 1,
                     [&](std::uint32_t, slot_owner_block_t const& block) noexcept { found = block; });
@@ -1133,10 +1137,7 @@ class basic_slotted_volume {
                 return {status_code_t::out_of_memory_k, "No room for the database's name"};
             manifest_.placement = manifest_placement_t::offsets_k;
             manifest_owner_ = owner_block_(0);
-            auto [writer_channel, writer_channel_status] = channel.acquire();
-            if (writer_channel_status.failed()) return writer_channel_status;
-            basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, std::move(writer_channel),
-                                                                   first.medium.reference()};
+            basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, channel, first.medium.reference()};
             if (status_t const written = write_owner_block_(writer, first, first.base, &manifest_owner_);
                 written.failed())
                 return written;
@@ -1167,14 +1168,12 @@ class basic_slotted_volume {
         std::uint64_t const rounded = round_up_to_multiple(owner.manifest_bytes, first.block_bytes);
         if (text.resize(static_cast<std::size_t>(rounded)) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room to read the manifest"};
-        auto [reader_channel, reader_channel_status] = channel.acquire();
-        if (reader_channel_status.failed()) return reader_channel_status;
-        basic_read_pipeline<disk_type_> reader {*disk_, std::move(reader_channel), first.medium.reference()};
+        basic_read_pipeline<disk_type_> reader {*disk_, channel, first.medium.reference()};
         std::uint64_t const block_bytes = round_down_to_multiple(channel.requests().buffer_bytes(), first.block_bytes);
         std::uint64_t offered = 0;
-        status_t carried;
+        status_t held;
         auto sink = [&](completed_buffer_t const& completed) noexcept {
-            if (status_t const whole = require_completed_in_full(completed); whole.failed()) carried = whole;
+            if (status_t const whole = require_completed_in_full(completed); whole.failed()) held = whole;
             else std::memcpy(text.data() + completed.tag * block_bytes, completed.bytes.data(), completed.bytes.size());
         };
         for (request_tag_t tag = 0; offered != rounded; ++tag) {
@@ -1188,7 +1187,7 @@ class basic_slotted_volume {
             offered += chunk;
         }
         if (status_t const polled = reader.poll_all_completions(sink); polled.failed()) return polled;
-        if (carried.failed()) return carried;
+        if (held.failed()) return held;
         if (status_t const parsed = manifest_.parse(std::span<char> {text.data(), owner.manifest_bytes}, allocator_);
             parsed.failed())
             return parsed;
@@ -1228,9 +1227,7 @@ class basic_slotted_volume {
         std::uint32_t const first_scanned = index == 0 ? 1 : 0;
         // The reader gives the queue pair back before the writer below takes it.
         {
-            auto [reader_channel, reader_channel_status] = channel.acquire();
-            if (reader_channel_status.failed()) return reader_channel_status;
-            basic_read_pipeline<disk_type_> reader {*disk_, std::move(reader_channel), medium.medium.reference()};
+            basic_read_pipeline<disk_type_> reader {*disk_, channel, medium.medium.reference()};
             if (status_t const read = read_owner_blocks_(
                     reader, medium, first_scanned, count,
                     [&](std::uint32_t slot, slot_owner_block_t const& block) noexcept {
@@ -1243,10 +1240,7 @@ class basic_slotted_volume {
                 return read;
         }
 
-        auto [writer_channel, writer_channel_status] = channel.acquire();
-        if (writer_channel_status.failed()) return writer_channel_status;
-        basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, std::move(writer_channel),
-                                                               medium.medium.reference()};
+        basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, channel, medium.medium.reference()};
         for (std::uint32_t slot = count; slot != first_scanned; --slot) {
             std::uint32_t const at = slot - 1;
             bool const named = medium.slots.slot(at).live_bytes != 0;
@@ -1266,10 +1260,7 @@ class basic_slotted_volume {
      *  and zeroes and deallocates every one freed. */
     status_t write_touched_(io_channel_t& channel, std::size_t index) noexcept {
         raw_medium_t& medium = media_[index];
-        auto [writer_channel, writer_channel_status] = channel.acquire();
-        if (writer_channel_status.failed()) return writer_channel_status;
-        basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, std::move(writer_channel),
-                                                               medium.medium.reference()};
+        basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, channel, medium.medium.reference()};
         slot_owner_block_t const owner = owner_block_(static_cast<std::uint32_t>(index));
         // A slot vacated since a run was dropped has its owner block zeroed below, and may hold a
         // newer run already.
@@ -1354,10 +1345,10 @@ class basic_slotted_volume {
     template <typename visitor_type_>
     static status_t read_owner_blocks_(basic_read_pipeline<disk_type_>& reader, raw_medium_t const& medium,
                                        std::uint32_t begin, std::uint32_t end, visitor_type_&& visitor) noexcept {
-        status_t carried;
+        status_t held;
         auto sink = [&](completed_buffer_t const& completed) noexcept {
             if (status_t const whole = require_completed_in_full(completed); whole.failed()) {
-                carried = whole;
+                held = whole;
                 return;
             }
             slot_owner_block_t block {};
@@ -1374,7 +1365,7 @@ class basic_slotted_volume {
             if (status_t const submitted = reader.submit(); submitted.failed()) return submitted;
         }
         if (status_t const polled = reader.poll_all_completions(sink); polled.failed()) return polled;
-        return carried;
+        return held;
     }
 
     [[nodiscard]] static std::uint64_t slot_base_(raw_medium_t const& medium, std::uint32_t slot) noexcept {
@@ -1386,7 +1377,7 @@ class basic_slotted_volume {
         return std::memcmp(&block, &zero, sizeof(block)) == 0;
     }
 
-    /** The owner block every slot of data directory @p medium carries, without
+    /** The owner block every slot of data directory @p medium holds, without
      *  the manifest fields. */
     [[nodiscard]] slot_owner_block_t owner_block_(std::uint32_t medium) const noexcept {
         slot_owner_block_t owner {};
@@ -1420,7 +1411,7 @@ class basic_slotted_volume {
  *  directory, a slotted volume when it is a raw medium; every call is one @c visit, paid per
  *  run rather than per request. */
 template <typename disk_type_, typename waiter_type_, typename allocator_type_>
-    requires ring_concept<disk_type_>
+    requires disk_concept<disk_type_>
 class any_volume {
   public:
 

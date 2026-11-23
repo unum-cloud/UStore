@@ -35,7 +35,7 @@ The engine suites share `nvme/fixture.hpp`: one shape per suite, one mount per t
 A transport the machine does not offer skips with its reason, and a transport the flags claim that then fails to mount fails the suite.
 Every result line reads `<suite>.<transport>.<case>`.
 CMake builds every suite below as `ustore_test_nvme_<suite>`, the Linux transports only on Linux.
-The database transaction and stress suites link the device compactor when the build carries CUDA.
+The database transaction and stress suites link the device compactor when the build holds CUDA.
 Every suite instantiates the templates with ForkUnion's standard atomic reference and a yielding waiter, as no suite picks a CPU class.
 No suite reaching the harness compiles under nvcc, since nvcc's front end crashes instantiating StringZilla's string.
 The compaction suite builds twice, as `ustore_test_nvme_compaction_host` with every test build and as `ustore_test_nvme_compaction` over the device compactor, which `nvme/compaction_device.cpp` instantiates for the suite's key slots.

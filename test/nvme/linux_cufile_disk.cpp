@@ -113,8 +113,7 @@ class device_buffer_t {
 
 /** Submits @p requests in one batch and waits for every completion, checking that each
  *  completed in full. */
-void move_in_full(linux_cufile_files_disk_t& disk, queue_pair_t const& queue_pair,
-                  std::span<request_t const> requests) {
+void move_in_full(linux_cufile_files_disk_t& disk, queue_ref_t const& queue_pair, std::span<request_t const> requests) {
     std::array<completion_t, polling_room_k> completions {};
     expect_true(disk.submit(queue_pair, requests) == requests.size());
     expect_true(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
@@ -148,10 +147,11 @@ case_result_t test_cufile_moves_device_memory(linux_cufile_files_disk_t& disk, m
     std::span<byte_t> const read = whole(host).subspan(device_bytes_k);
     paint(written, 41);
 
-    expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
-    expect_true(acquired.has_value());
-    if (!acquired) return {};
-    queue_pair_t queue_pair = std::move(*acquired);
+    auto [queue, make_queue_status] = linux_cufile_queue_t::make(queue_pair_depth_k, {});
+    expect_true(make_queue_status.succeeded());
+    if (make_queue_status.failed()) return {};
+    queue_ref_t const queue_pair {queue, queue_id_t {0}};
+    expect_true(disk.register_media(queue_pair).succeeded());
     expected<registered_memory_t> host_registered = disk.register_memory(whole(host), memory_space_t::host_k);
     expected<registered_memory_t> device_registered = disk.register_memory(device.bytes(), memory_space_t::gpu_k);
     expect_true(host_registered.has_value() && device_registered.has_value());
@@ -186,8 +186,45 @@ case_result_t test_cufile_moves_device_memory(linux_cufile_files_disk_t& disk, m
         if (host_registered) expect_true(disk.unregister_memory(*host_registered).succeeded());
         if (device_registered) expect_true(disk.unregister_memory(*device_registered).succeeded());
     }
-    expect_true(disk.release_queue_pair(queue_pair).succeeded());
     return {};
+}
+
+/** A queue's own blocks move with no registration of their own: a write from the first half and a
+ *  read into the second, both naming @c queue_range_k, leave the halves equal. */
+void test_cufile_moves_the_queue_range(linux_cufile_files_disk_t& disk, medium_reference_t medium) {
+    test_buffer_t blocks = make_buffer(2 * block_bytes_k);
+    if (!expect_true(blocks.size() == 2 * block_bytes_k)) return;
+    auto [queue, make_queue_status] = linux_cufile_queue_t::make(queue_pair_depth_k, whole(blocks));
+    expect_true(make_queue_status.succeeded());
+    if (make_queue_status.failed()) return;
+    queue_ref_t const queue_pair {queue, queue_id_t {0}};
+    expect_true(disk.register_media(queue_pair).succeeded());
+
+    paint(whole(blocks).first(block_bytes_k), 7);
+    paint(whole(blocks).subspan(block_bytes_k), 0);
+    std::array<request_t, 1> const write {
+        write_request(medium, extent_t {0, block_bytes_k},
+                      memory_reference_t {registered_memory_id_t::queue_range_k, 0, 0}, queue_pair.token(0))};
+    std::array<request_t, 1> const read {read_request(
+        medium, extent_t {0, block_bytes_k},
+        memory_reference_t {registered_memory_id_t::queue_range_k, 0, block_bytes_k}, queue_pair.token(1))};
+    move_in_full(disk, queue_pair, write);
+    move_in_full(disk, queue_pair, read);
+    expect_true(same_bytes(whole(blocks).first(block_bytes_k), whole(blocks).subspan(block_bytes_k)));
+}
+
+/** A hold refuses a blocking queue, which serves database mounts this transport never backs, and a
+ *  cuFile queue deeper than the driver's batch. */
+void test_cufile_refuses_foreign_queues(linux_cufile_files_disk_t& disk) {
+    auto [blocking, make_blocking_status] = blocking_queue_t::make(queue_pair_depth_k, {});
+    expect_true(make_blocking_status.succeeded());
+    if (make_blocking_status.succeeded())
+        expect_status(disk.register_media(queue_ref_t {blocking, queue_id_t {0}}), status_code_t::invalid_argument_k);
+
+    auto [deep, make_deep_status] = linux_cufile_queue_t::make(disk.capabilities().depth_limit + 1, {});
+    expect_true(make_deep_status.succeeded());
+    if (make_deep_status.succeeded())
+        expect_status(disk.register_media(queue_ref_t {deep, queue_id_t {0}}), status_code_t::invalid_argument_k);
 }
 
 #pragma endregion Cases
@@ -199,8 +236,6 @@ void cufile_transport(char const* directory) {
     run_test_case("test_cufile_refuses_direct_without_nvidia_fs", test_cufile_refuses_direct_without_nvidia_fs);
 
     linux_cufile_disk_config_t config;
-    config.queue_pairs_limit = 4;
-    config.depth_limit = 64;
     config.registered_memory_limit = 8;
     config.media_limit = 4;
     config.gds = ustore_gds_compatibility_k;
@@ -209,6 +244,7 @@ void cufile_transport(char const* directory) {
     if (!disk) return;
     run_test_case("linux_cufile_files_disk_t::capabilities",
                   [&] { expect_true(disk->capabilities().reaches_gpu_memory); });
+    run_test_case("test_cufile_refuses_foreign_queues", test_cufile_refuses_foreign_queues, *disk);
 
     test_cuda_t const cuda = test_cuda_t::load();
     std::string const path = fmt::format("{}/{}", directory, "volume.bin");
@@ -217,12 +253,13 @@ void cufile_transport(char const* directory) {
                   ring_cases("linux_cufile_files_disk_t", *disk, medium);
                   run_test_case("test_cufile_moves_device_memory", test_cufile_moves_device_memory, *disk, medium,
                                 cuda);
+                  run_test_case("test_cufile_moves_the_queue_range", test_cufile_moves_the_queue_range, *disk, medium);
               });
 
-    std::string const borrowed_path = fmt::format("{}/{}", directory, "volume_borrowed.bin");
+    std::string const viewed_path = fmt::format("{}/{}", directory, "volume_viewed.bin");
     run_test_case("test_ring_holds_a_medium_in_flight<linux_cufile_files_disk_t>",
                   test_ring_holds_a_medium_in_flight<linux_cufile_files_disk_t>, *disk,
-                  volume_request(borrowed_path.c_str()));
+                  volume_request(viewed_path.c_str()));
     std::string const durable_path = fmt::format("{}/{}", directory, "volume_durable.bin");
     run_test_case("test_ring_keeps_what_it_flushed<linux_cufile_files_disk_t>",
                   test_ring_keeps_what_it_flushed<linux_cufile_files_disk_t>, *disk,

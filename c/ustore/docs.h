@@ -358,6 +358,26 @@ typedef struct ustore_docs_column_view_t {
 } ustore_docs_column_view_t;
 
 /**
+ *  @brief One batch of a docs cursor's pull: @c count rows, each a key and a cell of every column
+ *      the cursor gathers.
+ *
+ *  It points into the arena of the pull, valid until that arena is rewound or freed.
+ */
+typedef struct ustore_docs_batch_view_t {
+
+    /** Number of rows. */
+    ustore_size_t count;
+
+    /** The key of every row, in walk order within and across the batches of one pull. */
+    ustore_key_t const* keys;
+
+    /** The cursor's @c fields_count columns, each of @c count rows, as @c ustore_docs_gather lays
+     *  them out. */
+    ustore_docs_column_view_t const* columns;
+
+} ustore_docs_batch_view_t;
+
+/**
  *  @brief The arguments of @c ustore_docs_gather, which reads @c fields_count fields of @c count
  *      documents into columns.
  *
@@ -627,8 +647,21 @@ typedef struct ustore_docs_cursor_init_t {
      *  once; a zeroed view walks every key. */
     ustore_bytes_view_t filter;
 
-    /** Optional verdict on the keys of every page, asked as its @c cost says; host executors only. */
+    /** Optional verdict on the keys of every pull, asked as its @c cost says; host executors
+     *  only. */
     ustore_predicate_t predicate;
+
+    /** Number of fields every pull gathers into the columns of its batches, zero for keys alone. */
+    ustore_size_t fields_count;
+
+    /** Fields to gather from every document, @c fields_count of them, copied and compiled here
+     *  once; the empty field is the whole document, gathered as @c
+     *  ustore_docs_field_type_json_k. */
+    ustore_strings_view_t fields;
+
+    /** Types the columns are converted into, @c fields_count of them, one per field, copied
+     *  here. */
+    ustore_docs_field_type_t const* columns_types;
 
 } ustore_docs_cursor_init_t;
 
@@ -639,14 +672,14 @@ typedef struct ustore_docs_cursor_init_t {
  *
  *  @par Statuses:
  *  - @c ustore_status_invalid_argument_k The @c cursor output is @c NULL, the @c view was made
- *    by neither view constructor or reads another database, a predicate cost is unknown, or
- *    the @c filter does not compile.
+ *    by neither view constructor or reads another database, a predicate cost is unknown, the
+ *    @c filter does not compile, or the @c fields or their types are missing or unknown.
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  */
 USTORE_EXPORT void ustore_docs_cursor_init(ustore_docs_cursor_init_t* arguments);
 
-/** The arguments of @c ustore_docs_cursor_next, which pulls the next page of a walk, with the documents when asked,
- *  in one call. */
+/** The arguments of @c ustore_docs_cursor_next, which pulls the next keys of a walk as batches of
+ *  rows, with the columns its cursor gathers, in one call. */
 typedef struct ustore_docs_cursor_next_t {
 
     /** The database the cursor was opened on. */
@@ -664,20 +697,18 @@ typedef struct ustore_docs_cursor_next_t {
     /** The cursor to advance, which a pull that fails or is cancelled leaves where it was. */
     ustore_docs_cursor_t cursor;
 
-    /** Output for the keys of the page in their order, inside @c arena. */
-    ustore_key_t const** keys;
+    /** Output for the batches of the pull in walk order, one per task of the executor that found
+     *  rows, inside @c arena. */
+    ustore_docs_batch_view_t const** batches;
 
-    /** Optional output for the whole documents as a tape inside @c arena, where a key removed at the head between the
-     *  listing and the read of one pull reads as an empty document; @c NULL skips them. */
-    ustore_strings_view_t* values;
-
-    /** Output for the keys written, zero once the walk is exhausted; zeroed on failure. */
-    ustore_size_t* written;
+    /** Output for the batches written, zero once the walk is exhausted; zeroed on failure. */
+    ustore_size_t* batches_count;
 
     /** Rewound by this call, then holding every output it writes; @c NULL is refused. */
     ustore_arena_t arena;
 
-    /** Most keys the page holds, where a page of fewer exhausts the walk. */
+    /** Most rows the batches of one pull hold together; a pull that is not the walk's last holds at
+     *  least one. */
     ustore_size_t wanted;
 
     /** Optional callback reporting the one pull, which may cancel it before the cursor advances. */
@@ -689,13 +720,13 @@ typedef struct ustore_docs_cursor_next_t {
 } ustore_docs_cursor_next_t;
 
 /**
- *  @brief Pulls the next page of a walk, and the documents of its keys when asked.
+ *  @brief Pulls the next keys of a walk as batches of rows, split over the threads of the executor.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  @par Statuses:
- *  - @c ustore_status_invalid_argument_k The @c cursor, the @c arena or the @c written output
- *    is @c NULL, the cursor walks another database, a watching pull goes through a staged
- *    transaction, or the collection holds another modality.
+ *  - @c ustore_status_invalid_argument_k The @c cursor, the @c arena, the @c batches or the
+ *    @c batches_count output is @c NULL, the cursor walks another database, a watching pull goes
+ *    through a staged transaction, or the collection holds another modality.
  *  - @c ustore_status_device_k The arena lives where another executor computes, a cursor opened
  *    for a device is pulled on host threads, or a host cursor is pulled on a device.
  *  - @c ustore_status_contended_k The arena, the cursor or the transaction it reads through serves
@@ -705,8 +736,9 @@ typedef struct ustore_docs_cursor_next_t {
  *  - @c ustore_status_unsupported_k The pulling executor's device loaded no bundle of the library's
  *    kernels and the walk has a @c filter.
  *  - @c ustore_status_not_found_k The collection does not exist or was dropped meanwhile.
- *  - @c ustore_status_malformed_k A document the filter reads does not parse.
- *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken.
+ *  - @c ustore_status_malformed_k A document the filter or a field reads does not parse.
+ *  - @c ustore_status_capacity_exhausted_k Every shared NVMe channel is taken, or a document folded
+ *    from NVMe changes outgrew the bytes its runs hold.
  */
 USTORE_EXPORT void ustore_docs_cursor_next(ustore_docs_cursor_next_t* arguments);
 

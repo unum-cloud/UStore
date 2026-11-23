@@ -50,7 +50,7 @@
 #include "ustore/blobs/nvme_transactions.hpp"   // `transaction_registry`, `transaction_core`, `nvme_store_concept`
 #include "ustore/blobs/nvme_tree.hpp"           // `lsm_tree_run_record_t`, `database_config_t`
 #include "ustore/utilities/nvme_manifest.hpp"   // `manifest_t`, `manifest_collection_t`, `manifest_file_t`
-#include "ustore/utilities/nvme_channels.hpp"   // `io_channel_t`, `basic_io_channel_pool`
+#include "ustore/utilities/nvme_queues.hpp"     // `thread_channels_t`
 #include "ustore/utilities/nvme_mounts.hpp"     // `resources_shared_ptr`
 #include "ustore/utilities/nvme_ring.hpp"       // `portable_alignment_k`
 #include "ustore/utilities/algorithm.hpp"       // `radix_sort`
@@ -60,14 +60,16 @@
 
 namespace unum::ustore::blobs {
 
-using utilities::basic_io_channel_pool;
+using utilities::io_transport_t;
 using utilities::manifest_collection_t;
 using utilities::manifest_file_t;
 using utilities::manifest_no_collection_k;
 using utilities::manifest_t;
 using utilities::medium_extent_t;
+using utilities::nvme_queues_ref_t;
 using utilities::path_max_bytes_k;
 using utilities::sha256_t;
+using utilities::thread_channels_t;
 using utilities::volume_config_t;
 
 #pragma region Database Snapshot
@@ -118,8 +120,8 @@ class database_snapshot {
     /** Copies the value @p id held for @p stored_key at the snapshot's stamp into @p into, filing it in the value
      *  cache when it paid I/O for it. */
     status_t select(any_collection_id_t const& id, stored_key_t stored_key, std::span<byte_t> into,
-                    stored_value_size_t& size) noexcept {
-        return pinned_.store().select(id, stored_key, into, size, pinned_.stamp());
+                    stored_value_size_t& size, nvme_queues_ref_t queues = {}) noexcept {
+        return pinned_.store().select(id, stored_key, into, size, pinned_.stamp(), queues);
     }
 
   private:
@@ -138,7 +140,7 @@ class database_snapshot {
  *  @tparam store_type_ The store the writes land in, which must satisfy @c transaction_store_concept.
  *  @tparam row_kit_type_ The SmashTable kit the writes' and watches' hash tables search with.
  *
- *  The core carries the writes, the watches, the stamps and the two-phase lifecycle; what is here
+ *  The core holds the writes, the watches, the stamps and the two-phase lifecycle; what is here
  *  resolves a collection's name to its ID and widths once per run of calls, and reads through the
  *  store at the right stamp.
  */
@@ -162,7 +164,7 @@ class database_transaction {
      *  every other kind. */
     using core_t = transaction_core<stored_key_t, registry_t, atomic_reference_, waiter_type_>;
 
-    /** The uncommitted writes and the watched keys this transaction carries. */
+    /** The uncommitted writes and the watched keys this transaction holds. */
     using state_t = typename core_t::state_t;
 
     /** The uncommitted deltas alone, filed under the collection they belong to. */
@@ -194,13 +196,13 @@ class database_transaction {
 
 #pragma region Lifecycle
 
-    /** Seals every write, takes the ledger's leader word and lays out every view the
-     *  commit publishes, as @c transaction_core::stage does. */
-    status_t stage() noexcept { return core_.stage(); }
+    /** Seals every write, takes the ledger's leader word and lays out every view the commit
+     *  publishes, as @c transaction_core::stage does, flushing on the thread of @p queues. */
+    status_t stage(nvme_queues_ref_t queues = {}) noexcept { return core_.stage(queues); }
 
-    /** Lands every write of this transaction and starts it again,
-     *  as @c transaction_core::commit does. */
-    status_t commit() noexcept { return core_.commit(); }
+    /** Lands every write of this transaction and starts it again, as @c transaction_core::commit
+     *  does, paying for its maintenance on the thread of @p queues. */
+    status_t commit(nvme_queues_ref_t queues = {}) noexcept { return core_.commit(queues); }
 
     /** Drops every write and every watch, and starts the transaction over from this moment. */
     void rollback() noexcept { core_.rollback(); }
@@ -362,28 +364,30 @@ class database_transaction {
 
 #pragma region Lookups
 
-    /** Whether this transaction or the store carries @p stored_key of @p id, executor thread @p thread_index reading
-     *  the store on its own channel and epoch slot, as every lookup below does. */
+    /** Whether this transaction or the store holds @p stored_key of @p id, executor thread
+     *  @p thread_index reading the store on its own channel and epoch slot, as every
+     *  lookup below does. */
     [[nodiscard]] bool contains(any_collection_id_t const& id, stored_key_t stored_key,
-                                std::size_t thread_index = outside_executor_k) noexcept {
+                                std::size_t thread_index = 0) noexcept {
         return contains_uncommitted(id, stored_key) || contains_committed(id, stored_key, thread_index);
     }
 
-    /** Bytes the value of @p stored_key takes, as this transaction would see it. */
+    /** Bytes the value of @p stored_key takes, as this transaction would see it, folding on @p
+     *  queue set's thread. */
     status_t stored_value_size(any_collection_id_t const& id, stored_key_t stored_key, stored_value_size_t& size,
-                               std::size_t thread_index = outside_executor_k) noexcept {
+                               nvme_queues_ref_t queues = {}) noexcept {
         status_t const own_status = stored_value_size_uncommitted(id, stored_key, size);
         if (own_status.succeeded() || !(own_status == status_code_t::not_found_k)) return own_status;
-        return stored_value_size_committed(id, stored_key, size, thread_index);
+        return stored_value_size_committed(id, stored_key, size, queues);
     }
 
     /** Copies the value of @p stored_key into @p into, taking this transaction's own write first. */
     template <watch_schedule_t watch_schedule_ = watch_schedule_t::default_k>
     status_t select(any_collection_id_t const& id, stored_key_t stored_key, stored_value_span_t into,
-                    stored_value_size_t& size, std::size_t thread_index = outside_executor_k) noexcept {
+                    stored_value_size_t& size, nvme_queues_ref_t queues = {}) noexcept {
         status_t const own_status = select_uncommitted(id, stored_key, into, size);
         if (own_status.succeeded()) return own_status;
-        return select_committed<watch_schedule_>(id, stored_key, into, size, thread_index);
+        return select_committed<watch_schedule_>(id, stored_key, into, size, queues);
     }
 
     /** What this transaction's own deltas did to @p stored_key of @p id: wrote it, removed it, or neither. */
@@ -409,7 +413,7 @@ class database_transaction {
         });
     }
 
-    /** Whether this transaction's own deltas carry @p stored_key of @p id. */
+    /** Whether this transaction's own deltas hold @p stored_key of @p id. */
     [[nodiscard]] bool contains_uncommitted(any_collection_id_t const& id, stored_key_t stored_key) noexcept {
         if (!core_.started()) return false;
         collection_id_t const collection_id = resolve_(id).id;
@@ -437,19 +441,18 @@ class database_transaction {
         return core_.state().deltas.select(collection_id, stored_key, into, size);
     }
 
-    /** Whether the store carries @p stored_key of @p id, ignoring what this transaction wrote. */
+    /** Whether the store holds @p stored_key of @p id, ignoring what this transaction wrote. */
     [[nodiscard]] bool contains_committed(any_collection_id_t const& id, stored_key_t stored_key,
-                                          std::size_t thread_index = outside_executor_k) noexcept {
+                                          std::size_t thread_index = 0) noexcept {
         if (!core_.started()) return false;
         return core_.store().contains(id, stored_key, core_.start_stamp(), thread_index);
     }
 
     /** Bytes the store held for @p stored_key of @p id when this transaction started, ignoring what it wrote. */
     status_t stored_value_size_committed(any_collection_id_t const& id, stored_key_t stored_key,
-                                         stored_value_size_t& size,
-                                         std::size_t thread_index = outside_executor_k) noexcept {
+                                         stored_value_size_t& size, nvme_queues_ref_t queues = {}) noexcept {
         if (!core_.started()) return {status_code_t::invalid_argument_k, "That transaction is staged"};
-        return core_.store().stored_value_size(id, stored_key, size, core_.start_stamp(), thread_index);
+        return core_.store().stored_value_size(id, stored_key, size, core_.start_stamp(), queues);
     }
 
     /**
@@ -464,7 +467,7 @@ class database_transaction {
      */
     template <watch_schedule_t watch_schedule_ = watch_schedule_t::default_k>
     status_t select_committed(any_collection_id_t const& id, stored_key_t stored_key, stored_value_span_t into,
-                              stored_value_size_t& size, std::size_t thread_index = outside_executor_k) noexcept {
+                              stored_value_size_t& size, nvme_queues_ref_t queues = {}) noexcept {
         if (!core_.started()) return {status_code_t::invalid_argument_k, "That transaction is staged"};
         collection_id_t const collection_id = resolve_(id).id;
         if (collection_id == collection_invalid_id_k)
@@ -472,7 +475,7 @@ class database_transaction {
 
         transaction_stamp_t const at = core_.template read_stamp_for<watch_schedule_>();
         transaction_stamp_t const from = core_.template watch_stamp_for<watch_schedule_>();
-        if (status_t const read = core_.store().select(collection_id, stored_key, into, size, at, thread_index);
+        if (status_t const read = core_.store().select(collection_id, stored_key, into, size, at, queues);
             read.failed())
             return read;
 
@@ -627,7 +630,7 @@ concept weighs_memory_pressure_concept = requires(store_type_ const& store, seal
  *  @tparam store_types_ The stores a collection may live in, of which a create and a mount take the
  *      one its tag names.
  *
- *  The volume and the channels are borrowed and must outlive the database, and so must the budget
+ *  The volume and the channels are viewed and must outlive the database, and so must the budget
  *  the collections charge their memory to. A database is pinned rather than movable, because its
  *  registry and every live transaction name it.
  */
@@ -646,12 +649,6 @@ class basic_database {
 
     /** The transport those volumes move bytes through. */
     using disk_t = typename volume_t::disk_t;
-
-    /** The queue pairs every call that moves bytes borrows one of. */
-    using channel_pool_t = basic_io_channel_pool<disk_t, atomic_reference_, waiter_type_>;
-
-    /** One borrowed queue pair, drained and given back when it dies. */
-    using channel_guard_t = typename channel_pool_t::guard_t;
 
     /** A collection named by its ID or by its name, which is how every call addresses one. */
     using any_collection_id_t = std::variant<collection_id_t, collection_alphanumeric_id_t>;
@@ -767,8 +764,10 @@ class basic_database {
     /**
      *  @brief Opens every collection the manifest @p volume read names, or starts
      *      an empty database.
-     *  @param[in,out] volume The volume every run lands on, borrowed and outliving the database.
-     *  @param[in,out] channels The queue pairs every call borrows one of, borrowed and outliving the database.
+     *  @param[in,out] volume The volume every run lands on, owned by the caller and
+     *      outliving the database.
+     *  @param[in] queues The opening call's queue set, whose thread reads the manifest and drops
+     *      the commit a crash tore.
      *  @param[in] config The delta bounds a transaction takes when its caller names none.
      *  @param[in] compactor What every merge runs on: the calling thread, or a device compactor the caller owns, which
      *      outlives the database.
@@ -781,11 +780,10 @@ class basic_database {
      *  of a restored database hashes its runs; a save hashes them again as it copies them.
      */
     template <typename digester_type_ = unverified_runs_t>
-    status_t mount(volume_t& volume, channel_pool_t& channels, database_config_t const& config,
+    status_t mount(volume_t& volume, nvme_queues_ref_t queues, database_config_t const& config,
                    compactor_ref_t compactor = {}, digester_type_ const& digester = {}) noexcept {
         if (volume_ != nullptr) return {status_code_t::already_exists_k, "This database has already mounted"};
         volume_ = &volume;
-        channels_ = &channels;
         config_ = config;
         compactor_ = compactor;
         auto [entries, entries_status] = entries_t::make(1, entries_t::capacity_max_k,
@@ -793,7 +791,7 @@ class basic_database {
         entries_ = std::move(entries);
         status_t const opened = entries_status != st::status_t::success_k
                                     ? status_t {status_code_t::out_of_memory_k, "No room for the collections"}
-                                    : open_manifest_(digester);
+                                    : open_manifest_(queues, digester);
         if (opened.failed()) {
             // A manifest this database could not open stays as it lies, never published again
             // without what it missed.
@@ -802,7 +800,6 @@ class basic_database {
             run_pools_.clear();
             user_data_bytes_ = 0;
             volume_ = nullptr;
-            channels_ = nullptr;
         }
         return opened;
     }
@@ -810,23 +807,24 @@ class basic_database {
     /**
      *  @brief Flushes every collection, publishes the manifest and lets every collection go.
      *
-     *  @note The volume and the channels are still needed here, so this runs before the mount
-     *      underneath is torn down; the destructor calls it for a caller that did not.
+     *  @note The volume is still needed here, so this runs before the mount underneath is torn
+     *      down, on the writing channel of the thread of @p queues; the destructor calls it for a
+     *      caller that did not, on a blocking queue set made for it.
      */
-    status_t unmount() noexcept {
+    status_t unmount(nvme_queues_ref_t queues = {}) noexcept {
         if (volume_ == nullptr) return {};
         status_t first;
         {
-            expected<claimed_channel_t> claimed = claim_channel_();
+            expected<claimed_channels_t> claimed = claim_channels_(queues);
             if (!claimed) first = claimed.status();
-            else {
+            else if (config_.access != utilities::medium_access_t::read_only_k) {
                 for (std::size_t index = 0; index != collections_.size(); ++index)
                     if (status_t const flushed = std::visit(
-                            [&](auto& held) noexcept { return held.flush(claimed->channel()); },
+                            [&](auto& held) noexcept { return held.flush(claimed->writing()); },
                             collections_[index]->held);
                         flushed.failed() && first.succeeded())
                         first = flushed;
-                if (status_t const saved = publish_manifest_(claimed->channel()); saved.failed() && first.succeeded())
+                if (status_t const saved = publish_manifest_(claimed->writing()); saved.failed() && first.succeeded())
                     first = saved;
             }
             // The entries outlive the publication that stops naming them, which waits out every reader of the
@@ -838,7 +836,6 @@ class basic_database {
         run_pools_.clear();
         user_data_bytes_ = 0;
         volume_ = nullptr;
-        channels_ = nullptr;
         return first;
     }
 
@@ -896,7 +893,7 @@ class basic_database {
      *  included, inside the epochs of @p thread_index, answering @c not_found_k for a collection
      *  not listed at that stamp. */
     status_t listed_store_tag(collection_id_t collection_id, transaction_stamp_t stamp, std::uint16_t& store_tag,
-                              std::size_t thread_index = outside_executor_k) noexcept {
+                              std::size_t thread_index = 0) noexcept {
         reader_t const inside = ledger_.epochs().enter(thread_index);
         collection_entry_t const* const found = entry_with_id_(collection_id);
         if (!found) return {status_code_t::not_found_k, "The database lists no such collection at that stamp"};
@@ -976,7 +973,8 @@ class basic_database {
      */
     status_t create_collection(collection_id_t collection_id, string_view_t name, std::uint16_t store_tag,
                                collection_config_t const& config,
-                               collection_id_t flushed_with = collection_invalid_id_k) noexcept {
+                               collection_id_t flushed_with = collection_invalid_id_k,
+                               nvme_queues_ref_t queues = {}) noexcept {
         if (name.empty()) return status_t {status_code_t::invalid_argument_k, "A collection is named by a byte"};
         if (name.size() > collection_name_max_bytes_k)
             return status_t {status_code_t::invalid_argument_k, "A collection name is shorter than that"};
@@ -984,7 +982,7 @@ class basic_database {
             return status_t {status_code_t::invalid_argument_k, "That ID names no collection"};
         if (store_tags_type_::index_of(store_tag) >= sizeof...(store_types_))
             return status_t {status_code_t::invalid_argument_k, "That tag names no store this database keeps"};
-        expected<claimed_channel_t> claimed = claim_channel_();
+        expected<claimed_channels_t> claimed = claim_channels_(queues);
         if (!claimed) return claimed.status();
         if (entry_named_(name) != nullptr || entry_with_id_(collection_id) != nullptr)
             return status_t {status_code_t::already_exists_k, "The database already names that collection"};
@@ -1005,9 +1003,9 @@ class basic_database {
         else {
             // Hidden from every pinned stamp until the commit below draws its listing stamp.
             entry->listed_stamp = invalid_transaction_stamp_k;
-            if (status_t const flushed = flush_into_publication_(claimed->channel(), flushed_with); flushed.failed())
+            if (status_t const flushed = flush_into_publication_(claimed->writing(), flushed_with); flushed.failed())
                 created = flushed;
-            else if (status_t const saved = publish_manifest_(claimed->channel()); saved.failed()) created = saved;
+            else if (status_t const saved = publish_manifest_(claimed->writing()); saved.failed()) created = saved;
             else created = publish_collections_();
             if (created.failed()) collections_.erase(collections_.size() - 1);
         }
@@ -1019,13 +1017,13 @@ class basic_database {
     /** Returns every run of @p id to its volume and forgets the name, which destroys the
      *  data; @p flushed_with names a collection whose memory runs the same manifest names, as
      *  the create does. */
-    status_t drop_collection(any_collection_id_t const& id,
-                             collection_id_t flushed_with = collection_invalid_id_k) noexcept {
-        expected<claimed_channel_t> claimed = claim_channel_();
+    status_t drop_collection(any_collection_id_t const& id, collection_id_t flushed_with = collection_invalid_id_k,
+                             nvme_queues_ref_t queues = {}) noexcept {
+        expected<claimed_channels_t> claimed = claim_channels_(queues);
         if (!claimed) return claimed.status();
         collection_entry_t* doomed = entry_at_(id);
         if (!doomed) return {status_code_t::not_found_k, "The database names no such collection"};
-        if (status_t const flushed = flush_into_publication_(claimed->channel(), flushed_with); flushed.failed())
+        if (status_t const flushed = flush_into_publication_(claimed->writing(), flushed_with); flushed.failed())
             return flushed;
 
         // The manifest stops naming the runs before a single one of them is handed back. The
@@ -1040,7 +1038,7 @@ class basic_database {
             [[maybe_unused]] st::status_t const returned = collections_.push_back(std::move(doomed));
             return publication;
         }
-        if (status_t const saved = publish_manifest_(claimed->channel()); saved.failed()) {
+        if (status_t const saved = publish_manifest_(claimed->writing()); saved.failed()) {
             [[maybe_unused]] st::status_t const returned = collections_.push_back(std::move(doomed));
             [[maybe_unused]] status_t const restored = publish_collections_();
             return saved;
@@ -1092,7 +1090,7 @@ class basic_database {
      *  @return @c not_found_k for a collection the database does not name.
      */
     expected<collection_reading_t> read_collection(any_collection_id_t const& id, transaction_stamp_t stamp,
-                                                   std::size_t thread_index = outside_executor_k) noexcept {
+                                                   std::size_t thread_index = 0) noexcept {
         collection_reading_t read;
         read.inside_ = ledger_.epochs().enter(thread_index);
         read.entry_ = entry_at_(id);
@@ -1122,19 +1120,19 @@ class basic_database {
         return visited;
     }
 
-    /** What @p id carries for @p stored_key as a reader pinned at @p stamp sees it, and the bytes its value takes;
-     *  a collection the database does not name carries nothing. Executor thread @p thread_index reads on its own
-     *  epoch slot, as every lookup below does. */
+    /** What @p id holds for @p stored_key as a reader pinned at @p stamp sees it, and the bytes its
+     *  value takes; a collection the database does not name holds nothing. Executor thread @p
+     *  @p thread_index reads on its own epoch slot, as every lookup below does. */
     [[nodiscard]] lookup_result_t find(any_collection_id_t const& id, stored_key_t stored_key,
                                        stored_value_size_t& size, transaction_stamp_t stamp = head_stamp_k,
-                                       std::size_t thread_index = outside_executor_k) noexcept {
+                                       std::size_t thread_index = 0) noexcept {
         size = 0;
         auto [read, read_status] = read_collection(id, stamp, thread_index);
         if (read_status.failed()) return lookup_result_t::missing_k;
         return find(read, stored_key, size);
     }
 
-    /** What the collection @p read reads carries for @p stored_key, and its value's bytes. */
+    /** What the collection @p read reads holds for @p stored_key, and its value's bytes. */
     [[nodiscard]] lookup_result_t find(collection_reading_t const& read, stored_key_t stored_key,
                                        stored_value_size_t& size) noexcept {
         size = 0;
@@ -1149,11 +1147,10 @@ class basic_database {
         return found;
     }
 
-    /** Whether @p id carries @p stored_key with a value rather than a remove delta, as a reader pinned at @p stamp
-     *  sees it, a chain of changes always folding into one. */
+    /** Whether @p id holds @p stored_key with a value rather than a remove delta, as a reader
+     *  pinned at @p stamp sees it, a chain of changes always folding into one. */
     [[nodiscard]] bool contains(any_collection_id_t const& id, stored_key_t stored_key,
-                                transaction_stamp_t stamp = head_stamp_k,
-                                std::size_t thread_index = outside_executor_k) noexcept {
+                                transaction_stamp_t stamp = head_stamp_k, std::size_t thread_index = 0) noexcept {
         stored_value_size_t size = 0;
         lookup_result_t const found = find(id, stored_key, size, stamp, thread_index);
         return found == lookup_result_t::written_k || found == lookup_result_t::incomplete_k;
@@ -1163,19 +1160,18 @@ class basic_database {
      *  miss and a removal; a chain of changes reaching values apart from their key slots is folded through a channel
      *  to be measured. */
     status_t stored_value_size(any_collection_id_t const& id, stored_key_t stored_key, stored_value_size_t& size,
-                               transaction_stamp_t stamp = head_stamp_k,
-                               std::size_t thread_index = outside_executor_k) noexcept {
+                               transaction_stamp_t stamp = head_stamp_k, nvme_queues_ref_t queues = {}) noexcept {
         size = 0;
-        auto [read, read_status] = read_collection(id, stamp, thread_index);
+        auto [read, read_status] = read_collection(id, stamp, queues.thread_index);
         if (read_status.failed()) return {status_code_t::not_found_k, "That collection misses it"};
-        return stored_value_size(read, stored_key, size, thread_index);
+        return stored_value_size(read, stored_key, size, queues);
     }
 
     /** Bytes the value of @p stored_key takes in the collection @p read reads, as @c
-     *  stored_value_size above measures them, executor thread @p thread_index taking its own
-     *  channel for a fold. */
+     *  stored_value_size above measures them, a chain of changes folding on the reading channel
+     *  of the thread of @p queues. */
     status_t stored_value_size(collection_reading_t const& read, stored_key_t stored_key, stored_value_size_t& size,
-                               std::size_t thread_index = outside_executor_k) noexcept {
+                               nvme_queues_ref_t queues = {}) noexcept {
         lookup_result_t const found = find(read, stored_key, size);
         if (found == lookup_result_t::written_k) return {};
         if (found != lookup_result_t::incomplete_k) return {status_code_t::not_found_k, "That collection misses it"};
@@ -1187,7 +1183,7 @@ class basic_database {
         utilities::local_arena_t scratch;
         if (status_t const selected = select(read, scratch.allocator().arena,
                                              std::span<stored_key_t const> {&stored_key, 1},
-                                             std::span<lookup_result_t> {&folded, 1}, count, thread_index);
+                                             std::span<lookup_result_t> {&folded, 1}, count, queues);
             selected.failed())
             return selected;
         if (folded != lookup_result_t::written_k) return {status_code_t::not_found_k, "That collection misses it"};
@@ -1206,26 +1202,26 @@ class basic_database {
      */
     status_t select(any_collection_id_t const& id, stored_key_t stored_key, std::span<byte_t> into,
                     stored_value_size_t& size, transaction_stamp_t stamp = head_stamp_k,
-                    std::size_t thread_index = outside_executor_k) noexcept {
+                    nvme_queues_ref_t queues = {}) noexcept {
         size = 0;
-        auto [read, read_status] = read_collection(id, stamp, thread_index);
+        auto [read, read_status] = read_collection(id, stamp, queues.thread_index);
         if (read_status.failed()) return read_status;
-        return select(read, stored_key, into, size, thread_index);
+        return select(read, stored_key, into, size, queues);
     }
 
     /** Copies the value the collection @p read reads holds for @p stored_key into @p into, as @c
-     *  select above copies it, executor thread @p thread_index taking its own channel. */
+     *  select above copies it, on the reading channel of the thread of @p queues. */
     status_t select(collection_reading_t const& read, stored_key_t stored_key, std::span<byte_t> into,
-                    stored_value_size_t& size, std::size_t thread_index = outside_executor_k) noexcept {
+                    stored_value_size_t& size, nvme_queues_ref_t queues = {}) noexcept {
         size = 0;
-        auto [channel, acquire_status] = channels_->acquire(thread_index);
-        if (acquire_status.failed()) return acquire_status;
+        expected<claimed_channels_t> channels = queues_channels_(queues, claim_guard_t {});
+        if (!channels) return channels.status();
         return visit_reading(
             read,
             [&]<typename store_type_>(store_type_& collection,
                                       typename store_type_::reading_t const& reading) noexcept -> status_t {
                 if constexpr (keyed_by_database<store_type_>())
-                    return collection.select(channel.channel(), reading, stored_key, into, size);
+                    return collection.select(channels->reading(), reading, stored_key, into, size);
                 else return keyed_otherwise_();
             });
     }
@@ -1242,28 +1238,27 @@ class basic_database {
     template <typename sink_type_>
     status_t select(any_collection_id_t const& id, std::span<stored_key_t const> stored_keys,
                     std::span<lookup_result_t> results, sink_type_&& sink, transaction_stamp_t stamp = head_stamp_k,
-                    std::size_t thread_index = outside_executor_k) noexcept {
-        auto [read, read_status] = read_collection(id, stamp, thread_index);
+                    nvme_queues_ref_t queues = {}) noexcept {
+        auto [read, read_status] = read_collection(id, stamp, queues.thread_index);
         if (read_status.failed()) return read_status;
         utilities::local_arena_t scratch;
-        return select(read, scratch.allocator().arena, stored_keys, results, sink, thread_index);
+        return select(read, scratch.allocator().arena, stored_keys, results, sink, queues);
     }
 
     /** Reads the values of @p stored_keys out of the collection @p read reads, as the batched @c
      *  select above reads them, carving what it tracks from @p scratch, which the caller rewinds,
-     *  executor thread @p thread_index taking its own channel. */
+     *  on the reading channel of the thread of @p queues. */
     template <typename sink_type_>
     status_t select(collection_reading_t const& read, ustore_arena_t scratch, std::span<stored_key_t const> stored_keys,
-                    std::span<lookup_result_t> results, sink_type_&& sink,
-                    std::size_t thread_index = outside_executor_k) noexcept {
-        auto [channel, acquire_status] = channels_->acquire(thread_index);
-        if (acquire_status.failed()) return acquire_status;
+                    std::span<lookup_result_t> results, sink_type_&& sink, nvme_queues_ref_t queues = {}) noexcept {
+        expected<claimed_channels_t> channels = queues_channels_(queues, claim_guard_t {});
+        if (!channels) return channels.status();
         return visit_reading(
             read,
             [&]<typename store_type_>(store_type_ const& collection,
                                       typename store_type_::reading_t const& reading) noexcept -> status_t {
                 if constexpr (keyed_by_database<store_type_>())
-                    return collection.select(channel.channel(), reading, scratch, stored_keys, results, sink);
+                    return collection.select(channels->reading(), reading, scratch, stored_keys, results, sink);
                 else return keyed_otherwise_();
             });
     }
@@ -1274,10 +1269,11 @@ class basic_database {
      *  @param[in] id The collection to walk, named by its ID or by its name.
      *  @param[in] scratch Where each page carves its run cursors, which the caller rewinds.
      *  @param[in] from The first key the walk reports, which need not be in the collection.
-     *  @param[in] visitor Called as @c visitor(stored_key, state, size) for the newest version of every key at or
-     *      below @p stamp, removals included, answering whether the walk carries on.
+     *  @param[in] visitor Called as <tt>visitor(stored_key, state, size)</tt> for the newest version of
+     *      every key at or below @p stamp, removals included, answering whether the walk continues.
      *  @param[in] stamp The stamp a reader is pinned at, which sees the newest version at or below it.
-     *  @param[in] thread_index The executor thread walking, which announces on its own epoch slot.
+     *  @param[in] queues The queue set walking, whose thread announces on its own epoch slot and
+     *      folds a chain of changes on its reading channel.
      *  @param[in] direction Whether the walk goes up or down, reading only the keys it hands out.
      *
      *  @note The walk reads one page of keys at a time inside the epochs, finding the collection again for each, and
@@ -1286,7 +1282,7 @@ class basic_database {
      */
     template <typename visitor_type_>
     status_t scan(any_collection_id_t const& id, ustore_arena_t scratch, stored_key_t from, visitor_type_&& visitor,
-                  transaction_stamp_t stamp = head_stamp_k, std::size_t thread_index = outside_executor_k,
+                  transaction_stamp_t stamp = head_stamp_k, nvme_queues_ref_t queues = {},
                   scan_direction_t direction = scan_direction_t::ascending_k) noexcept {
         // A head walk pins the stamp it starts at, so every page reads the same commits.
         stamp_pin<atomic_reference_, waiter_type_> pin;
@@ -1296,7 +1292,7 @@ class basic_database {
             std::size_t count = 0;
             bool follows = false;
             {
-                reader_t const inside = ledger_.epochs().enter(thread_index);
+                reader_t const inside = ledger_.epochs().enter(queues.thread_index);
                 collection_entry_t const* const found = entry_at_(id);
                 if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
                 status_t const read = std::visit(
@@ -1307,7 +1303,7 @@ class basic_database {
                                                   waiter_type_, typename store_type_::fold_t,
                                                   typename store_type_::device_fold_t, row_kit_type_>;
                             auto [scanner, over_status] = scanner_t::over(collection, scratch, from, stamp,
-                                                                          thread_index, direction);
+                                                                          queues.thread_index, direction);
                             if (over_status.failed()) return over_status;
                             std::span<scan_entry<stored_key_t> const> const entries = scanner.page();
                             std::copy(entries.begin(), entries.end(), page.begin());
@@ -1324,7 +1320,7 @@ class basic_database {
                 scan_entry<stored_key_t>& entry = page[index];
                 // A chain of changes the scanner could not fold without a channel is folded here, outside the epochs
                 if (entry.state == lookup_result_t::incomplete_k) {
-                    status_t const measured = stored_value_size(id, entry.stored_key, entry.size, stamp, thread_index);
+                    status_t const measured = stored_value_size(id, entry.stored_key, entry.size, stamp, queues);
                     if (measured.failed() && !(measured == status_code_t::not_found_k)) return measured;
                     entry.state = measured.succeeded() ? lookup_result_t::written_k : lookup_result_t::removed_k;
                 }
@@ -1336,12 +1332,11 @@ class basic_database {
 
     /** Hands @p visitor every key of the collection @p read reads from @p from on in @p direction,
      *  as @c scan above does, every page read through @p read inside the epochs it holds, so @p
-     *  visitor runs inside them too and must not write; executor thread @p thread_index takes its
-     *  own channel to fold a chain of changes. */
+     *  visitor runs inside them too and must not write; a chain of changes folds on the reading
+     *  channel of the thread of @p queues. */
     template <typename visitor_type_>
     status_t scan(collection_reading_t const& read, ustore_arena_t scratch, stored_key_t from, visitor_type_&& visitor,
-                  std::size_t thread_index = outside_executor_k,
-                  scan_direction_t direction = scan_direction_t::ascending_k) noexcept {
+                  nvme_queues_ref_t queues = {}, scan_direction_t direction = scan_direction_t::ascending_k) noexcept {
         return visit_reading(
             read,
             [&]<typename store_type_>(store_type_ const& collection,
@@ -1356,7 +1351,7 @@ class basic_database {
                         lookup_result_t state = scanner.state();
                         stored_value_size_t size = scanner.size();
                         if (state == lookup_result_t::incomplete_k) {
-                            status_t const measured = stored_value_size(read, scanner.stored_key(), size, thread_index);
+                            status_t const measured = stored_value_size(read, scanner.stored_key(), size, queues);
                             if (measured.failed() && !(measured == status_code_t::not_found_k)) return measured;
                             state = measured.succeeded() ? lookup_result_t::written_k : lookup_result_t::removed_k;
                         }
@@ -1369,13 +1364,129 @@ class basic_database {
             });
     }
 
+    /** Cuts the walk of the collection @p read reads from @p from towards @p bound, inclusive, in
+     *  @p direction into tasks, as @c nvme_store_cursor::split cuts it, with no read, answering how
+     *  many, and in @p stop where the next walk starts, unless they reach @p bound. */
+    expected<std::size_t> split(collection_reading_t const& read, ustore_arena_t scratch, stored_key_t from,
+                                stored_key_t bound, scan_direction_t direction, std::uint64_t wanted,
+                                std::span<stored_key_t> starts, std::span<std::uint64_t> entries,
+                                std::span<std::uint64_t> bytes, std::optional<stored_key_t>& stop) noexcept {
+        std::size_t tasks = 0;
+        status_t const visited = visit_reading(
+            read,
+            [&]<typename store_type_>(store_type_ const&,
+                                      typename store_type_::reading_t const& reading) noexcept -> status_t {
+                if constexpr (keyed_by_database<store_type_>()) {
+                    using scanner_t = nvme_store_cursor<typename store_type_::key_slot_t, volume_t, atomic_reference_,
+                                                        waiter_type_, typename store_type_::fold_t,
+                                                        typename store_type_::device_fold_t, row_kit_type_>;
+                    auto [split, split_status] = scanner_t::split(reading, scratch, from, bound, direction, wanted,
+                                                                  starts, entries, bytes);
+                    if (split_status.failed()) return split_status;
+                    tasks = split.tasks;
+                    stop.reset();
+                    if (split.end == scanner_t::split_end_t::stops_k) stop = split.stop;
+                    return {};
+                }
+                else return keyed_otherwise_();
+            });
+        if (visited.failed()) return visited;
+        return tasks;
+    }
+
+    /**
+     *  @brief Walks the collection @p read reads from @p from in @p direction up to @p bound,
+     *      inclusive, handing @p round its present keys a round at a time.
+     *  @param[in] round Called as <tt>round(keys, sizes, read)</tt> inside the epochs @p read
+     *      holds, answering whether the walk continues, where <tt>read(picked, sink)</tt> lands the
+     *      values of the keys at the indices @p picked as <tt>sink(index, offset, bytes)</tt>,
+     *      @p index counting into @p picked.
+     *
+     *  A round holds as many keys as fill the blocks of the reading channel of the thread of @p
+     *  queues once, so their values land with no second lookup.
+     */
+    template <typename round_type_>
+    status_t scan_rounds(collection_reading_t const& read, ustore_arena_t scratch, stored_key_t from,
+                         stored_key_t bound, scan_direction_t direction, round_type_&& round,
+                         nvme_queues_ref_t queues = {}) noexcept {
+        expected<claimed_channels_t> channels = queues_channels_(queues, claim_guard_t {});
+        if (!channels) return channels.status();
+        io_channel_t& channel = channels->reading();
+        std::uint64_t const round_bytes = channel.read_pieces().size() * channel.requests().buffer_bytes();
+        return visit_reading(
+            read,
+            [&]<typename store_type_>(store_type_ const& collection,
+                                      typename store_type_::reading_t const& reading) noexcept -> status_t {
+                if constexpr (keyed_by_database<store_type_>()) {
+                    using scanner_t = nvme_store_cursor<typename store_type_::key_slot_t, volume_t, atomic_reference_,
+                                                        waiter_type_, typename store_type_::fold_t,
+                                                        typename store_type_::device_fold_t, row_kit_type_>;
+                    auto [scanner, over_status] = scanner_t::over(collection, reading, scratch, from, direction);
+                    if (over_status.failed()) return over_status;
+                    st::vector<stored_key_t, utilities::arena_allocator<stored_key_t>> keys {{scratch}};
+                    st::vector<stored_value_size_t, utilities::arena_allocator<stored_value_size_t>> sizes {{scratch}};
+                    st::vector<value_place_t, utilities::arena_allocator<value_place_t>> places {{scratch}};
+                    for (;;) {
+                        keys.clear(), sizes.clear(), places.clear();
+                        auto [within, filled_status] = fill_round_(scanner, read, bound, direction, round_bytes, keys,
+                                                                   sizes, places, queues);
+                        if (filled_status.failed()) return filled_status;
+                        if (keys.empty()) return {};
+                        auto reader = [&](std::span<std::size_t const> picked, auto&& sink) noexcept -> status_t {
+                            return collection.read_placed(channel, reading, scratch,
+                                                          std::span<stored_key_t const> {keys},
+                                                          std::span<value_place_t const> {places}, picked, sink);
+                        };
+                        auto [keeps_going, round_status] = round(std::span<stored_key_t const> {keys},
+                                                                 std::span<stored_value_size_t const> {sizes}, reader);
+                        if (round_status.failed()) return round_status;
+                        if (!keeps_going || !within) return {};
+                    }
+                }
+                else return keyed_otherwise_();
+            });
+    }
+
+    /** Moves @p scanner over the present keys of the next round of the collection @p read reads, up
+     *  to @p bound, inclusive, in @p direction, until their sizes fill @p round_bytes, appending
+     *  each key, size and place; answers whether the walk is still inside its range, a chain of
+     *  changes folding on @p queues's reading channel. */
+    template <typename scanner_type_, typename keys_type_, typename sizes_type_, typename places_type_>
+    expected<bool> fill_round_(scanner_type_& scanner, collection_reading_t const& read, stored_key_t bound,
+                               scan_direction_t direction, std::uint64_t round_bytes, keys_type_& keys,
+                               sizes_type_& sizes, places_type_& places, nvme_queues_ref_t queues) noexcept {
+        bool const descending = direction == scan_direction_t::descending_k;
+        for (std::uint64_t bytes = 0; bytes < round_bytes || keys.empty();) {
+            if (scanner.reached_end() || (descending ? scanner.stored_key() < bound : bound < scanner.stored_key()))
+                return false;
+            lookup_result_t state = scanner.state();
+            stored_value_size_t size = scanner.size();
+            value_place_t place = scanner.place();
+            // A chain of changes the walk could not fold without a channel folds here
+            if (state == lookup_result_t::incomplete_k) {
+                status_t const measured = stored_value_size(read, scanner.stored_key(), size, queues);
+                if (measured.failed() && !(measured == status_code_t::not_found_k)) return measured;
+                state = measured.succeeded() ? lookup_result_t::written_k : lookup_result_t::removed_k;
+                place.level_number = value_place_t::folded_k;
+            }
+            bool const kept = state != lookup_result_t::written_k ||
+                              (keys.push_back(scanner.stored_key()) == st::status_t::success_k &&
+                               sizes.push_back(stored_value_size_t {size}) == st::status_t::success_k &&
+                               places.push_back(value_place_t {place}) == st::status_t::success_k);
+            if (!kept) return status_t {status_code_t::out_of_memory_k, "A walk could not hold its round"};
+            if (state == lookup_result_t::written_k) bytes += size;
+            if (status_t const advanced = scanner.advance(); advanced.failed()) return advanced;
+        }
+        return true;
+    }
+
     /**
      *  @brief Counts the runs of @p id a reader at @p stamp walks, for an unordered scan that walks each run on its
      *      own: every level's runs, then the memory runs oldest first.
      *  @note A transaction's own deltas are one more run, which @c database_transaction::for_each_uncommitted walks.
      */
     expected<counted_runs_t> runs_count(any_collection_id_t const& id, transaction_stamp_t stamp = head_stamp_k,
-                                        std::size_t thread_index = outside_executor_k) noexcept {
+                                        std::size_t thread_index = 0) noexcept {
         auto [read, read_status] = read_collection(id, stamp, thread_index);
         if (read_status.failed()) return read_status;
         return runs_count(read);
@@ -1407,9 +1518,9 @@ class basic_database {
      *  @param[in] counted The runs as @c runs_count counted them, which the index names one of.
      *  @param[in] run_index Which of the counted runs to walk.
      *  @param[in] from The first key to hand out.
-     *  @param[in] visitor Called as @c visitor(stored_key, state, size) inside the epochs, answering whether the walk
-     *      carries on, so it must not block; a caller bounds one call's work by answering false and resuming past the
-     *      last key.
+     *  @param[in] visitor Called as <tt>visitor(stored_key, state, size)</tt> inside the epochs,
+     *      answering whether the walk continues, so it must not block; a caller bounds one call's
+     *      work by answering false and resuming past the last key.
      *  @param[in] stamp The stamp a reader is pinned at, which every run of one scan should share.
      *  @param[in] thread_index The executor thread reading, which announces on its own epoch slot.
      *  @retval contended_k A flush, a compaction or a merge rearranged the runs since they were counted, so the scan
@@ -1418,7 +1529,7 @@ class basic_database {
     template <typename visitor_type_>
     status_t scan_run(any_collection_id_t const& id, counted_runs_t const& counted, std::uint64_t run_index,
                       stored_key_t from, visitor_type_&& visitor, transaction_stamp_t stamp = head_stamp_k,
-                      std::size_t thread_index = outside_executor_k) noexcept {
+                      std::size_t thread_index = 0) noexcept {
         auto [read, read_status] = read_collection(id, stamp, thread_index);
         if (read_status.failed()) return read_status;
         return scan_run(read, counted, run_index, from, visitor);
@@ -1468,16 +1579,16 @@ class basic_database {
      */
     template <typename visitor_type_>
     status_t changes_after(any_collection_id_t const& id, stored_change_t const& after, std::size_t wanted,
-                           visitor_type_&& visitor, std::size_t thread_index = outside_executor_k) noexcept {
-        reader_t const inside = ledger_.epochs().enter(thread_index);
+                           visitor_type_&& visitor, nvme_queues_ref_t queues = {}) noexcept {
+        reader_t const inside = ledger_.epochs().enter(queues.thread_index);
         collection_entry_t const* const found = entry_at_(id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
-        auto [channel, acquire_status] = channels_->acquire(thread_index);
-        if (acquire_status.failed()) return acquire_status;
+        expected<claimed_channels_t> channels = queues_channels_(queues, claim_guard_t {});
+        if (!channels) return channels.status();
         return std::visit(
             [&]<typename store_type_>(store_type_ const& collection) noexcept -> status_t {
                 if constexpr (keyed_by_database<store_type_>())
-                    return collection.changes_after(channel.channel(), after, wanted, visitor, thread_index);
+                    return collection.changes_after(channels->reading(), after, wanted, visitor, queues.thread_index);
                 else return {status_code_t::unsupported_k, "A collection keyed by strings feeds no changes"};
             },
             found->held);
@@ -1489,20 +1600,27 @@ class basic_database {
 
     /** Writes @p stored_value under @p stored_key of @p id as a commit of its own, flushing first when the memory runs
      *  are past their bounds. */
-    status_t insert(any_collection_id_t const& id, stored_key_t stored_key, stored_value_view_t stored_value) noexcept {
-        return commit_alone_(id, [&](auto const& collection) noexcept {
-            keyed_delta<stored_key_t> delta {stored_key, delta_view_t {delta_kind_t::write_k, stored_value}};
-            return collection.seal(std::span<keyed_delta<stored_key_t>> {&delta, 1});
-        });
+    status_t insert(any_collection_id_t const& id, stored_key_t stored_key, stored_value_view_t stored_value,
+                    nvme_queues_ref_t queues = {}) noexcept {
+        return commit_one_collection_(
+            id,
+            [&](auto const& collection) noexcept {
+                keyed_delta<stored_key_t> delta {stored_key, delta_view_t {delta_kind_t::write_k, stored_value}};
+                return collection.seal(std::span<keyed_delta<stored_key_t>> {&delta, 1});
+            },
+            queues);
     }
 
     /** Removes @p stored_key of @p id as a commit of its own, flushing first when the memory runs are past their
      *  bounds. */
-    status_t remove(any_collection_id_t const& id, stored_key_t stored_key) noexcept {
-        return commit_alone_(id, [&](auto const& collection) noexcept {
-            keyed_delta<stored_key_t> delta {stored_key, delta_view_t {delta_kind_t::remove_k, {}}};
-            return collection.seal(std::span<keyed_delta<stored_key_t>> {&delta, 1});
-        });
+    status_t remove(any_collection_id_t const& id, stored_key_t stored_key, nvme_queues_ref_t queues = {}) noexcept {
+        return commit_one_collection_(
+            id,
+            [&](auto const& collection) noexcept {
+                keyed_delta<stored_key_t> delta {stored_key, delta_view_t {delta_kind_t::remove_k, {}}};
+                return collection.seal(std::span<keyed_delta<stored_key_t>> {&delta, 1});
+            },
+            queues);
     }
 
     /**
@@ -1513,16 +1631,19 @@ class basic_database {
      *  @param[in] sizes Bytes of every value, one per key, which must add up to @p stored_values.
      */
     status_t insert(any_collection_id_t const& id, std::span<stored_key_t const> stored_keys,
-                    std::span<byte_t const> stored_values, std::span<stored_value_size_t const> sizes) noexcept {
-        return commit_alone_(id, [&](auto const& collection) noexcept {
-            return collection.seal_writes(stored_keys, stored_values, sizes);
-        });
+                    std::span<byte_t const> stored_values, std::span<stored_value_size_t const> sizes,
+                    nvme_queues_ref_t queues = {}) noexcept {
+        return commit_one_collection_(
+            id,
+            [&](auto const& collection) noexcept { return collection.seal_writes(stored_keys, stored_values, sizes); },
+            queues);
     }
 
     /** Removes every key of @p stored_keys in @p id, as one commit of its own. */
-    status_t remove(any_collection_id_t const& id, std::span<stored_key_t const> stored_keys) noexcept {
-        return commit_alone_(id,
-                             [&](auto const& collection) noexcept { return collection.seal_removals(stored_keys); });
+    status_t remove(any_collection_id_t const& id, std::span<stored_key_t const> stored_keys,
+                    nvme_queues_ref_t queues = {}) noexcept {
+        return commit_one_collection_(
+            id, [&](auto const& collection) noexcept { return collection.seal_removals(stored_keys); }, queues);
     }
 
 #pragma endregion Writes
@@ -1530,10 +1651,10 @@ class basic_database {
 #pragma region Maintenance
 
     /** Writes the memory runs of every collection as one run of its level zero. */
-    status_t flush() noexcept {
-        expected<claimed_channel_t> claimed = claim_channel_();
+    status_t flush(nvme_queues_ref_t queues = {}) noexcept {
+        expected<claimed_channels_t> claimed = claim_channels_(queues);
         if (!claimed) return claimed.status();
-        return flush_holding_(claimed->channel());
+        return flush_holding_(claimed->writing());
     }
 
     /** An ingest under way into one collection: the claim it holds until destroyed, and the rows and runs so far. */
@@ -1568,10 +1689,10 @@ class basic_database {
      *      was.
      */
     template <typename row_type_>
-    status_t write_ingest(ingest_t& ingest, std::span<row_type_ const> rows) noexcept {
-        auto [guard, acquire_status] = channels_->acquire();
-        if (acquire_status.failed()) return acquire_status;
-        io_channel_t& channel = guard.channel();
+    status_t write_ingest(ingest_t& ingest, std::span<row_type_ const> rows, nvme_queues_ref_t queues = {}) noexcept {
+        expected<claimed_channels_t> channels = queues_channels_(queues, claim_guard_t {});
+        if (!channels) return channels.status();
+        io_channel_t& channel = channels->writing();
         return with_ingest_<status_t>(
             ingest, [&]<typename held_type_>(held_type_& held, typename held_type_::ingest_runs_t& ingested) noexcept {
                 if constexpr (ingests_rows_concept<held_type_, row_type_>)
@@ -1589,12 +1710,13 @@ class basic_database {
      *  @return The stamp beside the status of the flush @p durability asked for, or no stamp
      *      beside the status that stopped it with every run dropped, with the claim given back.
      */
-    ingest_outcome_t publish_ingest(ingest_t& ingest, ustore_durability_t durability) noexcept {
-        // The channel goes back before the claim, as every claimed call gives them back
+    ingest_outcome_t publish_ingest(ingest_t& ingest, ustore_durability_t durability,
+                                    nvme_queues_ref_t queues = {}) noexcept {
+        // The channels drain before the claim goes back, as every claimed call gives them back
         ingest_outcome_t const landed = [&]() noexcept -> ingest_outcome_t {
-            auto [guard, acquire_status] = channels_->acquire();
-            if (acquire_status.failed()) return ingest_outcome_t {invalid_transaction_stamp_k, acquire_status};
-            io_channel_t& channel = guard.channel();
+            expected<claimed_channels_t> channels = queues_channels_(queues, claim_guard_t {});
+            if (!channels) return ingest_outcome_t {invalid_transaction_stamp_k, channels.status()};
+            io_channel_t& channel = channels->writing();
             expected<transaction_stamp_t> const published = with_ingest_<expected<transaction_stamp_t>>(
                 ingest,
                 [&]<typename held_type_>(held_type_& held, typename held_type_::ingest_runs_t& ingested) noexcept {
@@ -1629,16 +1751,16 @@ class basic_database {
         return false;
     }
 
-    /** Merges one overfull level of every collection that has one, which needs two channels at
-     *  once, fanning each merge on the host out over @p fan_out. */
-    status_t compact(compaction_fan_out_t const& fan_out = compaction_fan_out_t {}) noexcept {
-        // The claim the channel comes with lends the database's one set of merge buffers.
-        expected<claimed_channel_t> reading = claim_channel_();
-        if (!reading) return reading.status();
-        auto [writing, acquire_status] = channels_->acquire();
-        if (acquire_status.failed()) return acquire_status;
+    /** Merges one overfull level of every collection that has one on both channels of @p queues's
+     *  thread, fanning each merge on the host out over @p fan_out. */
+    status_t compact(compaction_fan_out_t const& fan_out = compaction_fan_out_t {},
+                     nvme_queues_ref_t queues = {}) noexcept {
+        // The claim the channels come with is the only holder of the database's one set
+        // of merge buffers.
+        expected<claimed_channels_t> claimed = claim_channels_(queues);
+        if (!claimed) return claimed.status();
 
-        manifest_write_t recording {this, &reading->channel()};
+        manifest_write_t recording {this, &claimed->reading()};
         lsm_tree_publication_hook_t published;
         published.notify = &record_manifest_;
         published.context = &recording;
@@ -1647,9 +1769,9 @@ class basic_database {
         for (std::size_t index = 0; index != collections_.size(); ++index) {
             auto [merged, compact_status] = std::visit(
                 [&]<typename store_type_>(store_type_& collection) noexcept -> expected<compaction_outcome_t> {
-                    auto [buffers, lent_status] = lent_merge_buffers_<store_type_>(fan_out.slices());
-                    if (lent_status.failed()) return lent_status;
-                    return collection.compact(reading->channel(), writing.channel(), buffers, compactor_, published,
+                    auto [buffers, merge_buffers_status] = merge_buffers_for_<store_type_>(fan_out.slices());
+                    if (merge_buffers_status.failed()) return merge_buffers_status;
+                    return collection.compact(claimed->reading(), claimed->writing(), buffers, compactor_, published,
                                               fan_out);
                 },
                 collections_[index]->held);
@@ -1666,7 +1788,7 @@ class basic_database {
      *  it lets go, so no commit waits behind another's maintenance.
      *  @note Called outside the ledger's epochs.
      */
-    status_t maintain(collection_id_t collection_id) noexcept {
+    status_t maintain(collection_id_t collection_id, nvme_queues_ref_t queues = {}) noexcept {
         {
             reader_t const inside = ledger_.epochs().enter();
             collection_entry_t const* const found = entry_with_id_(collection_id);
@@ -1674,11 +1796,11 @@ class basic_database {
                 !std::visit([](auto const& collection) noexcept { return collection.maintenance_due(); }, found->held))
                 return {};
         }
-        claim_guard_t const held = claim_guard_t::taken_if_free(*this);
+        claim_guard_t const held = claim_guard_t::taken_if_free(*this, queues);
         if (!held.holding()) return {};
         collection_entry_t* const found = entry_with_id_(collection_id);
         if (!found) return {};
-        return maintain_collection_(*found);
+        return maintain_collection_(*found, queues);
     }
 
     /** How many memory runs @p id's collection holds and how many commits they hold, or none for a missing one. */
@@ -1767,7 +1889,7 @@ class basic_database {
     status_t seal_collection(
         collection_id_t collection_id,
         transaction_deltas<stored_key_t, atomic_reference_, waiter_type_, row_kit_type_> const& written,
-        sealed_commit<stored_key_t, atomic_reference_, row_kit_type_>& sealed) noexcept {
+        sealed_commit<stored_key_t, atomic_reference_, row_kit_type_>& sealed, nvme_queues_ref_t queues = {}) noexcept {
         st::vector<keyed_delta<stored_key_t>, constrained_allocator<keyed_delta<stored_key_t>, atomic_reference_>>
             deltas {
                 constrained_allocator<keyed_delta<stored_key_t>, atomic_reference_> {resources_->memory_constraint}};
@@ -1777,10 +1899,13 @@ class basic_database {
             [[maybe_unused]] st::status_t const placed = deltas.push_back(
                 st::assume_reserved, keyed_delta<stored_key_t> {stored_key, delta});
         });
-        return seal_into_(collection_id, sealed, [&](auto const& collection) noexcept {
-            return collection.seal(std::span<keyed_delta<stored_key_t>> {deltas}, written.ranges(collection_id),
-                                   written.lendable_bytes());
-        });
+        return seal_into_(
+            collection_id, sealed,
+            [&](auto const& collection) noexcept {
+                return collection.seal(std::span<keyed_delta<stored_key_t>> {deltas}, written.ranges(collection_id),
+                                       written.adoptable_bytes());
+            },
+            queues);
     }
 
     /**
@@ -1832,7 +1957,7 @@ class basic_database {
      *  and answers a status. */
     template <typename visitor_type_>
     status_t visit_store(any_collection_id_t const& id, visitor_type_&& visitor,
-                         std::size_t thread_index = outside_executor_k) noexcept {
+                         std::size_t thread_index = 0) noexcept {
         reader_t const inside = ledger_.epochs().enter(thread_index);
         collection_entry_t* const found = entry_at_(id);
         if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
@@ -1842,13 +1967,10 @@ class basic_database {
     /** Flushes @p collection_id's memory runs while @p sealed, which a store keying its collections otherwise sealed
      *  for a transaction's share, would leave them past twice their bounds, as the database's own commits do. */
     template <typename sealed_type_>
-    status_t make_room(collection_id_t collection_id, sealed_type_ const& sealed) noexcept {
-        return make_room_(collection_id, sealed);
+    status_t make_room(collection_id_t collection_id, sealed_type_ const& sealed,
+                       nvme_queues_ref_t queues = {}) noexcept {
+        return make_room_(collection_id, sealed, queues);
     }
-
-    /** The queue pairs every call that moves bytes borrows one of, a read of a store keying its collections otherwise
-     *  included. */
-    [[nodiscard]] channel_pool_t& channels() noexcept { return *channels_; }
 
     /**
      *  @brief Claims a memory-run record of @p collection_id's store for a commit sealed for it,
@@ -1858,7 +1980,8 @@ class basic_database {
      *      the view failed.
      *  @note Called outside the ledger's epochs, which every flush waits out.
      */
-    status_t claim_memory_record(collection_id_t collection_id, memory_run_claim_t& claimed) noexcept {
+    status_t claim_memory_record(collection_id_t collection_id, memory_run_claim_t& claimed,
+                                 nvme_queues_ref_t queues = {}) noexcept {
         for (;;) {
             auto const [vacated, observed, taken] = claim_free_record_(collection_id, claimed);
             if (taken != status_code_t::capacity_exhausted_k) return taken;
@@ -1868,7 +1991,8 @@ class basic_database {
             atomic_reference_<std::uint32_t const> const vacated_now {*vacated};
             while (vacated_now.load(std::memory_order_acquire) == observed) {
                 bool flushed = false;
-                if (status_t const freed = flush_for_record_(collection_id, flushed); freed.failed()) return freed;
+                if (status_t const freed = flush_for_record_(collection_id, flushed, queues); freed.failed())
+                    return freed;
                 if (flushed) break;
                 waiter_type_ {}(vacated, observed, std::size_t {0});
             }
@@ -1911,7 +2035,7 @@ class basic_database {
 
     /** Flushes @p collection_id's memory runs to free a record, when it published any and nobody
      *  holds the claim, answering in @p flushed whether it did. */
-    status_t flush_for_record_(collection_id_t collection_id, bool& flushed) noexcept {
+    status_t flush_for_record_(collection_id_t collection_id, bool& flushed, nvme_queues_ref_t queues) noexcept {
         flushed = false;
         bool flushable = false;
         {
@@ -1924,12 +2048,12 @@ class basic_database {
         // A flush frees every published run's record; with none published, every record
         // is out with a commit.
         if (!flushable) return {};
-        claim_guard_t const held = claim_guard_t::taken_if_free(*this);
+        claim_guard_t const held = claim_guard_t::taken_if_free(*this, queues);
         if (!held.holding()) return {};
         collection_entry_t* const claimed_entry = entry_with_id_(collection_id);
         if (!claimed_entry) return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
-        if (status_t const done = std::visit([&](auto& collection) noexcept { return flush_and_compact_(collection); },
-                                             claimed_entry->held);
+        if (status_t const done = std::visit(
+                [&](auto& collection) noexcept { return flush_and_compact_(collection, queues); }, claimed_entry->held);
             done.failed())
             return done;
         flushed = true;
@@ -1948,40 +2072,40 @@ class basic_database {
 
     /** Replaces the caller's own data with @p bytes, which the engine never reads, as a manifest
      *  entry of no collection; none clears it. */
-    status_t save_user_data(bytes_view_t bytes) noexcept {
-        if (bytes.empty()) return clear_user_data();
-        expected<claimed_channel_t> claimed = claim_channel_();
+    status_t save_user_data(bytes_view_t bytes, nvme_queues_ref_t queues = {}) noexcept {
+        if (bytes.empty()) return clear_user_data(queues);
+        expected<claimed_channels_t> claimed = claim_channels_(queues);
         if (!claimed) return claimed.status();
         uuid128_t const run = uuid_generator();
         auto [written, allocate_status] = volume_->allocate(run, bytes.size());
         if (allocate_status.failed()) return allocate_status;
-        if (status_t const filled = write_extent<disk_t, waiter_type_>(volume_->disk(), claimed->channel(), written,
+        if (status_t const filled = write_extent<disk_t, waiter_type_>(volume_->disk(), claimed->writing(), written,
                                                                        bytes);
             filled.failed()) {
             volume_->deallocate(written);
             return filled;
         }
-        return replace_user_data_(claimed->channel(), run, written, bytes.size());
+        return replace_user_data_(claimed->writing(), run, written, bytes.size());
     }
 
     /** Reads the caller's own data into @p into, which must hold @c user_data_size_bytes of it. */
-    status_t load_user_data(bytes_span_t into) noexcept {
-        expected<claimed_channel_t> claimed = claim_channel_();
+    status_t load_user_data(bytes_span_t into, nvme_queues_ref_t queues = {}) noexcept {
+        expected<claimed_channels_t> claimed = claim_channels_(queues);
         if (!claimed) return claimed.status();
         if (user_data_bytes_ == 0) return {status_code_t::not_found_k, "The database holds no user data"};
         if (into.size() < user_data_bytes_)
             return {status_code_t::invalid_argument_k, "A buffer shorter than the data"};
-        return read_extent<disk_t>(volume_->disk(), claimed->channel(), user_data_,
+        return read_extent<disk_t>(volume_->disk(), claimed->reading(), user_data_,
                                    into.first(static_cast<std::size_t>(user_data_bytes_)));
     }
 
     /** Forgets the caller's own data and returns its bytes to the volume once the manifest
      *  stops naming it. */
-    status_t clear_user_data() noexcept {
-        expected<claimed_channel_t> claimed = claim_channel_();
+    status_t clear_user_data(nvme_queues_ref_t queues = {}) noexcept {
+        expected<claimed_channels_t> claimed = claim_channels_(queues);
         if (!claimed) return claimed.status();
         if (user_data_bytes_ == 0) return {status_code_t::not_found_k, "The database holds no user data"};
-        return replace_user_data_(claimed->channel(), uuid128_t {}, medium_extent_t {}, 0);
+        return replace_user_data_(claimed->writing(), uuid128_t {}, medium_extent_t {}, 0);
     }
 
 #pragma endregion User Data
@@ -2022,12 +2146,10 @@ class basic_database {
      */
     template <typename progress_type_, typename digester_type_>
     expected<archive_report_t> save(volume_config_t const& target, transaction_stamp_t stamp, progress_type_&& progress,
-                                    digester_type_ const& digester) noexcept {
-        expected<claimed_channel_t> claimed = claim_channel_();
+                                    digester_type_ const& digester, nvme_queues_ref_t queues = {}) noexcept {
+        expected<claimed_channels_t> claimed = claim_channels_(queues);
         if (!claimed) return claimed.status();
-        io_channel_t& channel = claimed->channel();
-        auto [writing, acquire_status] = channels_->acquire();
-        if (acquire_status.failed()) return acquire_status;
+        io_channel_t& channel = claimed->reading();
         // Memory runs reach the runs first, so the files below hold every version at or
         // below the stamp.
         if (status_t const flushed = flush_holding_(channel); flushed.failed()) return flushed;
@@ -2070,7 +2192,7 @@ class basic_database {
         status_t failure;
         for (placed_file_t const& source : sources) {
             sha256_t digest {};
-            auto [extent, place_status] = place_run_(into, channel, writing.channel(), source, held_by_run, report,
+            auto [extent, place_status] = place_run_(into, channel, claimed->writing(), source, held_by_run, report,
                                                      placed, digester, digest);
             if (place_status.failed()) {
                 failure = place_status;
@@ -2167,26 +2289,42 @@ class basic_database {
 
     friend claim_guard_t;
 
-    /** The claim and the channel one call of this database runs under, released in that order. */
-    class claimed_channel_t {
+    /** The claim one call of this database runs under, or none, and both channels of its queue set
+     *  thread, drained before the claim goes back, so nothing the call left in flight lands in
+     *  blocks the thread's next call reuses. */
+    class claimed_channels_t {
       public:
 
-        claimed_channel_t(claim_guard_t&& claim, channel_guard_t&& channel) noexcept
-            : claim_(std::move(claim)), channel_(std::move(channel)) {}
+        claimed_channels_t(claim_guard_t&& claim, disk_t& disk, thread_channels_t channels) noexcept
+            : claim_(std::move(claim)), disk_(&disk), channels_(channels) {}
 
-        claimed_channel_t(claimed_channel_t&&) noexcept = default;
-        claimed_channel_t& operator=(claimed_channel_t&&) noexcept = default;
+        claimed_channels_t(claimed_channels_t&& other) noexcept
+            : claim_(std::move(other.claim_)), disk_(std::exchange(other.disk_, nullptr)), channels_(other.channels_) {}
 
-        /** The channel, which only the thread holding this is on. */
-        [[nodiscard]] io_channel_t& channel() const noexcept { return channel_.channel(); }
+        claimed_channels_t& operator=(claimed_channels_t&&) = delete;
+
+        ~claimed_channels_t() noexcept {
+            if (!disk_) return;
+            [[maybe_unused]] status_t const reads_drained = disk_->drain(channels_.reading->queue_pair());
+            [[maybe_unused]] status_t const writes_drained = disk_->drain(channels_.writing->queue_pair());
+        }
+
+        /** The channel a call reads on, and a merge reads its inputs on. */
+        [[nodiscard]] io_channel_t& reading() const noexcept { return *channels_.reading; }
+
+        /** The channel every write of the call goes through. */
+        [[nodiscard]] io_channel_t& writing() const noexcept { return *channels_.writing; }
 
       private:
 
-        /** The database's claim, given back after the channel. */
+        /** The database's claim, given back after the channels drain. */
         claim_guard_t claim_;
 
-        /** The borrowed queue pair, drained and given back first. */
-        channel_guard_t channel_;
+        /** The disk both channels hold, null once moved from. */
+        disk_t* disk_ = nullptr;
+
+        /** The thread's two channels. */
+        thread_channels_t channels_;
     };
 
   public:
@@ -2378,7 +2516,8 @@ class basic_database {
 
     /** Lands what @p sealer seals out of @p id's collection as a commit of its own, through the sequencer. */
     template <typename sealer_type_>
-    status_t commit_alone_(any_collection_id_t const& id, sealer_type_&& sealer) noexcept {
+    status_t commit_one_collection_(any_collection_id_t const& id, sealer_type_&& sealer,
+                                    nvme_queues_ref_t queues) noexcept {
         head_commit_t head;
         head.store = this;
         {
@@ -2387,18 +2526,19 @@ class basic_database {
             if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
             head.id = found->id;
         }
-        if (status_t const sealed = seal_into_(head.id, head.sealed, sealer); sealed.failed()) return sealed;
+        if (status_t const sealed = seal_into_(head.id, head.sealed, sealer, queues); sealed.failed()) return sealed;
         if (head.sealed.empty()) return {};
         // Claimed before the leader word, waiting on a flush when every record is out, so the
         // commit cannot be refused.
-        if (status_t const claimed = claim_memory_record(head.id, head.record); claimed.failed()) return claimed;
+        if (status_t const claimed = claim_memory_record(head.id, head.record, queues); claimed.failed())
+            return claimed;
         commit_request_t request;
         request.context = &head;
         request.prepare = &prepare_head_;
         request.publish = &publish_head_;
         if (status_t const committed = ledger_.submit(request).status(); committed.failed()) return committed;
         // The commit has landed, so a failure to maintain is met again by the next commit making room.
-        [[maybe_unused]] status_t const maintained = maintain(head.id);
+        [[maybe_unused]] status_t const maintained = maintain(head.id, queues);
         return {};
     }
 
@@ -2406,8 +2546,8 @@ class basic_database {
      *  runs are past twice their bounds, inside the ledger's epochs only while sealing. */
     template <typename sealer_type_>
     status_t seal_into_(collection_id_t collection_id,
-                        sealed_commit<stored_key_t, atomic_reference_, row_kit_type_>& sealed,
-                        sealer_type_&& sealer) noexcept {
+                        sealed_commit<stored_key_t, atomic_reference_, row_kit_type_>& sealed, sealer_type_&& sealer,
+                        nvme_queues_ref_t queues) noexcept {
         {
             reader_t const inside = ledger_.epochs().enter();
             collection_entry_t const* const found = entry_with_id_(collection_id);
@@ -2425,7 +2565,7 @@ class basic_database {
                 found->held);
             if (status.failed()) return status;
         }
-        return make_room_(collection_id, sealed);
+        return make_room_(collection_id, sealed, queues);
     }
 
     /**
@@ -2435,7 +2575,7 @@ class basic_database {
      *  @return Success once the commit fits, or why a flush could not make room.
      */
     template <typename sealed_type_>
-    status_t make_room_(collection_id_t collection_id, sealed_type_ const& sealed) noexcept {
+    status_t make_room_(collection_id_t collection_id, sealed_type_ const& sealed, nvme_queues_ref_t queues) noexcept {
         if (sealed.empty()) return {};
         for (;;) {
             {
@@ -2451,7 +2591,7 @@ class basic_database {
                     found->held);
                 if (pressure != memory_pressure_t::stalled_k) return {};
             }
-            claim_guard_t const held = claim_guard_t::taken_if_free(*this);
+            claim_guard_t const held = claim_guard_t::taken_if_free(*this, queues);
             if (!held.holding()) {
                 // Whoever holds the claim may be flushing this very collection, so the pressure is read again after.
                 claim_.wait_until_released();
@@ -2460,31 +2600,30 @@ class basic_database {
             collection_entry_t* const claimed = entry_with_id_(collection_id);
             if (!claimed) return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
             if (status_t const flushed = std::visit(
-                    [&](auto& collection) noexcept { return flush_and_compact_(collection); }, claimed->held);
+                    [&](auto& collection) noexcept { return flush_and_compact_(collection, queues); }, claimed->held);
                 flushed.failed())
                 return flushed;
         }
     }
 
     /** Flushes @p collection's memory runs, publishes the manifest naming the run, and compacts the
-     *  tree for as long as the flush left a level over its bounds, holding the claim. */
+     *  tree for as long as the flush left a level over its bounds, holding the claim, on both
+     *  channels of the thread of @p queues. */
     template <typename collection_type_>
-    status_t flush_and_compact_(collection_type_& collection) noexcept {
-        auto [reading, reading_status] = channels_->acquire();
-        if (reading_status.failed()) return reading_status;
-        if (status_t const flushed = collection.flush(reading.channel()); flushed.failed()) return flushed;
-        if (status_t const saved = publish_manifest_(reading.channel()); saved.failed()) return saved;
+    status_t flush_and_compact_(collection_type_& collection, nvme_queues_ref_t queues) noexcept {
+        expected<claimed_channels_t> channels = queues_channels_(queues, claim_guard_t {});
+        if (!channels) return channels.status();
+        if (status_t const flushed = collection.flush(channels->writing()); flushed.failed()) return flushed;
+        if (status_t const saved = publish_manifest_(channels->writing()); saved.failed()) return saved;
         if (!collection.needs_compaction()) return {};
-        auto [writing, writing_status] = channels_->acquire();
-        if (writing_status.failed()) return writing_status;
-        manifest_write_t recording {this, &reading.channel()};
+        manifest_write_t recording {this, &channels->reading()};
         lsm_tree_publication_hook_t published;
         published.notify = &record_manifest_;
         published.context = &recording;
-        auto [buffers, lent_status] = lent_merge_buffers_<collection_type_>(1);
-        if (lent_status.failed()) return lent_status;
+        auto [buffers, merge_buffers_status] = merge_buffers_for_<collection_type_>(1);
+        if (merge_buffers_status.failed()) return merge_buffers_status;
         while (collection.needs_compaction()) {
-            auto [outcome, compact_status] = collection.compact(reading.channel(), writing.channel(), buffers,
+            auto [outcome, compact_status] = collection.compact(channels->reading(), channels->writing(), buffers,
                                                                 compactor_, published);
             if (compact_status.failed()) return compact_status;
             if (outcome == compaction_outcome_t::nothing_to_compact_k) break;
@@ -2494,21 +2633,22 @@ class basic_database {
 
     /** Merges @p entry's memory runs by tier, and flushes and compacts them once they hold their bounds, holding
      *  the claim. */
-    status_t maintain_collection_(collection_entry_t& entry) noexcept {
+    status_t maintain_collection_(collection_entry_t& entry, nvme_queues_ref_t queues) noexcept {
         return std::visit(
             [&](auto& collection) noexcept -> status_t {
                 if (status_t const merged = collection.merge_memory_runs(); merged.failed()) return merged;
                 if (!collection.flush_due()) return {};
-                return flush_and_compact_(collection);
+                return flush_and_compact_(collection, queues);
             },
             entry.held);
     }
 
     /** Maintains every collection, holding the claim; answers the first failure, after trying every collection. */
-    status_t maintain_due_() noexcept {
+    status_t maintain_due_(nvme_queues_ref_t queues) noexcept {
         status_t first;
         for (collection_entry_t* entry : collections_)
-            if (status_t const maintained = maintain_collection_(*entry); maintained.failed() && first.succeeded())
+            if (status_t const maintained = maintain_collection_(*entry, queues);
+                maintained.failed() && first.succeeded())
                 first = maintained;
         return first;
     }
@@ -2532,13 +2672,13 @@ class basic_database {
      *  that holder looks once more after it lets go, and a failed maintenance is met again
      *  by the next commit.
      */
-    void release_claim_() noexcept {
+    void release_claim_(nvme_queues_ref_t queues) noexcept {
         // Every release looks again, so a commit that found the claim held during a maintenance is
         // met after it.
         for (;;) {
             claim_.release();
             if (!maintenance_due_() || claim_.anyone_parked() || !claim_.take_if_free()) return;
-            if (maintain_due_().failed()) break;
+            if (maintain_due_(queues).failed()) break;
         }
         claim_.release();
     }
@@ -2558,12 +2698,21 @@ class basic_database {
         return first;
     }
 
-    /** Takes the claim and then a shared channel, which every call that moves bytes runs under. */
-    expected<claimed_channel_t> claim_channel_() noexcept {
-        claim_guard_t claim {*this};
-        auto [guard, acquire_status] = channels_->acquire();
-        if (acquire_status.failed()) return acquire_status;
-        return claimed_channel_t {std::move(claim), std::move(guard)};
+    /** Both channels of the thread of @p queues, with this database's disk media registered,
+     *  under @p claim; a call naming no queue set is refused, since only @c src/ builds queues
+     *  for a call. */
+    expected<claimed_channels_t> queues_channels_(nvme_queues_ref_t queues, claim_guard_t&& claim) noexcept {
+        if (!queues.queues) return status_t {status_code_t::invalid_argument_k, "A call names its queues"};
+        auto [channels, media_status] = queues.queues->both_channels_with_disk_media(queues.thread_index,
+                                                                                     volume_->disk());
+        if (media_status.failed()) return media_status;
+        return claimed_channels_t {std::move(claim), volume_->disk(), channels};
+    }
+
+    /** Takes the claim for a holder on @p queues, then both channels of its thread, which every
+     *  call that rewrites the manifest, a tree or the user data runs under. */
+    expected<claimed_channels_t> claim_channels_(nvme_queues_ref_t queues) noexcept {
+        return queues_channels_(queues, claim_guard_t {*this, queues});
     }
 
     /** Answers @p action on the store @p ingest writes into and the runs it wrote so far. */
@@ -2631,11 +2780,11 @@ class basic_database {
         return index;
     }
 
-    /** The merge buffers lent to a merge of a collection of @p store_type_ over @p slices slices,
-     *  under the claim; a merge of another store's collection frees what the last one grew, as
-     *  their buffers differ in type. */
+    /** The merge buffers of one merge of a collection of @p store_type_ over @p slices slices,
+     *  owned by this database and used under the claim; a merge of another store's collection frees
+     *  what the last one grew, as their buffers differ in type. */
     template <typename store_type_>
-    expected<std::span<typename store_type_::merge_buffers_t>> lent_merge_buffers_(std::size_t slices) noexcept {
+    expected<std::span<typename store_type_::merge_buffers_t>> merge_buffers_for_(std::size_t slices) noexcept {
         constexpr std::size_t held_index = store_index_<store_type_>() + 1;
         if (merge_buffers_.index() != held_index) merge_buffers_.template emplace<held_index>();
         st::vector<typename store_type_::merge_buffers_t>& buffers = std::get<held_index>(merge_buffers_);
@@ -2774,15 +2923,11 @@ class basic_database {
     status_t move_extent_(io_channel_t& reading, io_channel_t* writing, medium_extent_t const& from,
                           medium_extent_t const* into, digester_type_ const& digester, sha256_t& digest) noexcept {
         disk_t& disk = volume_->disk();
-        auto [reader_channel, reader_channel_status] = reading.acquire();
-        if (reader_channel_status.failed()) return reader_channel_status;
-        basic_read_pipeline<disk_t> reader {disk, std::move(reader_channel), from.medium};
+        basic_read_pipeline<disk_t> reader {disk, reading, from.medium};
         std::optional<basic_write_pipeline<disk_t, waiter_type_>> writer;
         std::uint64_t block_bytes = reading.requests().buffer_bytes();
         if (writing) {
-            auto [writer_channel, writer_channel_status] = writing->acquire();
-            if (writer_channel_status.failed()) return writer_channel_status;
-            writer.emplace(disk, std::move(writer_channel), into->medium);
+            writer.emplace(disk, *writing, into->medium);
             if (writing->requests().buffer_bytes() < block_bytes) block_bytes = writing->requests().buffer_bytes();
         }
         block_bytes = round_down_to_multiple<std::uint64_t>(block_bytes, portable_alignment_k);
@@ -2800,11 +2945,11 @@ class basic_database {
         digester.init(state);
         std::uint64_t hashed = 0;
 
-        status_t carried;
+        status_t held;
         auto sink = [&](utilities::completed_buffer_t const& completed) noexcept {
-            if (carried.failed()) return;
+            if (held.failed()) return;
             if (status_t const whole = utilities::require_completed_in_full(completed); whole.failed()) {
-                carried = whole;
+                held = whole;
                 return;
             }
             std::uint64_t const block = completed.tag;
@@ -2827,17 +2972,17 @@ class basic_database {
             if (!writer) return;
             auto [buffer, acquire_status] = writer->acquire_buffer_or_poll();
             if (acquire_status.failed()) {
-                carried = acquire_status;
+                held = acquire_status;
                 return;
             }
             std::memcpy(buffer.bytes().data(), completed.bytes.data(), completed.bytes.size());
             if (status_t const queued = writer->enqueue_write(std::move(buffer),
                                                               into->slice(block * block_bytes, completed.bytes.size()));
                 queued.failed())
-                carried = queued;
-            else if (status_t const submitted = writer->submit(); submitted.failed()) carried = submitted;
+                held = queued;
+            else if (status_t const submitted = writer->submit(); submitted.failed()) held = submitted;
         };
-        for (std::uint64_t next = 0; next != blocks && carried.succeeded();) {
+        for (std::uint64_t next = 0; next != blocks && held.succeeded();) {
             while (next != blocks && next < hashed + hashed_window_k && reader.can_enqueue()) {
                 std::uint64_t const offset = next * block_bytes;
                 std::uint64_t const chunk = from.extent.length - offset < block_bytes ? from.extent.length - offset
@@ -2852,7 +2997,7 @@ class basic_database {
             if (status_t const polled = reader.poll_one_completion(sink); polled.failed()) return polled;
         }
         if (status_t const polled = reader.poll_all_completions(sink); polled.failed()) return polled;
-        if (carried.failed()) return carried;
+        if (held.failed()) return held;
         if (hashed != blocks) return {status_code_t::internal_k, "A copy hashed fewer blocks than it read"};
         digest = digester.digest(state);
         return writer ? writer->poll_all_completions() : status_t {};
@@ -2947,33 +3092,29 @@ class basic_database {
     /** Opens every collection the manifest names, drops the versions a crash tore and publishes the
      *  collections, which a mount does once, leaving nothing published when it fails. */
     template <typename digester_type_>
-    status_t open_manifest_(digester_type_ const& digester) noexcept {
-        // Every executor thread with a channel of its own reads on an epoch slot of its own too.
-        if (status_t const reserved = ledger_.epochs().reserve_threads(channels_->executor_channels());
-            reserved.failed())
-            return reserved;
+    status_t open_manifest_(nvme_queues_ref_t queues, digester_type_ const& digester) noexcept {
         if (status_t const made = make_run_pools_(); made.failed()) return made;
-        expected<claimed_channel_t> claimed = claim_channel_();
+        expected<claimed_channels_t> claimed = claim_channels_(queues);
         if (!claimed) return claimed.status();
         std::uint64_t const durable_stamp = volume_->manifest().durable_stamp;
-        if (status_t const adopted = adopt_manifest_(claimed->channel(), digester); adopted.failed()) return adopted;
+        if (status_t const adopted = adopt_manifest_(claimed->reading(), digester); adopted.failed()) return adopted;
 
         // The stamps continue above the durable stamp, and every version above it is a commit a
         // crash tore, which is dropped before anything draws a stamp; resuming first is what lets
         // the truncation's manifest promise it.
         if (status_t const resumed = ledger_.resume(durable_stamp); resumed.failed()) return resumed;
-        auto [writing, acquire_status] = channels_->acquire();
-        if (acquire_status.failed()) return acquire_status;
-        manifest_write_t recording {this, &claimed->channel()};
+        // A reader pins the durable stamp at most, so it never sees a torn commit it leaves on disk
+        if (config_.access == utilities::medium_access_t::read_only_k) return publish_collections_();
+        manifest_write_t recording {this, &claimed->reading()};
         lsm_tree_publication_hook_t published;
         published.notify = &record_manifest_;
         published.context = &recording;
         for (std::size_t index = 0; index != collections_.size(); ++index)
             if (status_t const truncated = std::visit(
                     [&]<typename store_type_>(store_type_& collection) noexcept -> status_t {
-                        auto [buffers, lent_status] = lent_merge_buffers_<store_type_>(1);
-                        if (lent_status.failed()) return lent_status;
-                        return collection.truncate_above(claimed->channel(), writing.channel(), buffers, durable_stamp,
+                        auto [buffers, merge_buffers_status] = merge_buffers_for_<store_type_>(1);
+                        if (merge_buffers_status.failed()) return merge_buffers_status;
+                        return collection.truncate_above(claimed->reading(), claimed->writing(), buffers, durable_stamp,
                                                          published);
                     },
                     collections_[index]->held);
@@ -3119,11 +3260,8 @@ class basic_database {
     st::vector<any_run_pool_t> run_pools_;
 
     /** The one set of merge buffers, of the store whose collection merged last, which the claim
-     *  lends to one merge at a time instead of every collection keeping the largest it grew. */
+     *  gives to one merge at a time instead of every collection keeping the largest it grew. */
     std::variant<std::monostate, st::vector<typename store_types_::merge_buffers_t>...> merge_buffers_;
-
-    /** The queue pairs every call that moves bytes takes one of, null until the database is mounted. */
-    channel_pool_t* channels_ = nullptr;
 
     /** The delta bounds a transaction takes when its caller names none. */
     database_config_t config_ {};

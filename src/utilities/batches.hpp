@@ -10,14 +10,18 @@
 #include <cstddef> // `std::size_t`, `std::ptrdiff_t`
 #include <cstdint> // `std::uint64_t`, `std::uintptr_t`
 
+#include <algorithm>   // `std::sort`
 #include <chrono>      // `std::chrono::steady_clock`
 #include <limits>      // `std::numeric_limits`
+#include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 
 #include "ustore/db.h"       // `ustore_ingest_append_t`, `ustore_collection_create_t`, `ustore_drop_mode_t`
 #include "ustore/ranges.hpp" // `strided_iterator`, `strided`, `place_batch_t`, `edges_view_t`, `tape_string`
 #include "ustore/status.hpp" // `status_t`, `expected`
 #include "ustore/types.hpp"  // `smallest_key_k`, `string_of`
+
+#include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`
 
 #include "utilities/outputs.hpp" // `collection_find_outputs_t`
 
@@ -231,6 +235,42 @@ struct edges_batch_t {
 template <typename arguments_type_>
 place_batch_t places_of(arguments_type_ const& arguments) noexcept {
     return {strided(arguments.collections), strided(arguments.keys), {}, arguments.count};
+}
+
+/** The tasks of a batch ordered by collection and then key: which task each sorted one was, and the
+ *  batch of the same tasks in that order. */
+struct sorted_places_t {
+
+    /** The task each place of @c places was, so outputs still land in request order. */
+    std::span<std::size_t> tasks;
+
+    /** The places in sorted order, viewing pairs in the scratch the sort carved them from. */
+    place_batch_t places;
+};
+
+/** Sorts the tasks at @p places by collection and then key in @p scratch, so a batched read splits
+ *  over its slices as runs of neighbours, which share the blocks their values sit in. */
+inline expected<sorted_places_t> sort_places(place_batch_t const& places, ustore_arena_t scratch) noexcept {
+    auto [tasks, tasks_status] = arena_allocate<std::size_t>(scratch, places.count);
+    if (tasks_status.failed()) return tasks_status;
+    for (std::size_t task = 0; task != tasks.size(); ++task) tasks[task] = task;
+    // A batch already in order, like a scan or a flight of a sorted call, keeps its own places
+    std::size_t ascending = 1;
+    while (ascending < places.count && !(places[ascending].collection_key() < places[ascending - 1].collection_key()))
+        ++ascending;
+    if (ascending >= places.count) return sorted_places_t {tasks, places};
+    std::sort(tasks.begin(), tasks.end(), [&](std::size_t left, std::size_t right) noexcept {
+        return places[left].collection_key() < places[right].collection_key();
+    });
+    auto [pairs, pairs_status] = arena_allocate<collection_key_t>(scratch, places.count);
+    if (pairs_status.failed()) return pairs_status;
+    for (std::size_t index = 0; index != tasks.size(); ++index) pairs[index] = places[tasks[index]].collection_key();
+    auto const sorted = strided(pairs).immutable();
+    sorted_places_t sorted_places {tasks, {}};
+    sorted_places.places.collections_begin = sorted.members(&collection_key_t::collection).begin();
+    sorted_places.places.keys_begin = sorted.members(&collection_key_t::key).begin();
+    sorted_places.places.count = places.count;
+    return sorted_places;
 }
 
 /** The edges of a call writing or removing them, whose identifiers default to @c ustore_edge_id_default_k. */

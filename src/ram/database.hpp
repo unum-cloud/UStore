@@ -251,12 +251,16 @@ struct ram_variant {
     /** One compaction of a database of this class and isolation in flight. */
     struct compact_plan_t;
 
-    /** Opens a database of this class and isolation into @p database, persisting in @p directory unless it is empty. */
-    static status_t open(ustore_database_t* database, std::string_view directory) noexcept;
+    /** Opens a database of this class and isolation into @p database, persisting in @p directory
+     *  unless it is empty, holding at most @p memory_limit bytes of keys and values. */
+    static status_t open(ustore_database_t* database, std::string_view directory, std::size_t memory_limit) noexcept;
 };
 
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 struct changes_feed_state;
+
+/** Bytes of keys and values a database holds at most when its open names no @c memory_limit. */
+inline constexpr std::size_t ram_memory_limit_default_k = std::size_t {16} << 30;
 
 /** Everything a database at @p isolation_ holds, behind its database handle of the C ABI. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
@@ -289,6 +293,13 @@ struct database_state {
 
     /** Directory the image persists in, empty for a volatile database. */
     sz::string_t directory;
+
+    /** Bytes of keys and values the database may hold, as its open named them. */
+    std::size_t memory_limit = ram_memory_limit_default_k;
+
+    /** Bytes of keys and values landed since the open or the last clear, through the class's atomic
+     *  reference. */
+    std::size_t landed_bytes = 0;
 
     database_state() noexcept = default;
     database_state(database_state const&) = delete;
@@ -1152,7 +1163,7 @@ store_status_t commit_group(database_state<cpu_class_, isolation_>& state, stage
     return committed;
 }
 
-/** Stages @p stage_runs into the transaction @p view carries, or commits it as a transaction of its
+/** Stages @p stage_runs into the transaction @p view holds, or commits it as a transaction of its
  *  own and persists it when @p durability asks, for every call that writes. @p stage_runs is
  *  invoked as <tt>stage_runs(source, outcome)</tt> and may refuse the call through the outcome. */
 template <cpu_class_t cpu_class_, isolation_t isolation_, typename stage_runs_type_>
@@ -1329,7 +1340,7 @@ store_status_t commit_collections_change(database_state<cpu_class_, isolation_>&
 }
 
 /** Stages collection @p id holding @p modality under @p name in a store @p change installs,
- *  refusing a name another collection carries. */
+ *  refusing a name another collection holds. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 store_status_t stage_collection(transaction_source<cpu_class_, isolation_>& source,
                                 collections_change<cpu_class_, isolation_>& change, ustore_collection_id_t id,
@@ -1840,7 +1851,8 @@ status_t read_values(database_state<cpu_class_, isolation_>& state, arguments_ty
 
     // The source's claim keeps every version found alive until the outputs copy its value
     store_status_t const read = with_source(state, view, [&]<typename source_type_>(source_type_& source) noexcept {
-        auto read_slice = [&](std::size_t first_task, std::size_t length, view_t const&) noexcept -> status_t {
+        auto read_slice = [&](std::size_t first_task, std::size_t length, std::size_t,
+                              view_t const&) noexcept -> status_t {
             status_t sliced;
             store_status_t const runs = for_each_run(
                 source, places.collections_begin + static_cast<std::ptrdiff_t>(first_task), length, sliced,
@@ -1859,7 +1871,7 @@ status_t read_values(database_state<cpu_class_, isolation_>& state, arguments_ty
         // A transaction's reads join its watch set, so only a reader at one stamp splits the batch
         if constexpr (std::is_same_v<source_type_, reader_source<cpu_class_, isolation_>>)
             outcome = for_task_slices(view, places.size(), read_slice);
-        else outcome = read_slice(0, places.size(), view);
+        else outcome = read_slice(0, places.size(), 0, view);
         if (outcome.failed()) return store_status_t::success_k;
         outputs.assigned(places.size());
         outcome = outputs.finish(arguments);
@@ -1924,8 +1936,9 @@ status_t scan_keys(database_state<cpu_class_, isolation_>& state, arguments_type
 
     status_t outcome;
     store_status_t const walked = with_source(state, view, [&]<typename source_type_>(source_type_& source) noexcept {
-        auto scan_slice = [&](std::size_t first_task, std::size_t length, view_t const& slice) noexcept -> status_t {
-            scan_slice_t& sliced = slices[slice.thread_index];
+        auto scan_slice = [&](std::size_t first_task, std::size_t length, std::size_t run,
+                              view_t const& slice) noexcept -> status_t {
+            scan_slice_t& sliced = slices[run];
             sliced = {first_task, length, outputs.slice_in(slice.scratch)};
             status_t slice_outcome;
             store_status_t const runs = for_each_run(
@@ -1954,7 +1967,7 @@ status_t scan_keys(database_state<cpu_class_, isolation_>& state, arguments_type
         // A transaction's reads join its watch set, so only a reader at one stamp splits the batch
         if constexpr (std::is_same_v<source_type_, reader_source<cpu_class_, isolation_>>)
             outcome = for_task_slices(view, scans.size(), scan_slice);
-        else outcome = scan_slice(0, scans.size(), view);
+        else outcome = scan_slice(0, scans.size(), 0, view);
         return store_status_t::success_k;
     });
     if (status_t const status = reported(walked, outcome); status.failed()) return status;
@@ -2013,7 +2026,8 @@ status_t measure_keys(database_state<cpu_class_, isolation_>& state, arguments_t
     store_status_t const walked = with_source(state, view, [&]<typename source_type_>(source_type_& source) noexcept {
         auto const measure_run = [&]<typename entries_type_>(entries_type_& entries, std::size_t first,
                                                              std::size_t end) noexcept -> store_status_t {
-            auto measure_slice = [&](std::size_t first_task, std::size_t length, view_t const&) noexcept -> status_t {
+            auto measure_slice = [&](std::size_t first_task, std::size_t length, std::size_t,
+                                     view_t const&) noexcept -> status_t {
                 auto store = source.view(entries);
                 if (!store) return translate(store.status());
                 std::size_t const end_task = first + first_task + length;
@@ -2030,7 +2044,7 @@ status_t measure_keys(database_state<cpu_class_, isolation_>& state, arguments_t
             };
             if constexpr (std::is_same_v<source_type_, reader_source<cpu_class_, isolation_>>)
                 outcome = for_task_slices(view, end - first, measure_slice);
-            else outcome = measure_slice(0, end - first, view);
+            else outcome = measure_slice(0, end - first, 0, view);
             return store_status_t::success_k;
         };
         return for_each_run(source, measures.collections, measures.size(), outcome,
@@ -2078,15 +2092,18 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_database_de
         });
 }
 
-/** Implements @c ustore_database_clear, persisting a change of the names as a drop of one collection does. */
+/** Implements @c ustore_database_clear, persisting a change of the names as a drop of one
+ *  collection does, and giving back every byte the memory limit counted. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_database_clear_t const& arguments,
                view_t const&) noexcept {
     if (status_t const status = validate_drop_mode(arguments.mode); status.failed()) return status;
-    if (arguments.mode == ustore_drop_pairs_k) return clear_pairs(state);
-    if (arguments.mode == ustore_drop_values_k) return clear_values(state);
-    if (status_t const status = reset_database(state); status.failed()) return status;
-    return persist(state);
+    status_t const cleared = arguments.mode == ustore_drop_pairs_k    ? clear_pairs(state)
+                             : arguments.mode == ustore_drop_values_k ? clear_values(state)
+                                                                      : reset_database(state);
+    if (cleared.failed()) return cleared;
+    atomic_ref_of<cpu_class_, std::size_t> {state.landed_bytes}.store(0, std::memory_order_relaxed);
+    return arguments.mode == ustore_drop_collection_k ? persist(state) : status_t {};
 }
 
 /**
@@ -2096,7 +2113,7 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_database_cl
  *
  *  The merge's tasks touch disjoint stores, so any number of threads may @ref run them at once,
  *  and each vacuums its store as a fresh stamp lists it, skipping one dropped since the open, so a
- *  task run again changes nothing. Each task weighs one, as the versions a vacuum frees carry no
+ *  task run again changes nothing. Each task weighs one, as the versions a vacuum frees hold no
  *  byte count. The open reserves the collections, so neither @ref run, @ref advance nor
  *  @ref finish allocates.
  */
@@ -2250,7 +2267,7 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_snapshot_sa
 #pragma region Collection Calls
 
 /** Implements @c ustore_collection_list as a walk of the collections system collection at the head
- *  or at a snapshot, whose entries carry the modalities and the names. */
+ *  or at a snapshot, whose entries hold the modalities and the names. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_collection_list_t const& arguments,
                view_t const& view) noexcept {
@@ -2286,7 +2303,7 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_collection_
             return stage_collection(source, change, created, arguments.modality, name);
         });
     if (committed == store_status_t::key_already_exists_k)
-        return {status_code_t::already_exists_k, "A collection already carries the name"};
+        return {status_code_t::already_exists_k, "A collection already holds the name"};
     if (st::failed(committed)) return translate(committed);
     *arguments.collection = created;
     if (!name.empty()) return persist(state);
@@ -2712,13 +2729,59 @@ void pin_call(ustore_database_t database, ustore_collection_id_t const*, view_t 
 
 #pragma region Table
 
+/** Whether a call lands keys or values, which the memory limit of its database counts. */
+template <typename arguments_type_>
+concept lands_values_concept =
+    std::is_same_v<arguments_type_, ustore_blobs_write_t> || std::is_same_v<arguments_type_, ustore_docs_write_t> ||
+    std::is_same_v<arguments_type_, ustore_strings_write_t> || std::is_same_v<arguments_type_, ustore_pages_import_t> ||
+    std::is_same_v<arguments_type_, ustore_pages_insert_t> || std::is_same_v<arguments_type_, ustore_pages_splice_t> ||
+    std::is_same_v<arguments_type_, ustore_pages_set_attributes_t> ||
+    std::is_same_v<arguments_type_, ustore_graph_write_edges_t> ||
+    std::is_same_v<arguments_type_, ustore_graph_write_vertices_t>;
+
+/** Bytes the @p count strings of @p strings span. */
+inline std::size_t strings_bytes(strings_arg_t const& strings, std::size_t count) noexcept {
+    std::size_t bytes = 0;
+    if (strings)
+        for (std::size_t index = 0; index != count; ++index) bytes += static_cast<std::size_t>(strings[index].length);
+    return bytes;
+}
+
+/** Counts @p bytes more as landed in @p state, refusing them with @c capacity_exhausted_k, and
+ *  counting nothing, when they would pass its memory limit. */
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+status_t charge_landed(database_state<cpu_class_, isolation_>& state, std::size_t bytes) noexcept {
+    atomic_ref_of<cpu_class_, std::size_t> const landed {state.landed_bytes};
+    std::size_t const before = landed.fetch_add(bytes, std::memory_order_relaxed);
+    if (before + bytes <= state.memory_limit) return {};
+    landed.fetch_sub(bytes, std::memory_order_relaxed);
+    return {status_code_t::capacity_exhausted_k, "The write would pass the database's memory limit"};
+}
+
+/** Gives back @p bytes that @c charge_landed counted for a call that failed. */
+template <cpu_class_t cpu_class_, isolation_t isolation_>
+void refund_landed(database_state<cpu_class_, isolation_>& state, std::size_t bytes) noexcept {
+    atomic_ref_of<cpu_class_, std::size_t> {state.landed_bytes}.fetch_sub(bytes, std::memory_order_relaxed);
+}
+
 /** Serves a call on the database @p arguments address, whose handle the table of @p cpu_class_ at
- *  @p isolation_ stamped, with the ragged inputs the router gathered for it. */
+ *  @p isolation_ stamped, with the ragged inputs the router gathered for it, charging what a write
+ *  lands against the database's memory limit. */
 template <cpu_class_t cpu_class_, isolation_t isolation_, typename arguments_type_, typename... strings_types_>
 status_t serve_database(arguments_type_ const& arguments, strings_types_ const&... strings,
                         view_t const& view) noexcept {
-    return serve(*state_of<database_state<cpu_class_, isolation_>>(database_of(arguments)), arguments, strings...,
-                 view);
+    database_state<cpu_class_, isolation_>& state = *state_of<database_state<cpu_class_, isolation_>>(
+        database_of(arguments));
+    if constexpr (lands_values_concept<arguments_type_>) {
+        std::size_t const keys = std::is_same_v<arguments_type_, ustore_graph_write_edges_t> ? 3 : 1;
+        std::size_t const bytes = keys * arguments.count * sizeof(ustore_key_t) +
+                                  (std::size_t {0} + ... + strings_bytes(strings, arguments.count));
+        if (status_t const charged = charge_landed(state, bytes); charged.failed()) return charged;
+        status_t const served = serve(state, arguments, strings..., view);
+        if (served.failed()) refund_landed(state, bytes);
+        return served;
+    }
+    else return serve(state, arguments, strings..., view);
 }
 
 /** Frees the transaction behind @p handle, releasing the stamp it claimed, and the stores only it still reached. */
@@ -2750,11 +2813,17 @@ void database_free(ustore_database_t database) noexcept {
 }
 
 template <cpu_class_t cpu_class_, isolation_t isolation_>
-status_t ram_variant<cpu_class_, isolation_>::open(ustore_database_t* database, std::string_view directory) noexcept {
+status_t ram_variant<cpu_class_, isolation_>::open(ustore_database_t* database, std::string_view directory,
+                                                   std::size_t memory_limit) noexcept {
     auto [made, status] = make_handle<ustore_database_handle_t, database_state<cpu_class_, isolation_>>(
         ram_variant<cpu_class_, isolation_>::engine_k);
     if (status.failed()) return status;
     if (status_t const opened = open_database(*made.state, directory); opened.failed()) return opened;
+    if (memory_limit) made.state->memory_limit = memory_limit;
+    // The image holds the keys and values loaded, so it stands for what they take
+    made.state->landed_bytes = image_bytes(*made.state);
+    if (made.state->landed_bytes > made.state->memory_limit)
+        return {status_code_t::capacity_exhausted_k, "The image outgrows the memory limit"};
     *database = made.release();
     return {};
 }

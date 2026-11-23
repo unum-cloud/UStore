@@ -70,7 +70,7 @@ struct merge_run {
 };
 
 /** The C names of the merge kernels the bundles export for @p key_slot_type_, none for a key slot
- *  they carry none of, whose merges run on the host. */
+ *  they export none of, whose merges run on the host. */
 template <typename key_slot_type_>
 struct merge_kernel_names {
     static constexpr bool exported_k = false;
@@ -173,7 +173,7 @@ struct strings_merge_run {
 };
 
 /** The key slot a merge of strings judges survival on, whose stored key is a head. */
-using strings_merge_slot_t = key_slot<st::key128_t, value_layout_t::uuid_k, key_tails_t::carried_k>;
+using strings_merge_slot_t = key_slot<st::key128_t, value_layout_t::uuid_k, key_tails_t::present_k>;
 
 /** Where a version lands in a merge of strings, and whether it survives. */
 struct strings_merge_verdict_t {
@@ -370,8 +370,8 @@ __device__ located_key_slot<key_slot_type_> merge_packed(located_key_slot<key_sl
 
 /**
  *  @brief Compacts the flagged records of @p merged into @p survivors in one chained scan, writing
- *      their value offsets into @p prefix, where it is not null, and whether each carries the key
- *      of the survivor before it into @p shares.
+ *      their value offsets into @p prefix, where it is not null, and whether each holds the key of
+ *      the survivor before it into @p shares.
  *
  *  Block @c t of @p tickets packs the @c t th tile of the records: it counts its survivors and
  *  their bytes, takes the totals of the tiles before it from @p chains, the survivors' and the
@@ -780,7 +780,7 @@ st::status_t cuda_compactor_t::compact(compaction_kind_t kind,
                                        device_fold_type_ const& device_fold,
                                        std::type_identity_t<located_value_reader<key_slot_type_>> read_value,
                                        compaction_output<key_slot_type_, allocator_type_>& output) noexcept {
-    // A key slot the bundles carry no kernels for merges on the host.
+    // A key slot the bundles export no kernels for merges on the host.
     if constexpr (merge_kernel_names<key_slot_type_>::exported_k)
         return compact_on_device_(kind, upper, lower, extents, bounds, stamps, fold, device_fold, read_value, output);
     else return st::status_t::invalid_argument_k;

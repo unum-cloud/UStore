@@ -27,6 +27,8 @@
 #endif
 
 #include <array>       // `std::array`
+#include <algorithm>   // `std::make_heap`, `std::pop_heap`, `std::push_heap`
+#include <memory>      // `std::unique_ptr`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
@@ -41,14 +43,15 @@
 #include "ustore/arrow.h"    // `ustore_keys_view_from_arrow`, `ustore_strings_view_to_arrow`
 #include "ustore/docs.h"     // `ustore_docs_write_t`
 #include "ustore/graph.h"    // `ustore_graph_write_edges_t`
-#include "ustore/ranges.hpp" // `u64_tape`
+#include "ustore/ranges.hpp" // `u64_tape`, `tape_string`, `strided`
 #include "ustore/types.hpp"  // `sz`, `st`
 
 #include "ustore/utilities/blocking_files.hpp" // `mapped_file_t`
+#include "ustore/utilities/ram_buffers.hpp"    // `arena_allocate`, `arena_grow`, `arena_rewind`
 
 #include "arrow_ipc.hpp" // `ipc_read_prefix`, `ipc_write_batch`, `ipc_batch_to_arrow`
 #include "dataset.h"     // `ustore_dataset_import_t`, `ustore_dataset_export_t`
-#include "dataset.hpp"   // `format_of`, `failed`, `copy_path`, `task_arena_t`, `staged_output_t`
+#include "dataset.hpp"   // `format_of`, `failed`, `copy_path`, `staged_output_t`
 
 namespace unum::ustore::tools {
 
@@ -65,7 +68,7 @@ constexpr std::string_view collection_key_k = "ustore.collection";
 /** The field metadata key marking the XML values of a pages collection. */
 constexpr std::string_view page_encoding_key_k = "ustore.page_encoding";
 
-/** Pairs of metadata a schema read off an input may carry across its fields and itself. */
+/** Pairs of metadata a schema read off an input may hold across its fields and itself. */
 constexpr std::size_t schema_pairs_max_k = 64;
 
 /** Zeros that the padding after every gathered buffer points into, as long as the
@@ -212,7 +215,7 @@ class input_bytes_t {
     std::span<std::byte const> whole_;
     std::size_t cursor_ = 0;
 
-    /** The descriptor read in order, borrowed from standard input or from @c owned_, or
+    /** The descriptor read in order, viewed from standard input or from @c owned_, or
      *  negative when mapped. */
     int descriptor_ = -1;
 
@@ -487,24 +490,24 @@ void input_release(ArrowArrayStream* stream) noexcept { stream->release = nullpt
 }
 
 /** Finds the collection @p name addresses into @p id, answering its modality, or zero when no
- *  collection carries the name. */
-[[nodiscard]] ustore_modality_t find_named_collection(ustore_database_t database, std::string_view name,
+ *  collection holds the name. */
+[[nodiscard]] ustore_modality_t find_named_collection(ustore_database_t database, ustore_executor_t executor,
+                                                      ustore_arena_t arena, std::string_view name,
                                                       ustore_collection_id_t& id, ustore_outcome_t* outcome) noexcept {
-    task_arena_t const arena {nullptr, outcome};
-    if (failed(outcome)) return ustore_modality_t {};
     std::uint64_t const offsets[2] {0, name.size()};
     ustore_octet_t const* presences = nullptr;
     ustore_collection_id_t const* ids = nullptr;
     ustore_modality_t const* modalities = nullptr;
     ustore_collection_find_t find {};
     find.database = database;
+    find.executor = executor;
     find.outcome = outcome;
     find.count = 1;
     find.names = u64_tape(name.data(), offsets);
     find.presences = &presences;
     find.collections = &ids;
     find.modalities = &modalities;
-    find.arena = arena.get();
+    find.arena = arena;
     ustore_collection_find(&find);
     if (failed(outcome) || !(presences[0] & 1)) return ustore_modality_t {};
     id = ids[0];
@@ -512,7 +515,7 @@ void input_release(ArrowArrayStream* stream) noexcept { stream->release = nullpt
 }
 
 /** Writes an Arrow stream or file to a descriptor as batches are exported, gathering every body
- *  without a copy and never seeking, so standard output carries it too. */
+ *  without a copy and never seeking, so standard output holds it too. */
 class ipc_output_t {
     int descriptor_ = -1;
     ustore_dataset_format_t format_ = ustore_dataset_format_arrow_stream_k;
@@ -616,7 +619,7 @@ class ipc_output_t {
  *  output for @c -. */
 class output_descriptor_t {
 
-    /** The descriptor written, borrowed from standard output or from @c owned_. */
+    /** The descriptor written, viewed from standard output or from @c owned_. */
     int descriptor_ = -1;
 
     /** The file this output created, none for standard output. */
@@ -693,7 +696,7 @@ struct modality_columns_t {
         else if (name == "value") slot = strings ? &columns.keys : &columns.strings;
         if (!slot || *slot != absent_column_k) {
             *outcome = {ustore_status_invalid_argument_k,
-                        "The Arrow input carries a column its modality does not name, or names one twice"};
+                        "The Arrow input holds a column its modality does not name, or names one twice"};
             return false;
         }
         *slot = static_cast<std::size_t>(index);
@@ -765,9 +768,9 @@ constexpr std::size_t import_chunk_rows_k = 65536;
 
 /** Writes rows @b [first,first+count) of @p rows into @p collection through the writes
  *  of @p modality. */
-void write_chunk(ustore_database_t database, ustore_collection_id_t collection, ustore_modality_t modality,
-                 batch_views_t const& rows, std::size_t first, std::size_t count, ustore_durability_t durability,
-                 ustore_outcome_t* outcome) noexcept {
+void write_chunk(ustore_database_t database, ustore_executor_t executor, ustore_collection_id_t collection,
+                 ustore_modality_t modality, batch_views_t const& rows, std::size_t first, std::size_t count,
+                 ustore_durability_t durability, ustore_outcome_t* outcome) noexcept {
     ustore_collections_view_t const collections {&collection, 0};
     auto const slice = [&](ustore_keys_view_t keys) noexcept {
         return ustore_keys_view_t {keys.data ? keys.data + first : nullptr, keys.stride};
@@ -776,6 +779,7 @@ void write_chunk(ustore_database_t database, ustore_collection_id_t collection, 
     switch (modality) {
     case ustore_modality_docs_k: {
         ustore_docs_write_t write {.database = database,
+                                   .executor = executor,
                                    .outcome = outcome,
                                    .count = count,
                                    .collections = collections,
@@ -788,6 +792,7 @@ void write_chunk(ustore_database_t database, ustore_collection_id_t collection, 
     }
     case ustore_modality_pages_k: {
         ustore_pages_import_t import {.database = database,
+                                      .executor = executor,
                                       .outcome = outcome,
                                       .count = count,
                                       .collections = collections,
@@ -799,6 +804,7 @@ void write_chunk(ustore_database_t database, ustore_collection_id_t collection, 
     }
     case ustore_modality_strings_k: {
         ustore_strings_write_t write {.database = database,
+                                      .executor = executor,
                                       .outcome = outcome,
                                       .count = count,
                                       .collections = collections,
@@ -809,6 +815,7 @@ void write_chunk(ustore_database_t database, ustore_collection_id_t collection, 
     }
     case ustore_modality_graph_k: {
         ustore_graph_write_edges_t write {.database = database,
+                                          .executor = executor,
                                           .outcome = outcome,
                                           .count = count,
                                           .collections = collections,
@@ -820,6 +827,7 @@ void write_chunk(ustore_database_t database, ustore_collection_id_t collection, 
     }
     default: {
         ustore_blobs_write_t write {.database = database,
+                                    .executor = executor,
                                     .outcome = outcome,
                                     .count = count,
                                     .collections = collections,
@@ -833,13 +841,14 @@ void write_chunk(ustore_database_t database, ustore_collection_id_t collection, 
 
 /** Writes every row of @p rows in chunks, halving one the head refused for its size, each buffered
  *  but the last, which pays @p durability. */
-void write_rows(ustore_database_t database, ustore_collection_id_t collection, ustore_modality_t modality,
-                batch_views_t const& rows, ustore_durability_t durability, ustore_outcome_t* outcome) noexcept {
+void write_rows(ustore_database_t database, ustore_executor_t executor, ustore_collection_id_t collection,
+                ustore_modality_t modality, batch_views_t const& rows, ustore_durability_t durability,
+                ustore_outcome_t* outcome) noexcept {
     std::size_t chunk = import_chunk_rows_k;
     for (std::size_t first = 0; first != rows.count;) {
         std::size_t const count = fu::min_of<std::size_t>(chunk, rows.count - first);
         bool const last = first + count == rows.count;
-        write_chunk(database, collection, modality, rows, first, count,
+        write_chunk(database, executor, collection, modality, rows, first, count,
                     last ? durability : ustore_durability_buffered_k, outcome);
         if (outcome->status == ustore_status_capacity_exhausted_k && count > 1) {
             *outcome = {};
@@ -851,10 +860,14 @@ void write_rows(ustore_database_t database, ustore_collection_id_t collection, u
     }
 }
 
-/** Appends @p rows to @p ingest. */
-void append_rows(ustore_ingest_t ingest, batch_views_t const& rows, ustore_outcome_t* outcome) noexcept {
+/** Appends @p rows to @p ingest on @p executor, final on return or once submitted, as @p completion
+ *  says. */
+void append_rows(ustore_ingest_t ingest, ustore_executor_t executor, ustore_completion_t completion,
+                 batch_views_t const& rows, ustore_outcome_t* outcome) noexcept {
     ustore_ingest_append_t append {.ingest = ingest,
+                                   .executor = executor,
                                    .outcome = outcome,
+                                   .completion = completion,
                                    .count = rows.count,
                                    .keys = rows.keys,
                                    .values = rows.strings,
@@ -865,20 +878,20 @@ void append_rows(ustore_ingest_t ingest, batch_views_t const& rows, ustore_outco
 }
 
 /** The modality of @p collection as @p view lists it, or zero with a failure in @p outcome. */
-[[nodiscard]] ustore_modality_t listed_modality(ustore_database_t database, ustore_snapshot_t snapshot,
+[[nodiscard]] ustore_modality_t listed_modality(ustore_database_t database, ustore_executor_t executor,
+                                                ustore_arena_t arena, ustore_snapshot_t snapshot,
                                                 ustore_collection_id_t collection, ustore_outcome_t* outcome) noexcept {
-    task_arena_t const arena {nullptr, outcome};
-    if (failed(outcome)) return ustore_modality_t {};
     ustore_collection_id_t const* collections = nullptr;
     ustore_modality_t const* modalities = nullptr;
     ustore_size_t written = 0;
     ustore_collection_list_t list {.database = database,
+                                   .executor = executor,
                                    .outcome = outcome,
                                    .snapshot = snapshot,
                                    .collections = &collections,
                                    .modalities = &modalities,
                                    .written = &written,
-                                   .arena = arena.get()};
+                                   .arena = arena};
     ustore_collection_list(&list);
     for (ustore_size_t index = 0; !failed(outcome) && index != written; ++index)
         if (collections[index] == collection) return modalities[index];
@@ -963,19 +976,60 @@ void free_cursor(ustore_graph_vertices_cursor_t cursor) noexcept { ustore_graph_
 /** The walk an export takes over a collection of one modality, one batch at a time. */
 class export_walk_t {
     ustore_database_t database_ = nullptr;
+    ustore_executor_t executor_ = nullptr;
     ustore_view_t view_ = nullptr;
     ustore_collection_id_t collection_ {};
     export_cursor_t cursor_;
 
-    /** Where a graph's vertices land before their edges are read into the batch's arena. */
-    task_arena_t vertices_arena_;
+    /** The vertices of a graph's batch, kept while their edges are read into their own arena. */
+    st::vector<ustore_key_t> vertices_;
+
+    /** The batches of the last pull of documents not exported yet, in the arena that pull
+     *  filled. */
+    std::span<ustore_docs_batch_view_t const> pending_documents_;
 
     template <typename cursor_type_, typename init_type_>
     void open_(void (*init_)(init_type_*), ustore_outcome_t* outcome) noexcept {
         init_type_ init {};
-        init.cursor = &cursor_.template emplace<cursor_type_>(), init.database = database_, init.outcome = outcome;
+        init.cursor = &cursor_.template emplace<cursor_type_>(), init.database = database_, init.executor = executor_;
+        init.outcome = outcome;
         init.view = view_, init.collection = collection_;
+        // Documents export whole, as the one JSON column of the empty field
+        static constexpr std::uint32_t whole_document_offsets_k[2] = {0, 0};
+        static constexpr ustore_docs_field_type_t whole_document_type_k = ustore_docs_field_type_json_k;
+        if constexpr (std::is_same_v<init_type_, ustore_docs_cursor_init_t>) {
+            init.fields_count = 1;
+            init.fields.layout = ustore_strings_u32_tape_k;
+            init.fields.data.u32_tape.data = reinterpret_cast<ustore_byte_t const*>("");
+            init.fields.data.u32_tape.offsets = whole_document_offsets_k;
+            init.columns_types = &whole_document_type_k;
+        }
         init_(&init);
+    }
+
+    /** Hands out the next batch of the last pull of documents, pulling again once none is left. */
+    [[nodiscard]] std::size_t pull_documents_(ustore_docs_cursor_t cursor, ustore_size_t wanted, ustore_arena_t arena,
+                                              export_batch_t& batch, ustore_outcome_t* outcome) noexcept {
+        if (pending_documents_.empty()) {
+            ustore_docs_batch_view_t const* batches = nullptr;
+            ustore_size_t count = 0;
+            ustore_docs_cursor_next_t next {.database = database_,
+                                            .executor = executor_,
+                                            .outcome = outcome,
+                                            .cursor = cursor,
+                                            .batches = &batches,
+                                            .batches_count = &count,
+                                            .arena = arena,
+                                            .wanted = wanted};
+            ustore_docs_cursor_next(&next);
+            if (failed(outcome) || !count) return 0;
+            pending_documents_ = {batches, static_cast<std::size_t>(count)};
+        }
+        ustore_docs_batch_view_t const& documents = pending_documents_.front();
+        pending_documents_ = pending_documents_.subspan(1);
+        batch.add(ustore_keys_view_t {documents.keys, sizeof(ustore_key_t)}, documents.count, arena, outcome);
+        batch.add(documents.columns[0].strings, documents.count, arena, outcome);
+        return documents.count;
     }
 
     template <typename next_type_, typename cursor_type_>
@@ -986,7 +1040,8 @@ class export_walk_t {
         ustore_strings_view_t values {};
         ustore_size_t rows = 0;
         next_type_ next {};
-        next.database = database_, next.outcome = outcome, next.cursor = cursor, next.keys = &keys;
+        next.database = database_, next.executor = executor_, next.outcome = outcome, next.cursor = cursor;
+        next.keys = &keys;
         next.values = &values, next.written = &rows, next.arena = arena, next.wanted = wanted;
         if constexpr (requires { next.outputs_encoding; }) next.outputs_encoding = ustore_page_encoding_xml_k;
         next_(&next);
@@ -1002,6 +1057,7 @@ class export_walk_t {
         ustore_key_t const* values = nullptr;
         ustore_size_t rows = 0;
         ustore_strings_cursor_next_t next {.database = database_,
+                                           .executor = executor_,
                                            .outcome = outcome,
                                            .cursor = cursor,
                                            .strings = &strings,
@@ -1017,9 +1073,9 @@ class export_walk_t {
     }
 
   public:
-    export_walk_t(ustore_database_t database, ustore_view_t view, ustore_collection_id_t collection,
-                  ustore_modality_t modality, ustore_outcome_t* outcome) noexcept
-        : database_(database), view_(view), collection_(collection), vertices_arena_(nullptr, outcome) {
+    export_walk_t(ustore_database_t database, ustore_executor_t executor, ustore_view_t view,
+                  ustore_collection_id_t collection, ustore_modality_t modality, ustore_outcome_t* outcome) noexcept
+        : database_(database), executor_(executor), view_(view), collection_(collection) {
         if (failed(outcome)) return;
         switch (modality) {
         case ustore_modality_docs_k: open_<ustore_docs_cursor_t>(&ustore_docs_cursor_init, outcome); break;
@@ -1044,7 +1100,7 @@ class export_walk_t {
         return std::visit(
             [&]<typename cursor_type_>(cursor_type_ cursor) noexcept -> std::size_t {
                 if constexpr (std::is_same_v<cursor_type_, ustore_docs_cursor_t>)
-                    return pull_keyed_(&ustore_docs_cursor_next, cursor, wanted, arena, batch, outcome);
+                    return pull_documents_(cursor, wanted, arena, batch, outcome);
                 else if constexpr (std::is_same_v<cursor_type_, ustore_pages_cursor_t>)
                     return pull_keyed_(&ustore_pages_cursor_next, cursor, wanted, arena, batch, outcome);
                 else if constexpr (std::is_same_v<cursor_type_, ustore_strings_cursor_t>)
@@ -1068,24 +1124,32 @@ class export_walk_t {
             ustore_key_t const* vertices = nullptr;
             ustore_size_t written = 0;
             ustore_graph_vertices_cursor_next_t next {.database = database_,
+                                                      .executor = executor_,
                                                       .outcome = outcome,
                                                       .cursor = cursor,
                                                       .keys = &vertices,
                                                       .written = &written,
-                                                      .arena = vertices_arena_.get(),
+                                                      .arena = arena,
                                                       .wanted = wanted};
             ustore_graph_vertices_cursor_next(&next);
             if (failed(outcome) || !written) return 0;
+            // The read of their edges rewinds the arena the vertices came in
+            if (st::failed(vertices_.resize(written))) {
+                *outcome = {ustore_status_out_of_memory_k, "Failed to keep the vertices of a batch"};
+                return 0;
+            }
+            std::memcpy(vertices_.data(), vertices, written * sizeof(ustore_key_t));
             ustore_vertex_role_t const role = ustore_vertex_role_source_k;
             ustore_vertex_degree_t const* degrees = nullptr;
             ustore_length_t const* offsets = nullptr;
             ustore_key_t const* triples = nullptr;
             ustore_graph_read_edges_t read {.database = database_,
+                                            .executor = executor_,
                                             .outcome = outcome,
                                             .view = view_,
                                             .count = written,
                                             .collections = {&collection_, 0},
-                                            .vertices = {vertices, sizeof(ustore_key_t)},
+                                            .vertices = {vertices_.data(), sizeof(ustore_key_t)},
                                             .roles = {&role, 0},
                                             .degrees_per_vertex = &degrees,
                                             .edges_offsets = &offsets,
@@ -1103,6 +1167,259 @@ class export_walk_t {
     }
 };
 
+#pragma region Imports
+
+/** One Arrow input of an import: its bytes, the stream its batches come through, its schema and
+ *  where its columns sit. It neither moves nor copies, as the stream points at its state and the
+ *  state at its bytes. */
+struct import_input_t {
+    input_bytes_t input;
+    ipc_input_stream_t state;
+    ArrowArrayStream stream {};
+    ArrowSchema schema {};
+    modality_columns_t columns;
+
+    import_input_t() noexcept = default;
+    import_input_t(import_input_t const&) = delete;
+    import_input_t& operator=(import_input_t const&) = delete;
+    ~import_input_t() noexcept {
+        if (schema.release) schema.release(&schema);
+    }
+
+    /** Opens @p path, spelled as @p asked names or as its extension does, and reads its schema,
+     *  sniffing whether standard input holds a file or a stream. */
+    void open(char const* path, ustore_dataset_format_t asked, ustore_outcome_t* outcome) noexcept {
+        std::string_view const spelled {path};
+        ustore_dataset_format_t format = format_of(spelled, asked);
+        if (format == ustore_dataset_format_ndjson_k || format == ustore_dataset_format_csv_k) {
+            *outcome = {ustore_status_invalid_argument_k, "NDJSON and CSV import through ustore_docs_import"};
+            return;
+        }
+        // Standard input names no format, so it is sniffed: a file when it starts with the magic
+        bool const sniffed = format == ustore_dataset_format_automatic_k && spelled == "-";
+        if (format != ustore_dataset_format_arrow_stream_k && format != ustore_dataset_format_arrow_file_k &&
+            !sniffed) {
+            *outcome = {ustore_status_unsupported_k, "Unsupported file format, expected .arrows, .arrow or .feather"};
+            return;
+        }
+        input.open(path, outcome);
+        if (failed(outcome)) return;
+        std::string_view const magic = ipc_file_magic_k.substr(0, 6);
+        if (sniffed) {
+            std::span<std::byte const> const head = input.peek(magic.size(), outcome);
+            if (failed(outcome)) return;
+            bool const is_file = head.size() == magic.size() &&
+                                 std::memcmp(head.data(), magic.data(), magic.size()) == 0;
+            format = is_file ? ustore_dataset_format_arrow_file_k : ustore_dataset_format_arrow_stream_k;
+        }
+        state.input = &input;
+        if (format == ustore_dataset_format_arrow_file_k) {
+            std::span<std::byte const> const head = input.take(ipc_file_magic_k.size(), state.metadata, outcome);
+            if (failed(outcome)) return;
+            if (head.size() != ipc_file_magic_k.size() || std::memcmp(head.data(), magic.data(), magic.size()) != 0) {
+                *outcome = {ustore_status_malformed_k, "The Arrow file does not start with its magic"};
+                return;
+            }
+        }
+        ipc_message_t message;
+        if (!next_message(input, state.schema_metadata, message, outcome)) {
+            if (!failed(outcome)) *outcome = {ustore_status_malformed_k, "The Arrow input holds no schema"};
+            return;
+        }
+        if (message.kind != ipc_message_kind_t::schema_k) {
+            *outcome = {ustore_status_malformed_k, "The Arrow input starts with a batch, not a schema"};
+            return;
+        }
+        if (ipc_status_t const status = ipc_read_schema(message, state.fields, state.pairs, state.schema);
+            status != ipc_status_t::success_k) {
+            *outcome = outcome_of(status);
+            return;
+        }
+        stream = {&input_get_schema, &input_get_next, &input_get_last_error, &input_release, &state};
+        if (stream.get_schema(&stream, &schema) != 0) *outcome = state.failure;
+    }
+
+    /** Pulls the next batch of the input into @p batch, released by its caller, and its columns
+     *  into @p rows, answering false at the end of the input or on a failure in @p outcome. */
+    [[nodiscard]] bool next(ArrowArray& batch, batch_views_t& rows, ustore_outcome_t* outcome) noexcept {
+        batch = {};
+        if (stream.get_next(&stream, &batch) != 0) {
+            *outcome = state.failure;
+            return false;
+        }
+        return batch.release && rows_of(schema, batch, columns, rows, outcome);
+    }
+};
+
+/** Hands @p consume the rows of every input of @p inputs in their order, one batch at a time. */
+template <typename consumer_type_>
+void read_inputs_in_turn(std::span<import_input_t> inputs, consumer_type_&& consume,
+                         ustore_outcome_t* outcome) noexcept {
+    for (import_input_t& input : inputs)
+        for (;;) {
+            ArrowArray batch {};
+            batch_views_t rows;
+            bool const pulled = input.next(batch, rows, outcome);
+            if (pulled) consume(rows);
+            if (batch.release) batch.release(&batch);
+            if (!pulled || failed(outcome)) break;
+        }
+}
+
+/** Rows and bytes one merged batch of a sorted import holds at most before it lands. */
+constexpr std::size_t merged_batch_rows_k = 65536;
+constexpr std::size_t merged_batch_bytes_k = std::size_t {64} << 20;
+
+/** The rows a merge of sorted inputs lays out in an arena: keys, and values on a tape. */
+struct merged_batch_t {
+    std::span<ustore_key_t> keys;
+    std::span<std::uint64_t> offsets;
+    std::span<ustore_byte_t> bytes;
+    std::size_t count = 0;
+
+    /** Rewinds @p arena and carves room for a full batch's keys and offsets in it. */
+    void start(ustore_arena_t arena, ustore_outcome_t* outcome) noexcept {
+        arena_rewind(arena);
+        auto [carved_keys, keys_status] = arena_allocate<ustore_key_t>(arena, merged_batch_rows_k);
+        auto [carved_offsets, offsets_status] = arena_allocate<std::uint64_t>(arena, merged_batch_rows_k + 1);
+        if (keys_status.failed() || offsets_status.failed()) {
+            *outcome = {ustore_status_out_of_memory_k, "Failed to lay out a merged batch"};
+            return;
+        }
+        keys = carved_keys, offsets = carved_offsets, bytes = {}, count = 0;
+        offsets[0] = 0;
+    }
+
+    /** Appends a row of @p key and @p value, growing the tape in @p arena. */
+    void append(ustore_key_t const& key, ustore_bytes_view_t value, ustore_arena_t arena,
+                ustore_outcome_t* outcome) noexcept {
+        std::size_t const used = static_cast<std::size_t>(offsets[count]);
+        if (used + value.length > bytes.size()) {
+            std::size_t const grown = fu::max_of<std::size_t>(bytes.size(), used + value.length);
+            auto [larger, larger_status] = arena_grow<ustore_byte_t>(arena, bytes, grown);
+            if (larger_status.failed()) {
+                *outcome = {ustore_status_out_of_memory_k, "Failed to grow a merged batch"};
+                return;
+            }
+            bytes = larger;
+        }
+        if (value.length) std::memcpy(bytes.data() + used, value.data, value.length);
+        keys[count] = key;
+        offsets[count + 1] = used + value.length;
+        ++count;
+    }
+
+    [[nodiscard]] bool full() const noexcept {
+        return count == merged_batch_rows_k || offsets[count] >= merged_batch_bytes_k;
+    }
+
+    /** The batch as the views the writes and the ingest take. */
+    [[nodiscard]] batch_views_t rows() const noexcept {
+        batch_views_t rows;
+        rows.count = count;
+        rows.keys = {keys.data(), sizeof(ustore_key_t)};
+        rows.strings.layout = ustore_strings_u64_tape_k;
+        rows.strings.data.u64_tape.data = bytes.data();
+        rows.strings.data.u64_tape.offsets = offsets.data();
+        return rows;
+    }
+};
+
+/**
+ *  @brief Hands @p consume the rows of every sorted input of @p inputs merged into one key order,
+ *      in batches laid out in @p arena, a key several inputs hold landing once, from the last.
+ *
+ *  Keys order as their 16 bytes do, and the strings of a strings collection as their bytes do, the
+ *  order a sorted ingest checks. Every input holds one batch at a time, so memory holds a batch per
+ *  input and one merged batch.
+ */
+template <typename consumer_type_>
+void merge_sorted_inputs(std::span<import_input_t> inputs, ustore_modality_t modality,
+                         std::span<ustore_arena_t const, 2> arenas, consumer_type_&& consume,
+                         ustore_outcome_t* outcome) noexcept {
+    std::size_t const count = inputs.size();
+    st::vector<ArrowArray> batches;
+    st::vector<batch_views_t> rows;
+    st::vector<std::size_t> positions;
+    st::vector<std::size_t> repeating;
+    if (st::failed(batches.resize(count)) || st::failed(rows.resize(count)) || st::failed(positions.resize(count)) ||
+        st::failed(repeating.reserve(count))) {
+        *outcome = {ustore_status_out_of_memory_k, "Failed to allocate the merge"};
+        return;
+    }
+    // Moves input @p index past its exhausted batches, answering whether it holds a row
+    auto const refill = [&](std::size_t index) noexcept {
+        while (batches[index].release && positions[index] == rows[index].count) {
+            batches[index].release(&batches[index]);
+            positions[index] = 0;
+            if (!inputs[index].next(batches[index], rows[index], outcome)) {
+                if (batches[index].release) batches[index].release(&batches[index]);
+                batches[index] = {};
+            }
+        }
+        return batches[index].release != nullptr;
+    };
+    auto const order_of = [&](std::size_t index) noexcept -> std::string_view {
+        std::size_t const row = positions[index];
+        if (modality == ustore_modality_strings_k) return string_of(tape_string(rows[index].strings, row));
+        strided_iterator<ustore_key_t const> const keys = strided(rows[index].keys);
+        ustore_key_t const& key = keys[row];
+        return {reinterpret_cast<char const*>(key.uuid.bytes), sizeof(ustore_key_t)};
+    };
+    for (std::size_t index = 0; index != count && !failed(outcome); ++index)
+        if (inputs[index].next(batches[index], rows[index], outcome)) [[maybe_unused]]
+            bool const held = refill(index);
+
+    // A min-heap of the inputs holding rows, by next key and then by position, so equal keys pop in
+    // input order and the last one popped is the one that lands
+    auto const after = [&](std::size_t left, std::size_t right) noexcept {
+        std::string_view const left_key = order_of(left), right_key = order_of(right);
+        return left_key == right_key ? left > right : left_key > right_key;
+    };
+    st::vector<std::size_t> heap;
+    if (st::failed(heap.reserve(count))) {
+        *outcome = {ustore_status_out_of_memory_k, "Failed to allocate the merge"};
+        return;
+    }
+    for (std::size_t index = 0; index != count; ++index)
+        if (batches[index].release) [[maybe_unused]]
+            st::status_t const pushed = heap.push_back(st::assume_reserved, std::size_t {index});
+    std::make_heap(heap.begin(), heap.end(), after);
+
+    // Batches fill the two arenas in turn, so one lands while the next one merges
+    std::size_t filling = 0;
+    merged_batch_t merged;
+    merged.start(arenas[filling], outcome);
+    while (!failed(outcome) && heap.size() != 0) {
+        repeating.clear();
+        do {
+            std::pop_heap(heap.begin(), heap.end(), after);
+            [[maybe_unused]] st::status_t const kept = repeating.push_back(st::assume_reserved,
+                                                                           std::size_t {heap.back()});
+            heap.pop_back();
+        } while (heap.size() != 0 && order_of(heap.front()) == order_of(repeating[0]));
+        std::size_t const winner = repeating.back();
+        std::size_t const row = positions[winner];
+        strided_iterator<ustore_key_t const> const keys = strided(rows[winner].keys);
+        merged.append(keys[row], tape_string(rows[winner].strings, row), arenas[filling], outcome);
+        for (std::size_t const index : repeating) {
+            ++positions[index];
+            if (!refill(index)) continue;
+            [[maybe_unused]] st::status_t const pushed = heap.push_back(st::assume_reserved, std::size_t {index});
+            std::push_heap(heap.begin(), heap.end(), after);
+        }
+        if (failed(outcome) || !merged.full()) continue;
+        consume(merged.rows());
+        filling = 1 - filling;
+        if (!failed(outcome)) merged.start(arenas[filling], outcome);
+    }
+    if (!failed(outcome) && merged.count) consume(merged.rows());
+    for (ArrowArray& batch : batches)
+        if (batch.release) batch.release(&batch);
+}
+
+#pragma endregion Imports
+
 #pragma endregion Arrow
 
 } // namespace unum::ustore::tools
@@ -1119,74 +1436,52 @@ void ustore_dataset_import(ustore_dataset_import_t* task_pointer) {
         *task.outcome = {ustore_status_uninitialized_k, "Database is uninitialized"};
         return;
     }
+    if (!task.arena) {
+        *task.outcome = {ustore_status_invalid_argument_k, "The task needs an arena"};
+        return;
+    }
     if (task.ingestion != ustore_dataset_ingestion_batched_k && task.ingestion != ustore_dataset_ingestion_sorted_k &&
         task.ingestion != ustore_dataset_ingestion_unsorted_k) {
         *task.outcome = {ustore_status_invalid_argument_k, "Unknown ingestion"};
         return;
     }
-    sz::string_t path;
-    copy_path(task.path, path, task.outcome);
+    if (!task.paths_count) {
+        *task.outcome = {ustore_status_invalid_argument_k, "The import needs an input"};
+        return;
+    }
+    std::size_t const count = static_cast<std::size_t>(task.paths_count);
+    std::unique_ptr<import_input_t[]> owned {new (std::nothrow) import_input_t[count]};
+    if (!owned) {
+        *task.outcome = {ustore_status_out_of_memory_k, "Failed to allocate the inputs"};
+        return;
+    }
+    std::span<import_input_t> const inputs {owned.get(), count};
+    for (std::size_t index = 0; index != count && !failed(task.outcome); ++index) {
+        ustore_bytes_view_t path {};
+        if (task.paths.layout == ustore_strings_accessor_k)
+            task.paths.data.accessor.get(task.paths.data.accessor.handle, &index, 1, &path);
+        else path = tape_string(task.paths, index);
+        sz::string_t copied;
+        copy_path(path, copied, task.outcome);
+        if (!failed(task.outcome) && count > 1 && copied.view() == "-")
+            *task.outcome = {ustore_status_invalid_argument_k, "Standard input is the only input of its import"};
+        if (!failed(task.outcome)) inputs[index].open(copied.c_str(), task.format, task.outcome);
+    }
     if (failed(task.outcome)) return;
-    ustore_dataset_format_t format = format_of(path.view(), task.format);
-    if (format == ustore_dataset_format_ndjson_k || format == ustore_dataset_format_csv_k) {
-        *task.outcome = {ustore_status_invalid_argument_k, "NDJSON and CSV import through ustore_docs_import"};
-        return;
-    }
-    // Standard input names no format, so it is sniffed: an Arrow file when it starts with
-    // the file's magic
-    bool const sniffed = format == ustore_dataset_format_automatic_k && path.view() == "-";
-    if (format != ustore_dataset_format_arrow_stream_k && format != ustore_dataset_format_arrow_file_k && !sniffed) {
-        *task.outcome = {ustore_status_unsupported_k, "Unsupported file format, expected .arrows, .arrow or .feather"};
-        return;
-    }
 
-    input_bytes_t input;
-    input.open(path.c_str(), task.outcome);
-    if (failed(task.outcome)) return;
-    std::string_view const magic = ipc_file_magic_k.substr(0, 6);
-    if (sniffed) {
-        std::span<std::byte const> const head = input.peek(magic.size(), task.outcome);
-        if (failed(task.outcome)) return;
-        bool const is_file = head.size() == magic.size() && std::memcmp(head.data(), magic.data(), magic.size()) == 0;
-        format = is_file ? ustore_dataset_format_arrow_file_k : ustore_dataset_format_arrow_stream_k;
-    }
-    ipc_input_stream_t state;
-    state.input = &input;
-    if (format == ustore_dataset_format_arrow_file_k) {
-        std::span<std::byte const> const head = input.take(ipc_file_magic_k.size(), state.metadata, task.outcome);
-        if (failed(task.outcome)) return;
-        if (head.size() != ipc_file_magic_k.size() || std::memcmp(head.data(), magic.data(), magic.size()) != 0) {
-            *task.outcome = {ustore_status_malformed_k, "The Arrow file does not start with its magic"};
-            return;
-        }
-    }
-
-    ipc_message_t message;
-    if (!next_message(input, state.schema_metadata, message, task.outcome)) {
-        if (!failed(task.outcome)) *task.outcome = {ustore_status_malformed_k, "The Arrow input holds no schema"};
-        return;
-    }
-    if (message.kind != ipc_message_kind_t::schema_k) {
-        *task.outcome = {ustore_status_malformed_k, "The Arrow input starts with a batch, not a schema"};
-        return;
-    }
-    if (ipc_status_t const status = ipc_read_schema(message, state.fields, state.pairs, state.schema);
-        status != ipc_status_t::success_k) {
-        *task.outcome = outcome_of(status);
-        return;
-    }
-
+    ipc_schema_t const& first = inputs[0].state.schema;
     std::string_view const name = task.collection_name.length ? string_of(task.collection_name)
-                                                              : metadata_value(state.schema.metadata, collection_key_k);
+                                                              : metadata_value(first.metadata, collection_key_k);
     if (name.empty()) {
         *task.outcome = {ustore_status_invalid_argument_k,
                          "Neither the call nor the schema's ustore.collection names it"};
         return;
     }
     ustore_collection_id_t collection {};
-    ustore_modality_t const existing = find_named_collection(task.database, name, collection, task.outcome);
+    ustore_modality_t const existing = find_named_collection(task.database, task.executor, task.arena, name, collection,
+                                                             task.outcome);
     if (failed(task.outcome)) return;
-    ustore_modality_t const wanted = task.modality ? task.modality : existing ? existing : modality_of(state.schema);
+    ustore_modality_t const wanted = task.modality ? task.modality : existing ? existing : modality_of(first);
     if (!wanted) {
         *task.outcome = {ustore_status_invalid_argument_k,
                          "Neither the schema's ustore.modality nor its columns name a modality, so name one"};
@@ -1196,9 +1491,19 @@ void ustore_dataset_import(ustore_dataset_import_t* task_pointer) {
         *task.outcome = {ustore_status_invalid_argument_k, "The collection holds another modality"};
         return;
     }
+    bool const merges = task.ingestion == ustore_dataset_ingestion_sorted_k && count > 1;
+    if (merges && wanted == ustore_modality_graph_k) {
+        *task.outcome = {ustore_status_unsupported_k, "Several graph inputs merge into no key order"};
+        return;
+    }
+    for (import_input_t& input : inputs)
+        if (!failed(task.outcome)) [[maybe_unused]]
+            bool const resolved = resolve_columns(input.schema, wanted, input.columns, task.outcome);
+    if (failed(task.outcome)) return;
     if (!existing) {
         ustore_collection_create_t create {};
         create.database = task.database;
+        create.executor = task.executor;
         create.outcome = task.outcome;
         create.name = bytes_of(name);
         create.modality = wanted;
@@ -1207,55 +1512,82 @@ void ustore_dataset_import(ustore_dataset_import_t* task_pointer) {
         if (failed(task.outcome)) return;
     }
 
-    ArrowArrayStream stream {&input_get_schema, &input_get_next, &input_get_last_error, &input_release, &state};
-    ArrowSchema schema {};
-    if (stream.get_schema(&stream, &schema) != 0) *task.outcome = state.failure;
-    modality_columns_t columns;
-    if (!failed(task.outcome)) [[maybe_unused]]
-        bool const resolved = resolve_columns(schema, wanted, columns, task.outcome);
-    ustore_size_t written = 0;
-    if (!failed(task.outcome) && task.ingestion == ustore_dataset_ingestion_batched_k) {
-        // One batch is pulled ahead, so the last write knows it is the one paying
-        // for the durability
-        ArrowArray current {}, upcoming {};
-        if (stream.get_next(&stream, &current) != 0) *task.outcome = state.failure;
-        while (!failed(task.outcome) && current.release) {
-            if (stream.get_next(&stream, &upcoming) != 0) *task.outcome = state.failure;
-            batch_views_t rows;
-            if (!failed(task.outcome) && rows_of(schema, current, columns, rows, task.outcome))
-                write_rows(task.database, collection, wanted, rows,
-                           upcoming.release ? ustore_durability_buffered_k : task.durability, task.outcome);
-            if (!failed(task.outcome)) written += rows.count;
-            current.release(&current);
-            current = upcoming, upcoming = {};
-            if (!failed(task.outcome) && current.release) [[maybe_unused]]
-                bool const goes_on = advance(task, input.taken(), input.size());
-        }
-        if (current.release) current.release(&current);
+    // A merge lays its batches out in the task's arena and a spare one by turns
+    ustore_arena_t spare = nullptr;
+    if (merges) {
+        ustore_arena_init_t made {.arena = &spare, .executor = task.executor, .outcome = task.outcome};
+        ustore_arena_init(&made);
+        if (failed(task.outcome)) return;
     }
-    else if (!failed(task.outcome)) {
+    ustore_arena_t const arenas[2] {task.arena, spare};
+    std::size_t total = 0;
+    for (import_input_t const& input : inputs) total += input.input.size();
+    ustore_size_t written = 0;
+    auto const report = [&]() noexcept {
+        std::size_t taken = 0;
+        for (import_input_t const& input : inputs) taken += input.input.taken();
+        [[maybe_unused]] bool const goes_on = advance(task, taken, total);
+    };
+    auto const land = [&](auto&& consume) noexcept {
+        auto const counted = [&](batch_views_t const& rows) noexcept {
+            consume(rows);
+            if (failed(task.outcome)) return;
+            written += rows.count;
+            report();
+        };
+        if (merges) merge_sorted_inputs(inputs, wanted, arenas, counted, task.outcome);
+        else read_inputs_in_turn(inputs, counted, task.outcome);
+    };
+
+    if (task.ingestion == ustore_dataset_ingestion_batched_k) {
+        // Every batch lands buffered, and one flush makes all of them durable when the task asks
+        land([&](batch_views_t const& rows) noexcept {
+            write_rows(task.database, task.executor, collection, wanted, rows, ustore_durability_buffered_k,
+                       task.outcome);
+        });
+        if (!failed(task.outcome) && task.durability == ustore_durability_flushed_k) {
+            ustore_database_flush_t flush {.database = task.database,
+                                           .executor = task.executor,
+                                           .outcome = task.outcome};
+            ustore_database_flush(&flush);
+        }
+    }
+    else {
         ustore_ingest_t ingest = nullptr;
         ustore_ingest_init_t init {.ingest = &ingest,
                                    .database = task.database,
+                                   .executor = task.executor,
                                    .outcome = task.outcome,
                                    .collection = collection,
                                    .order = task.ingestion == ustore_dataset_ingestion_sorted_k
                                                 ? ustore_ingest_sorted_k
                                                 : ustore_ingest_unsorted_k};
         ustore_ingest_init(&init);
-        while (!failed(task.outcome)) {
-            ArrowArray batch {};
-            if (stream.get_next(&stream, &batch) != 0) *task.outcome = state.failure;
-            if (failed(task.outcome) || !batch.release) break;
-            batch_views_t rows;
-            if (rows_of(schema, batch, columns, rows, task.outcome)) append_rows(ingest, rows, task.outcome);
-            if (!failed(task.outcome)) written += rows.count;
-            batch.release(&batch);
-            if (!failed(task.outcome)) [[maybe_unused]]
-                bool const goes_on = advance(task, input.taken(), input.size());
-        }
+        // A merged batch appends while the next merges into the other arena, so each waits for the
+        // one before it; rows read in place append final, as their batch goes right after
+        ustore_outcome_t appended {};
+        bool appending = false;
+        auto const wait_appended = [&]() noexcept {
+            if (!appending) return;
+            ustore_outcome_wait(&appended);
+            appending = false;
+            if (appended.status != ustore_status_success_k) *task.outcome = appended;
+        };
+        if (!failed(task.outcome))
+            land([&](batch_views_t const& rows) noexcept {
+                wait_appended();
+                if (failed(task.outcome)) return;
+                append_rows(ingest, task.executor, merges ? ustore_completion_deferred_k : ustore_completion_blocking_k,
+                            rows, &appended);
+                appending = true;
+                if (!merges) wait_appended();
+            });
+        wait_appended();
         if (!failed(task.outcome)) {
-            ustore_ingest_finish_t finish {.ingest = ingest, .outcome = task.outcome, .durability = task.durability};
+            ustore_ingest_finish_t finish {.ingest = ingest,
+                                           .executor = task.executor,
+                                           .outcome = task.outcome,
+                                           .durability = task.durability};
             ustore_ingest_finish(&finish);
         }
         ustore_ingest_free(ingest);
@@ -1264,13 +1596,14 @@ void ustore_dataset_import(ustore_dataset_import_t* task_pointer) {
             ustore_outcome_t dropped {};
             ustore_collection_drop_t drop {};
             drop.database = task.database;
+            drop.executor = task.executor;
             drop.outcome = &dropped;
             drop.collection = collection;
             drop.mode = ustore_drop_collection_k;
             ustore_collection_drop(&drop);
         }
     }
-    if (schema.release) schema.release(&schema);
+    ustore_arena_free(spare);
     if (!failed(task.outcome) && task.written) *task.written = written;
 }
 
@@ -1282,6 +1615,10 @@ void ustore_dataset_export(ustore_dataset_export_t* task_pointer) {
 
     if (!task.database) {
         *task.outcome = {ustore_status_uninitialized_k, "Database is uninitialized"};
+        return;
+    }
+    if (!task.arena) {
+        *task.outcome = {ustore_status_invalid_argument_k, "The task needs an arena"};
         return;
     }
     ustore_size_t const alignment = task.alignment ? task.alignment : ipc_alignment_default_k;
@@ -1309,13 +1646,16 @@ void ustore_dataset_export(ustore_dataset_export_t* task_pointer) {
     ustore_snapshot_t snapshot = nullptr;
     ustore_view_t view = task.view;
     if (!view) {
-        ustore_snapshot_init_t init {.snapshot = &snapshot, .database = task.database, .outcome = task.outcome};
+        ustore_snapshot_init_t init {.snapshot = &snapshot,
+                                     .database = task.database,
+                                     .executor = task.executor,
+                                     .outcome = task.outcome};
         ustore_snapshot_init(&init);
         view = ustore_snapshot_view(snapshot);
     }
-    ustore_modality_t const modality = failed(task.outcome)
-                                           ? ustore_modality_t {}
-                                           : listed_modality(task.database, snapshot, task.collection, task.outcome);
+    ustore_modality_t const modality = failed(task.outcome) ? ustore_modality_t {}
+                                                            : listed_modality(task.database, task.executor, task.arena,
+                                                                              snapshot, task.collection, task.outcome);
     std::array<ipc_key_value_t, 2> metadata {
         {{modality_key_k, failed(task.outcome) ? "" : ustore_modality_name(modality)},
          {collection_key_k, string_of(task.collection_name)}}};
@@ -1327,12 +1667,11 @@ void ustore_dataset_export(ustore_dataset_export_t* task_pointer) {
     if (!failed(task.outcome)) writer.begin(schema, task.outcome);
     ustore_size_t rows = 0;
     {
-        export_walk_t walk {task.database, view, task.collection, modality, task.outcome};
-        task_arena_t const arena {nullptr, task.outcome};
+        export_walk_t walk {task.database, task.executor, view, task.collection, modality, task.outcome};
         ustore_size_t const wanted = task.batch_rows ? task.batch_rows : import_chunk_rows_k;
         while (!failed(task.outcome)) {
             export_batch_t batch;
-            std::size_t const count = walk.next(wanted, arena.get(), batch, task.outcome);
+            std::size_t const count = walk.next(wanted, task.arena, batch, task.outcome);
             if (failed(task.outcome) || !count) break;
             std::array<ArrowArray*, 3> children {};
             for (std::size_t index = 0; index != batch.count; ++index) children[index] = &batch.columns[index].array;

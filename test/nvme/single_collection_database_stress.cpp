@@ -42,7 +42,7 @@ using namespace unum::ustore::utilities;
 constexpr std::size_t worker_threads_k = 4;
 
 /** The numbers every case mounts with: three channels for the stack and one for every worker thread. */
-constexpr fixture_config_t stress_config_k {.shared_io_channels = 3 + worker_threads_k + 1};
+constexpr fixture_config_t stress_config_k {.queues_threads = 3 + worker_threads_k + 1};
 
 /** Keys every worker owns, writing and removing them alone. */
 constexpr std::size_t keys_per_worker_k = 256;
@@ -57,26 +57,25 @@ using stored_key_t = std::uint64_t;
 template <typename fixture_type_>
 struct stress_stack {
     using fixture_t = fixture_type_;
-    using guard_t = typename fixture_t::guard_t;
     using volume_t = typename fixture_t::volume_t;
 
     /** The disk, the arena and the channels. */
     std::unique_ptr<fixture_t> fixture;
 
     /** The channel the database writes, flushes and commits on. */
-    guard_t writing;
+    io_channel_t* writing = nullptr;
 
     /** The second channel a compaction writes its new runs on. */
-    guard_t merging;
+    io_channel_t* merging = nullptr;
 
     /** The channel the calling thread reads on. */
-    guard_t reading;
+    io_channel_t* reading = nullptr;
 
     /** The volume every run and blob lands on, pinned so a database may point at it. */
     std::unique_ptr<volume_t> volume;
 
     /** The channel of the calling thread, which every read of this stack takes. */
-    [[nodiscard]] io_channel_t& channel() noexcept { return reading.channel(); }
+    [[nodiscard]] io_channel_t& channel() noexcept { return *reading; }
 };
 
 /**
@@ -115,17 +114,17 @@ expected<std::unique_ptr<stress_stack<typename mount_type_::fixture_t>>> make_st
     if (mount_status.failed()) return mount_status;
     stack->fixture = std::move(fixture);
 
-    auto [writing, acquire_writing_status] = stack->fixture->channels.acquire();
+    auto [writing, acquire_writing_status] = stack->fixture->channel(0);
     if (acquire_writing_status.failed()) return acquire_writing_status;
     stack->writing = std::move(writing);
-    auto [merging, acquire_merging_status] = stack->fixture->channels.acquire();
+    auto [merging, acquire_merging_status] = stack->fixture->channel(1);
     if (acquire_merging_status.failed()) return acquire_merging_status;
     stack->merging = std::move(merging);
-    auto [reading, acquire_reading_status] = stack->fixture->channels.acquire();
+    auto [reading, acquire_reading_status] = stack->fixture->channel(2);
     if (acquire_reading_status.failed()) return acquire_reading_status;
     stack->reading = std::move(reading);
 
-    expected<volume_t> volume = stack->fixture->mount_volume(stack->writing.channel());
+    expected<volume_t> volume = stack->fixture->mount_volume(*stack->writing);
     if (!volume) return volume.status();
     stack->volume = std::unique_ptr<volume_t> {new (std::nothrow) volume_t {std::move(*volume)}};
     if (!stack->volume) return status_t {status_code_t::out_of_memory_k, "The volume did not fit"};
@@ -163,7 +162,8 @@ void check_model(database_type_ const& store, io_channel_t& channel, std::span<e
     expect_equal(mismatches, std::size_t {0});
 
     for (std::size_t index = 0; index != count; ++index) {
-        // A key never written answers missing, and a removed key answers its remove delta; neither carries a value.
+        // A key never written answers missing, and a removed key answers its remove delta; neither
+        // holds a value.
         bool const absent_wanted = wanted[index].state != lookup_result_t::written_k;
         bool const absent_seen = results[index] != lookup_result_t::written_k;
         expect_true(absent_wanted == absent_seen);
@@ -185,7 +185,6 @@ template <typename key_slot_type_, typename mount_type_>
 void concurrent_operations_keep_their_values(mount_type_ const& mount, stored_value_size_t value_size,
                                              stored_value_size_t value_max_size) {
     using stack_t = stress_stack<typename mount_type_::fixture_t>;
-    using guard_t = typename stack_t::guard_t;
     using volume_t = typename stack_t::volume_t;
     using database_t = basic_single_collection_database<
         typename key_slot_type_::stored_key_t, volume_t, atomic_reference, waiter_t,
@@ -196,8 +195,8 @@ void concurrent_operations_keep_their_values(mount_type_ const& mount, stored_va
     if (!stack) return;
 
     expected<typename database_t::database_unique_ptr_t> store = database_t::open(
-        *(*stack)->volume, (*stack)->writing.channel(), (*stack)->merging.channel(),
-        stress_config(value_size, value_max_size), (*stack)->fixture->resources);
+        *(*stack)->volume, *(*stack)->writing, *(*stack)->merging, stress_config(value_size, value_max_size),
+        (*stack)->fixture->resources);
     expect_true(store.has_value());
     if (!store) return;
     stored_value_size_t const widest = (*store)->value_max_size();
@@ -227,7 +226,7 @@ void concurrent_operations_keep_their_values(mount_type_ const& mount, stored_va
     std::array<std::thread, worker_threads_k> workers;
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker)
         workers[worker] = std::thread {[&, worker]() noexcept {
-            expected<guard_t> guard = (*stack)->fixture->channels.acquire();
+            expected<io_channel_t*> guard = (*stack)->fixture->channel(3 + worker);
             expect_true(guard.has_value());
             if (!guard) return;
 
@@ -247,7 +246,7 @@ void concurrent_operations_keep_their_values(mount_type_ const& mount, stored_va
                     bool const owned = anywhere / keys_per_worker_k == worker;
                     stored_key_t const key = owned ? entry.stored_key : anywhere;
                     stored_value_size_t size = 0;
-                    status_t const read = (*store)->select(guard->channel(), key, std::span<byte_t> {value}, size);
+                    status_t const read = (*store)->select(**guard, key, std::span<byte_t> {value}, size);
                     if (read.succeeded()) {
                         if (owned) {
                             expect_true(entry.state == lookup_result_t::written_k);

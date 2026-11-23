@@ -69,7 +69,7 @@ enum class compaction_state_t : std::int32_t {
 
 #pragma region Configurations and Schemas
 
-/** Version every configuration and schema document carries; any other version is rejected. */
+/** Version every configuration and schema document holds; any other version is rejected. */
 inline constexpr char const format_version_k[] = "1.0";
 
 #pragma region Configurations
@@ -128,6 +128,10 @@ struct single_collection_database_config_t {
 /** Configuration of one database: collections sharing transactions. */
 struct database_config_t {
     transaction_config_t default_transaction {100 * 1024 * 1024ull, 100'000};
+
+    /** How the database treats its volume: @c read_only_k adopts the manifest as it lies and
+     *  publishes nothing, neither truncating torn commits at mount nor flushing at unmount. */
+    utilities::medium_access_t access = utilities::medium_access_t::create_read_write_k;
 };
 
 /** Limits of one single-collection database: its collection and its transactions. */
@@ -766,28 +770,12 @@ template <issue_sink_concept sink_type_>
         return report_issue(sink, issue_kind_t::error_k, "A channel needs a request block and a streaming block");
     if (config.channels.request_buffer_bytes == 0 || config.channels.stream_buffer_bytes == 0)
         return report_issue(sink, issue_kind_t::error_k, "I/O blocks leave a channel nothing to transfer through");
-    if (config.shared_io_channels == 0)
-        return report_issue(sink, issue_kind_t::error_k,
-                            "A mount keeps a channel for the threads outside its executor");
 
     for (std::size_t index = 0; index < config.data_directories.size(); ++index)
         for (std::size_t later = index + 1; later < config.data_directories.size(); ++later)
             if (config.data_directories[index].path == config.data_directories[later].path)
                 return report_issue(sink, issue_kind_t::error_k, "Data directory is listed twice: {}",
                                     config.data_directories[index].path.c_str());
-    return true;
-}
-
-/** Checks resources, then an explicit thread count against @c executor_t::logical_cores_count. */
-template <issue_sink_concept sink_type_>
-[[nodiscard]] bool validate(resources_config_t const& config, std::size_t logical_cores_count,
-                            sink_type_&& sink) noexcept {
-    if (!validate(config, sink)) return false;
-    if (config.threads > logical_cores_count)
-        return report_issue(sink, issue_kind_t::error_k, "{} threads exceed the {} logical cores", config.threads,
-                            logical_cores_count);
-    if (config.threads == logical_cores_count)
-        report_issue(sink, issue_kind_t::warning_k, "Threads take every logical core");
     return true;
 }
 

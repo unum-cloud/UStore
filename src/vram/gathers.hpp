@@ -135,7 +135,7 @@ expected<walked_documents_t> walk_documents(engine_t const& engine, ustore_docs_
     rebased.matcher = engine_slot.data();
     if (status_t const status = rebase_on_device(rebased, executor); status.failed()) return status;
     sz_subdocuments_engine_t const* const on_device = std::get_if<sz_subdocuments_engine_t>(&rebased.on_device);
-    // Field paths carry no filters, so every engine they compile rebases
+    // Field paths hold no filters, so every engine they compile rebases
     if (!on_device) return status_t {status_code_t::internal_k, "The field paths compiled into filters"};
 
     // Empty documents leave the short list, so no lane walks them

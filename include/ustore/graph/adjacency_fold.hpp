@@ -338,7 +338,7 @@ inline std::size_t deltas_of_edge(labeled_edge_t const& edge, half_edge_operatio
     return count;
 }
 
-/** Serializes @p deltas back to back into a block of @p allocator, a chain one delta view carries. */
+/** Serializes @p deltas back to back into a block of @p allocator, a chain one delta view holds. */
 template <typename allocator_type_>
 expected<std::span<byte_t const>> encode_deltas(std::span<half_edge_delta_t const> deltas,
                                                 allocator_type_& allocator) noexcept {
@@ -584,11 +584,12 @@ inline constexpr std::size_t sequenced_digits_k = 2 * (delta_edge_offset_k - del
 /**
  *  @brief The fold of graph adjacency, fitting the fold concept of <tt>ustore/utilities/folds.hpp</tt>.
  *
- *  A base is a vertex value, a write replaces it and a removal drops the vertex, and a change carries a chain of
- *  half-edge records. Applying yields the value with every record folded in, sorted, at whatever size it grows to.
- *  Composing keeps the newest record of every half-edge and drops everything older than a removal of the vertex,
- *  after which a removal of one half-edge has nothing left to hide and goes too. Without such a removal an insert
- *  followed by a removal of one half-edge still becomes the removal, because an older version may hold the half-edge.
+ *  A base is a vertex value, a write replaces it and a removal drops the vertex, and a change holds
+ *  a chain of half-edge records. Applying yields the value with every record folded in, sorted, at
+ *  whatever size it grows to. Composing keeps the newest record of every half-edge and drops
+ *  everything older than a removal of the vertex, after which a removal of one half-edge has
+ *  nothing left to hide and goes too. Without such a removal an insert followed by a removal of one
+ *  half-edge still becomes the removal, because an older version may hold the half-edge.
  */
 struct adjacency_fold_t {
 
@@ -636,7 +637,7 @@ struct adjacency_fold_t {
      *  A write or a removal of the vertex value is a base rather than a change, so the caller applies the chain to it
      *  instead, as @ref closes tells. Composing is associative, byte for byte, as a segmented reduction needs.
      *
-     *  @return The chain in a block of @p allocator, empty when the deltas carry no records.
+     *  @return The chain in a block of @p allocator, empty when the deltas hold no records.
      */
     template <typename allocator_type_>
     expected<std::span<byte_t const>> compose(std::span<delta_view_t const> deltas,
@@ -653,7 +654,7 @@ struct adjacency_fold_t {
             total += chain->size();
         }
         if (!total) return std::span<byte_t const> {};
-        // Every record carries its place in the chain as a 32-bit sequence
+        // Every record holds its place in the chain as a 32-bit sequence
         if (total > (std::numeric_limits<std::uint32_t>::max)())
             return status_t {status_code_t::capacity_exhausted_k, "Too many half-edge deltas to compose"};
 

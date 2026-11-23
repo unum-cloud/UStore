@@ -53,7 +53,7 @@
 #include "database.hpp" // `nvme_variant`, `database_describe`, `resolve_modality`, `transaction_free`
 #include "blobs.hpp"    // `blobs_write`, `remove_values`, `scan_values`, `sample_values`, `measure_values`
 #include "strings.hpp"  // `strings_write`, `strings_remove`, `strings_read`, `strings_scan`, `strings_sample`
-#include "docs.hpp"     // `docs_write`
+#include "docs.hpp"     // `docs_write`, `docs_scan`
 #include "graph.hpp"    // `graph_read_edges`, `graph_write_edges`, `graph_remove_vertices`
 #include "ingest.hpp"   // `ingest_init`, `ingest_append`, `ingest_finish`, `ingest_free`
 #include "pages.hpp"    // `pages_import`, `pages_insert`
@@ -128,7 +128,7 @@ docs_verbs<vendored_residency_t::host_k> const nvme_variant<cpu_class_>::docs_ve
     .gist = &docs_gist_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>>,
     .gather = &docs_gather_over_blobs<strings_kit_t, values_verbs_k, &resolve_modality<cpu_class_>>,
     .remove = &remove_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>, ustore_modality_docs_k>,
-    .scan = &scan_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>, ustore_modality_docs_k>,
+    .scan = &docs_scan<cpu_class_>,
     .sample = &sample_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>, ustore_modality_docs_k>,
     .measure = &measure_over_blobs<values_verbs_k, &resolve_modality<cpu_class_>, ustore_modality_docs_k>,
 };

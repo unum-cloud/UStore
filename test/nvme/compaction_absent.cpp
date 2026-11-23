@@ -37,7 +37,7 @@ using st::key128_t;
 using utilities::last_write_fold_t;
 
 expected<cuda_compactor_t> cuda_compactor_t::make(utilities::cuda_executor_t&, device_sections_reader_t) noexcept {
-    return status_t {status_code_t::unsupported_k, "The suite's host build carries no device compactor"};
+    return status_t {status_code_t::unsupported_k, "The suite's host build holds no device compactor"};
 }
 
 cuda_compactor_t::~cuda_compactor_t() noexcept {}
@@ -55,7 +55,7 @@ st::status_t cuda_compactor_t::compact(compaction_kind_t, std::span<sorted_run_i
 }
 
 expected<hip_compactor_t> hip_compactor_t::make(utilities::hip_executor_t&, device_sections_reader_t) noexcept {
-    return status_t {status_code_t::unsupported_k, "The suite's host build carries no device compactor"};
+    return status_t {status_code_t::unsupported_k, "The suite's host build holds no device compactor"};
 }
 
 hip_compactor_t::~hip_compactor_t() noexcept {}

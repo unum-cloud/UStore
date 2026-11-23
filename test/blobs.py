@@ -13,7 +13,7 @@ from uuid import UUID
 
 import numpy as np
 import pytest
-from base import BATCH_SIZES, key, keys, location, pyarrow_available
+from base import BATCH_SIZES, executor_for, key, keys, location, pyarrow_available
 
 import ustore
 
@@ -27,7 +27,7 @@ VALUE_SHAPES = {
 
 
 def records(integers: list[int]) -> np.ndarray:
-    """Integer keys as the 16-byte records a batch borrows without converting them."""
+    """Integer keys as the 16-byte records a batch views without converting them."""
     return np.frombuffer(b"".join(uuid.bytes for uuid in keys(integers)), dtype="V16")
 
 
@@ -118,7 +118,7 @@ def test_every_spelling_of_a_key_addresses_one_value(view, blobs, arena, spellin
 @pytest.mark.parametrize("count", BATCH_SIZES)
 @pytest.mark.parametrize("container", KEY_CONTAINERS)
 def test_batch_round_trip(view, blobs, arena, count: int, container: str):
-    """A batch reads back in the order it was asked for, borrowed as 16-byte keys or converted from integers."""
+    """A batch reads back in the order it was asked for, viewed as 16-byte keys or converted from integers."""
     keys = KEY_CONTAINERS[container](list(range(count)))
     values = [str(key).encode() * (key % 3 + 1) for key in range(count)]
     view.write(keys, values, collection=blobs)
@@ -193,22 +193,22 @@ def test_rejects_mismatched_batch_widths(view, blobs, values: list[bytes]):
 
 
 @pytest.mark.any_engine
-def test_values_are_borrowed_not_copied(view, blobs, arena):
+def test_values_are_viewed_not_copied(view, blobs, arena):
     """A read answers read-only memoryviews into the arena rather than copies."""
-    view.set(1, b"borrowed", collection=blobs)
+    view.set(1, b"owned", collection=blobs)
     found = view.read([1], arena, collection=blobs)[0]
     assert isinstance(found, memoryview)
     assert found.readonly
-    assert bytes(found) == b"borrowed"
+    assert bytes(found) == b"owned"
 
 
 @pytest.mark.any_engine
 def test_a_view_outlives_the_tape_that_exported_it(view, blobs, arena):
     """A value's memoryview stays readable after its tape is collected."""
-    view.set(1, b"borrowed", collection=blobs)
+    view.set(1, b"owned", collection=blobs)
     held = view.read([1], arena, collection=blobs)[0]
     gc.collect()
-    assert bytes(held) == b"borrowed"
+    assert bytes(held) == b"owned"
 
 
 def test_one_arena_serves_every_verb_in_turn(view, blobs, arena):
@@ -455,7 +455,7 @@ def test_scan_patterns_predicates_and_scores(view, blobs, arena, unraisable):
 
 @pytest.mark.parametrize("page_size", [1, 3, 10, 11])
 def test_a_cursor_walks_a_collection_whole(view, blobs, arena, page_size: int):
-    """Pages resume past their last key, carry the values when asked, and an empty one ends the walk."""
+    """Pages resume past their last key, hold the values when asked, and an empty one ends the walk."""
     stored = [bytes([index]) * index for index in range(10)]
     view.write(list(range(10)), stored, collection=blobs)
     walked, values = [], []
@@ -479,7 +479,7 @@ def test_a_cursor_resumes_past_its_last_key(database, blobs, arena):
 
 
 def test_a_page_exports_its_keys(database, blobs, arena):
-    """A cursor page exports its keys as 16-byte rows, carrying no values unless asked."""
+    """A cursor page exports its keys as 16-byte rows, holding no values unless asked."""
     database.write([5, 6], b"v", collection=blobs)
     with database.cursor(collection=blobs) as cursor:
         page = cursor.next(2, arena)
@@ -491,11 +491,11 @@ def test_a_page_exports_its_keys(database, blobs, arena):
         assert not cursor.next(2, arena)
 
 
-def test_a_cursor_pulls_on_its_receivers_executor(database, blobs):
+def test_a_cursor_pulls_on_its_receivers_executor(database, blobs, engine: str):
     """Every pull blocks on the executor the cursor was opened through, which no deferred view offers, and a closed
     executor or cursor refuses the next pull."""
     database.write([1, 2, 3], b"v", collection=blobs)
-    with ustore.Executor.for_ram(2) as executor:
+    with executor_for(engine, 2) as executor:
         cursor = database.on(executor).cursor(collection=blobs)
         assert list(cursor.next(2, ustore.Arena(executor))) == keys([1, 2])
         assert not hasattr(database.deferred(executor), "cursor")
@@ -525,10 +525,10 @@ def outcomes_of(calls: list[ustore.Deferred]) -> list[ustore.Status]:
     return outcomes
 
 
-def test_a_deferred_read_answers_once_waited(database, blobs):
+def test_a_deferred_read_answers_once_waited(database, blobs, engine: str):
     """A deferred read answers a Deferred that turns successful with the values once waited."""
     database.write([1, 2], [b"a", b"bb"], collection=blobs)
-    with ustore.Executor.for_ram(2) as executor:
+    with executor_for(engine, 2) as executor:
         reading = database.deferred(executor).read([1, 2, 3], ustore.Arena(executor), collection=blobs)
         assert isinstance(reading, ustore.Deferred)
         assert reading.status in (ustore.Status.DEFERRED, ustore.Status.SUCCESS)
@@ -536,10 +536,10 @@ def test_a_deferred_read_answers_once_waited(database, blobs):
         assert reading.status is ustore.Status.SUCCESS
 
 
-def test_a_deferred_call_holds_its_arena(database, blobs):
+def test_a_deferred_call_holds_its_arena(database, blobs, engine: str):
     """A deferred call holds its arena until it is waited on, then its result views the arena as a blocking one does."""
     database.write([1, 2], [b"a", b"bb"], collection=blobs)
-    with ustore.Executor.for_ram(1) as executor:
+    with executor_for(engine, 1) as executor:
         arena = ustore.Arena(executor)
         reading = database.deferred(executor).read([1, 2], arena, collection=blobs)
         values = reading.wait()
@@ -547,12 +547,12 @@ def test_a_deferred_call_holds_its_arena(database, blobs):
         assert database.on(executor).read([2], arena, collection=blobs).lengths == (2,)
 
 
-def test_shorthand_on_a_deferred_view_owns_its_arena(database, blobs, arena):
+def test_shorthand_on_a_deferred_view_owns_its_arena(database, blobs, arena, engine: str):
     """`get`, `contains` and a mapping view answer a Deferred of the copy they make, through an arena of their own,
     each on an executor of its own, since an executor runs one call at a time."""
     database.write([1, 2], [b"a", b"bb"], collection=blobs)
     with contextlib.ExitStack() as executors:
-        later = [database.deferred(executors.enter_context(ustore.Executor.for_ram(1))) for _ in range(4)]
+        later = [database.deferred(executors.enter_context(executor_for(engine, 1))) for _ in range(4)]
         getting, holding, subscripting = (
             later[0].get(1, collection=blobs),
             later[1].contains(2, collection=blobs),
@@ -567,10 +567,10 @@ def test_shorthand_on_a_deferred_view_owns_its_arena(database, blobs, arena):
         assert bytes(held) == b"bb"
 
 
-def test_await_under_asyncio(database, blobs, arena):
+def test_await_under_asyncio(database, blobs, arena, engine: str):
     """Gathered calls run at once, so each takes an executor of its own."""
     with contextlib.ExitStack() as executors:
-        later = [database.deferred(executors.enter_context(ustore.Executor.for_ram(1))) for _ in range(4)]
+        later = [database.deferred(executors.enter_context(executor_for(engine, 1))) for _ in range(4)]
 
         async def main() -> tuple[list[bytes], list[bytes | None]]:
             await later[0].write([1, 2], [b"a", b"bb"], collection=blobs)
@@ -581,9 +581,9 @@ def test_await_under_asyncio(database, blobs, arena):
         assert asyncio.run(main()) == ([b"a", b"bb"], [None, b"a", b"bb", None])
 
 
-def test_await_raises_what_wait_raises(database, blobs):
+def test_await_raises_what_wait_raises(database, blobs, engine: str):
     """Awaiting runs `wait()` on the loop's own executor, so a refusal reaches the task as it would the thread."""
-    with ustore.Executor.for_ram(1) as executor:
+    with executor_for(engine, 1) as executor:
         missing = database.deferred(executor)["blobs"].blobs[404]
 
         async def main() -> bytes:
@@ -594,9 +594,9 @@ def test_await_raises_what_wait_raises(database, blobs):
         assert missing.status is ustore.Status.SUCCESS
 
 
-def test_a_deferred_call_finishes_by_polling(database, blobs):
+def test_a_deferred_call_finishes_by_polling(database, blobs, engine: str):
     """The executor's own thread serves a deferred call, so polling its status alone sees it final."""
-    with ustore.Executor.for_ram(2) as executor:
+    with executor_for(engine, 2) as executor:
         writing = database.deferred(executor).write([1], [b"a"], collection=blobs)
         while writing.status is ustore.Status.DEFERRED:
             pass
@@ -606,9 +606,9 @@ def test_a_deferred_call_finishes_by_polling(database, blobs):
         assert writing.wait() is None
 
 
-def test_a_held_executor_refuses_the_next_call(database, blobs):
+def test_a_held_executor_refuses_the_next_call(database, blobs, engine: str):
     """An executor serves one call at a time, so submissions finding it held raise once waited for."""
-    with ustore.Executor.for_ram(1) as executor:
+    with executor_for(engine, 1) as executor:
         later = database.deferred(executor)
         calls = [later.write(list(range(256)), b"v" * 1024, collection=blobs) for _ in range(64)]
         outcomes = outcomes_of(calls)
@@ -616,9 +616,9 @@ def test_a_held_executor_refuses_the_next_call(database, blobs):
     assert set(outcomes) <= {ustore.Status.SUCCESS, ustore.Status.CONTENDED}
 
 
-def test_a_drain_frees_the_executor_in_either_mood(database, blobs):
+def test_a_drain_frees_the_executor_in_either_mood(database, blobs, engine: str):
     """A drain only waits until no call holds the executor, so the next call on it runs, whichever mood it left."""
-    with ustore.Executor.for_ram(2) as executor:
+    with executor_for(engine, 2) as executor:
         for mood in (ustore.Mood.SPINNING, ustore.Mood.PARKED):
             writing = database.deferred(executor).write(list(range(256)), b"v" * 1024, collection=blobs)
             executor.drain(mood)
@@ -626,33 +626,35 @@ def test_a_drain_frees_the_executor_in_either_mood(database, blobs):
             assert writing.wait() is None
 
 
-def test_close_waits_for_deferred_calls(open_database):
+def test_close_waits_for_deferred_calls(open_database, engine: str):
     """Freeing a database waits in C for the deferred calls naming it, so closing one never refuses."""
     database = open_database()
     blobs = database.collection_create("blobs", modality=ustore.Modality.BLOBS)
-    with ustore.Executor.for_ram(1) as executor:
+    with executor_for(engine, 1) as executor:
         writing = database.deferred(executor).write(list(range(4096)), b"v" * 1024, collection=blobs)
         database.close()
         assert writing.status is ustore.Status.SUCCESS
         assert writing.wait() is None
 
 
-def test_an_executor_serves_the_memory_domains_named(database, blobs, tmp_path):
-    """Every host has NUMA node zero, an identifier no node carries is refused, and so is a null pool."""
-    with ustore.Executor.for_ram(threads=1, memory_domains=[0]) as executor:
+def test_an_executor_serves_the_memory_domains_named(database, blobs, tmp_path, engine: str):
+    """Every host has NUMA node zero, an identifier no node holds is refused, and paths place an NVMe executor."""
+    with executor_for(engine, 1, memory_domains=[0]) as executor:
         database.on(executor).set(1, b"a", collection=blobs)
         assert database.deferred(executor).get(1, collection=blobs).wait() == b"a"
     with pytest.raises(ustore.InvalidArgumentError):
         ustore.Executor.for_ram(memory_domains=[1 << 20])
     with pytest.raises(ustore.InvalidArgumentError):
-        ustore.Executor.on_pool(0)
+        ustore.Executor.for_nvme(1, transport=ustore.Transport.BLOCKING, memory_domains=[1 << 20])
+    with ustore.Executor.for_nvme(transport=ustore.Transport.BLOCKING, paths=[tmp_path]):
+        pass
     # Merges take a VRAM executor alone, and a build without NVMe refuses the open before reading it
     with (
         ustore.Executor.for_nvme(1, transport=ustore.Transport.BLOCKING, queue_depth=32) as executor,
         pytest.raises((ustore.DeviceError, ustore.UnsupportedError)),
     ):
         ustore.Database.open_nvme(location("nvme", tmp_path), compactions=executor)
-    # A build without CUDA refuses every device, and one with CUDA refuses an ordinal no device carries
+    # A build without CUDA refuses every device, and one with CUDA refuses an ordinal no device has
     with pytest.raises((ustore.UnsupportedError, ustore.DeviceError)):
         ustore.Executor.for_vram(1 << 20, gds=ustore.Gds.COMPATIBILITY)
 
@@ -660,7 +662,7 @@ def test_an_executor_serves_the_memory_domains_named(database, blobs, tmp_path):
 def test_a_database_opens_on_an_executor(engine: str, tmp_path):
     """A constructor given an executor blocks on it, and one given a closed executor opens nothing."""
     with (
-        ustore.Executor.for_ram(2) as executor,
+        executor_for(engine, 2) as executor,
         getattr(ustore.Database, f"open_{engine}")(location(engine, tmp_path), executor=executor) as database,
     ):
         blobs = database.collection_create("blobs", modality=ustore.Modality.BLOBS)
@@ -671,13 +673,13 @@ def test_a_database_opens_on_an_executor(engine: str, tmp_path):
         assert reopened.get(1, collection=blobs) == b"a"
 
 
-def test_the_collector_frees_a_cycle_through_a_finished_deferred(database, blobs):
+def test_the_collector_frees_a_cycle_through_a_finished_deferred(database, blobs, engine: str):
     """A cycle through what a final Deferred raised is garbage the collector frees, rather than a leak."""
 
     class Holder:
         call: ustore.Deferred[bytes]
 
-    with ustore.Executor.for_ram(1) as executor:
+    with executor_for(engine, 1) as executor:
         holder = Holder()
         holder.call = database.deferred(executor)["blobs"].blobs[404]
         with pytest.raises(KeyError) as raised:
@@ -696,9 +698,9 @@ def test_a_deferred_contains_answers_a_bool_once_waited(view, blobs, later):
     assert later.contains(2, collection=blobs).wait() is False
 
 
-def test_a_deferred_view_names_the_verb_it_takes_instead(database, blobs, docs):
+def test_a_deferred_view_names_the_verb_it_takes_instead(database, blobs, docs, engine: str):
     """What cannot answer a Deferred raises TypeError naming the flat verb to call."""
-    with ustore.Executor.for_ram(1) as executor:
+    with executor_for(engine, 1) as executor:
         values, documents = database.deferred(executor)["blobs"], database.deferred(executor)["docs"]
         with pytest.raises(TypeError, match="write"):
             values.blobs[1] = b"a"

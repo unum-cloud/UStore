@@ -11,16 +11,16 @@
 #include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
-#include <memory>       // `std::unique_ptr`
+#include <memory>       // `std::unique_ptr`, `std::uninitialized_default_construct`, `std::destroy`
 #include <mutex>        // `std::unique_lock`
-#include <new>          // `std::nothrow`
 #include <shared_mutex> // `std::shared_lock`
 
 #include <rocksdb/db.h>
 
 #include "ustore/ranges.hpp" // `place_batch_t`, `strided`
 
-#include "ustore/utilities/algorithm.hpp" // `reservoir_sample_iterator`
+#include "ustore/utilities/algorithm.hpp"   // `reservoir_sample_iterator`
+#include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`
 
 #include "database.hpp"          // `database_t`, `transaction_t`, `seek_towards`, `buffer_remove`, `get_many`
 #include "utilities/batches.hpp" // `validate_write`, `places_of`, `scans_of`, `measures_of`
@@ -163,16 +163,19 @@ status_t blobs_read(ustore_blobs_read_t const& arguments, view_t const& view) {
         return export_values(arguments, &value, &status, view.scratch);
     }
 
-    // Values stay pinned until the outputs copy them, so each is copied once, straight from its block
-    std::unique_ptr<::rocksdb::PinnableSlice[]> values {new (std::nothrow)::rocksdb::PinnableSlice[count]};
-    std::unique_ptr<native_status_t[]> statuses {new (std::nothrow) native_status_t[count]};
-    if (!values || !statuses) return {status_code_t::out_of_memory_k, "Failed to allocate the batch"};
-
-    if (status_t const status = get_many(database, transaction, read_options, places, view.watch, values.get(),
-                                         statuses.get());
-        status.failed())
-        return status;
-    return export_values(arguments, values.get(), statuses.get(), view.scratch);
+    // Values stay pinned in scratch until the outputs copy each once, straight from its block
+    auto [values, values_status] = arena_allocate<::rocksdb::PinnableSlice>(view.scratch, count);
+    if (values_status.failed()) return values_status;
+    auto [statuses, statuses_status] = arena_allocate<native_status_t>(view.scratch, count);
+    if (statuses_status.failed()) return statuses_status;
+    std::uninitialized_default_construct(values.begin(), values.end());
+    std::uninitialized_default_construct(statuses.begin(), statuses.end());
+    status_t status = get_many(database, transaction, read_options, places, view.watch, values.data(), statuses.data(),
+                               view.scratch);
+    if (status.succeeded()) status = export_values(arguments, values.data(), statuses.data(), view.scratch);
+    std::destroy(values.begin(), values.end());
+    std::destroy(statuses.begin(), statuses.end());
+    return status;
 }
 
 status_t blobs_scan(ustore_blobs_scan_t const& arguments, view_t const& view) {

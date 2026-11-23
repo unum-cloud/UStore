@@ -145,13 +145,6 @@ __attribute__((visibility("default"))) int hipSetDevice(int device) {
     return device == 0 ? success_k : invalid_device_k;
 }
 
-__attribute__((visibility("default"))) int hipStreamCreateWithFlags(void** stream, unsigned) {
-    *stream = &token;
-    return success_k;
-}
-
-__attribute__((visibility("default"))) int hipStreamDestroy(void*) { return success_k; }
-
 __attribute__((visibility("default"))) int hipStreamSynchronize(void*) {
     ++fake_hip_counters.waits;
     return success_k;

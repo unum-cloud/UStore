@@ -186,7 +186,7 @@ enum class file_buffering_t : std::uint8_t {
     unbuffered_k,
 };
 
-/** The largest run one positioned call carries, kept well inside every platform's own limit. */
+/** The largest run one positioned call holds, kept well inside every platform's own limit. */
 inline constexpr std::uint64_t native_transfer_bytes_k = 1024ull * 1024ull * 1024ull;
 
 #if USTORE_OS_WINDOWS_
@@ -843,7 +843,7 @@ inline status_t sync_directory(char const* path) noexcept {
 class file_appender_t {
   public:
 
-    /** Bytes held back before one write carries them. */
+    /** Bytes held back before one write holds them. */
     static constexpr std::size_t pending_capacity_k = 64 * 1024;
 
     file_appender_t(native_file_t file, native_file_event_t const& event) noexcept : file_(file), event_(event) {}

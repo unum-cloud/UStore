@@ -154,12 +154,37 @@ void walk_keyed(ustore_database_t database, ustore_collection_id_t collection, v
     free_(cursor);
 }
 
+/** Walks the documents of @p collection to their end, appending every key and whole document to @p
+ *  rows. */
+void walk_documents(ustore_database_t database, ustore_collection_id_t collection, rows_t& rows) {
+    ustore_docs_cursor_t cursor = nullptr;
+    ustore_outcome_t outcome {};
+    std::array<std::uint32_t, 2> const whole_offsets {0, 0};
+    ustore_docs_field_type_t const whole_type = ustore_docs_field_type_json_k;
+    ustore_docs_cursor_init_t init {};
+    init.cursor = &cursor, init.database = database, init.outcome = &outcome, init.collection = collection;
+    init.fields_count = 1, init.fields = u32_tape("", whole_offsets.data()), init.columns_types = &whole_type;
+    ustore_docs_cursor_init(&init);
+    if (!expect_success(outcome)) return;
+    arena_t arena;
+    for (ustore_size_t count = 1; count;) {
+        ustore_docs_batch_view_t const* batches = nullptr;
+        ustore_docs_cursor_next_t next {};
+        next.database = database, next.outcome = &outcome, next.cursor = cursor, next.batches = &batches;
+        next.batches_count = &count, next.arena = arena.arena, next.wanted = 64;
+        ustore_docs_cursor_next(&next);
+        if (!expect_success(outcome)) break;
+        for (ustore_docs_batch_view_t const& batch : std::span<ustore_docs_batch_view_t const> {batches, count})
+            for (std::size_t index = 0; index != batch.count; ++index)
+                rows.push_back({cell_of(batch.keys[index]), cell_of(batch.columns[0].strings, index)});
+    }
+    ustore_docs_cursor_free(cursor);
+}
+
 /** Reads every row of @p collection of @p modality into @p rows through its cursor, a graph as its edges. */
 void dump(ustore_database_t database, ustore_collection_id_t collection, ustore_modality_t modality, rows_t& rows) {
     switch (modality) {
-    case ustore_modality_docs_k:
-        return walk_keyed(database, collection, &ustore_docs_cursor_init, &ustore_docs_cursor_next,
-                          &ustore_docs_cursor_free, rows);
+    case ustore_modality_docs_k: return walk_documents(database, collection, rows);
     case ustore_modality_pages_k:
         return walk_keyed(database, collection, &ustore_pages_cursor_init, &ustore_pages_cursor_next,
                           &ustore_pages_cursor_free, rows);
@@ -732,18 +757,36 @@ void test_arrow_exports_read_in_place(config_t const& config) {
     ustore_blobs_cursor_free(cursor);
 }
 
-/** What an ingest of two rows answers on one engine. */
+/** What an ingest into a collection of one modality answers on one engine. */
 struct ingest_expectation_t {
     std::string_view engine;
+    ustore_modality_t modality;
     status_code_t status;
 };
 
-/** Every engine's answer to an ingest, one row each, so an engine gaining ingests flips its own row alone. */
+/** Every engine's answer to an ingest of every modality, one row each, so an engine gaining a
+ *  modality flips its own row alone. */
 constexpr ingest_expectation_t ingest_expectations_k[] {
-    {"ram", status_code_t::success_k},
-    {"rocksdb", status_code_t::unsupported_k},
-    {"leveldb", status_code_t::unsupported_k},
-    {"nvme", status_code_t::success_k},
+    {"ram", ustore_modality_blobs_k, status_code_t::success_k},
+    {"ram", ustore_modality_docs_k, status_code_t::success_k},
+    {"ram", ustore_modality_pages_k, status_code_t::success_k},
+    {"ram", ustore_modality_strings_k, status_code_t::success_k},
+    {"ram", ustore_modality_graph_k, status_code_t::success_k},
+    {"rocksdb", ustore_modality_blobs_k, status_code_t::success_k},
+    {"rocksdb", ustore_modality_docs_k, status_code_t::success_k},
+    {"rocksdb", ustore_modality_pages_k, status_code_t::success_k},
+    {"rocksdb", ustore_modality_strings_k, status_code_t::unsupported_k},
+    {"rocksdb", ustore_modality_graph_k, status_code_t::unsupported_k},
+    {"leveldb", ustore_modality_blobs_k, status_code_t::unsupported_k},
+    {"leveldb", ustore_modality_docs_k, status_code_t::unsupported_k},
+    {"leveldb", ustore_modality_pages_k, status_code_t::unsupported_k},
+    {"leveldb", ustore_modality_strings_k, status_code_t::unsupported_k},
+    {"leveldb", ustore_modality_graph_k, status_code_t::unsupported_k},
+    {"nvme", ustore_modality_blobs_k, status_code_t::success_k},
+    {"nvme", ustore_modality_docs_k, status_code_t::success_k},
+    {"nvme", ustore_modality_pages_k, status_code_t::success_k},
+    {"nvme", ustore_modality_strings_k, status_code_t::success_k},
+    {"nvme", ustore_modality_graph_k, status_code_t::success_k},
 };
 
 /** An ingest the case frees on destruction. */
@@ -791,34 +834,38 @@ bool expect_succeeded(ustore_outcome_t outcome, std::source_location where = std
     return expect_success(outcome, where);
 }
 
-/** Whether the engine @p config ingests, as its row of @c ingest_expectations_k says. */
-bool ingests(config_t const& config) noexcept {
+/** Whether the engine ingests collections of @p modality, as @c ingest_expectations_k says. */
+bool ingests(config_t const& config, ustore_modality_t modality = ustore_modality_blobs_k) noexcept {
     for (ingest_expectation_t const& row : ingest_expectations_k)
-        if (row.engine == config.engine()) return row.status == status_code_t::success_k;
+        if (row.engine == config.engine() && row.modality == modality) return row.status == status_code_t::success_k;
     return false;
 }
 
 /** The reason a case gated on an ingesting engine reports elsewhere. */
 constexpr char const* needs_ingest_k = "needs an engine whose row of `ingest_expectations_k` ingests";
 
-/** Every engine opens an ingest as its row of @c ingest_expectations_k says. */
+/** Every engine opens an ingest of every modality as its row of @c ingest_expectations_k says. */
 case_result_t test_arrow_ingest_per_engine(config_t const& config) {
-    ingest_expectation_t const* expectation = nullptr;
-    for (ingest_expectation_t const& row : ingest_expectations_k)
-        if (row.engine == config.engine()) expectation = &row;
-    if (!expectation) return case_result_t::skipped("needs a row in `ingest_expectations_k`");
     fixture_t fixture {config};
     if (!fixture.database) return {};
-    ustore_collection_id_t const collection = fixture.create("ingested", ustore_modality_blobs_k);
-    ingest_t ingest {fixture.database, collection, ustore_ingest_sorted_k};
-    expect_status(status_t {ingest.outcome}, expectation->status);
-    expect_equal(ingest.ingest != nullptr, expectation->status == status_code_t::success_k);
-    if (!ingest.ingest) return {};
-    modality_rows_t const rows {ustore_modality_blobs_k, 2};
-    expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 0, 2));
-    expect_succeeded(ingest.finish());
-    // A finished ingest takes no more rows
-    expect_status(status_t {ingest.append(ustore_modality_blobs_k, rows, 0, 2)}, status_code_t::invalid_argument_k);
+    std::size_t rows_found = 0;
+    for (ingest_expectation_t const& expectation : ingest_expectations_k) {
+        if (expectation.engine != config.engine()) continue;
+        ++rows_found;
+        ustore_modality_t const modality = expectation.modality;
+        std::string const name = fmt::format("ingested-{}", ustore_modality_name(modality));
+        ustore_collection_id_t const collection = fixture.create(name.c_str(), modality);
+        ingest_t ingest {fixture.database, collection, ustore_ingest_sorted_k};
+        expect_status(status_t {ingest.outcome}, expectation.status);
+        expect_equal(ingest.ingest != nullptr, expectation.status == status_code_t::success_k);
+        if (!ingest.ingest) continue;
+        modality_rows_t const rows {modality, 2};
+        expect_succeeded(ingest.append(modality, rows, 0, 2));
+        expect_succeeded(ingest.finish());
+        // A finished ingest takes no more rows
+        expect_status(status_t {ingest.append(modality, rows, 0, 2)}, status_code_t::invalid_argument_k);
+    }
+    if (!rows_found) return case_result_t::skipped("needs a row in `ingest_expectations_k`");
     return {};
 }
 
@@ -830,6 +877,7 @@ case_result_t test_arrow_ingest_equals_writes(config_t const& config) {
     constexpr std::size_t count_k = 100;
     for (ustore_modality_t const modality : {ustore_modality_blobs_k, ustore_modality_docs_k, ustore_modality_pages_k,
                                              ustore_modality_strings_k, ustore_modality_graph_k}) {
+        if (!ingests(config, modality)) continue;
         char const* const name = ustore_modality_name(modality);
         modality_rows_t const rows {modality, count_k};
         ustore_collection_id_t const written_collection = fixture.create(fmt::format("{}-written", name).c_str(),

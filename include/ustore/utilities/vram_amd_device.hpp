@@ -42,6 +42,10 @@ using hip_event_handle_t = struct hip_event_opaque_t*;
 using hip_module_handle_t = struct hip_module_opaque_t*;
 using hip_function_handle_t = struct hip_function_opaque_t*;
 
+/** @c hipStreamPerThread, the calling thread's default stream on the current device, which no one
+ *  creates or destroys. */
+inline hip_stream_handle_t const hip_stream_per_thread_k = reinterpret_cast<hip_stream_handle_t>(2);
+
 /** The @c hipDeviceAttribute_t values UStore queries; on AMD the compute capability is the @c gfx processor's major
  *  and minor version. */
 enum hip_device_attribute_t : int {
@@ -51,9 +55,8 @@ enum hip_device_attribute_t : int {
     hip_attribute_host_numa_id_k = 92,
 };
 
-/** The flags UStore passes, @c hipStreamNonBlocking, @c hipEventBlockingSync and @c hipEventDisableTiming, and the
+/** The flags UStore passes, @c hipEventBlockingSync and @c hipEventDisableTiming, and the
  *  @c hipPointer_attribute values it reads. */
-inline constexpr unsigned hip_stream_non_blocking_k = 1;
 inline constexpr unsigned hip_event_blocking_sync_k = 1;
 inline constexpr unsigned hip_event_disable_timing_k = 2;
 inline constexpr int hip_pointer_memory_type_k = 2;
@@ -84,8 +87,6 @@ struct hip_api_t {
     hip_result_t (*get_device_name)(char*, int, int) = nullptr;
     hip_result_t (*get_device_memory)(std::size_t*, int) = nullptr;
     hip_result_t (*set_device)(int) = nullptr;
-    hip_result_t (*stream_create_with_flags)(hip_stream_handle_t*, unsigned) = nullptr;
-    hip_result_t (*stream_destroy)(hip_stream_handle_t) = nullptr;
     hip_result_t (*stream_synchronize)(hip_stream_handle_t) = nullptr;
     hip_result_t (*event_create_with_flags)(hip_event_handle_t*, unsigned) = nullptr;
     hip_result_t (*event_record)(hip_event_handle_t, hip_stream_handle_t) = nullptr;
@@ -130,8 +131,6 @@ struct hip_api_t {
             library.resolve("hipDeviceGetName", runtime.get_device_name) &&
             library.resolve("hipDeviceTotalMem", runtime.get_device_memory) &&
             library.resolve("hipSetDevice", runtime.set_device) &&
-            library.resolve("hipStreamCreateWithFlags", runtime.stream_create_with_flags) &&
-            library.resolve("hipStreamDestroy", runtime.stream_destroy) &&
             library.resolve("hipStreamSynchronize", runtime.stream_synchronize) &&
             library.resolve("hipEventCreateWithFlags", runtime.event_create_with_flags) &&
             library.resolve("hipEventRecord", runtime.event_record) &&
@@ -292,11 +291,12 @@ class hip_executor_t {
     /** The kernels this executor launches. */
     using function_t = hip_function_handle_t;
 
-    /** Binds HIP ordinal @p ordinal, and queues on @p borrowed, a @c hipStream_t of the caller's on
-     *  that device which outlives the executor, or on one of its own for null; its scratch never
-     *  grows past @p scratch_limit bytes, zero for no limit, and its launches find their kernels in
+    /** Binds HIP ordinal @p ordinal, and queues on @p stream, a @c hipStream_t of the caller's on
+     *  that device, which the caller destroys after freeing the executor, or on the per-thread
+     *  default stream for null, creating and destroying none; its scratch never grows past
+     *  @p scratch_limit bytes, zero for no limit, and its launches find their kernels in
      *  @p kernels, the device's table of the library's bundle, or none for null. */
-    static expected<hip_executor_t> spawn(hip_api_t const& api, int ordinal, void* borrowed, std::size_t scratch_limit,
+    static expected<hip_executor_t> spawn(hip_api_t const& api, int ordinal, void* stream, std::size_t scratch_limit,
                                           kernel_table<hip_module_t> const* kernels = nullptr) noexcept {
         if (!api || api.set_device(ordinal) != hip_success_k)
             return status_t {status_code_t::device_k, "The HIP runtime refused the device"};
@@ -305,12 +305,7 @@ class hip_executor_t {
         executor.device_ = ordinal;
         executor.scratch_limit_ = scratch_limit;
         executor.kernels_ = kernels;
-        executor.stream_ = static_cast<hip_stream_handle_t>(borrowed);
-        if (!borrowed) {
-            if (api.stream_create_with_flags(&executor.owned_stream_, hip_stream_non_blocking_k) != hip_success_k)
-                return status_t {status_code_t::device_k, "Failed to create a stream on the device"};
-            executor.stream_ = executor.owned_stream_;
-        }
+        executor.stream_ = stream ? static_cast<hip_stream_handle_t>(stream) : hip_stream_per_thread_k;
         executor.event_ = hip_event_t {api};
         if (!executor.event_) return status_t {status_code_t::device_k, "Failed to create an event on the device"};
         // The bounce stays on node zero where the runtime places the device on no NUMA node
@@ -333,7 +328,6 @@ class hip_executor_t {
         if (!api_ || api_->set_device(device_) != hip_success_k) return;
         api_->stream_synchronize(stream_);
         free_blocks(managed_.blocks, [this](std::uintptr_t address) noexcept { free_managed(address); });
-        if (owned_stream_) api_->stream_destroy(owned_stream_);
     }
 
     /** Waits until everything queued on the stream ran, reporting a failure among it as @c device_k. */
@@ -349,7 +343,7 @@ class hip_executor_t {
     /** Bytes of scratch a call may take, zero for no limit. */
     std::size_t scratch_limit() const noexcept { return scratch_limit_; }
 
-    /** The stream every call queues on, owned or borrowed. */
+    /** The stream every call queues on, the caller's or the per-thread default one. */
     hip_stream_handle_t stream() const noexcept { return stream_; }
 
     /** The runtime table every call goes through. */
@@ -438,16 +432,13 @@ class hip_executor_t {
     hip_executor_t() noexcept = default;
 
     void swap(hip_executor_t& other) noexcept {
-        std::swap(api_, other.api_), std::swap(owned_stream_, other.owned_stream_), std::swap(stream_, other.stream_);
+        std::swap(api_, other.api_), std::swap(stream_, other.stream_);
         std::swap(event_, other.event_), std::swap(device_, other.device_);
         std::swap(scratch_limit_, other.scratch_limit_), std::swap(kernels_, other.kernels_);
         std::swap(bounce_, other.bounce_), std::swap(managed_, other.managed_);
     }
 
     hip_api_t const* api_ = nullptr;
-
-    /** The stream made here and destroyed with the executor, null when the caller lent @c stream_. */
-    hip_stream_handle_t owned_stream_ = nullptr;
 
     hip_stream_handle_t stream_ = nullptr;
     hip_event_t event_;

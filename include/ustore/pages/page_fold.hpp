@@ -37,7 +37,7 @@
 
 namespace unum::ustore::pages {
 
-// A write carries a dense tree, a removal nothing, and a change a chain of edits
+/** A write holds a dense tree, a removal nothing, and a change a chain of edits. */
 using utilities::delta_kind_t;
 using utilities::delta_view_t;
 
@@ -215,7 +215,7 @@ struct page_fold_t {
 
         if (status_t status = growth_status(keep.resize(edits.size(), 1)); status.failed()) return status;
         auto targets_content = [](edit_t const& edit) noexcept {
-            return edit.modification == modification_t::splice_k || carries_field(edit.modification);
+            return edit.modification == modification_t::splice_k || has_field(edit.modification);
         };
         auto removes = [](edit_t const& edit, element_key_t const& element) noexcept {
             return edit.modification == modification_t::remove_k && edit.element == element;
@@ -233,13 +233,13 @@ struct page_fold_t {
                     if (targets_content(edits[older]) && edits[older].element == edits[newer].element) keep[older] = 0;
 
         for (std::size_t older = 0; older != edits.size(); ++older) {
-            if (!keep[older] || !carries_field(edits[older].modification)) continue;
+            if (!keep[older] || !has_field(edits[older].modification)) continue;
             element_key_t const element = edits[older].element;
             for (std::size_t newer = older + 1; newer != edits.size(); ++newer) {
                 edit_t const& candidate = edits[newer];
                 if (!keep[newer]) continue;
                 if (reincarnates(candidate, element) || removes(candidate, element)) break;
-                if (!carries_field(candidate.modification) || !(candidate.element == element) ||
+                if (!has_field(candidate.modification) || !(candidate.element == element) ||
                     candidate.field != edits[older].field)
                     continue;
                 if (candidate.modification == modification_t::remove_attributes_k) {

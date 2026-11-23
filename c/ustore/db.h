@@ -124,19 +124,19 @@ typedef enum ustore_admission_t {
 } ustore_admission_t;
 
 /** Admits or rejects @p count listed keys at once, never zero, writing one admission per key into @p admissions, a
- *  buffer the library owns for the call. Runs on the thread running the call, never concurrently with itself within
- *  one call. */
+ *  buffer the library owns for the call. Called concurrently from the executor's threads. */
 typedef void (*ustore_predicate_callback_t)(ustore_key_t const* keys, ustore_admission_t* admissions,
                                             ustore_size_t count, void* state);
 
 /** How costly one predicate call is, which decides where in a scan it is asked. */
 typedef enum ustore_predicate_cost_t {
 
-    /** Asked once per page of listed keys, before patterns or filters read any value, so it narrows those reads. */
+    /** Asked once per page of listed keys, or per round of a cursor's task, before patterns or
+     *  filters read any value, so it narrows those reads. */
     ustore_predicate_cheap_k = 0,
 
-    /** Asked once per page about the keys patterns and filters kept, for handlers that pay per call, such as a lookup
-     *  in an external database. */
+    /** Asked once per page, or per round of a cursor's task, about the keys patterns and filters
+     *  kept, for handlers that pay per call, such as a lookup in an external database. */
     ustore_predicate_expensive_k = 1,
 
 } ustore_predicate_cost_t;
@@ -310,6 +310,12 @@ typedef struct ustore_database_init_ram_t {
      *  refusing it; zero sets none. The description reports the class picked. */
     ustore_cpu_class_t cpu_class_ceiling;
 
+    /** Bytes of keys and values the database may hold, past which a write, import or ingest
+     *  answers @c ustore_status_capacity_exhausted_k. Every write counts the bytes it lands, and
+     *  only a clear gives them back, as removals and overwrites leave older versions to the store;
+     *  zero takes 16 GiB. */
+    ustore_size_t memory_limit;
+
 } ustore_database_init_ram_t;
 
 /**
@@ -351,6 +357,12 @@ typedef struct ustore_database_open_ram_t {
      *  intersected with what the CPU runs, so a class the CPU lacks narrows the pick rather than
      *  refusing it; zero sets none. The description reports the class picked. */
     ustore_cpu_class_t cpu_class_ceiling;
+
+    /** Bytes of keys and values the database may hold, past which a write, import or ingest
+     *  answers @c ustore_status_capacity_exhausted_k. Every write counts the bytes it lands, and
+     *  only a clear gives them back, as removals and overwrites leave older versions to the store;
+     *  zero takes 16 GiB. */
+    ustore_size_t memory_limit;
 
 } ustore_database_open_ram_t;
 
@@ -396,6 +408,14 @@ typedef struct ustore_database_open_rocksdb_t {
     /** Entries of @c data_directories. */
     ustore_size_t data_directories_count;
 
+    /** Bytes of host memory the engine may cache and buffer, a quarter of it for one block cache
+     *  and a quarter for one write buffer manager every column family shares; zero takes 1 GiB. */
+    ustore_size_t memory_limit;
+
+    /** Threads of the pool this database owns, which runs its flushes and compactions, never the
+     *  process-global environment's; zero takes 2. */
+    ustore_size_t background_threads;
+
 } ustore_database_open_rocksdb_t;
 
 /**
@@ -437,6 +457,14 @@ typedef struct ustore_database_view_rocksdb_t {
     /** Entries of @c data_directories. */
     ustore_size_t data_directories_count;
 
+    /** Bytes of host memory the engine may cache and buffer, a quarter of it for one block cache
+     *  and a quarter for one write buffer manager every column family shares; zero takes 1 GiB. */
+    ustore_size_t memory_limit;
+
+    /** Threads of the pool this database owns, which runs its flushes and compactions, never the
+     *  process-global environment's; zero takes 2. */
+    ustore_size_t background_threads;
+
 } ustore_database_view_rocksdb_t;
 
 /**
@@ -477,13 +505,22 @@ typedef struct ustore_database_open_leveldb_t {
     /** Directory of the database, which must exist. */
     ustore_bytes_view_t directory;
 
+    /** Bytes of host memory the engine may cache and buffer, a quarter of it for the block cache
+     *  and a quarter for the write buffer; zero takes 1 GiB. */
+    ustore_size_t memory_limit;
+
+    /** Threads that compact the database, of which LevelDB runs one, so zero and one are accepted
+     *  and more answers @c ustore_status_unsupported_k. */
+    ustore_size_t background_threads;
+
 } ustore_database_open_leveldb_t;
 
 /**
  *  @brief Serves a directory in place through the LevelDB engine, creating the database if absent.
  *
  *  @par Statuses:
- *  - @c ustore_status_unsupported_k The library was built without the engine.
+ *  - @c ustore_status_unsupported_k The library was built without the engine, or more than one
+ *    @c background_threads are asked.
  *  - @c ustore_status_device_k The executor computes on a device.
  *  - @c ustore_status_contended_k The executor serves another call.
  *  - @c ustore_status_invalid_argument_k The @c database output is @c NULL, or the @c directory is
@@ -591,6 +628,73 @@ typedef struct ustore_database_open_nvme_t {
  */
 USTORE_EXPORT void ustore_database_open_nvme(ustore_database_open_nvme_t* arguments);
 
+/** The arguments of @c ustore_database_view_nvme, where a zero size keeps the engine's default. */
+typedef struct ustore_database_view_nvme_t {
+
+    /** Output for the opened database, left @c NULL on failure. */
+    ustore_database_t* database;
+
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. The database moves
+     *  bytes as the placement of one made by @c ustore_executor_for_nvme names, read once here, and
+     *  with that call's defaults for any other executor and for none. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
+    ustore_outcome_t* outcome;
+
+    /** Whether the call returns final, the default, or once submitted. */
+    ustore_completion_t completion;
+
+    /** The manifest of an existing database, <tt>\<database\>.ustore.json</tt>, in its first data
+     *  directory. */
+    ustore_bytes_view_t directory;
+
+    /** Further data directories, as the database was opened with, or null. */
+    ustore_data_directory_t const* data_directories;
+
+    /** Entries of @c data_directories. */
+    ustore_size_t data_directories_count;
+
+    /** Bytes of host memory the engine may pin and cache. */
+    ustore_size_t memory_limit;
+
+    /** Operations that may run on one collection at once. */
+    ustore_size_t collection_concurrency_limit;
+
+    /** Bytes of values each collection may cache. */
+    ustore_size_t collection_cache_limit;
+
+    /** The newest CPU class the database may confine its waits, atomics and string kernels to,
+     *  intersected with what the CPU runs, so a class the CPU lacks narrows the pick rather than
+     *  refusing it; zero sets none. The description reports the class picked. */
+    ustore_cpu_class_t cpu_class_ceiling;
+
+} ustore_database_view_nvme_t;
+
+/**
+ *  @brief Serves the database a manifest names through the NVMe engine, read-only.
+ *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
+ *
+ *  The database reads the state its manifest named at open, up to its durable stamp, and writes
+ *  nothing to any data directory: no manifest, no recovery of torn commits and no sweep of leftover
+ *  runs, at open or at close. It takes no lock, so it reads beside a writer the runs its manifest
+ *  named. It refuses every call that would change it with @c ustore_status_read_only_k: writes,
+ *  removes, transactions, collection creates and drops, clears, flushes, ingests and compactions.
+ *  Snapshots and their saves still serve.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_unsupported_k The library was built without the engine, the manifest names
+ *    raw media, or no compiled class fits under the @c cpu_class_ceiling.
+ *  - @c ustore_status_device_k The executor computes on a device.
+ *  - @c ustore_status_contended_k The executor serves another call.
+ *  - @c ustore_status_invalid_argument_k The @c database output is @c NULL, the @c directory names
+ *    no @c .ustore.json file, the counted @c data_directories are @c NULL or one has an empty path,
+ *    or a size is out of range.
+ *  - @c ustore_status_not_found_k The manifest or its directory does not exist.
+ *  - @c ustore_status_malformed_k The manifest is corrupt or the system collections are missing.
+ */
+USTORE_EXPORT void ustore_database_view_nvme(ustore_database_view_nvme_t* arguments);
+
 /** What an open database reports about itself in one call, where every size is the engine's estimate, and zero where
  *  the engine keeps none. */
 typedef struct ustore_database_description_t {
@@ -620,11 +724,11 @@ typedef struct ustore_database_description_t {
 
     /** Bytes of the NVMe engine's io_uring arena the locked-memory cap refused to pin, so each
      *  request pins its own. */
-    ustore_size_t pin_refused_bytes;
+    ustore_size_t unpinned_staging_bytes;
 
     /** Requests the NVMe engine sent unpinned while its arena was pinned, as each crossed a
      *  gibibyte of it. */
-    ustore_size_t crossing_requests;
+    ustore_size_t requests_across_registered_slots;
 
 } ustore_database_description_t;
 
@@ -1102,11 +1206,11 @@ USTORE_EXPORT void ustore_collection_list(ustore_collection_list_t* arguments);
  *      identifier addressing it.
  *
  *  Runs at the head of the database. A name is recorded with the collection in one step and
- *  survives a crash beside it, and a name another collection carries, even one a concurrent creator
+ *  survives a crash beside it, and a name another collection holds, even one a concurrent creator
  *  took first, fails the call and creates nothing. Each engine keeps the names in the system
  *  collection @c _names and every collection's modality and name in @c _collections, which no
  *  identifier reaches, and a name resolves in two phases: once through @c ustore_collection_find,
- *  and from then on by identifier, as no other call carries one. A name starting with @c _ is
+ *  and from then on by identifier, as no other call holds one. A name starting with @c _ is
  *  reserved for system collections and refused.
  */
 typedef struct ustore_collection_create_t {
@@ -1123,8 +1227,8 @@ typedef struct ustore_collection_create_t {
     /** Whether the call returns final, the default, or once submitted. */
     ustore_completion_t completion;
 
-    /** Optional name no other collection carries and not starting with @c _, where a zeroed view creates a collection
-     *  without one. */
+    /** Optional name no other collection holds and not starting with @c _, where a zeroed view
+     *  creates a collection without one. */
     ustore_bytes_view_t name;
 
     /** What the collection holds, which fixes how it is keyed and so which calls reach it. */
@@ -1148,7 +1252,7 @@ typedef struct ustore_collection_create_t {
  *    is empty with non-null data, or the @c collection output is @c NULL.
  *  - @c ustore_status_unsupported_k The executor computes on a device, or a documents, graph or
  *    pages collection is asked of an NVMe database whose values share one size.
- *  - @c ustore_status_already_exists_k Another collection carries the @c name.
+ *  - @c ustore_status_already_exists_k Another collection holds the @c name.
  *  - @c ustore_status_write_conflict_k Concurrent commits kept conflicting, on the RAM and NVMe
  *    engines.
  *  - @c ustore_status_capacity_exhausted_k The name outgrows the NVMe schema's record, or every
@@ -1159,10 +1263,11 @@ USTORE_EXPORT void ustore_collection_create(ustore_collection_create_t* argument
 /**
  *  @brief The arguments of @c ustore_collection_find, which reads the collections a batch of names address.
  *
- *  Collections are created and dropped only at the head, so their names are read at the head or at a snapshot and
- *  never inside a transaction, and resolving a name never joins the conflicts of the work that follows it. A name no
- *  collection carries, the names of the system collections included, answers the nil UUID, a zero modality and an
- *  unset presence bit. Every output holds one entry per name inside @c arena.
+ *  Collections are created and dropped only at the head, so their names are read at the head or at
+ *  a snapshot and never inside a transaction, and resolving a name never joins the conflicts of the
+ *  work that follows it. A name no collection holds, the names of the system collections included,
+ *  answers the nil UUID, a zero modality and an unset presence bit. Every output holds one entry
+ *  per name inside @c arena.
  */
 typedef struct ustore_collection_find_t {
 
@@ -1187,8 +1292,8 @@ typedef struct ustore_collection_find_t {
     /** Names to resolve, one per task. */
     ustore_strings_view_t names;
 
-    /** Optional output for a bitset of @c count bits marking the names a collection carries, addressed as Apache Arrow
-     *  does, inside @c arena. */
+    /** Optional output for a bitset of @c count bits marking the names a collection holds,
+     *  addressed as Apache Arrow does, inside @c arena. */
     ustore_octet_t const** presences;
 
     /** Output for the identifiers of the collections the names address, inside @c arena. */
@@ -1254,7 +1359,7 @@ typedef struct ustore_collection_drop_t {
  *  - @c ustore_status_invalid_argument_k The @c mode is unknown, @c ustore_drop_values_k empties a
  *    strings collection, or a snapshot is open while @c ustore_drop_collection_k drops the
  *    collection on the RAM and RocksDB engines.
- *  - @c ustore_status_not_found_k No collection carries the identifier, a system one included.
+ *  - @c ustore_status_not_found_k No collection holds the identifier, a system one included.
  *  - @c ustore_status_write_conflict_k Concurrent commits kept conflicting, on the RAM and NVMe
  *    engines.
  *  - @c ustore_status_capacity_exhausted_k Every shared channel is taken on the NVMe engine.
@@ -1569,7 +1674,7 @@ typedef struct ustore_changes_cursor_next_t {
     /** Output for what every change did, inside @c arena. */
     ustore_change_kind_t const** kinds;
 
-    /** Optional output for the bytes every change carries as a tape inside @c arena, empty for a
+    /** Optional output for the bytes every change holds as a tape inside @c arena, empty for a
      *  removal; @c NULL skips them. */
     ustore_strings_view_t* values;
 
@@ -1629,10 +1734,12 @@ USTORE_EXPORT ustore_status_t ustore_ingest_order_from_name(ustore_bytes_view_t 
 /**
  *  @brief An ingest under way into one collection, which lands every row appended to it as one commit of its own.
  *
- *  It joins no transaction and watches nothing: every row lands at one stamp, so a reader sees all of the ingest or
- *  none of it, and a transaction that began before it and wrote a key it lands fails at commit. Its calls run on the
- *  calling thread, one at a time. On NVMe it holds the database's maintenance claim from its init to its finish or
- *  free, so flushes, compactions, creates and drops wait for it meanwhile.
+ *  It joins no transaction and watches nothing: every row lands at one stamp, so a reader sees all
+ *  of the ingest or none of it, and a transaction that began before it and wrote a key it lands
+ *  fails at commit. Its calls run one at a time, each on the executor it names, and its state lives
+ *  on the memory domain of the init's executor. On NVMe it holds the database's maintenance claim
+ *  from its init to its finish or free, so flushes, compactions, creates and drops wait for it all
+ *  the while it is open.
  */
 typedef struct ustore_ingest_handle_t* ustore_ingest_t;
 
@@ -1645,8 +1752,15 @@ typedef struct ustore_ingest_init_t {
     /** An open database, which stays open until the ingest is freed. */
     ustore_database_t database;
 
-    /** Output for the outcome, final on return. */
+    /** Executor that runs the call, whose memory domain holds the ingest's state; @c NULL runs it
+     *  on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
+
+    /** Whether the call returns final, the default, or once submitted. */
+    ustore_completion_t completion;
 
     /** Collection the rows land in. */
     ustore_collection_id_t collection;
@@ -1663,7 +1777,9 @@ typedef struct ustore_ingest_init_t {
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL.
  *  - @c ustore_status_invalid_argument_k The @c ingest output is @c NULL, or the @c order is unknown.
  *  - @c ustore_status_read_only_k The database was opened read-only.
- *  - @c ustore_status_unsupported_k The engine ingests nothing, or not into that collection's modality.
+ *  - @c ustore_status_unsupported_k The engine ingests nothing, or not into that collection's
+ *    modality, or the executor computes on a device.
+ *  - @c ustore_status_contended_k The executor serves another call.
  *  - @c ustore_status_not_found_k The collection does not exist.
  */
 USTORE_EXPORT void ustore_ingest_init(ustore_ingest_init_t* arguments);
@@ -1671,17 +1787,24 @@ USTORE_EXPORT void ustore_ingest_init(ustore_ingest_init_t* arguments);
 /**
  *  @brief The arguments of @c ustore_ingest_append, which hands an ingest one batch of rows.
  *
- *  The rows are copied or written before the call returns, so every view may die after it. Blobs, documents and pages
- *  take @c keys and @c values, strings take their strings as @c values and the keys they map onto as @c keys, and edges
- *  take @c sources, @c targets and optionally @c edges.
+ *  The rows are copied or written before the outcome is final, so every view may die after it.
+ *  Blobs, documents and pages take @c keys and @c values, strings take their strings as @c values
+ *  and the keys they map onto as @c keys, and edges take @c sources, @c targets and optionally
+ *  @c edges as their identifiers.
  */
 typedef struct ustore_ingest_append_t {
 
     /** The ingest, which a failed append leaves as it was. */
     ustore_ingest_t ingest;
 
-    /** Output for the outcome, final on return. */
+    /** Executor that runs the call, parsing values over its threads, or @c NULL for the caller. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
+
+    /** Whether the call returns final, the default, or once submitted. */
+    ustore_completion_t completion;
 
     /** Number of rows. */
     ustore_size_t count;
@@ -1710,20 +1833,29 @@ typedef struct ustore_ingest_append_t {
  *  - @c ustore_status_invalid_argument_k The @c ingest is @c NULL or finished, a view the modality
  *    needs is missing, the @c values come in an unknown layout, or a key does not ascend past every
  *    key before it under @c ustore_ingest_sorted_k.
+ *  - @c ustore_status_unsupported_k The executor computes on a device.
+ *  - @c ustore_status_contended_k Another append or the finish runs on the same @c ingest, or the
+ *    executor serves another call.
  *  - @c ustore_status_malformed_k A value is past what the collection admits, a document no JSON, or a page no XML.
  *  - @c ustore_status_capacity_exhausted_k The volume is full.
- *  - @c ustore_status_contended_k Another append or the finish runs on the same @c ingest.
  */
 USTORE_EXPORT void ustore_ingest_append(ustore_ingest_append_t* arguments);
 
 /** The arguments of @c ustore_ingest_finish, which lands every row appended as one commit and ends the ingest. */
 typedef struct ustore_ingest_finish_t {
 
-    /** The ingest, finished on return whatever the outcome, which only @c ustore_ingest_free still takes. */
+    /** The ingest, finished once the outcome is final unless the call was refused as contended,
+     *  after which only @c ustore_ingest_free takes it. */
     ustore_ingest_t ingest;
 
-    /** Output for the outcome, final on return. */
+    /** Executor that runs the call, where @c NULL runs it on the calling thread. */
+    ustore_executor_t executor;
+
+    /** Output for the outcome, final once its status leaves @c ustore_status_deferred_k. */
     ustore_outcome_t* outcome;
+
+    /** Whether the call returns final, the default, or once submitted. */
+    ustore_completion_t completion;
 
     /** Buffered: visible on return, durable at the next flush, dropped whole by a crash before it. */
     ustore_durability_t durability;
@@ -1739,9 +1871,10 @@ typedef struct ustore_ingest_finish_t {
  *
  *  @par Statuses:
  *  - @c ustore_status_invalid_argument_k The @c ingest is @c NULL or finished, or the @c durability is unknown.
+ *  - @c ustore_status_unsupported_k The executor computes on a device.
+ *  - @c ustore_status_contended_k An append runs on the same @c ingest, the executor serves another
+ *    call, or memory runs kept refilling while the ingest waited them out.
  *  - @c ustore_status_not_found_k The collection was dropped meanwhile.
- *  - @c ustore_status_contended_k An append runs on the same @c ingest, or memory runs kept
- *    refilling while the ingest waited them out.
  *  - @c ustore_status_capacity_exhausted_k The volume is full.
  */
 USTORE_EXPORT void ustore_ingest_finish(ustore_ingest_finish_t* arguments);

@@ -76,7 +76,7 @@ if (NOT TARGET rocksdb)
     # RocksDB loads fixed-width integers from unaligned addresses on purpose, and exempts those loads from the
     # undefined-behavior sanitizer only when told a sanitized build is running
     target_compile_definitions(rocksdb PRIVATE ROCKSDB_UBSAN_RUN)
-    # RocksDB installs its static archive through an export set, which must also carry the archives it links
+    # RocksDB installs its static archive through an export set, which must also hold the archives it links
     if (TARGET uring)
         install(
             TARGETS uring

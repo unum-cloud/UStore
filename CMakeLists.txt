@@ -168,7 +168,7 @@ include(cmake/ustore_gpu.cmake)
 
 # The RAM and NVMe engines compile one variant per CPU class, in `src/<engine>/variants_<class>.cpp`, and their opens
 # pick the newest one the running CPU admits. A class is its parent plus the ForkUnion capabilities its waiter and
-# atomic reference add beyond the spin hint every core of an architecture carries and the StringZilla capabilities its
+# atomic reference add beyond the spin hint every core of an architecture holds and the StringZilla capabilities its
 # strings kit adds, restated here row for row from `parent_class_of`, `waiter_for_cpu_class`, `atomic_ref_for_cpu_class`
 # and `stringzilla_capabilities_of` of `src/lib.hpp`. It exists when its parent does and every one of those capabilities
 # is enabled. A multiversioned build keeps every class that exists. A monoversioned build keeps none, the `serial` floor
@@ -358,7 +358,7 @@ if (${USTORE_WITH_NVME})
     list(APPEND ustore_engine_names_ "nvme")
 
     # The engine's compaction on the device, whose objects both libraries take: host C++ launching the bundles' kernels
-    # through the driver, so it builds everywhere and a device whose bundle carries no kernels makes no compactor
+    # through the driver, so it builds everywhere and a device whose bundle holds no kernels makes no compactor
     add_library(ustore_nvme_compaction OBJECT "${CMAKE_CURRENT_SOURCE_DIR}/src/nvme/compaction.cpp")
     target_link_libraries(
         ustore_nvme_compaction
@@ -463,7 +463,7 @@ target_compile_options(
 )
 set_target_properties(ustore_static PROPERTIES EXPORT_NAME static)
 set_target_properties(ustore_shared PROPERTIES EXPORT_NAME shared)
-# `SOVERSION` carries the major alone, the only break the C ABI admits
+# `SOVERSION` holds the major alone, the only break the C ABI admits
 set_target_properties(ustore_shared PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR})
 target_compile_definitions(
     ustore_shared
@@ -480,7 +480,7 @@ target_link_libraries(
 )
 # Every GPU runtime and cuFile open through `dlopen` at first use, which glibc before 2.34 keeps in `libdl`
 target_link_libraries(ustore_static PUBLIC ${CMAKE_DL_LIBS})
-# On Apple platforms the Metal layer calls Metal and the Objective-C runtime directly, which every Mac carries
+# On Apple platforms the Metal layer calls Metal and the Objective-C runtime directly, which every Mac holds
 if (USTORE_METAL_ARCH AND APPLE)
     target_link_libraries(ustore_static PUBLIC "-framework Metal" "-framework Foundation" objc)
     target_link_libraries(ustore_shared PRIVATE "-framework Metal" "-framework Foundation" objc)

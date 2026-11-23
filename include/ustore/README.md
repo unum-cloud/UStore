@@ -6,7 +6,7 @@ Every subfolder `ustore/<dir>/` opens `unum::ustore::<dir>`, and every header is
 
 ## Stability
 
-These headers carry no stability promise.
+These headers hold no stability promise.
 Their names, layouts and signatures change with the engines that instantiate them, in any release, and only the C ABI of `c/ustore/*.h` is versioned.
 Pin a commit, not a version, when building on them.
 
@@ -16,7 +16,7 @@ Pin a commit, not a version, when building on them.
   - `types.hpp`: `status_t`, `status_code_t` and `expected`, UUIDs, keys and collection IDs with their orders, hashes and text, edges, value views, byte views and the serialization over them, owned text and integer rounding.
     `cpp/ustore/status.hpp` and `cpp/ustore/types.hpp` re-export it all into `unum::ustore`.
   - `ram_buffers.hpp`: the growing arena behind `ustore_arena_t` and every call's scratch, the `arena_allocator` SmashTable's containers take, the aligned and budgeted allocators of unbuffered I/O with the buffers they grow, and `growing_strings`, a column of strings exported as a tape.
-  - `ram_device.hpp`: `topology_t`, `executor_t`, `lent_pool_t` and `pool_view_t` over ForkUnion's C ABI.
+  - `ram_device.hpp`: `topology_t`, `ram_executor_t` and `pool_view_t` over ForkUnion's C ABI.
   - `vram_device.hpp`: the vendor-neutral face of the GPU residency, every vendor's driver, the device listing, and the kernels every vendor's executor launches.
   - `vram_nvidia_device.hpp`: CUDA devices, streams, events and buffers from the host.
   - `vram_amd_device.hpp`: AMD devices from the host, the HIP runtime opened at first use, the device listing, modules, events and the executor.
@@ -45,7 +45,7 @@ Pin a commit, not a version, when building on them.
   - `nvme_tree.hpp`: configurations and schemas, the merge of one level into the next, and the level set readers see; `nvme_lsm_level.hpp`: the LSM levels.
   - `nvme_published_runs.hpp`: `commit_ledger`, `stamp_pin` and `pinned_snapshot`, the stamps and the sequencer every NVMe store commits through, `maintenance_claim`, the claim a database's maintenance runs under, and `published_runs`, the tree, memory runs and published view every NVMe store owns, with the commits, merges, flushes, compactions and truncations that move its runs.
   - `nvme_store.hpp`: `nvme_store`, the store of one collection, memory runs in front of a tree, with its snapshots; `nvme_value_cache.hpp`: its value cache; `nvme_store_cursor.hpp`: `nvme_store_cursor`.
-  - `nvme_transactions.hpp`: `transaction_deltas` and the read sets one transaction carries, `transaction_registry`, which orders and conflict-checks the transactions of one store, and `transaction_core`, the lifecycle, stamps and watches every transaction is made of.
+  - `nvme_transactions.hpp`: `transaction_deltas` and the read sets one transaction holds, `transaction_registry`, which orders and conflict-checks the transactions of one store, and `transaction_core`, the lifecycle, stamps and watches every transaction is made of.
   - `nvme_database.hpp`: databases of named collections, with their snapshots and optimistic transactions over the shared registry and core.
   - `nvme_single_collection_database.hpp`: single-collection databases, with their snapshots and transactions over the same registry and core.
 - `graph/`, in `unum::ustore::graph`:
@@ -76,7 +76,7 @@ Pin a commit, not a version, when building on them.
 ## Building
 
 Every template that owns a shared word or waits on one takes the atomic reference and the waiter as template parameters, wrapping the waiter in SmashTable's parking policy itself, and names no CPU class, instruction or ForkUnion `preferred_*` alias; `src/` picks both per CPU class.
-CMake exports the headers as the `ustore::header` interface target, which carries the include paths of `c/` and `include/` and links the header targets of ForkUnion, SmashTable and StringZilla, plus the include paths of yyjson and fmt, in the build tree.
+CMake exports the headers as the `ustore::header` interface target, which holds the include paths of `c/` and `include/` and links the header targets of ForkUnion, SmashTable and StringZilla, plus the include paths of yyjson and fmt, in the build tree.
 An install copies `include/ustore/` beside `c/ustore/` and `cpp/ustore/`, but none of the siblings' headers, so a consumer of the installed package brings each sibling's own package, as the C++ SDK already asks.
 Headers that call ForkUnion's C ABI, such as `ram_buffers.hpp` and `ram_device.hpp`, also need `forkunion::static` or `ustore::static` at link time.
 `docs/json_paths.hpp` calls StringZilla's dispatched kernels, which its header-only build answers with `sz_missing_library_k`, so it resolves nothing without `stringzilla::static` or `ustore::static`, and its callers fall back to yyjson.

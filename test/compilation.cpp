@@ -93,7 +93,7 @@ static_assert(
 static_assert(std::same_as<decltype(std::declval<blobs_collection_t const&>().remove(keys_view_t {})), status_t>);
 static_assert(std::same_as<decltype(std::declval<deferred_blobs_t const&>().remove(keys_view_t {})), deferred<>>);
 
-/* A deferred verb borrows its inputs as views of any contiguous batch, and an arena by reference,
+/* A deferred verb views its inputs as views of any contiguous batch, and an arena by reference,
  * so a temporary arena, which would die before the call is final, never reaches it */
 static_assert(reads_concept<deferred_blobs_t, std::array<ustore_key_t, 2>&, arena_t&>);
 static_assert(reads_concept<deferred_blobs_t, st::vector<ustore_key_t>&, arena_t&>);
@@ -139,12 +139,12 @@ static_assert(std::is_nothrow_move_constructible_v<changes_cursor_t> &&
 static_assert(std::is_nothrow_move_constructible_v<ingest_t> && !std::is_copy_constructible_v<ingest_t>);
 static_assert(std::is_nothrow_move_constructible_v<arrow_export_t> && !std::is_copy_constructible_v<arrow_export_t>);
 
-/* A shorthand result owns its one-off arena, while a view only borrows one */
+/* A shorthand result owns its one-off arena, while a view only views one */
 static_assert(owns_arena_concept<owned_value_t, value_view_t>);
 static_assert(owns_arena_concept<owned<values_view_t>, values_view_t>);
 static_assert(!owns_arena_concept<value_view_t, value_view_t>);
 
-/* A progress callable never throws, as every wrapper is noexcept, and the call borrows it, so a
+/* A progress callable never throws, as every wrapper is noexcept, and the call views it, so a
  * temporary never does */
 using continuing_progress_t = decltype([](ustore_size_t, ustore_size_t) noexcept { return ustore_continue_k; });
 using throwing_progress_t = decltype([](ustore_size_t, ustore_size_t) { return ustore_continue_k; });
@@ -241,7 +241,7 @@ void test_wrappers_compile(config_t const& config) {
     [[maybe_unused]] bool const field_matches =
         documents_collection[collection_key_field_t {key_from_integer(56), "hello"}].value() == "world";
 
-    // The same verbs blocking on an executor, and answering deferred calls that borrow their inputs
+    // The same verbs blocking on an executor, and answering deferred calls that view their inputs
     auto [executor, executor_status] = executor_handle_t::for_ram({.threads = 1});
     if (!expect_true(executor_status.succeeded())) return;
     expect_true(database_t::init_ram({}, executor).has_value());
@@ -253,58 +253,56 @@ void test_wrappers_compile(config_t const& config) {
 
     database_on<ustore_completion_deferred_k> const deferred_head = database.deferred(executor);
     deferred_blobs_t const deferred_main = deferred_head[main_collection];
-    std::array<ustore_key_t, 2> const borrowed_keys {key_from_integer(43), key_from_integer(44)};
+    std::array<ustore_key_t, 2> const viewed_keys {key_from_integer(43), key_from_integer(44)};
     values_tape_t blobs;
     fill_tape(blobs, {"left", "right"});
-    expect_true(deferred_main.write(borrowed_keys, blobs).wait().succeeded());
-    deferred<values_view_t> reading = deferred_main.read(borrowed_keys, arena);
+    expect_true(deferred_main.write(viewed_keys, blobs).wait().succeeded());
+    deferred<values_view_t> reading = deferred_main.read(viewed_keys, arena);
     [[maybe_unused]] status_code_t const polled = reading.status();
     expected<values_view_t> read = reading.wait();
     expect_true(read.has_value());
     if (read)
         for ([[maybe_unused]] value_view_t const element : *read) {}
-    deferred<> removing = deferred_main.remove(borrowed_keys);
+    deferred<> removing = deferred_main.remove(viewed_keys);
     expect_true(removing.wait().succeeded());
     expect_true(main_collection.deferred(executor).clear_values().wait().succeeded());
     expected<deferred_blobs_t> created = deferred_head.create("created").wait();
     expect_true(created.has_value());
     if (created) {
-        expect_true(deferred_head[*created].remove(borrowed_keys).wait().succeeded());
+        expect_true(deferred_head[*created].remove(viewed_keys).wait().succeeded());
         expect_true(deferred_head.drop(*created).wait().succeeded());
     }
     expect_true(deferred_head.collections(arena).wait().has_value());
     expect_true(deferred_head.describe().wait().has_value());
     expect_true(deferred_head.flush().wait().succeeded());
 
-    // Deferred documents, graphs and strings, each verb borrowing its inputs
+    // Deferred documents, graphs and strings, each verb viewing its inputs
     expect_true(head.find_or_create<docs_collection_t>("docs").has_value());
     deferred_docs_t const deferred_documents = *deferred_head.find<docs_collection_t>("docs");
     values_tape_t documents;
     fill_tape(documents, {R"({"hello":"world"})", R"({"hello":"again"})"});
-    expect_true(deferred_documents.write(borrowed_keys, documents).wait().succeeded());
-    [[maybe_unused]] expected<values_view_t> const documents_read =
-        deferred_documents.read(borrowed_keys, arena).wait();
+    expect_true(deferred_documents.write(viewed_keys, documents).wait().succeeded());
+    [[maybe_unused]] expected<values_view_t> const documents_read = deferred_documents.read(viewed_keys, arena).wait();
     values_tape_t hello;
     fill_tape(hello, {"hello"});
     [[maybe_unused]] expected<values_view_t> const fields_read =
-        deferred_documents.read(borrowed_keys, arena, hello, ustore_docs_field_type_string_k).wait();
-    [[maybe_unused]] expected<sz::strings_view_t> const gist = deferred_documents.gist(borrowed_keys, arena).wait();
+        deferred_documents.read(viewed_keys, arena, hello, ustore_docs_field_type_string_k).wait();
+    [[maybe_unused]] expected<sz::strings_view_t> const gist = deferred_documents.gist(viewed_keys, arena).wait();
     auto const header = make_table_header().with<std::string_view>("hello");
     [[maybe_unused]] expected<docs_table<std::string_view>> const gathered =
-        deferred_documents.gather(borrowed_keys, header, arena).wait();
-    expect_true(deferred_documents.remove(borrowed_keys).wait().succeeded());
+        deferred_documents.gather(viewed_keys, header, arena).wait();
+    expect_true(deferred_documents.remove(viewed_keys).wait().succeeded());
     expect_true(head.create<graph_collection_t>("graph").has_value());
     deferred_graph_t const deferred_graph = *deferred_head.find<graph_collection_t>("graph");
-    std::array<edge_t, 1> const borrowed_edges {edge_t {key_from_integer(43), key_from_integer(44)}};
+    std::array<edge_t, 1> const viewed_edges {edge_t {key_from_integer(43), key_from_integer(44)}};
     ustore_vertex_role_t const leaving = ustore_vertex_role_source_k;
-    strided_span<ustore_vertex_role_t const> const roles {{&leaving, 0}, borrowed_keys.size()};
-    expect_true(deferred_graph.write_edges(borrowed_edges).wait().succeeded());
-    expect_true(deferred_graph.write_vertices(borrowed_keys).wait().succeeded());
-    [[maybe_unused]] expected<edges_view_t> const edges_read = deferred_graph.read_edges(borrowed_keys, arena).wait();
-    [[maybe_unused]] expected<degrees_view_t> const degrees =
-        deferred_graph.degrees(borrowed_keys, arena, roles).wait();
-    expect_true(deferred_graph.remove_edges(borrowed_edges).wait().succeeded());
-    expect_true(deferred_graph.remove_vertices(borrowed_keys).wait().succeeded());
+    strided_span<ustore_vertex_role_t const> const roles {{&leaving, 0}, viewed_keys.size()};
+    expect_true(deferred_graph.write_edges(viewed_edges).wait().succeeded());
+    expect_true(deferred_graph.write_vertices(viewed_keys).wait().succeeded());
+    [[maybe_unused]] expected<edges_view_t> const edges_read = deferred_graph.read_edges(viewed_keys, arena).wait();
+    [[maybe_unused]] expected<degrees_view_t> const degrees = deferred_graph.degrees(viewed_keys, arena, roles).wait();
+    expect_true(deferred_graph.remove_edges(viewed_edges).wait().succeeded());
+    expect_true(deferred_graph.remove_vertices(viewed_keys).wait().succeeded());
 
     expect_true(head.create<strings_collection_t>("strings").has_value());
     deferred_strings_t const deferred_strings = *deferred_head.find<strings_collection_t>("strings");
@@ -339,7 +337,7 @@ void test_wrappers_compile(config_t const& config) {
             transaction.on().find<docs_collection_t>("docs");
         transaction_on<ustore_completion_deferred_k> const deferred_transaction = transaction.deferred(executor);
         [[maybe_unused]] expected<deferred_blobs_t> const deferred_named = deferred_transaction["docs"];
-        expect_true(deferred_transaction.find("main")->remove(borrowed_keys).wait().succeeded());
+        expect_true(deferred_transaction.find("main")->remove(viewed_keys).wait().succeeded());
         [[maybe_unused]] expected<read_stamp_t> const staged = deferred_transaction.stage().wait();
         [[maybe_unused]] status_t const rolled_back = deferred_transaction.rollback().wait();
         [[maybe_unused]] expected<commit_stamp_t> const committed = deferred_transaction.commit().wait();
@@ -358,9 +356,9 @@ void test_wrappers_compile(config_t const& config) {
         [[maybe_unused]] expected<strings_read_collection_t> const snapshot_strings =
             snapshot.on().find<strings_collection_t>("strings");
         deferred_blobs_read_t const deferred_snapshot = *snapshot.deferred(executor).find("main");
-        expect_true(deferred_snapshot.read(borrowed_keys, arena).wait().has_value());
+        expect_true(deferred_snapshot.read(viewed_keys, arena).wait().has_value());
         auto const deferred_snapshot_documents = *snapshot.deferred(executor).find<docs_collection_t>("docs");
-        expect_true(deferred_snapshot_documents.read(borrowed_keys, arena).wait().has_value());
+        expect_true(deferred_snapshot_documents.read(viewed_keys, arena).wait().has_value());
         if (config.directory()) {
             std::string const saved = fmt::format("{}/{}", config.directory(), "saved");
             expect_true(create_directories(saved.c_str()));
@@ -413,8 +411,11 @@ void test_wrappers_match(config_t const& config) {
     match_t const filtered {.filter = bytes_of(older), .predicate = predicate_of(even_keys)};
     auto [cursor, cursor_status] = docs_cursor_t::make(receiver, people, smallest_key_k, filtered);
     if (!expect_true(cursor_status.succeeded())) return;
-    auto [page, page_status] = cursor.next_pairs(8, arena);
-    expect_true(page_status.succeeded() && page.keys.size() == 2 && page.keys[1] == key_from_integer(4));
+    auto [batches, batches_status] = cursor.next(8, arena);
+    std::size_t rows = 0;
+    for (ustore_docs_batch_view_t const& batch : batches) rows += batch.count;
+    expect_true(batches_status.succeeded() && rows == 2 &&
+                batches.back().keys[batches.back().count - 1] == key_from_integer(4));
     expect_true(asked != 0);
     expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
 }

@@ -18,7 +18,8 @@
 #include <algorithm>   // `std::is_sorted`
 #include <array>       // `std::array`
 #include <iterator>    // `std::make_move_iterator`
-#include <new>         // `std::nothrow`
+#include <memory>      // `std::destroy_at`
+#include <new>         // placement `new`
 #include <span>        // `std::span`
 #include <type_traits> // `std::is_same_v`
 #include <utility>     // `std::move`
@@ -33,10 +34,11 @@
 #include "ustore/pages/ram_store.hpp"       // `page_pair_t`
 #include "ustore/strings/ram_store.hpp"     // `string_pair_t`, `string_key_from`
 #include "ustore/utilities/algorithm.hpp"   // `merge_sort`
-#include "ustore/utilities/ram_buffers.hpp" // `growth_status`
+#include "ustore/utilities/ram_buffers.hpp" // `growth_status`, `arena_allocate`
 
 #include "database.hpp"          // `database_state`, `transaction_source`, `for_each_run`, `persist`
-#include "ingest_layer.hpp"      // `ingest_value_parser`, `ingest_values_t`
+#include "ingest_layer.hpp"      // `parse_ingest_values`, `ingest_values_t`
+#include "pages_layer.hpp"       // `clock_stamp`
 #include "utilities/batches.hpp" // `keyed_rows_t`, `keyed_rows_of`, `ingest_edges_of`
 
 namespace unum::ustore::ram {
@@ -73,12 +75,13 @@ bool precedes(entry_type_ const& first, entry_type_ const& second) noexcept {
 inline constexpr status_t descending_key_k {status_code_t::invalid_argument_k,
                                             "A key descends or repeats in a stream ingested as sorted"};
 
-/** Appends the entries of @p rows to @p entries, as a store of @p store_type_ files them, parsing every document and
- *  page through @p value_parser, and refusing a key that does not ascend when @p order promises it. */
-template <typename store_type_, strings_kit_concept strings_kit_type_>
+/** Appends the entries of @p rows to @p entries, as a store of @p store_type_ files them, copying
+ *  the @p values every row lands as, and refusing a key that does not ascend when @p order is
+ *  @c ustore_ingest_sorted_k. */
+template <typename store_type_>
 status_t gather_rows(keyed_rows_t const& rows, ustore_ingest_order_t order,
                      ingested_entries<typename store_type_::value_t>& entries,
-                     ingest_value_parser<strings_kit_type_>& value_parser) noexcept {
+                     std::span<std::span<byte_t const> const> values) noexcept {
     using entry_t = typename store_type_::value_t;
     if (status_t const reserved = growth_status(entries.reserve(entries.size() + rows.size())); reserved.failed())
         return reserved;
@@ -90,10 +93,7 @@ status_t gather_rows(keyed_rows_t const& rows, ustore_ingest_order_t order,
             entry = entry_t {std::move(key), rows.keys[row]};
         }
         else {
-            value_parser.rewind();
-            auto [value, value_status] = value_parser(rows, row);
-            if (value_status.failed()) return value_status;
-            auto [copied, copy_status] = copy_blob(value_view_t {value});
+            auto [copied, copy_status] = copy_blob(value_view_t {values[row]});
             if (st::failed(copy_status)) return translate(copy_status);
             entry = entry_t {rows.keys[row], typename entry_t::mapped_type {std::move(copied)}};
         }
@@ -214,7 +214,13 @@ struct ingest_state {
     database_state<cpu_class_, isolation_>& database;
     ustore_collection_id_t collection;
     ustore_ingest_order_t order;
-    ingest_value_parser<strings_kit_of<cpu_class_>> value_parser;
+
+    /** What the rows land as. */
+    ingest_values_t lands_as;
+
+    /** Where the next page parsed is placed, its sequence counting the pages parsed so far. */
+    pages::placement_t placement;
+
     any_ingested_entries_t entries;
 };
 
@@ -253,11 +259,10 @@ status_t ingest_init(ustore_ingest_init_t const& arguments, view_t const& view) 
                                                     return {};
                                                 });
     if (opened.failed()) return opened;
-    ingest_state<cpu_class_, isolation_>* const ingest = new (std::nothrow) ingest_state<cpu_class_, isolation_> {
-        database, arguments.collection, arguments.order, ingest_value_parser<strings_kit_of<cpu_class_>> {values},
-        std::move(entries)};
-    if (!ingest) return {status_code_t::out_of_memory_k, "Failed to allocate the ingest"};
-    (*arguments.ingest)->state = ingest;
+    auto [room, room_status] = arena_allocate<ingest_state<cpu_class_, isolation_>>(&(*arguments.ingest)->kept, 1);
+    if (room_status.failed()) return room_status;
+    (*arguments.ingest)->state = new (room.data()) ingest_state<cpu_class_, isolation_> {
+        database, arguments.collection, arguments.order, values, {clock_stamp(), 0}, std::move(entries)};
     return {};
 }
 
@@ -266,7 +271,9 @@ template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t ingest_append(ustore_ingest_append_t const& arguments, strings_arg_t const& values,
                        view_t const& view) noexcept {
     ingest_state<cpu_class_, isolation_>& ingest = *state_of<ingest_state<cpu_class_, isolation_>>(arguments.ingest);
-    return with_ingested_store(
+    std::size_t const bytes = arguments.count * sizeof(ustore_key_t) + strings_bytes(values, arguments.count);
+    if (status_t const charged = charge_landed(ingest.database, bytes); charged.failed()) return charged;
+    status_t const appended = with_ingested_store(
         ingest.database, ingest.collection, view, [&]<typename store_type_>(store_type_&) noexcept -> status_t {
             using entry_t = entry_of<store_type_>;
             ingested_entries<entry_t>* const entries = std::get_if<ingested_entries<entry_t>>(&ingest.entries);
@@ -280,13 +287,18 @@ status_t ingest_append(ustore_ingest_append_t const& arguments, strings_arg_t co
             }
             else {
                 auto [rows, rows_status] = utilities::keyed_rows_of(arguments, values);
-                gathered = rows_status.failed()
-                               ? rows_status
-                               : gather_rows<store_type_>(rows, ingest.order, *entries, ingest.value_parser);
+                if (rows_status.failed()) return rows_status;
+                auto [parsed, parsed_status] = parse_ingest_values<strings_kit_of<cpu_class_>>(ingest.lands_as, rows,
+                                                                                               ingest.placement, view);
+                gathered = parsed_status.failed() ? parsed_status
+                                                  : gather_rows<store_type_>(rows, ingest.order, *entries, parsed);
+                if (gathered.succeeded()) ingest.placement.sequence += static_cast<std::uint32_t>(rows.size());
             }
             while (gathered.failed() && entries->size() != before) entries->pop_back();
             return gathered;
         });
+    if (appended.failed()) refund_landed(ingest.database, bytes);
+    return appended;
 }
 
 /** Implements @c ustore_ingest_finish as one transaction of its own over the collection's store, published under one
@@ -321,7 +333,7 @@ status_t ingest_finish(ustore_ingest_finish_t const& arguments, view_t const&) n
 /** Implements @c ustore_ingest_free, dropping every entry the ingest still holds. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 void ingest_free(ustore_ingest_t handle) noexcept {
-    delete state_of<ingest_state<cpu_class_, isolation_>>(handle);
+    std::destroy_at(state_of<ingest_state<cpu_class_, isolation_>>(handle));
 }
 
 #pragma endregion Ingest

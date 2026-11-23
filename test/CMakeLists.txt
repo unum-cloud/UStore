@@ -59,13 +59,13 @@ if (${USTORE_WITH_NVME})
                     ustore_warnings
         )
         set(storage_arguments_ --directory ${CMAKE_BINARY_DIR}/test_data)
-        # Every suite reaching the tree's merger links the compactor, which makes no lane without a CUDA compiler
+        # Every suite reaching the tree's merger links the compactor, which makes no queue set without a CUDA compiler
         target_link_libraries(${storage_exe_} PRIVATE ustore_nvme_compaction)
         # The suites counting allocations share one replacement of the global allocation functions
         if (storage_name_ MATCHES "^(tree|database)$")
             target_sources(${storage_exe_} PRIVATE nvme/allocation_watch.cpp)
         endif ()
-        # The LSM suite merges on the device where the build carries one, launching the kernels the library embeds,
+        # The LSM suite merges on the device where the build holds one, launching the kernels the library embeds,
         # so it links the bundles, and on the transports that need no hardware option its device case may no longer
         # skip
         if (storage_name_ STREQUAL "tree")
@@ -90,7 +90,7 @@ if (${USTORE_WITH_NVME})
     endforeach ()
 
     # The database suites run as plain C++ everywhere, and merge on the device through the compactor once the build
-    # carries one
+    # holds one
     set(ustore_nvme_device_suites_ database_transaction single_collection_database_transaction
                                    single_collection_database_stress single_collection_database_transaction_stress
     )
@@ -130,7 +130,7 @@ if (${USTORE_WITH_NVME})
 endif ()
 
 # The compaction suite as plain C++ checks the comparator, the survival rule, the sorted-run split and the placement
-# without a device, over a compactor that makes no lane, so it builds without a CUDA compiler
+# without a device, over a compactor that makes no queue set, so it builds without a CUDA compiler
 set(ustore_compaction_host_source_ "${CMAKE_CURRENT_BINARY_DIR}/nvme/compaction_host.cpp")
 configure_file("${CMAKE_CURRENT_SOURCE_DIR}/nvme/compaction.cu" "${ustore_compaction_host_source_}" COPYONLY)
 add_executable(
@@ -147,7 +147,7 @@ target_link_libraries(
 add_test(NAME ustore_test_nvme_compaction_host COMMAND ustore_test_nvme_compaction_host)
 
 # The device half of the suite is the same source over the compiled compactor, whose kernels the library's bundle
-# carries, so it links the library for them; one unit instantiates the compactor for its key slots
+# holds, so it links the library for them; one unit instantiates the compactor for its key slots
 if (ustore_device_compaction_)
     add_executable(
         ustore_test_nvme_compaction "${ustore_compaction_host_source_}"

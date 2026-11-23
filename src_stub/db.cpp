@@ -97,7 +97,7 @@ status_t store_image(std::string const& directory, std::string const& image, std
     for (std::size_t bytes : sizes) total += bytes;
     for (std::size_t bytes : sizes) {
         finished += bytes;
-        if (!carries_on(progress, progress_state, finished, total)) {
+        if (!keeps_going(progress, progress_state, finished, total)) {
             std::remove(staging.c_str());
             return {ustore_status_cancelled_k, "The progress callback cancelled the save"};
         }
@@ -193,7 +193,7 @@ bool refuse_isolation(call_t& call, ustore_isolation_t isolation) noexcept {
     return false;
 }
 
-/** Refuses a directory carrying a length without bytes, or a NUL byte no path may hold. */
+/** Refuses a directory holding a length without bytes, or a NUL byte no path may hold. */
 bool refuse_path(call_t& call, ustore_bytes_view_t path) noexcept {
     if (path.length && !path.data)
         return call.stop(ustore_status_invalid_argument_k, "A directory with a length needs its bytes");
@@ -233,7 +233,7 @@ concept caps_cpu_class_concept = requires(arguments_type_ const& arguments) { ar
 template <typename arguments_type_>
 concept asks_durability_concept = requires(arguments_type_ const& arguments) { arguments.durability; };
 
-/** Whether a collection of @p database carries @p name; an empty name is never taken. */
+/** Whether a collection of @p database holds @p name; an empty name is never taken. */
 bool name_taken(ustore_database_handle_t const& database, std::string_view name) noexcept {
     if (name.empty()) return false;
     for (auto const& [id, collection] : database.collections)
@@ -241,7 +241,7 @@ bool name_taken(ustore_database_handle_t const& database, std::string_view name)
     return false;
 }
 
-/** Answers every open of an engine the stand-in does not carry, once its arguments passed as
+/** Answers every open of an engine the stand-in does not hold, once its arguments passed as
  *  that engine checks. */
 template <typename arguments_type_>
 void refuse_engine(arguments_type_* arguments, char const* message) {
@@ -352,7 +352,7 @@ void advance_plan(call_t& call, ustore_database_compact_plan_handle_t& plan, ust
     std::size_t const total = units_of(plan);
     auto report = [&]() noexcept {
         std::size_t const done = units_done(plan);
-        if (carries_on(progress, progress_state, done, total) || done == total) return true;
+        if (keeps_going(progress, progress_state, done, total) || done == total) return true;
         return call.fail(ustore_status_cancelled_k, "The progress callback cancelled the compaction");
     };
     if (plan.phase == ustore_phase_none_k) plan.phase = ustore_phase_merge_k, plan.completed = 0;
@@ -467,6 +467,11 @@ void ustore_database_open_nvme(ustore_database_open_nvme_t* arguments) {
     refuse_engine(arguments, "The library was built without the NVMe engine");
 }
 
+void ustore_database_view_nvme(ustore_database_view_nvme_t* arguments) {
+    if (submitted<&ustore_database_view_nvme>(arguments)) return;
+    refuse_engine(arguments, "The library was built without the NVMe engine");
+}
+
 void ustore_database_describe(ustore_database_describe_t* arguments) {
     if (submitted<&ustore_database_describe>(arguments)) return;
     call_t call(arguments->outcome);
@@ -481,7 +486,7 @@ void ustore_database_describe(ustore_database_describe_t* arguments) {
         ustore_capabilities_transactions_k | ustore_capabilities_snapshots_k | ustore_capabilities_saves_snapshots_k);
     description.engine = ustore_engine_ram_k;
     description.isolation = database.isolation;
-    // Serial is the one class the stand-in carries, so every ceiling picks it
+    // Serial is the one class the stand-in holds, so every ceiling picks it
     description.cpu_class = ustore_cpu_class_serial_k;
     std::shared_lock lock(database.mutex);
     for (auto const& [id, collection] : database.collections)
@@ -741,7 +746,7 @@ void ustore_collection_create(ustore_collection_create_t* arguments) {
     try {
         std::unique_lock lock(database.mutex);
         if (name_taken(database, name))
-            return call.refuse(ustore_status_already_exists_k, "Another collection carries the name");
+            return call.refuse(ustore_status_already_exists_k, "Another collection holds the name");
         collection_t collection;
         std::array<std::uint8_t, 16> const uuid = mint_uuid_v7();
         std::memcpy(collection.id.uuid.bytes, uuid.data(), uuid.size());
@@ -825,7 +830,7 @@ void ustore_collection_drop(ustore_collection_drop_t* arguments) {
         std::unique_lock lock(database.mutex);
         auto const found = database.collections.find(bytes_of(arguments->collection));
         if (found == database.collections.end())
-            return call.refuse(ustore_status_not_found_k, "No collection carries the identifier");
+            return call.refuse(ustore_status_not_found_k, "No collection holds the identifier");
         if (arguments->mode == ustore_drop_values_k && found->second.modality == ustore_modality_strings_k)
             return call.refuse(ustore_status_invalid_argument_k, "A strings collection keeps no other values");
         if (arguments->mode == ustore_drop_collection_k) {
@@ -1078,6 +1083,7 @@ struct ustore_ingest_handle_t {
 };
 
 void ustore_ingest_init(ustore_ingest_init_t* arguments) {
+    if (submitted<&ustore_ingest_init>(arguments)) return;
     call_t call(arguments->outcome);
     if (arguments->ingest) *arguments->ingest = nullptr;
     if (refuse_database(call, arguments->database)) return;
@@ -1087,6 +1093,7 @@ void ustore_ingest_init(ustore_ingest_init_t* arguments) {
     if (order != ustore_ingest_sorted_k && order != ustore_ingest_unsorted_k)
         return call.refuse(ustore_status_invalid_argument_k, "Unknown ingest order");
     if (refuse_read_only(call, arguments->database)) return;
+    if (!call.hold_executor(arguments->executor)) return;
     ustore_database_handle_t& database = *arguments->database;
     auto* const ingest = new (std::nothrow) ustore_ingest_handle_t {};
     if (!ingest) return call.refuse(ustore_status_out_of_memory_k, "Failed to allocate the ingest");
@@ -1151,10 +1158,12 @@ bool rows_ascend(ustore_ingest_handle_t const& ingest, std::vector<std::pair<std
 }
 
 void ustore_ingest_append(ustore_ingest_append_t* arguments) {
+    if (submitted<&ustore_ingest_append>(arguments)) return;
     call_t call(arguments->outcome);
     ustore_ingest_handle_t* const ingest = arguments->ingest;
     if (!ingest || ingest->finished)
         return call.refuse(ustore_status_invalid_argument_k, "The ingest is null or finished");
+    if (!call.hold_executor(arguments->executor)) return;
     std::size_t const count = arguments->count;
     bool const edges = ingest->modality == ustore_modality_graph_k;
     strings_in_t values;
@@ -1188,11 +1197,13 @@ void ustore_ingest_append(ustore_ingest_append_t* arguments) {
 }
 
 void ustore_ingest_finish(ustore_ingest_finish_t* arguments) {
+    if (submitted<&ustore_ingest_finish>(arguments)) return;
     call_t call(arguments->outcome);
     if (arguments->commit_stamp) *arguments->commit_stamp = 0;
     ustore_ingest_handle_t* const ingest = arguments->ingest;
     if (!ingest || ingest->finished)
         return call.refuse(ustore_status_invalid_argument_k, "The ingest is null or finished");
+    if (!call.hold_executor(arguments->executor)) return;
     auto const durability = std::bit_cast<std::underlying_type_t<ustore_durability_t>>(arguments->durability);
     if (durability != ustore_durability_buffered_k && durability != ustore_durability_flushed_k)
         return call.refuse(ustore_status_invalid_argument_k, "Unknown durability");

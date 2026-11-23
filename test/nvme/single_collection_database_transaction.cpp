@@ -41,7 +41,7 @@ using namespace unum::ustore::utilities;
 #pragma region Shape
 
 /** The numbers every case mounts with: channels for a compaction to hold two, the case one, and spares. */
-constexpr fixture_config_t transactions_config_k {.shared_io_channels = 6};
+constexpr fixture_config_t transactions_config_k {.queues_threads = 6};
 
 /** Keys every case writes, split in halves between transactions, whose disjoint halves never conflict. */
 constexpr std::size_t population_k = 1000;
@@ -74,7 +74,6 @@ using variable_width_layout_t = layout<key_slot<stored_key_t, value_layout_t::va
 template <typename layout_type_, typename fixture_type_>
 struct transactions_types {
     using fixture_t = fixture_type_;
-    using guard_t = typename fixture_t::guard_t;
     using volume_t = typename fixture_t::volume_t;
     using key_slot_t = typename layout_type_::key_slot_t;
     using database_t = basic_single_collection_database<
@@ -90,13 +89,13 @@ struct transactions_types {
         std::unique_ptr<fixture_t> fixture;
 
         /** The channel the database writes, flushes and commits on. */
-        guard_t writing;
+        io_channel_t* writing = nullptr;
 
         /** The second channel a compaction writes its new runs on. */
-        guard_t merging;
+        io_channel_t* merging = nullptr;
 
         /** The channel the calling thread reads on. */
-        guard_t reading;
+        io_channel_t* reading = nullptr;
 
         /** The volume every run and blob lands on, pinned so a database may point at it. */
         std::unique_ptr<volume_t> volume;
@@ -105,7 +104,7 @@ struct transactions_types {
         database_pointer_t store;
 
         /** The channel of the calling thread, which every read of this stack takes. */
-        [[nodiscard]] io_channel_t& channel() noexcept { return reading.channel(); }
+        [[nodiscard]] io_channel_t& channel() noexcept { return *reading; }
     };
 };
 
@@ -144,17 +143,17 @@ make_stack(mount_type_ const& mount) noexcept {
     if (mount_status.failed()) return mount_status;
     stack->fixture = std::move(fixture);
 
-    auto [writing, acquire_writing_status] = stack->fixture->channels.acquire();
+    auto [writing, acquire_writing_status] = stack->fixture->channel(0);
     if (acquire_writing_status.failed()) return acquire_writing_status;
     stack->writing = std::move(writing);
-    auto [merging, acquire_merging_status] = stack->fixture->channels.acquire();
+    auto [merging, acquire_merging_status] = stack->fixture->channel(1);
     if (acquire_merging_status.failed()) return acquire_merging_status;
     stack->merging = std::move(merging);
-    auto [reading, acquire_reading_status] = stack->fixture->channels.acquire();
+    auto [reading, acquire_reading_status] = stack->fixture->channel(2);
     if (acquire_reading_status.failed()) return acquire_reading_status;
     stack->reading = std::move(reading);
 
-    expected<volume_t> volume = stack->fixture->mount_volume(stack->writing.channel());
+    expected<volume_t> volume = stack->fixture->mount_volume(*stack->writing);
     if (!volume) return volume.status();
     stack->volume = std::unique_ptr<volume_t> {new (std::nothrow) volume_t {std::move(*volume)}};
     if (!stack->volume) return status_t {status_code_t::out_of_memory_k, "The volume did not fit"};
@@ -162,7 +161,7 @@ make_stack(mount_type_ const& mount) noexcept {
     single_collection_database_config_t const config = test_config(layout_type_::value_size_k,
                                                                    layout_type_::value_max_size_k);
     expected<typename types_t::database_pointer_t> store = database_t::open(
-        *stack->volume, stack->writing.channel(), stack->merging.channel(), config, stack->fixture->resources);
+        *stack->volume, *stack->writing, *stack->merging, config, stack->fixture->resources);
     if (!store) return store.status();
     stack->store = std::move(*store);
     return stack;
