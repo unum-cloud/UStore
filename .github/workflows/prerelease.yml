@@ -44,6 +44,11 @@ jobs:
     needs: hooks
     uses: ./.github/workflows/test-rust.yml
 
+  test_go:
+    name: Test Go
+    needs: hooks
+    uses: ./.github/workflows/test-go.yml
+
   test_mojo:
     name: Test Mojo
     needs: hooks
