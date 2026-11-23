@@ -17,10 +17,10 @@
  *  version per key at a stamp one past the head, and a reader sees the newest version at or
  *  below its stamp.
  *
- *  A blocking call runs on its caller, and a deferred one on the worker of its executor, which the
- *  submission claims with the call's arena and transaction, while a call meeting a running one on
- *  its executor, arena, transaction or cursor finishes contended. Every refusal follows the ruled
- *  order: a null handle, then invalid arguments, read-only, unsupported, and contention last.
+ *  Every call runs on its caller, a deferred one too, as an executor without threads of its own
+ *  runs it at submission, while a call meeting a running one on its executor, arena, transaction or
+ *  cursor finishes contended. Every refusal follows the ruled order: a null handle, then invalid
+ *  arguments, read-only, unsupported, and contention last.
  */
 #ifndef UNUM_USTORE_STUB_LIB_HPP
 #define UNUM_USTORE_STUB_LIB_HPP
@@ -190,8 +190,7 @@ class call_t {
 
     bool failed() const noexcept { return recorded_.failed(); }
 
-    /** What tells this call apart in a claim: its outcome, which a deferred call's
-     *  submission claimed with. */
+    /** What tells this call apart in a claim: its outcome, or itself without one. */
     void const* owner() const noexcept { return outcome_ ? static_cast<void const*>(outcome_) : this; }
     status_t recorded() const noexcept { return recorded_; }
 
@@ -1023,7 +1022,7 @@ inline bool compile_patterns(call_t& call, ustore_patterns_t const& patterns, ma
 /** Refuses a predicate cost no constant names. */
 inline bool refuse_predicate(call_t& call, ustore_predicate_t const& predicate) noexcept {
     auto const cost = std::bit_cast<std::underlying_type_t<ustore_predicate_cost_t>>(predicate.cost);
-    if (cost != ustore_predicate_cheap_k && cost != ustore_predicate_expensive_k)
+    if (cost != ustore_predicate_cost_cheap_k && cost != ustore_predicate_cost_expensive_k)
         return call.stop(ustore_status_invalid_argument_k, "Unknown predicate cost");
     return false;
 }
@@ -1147,14 +1146,14 @@ inline void sift(sieve_t const& sieve, std::vector<entry_t>& batch, std::vector<
         for (std::size_t index = 0; index != positions.size(); ++index)
             if (!verdicts[index]) admitted[positions[index]] = false;
     };
-    ask(ustore_predicate_cheap_k);
+    ask(ustore_predicate_cost_cheap_k);
     for (std::size_t index = 0; index != batch.size(); ++index) {
         if (!admitted[index]) continue;
         if (sieve.matcher && !sieve.matcher->matches(sieve.text_for(batch[index]), &scores[index]))
             admitted[index] = false;
         else if (sieve.keeps && !sieve.keeps(batch[index], sieve.keeps_context)) admitted[index] = false;
     }
-    ask(ustore_predicate_expensive_k);
+    ask(ustore_predicate_cost_expensive_k);
     std::size_t kept = 0;
     for (std::size_t index = 0; index != batch.size(); ++index)
         if (admitted[index]) {
@@ -1359,24 +1358,7 @@ inline void stage_edges(reader_t const& reader, writer_t& writer, collection_t c
 
 #pragma endregion Cross Modality Hooks
 
-#pragma region Deferred Calls
-
-/** Whether a call writes its outputs into an arena it names. */
-template <typename arguments_type_>
-concept fills_arena_concept = requires(arguments_type_ const& arguments) { arguments.arena; };
-
-/** Whether a call reads through a view. */
-template <typename arguments_type_>
-concept reads_view_concept = requires(arguments_type_ const& arguments) { arguments.view; };
-
-/** Whether a call joins a transaction it names, rather than creating one through a pointer to
- *  it. */
-template <typename arguments_type_>
-concept joins_transaction_concept = std::is_same_v<decltype(arguments_type_::transaction), ustore_transaction_t>;
-
-/** Whether a call names an open database, rather than creating one through a pointer to it. */
-template <typename arguments_type_>
-concept names_database_concept = std::is_same_v<decltype(arguments_type_::database), ustore_database_t>;
+#pragma region Arguments
 
 /** Whether a scan can answer one BM25 score per listed key. */
 template <typename arguments_type_>
@@ -1386,107 +1368,7 @@ concept scores_matches_concept = requires(arguments_type_ const& arguments) { ar
 template <typename arguments_type_>
 concept exports_values_concept = requires(arguments_type_ const& arguments) { arguments.values; };
 
-/** The transaction a view names, or null for the head, a snapshot or a view
- *  neither constructor made. */
-inline ustore_transaction_t transaction_of(ustore_view_t view) noexcept {
-    auto const bits = reinterpret_cast<std::uintptr_t>(view);
-    std::uintptr_t const tag = bits & 3u;
-    if (tag != static_cast<std::uintptr_t>(view_tag_t::watching_k) &&
-        tag != static_cast<std::uintptr_t>(view_tag_t::unwatched_k))
-        return nullptr;
-    auto* const transaction = reinterpret_cast<ustore_transaction_t>(bits & ~std::uintptr_t {3});
-    return transaction && transaction->magic == magic_t::transaction_k ? transaction : nullptr;
-}
-
-/** A deferred call copied for the worker of its executor, which records into an outcome of its
- *  own and publishes into the caller's only once it let go of everything it claimed and named. */
-template <typename arguments_type_>
-struct deferred_call {
-    arguments_type_ arguments;
-    ustore_outcome_t* published = nullptr;
-    ustore_outcome_t recorded {};
-    std::array<claim_t*, 3> claims {};
-    std::array<named_calls_t*, 2> named {};
-    void (*verb)(arguments_type_*) = nullptr;
-    deferred_job_t job;
-};
-
-/** Runs the deferred call at @p state on the worker, then lets go and publishes
- *  its final status. */
-template <typename arguments_type_>
-void run_deferred(void* state) noexcept {
-    auto* const call = static_cast<deferred_call<arguments_type_>*>(state);
-    call->verb(&call->arguments);
-    for (claim_t* claim : call->claims)
-        if (claim) claim->release(&call->recorded);
-    for (named_calls_t* named : call->named)
-        if (named) named->fetch_sub(1, std::memory_order_acq_rel);
-    publish(call->published, load_status(&call->recorded), call->recorded.message);
-    delete call;
-}
-
-/**
- *  @brief Hands a deferred call on an executor owning its threads to that executor's worker,
- *      answering whether it did, so the verb returns at once, or runs in place when it did not.
- *
- *  The submission claims the executor, the arena and the transaction the call names, so a second
- *  call finds them contended from the moment the first returns. A call meeting any of them held
- *  runs in place instead, where its arguments are checked first and the contention refused in the
- *  ruled order. A lent pool and a call made from the worker itself, from a callback of the call it
- *  runs, also run in place.
- */
-template <auto verb_, typename arguments_type_>
-bool submitted(arguments_type_* arguments) noexcept {
-    ustore_executor_handle_t* const executor = arguments->executor;
-    ustore_outcome_t* const outcome = arguments->outcome;
-    if (!executor || !outcome || arguments->completion != ustore_completion_deferred_k) return false;
-    if (!executor->worker.joinable() || std::this_thread::get_id() == executor->worker.get_id()) return false;
-    auto* const call = new (std::nothrow) deferred_call<arguments_type_>;
-    if (!call) return false;
-    call->arguments = *arguments;
-    void const* const owner = &call->recorded;
-    std::size_t taken = 0;
-    auto take = [&](claim_t& claim) noexcept {
-        if (!claim.take(owner)) return false;
-        call->claims[taken++] = &claim;
-        return true;
-    };
-    bool claimed = take(executor->claim);
-    if constexpr (fills_arena_concept<arguments_type_>)
-        if (claimed && arguments->arena) claimed = take(arguments->arena->claim);
-    ustore_transaction_t transaction = nullptr;
-    if constexpr (reads_view_concept<arguments_type_>) transaction = transaction_of(arguments->view);
-    if constexpr (joins_transaction_concept<arguments_type_>) transaction = arguments->transaction;
-    if (claimed && transaction && transaction->magic == magic_t::transaction_k) claimed = take(transaction->claim);
-    if (!claimed) {
-        for (claim_t* claim : call->claims)
-            if (claim) claim->release(owner);
-        delete call;
-        return false;
-    }
-    // The frees of the database and the arena wait for the call from its submission on
-    if constexpr (names_database_concept<arguments_type_>)
-        if (arguments->database) call->named[0] = &arguments->database->named_calls;
-    if constexpr (fills_arena_concept<arguments_type_>)
-        if (arguments->arena) call->named[1] = &arguments->arena->named_calls;
-    for (named_calls_t* named : call->named)
-        if (named) named->fetch_add(1, std::memory_order_acq_rel);
-    std::atomic_ref<ustore_status_t>(outcome->status).store(ustore_status_deferred_k, std::memory_order_relaxed);
-    call->published = outcome;
-    call->arguments.outcome = &call->recorded;
-    call->verb = verb_;
-    call->job = {&run_deferred<arguments_type_>, call};
-    // The worker empties its slot before it runs a call, so the previous one may still run past it
-    {
-        std::unique_lock lock(executor->job_mutex);
-        executor->job_changed.wait(lock, [&] { return executor->job == nullptr; });
-        executor->job = &call->job;
-    }
-    executor->job_changed.notify_all();
-    return true;
-}
-
-#pragma endregion Deferred Calls
+#pragma endregion Arguments
 
 } // namespace unum::ustore::stub
 

@@ -219,7 +219,7 @@ class lsm_record_pool {
     /** A pool over the records @p made, or the status SmashTable refused them with. */
     static expected<lsm_record_pool> adopt_(st::expected<records_t>&& made) noexcept {
         if (made.status() == st::status_t::invalid_argument_k)
-            return status_t {status_code_t::invalid_argument_k, "A pool holds fewer records than its index names"};
+            return status_t {status_code_t::invalid_argument_k, "A pool holds fewer records than indexed"};
         if (!made) return status_t {status_code_t::out_of_memory_k, "No room for the records of a pool"};
         lsm_record_pool pool;
         pool.records_ = std::move(*made);
@@ -360,7 +360,7 @@ class lsm_level {
                 else position = middle;
             }
             if (position != runs_.size() && !inserted.precedes(run_at_(position)))
-                return {status_code_t::invalid_argument_k, "A sorted level takes runs that overlap no other"};
+                return {status_code_t::invalid_argument_k, "A sorted level takes disjoint runs"};
         }
         note_(inserted);
         [[maybe_unused]] st::status_t const placed = runs_.insert(position, std::move(run));
@@ -530,7 +530,7 @@ class lsm_level {
 
         st::vector<std::uint64_t> cursors;
         if (cursors.resize(runs_.size()) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A level could not track a cursor per run"};
+            return {status_code_t::out_of_memory_k, "No room for a cursor per run"};
         for (std::size_t index = 0; index != runs_.size(); ++index) cursors[index] = 0;
 
         for (;;) {

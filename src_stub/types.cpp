@@ -5,16 +5,15 @@
  *  @brief The vocabulary verbs that belong to no database: outcomes, the spelling of every closed
  *      set, the version, executors and arenas.
  *
- *  An executor of its own threads keeps one worker, which runs its deferred calls one at a time,
- *  while a blocking call runs on its caller and a lent pool runs every call at submission. A call
- *  meeting a running one on its executor finishes contended. No GPU is ever listed, so a VRAM
- *  executor is refused for the ordinal no device carries. The one CPU class is serial, so any known
- *  CPU class ceiling picks it and only a value no class takes is refused.
+ *  An executor starts no threads, so every call runs on its caller, a deferred one at submission,
+ *  final when it returns. A call meeting a running one on its executor finishes contended. No GPU
+ *  is ever listed, so a VRAM executor is refused for the ordinal no device carries. The one CPU
+ *  class is serial, so any known CPU class ceiling picks it, and the stub refuses only a value
+ *  that no class takes.
  */
 #include <sys/stat.h> // `stat` - the memory domains the system lists
 
 #include <string> // `std::to_string`
-#include <thread> // `std::thread`
 
 #include "lib.hpp"
 
@@ -120,8 +119,8 @@ constexpr spelling<ustore_case_sensitivity_t> case_sensitivity_names_k[] {
 };
 
 constexpr spelling<ustore_predicate_cost_t> predicate_cost_names_k[] {
-    {ustore_predicate_cheap_k, "cheap"},
-    {ustore_predicate_expensive_k, "expensive"},
+    {ustore_predicate_cost_cheap_k, "cheap"},
+    {ustore_predicate_cost_expensive_k, "expensive"},
 };
 
 constexpr spelling<ustore_cpu_class_t> cpu_class_names_k[] {
@@ -256,38 +255,6 @@ bool refuse_cpu_class_ceiling(call_t& call, ustore_cpu_class_t cpu_class_ceiling
     return false;
 }
 
-/** The job a freeing executor hands its worker, which returns on it. */
-deferred_job_t stop_job_k;
-
-/** Runs every deferred call handed to @p executor, one at a time, until the stop job. */
-void serve_deferred(ustore_executor_handle_t* executor) noexcept {
-    while (true) {
-        deferred_job_t taken;
-        {
-            std::unique_lock lock(executor->job_mutex);
-            executor->job_changed.wait(lock, [&] { return executor->job != nullptr; });
-            if (executor->job == &stop_job_k) return;
-            // The slot empties before the call runs, as the call may free the job it came in
-            taken = *executor->job;
-            executor->job = nullptr;
-        }
-        executor->job_changed.notify_all();
-        taken.run(taken.state);
-    }
-}
-
-/** Starts the worker of @p executor, which runs its deferred calls, refusing the call when the
- *  system denies it. */
-bool start_worker(call_t& call, ustore_executor_handle_t* executor) noexcept {
-    try {
-        executor->worker = std::thread(&serve_deferred, executor);
-        return true;
-    }
-    catch (...) {
-        return call.fail(ustore_status_unsupported_k, "The system refused to start the threads");
-    }
-}
-
 } // namespace unum::ustore::stub
 
 ustore_status_t ustore_outcome_wait(ustore_outcome_t* outcome) {
@@ -360,7 +327,6 @@ void ustore_executor_for_ram(ustore_executor_for_ram_t* arguments) {
     auto* const executor = new (std::nothrow) ustore_executor_handle_t {};
     if (!executor) return call.refuse(ustore_status_out_of_memory_k, "Failed to allocate the executor");
     executor->threads = arguments->threads ? arguments->threads : 1;
-    if (!start_worker(call, executor)) return delete executor;
     *arguments->executor = executor;
 }
 
@@ -389,7 +355,6 @@ void ustore_executor_for_nvme(ustore_executor_for_nvme_t* arguments) {
     executor->for_nvme = true;
     executor->nvme = arguments->nvme;
     executor->threads = arguments->threads ? arguments->threads : 1;
-    if (!start_worker(call, executor)) return delete executor;
     *arguments->executor = executor;
 }
 
@@ -426,15 +391,6 @@ void ustore_executor_drain(ustore_executor_drain_t* arguments) {
 void ustore_executor_free(ustore_executor_t executor) {
     if (!executor) return;
     while (executor->claim.held()) std::this_thread::yield();
-    if (executor->worker.joinable()) {
-        {
-            std::unique_lock lock(executor->job_mutex);
-            executor->job_changed.wait(lock, [&] { return executor->job == nullptr; });
-            executor->job = &stop_job_k;
-        }
-        executor->job_changed.notify_all();
-        executor->worker.join();
-    }
     delete executor;
 }
 

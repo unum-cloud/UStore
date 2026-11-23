@@ -22,7 +22,7 @@
 
 #include <fmt/format.h>
 
-#include "ustore/ranges.hpp" // `bits_view_t`, `strided_strings`, `tape_string`, `tape_slice`
+#include "ustore/utilities/ranges.hpp" // `bits_view_t`, `strided_strings`, `tape_string`, `tape_slice`
 #include "ustore/ustore.h"
 
 #include "abi/fixture.hpp" // `open_reference`
@@ -75,9 +75,9 @@ struct fixture_t {
     explicit fixture_t(config_t const& config) noexcept : fixture_t(open_raw(config)) {}
 
     /** Takes over the database @p opening answers and creates a strings collection in it. */
-    explicit fixture_t(expected<ustore_database_t> const& opening) noexcept {
+    explicit fixture_t(util::expected<ustore_database_t> const& opening) noexcept {
         auto [opened, open_status] = opening;
-        if (!expect_status(open_status, status_code_t::success_k)) return;
+        if (!expect_status(open_status, util::status_code_t::success_k)) return;
         database = opened;
         ustore_outcome_t outcome {};
         ustore_collection_create_t create {};
@@ -107,7 +107,7 @@ struct fixture_t {
 [[nodiscard]] ustore_outcome_t write_strings(fixture_t& fixture, std::span<std::string_view const> texts,
                                              std::span<ustore_key_t const> values,
                                              ustore_transaction_t transaction = nullptr) noexcept {
-    strided_strings<std::string_view> const strided_texts {{texts.data(), sizeof(std::string_view)}};
+    util::strided_strings<std::string_view> const strided_texts {{texts.data(), sizeof(std::string_view)}};
     ustore_outcome_t outcome {};
     ustore_strings_write_t write {};
     write.database = fixture.database;
@@ -138,7 +138,7 @@ bool write_one(fixture_t& fixture, std::string_view text, ustore_key_t value) no
 
 /** Removes @p texts in one call of @c ustore_strings_remove, failing a check when it is refused. */
 bool erase_strings(fixture_t& fixture, std::span<std::string_view const> texts) noexcept {
-    strided_strings<std::string_view> const strided_texts {{texts.data(), sizeof(std::string_view)}};
+    util::strided_strings<std::string_view> const strided_texts {{texts.data(), sizeof(std::string_view)}};
     ustore_outcome_t outcome {};
     ustore_strings_remove_t remove {};
     remove.database = fixture.database;
@@ -203,7 +203,7 @@ struct read_results_t {
     ustore_key_t const* values = nullptr;
 
     /** Whether the string of task @p index is present. */
-    [[nodiscard]] bool present(std::size_t index) const noexcept { return bits_view_t {presences}[index]; }
+    [[nodiscard]] bool present(std::size_t index) const noexcept { return util::bits_view_t {presences}[index]; }
 
     /** The key the string of task @p index maps onto. */
     [[nodiscard]] ustore_key_t value_of(std::size_t index) const noexcept { return values[index]; }
@@ -213,7 +213,7 @@ struct read_results_t {
  *  the read is refused. */
 bool read_strings(fixture_t& fixture, std::span<std::string_view const> texts, read_results_t& results,
                   ustore_view_t view = nullptr) noexcept {
-    strided_strings<std::string_view> const strided_texts {{texts.data(), sizeof(std::string_view)}};
+    util::strided_strings<std::string_view> const strided_texts {{texts.data(), sizeof(std::string_view)}};
     ustore_outcome_t outcome {};
     ustore_strings_read_t read {};
     read.database = fixture.database;
@@ -247,7 +247,7 @@ struct scan_results_t {
 
     /** The string found at @p index. */
     [[nodiscard]] std::string_view operator[](std::size_t index) const noexcept {
-        return chars_of(tape_string(strings, index));
+        return util::chars_of(util::tape_string(strings, index));
     }
 };
 
@@ -256,9 +256,9 @@ struct scan_results_t {
 bool scan_prefix(fixture_t& fixture, std::string_view prefix, ustore_length_t limit, scan_results_t& results,
                  std::string_view start = {}, ustore_view_t view = nullptr, std::string_view end = {},
                  ustore_scan_direction_t direction = ustore_scan_ascending_k) noexcept {
-    strided_strings<std::string_view> const prefixes {{&prefix, 0}};
-    strided_strings<std::string_view> const starts {{&start, 0}};
-    strided_strings<std::string_view> const ends {{&end, 0}};
+    util::strided_strings<std::string_view> const prefixes {{&prefix, 0}};
+    util::strided_strings<std::string_view> const starts {{&start, 0}};
+    util::strided_strings<std::string_view> const ends {{&end, 0}};
     ustore_length_t const* scan_offsets = nullptr;
     ustore_outcome_t outcome {};
     ustore_strings_scan_t scan {};
@@ -280,7 +280,7 @@ bool scan_prefix(fixture_t& fixture, std::string_view prefix, ustore_length_t li
     bool const scan_succeeded = expect_success(outcome);
     if (!expect_true(scan_offsets != nullptr) || !scan_succeeded) return false;
     results.count = scan_offsets[1] - scan_offsets[0];
-    results.strings = tape_slice(results.strings, scan_offsets[0]);
+    results.strings = util::tape_slice(results.strings, scan_offsets[0]);
     return true;
 }
 
@@ -304,7 +304,7 @@ void test_strings_short_ordering(config_t const& config) {
     // Written out of order, including a byte above the signed range, which the key encoding must not reorder
     std::array<std::string_view, 6> const written {"b", "a", "ab", "aa", "\x80", ""};
     strings_batch_t batch;
-    for (std::string_view const text : written) batch.assign(text, key_from_integer(batch.count + 1));
+    for (std::string_view const text : written) batch.assign(text, util::key_from_integer(batch.count + 1));
     write_batch(fixture, batch);
 
     std::array<std::string_view, 6> const ordered {"", "a", "aa", "ab", "b", "\x80"};
@@ -317,10 +317,10 @@ void test_strings_prefix_scan(config_t const& config) {
     if (!fixture.ready()) return;
 
     strings_batch_t batch;
-    batch.assign("user:2", key_from_integer(2));
-    batch.assign("team:1", key_from_integer(100));
-    batch.assign("user:10", key_from_integer(10));
-    batch.assign("user:1", key_from_integer(1));
+    batch.assign("user:2", util::key_from_integer(2));
+    batch.assign("team:1", util::key_from_integer(100));
+    batch.assign("user:10", util::key_from_integer(10));
+    batch.assign("user:1", util::key_from_integer(1));
     write_batch(fixture, batch);
 
     std::array<std::string_view, 3> const users {"user:1", "user:10", "user:2"};
@@ -339,13 +339,12 @@ void test_strings_shared_prefix(config_t const& config) {
     if (!fixture.ready()) return;
 
     // Fifteen leading bytes in common, so the strings share a key at every key width the engine compiles with
-    constexpr std::string_view shared_k = "shared-prefix!!";
-    std::array<std::string_view, 3> const written {"shared-prefix!!alpha", "shared-prefix!!gamma",
-                                                   "shared-prefix!!beta"};
+    constexpr std::string_view shared_k = "shared-prefix";
+    std::array<std::string_view, 3> const written {"shared-prefixalpha", "shared-prefixgamma", "shared-prefixbeta"};
     strings_batch_t batch;
-    batch.assign(written[0], key_from_integer(1));
-    batch.assign(written[1], key_from_integer(3));
-    batch.assign(written[2], key_from_integer(2));
+    batch.assign(written[0], util::key_from_integer(1));
+    batch.assign(written[1], util::key_from_integer(3));
+    batch.assign(written[2], util::key_from_integer(2));
     write_batch(fixture, batch);
 
     read_results_t results;
@@ -353,8 +352,7 @@ void test_strings_shared_prefix(config_t const& config) {
     for (std::size_t index = 0; index != batch.count; ++index)
         expect_true(results.present(index) && results.value_of(index) == batch.values[index]);
 
-    std::array<std::string_view, 3> const ordered {"shared-prefix!!alpha", "shared-prefix!!beta",
-                                                   "shared-prefix!!gamma"};
+    std::array<std::string_view, 3> const ordered {"shared-prefixalpha", "shared-prefixbeta", "shared-prefixgamma"};
     expect_scan(fixture, shared_k, ordered);
 }
 
@@ -368,10 +366,10 @@ void test_strings_empty_and_embedded_zero(config_t const& config) {
 
     // The nil UUID is a key like any other, which only the presence bit tells apart from a missing string
     strings_batch_t batch;
-    batch.assign("", key_from_integer(1));
+    batch.assign("", util::key_from_integer(1));
     batch.assign(with_zero_k, ustore_key_t {});
-    batch.assign(trailing_zero_k, key_from_integer(3));
-    batch.assign("a", key_from_integer(4));
+    batch.assign(trailing_zero_k, util::key_from_integer(3));
+    batch.assign("a", util::key_from_integer(4));
     write_batch(fixture, batch);
 
     read_results_t results;
@@ -403,8 +401,8 @@ void test_strings_update_and_remove(config_t const& config) {
     fixture_t fixture {config};
     if (!fixture.ready()) return;
 
-    constexpr ustore_key_t first_k = key_from_integer(1);
-    constexpr ustore_key_t second_k = key_from_integer(2);
+    constexpr ustore_key_t first_k = util::key_from_integer(1);
+    constexpr ustore_key_t second_k = util::key_from_integer(2);
     write_one(fixture, "key", first_k);
     strings_batch_t probe;
     probe.assign("key", ustore_key_t {});
@@ -418,7 +416,7 @@ void test_strings_update_and_remove(config_t const& config) {
     expect_true(results.present(0) && results.value_of(0) == second_k);
 
     ustore_outcome_t refused = drop_collection(fixture, ustore_drop_values_k);
-    expect_status(status_t {refused}, status_code_t::invalid_argument_k);
+    expect_status(status_of(refused), util::status_code_t::invalid_argument_k);
     read_batch(fixture, probe, results);
     expect_true(results.present(0) && results.value_of(0) == second_k);
 
@@ -457,14 +455,14 @@ void test_strings_shared_heads(config_t const& config) {
 
     constexpr std::size_t count_k = 10'000;
     constexpr std::size_t batch_k = 1'000;
-    constexpr std::string_view shared_k = "shared-prefix!!";
+    constexpr std::string_view shared_k = "shared-prefix";
     std::vector<std::string> texts(count_k);
     std::vector<std::string_view> text_views(count_k);
     std::vector<ustore_key_t> values(count_k);
     for (std::size_t index = 0; index != count_k; ++index) {
         texts[index] = fmt::format("{}{:05}", shared_k, index);
         text_views[index] = texts[index];
-        values[index] = key_from_integer(index + 1);
+        values[index] = util::key_from_integer(index + 1);
     }
     std::span<std::string_view const> const all_texts {text_views};
     std::span<ustore_key_t const> const all_values {values};
@@ -483,8 +481,8 @@ void test_strings_shared_heads(config_t const& config) {
     expect_listed(fixture, shared_k, all_texts);
 
     std::array<std::string_view, 3> const twice {text_views[0], text_views[1], text_views[0]};
-    std::array<ustore_key_t, 3> const rewrites {key_from_integer(count_k + 1), key_from_integer(count_k + 2),
-                                                key_from_integer(count_k + 3)};
+    std::array<ustore_key_t, 3> const rewrites {
+        util::key_from_integer(count_k + 1), util::key_from_integer(count_k + 2), util::key_from_integer(count_k + 3)};
     ustore_outcome_t rewritten = write_strings(fixture, twice, rewrites);
     expect_success(rewritten);
     read_results_t results;
@@ -510,7 +508,7 @@ void test_strings_shared_heads(config_t const& config) {
     ustore_collection_create_t create {};
     create.database = fixture.database;
     create.outcome = &outcome;
-    create.name = bytes_of(name);
+    create.name = util::bytes_of(name);
     create.modality = modality;
     create.collection = &collection;
     ustore_collection_create(&create);
@@ -528,13 +526,13 @@ void test_strings_name_taken_across_modalities(config_t const& config) {
     expect_success(outcome);
     ustore_collection_id_t strings {};
     outcome = create_named(fixture, "taken.by.blobs", ustore_modality_strings_k, strings);
-    expect_status(status_t {outcome}, status_code_t::already_exists_k);
+    expect_status(status_of(outcome), util::status_code_t::already_exists_k);
     expect_true(strings == ustore_collection_id_t {});
 
     outcome = create_named(fixture, "taken.by.strings", ustore_modality_strings_k, strings);
     expect_success(outcome);
     outcome = create_named(fixture, "taken.by.strings", ustore_modality_blobs_k, blobs);
-    expect_status(status_t {outcome}, status_code_t::already_exists_k);
+    expect_status(status_of(outcome), util::status_code_t::already_exists_k);
     expect_true(blobs == ustore_collection_id_t {});
 }
 
@@ -554,12 +552,12 @@ case_result_t test_strings_one_head_two_writers(config_t const& config) {
     if (!(description.capabilities & ustore_capabilities_transactions_k))
         return case_result_t::skipped(needs_transactions_k);
 
-    std::string const first_text = std::string {"shared-prefix!!"} + std::string(40, 'a');
-    std::string const second_text = std::string {"shared-prefix!!"} + std::string(40, 'b');
+    std::string const first_text = std::string {"shared-prefix"} + std::string(40, 'a');
+    std::string const second_text = std::string {"shared-prefix"} + std::string(40, 'b');
     std::array<std::string_view, 1> const first {first_text};
     std::array<std::string_view, 1> const second {second_text};
-    std::array<ustore_key_t, 1> const first_keys {key_from_integer(1)};
-    std::array<ustore_key_t, 1> const second_keys {key_from_integer(2)};
+    std::array<ustore_key_t, 1> const first_keys {util::key_from_integer(1)};
+    std::array<ustore_key_t, 1> const second_keys {util::key_from_integer(2)};
 
     // Each transaction reads its string before writing it, so the read is watched as well as the write
     transaction_holder_t first_writer;
@@ -575,7 +573,7 @@ case_result_t test_strings_one_head_two_writers(config_t const& config) {
     outcome = write_strings(fixture, second, second_keys, second_writer.transaction);
     expect_success(outcome);
     // A walk through a transaction lists its own writes, and nothing another transaction has not committed
-    expect_listed(fixture, "shared-prefix!!", first,
+    expect_listed(fixture, "shared-prefix", first,
                   ustore_transaction_view(first_writer.transaction, ustore_watch_keys_k));
     outcome = commit_transaction(fixture, first_writer.transaction);
     expect_success(outcome);
@@ -597,7 +595,7 @@ case_result_t test_strings_one_head_two_writers(config_t const& config) {
     outcome = commit_transaction(fixture, earlier.transaction);
     expect_success(outcome);
     outcome = commit_transaction(fixture, later.transaction);
-    expect_status(outcome, status_code_t::write_conflict_k);
+    expect_status(outcome, util::status_code_t::write_conflict_k);
     read_strings(fixture, first, results);
     expect_true(results.present(0) && results.value_of(0) == first_keys[0]);
     return {};
@@ -620,7 +618,8 @@ case_result_t test_strings_transaction_reads_its_own(config_t const& config) {
         return case_result_t::skipped(needs_transactions_k);
 
     std::array<std::string_view, 3> const texts {"before", "own", "after"};
-    std::array<ustore_key_t, 3> const keys {key_from_integer(1), key_from_integer(2), key_from_integer(3)};
+    std::array<ustore_key_t, 3> const keys {util::key_from_integer(1), util::key_from_integer(2),
+                                            util::key_from_integer(3)};
     write_one(fixture, texts[0], keys[0]);
     transaction_holder_t reader;
     if (!begin_transaction(fixture, reader)) return {};
@@ -648,7 +647,7 @@ void test_strings_long_string(config_t const& config) {
         long_text[index] = static_cast<char>('a' + index % 26);
     std::string const short_text = long_text.substr(0, 20);
     std::array<std::string_view, 2> const texts {long_text, short_text};
-    std::array<ustore_key_t, 2> const values {key_from_integer(1), key_from_integer(2)};
+    std::array<ustore_key_t, 2> const values {util::key_from_integer(1), util::key_from_integer(2)};
     ustore_outcome_t outcome = write_strings(fixture, texts, values);
     expect_success(outcome);
 
@@ -677,9 +676,9 @@ void test_strings_scan_pagination(config_t const& config) {
     if (!fixture.ready()) return;
 
     strings_batch_t batch;
-    batch.assign("page:a", key_from_integer(1));
-    batch.assign("page:b", key_from_integer(2));
-    batch.assign("page:c", key_from_integer(3));
+    batch.assign("page:a", util::key_from_integer(1));
+    batch.assign("page:b", util::key_from_integer(2));
+    batch.assign("page:c", util::key_from_integer(3));
     write_batch(fixture, batch);
 
     scan_results_t first_page;
@@ -704,7 +703,7 @@ constexpr std::array<std::string_view, 6> range_strings_k {"a", "ab", "abc", "b"
 bool write_range_strings(fixture_t& fixture) noexcept {
     strings_batch_t batch;
     for (std::size_t index = 0; index != range_strings_k.size(); ++index)
-        batch.assign(range_strings_k[index], key_from_integer(index));
+        batch.assign(range_strings_k[index], util::key_from_integer(index));
     return write_batch(fixture, batch);
 }
 
@@ -757,8 +756,8 @@ void test_strings_cursor_descending_end(config_t const& config) {
         init.database = fixture->database;
         init.outcome = &outcome;
         init.collection = fixture->collection;
-        init.start_string = bytes_of("c");
-        init.end_string = bytes_of("ab");
+        init.start_string = util::bytes_of("c");
+        init.end_string = util::bytes_of("ab");
         init.direction = ustore_scan_descending_k;
         ustore_strings_cursor_init(&init);
         if (!expect_success(outcome)) continue;
@@ -780,7 +779,7 @@ void test_strings_cursor_descending_end(config_t const& config) {
             expect_success(outcome);
             expect_equal(static_cast<std::size_t>(written), count);
             for (std::size_t index = 0; index != written && index != count; ++index)
-                expect_equal(chars_of(tape_string(found, index)), pinned[first + index]);
+                expect_equal(util::chars_of(util::tape_string(found, index)), pinned[first + index]);
             first += count;
         }
         ustore_strings_cursor_free(cursor);
@@ -795,8 +794,8 @@ void test_strings_range_remove(config_t const& config) {
     if (!tested.ready() || !reference.ready()) return;
     std::array<std::string_view, 2> const starts {"ab", "c"};
     std::array<std::string_view, 2> const ends {"b", ""};
-    strided_strings<std::string_view> const strided_starts {{starts.data(), sizeof(std::string_view)}};
-    strided_strings<std::string_view> const strided_ends {{ends.data(), sizeof(std::string_view)}};
+    util::strided_strings<std::string_view> const strided_starts {{starts.data(), sizeof(std::string_view)}};
+    util::strided_strings<std::string_view> const strided_ends {{ends.data(), sizeof(std::string_view)}};
     for (fixture_t* fixture : {&tested, &reference}) {
         write_range_strings(*fixture);
         ustore_outcome_t outcome {};
@@ -832,8 +831,8 @@ void test_strings_range_measure(config_t const& config) {
     for (fixture_t* fixture : {&tested, &reference}) {
         write_range_strings(*fixture);
         for (measured_range_t const& range : ranges) {
-            strided_strings<std::string_view> const starts {{&range.start, 0}};
-            strided_strings<std::string_view> const ends {{&range.end, 0}};
+            util::strided_strings<std::string_view> const starts {{&range.start, 0}};
+            util::strided_strings<std::string_view> const ends {{&range.end, 0}};
             ustore_size_t const *min_cardinalities = nullptr, *max_cardinalities = nullptr;
             ustore_size_t const *min_value_bytes = nullptr, *max_value_bytes = nullptr;
             ustore_outcome_t outcome {};
@@ -887,10 +886,10 @@ void test_strings_sample(config_t const& config) {
             std::size_t const count = offsets[1] - offsets[0];
             expect_equal(count, wanted < range_strings_k.size() ? wanted : range_strings_k.size());
             for (std::size_t index = 0; index != count; ++index) {
-                std::string_view const text = chars_of(tape_string(drawn, offsets[0] + index));
+                std::string_view const text = util::chars_of(util::tape_string(drawn, offsets[0] + index));
                 expect_true(std::find(range_strings_k.begin(), range_strings_k.end(), text) != range_strings_k.end());
                 for (std::size_t earlier = 0; earlier != index; ++earlier)
-                    expect_true(chars_of(tape_string(drawn, offsets[0] + earlier)) != text);
+                    expect_true(util::chars_of(util::tape_string(drawn, offsets[0] + earlier)) != text);
             }
         }
     }
@@ -903,12 +902,12 @@ void test_strings_sample(config_t const& config) {
 int main(int argc, char** argv) {
     start_test_run(argc, argv);
 
-    auto const maybe_test_directory = scratch_directory_t::make(test_run.settings.directory);
-    if (!maybe_test_directory) {
+    auto [scratch, scratch_status] = scratch_directory_t::make(test_run.settings.directory);
+    if (st::failed(scratch_status)) {
         fmt::println(stderr, "Cannot create a unique directory under {}", test_run.settings.directory);
         return 1;
     }
-    char const* const directory = maybe_test_directory->path();
+    char const* const directory = scratch.path();
     if (directory) fmt::println("Will work in directory: {}", directory);
     else fmt::println("Will work with default configuration");
     config_t const config {test_run.settings.engine, directory};

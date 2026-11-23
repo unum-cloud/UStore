@@ -37,7 +37,7 @@ using namespace unum::ustore::pages;
 using namespace unum::ustore::test::pages;
 
 /** The widest StringZilla kernels this build compiled. */
-using strings_kit_t = utilities::strings_ladder<sz_capabilities_compiled_cpu_mask()>::strings_kit_t;
+using strings_kit_t = util::strings_ladder<sz_capabilities_compiled_cpu_mask()>::strings_kit_t;
 
 /** The StringZilla capabilities this machine runs among those the build compiled, which the engines
  *  compile for, while @c strings_kit_t keeps to a tier the build's own flags guarantee. */

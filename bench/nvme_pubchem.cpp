@@ -341,13 +341,12 @@ int main(int argc, char** argv) {
     fmt::println("- loaded {} rows, {:.2f} GB of keys, SMILES and fingerprints", rows,
                  static_cast<double>(ingested_bytes) / 1e9);
 
-    auto maybe_executor = executor_t::make(static_cast<std::size_t>(settings.threads.value),
-                                           caller_exclusivity_t::caller_inclusive_k);
-    if (!maybe_executor) {
+    auto [executor, executor_status] = executor_t::make(static_cast<std::size_t>(settings.threads.value),
+                                                        caller_exclusivity_t::caller_inclusive_k);
+    if (st::failed(executor_status)) {
         fmt::println(stderr, "Failed to spawn {} threads", settings.threads.value);
         return 1;
     }
-    executor_t& executor = *maybe_executor;
 
     // Every thread writes its share of batches into both collections; a sampler tracks the space.
     ustore_database_t database = nullptr;
@@ -518,8 +517,8 @@ int main(int argc, char** argv) {
     };
     for (std::size_t const batch : {std::size_t {32}, std::size_t {1024}})
         blobs_reads(executor, fmt::format("pubchem_blobs_read_batch{}", batch), batch);
-    auto maybe_readers = executor_t::make(32, caller_exclusivity_t::caller_inclusive_k);
-    if (maybe_readers) blobs_reads(*maybe_readers, "pubchem_blobs_read_single_32_threads", 1);
+    auto [readers, readers_status] = executor_t::make(32, caller_exclusivity_t::caller_inclusive_k);
+    if (!st::failed(readers_status)) blobs_reads(readers, "pubchem_blobs_read_single_32_threads", 1);
     for (std::size_t const depth : {std::size_t {32}, std::size_t {1024}}) {
         std::string const strings_name = fmt::format("pubchem_strings_read_batch{}", depth);
         if (settings.regex_filter.selects(strings_name))

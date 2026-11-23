@@ -157,13 +157,13 @@ class linux_aio_files_disk {
      */
     static expected<linux_aio_files_disk> make(linux_aio_disk_config_t const& config) noexcept {
         if (config.queue_pairs_limit == 0 || config.depth_limit == 0)
-            return status_t {status_code_t::invalid_argument_k, "A context needs a queue pair and a request of depth"};
+            return status_t {status_code_t::invalid_argument_k, "A context needs a queue pair and depth"};
         if (config.queue_pairs_limit == static_cast<std::uint16_t>(queue_pair_id_t::unallocated_k) ||
             config.registered_memory_limit == static_cast<std::uint16_t>(registered_memory_id_t::unregistered_k) ||
             config.media_limit == static_cast<std::uint16_t>(registered_medium_id_t::unregistered_k))
-            return status_t {status_code_t::invalid_argument_k, "A disk keeps one identifier for an empty handle"};
+            return status_t {status_code_t::invalid_argument_k, "A disk reserves one id for empty handles"};
         if (config.media_limit == 0 || config.registered_memory_limit == 0)
-            return status_t {status_code_t::invalid_argument_k, "A disk needs a medium and a range to move between"};
+            return status_t {status_code_t::invalid_argument_k, "A disk needs a medium and a range"};
         if (config.depth_limit > depth_ceiling_k)
             return status_t {status_code_t::invalid_argument_k, "A context holds fewer requests than that"};
 
@@ -224,7 +224,7 @@ class linux_aio_files_disk {
      */
     expected<queue_pair_t> acquire_queue_pair(queue_depth_t depth) noexcept {
         if (depth == 0 || depth > depth_limit_)
-            return status_t {status_code_t::invalid_argument_k, "A queue pair asks for more depth than the disk has"};
+            return status_t {status_code_t::invalid_argument_k, "The queue pair depth exceeds the disk's"};
         for (std::size_t index = 0; index != queue_pairs_.size(); ++index) {
             queue_pair_slot_t& slot = queue_pairs_[index];
             std::int32_t expected_free = 0;
@@ -241,7 +241,7 @@ class linux_aio_files_disk {
             slot.locals_count = 0;
             return queue_pair_t {disk_handle_t {static_cast<std::uint16_t>(index), slot.generation}, depth};
         }
-        return status_t {status_code_t::capacity_exhausted_k, "Every queue pair of this disk is already held"};
+        return status_t {status_code_t::capacity_exhausted_k, "Every queue pair of the disk is held"};
     }
 
     /**
@@ -307,7 +307,7 @@ class linux_aio_files_disk {
             return registered_memory_t {disk_handle_t {static_cast<std::uint16_t>(index), slot.generation}, memory,
                                         space};
         }
-        return status_t {status_code_t::capacity_exhausted_k, "Every registered memory slot of this disk is taken"};
+        return status_t {status_code_t::capacity_exhausted_k, "Every registered memory slot is taken"};
     }
 
     /**
@@ -318,7 +318,7 @@ class linux_aio_files_disk {
         registered_memory_slot_t* const slot = slot_of_(registered_memory);
         if (!slot) return {status_code_t::invalid_argument_k, "The registered memory is not this disk's"};
         if (in_flight_(*slot).load(std::memory_order_acquire) != 0)
-            return {status_code_t::invalid_argument_k, "The range is still a medium of requests in flight"};
+            return {status_code_t::invalid_argument_k, "Requests in flight still use the range"};
         ++slot->generation;
         slot->base = nullptr;
         slot->length = 0;
@@ -373,7 +373,7 @@ class linux_aio_files_disk {
         registered_medium_slot_t* const slot = slot_of_(registered_medium);
         if (!slot) return {status_code_t::invalid_argument_k, "The medium is not this disk's"};
         if (in_flight_(*slot).load(std::memory_order_acquire) != 0)
-            return {status_code_t::invalid_argument_k, "The medium is still named by requests in flight"};
+            return {status_code_t::invalid_argument_k, "Requests in flight still use the medium"};
         [[maybe_unused]] status_t const closed = close_native_file(slot->file);
         ++slot->generation;
         slot->file = invalid_native_file_k;
@@ -475,7 +475,7 @@ class linux_aio_files_disk {
             if (outstanding_(*slot) == 0) return std::size_t {0};
             long const minimum = slot->locals_count == 0 && slot->staged_count == 0 ? 1L : 0L;
             if (minimum != 0 && slot->flights_count == 0)
-                return status_t {status_code_t::io_k, "The queue pair awaits requests the kernel never took"};
+                return status_t {status_code_t::io_k, "The kernel never took the queued requests"};
             auto [moved, reap_status] = reap_(queue_pair, into, minimum);
             if (reap_status.failed()) return reap_status;
             if (moved != 0) return moved;

@@ -42,9 +42,10 @@
 
 #include "ustore/blobs.h"
 #include "ustore/db.h"
-#include "ustore/types.hpp"
+#include "ustore/utilities/types.hpp" // `bytes_of`
 
 #include "dataset.h"
+#include "dataset.hpp" // `task_arena_t`
 #include "harness.hpp"
 
 namespace unum::ustore::bench {
@@ -221,7 +222,7 @@ void clear_collection(ustore_database_t database, ustore_collection_id_t collect
 }
 
 /** Imports every listed file as documents, each thread over its own contiguous share of the files. */
-void bench_docs_import(executor_t& executor, tabular_t const& tabular, tabular_graph_settings_t const& settings,
+void bench_docs_import(util::executor_t& executor, tabular_t const& tabular, tabular_graph_settings_t const& settings,
                        std::string_view name) {
     print(run_pass(executor, name, tabular.files.size(), [&](loop_t& loop, std::size_t) noexcept {
         ustore_outcome_t outcome {};
@@ -230,9 +231,9 @@ void bench_docs_import(executor_t& executor, tabular_t const& tabular, tabular_g
             importing.database = tabular.database;
             importing.outcome = &outcome;
             importing.collection = tabular.docs;
-            importing.path = bytes_of(tabular.path(file));
+            importing.path = util::bytes_of(tabular.path(file));
             importing.max_batch_size = settings.memory_limit.value;
-            importing.id_field = bytes_of(settings.id_field);
+            importing.id_field = util::bytes_of(settings.id_field);
             ustore_docs_import(&importing);
             if (outcome.status != ustore_status_success_k) loop.fail();
             else loop.count(1, tabular.files[file].size);
@@ -242,7 +243,7 @@ void bench_docs_import(executor_t& executor, tabular_t const& tabular, tabular_g
 }
 
 /** Imports every listed file as a graph, each thread over its own contiguous share of the files. */
-void bench_graph_import(executor_t& executor, tabular_t const& tabular, tabular_graph_settings_t const& settings,
+void bench_graph_import(util::executor_t& executor, tabular_t const& tabular, tabular_graph_settings_t const& settings,
                         std::string_view name) {
     print(run_pass(executor, name, tabular.files.size(), [&](loop_t& loop, std::size_t) noexcept {
         ustore_outcome_t outcome {};
@@ -251,11 +252,11 @@ void bench_graph_import(executor_t& executor, tabular_t const& tabular, tabular_
             importing.database = tabular.database;
             importing.outcome = &outcome;
             importing.collection = tabular.graph;
-            importing.path = bytes_of(tabular.path(file));
+            importing.path = util::bytes_of(tabular.path(file));
             importing.max_batch_size = settings.memory_limit.value;
-            importing.source_id_field = bytes_of(settings.source_field);
-            importing.target_id_field = bytes_of(settings.target_field);
-            importing.edge_id_field = bytes_of(settings.edge_field);
+            importing.source_id_field = util::bytes_of(settings.source_field);
+            importing.target_id_field = util::bytes_of(settings.target_field);
+            importing.edge_id_field = util::bytes_of(settings.edge_field);
             ustore_graph_import(&importing);
             if (outcome.status != ustore_status_success_k) loop.fail();
             else loop.count(1, tabular.files[file].size);
@@ -265,22 +266,22 @@ void bench_graph_import(executor_t& executor, tabular_t const& tabular, tabular_
 }
 
 /** Exports the documents once from every thread, each into its own file. */
-void bench_docs_export(executor_t& executor, tabular_t const& tabular, tabular_graph_settings_t const& settings,
+void bench_docs_export(util::executor_t& executor, tabular_t const& tabular, tabular_graph_settings_t const& settings,
                        std::string_view name) {
     print(run_pass(executor, name, executor.threads_count(), [&](loop_t& loop, std::size_t thread) noexcept {
         sz::string_t output;
         if (!export_path(output, settings, "tabular_graph_docs", thread))
             return loop.skip("no memory for the output path");
-        auto [arena, arena_status] = arena_t::make();
-        if (arena_status.failed()) return loop.skip("no memory for the arena");
         ustore_outcome_t outcome {};
+        tools::task_arena_t const arena {nullptr, &outcome};
+        if (outcome.status != ustore_status_success_k) return loop.skip("no memory for the arena");
         for ([[maybe_unused]] std::size_t call : loop) {
             ustore_docs_export_t exporting {};
             exporting.database = tabular.database;
             exporting.outcome = &outcome;
-            exporting.arena = arena;
+            exporting.arena = arena.get();
             exporting.collection = tabular.docs;
-            exporting.path = bytes_of(output.view());
+            exporting.path = util::bytes_of(output.view());
             exporting.max_batch_size = settings.memory_limit.value;
             ustore_docs_export(&exporting);
             if (outcome.status != ustore_status_success_k) loop.fail();
@@ -291,7 +292,7 @@ void bench_docs_export(executor_t& executor, tabular_t const& tabular, tabular_g
 }
 
 /** Exports the graph once from every thread, each into its own file. */
-void bench_graph_export(executor_t& executor, tabular_t const& tabular, tabular_graph_settings_t const& settings,
+void bench_graph_export(util::executor_t& executor, tabular_t const& tabular, tabular_graph_settings_t const& settings,
                         std::string_view name) {
     print(run_pass(executor, name, executor.threads_count(), [&](loop_t& loop, std::size_t thread) noexcept {
         sz::string_t output;
@@ -308,20 +309,20 @@ void bench_graph_export(executor_t& executor, tabular_t const& tabular, tabular_
             for (std::size_t index = 0; index != name->size(); ++index)
                 if ((*name)[index] == '/') (*name)[index] = '_';
 
-        auto [arena, arena_status] = arena_t::make();
-        if (arena_status.failed()) return loop.skip("no memory for the arena");
         ustore_outcome_t outcome {};
+        tools::task_arena_t const arena {nullptr, &outcome};
+        if (outcome.status != ustore_status_success_k) return loop.skip("no memory for the arena");
         for ([[maybe_unused]] std::size_t call : loop) {
             ustore_graph_export_t exporting {};
             exporting.database = tabular.database;
             exporting.outcome = &outcome;
-            exporting.arena = arena;
+            exporting.arena = arena.get();
             exporting.collection = tabular.graph;
-            exporting.path = bytes_of(output.view());
+            exporting.path = util::bytes_of(output.view());
             exporting.max_batch_size = settings.memory_limit.value;
-            exporting.source_id_field = bytes_of(source.view());
-            exporting.target_id_field = bytes_of(target.view());
-            exporting.edge_id_field = bytes_of(edge.view());
+            exporting.source_id_field = util::bytes_of(source.view());
+            exporting.target_id_field = util::bytes_of(target.view());
+            exporting.edge_id_field = util::bytes_of(edge.view());
             ustore_graph_export(&exporting);
             if (outcome.status != ustore_status_success_k) loop.fail();
             else loop.count(1, take_exported(output.c_str()));
@@ -396,13 +397,13 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    auto maybe_executor = executor_t::make(settings.threads.value, caller_exclusivity_t::caller_inclusive_k);
-    if (!maybe_executor) {
+    auto [executor, executor_status] = util::executor_t::make(settings.threads.value,
+                                                              util::caller_exclusivity_t::caller_inclusive_k);
+    if (st::failed(executor_status)) {
         fmt::println(stderr, "Failed to spawn {} threads", settings.threads.value);
         ustore_database_free(tabular.database);
         return 1;
     }
-    executor_t& executor = *maybe_executor;
     std::string_view const format = format_as(selected_format(settings));
     std::string const docs_import_name = fmt::format("docs_import_{}", format);
     std::string const docs_export_name = fmt::format("docs_export_{}", format);

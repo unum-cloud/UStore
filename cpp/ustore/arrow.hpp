@@ -8,13 +8,12 @@
 
 #pragma once
 
+#include <cstddef> // `std::size_t`
+
 #include <utility> // `std::swap`
 
-#include "ustore/arrow.h"
-#include "ustore/docs_table.hpp" // `dynamic_column_view_t`
-#include "ustore/ranges.hpp"     // `keys_view_t`, `values_view_t`
-#include "ustore/status.hpp"     // `status_t`, `expected`
-#include "ustore/types.hpp"      // `arena_t`
+#include "ustore/docs.hpp"  // `dynamic_column_view_t`
+#include "ustore/types.hpp" // `status_t`, `expected`, `arena_t`, `keys_view_t`, `values_view_t`
 
 namespace unum::ustore {
 
@@ -74,8 +73,8 @@ inline expected<keys_view_t> keys_view_from_arrow(ArrowSchema const& schema, Arr
     ustore_size_t count = 0;
     if (ustore_status_t const status = ustore_keys_view_from_arrow(&schema, &array, &keys, &count);
         status != ustore_status_success_k)
-        return arrow_status_(status);
-    return keys_view_t {{keys.data, keys.stride}, count};
+        return {{}, arrow_status_(status)};
+    return {keys_view_t {{keys.data, keys.stride}, count}};
 }
 
 /** Views the byte strings of one Arrow @c binary, @c utf8, @c large_binary or @c large_utf8
@@ -86,8 +85,8 @@ inline expected<values_view_t> strings_view_from_arrow(ArrowSchema const& schema
     ustore_size_t count = 0;
     if (ustore_status_t const status = ustore_strings_view_from_arrow(&schema, &array, &strings, &count);
         status != ustore_status_success_k)
-        return arrow_status_(status);
-    return values_view_t {count, nullptr, strings};
+        return {{}, arrow_status_(status)};
+    return {values_view_t {count, nullptr, strings}};
 }
 
 /**
@@ -103,11 +102,11 @@ inline expected<values_view_t> strings_view_from_arrow(ArrowSchema const& schema
 inline expected<arrow_export_t> keys_view_to_arrow(keys_view_t keys, arena_t& arena) noexcept {
     arrow_export_t exported;
     ustore_keys_view_t const view {keys.data(), keys.stride()};
-    if (ustore_status_t const status = ustore_keys_view_to_arrow(view, keys.size(), arena, &exported.schema(),
+    if (ustore_status_t const status = ustore_keys_view_to_arrow(view, keys.size(), arena.handle(), &exported.schema(),
                                                                  &exported.array());
         status != ustore_status_success_k)
-        return arrow_status_(status);
-    return exported;
+        return {{}, arrow_status_(status)};
+    return {std::move(exported)};
 }
 
 /**
@@ -124,11 +123,11 @@ inline expected<arrow_export_t> keys_view_to_arrow(keys_view_t keys, arena_t& ar
 inline expected<arrow_export_t> strings_view_to_arrow(ustore_strings_view_t tape, std::size_t count,
                                                       ustore_strings_layout_t layout, arena_t& arena) noexcept {
     arrow_export_t exported;
-    if (ustore_status_t const status = ustore_strings_view_to_arrow(tape, count, layout, arena, &exported.schema(),
-                                                                    &exported.array());
+    if (ustore_status_t const status = ustore_strings_view_to_arrow(tape, count, layout, arena.handle(),
+                                                                    &exported.schema(), &exported.array());
         status != ustore_status_success_k)
-        return arrow_status_(status);
-    return exported;
+        return {{}, arrow_status_(status)};
+    return {std::move(exported)};
 }
 
 /** Exports @p values a call wrote into @p arena as one Arrow column in the layout of their tape,
@@ -152,11 +151,11 @@ inline expected<arrow_export_t> strings_view_to_arrow(values_view_t const& value
 inline expected<arrow_export_t> docs_column_view_to_arrow(dynamic_column_view_t const& column,
                                                           arena_t& arena) noexcept {
     arrow_export_t exported;
-    if (ustore_status_t const status = ustore_docs_column_view_to_arrow(&column.arrays(), column.size(), column.type(),
-                                                                        arena, &exported.schema(), &exported.array());
+    if (ustore_status_t const status = ustore_docs_column_view_to_arrow(
+            &column.arrays(), column.size(), column.type(), arena.handle(), &exported.schema(), &exported.array());
         status != ustore_status_success_k)
-        return arrow_status_(status);
-    return exported;
+        return {{}, arrow_status_(status)};
+    return {std::move(exported)};
 }
 
 } // namespace unum::ustore

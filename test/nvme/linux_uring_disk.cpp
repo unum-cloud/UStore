@@ -43,7 +43,6 @@ namespace unum::ustore::test {
 using namespace unum::ustore::test::nvme;
 
 using namespace unum::ustore::blobs;
-using namespace unum::ustore::utilities;
 
 #pragma region Fixtures
 
@@ -63,11 +62,11 @@ using namespace unum::ustore::utilities;
 
 /** Registers @p request on @p disk and answers the capacity the registered medium carries, giving the medium back. */
 template <typename disk_type_>
-expected<std::uint64_t> registered_capacity(disk_type_& disk, medium_options_t const& request) {
+util::expected<std::uint64_t> registered_capacity(disk_type_& disk, util::medium_options_t const& request) {
     auto [registered, register_medium_status] = disk.register_medium(request);
     if (register_medium_status.failed()) return register_medium_status;
     std::uint64_t const capacity = registered.capacity();
-    if (status_t const released = disk.unregister_medium(registered); released.failed()) return released;
+    if (util::status_t const released = disk.unregister_medium(registered); released.failed()) return released;
     return capacity;
 }
 
@@ -85,18 +84,16 @@ void on_queue_pair(linux_uring_files_disk_t& disk, std::size_t bytes, body_type_
     expect_equal(buffer.size(), bytes);
     if (buffer.size() != bytes) return;
 
-    expected<queue_pair_t> acquired = disk.acquire_queue_pair(queue_pair_depth_k);
-    expect_true(acquired.has_value());
-    if (!acquired) return;
-    queue_pair_t queue_pair = std::move(*acquired);
+    auto [queue_pair, acquire_status] = disk.acquire_queue_pair(queue_pair_depth_k);
+    expect_true(acquire_status.succeeded());
+    if (acquire_status.failed()) return;
 
-    expected<registered_memory_t> pinned = disk.register_memory(whole(buffer), memory_space_t::host_k);
-    expect_true(pinned.has_value());
-    if (!pinned) {
+    auto [registered_memory, register_status] = disk.register_memory(whole(buffer), util::memory_space_t::host_k);
+    expect_true(register_status.succeeded());
+    if (register_status.failed()) {
         expect_true(disk.release_queue_pair(queue_pair).succeeded());
         return;
     }
-    registered_memory_t registered_memory = std::move(*pinned);
 
     body(queue_pair, registered_memory, whole(buffer));
 
@@ -108,29 +105,30 @@ void on_queue_pair(linux_uring_files_disk_t& disk, std::size_t bytes, body_type_
 #pragma region Cases
 
 /** A request the disk can refuse before the kernel sees it fails alone, and its neighbours still run. */
-void test_uring_fails_one_request_of_a_batch(linux_uring_files_disk_t& disk, medium_reference_t medium) {
+void test_uring_fails_one_request_of_a_batch(linux_uring_files_disk_t& disk, util::medium_reference_t medium) {
     on_queue_pair(
         disk, 2 * block_bytes_k,
-        [&](queue_pair_t& queue_pair, registered_memory_t& registered_memory, std::span<byte_t>) {
-            memory_reference_t stale = registered_memory.reference(0);
+        [&](util::queue_pair_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
+            util::memory_reference_t stale = registered_memory.reference(0);
             stale.generation = static_cast<std::uint16_t>(registered_memory.generation() + 1);
 
-            std::array<request_t, 3> batch {};
-            batch[0] = read_request(medium, extent_t {0, block_bytes_k}, stale, queue_pair.token(0));
-            batch[1] = read_request(medium, extent_t {1, block_bytes_k}, registered_memory.reference(0),
-                                    queue_pair.token(1));
-            batch[2] = read_request(medium, extent_t {0, block_bytes_k}, registered_memory.reference(block_bytes_k),
-                                    queue_pair.token(2));
-            expect_true(disk.submit(queue_pair, std::span<request_t const> {batch}) == std::size_t {3});
+            std::array<util::request_t, 3> batch {};
+            batch[0] = util::read_request(medium, util::extent_t {0, block_bytes_k}, stale, queue_pair.token(0));
+            batch[1] = util::read_request(medium, util::extent_t {1, block_bytes_k}, registered_memory.reference(0),
+                                          queue_pair.token(1));
+            batch[2] = util::read_request(medium, util::extent_t {0, block_bytes_k},
+                                          registered_memory.reference(block_bytes_k), queue_pair.token(2));
+            expect_true(disk.submit(queue_pair, std::span<util::request_t const> {batch}) == std::size_t {3});
 
-            std::array<completion_t, polling_room_k> completions {};
-            expect_true(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
-                                                            3) == std::size_t {3});
+            std::array<util::completion_t, polling_room_k> completions {};
+            expect_true(util::poll_completions_at_least<waiter_t>(
+                            disk, queue_pair, std::span<util::completion_t> {completions}, 3) == std::size_t {3});
             std::size_t refused = 0;
             std::size_t whole = 0;
             for (std::size_t index = 0; index != 3; ++index) {
-                if (completions[index].state == completion_state_t::failed_k) {
-                    refused += expect_status(completions[index].status, status_code_t::invalid_argument_k) ? 1 : 0;
+                if (completions[index].state == util::completion_state_t::failed_k) {
+                    refused += expect_status(completions[index].status, util::status_code_t::invalid_argument_k) ? 1
+                                                                                                                 : 0;
                     continue;
                 }
                 whole += completions[index].completed_in_full() ? 1 : 0;
@@ -141,50 +139,52 @@ void test_uring_fails_one_request_of_a_batch(linux_uring_files_disk_t& disk, med
 }
 
 /** A chain whose first read is short reports the rest cancelled, which is what cutting a link means. */
-void test_uring_cuts_a_chain_on_a_short_read(linux_uring_files_disk_t& disk, medium_reference_t medium) {
+void test_uring_cuts_a_chain_on_a_short_read(linux_uring_files_disk_t& disk, util::medium_reference_t medium) {
     constexpr std::uint64_t reachable_k = 1024;
-    on_queue_pair(disk, 3 * block_bytes_k,
-                  [&](queue_pair_t& queue_pair, registered_memory_t& registered_memory, std::span<byte_t>) {
-                      std::array<request_t, 3> chain {};
-                      chain[0] = read_request(medium, extent_t {volume_bytes_k - reachable_k, block_bytes_k},
-                                              registered_memory.reference(0), queue_pair.token(0));
-                      chain[0].chaining = request_chaining_t::chained_k;
-                      chain[1] = read_request(medium, extent_t {0, block_bytes_k},
-                                              registered_memory.reference(block_bytes_k), queue_pair.token(1));
-                      chain[1].chaining = request_chaining_t::chained_k;
-                      chain[2] = read_request(medium, extent_t {block_bytes_k, block_bytes_k},
-                                              registered_memory.reference(2 * block_bytes_k), queue_pair.token(2));
+    on_queue_pair(
+        disk, 3 * block_bytes_k,
+        [&](util::queue_pair_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
+            std::array<util::request_t, 3> chain {};
+            chain[0] = util::read_request(medium, util::extent_t {volume_bytes_k - reachable_k, block_bytes_k},
+                                          registered_memory.reference(0), queue_pair.token(0));
+            chain[0].chaining = util::request_chaining_t::chained_k;
+            chain[1] = util::read_request(medium, util::extent_t {0, block_bytes_k},
+                                          registered_memory.reference(block_bytes_k), queue_pair.token(1));
+            chain[1].chaining = util::request_chaining_t::chained_k;
+            chain[2] = util::read_request(medium, util::extent_t {block_bytes_k, block_bytes_k},
+                                          registered_memory.reference(2 * block_bytes_k), queue_pair.token(2));
 
-                      expect_true(disk.submit(queue_pair, std::span<request_t const> {chain}) == std::size_t {3});
-                      std::array<completion_t, polling_room_k> completions {};
-                      expect_true(poll_completions_at_least<waiter_t>(
-                                      disk, queue_pair, std::span<completion_t> {completions}, 3) == std::size_t {3});
-                      expect_true(completions[0].state == completion_state_t::partial_k);
-                      expect_equal(completions[0].transferred_bytes, reachable_k);
-                      expect_true(completions[1].state == completion_state_t::cancelled_k);
-                      expect_true(completions[2].state == completion_state_t::cancelled_k);
-                      expect_equal(completions[1].token.tag(), std::uint32_t {1});
-                      expect_equal(completions[2].token.tag(), std::uint32_t {2});
-                  });
+            expect_true(disk.submit(queue_pair, std::span<util::request_t const> {chain}) == std::size_t {3});
+            std::array<util::completion_t, polling_room_k> completions {};
+            expect_true(util::poll_completions_at_least<waiter_t>(
+                            disk, queue_pair, std::span<util::completion_t> {completions}, 3) == std::size_t {3});
+            expect_true(completions[0].state == util::completion_state_t::partial_k);
+            expect_equal(completions[0].transferred_bytes, reachable_k);
+            expect_true(completions[1].state == util::completion_state_t::cancelled_k);
+            expect_true(completions[2].state == util::completion_state_t::cancelled_k);
+            expect_equal(completions[1].token.tag(), std::uint32_t {1});
+            expect_equal(completions[2].token.tag(), std::uint32_t {2});
+        });
 }
 
 /** A cancellation mid-flight delivers one completion per submitted request, and never one extra. */
-void test_uring_counts_completions_after_a_cancel(linux_uring_files_disk_t& disk, medium_reference_t medium) {
+void test_uring_counts_completions_after_a_cancel(linux_uring_files_disk_t& disk, util::medium_reference_t medium) {
     on_queue_pair(
         disk, queue_pair_depth_k * block_bytes_k,
-        [&](queue_pair_t& queue_pair, registered_memory_t& registered_memory, std::span<byte_t>) {
-            std::array<request_t, queue_pair_depth_k> batch {};
+        [&](util::queue_pair_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
+            std::array<util::request_t, queue_pair_depth_k> batch {};
             for (std::size_t index = 0; index != queue_pair_depth_k; ++index)
-                batch[index] = read_request(medium, extent_t {index * block_bytes_k, block_bytes_k},
-                                            registered_memory.reference(index * block_bytes_k),
-                                            queue_pair.token(static_cast<std::uint32_t>(index)));
-            expect_true(disk.submit(queue_pair, std::span<request_t const> {batch}) ==
+                batch[index] = util::read_request(medium, util::extent_t {index * block_bytes_k, block_bytes_k},
+                                                  registered_memory.reference(index * block_bytes_k),
+                                                  queue_pair.token(static_cast<std::uint32_t>(index)));
+            expect_true(disk.submit(queue_pair, std::span<util::request_t const> {batch}) ==
                         std::size_t {queue_pair_depth_k});
             disk.cancel(queue_pair);
 
-            std::array<completion_t, polling_room_k> completions {};
-            expect_true(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
-                                                            queue_pair_depth_k) == std::size_t {queue_pair_depth_k});
+            std::array<util::completion_t, polling_room_k> completions {};
+            expect_true(util::poll_completions_at_least<waiter_t>(
+                            disk, queue_pair, std::span<util::completion_t> {completions}, queue_pair_depth_k) ==
+                        std::size_t {queue_pair_depth_k});
             std::array<std::size_t, queue_pair_depth_k> seen {};
             for (std::size_t index = 0; index != queue_pair_depth_k; ++index) {
                 std::uint32_t const tag = completions[index].token.tag();
@@ -196,7 +196,7 @@ void test_uring_counts_completions_after_a_cancel(linux_uring_files_disk_t& disk
             expect_equal(disk.outstanding(queue_pair), std::size_t {0});
 
             for (std::size_t attempt = 0; attempt != 64; ++attempt)
-                expect_true(disk.poll_completions(queue_pair, std::span<completion_t> {completions}) ==
+                expect_true(disk.poll_completions(queue_pair, std::span<util::completion_t> {completions}) ==
                             std::size_t {0});
         });
 }
@@ -209,57 +209,58 @@ void test_uring_counts_completions_after_a_cancel(linux_uring_files_disk_t& disk
  *  far more often than the queue has seats puts the kernel over the edge, and from there every
  *  completion sits in the kernel's overflow list until a poll enters again to flush it.
  */
-void test_uring_polls_an_overflowed_queue(linux_uring_files_disk_t& disk, medium_reference_t medium) {
+void test_uring_polls_an_overflowed_queue(linux_uring_files_disk_t& disk, util::medium_reference_t medium) {
     constexpr std::size_t cancels_k = 64;
-    on_queue_pair(disk, queue_pair_depth_k * block_bytes_k,
-                  [&](queue_pair_t& queue_pair, registered_memory_t& registered_memory, std::span<byte_t>) {
-                      std::array<request_t, queue_pair_depth_k> batch {};
-                      for (std::size_t index = 0; index != queue_pair_depth_k; ++index)
-                          batch[index] = read_request(medium, extent_t {index * block_bytes_k, block_bytes_k},
-                                                      registered_memory.reference(index * block_bytes_k),
-                                                      queue_pair.token(static_cast<std::uint32_t>(index)));
-                      expect_true(disk.submit(queue_pair, std::span<request_t const> {batch}) ==
-                                  std::size_t {queue_pair_depth_k});
-                      for (std::size_t attempt = 0; attempt != cancels_k; ++attempt) disk.cancel(queue_pair);
+    on_queue_pair(
+        disk, queue_pair_depth_k * block_bytes_k,
+        [&](util::queue_pair_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
+            std::array<util::request_t, queue_pair_depth_k> batch {};
+            for (std::size_t index = 0; index != queue_pair_depth_k; ++index)
+                batch[index] = util::read_request(medium, util::extent_t {index * block_bytes_k, block_bytes_k},
+                                                  registered_memory.reference(index * block_bytes_k),
+                                                  queue_pair.token(static_cast<std::uint32_t>(index)));
+            expect_true(disk.submit(queue_pair, std::span<util::request_t const> {batch}) ==
+                        std::size_t {queue_pair_depth_k});
+            for (std::size_t attempt = 0; attempt != cancels_k; ++attempt) disk.cancel(queue_pair);
 
-                      std::array<completion_t, 1> narrow {};
-                      std::array<std::size_t, queue_pair_depth_k> seen {};
-                      for (std::size_t index = 0; index != queue_pair_depth_k; ++index) {
-                          expect_true(poll_completions_at_least<waiter_t>(
-                                          disk, queue_pair, std::span<completion_t> {narrow}, 1) == std::size_t {1});
-                          std::uint32_t const tag = narrow[0].token.tag();
-                          expect_true(tag < queue_pair_depth_k);
-                          if (tag < queue_pair_depth_k) ++seen[tag];
-                      }
-                      for (std::size_t index = 0; index != queue_pair_depth_k; ++index)
-                          expect_equal(seen[index], std::size_t {1});
-                      expect_equal(disk.outstanding(queue_pair), std::size_t {0});
+            std::array<util::completion_t, 1> narrow {};
+            std::array<std::size_t, queue_pair_depth_k> seen {};
+            for (std::size_t index = 0; index != queue_pair_depth_k; ++index) {
+                expect_true(util::poll_completions_at_least<waiter_t>(
+                                disk, queue_pair, std::span<util::completion_t> {narrow}, 1) == std::size_t {1});
+                std::uint32_t const tag = narrow[0].token.tag();
+                expect_true(tag < queue_pair_depth_k);
+                if (tag < queue_pair_depth_k) ++seen[tag];
+            }
+            for (std::size_t index = 0; index != queue_pair_depth_k; ++index)
+                expect_equal(seen[index], std::size_t {1});
+            expect_equal(disk.outstanding(queue_pair), std::size_t {0});
 
-                      std::array<completion_t, polling_room_k> completions {};
-                      for (std::size_t attempt = 0; attempt != 256; ++attempt)
-                          expect_true(disk.poll_completions(queue_pair, std::span<completion_t> {completions}) ==
-                                      std::size_t {0});
-                  });
+            std::array<util::completion_t, polling_room_k> completions {};
+            for (std::size_t attempt = 0; attempt != 256; ++attempt)
+                expect_true(disk.poll_completions(queue_pair, std::span<util::completion_t> {completions}) ==
+                            std::size_t {0});
+        });
 }
 
 /** A full ring drained one completion at a time still answers for every request it took. */
-void test_uring_polls_through_a_narrow_window(linux_uring_files_disk_t& disk, medium_reference_t medium) {
+void test_uring_polls_through_a_narrow_window(linux_uring_files_disk_t& disk, util::medium_reference_t medium) {
     on_queue_pair(
         disk, queue_pair_depth_k * block_bytes_k,
-        [&](queue_pair_t& queue_pair, registered_memory_t& registered_memory, std::span<byte_t>) {
+        [&](util::queue_pair_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
             std::size_t retired = 0;
             for (std::size_t round = 0; round != 4; ++round) {
-                std::array<request_t, queue_pair_depth_k> batch {};
+                std::array<util::request_t, queue_pair_depth_k> batch {};
                 for (std::size_t index = 0; index != queue_pair_depth_k; ++index)
-                    batch[index] = read_request(medium, extent_t {index * block_bytes_k, block_bytes_k},
-                                                registered_memory.reference(index * block_bytes_k),
-                                                queue_pair.token(static_cast<std::uint32_t>(retired + index)));
-                expect_true(disk.submit(queue_pair, std::span<request_t const> {batch}) ==
+                    batch[index] = util::read_request(medium, util::extent_t {index * block_bytes_k, block_bytes_k},
+                                                      registered_memory.reference(index * block_bytes_k),
+                                                      queue_pair.token(static_cast<std::uint32_t>(retired + index)));
+                expect_true(disk.submit(queue_pair, std::span<util::request_t const> {batch}) ==
                             std::size_t {queue_pair_depth_k});
-                std::array<completion_t, 1> narrow {};
+                std::array<util::completion_t, 1> narrow {};
                 for (std::size_t index = 0; index != queue_pair_depth_k; ++index) {
-                    expect_true(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {narrow},
-                                                                    1) == std::size_t {1});
+                    expect_true(util::poll_completions_at_least<waiter_t>(
+                                    disk, queue_pair, std::span<util::completion_t> {narrow}, 1) == std::size_t {1});
                     expect_true(narrow[0].completed_in_full());
                 }
                 expect_equal(disk.outstanding(queue_pair), std::size_t {0});
@@ -271,22 +272,22 @@ void test_uring_polls_through_a_narrow_window(linux_uring_files_disk_t& disk, me
 
 /** What the disk reports is what @c statx says the filesystem under the volume demands. */
 void test_uring_reports_the_alignment_statx_reports(linux_uring_files_disk_t& disk, char const* path) {
-    ring_capabilities_t const limits = disk.capabilities();
+    util::ring_capabilities_t const limits = disk.capabilities();
 
-    native_file_t const file = ::open(path, O_RDONLY | O_DIRECT);
-    expect_true(file != invalid_native_file_k);
-    if (file == invalid_native_file_k) return;
+    util::native_file_t const file = ::open(path, O_RDONLY | O_DIRECT);
+    expect_true(file != util::invalid_native_file_k);
+    if (file == util::invalid_native_file_k) return;
     struct statx description {};
     int const described = static_cast<int>(
         ::syscall(__NR_statx, file, "", AT_EMPTY_PATH, STATX_DIOALIGN, &description));
-    [[maybe_unused]] status_t const closed = close_native_file(file);
+    [[maybe_unused]] util::status_t const closed = util::close_native_file(file);
     expect_equal(described, 0);
     if (described != 0) return;
 
     bool const answered = (description.stx_mask & STATX_DIOALIGN) != 0 && description.stx_dio_mem_align != 0 &&
                           description.stx_dio_offset_align != 0;
-    std::uint64_t const memory = answered ? description.stx_dio_mem_align : portable_alignment_k;
-    std::uint64_t const offset = answered ? description.stx_dio_offset_align : portable_alignment_k;
+    std::uint64_t const memory = answered ? description.stx_dio_mem_align : util::portable_alignment_k;
+    std::uint64_t const offset = answered ? description.stx_dio_offset_align : util::portable_alignment_k;
     expect_equal(limits.memory_alignment, memory);
     expect_equal(limits.offset_alignment, offset);
     expect_equal(limits.length_granularity, offset);
@@ -295,35 +296,36 @@ void test_uring_reports_the_alignment_statx_reports(linux_uring_files_disk_t& di
 
 /** A range past one gibibyte pins as a run of table slots: a transfer inside the second slot moves
  *  through it, and one across the boundary moves unpinned, which the disk counts. */
-void test_uring_pins_a_range_past_a_gibibyte(linux_uring_files_disk_t& disk, medium_reference_t medium) {
-    std::size_t const boundary = linux_uring_registered_range_bytes_k;
+void test_uring_pins_a_range_past_a_gibibyte(linux_uring_files_disk_t& disk, util::medium_reference_t medium) {
+    std::size_t const boundary = util::linux_uring_registered_range_bytes_k;
     on_queue_pair(
         disk, boundary + 2 * block_bytes_k,
-        [&](queue_pair_t& queue_pair, registered_memory_t& registered_memory, std::span<byte_t> buffer) {
+        [&](util::queue_pair_t& queue_pair, util::registered_memory_t& registered_memory,
+            std::span<util::byte_t> buffer) {
             test_buffer_t expected = make_buffer(2 * block_bytes_k);
             paint(whole(expected), 3);
-            std::span<byte_t> const across = buffer.subspan(boundary - block_bytes_k, 2 * block_bytes_k);
+            std::span<util::byte_t> const across = buffer.subspan(boundary - block_bytes_k, 2 * block_bytes_k);
             paint(across, 3);
 
-            std::array<completion_t, polling_room_k> completions {};
-            auto const moved_in_full = [&](std::array<request_t, 2> const& batch) {
-                expect_true(disk.submit(queue_pair, std::span<request_t const> {batch}) == std::size_t {2});
-                expect_true(poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<completion_t> {completions},
-                                                                2) == std::size_t {2});
+            std::array<util::completion_t, polling_room_k> completions {};
+            auto const moved_in_full = [&](std::array<util::request_t, 2> const& batch) {
+                expect_true(disk.submit(queue_pair, std::span<util::request_t const> {batch}) == std::size_t {2});
+                expect_true(util::poll_completions_at_least<waiter_t>(
+                                disk, queue_pair, std::span<util::completion_t> {completions}, 2) == std::size_t {2});
                 expect_true(completions[0].completed_in_full() && completions[1].completed_in_full());
             };
             moved_in_full({
-                write_request(medium, extent_t {block_bytes_k, 2 * block_bytes_k},
-                              registered_memory.reference(boundary - block_bytes_k), queue_pair.token(0)),
-                write_request(medium, extent_t {0, block_bytes_k}, registered_memory.reference(boundary),
-                              queue_pair.token(1)),
+                util::write_request(medium, util::extent_t {block_bytes_k, 2 * block_bytes_k},
+                                    registered_memory.reference(boundary - block_bytes_k), queue_pair.token(0)),
+                util::write_request(medium, util::extent_t {0, block_bytes_k}, registered_memory.reference(boundary),
+                                    queue_pair.token(1)),
             });
             std::memset(buffer.data() + boundary - block_bytes_k, 0, 3 * block_bytes_k);
             moved_in_full({
-                read_request(medium, extent_t {block_bytes_k, 2 * block_bytes_k},
-                             registered_memory.reference(boundary - block_bytes_k), queue_pair.token(2)),
-                read_request(medium, extent_t {0, block_bytes_k}, registered_memory.reference(boundary + block_bytes_k),
-                             queue_pair.token(3)),
+                util::read_request(medium, util::extent_t {block_bytes_k, 2 * block_bytes_k},
+                                   registered_memory.reference(boundary - block_bytes_k), queue_pair.token(2)),
+                util::read_request(medium, util::extent_t {0, block_bytes_k},
+                                   registered_memory.reference(boundary + block_bytes_k), queue_pair.token(3)),
             });
             expect_true(std::memcmp(across.data(), expected.data(), 2 * block_bytes_k) == 0);
             expect_true(std::memcmp(buffer.data() + boundary + block_bytes_k, expected.data() + block_bytes_k,
@@ -331,8 +333,8 @@ void test_uring_pins_a_range_past_a_gibibyte(linux_uring_files_disk_t& disk, med
 
             struct rlimit locked {};
             if (::getrlimit(RLIMIT_MEMLOCK, &locked) == 0 && locked.rlim_cur == RLIM_INFINITY)
-                expect_true(disk.pinning() == range_pinning_t::pinned_k);
-            std::uint64_t const crossed = disk.pinning() == range_pinning_t::pinned_k ? 2 : 0;
+                expect_true(disk.pinning() == util::range_pinning_t::pinned_k);
+            std::uint64_t const crossed = disk.pinning() == util::range_pinning_t::pinned_k ? 2 : 0;
             expect_equal(disk.crossing_requests(), crossed);
         });
 }
@@ -343,39 +345,40 @@ void test_device_reports_its_capacity(std::string_view device) {
     expect_true(exported != 0);
     if (exported == 0) return;
 
-    medium_options_t request;
+    util::medium_options_t request;
     request.name = device.data();
-    request.access = medium_access_t::read_only_k;
+    request.access = util::medium_access_t::read_only_k;
 
-    expected<blocking_files_device_t> device_transport = blocking_files_device_t::make(file_buffering_t::unbuffered_k);
-    expect_true(device_transport.has_value());
-    if (!device_transport) return;
-    disk_config_t blocking_config;
-    resource_constraint_t budget {unlimited_resource_k};
-    expected<blocking_files_disk_t> blocking = blocking_files_disk_t::make(std::move(*device_transport),
-                                                                           blocking_config, budget);
-    expect_true(blocking.has_value());
-    if (!blocking) return;
-    expected<std::uint64_t> const blocking_capacity = registered_capacity(*blocking, request);
-    expect_true(blocking_capacity.has_value());
-    if (blocking_capacity) expect_equal(*blocking_capacity, exported);
+    auto [device_transport,
+          make_device_status] = util::blocking_files_device_t::make(util::file_buffering_t::unbuffered_k);
+    expect_true(make_device_status.succeeded());
+    if (make_device_status.failed()) return;
+    util::disk_config_t blocking_config;
+    resource_constraint_t budget {util::unlimited_resource_k};
+    auto [blocking, make_blocking_status] = blocking_files_disk_t::make(std::move(device_transport), blocking_config,
+                                                                        budget);
+    expect_true(make_blocking_status.succeeded());
+    if (make_blocking_status.failed()) return;
+    auto const [blocking_capacity, blocking_capacity_status] = registered_capacity(blocking, request);
+    expect_true(blocking_capacity_status.succeeded());
+    if (blocking_capacity_status.succeeded()) expect_equal(blocking_capacity, exported);
 
-    linux_uring_disk_config_t uring_config;
-    expected<linux_uring_files_disk_t> uring = linux_uring_files_disk_t::make(uring_config);
-    expect_true(uring.has_value());
-    if (!uring) return;
-    expected<std::uint64_t> const uring_capacity = registered_capacity(*uring, request);
-    expect_true(uring_capacity.has_value());
-    if (uring_capacity) expect_equal(*uring_capacity, exported);
+    util::linux_uring_disk_config_t uring_config;
+    auto [uring, make_uring_status] = linux_uring_files_disk_t::make(uring_config);
+    expect_true(make_uring_status.succeeded());
+    if (make_uring_status.failed()) return;
+    auto const [uring_capacity, uring_capacity_status] = registered_capacity(uring, request);
+    expect_true(uring_capacity_status.succeeded());
+    if (uring_capacity_status.succeeded()) expect_equal(uring_capacity, exported);
 
     // A device keeps the capacity of its environment, so a request to create it at a length is refused.
-    medium_options_t sized = request;
-    sized.access = medium_access_t::create_read_write_k;
+    util::medium_options_t sized = request;
+    sized.access = util::medium_access_t::create_read_write_k;
     sized.length = exported;
-    expected<registered_medium_t> refused = uring->register_medium(sized);
-    expect_true(!refused.has_value());
-    if (refused) expect_true(uring->unregister_medium(*refused).succeeded());
-    else expect_status(refused, status_code_t::invalid_argument_k);
+    auto [refused, register_status] = uring.register_medium(sized);
+    expect_true(register_status.failed());
+    if (register_status.succeeded()) expect_true(uring.unregister_medium(refused).succeeded());
+    else expect_status(register_status, util::status_code_t::invalid_argument_k);
 }
 
 #pragma endregion Cases
@@ -384,48 +387,48 @@ void test_device_reports_its_capacity(std::string_view device) {
 
 /** Mounts the io_uring transport on a preallocated volume and runs the suite on it. */
 void uring_transport(char const* directory) {
-    linux_uring_disk_config_t config;
+    util::linux_uring_disk_config_t config;
     config.queue_pairs_limit = 4;
     config.depth_limit = queue_pair_depth_k;
     config.registered_memory_limit = 4;
     config.media_limit = 4;
-    config.buffering = file_buffering_t::unbuffered_k;
+    config.buffering = util::file_buffering_t::unbuffered_k;
 
-    expected<linux_uring_files_disk_t> disk = linux_uring_files_disk_t::make(config);
-    run_test_case("linux_uring_files_disk_t::make", [&] { expect_status(disk, status_code_t::success_k); });
-    if (!disk) return;
+    auto [disk, status] = linux_uring_files_disk_t::make(config);
+    run_test_case("linux_uring_files_disk_t::make", [&] { expect_status(status, util::status_code_t::success_k); });
+    if (status.failed()) return;
 
     std::string const path = fmt::format("{}/{}", directory, "volume.bin");
-    on_medium("linux_uring_files_disk_t::register_medium", *disk, volume_request(path.c_str()),
-              [&](medium_reference_t medium) {
-                  ring_cases("linux_uring_files_disk_t", *disk, medium);
+    on_medium("linux_uring_files_disk_t::register_medium", disk, volume_request(path.c_str()),
+              [&](util::medium_reference_t medium) {
+                  ring_cases("linux_uring_files_disk_t", disk, medium);
                   run_test_case("test_uring_fails_one_request_of_a_batch", test_uring_fails_one_request_of_a_batch,
-                                *disk, medium);
+                                disk, medium);
                   run_test_case("test_uring_cuts_a_chain_on_a_short_read", test_uring_cuts_a_chain_on_a_short_read,
-                                *disk, medium);
+                                disk, medium);
                   run_test_case("test_uring_counts_completions_after_a_cancel",
-                                test_uring_counts_completions_after_a_cancel, *disk, medium);
+                                test_uring_counts_completions_after_a_cancel, disk, medium);
                   run_test_case("test_uring_polls_through_a_narrow_window", test_uring_polls_through_a_narrow_window,
-                                *disk, medium);
-                  run_test_case("test_uring_polls_an_overflowed_queue", test_uring_polls_an_overflowed_queue, *disk,
+                                disk, medium);
+                  run_test_case("test_uring_polls_an_overflowed_queue", test_uring_polls_an_overflowed_queue, disk,
                                 medium);
                   run_test_case("test_uring_pins_a_range_past_a_gibibyte", test_uring_pins_a_range_past_a_gibibyte,
-                                *disk, medium);
+                                disk, medium);
                   run_test_case("test_uring_reports_the_alignment_statx_reports",
-                                test_uring_reports_the_alignment_statx_reports, *disk, path.c_str());
+                                test_uring_reports_the_alignment_statx_reports, disk, path.c_str());
               });
 
     std::string const borrowed_path = fmt::format("{}/{}", directory, "volume_borrowed.bin");
     run_test_case("test_ring_holds_a_medium_in_flight<linux_uring_files_disk_t>",
-                  test_ring_holds_a_medium_in_flight<linux_uring_files_disk_t>, *disk,
+                  test_ring_holds_a_medium_in_flight<linux_uring_files_disk_t>, disk,
                   volume_request(borrowed_path.c_str()));
     std::string const deallocated_path = fmt::format("{}/{}", directory, "volume_deallocated.bin");
     run_test_case("test_ring_deallocates_a_file_extent<linux_uring_files_disk_t>",
-                  test_ring_deallocates_a_file_extent<linux_uring_files_disk_t>, *disk,
+                  test_ring_deallocates_a_file_extent<linux_uring_files_disk_t>, disk,
                   volume_request(deallocated_path.c_str()));
     std::string const logical_block_path = fmt::format("{}/{}", directory, "volume_logical_block.bin");
     run_test_case("test_ring_reports_a_logical_block<linux_uring_files_disk_t>",
-                  test_ring_reports_a_logical_block<linux_uring_files_disk_t>, *disk,
+                  test_ring_reports_a_logical_block<linux_uring_files_disk_t>, disk,
                   volume_request(logical_block_path.c_str()));
 }
 
@@ -437,21 +440,20 @@ int main(int argc, char** argv) {
     using namespace unum::ustore;
     using namespace unum::ustore::test;
     using namespace unum::ustore::blobs;
-    using namespace unum::ustore::utilities;
 
     start_test_run(argc, argv);
 
-    st::expected<scratch_directory_t> directory = scratch_directory_t::make(test_run.settings.directory);
-    if (!directory) {
+    auto [directory, directory_status] = scratch_directory_t::make(test_run.settings.directory);
+    if (st::failed(directory_status)) {
         fmt::println(stderr, "  the working directory would not open");
         return 1;
     }
 
-    if (char const* const reason = transport_refusal(transport_t::linux_uring_k, directory->path()))
+    if (char const* const reason = transport_refusal(transport_t::linux_uring_k, directory.path()))
         run_test_case("linux_uring_files_disk_t::make", [reason] { return case_result_t::skipped(reason); });
-    else uring_transport(directory->path());
+    else uring_transport(directory.path());
 
-    if (char const* const reason = transport_refusal(transport_t::device_k, directory->path()))
+    if (char const* const reason = transport_refusal(transport_t::device_k, directory.path()))
         run_test_case("test_device_reports_its_capacity", [reason] { return case_result_t::skipped(reason); });
     else run_test_case("test_device_reports_its_capacity", test_device_reports_its_capacity, test_run.settings.device);
     return finish_test_run();

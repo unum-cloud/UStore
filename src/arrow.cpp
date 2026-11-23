@@ -97,7 +97,7 @@ struct exported_column_t {
 /** The device runs of @p arena, with the Arrow device type and ordinal they live on, null
  *  for host pages. */
 struct device_arena_t {
-    device_blocks_t const* blocks = nullptr;
+    util::device_blocks_t const* blocks = nullptr;
     ArrowDeviceType type = ARROW_DEVICE_CPU;
     std::int64_t device = -1;
 };
@@ -114,9 +114,9 @@ device_arena_t device_arena_of(ustore_arena_t arena) noexcept {
 
 /** Whether the @p bytes at @p first lie inside one run of @p blocks, of which only the newest
  *  is partly used. */
-bool device_blocks_hold(device_blocks_t const& blocks, std::uintptr_t first, std::size_t bytes) noexcept {
+bool device_blocks_hold(util::device_blocks_t const& blocks, std::uintptr_t first, std::size_t bytes) noexcept {
     for (std::uint32_t block = 0; block != blocks.count; ++block) {
-        device_block_t const& run = blocks.blocks[block];
+        util::device_block_t const& run = blocks.blocks[block];
         std::size_t const used = block + 1 == blocks.count ? blocks.used : run.capacity;
         if (first >= run.address && first - run.address <= used && bytes <= used - (first - run.address)) return true;
     }
@@ -128,10 +128,10 @@ bool arena_holds(ustore_arena_t arena, void const* data, std::size_t bytes) noex
     if (!bytes) return true;
     if (device_arena_t const device = device_arena_of(arena); device.blocks)
         return data && device_blocks_hold(*device.blocks, reinterpret_cast<std::uintptr_t>(data), bytes);
-    host_blocks_t const* const blocks = host_blocks_of(arena);
+    host_blocks_t const* const blocks = util::host_blocks_of(arena);
     if (!blocks || !data) return false;
     std::uintptr_t const first = reinterpret_cast<std::uintptr_t>(data);
-    for (arena_block_t const* block = blocks->newest; block; block = block->previous) {
+    for (util::arena_block_t const* block = blocks->newest; block; block = block->previous) {
         std::uintptr_t const begin = reinterpret_cast<std::uintptr_t>(block);
         if (first >= begin && first - begin <= block->used && bytes <= block->used - (first - begin)) return true;
     }
@@ -147,7 +147,7 @@ bool arena_holds_tape(ustore_arena_t arena, ustore_strings_view_t const& strings
     std::size_t const width = wide ? sizeof(std::uint64_t) : sizeof(std::uint32_t);
     // The host reads no device offsets, so a device tape is held where its offsets and its
     // first byte are
-    if (wraps_on_multiply(count + 1, width) || !arena_holds(arena, offsets, (count + 1) * width)) return false;
+    if (util::wraps_on_multiply(count + 1, width) || !arena_holds(arena, offsets, (count + 1) * width)) return false;
     if (device_arena_of(arena).blocks) return !data || arena_holds(arena, data, 1);
     std::uint64_t const first = wide ? strings.data.u64_tape.offsets[0] : strings.data.u32_tape.offsets[0];
     std::uint64_t const end = wide ? strings.data.u64_tape.offsets[count] : strings.data.u32_tape.offsets[count];
@@ -169,26 +169,26 @@ struct converted_offsets_t {
 
 /** Converts the tape @p strings of @p rows strings on host pages into the other width behind the
  *  call's outputs in @p arena. */
-expected<converted_offsets_t> convert_on_host(ustore_arena_t arena, ustore_strings_view_t const& strings,
-                                              std::size_t rows) noexcept {
+util::expected<converted_offsets_t> convert_on_host(ustore_arena_t arena, ustore_strings_view_t const& strings,
+                                                    std::size_t rows) noexcept {
     bool const wide = strings.layout == ustore_strings_u64_tape_k;
-    if (wide && (wraps_on_multiply(rows + 1, sizeof(std::uint64_t)) ||
+    if (wide && (util::wraps_on_multiply(rows + 1, sizeof(std::uint64_t)) ||
                  !arena_holds(arena, strings.data.u64_tape.offsets, (rows + 1) * sizeof(std::uint64_t))))
-        return status_code_t::invalid_argument_k;
+        return util::status_code_t::invalid_argument_k;
     // A span past 32 bits is refused before its bytes are looked for, as no arena holds that
     // many of them
     std::uint64_t const first = wide ? strings.data.u64_tape.offsets[0] : 0;
     std::uint64_t const end = wide ? strings.data.u64_tape.offsets[rows] : 0;
     if (end >= first && end - first > (std::numeric_limits<std::uint32_t>::max)())
-        return status_code_t::capacity_exhausted_k;
-    if (!arena_holds_tape(arena, strings, rows)) return status_code_t::invalid_argument_k;
+        return util::status_code_t::capacity_exhausted_k;
+    if (!arena_holds_tape(arena, strings, rows)) return util::status_code_t::invalid_argument_k;
     if (wide) {
-        auto [narrowed, carve_status] = arena_allocate<std::uint32_t>(arena, rows + 1);
+        auto [narrowed, carve_status] = util::arena_allocate<std::uint32_t>(arena, rows + 1);
         if (carve_status.failed()) return carve_status;
         convert_offsets(strings.data.u64_tape.offsets, narrowed, first);
         return converted_offsets_t {narrowed.data(), first};
     }
-    auto [widened, carve_status] = arena_allocate<std::uint64_t>(arena, rows + 1);
+    auto [widened, carve_status] = util::arena_allocate<std::uint64_t>(arena, rows + 1);
     if (carve_status.failed()) return carve_status;
     convert_offsets(strings.data.u32_tape.offsets, widened, 0);
     return converted_offsets_t {widened.data(), 0};
@@ -197,14 +197,14 @@ expected<converted_offsets_t> convert_on_host(ustore_arena_t arena, ustore_strin
 /** Converts the @p rows + 1 offsets at @p offsets on @p executor's device into @p blocks in the
  *  other width, through the executor's bounce. */
 template <typename converted_type_, typename source_type_, gpu_executor_concept executor_type_>
-expected<converted_offsets_t> convert_through(executor_type_& executor, device_blocks_t& blocks,
-                                              source_type_ const* offsets, std::size_t rows) noexcept {
+util::expected<converted_offsets_t> convert_through(executor_type_& executor, util::device_blocks_t& blocks,
+                                                    source_type_ const* offsets, std::size_t rows) noexcept {
     ustore_arena_t const bounce = executor.bounce();
-    auto [source, source_status] = arena_allocate<source_type_>(bounce, rows + 1);
+    auto [source, source_status] = util::arena_allocate<source_type_>(bounce, rows + 1);
     if (source_status.failed()) return source_status;
-    auto [target, target_status] = arena_allocate<converted_type_>(bounce, rows + 1);
+    auto [target, target_status] = util::arena_allocate<converted_type_>(bounce, rows + 1);
     if (target_status.failed()) return target_status;
-    status_t status = executor.pin_bounce();
+    util::status_t status = executor.pin_bounce();
     if (status.succeeded())
         status = executor.download_async(std::as_writable_bytes(source), reinterpret_cast<std::uintptr_t>(offsets));
     if (status.succeeded()) status = executor.wait();
@@ -212,8 +212,8 @@ expected<converted_offsets_t> convert_through(executor_type_& executor, device_b
     std::uint64_t const first = sizeof(converted_type_) < sizeof(source_type_) ? static_cast<std::uint64_t>(source[0])
                                                                                : 0;
     std::uint64_t const end = source[rows];
-    if (end < first) return status_code_t::invalid_argument_k;
-    if (end - first > (std::numeric_limits<std::uint32_t>::max)()) return status_code_t::capacity_exhausted_k;
+    if (end < first) return util::status_code_t::invalid_argument_k;
+    if (end - first > (std::numeric_limits<std::uint32_t>::max)()) return util::status_code_t::capacity_exhausted_k;
     convert_offsets(source.data(), target, first);
     auto [carved, carved_status] = carve<converted_type_>(blocks, executor, rows + 1);
     if (carved_status.failed()) return carved_status;
@@ -241,16 +241,16 @@ ustore_status_t visit_export_executor(ustore_arena_t arena, visitor_type_&& visi
     gpu_class_t const gpu_class = runtime.classes[listed];
     if (gpu_class == gpu_class_t::unknown_k) return ustore_status_unsupported_k;
     std::variant<std::monostate, cuda_executor_t, hip_executor_t, metal_executor_t> spawned;
-    if (status_t const status = spawn_gpu_executor(runtime.drivers, runtime.cuda_kernels, runtime.hip_kernels,
-                                                   runtime.metal_kernels, runtime.devices[listed], gpu_class, nullptr,
-                                                   0, ustore_gds_compatibility_k, spawned);
+    if (util::status_t const status = spawn_gpu_executor(runtime.drivers, runtime.cuda_kernels, runtime.hip_kernels,
+                                                         runtime.metal_kernels, runtime.devices[listed], gpu_class,
+                                                         nullptr, 0, ustore_gds_compatibility_k, spawned);
         status.failed())
         return static_cast<ustore_status_t>(status.code);
     return std::visit(
         [&]<typename executor_type_>(executor_type_& executor) noexcept -> ustore_status_t {
             if constexpr (std::is_same_v<executor_type_, std::monostate>) return ustore_status_device_k;
             else {
-                device_blocks_t* const blocks = device_blocks_of(arena, executor);
+                util::device_blocks_t* const blocks = device_blocks_of(arena, executor);
                 if (!blocks) return ustore_status_device_k;
                 return visitor(executor, *blocks);
             }
@@ -261,12 +261,12 @@ ustore_status_t visit_export_executor(ustore_arena_t arena, visitor_type_&& visi
 /** Converts the device tape @p strings of @p rows strings as @c convert_on_host does, through an
  *  executor spawned on the arena's device for this export alone: the offsets come down into its
  *  bounce, convert there and go back up behind the call's outputs. */
-expected<converted_offsets_t> convert_on_device(ustore_arena_t arena, ustore_strings_view_t const& strings,
-                                                std::size_t rows) noexcept {
-    if (!arena_holds_tape(arena, strings, rows)) return status_code_t::invalid_argument_k;
+util::expected<converted_offsets_t> convert_on_device(ustore_arena_t arena, ustore_strings_view_t const& strings,
+                                                      std::size_t rows) noexcept {
+    if (!arena_holds_tape(arena, strings, rows)) return util::status_code_t::invalid_argument_k;
     converted_offsets_t converted;
     ustore_status_t const visited = visit_export_executor(
-        arena, [&]<typename executor_type_>(executor_type_& executor, device_blocks_t& blocks) noexcept {
+        arena, [&]<typename executor_type_>(executor_type_& executor, util::device_blocks_t& blocks) noexcept {
             auto const [offsets, convert_status] =
                 strings.layout == ustore_strings_u64_tape_k
                     ? convert_through<std::uint32_t>(executor, blocks, strings.data.u64_tape.offsets, rows)
@@ -274,36 +274,37 @@ expected<converted_offsets_t> convert_on_device(ustore_arena_t arena, ustore_str
             converted = offsets;
             return static_cast<ustore_status_t>(convert_status.code);
         });
-    if (visited != ustore_status_success_k) return static_cast<status_code_t>(visited);
+    if (visited != ustore_status_success_k) return static_cast<util::status_code_t>(visited);
     return converted;
 }
 
 /** Densely copies strided @p rows past the call's outputs in host @p arena, pointing them at it. */
-ustore_status_t densify_on_host(ustore_arena_t arena, strided_rows_t& rows) noexcept {
-    auto [dense, carve_status] = arena_allocate<ustore_key_t>(arena, static_cast<std::size_t>(rows.rows));
+ustore_status_t densify_on_host(ustore_arena_t arena, util::strided_rows_t& rows) noexcept {
+    auto [dense, carve_status] = util::arena_allocate<ustore_key_t>(arena, static_cast<std::size_t>(rows.rows));
     if (carve_status.failed()) return static_cast<ustore_status_t>(carve_status.code);
-    rows.dense = bytes_of(dense.data(), dense.size()).data();
+    rows.dense = util::bytes_of(dense.data(), dense.size()).data();
     for (std::uint64_t row = 0; row != rows.rows; ++row) densify_row(rows, row);
     return ustore_status_success_k;
 }
 
 /** Copies the strided @p rows of a device arena dense behind the call's outputs, through an
  *  executor spawned on the arena's device for this export alone, pointing them at the copy. */
-ustore_status_t densify_on_device(ustore_arena_t arena, strided_rows_t& rows) noexcept {
+ustore_status_t densify_on_device(ustore_arena_t arena, util::strided_rows_t& rows) noexcept {
     std::size_t const spanned = static_cast<std::size_t>((rows.rows - 1) * rows.stride + rows.row_bytes);
     if (!arena_holds(arena, rows.source, spanned)) return ustore_status_invalid_argument_k;
-    return visit_export_executor(arena, [&]<typename executor_type_>(executor_type_& executor,
-                                                                     device_blocks_t& blocks) noexcept {
-        if (!executor.kernels()) return ustore_status_device_k;
-        auto [dense, carve_status] = carve<ustore_key_t>(blocks, executor, static_cast<std::size_t>(rows.rows));
-        if (carve_status.failed()) return static_cast<ustore_status_t>(carve_status.code);
-        rows.dense = bytes_of(dense.data(), dense.size()).data();
-        status_t status = launch(executor, executor.kernels()->function("ustore_tape_densify"),
-                                 static_cast<unsigned>(divide_round_up<std::size_t>(rows.rows, tape_block_threads_k)),
-                                 tape_block_threads_k, 0u, rows);
-        if (status.succeeded()) status = executor.wait();
-        return static_cast<ustore_status_t>(status.code);
-    });
+    return visit_export_executor(
+        arena, [&]<typename executor_type_>(executor_type_& executor, util::device_blocks_t& blocks) noexcept {
+            if (!executor.kernels()) return ustore_status_device_k;
+            auto [dense, carve_status] = carve<ustore_key_t>(blocks, executor, static_cast<std::size_t>(rows.rows));
+            if (carve_status.failed()) return static_cast<ustore_status_t>(carve_status.code);
+            rows.dense = util::bytes_of(dense.data(), dense.size()).data();
+            util::status_t status = launch(
+                executor, executor.kernels()->function("ustore_tape_densify"),
+                static_cast<unsigned>(util::divide_round_up<std::size_t>(rows.rows, util::tape_block_threads_k)),
+                util::tape_block_threads_k, 0u, rows);
+            if (status.succeeded()) status = executor.wait();
+            return static_cast<ustore_status_t>(status.code);
+        });
 }
 
 void release_exported_schema(ArrowSchema* schema) noexcept { schema->release = nullptr; }
@@ -380,12 +381,13 @@ char const* docs_column_format(ustore_docs_field_type_t type, ustore_strings_lay
 using column_buffers_t = std::array<void const*, 3>;
 
 /** Packs the @p rows booleans at @p bools into bits past the call's outputs in host @p arena. */
-expected<std::span<ustore_octet_t>> pack_on_host(ustore_arena_t arena, ustore_byte_t const* bools,
-                                                 std::size_t rows) noexcept {
-    auto [bits, bits_status] = arena_allocate<ustore_octet_t>(arena, divide_round_up(rows, bits_in_byte_k));
+util::expected<std::span<ustore_octet_t>> pack_on_host(ustore_arena_t arena, ustore_byte_t const* bools,
+                                                       std::size_t rows) noexcept {
+    auto [bits, bits_status] = util::arena_allocate<ustore_octet_t>(arena,
+                                                                    util::divide_round_up(rows, util::bits_in_byte_k));
     if (bits_status.failed()) return bits_status;
-    for (std::size_t first = 0; first < rows; first += bits_in_byte_k)
-        bits[first / bits_in_byte_k] = docs::pack_bools(bools, rows, first);
+    for (std::size_t first = 0; first < rows; first += util::bits_in_byte_k)
+        bits[first / util::bits_in_byte_k] = docs::pack_bools(bools, rows, first);
     return bits;
 }
 
@@ -396,9 +398,9 @@ template <typename offset_type_>
 ustore_status_t drop_on_host(ustore_arena_t arena, offset_type_ const* offsets, ustore_byte_t const* bytes,
                              std::size_t rows, column_buffers_t& buffers) noexcept {
     if (static_cast<std::uint64_t>(offsets[rows] - offsets[0]) < rows) return ustore_status_invalid_argument_k;
-    auto [bare_offsets, offsets_status] = arena_allocate<offset_type_>(arena, rows + 1);
+    auto [bare_offsets, offsets_status] = util::arena_allocate<offset_type_>(arena, rows + 1);
     if (offsets_status.failed()) return static_cast<ustore_status_t>(offsets_status.code);
-    auto [bare_bytes, bytes_status] = arena_allocate<ustore_byte_t>(
+    auto [bare_bytes, bytes_status] = util::arena_allocate<ustore_byte_t>(
         arena, static_cast<std::size_t>(offsets[rows] - offsets[0]) - rows);
     if (bytes_status.failed()) return static_cast<ustore_status_t>(bytes_status.code);
     docs::terminated_texts<offset_type_> const texts {bytes, offsets, bare_bytes.data(), bare_offsets.data(), rows};
@@ -409,15 +411,16 @@ ustore_status_t drop_on_host(ustore_arena_t arena, offset_type_ const* offsets, 
 
 /** Packs the @p rows booleans at @p bools on @p executor's device into bits cut from @p blocks. */
 template <gpu_executor_concept executor_type_>
-expected<std::span<ustore_octet_t>> pack_on_device(executor_type_& executor, device_blocks_t& blocks,
-                                                   ustore_byte_t const* bools, std::size_t rows) noexcept {
-    if (!executor.kernels()) return status_code_t::device_k;
-    std::size_t const bytes = divide_round_up(rows, bits_in_byte_k);
+util::expected<std::span<ustore_octet_t>> pack_on_device(executor_type_& executor, util::device_blocks_t& blocks,
+                                                         ustore_byte_t const* bools, std::size_t rows) noexcept {
+    if (!executor.kernels()) return util::status_code_t::device_k;
+    std::size_t const bytes = util::divide_round_up(rows, util::bits_in_byte_k);
     auto [bits, bits_status] = carve<ustore_octet_t>(blocks, executor, bytes);
     if (bits_status.failed()) return bits_status;
-    status_t status = launch(executor, executor.kernels()->function("ustore_docs_pack_bools"),
-                             static_cast<unsigned>(divide_round_up<std::size_t>(bytes, docs::gather_block_threads_k)),
-                             docs::gather_block_threads_k, 0u, bools, std::uint64_t {rows}, bits.data());
+    util::status_t status = launch(
+        executor, executor.kernels()->function("ustore_docs_pack_bools"),
+        static_cast<unsigned>(util::divide_round_up<std::size_t>(bytes, docs::gather_block_threads_k)),
+        docs::gather_block_threads_k, 0u, bools, std::uint64_t {rows}, bits.data());
     if (status.succeeded()) status = executor.wait();
     if (status.failed()) return status;
     return bits;
@@ -427,12 +430,12 @@ expected<std::span<ustore_octet_t>> pack_on_device(executor_type_& executor, dev
  *  ending every row, on @p executor's device into @p blocks, learning its length from its first and
  *  last offsets through the bounce. */
 template <typename offset_type_, gpu_executor_concept executor_type_>
-ustore_status_t drop_on_device(executor_type_& executor, device_blocks_t& blocks, offset_type_ const* offsets,
+ustore_status_t drop_on_device(executor_type_& executor, util::device_blocks_t& blocks, offset_type_ const* offsets,
                                ustore_byte_t const* bytes, std::size_t rows, column_buffers_t& buffers) noexcept {
     if (!executor.kernels()) return ustore_status_device_k;
-    auto [ends, ends_status] = arena_allocate<offset_type_>(executor.bounce(), 2);
+    auto [ends, ends_status] = util::arena_allocate<offset_type_>(executor.bounce(), 2);
     if (ends_status.failed()) return static_cast<ustore_status_t>(ends_status.code);
-    status_t status = executor.pin_bounce();
+    util::status_t status = executor.pin_bounce();
     if (status.succeeded())
         status = executor.download_async(std::as_writable_bytes(ends.first(1)),
                                          reinterpret_cast<std::uintptr_t>(offsets));
@@ -452,7 +455,7 @@ ustore_status_t drop_on_device(executor_type_& executor, device_blocks_t& blocks
     char const* const kernel = sizeof(offset_type_) == sizeof(std::uint64_t) ? "ustore_docs_drop_terminators_u64"
                                                                              : "ustore_docs_drop_terminators_u32";
     status = launch(executor, executor.kernels()->function(kernel),
-                    static_cast<unsigned>(divide_round_up<std::size_t>(rows, docs::gather_block_threads_k)),
+                    static_cast<unsigned>(util::divide_round_up<std::size_t>(rows, docs::gather_block_threads_k)),
                     docs::gather_block_threads_k, 0u, texts);
     if (status.succeeded()) status = executor.wait();
     if (status.failed()) return static_cast<ustore_status_t>(status.code);
@@ -468,7 +471,7 @@ ustore_status_t lay_out_column(ustore_docs_column_view_t const& column, std::siz
                                ustore_arena_t arena, pack_type_&& pack, drop_type_&& drop,
                                column_buffers_t& buffers) noexcept {
     buffers = {column.validities, column.scalars, nullptr};
-    if (!arena_holds(arena, column.validities, divide_round_up(rows, bits_in_byte_k)))
+    if (!arena_holds(arena, column.validities, util::divide_round_up(rows, util::bits_in_byte_k)))
         return ustore_status_invalid_argument_k;
     if (std::size_t const width = docs::field_size_bytes(type); width) {
         if (!arena_holds(arena, column.scalars, rows * width)) return ustore_status_invalid_argument_k;
@@ -521,8 +524,8 @@ ustore_status_t ustore_strings_view_from_arrow(ArrowSchema const* schema, ArrowA
     void const* const offsets = array->buffers[1];
     if (!offsets) return ustore_status_malformed_k;
     auto const* const bytes = static_cast<ustore_byte_t const*>(array->buffers[2]);
-    *strings = narrow ? utilities::u32_tape(bytes, static_cast<std::uint32_t const*>(offsets) + array->offset)
-                      : utilities::u64_tape(bytes, static_cast<std::uint64_t const*>(offsets) + array->offset);
+    *strings = narrow ? util::u32_tape(bytes, static_cast<std::uint32_t const*>(offsets) + array->offset)
+                      : util::u64_tape(bytes, static_cast<std::uint64_t const*>(offsets) + array->offset);
     *count = static_cast<ustore_size_t>(array->length);
     return ustore_status_success_k;
 }
@@ -535,7 +538,8 @@ ustore_status_t ustore_keys_view_to_arrow(ustore_keys_view_t keys, ustore_size_t
         // Strided keys, like the triples of edges, are carved dense behind the call's outputs under the claim
         if (!take(arena->claim)) return ustore_status_contended_k;
         std::size_t const rows = static_cast<std::size_t>(count);
-        strided_rows_t strided_keys {bytes_of(keys.data, 1).data(), keys.stride, sizeof(ustore_key_t), rows, nullptr};
+        util::strided_rows_t strided_keys {util::bytes_of(keys.data, 1).data(), keys.stride, sizeof(ustore_key_t), rows,
+                                           nullptr};
         ustore_status_t const status = device_arena_of(arena).blocks ? densify_on_device(arena, strided_keys)
                                                                      : densify_on_host(arena, strided_keys);
         release(arena->claim);
@@ -605,12 +609,12 @@ ustore_status_t ustore_docs_column_view_to_arrow(ustore_docs_column_view_t const
             buffers);
     if (device)
         status = visit_export_executor(
-            arena, [&]<typename executor_type_>(executor_type_& executor, device_blocks_t& blocks) noexcept {
+            arena, [&]<typename executor_type_>(executor_type_& executor, util::device_blocks_t& blocks) noexcept {
                 // A view the gather left on the device comes down through the bounce first
                 if (executor.device_of(column) < 0) view = *column;
                 else {
-                    auto [copy, copy_status] = arena_allocate<ustore_docs_column_view_t>(executor.bounce(), 1);
-                    status_t loaded = copy_status;
+                    auto [copy, copy_status] = util::arena_allocate<ustore_docs_column_view_t>(executor.bounce(), 1);
+                    util::status_t loaded = copy_status;
                     if (loaded.succeeded()) loaded = executor.pin_bounce();
                     if (loaded.succeeded())
                         loaded = executor.download_async(std::as_writable_bytes(copy),

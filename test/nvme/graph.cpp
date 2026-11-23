@@ -92,8 +92,8 @@ expected<database_t> open_nvme(char const* directory, std::size_t memory_runs_by
     open.collection_level_enlarge_factor = enlarge_factor;
     open.collection_value_size = value_size;
     ustore_database_open_nvme(&open);
-    if (status_t const status {outcome}; status.failed()) return status;
-    return database_t {database};
+    if (status_t const status = status_of<status_t, status_code_t>(outcome); status.failed()) return {{}, status};
+    return {database_t {database}};
 }
 
 /** The edge from @p source to @p target named @p id, each spelled as the key of that integer. */
@@ -110,8 +110,8 @@ edges_view_t edges_of(std::vector<edge_t> const& edges) noexcept {
 void expect_degree(graph_collection_t& graph, std::uint64_t vertex, ustore_vertex_degree_t wanted,
                    ustore_vertex_role_t role = ustore_vertex_role_any_k) {
     auto [degree, degree_status] = graph.degree(key_from_integer(vertex), role);
-    expect_true(degree_status.succeeded());
-    if (degree_status.succeeded()) expect_equal(degree, wanted);
+    expect_true(!degree_status.failed());
+    if (!degree_status.failed()) expect_equal(degree, wanted);
 }
 
 #pragma endregion Edge Fixtures
@@ -176,15 +176,17 @@ void expect_model(graph_collection_t& graph, graph_model_t const& model, arena_t
     std::array<ustore_key_t, model_vertices_k> keys;
     for (std::uint64_t vertex = 0; vertex != model_vertices_k; ++vertex) keys[vertex] = key_from_integer(vertex);
     auto [degrees, degrees_status] = graph.degrees(strided(keys).immutable(), arena);
-    expect_true(degrees_status.succeeded());
+    expect_true(!degrees_status.failed());
     if (degrees_status.failed()) return;
     for (std::uint64_t vertex = 0; vertex != model_vertices_k; ++vertex) {
         expect_equal(degrees[vertex], model.degree(vertex));
-        expect_equal(*graph.present(keys[vertex]), model.vertices.contains(vertex));
+        auto [degree, degree_status] = graph.degree(keys[vertex]);
+        expect_true(!degree_status.failed());
+        expect_equal(degree != ustore_vertex_degree_missing_k, model.vertices.contains(vertex));
     }
     for (std::uint64_t vertex = 0; vertex != model_vertices_k; ++vertex) {
         auto [found, found_status] = graph.read_edges(keys[vertex], arena, ustore_vertex_role_source_k);
-        expect_true(found_status.succeeded());
+        expect_true(!found_status.failed());
         if (found_status.failed()) continue;
         std::vector<edge_t> const wanted = model.outgoing(vertex);
         expect_equal(found.size(), wanted.size());
@@ -210,9 +212,9 @@ case_result_t test_hub_past_value_bound(char const* directory) {
         expect_degree(graph, 1, 1);
         expect_degree(graph, hub_edges_k, 1, ustore_vertex_role_target_k);
         auto [arena, arena_status] = arena_t::make();
-        if (!expect_true(arena_status.succeeded())) return;
+        if (!expect_true(!arena_status.failed())) return;
         auto [found, found_status] = graph.read_edges(key_from_integer(0), arena, ustore_vertex_role_source_k);
-        if (!expect_true(found_status.succeeded())) return;
+        if (!expect_true(!found_status.failed())) return;
         expect_equal(found.size(), hub_edges_k);
         // Every half-edge of the hub is checked, so a single one lost or misordered fails the case once
         bool ordered = found.size() == hub_edges_k;
@@ -223,26 +225,26 @@ case_result_t test_hub_past_value_bound(char const* directory) {
 
     {
         auto [database, open_status] = open_nvme(home.c_str());
-        if (!expect_true(open_status.succeeded())) return {};
-        auto [graph, graph_status] = database.on().create<graph_collection_t>("hub");
-        if (!expect_true(graph_status.succeeded())) return {};
+        if (!expect_true(!open_status.failed())) return {};
+        auto [graph, graph_status] = database.create<graph_collection_t>("hub");
+        if (!expect_true(!graph_status.failed())) return {};
         std::vector<edge_t> batch;
         for (std::size_t first = 0; first != hub_edges_k; first += hub_batch_edges_k) {
             batch.clear();
             for (std::size_t index = first; index != first + hub_batch_edges_k; ++index)
                 batch.push_back(edge_of(0, index + 1, index + 1));
             status_t const written = graph.write_edges(edges_of(batch));
-            if (written.failed()) fmt::println(stderr, "  hub write: {}", written.message ? written.message : "");
-            expect_true(written.succeeded());
+            if (written.failed()) fmt::println(stderr, "  hub write: {}", written.note ? written.note : "");
+            expect_true(!written.failed());
         }
         check(graph);
-        expect_true(database.on().compact().succeeded());
+        expect_true(!database.compact().failed());
         check(graph);
     }
     auto [database, reopen_status] = open_nvme(home.c_str());
-    if (!expect_true(reopen_status.succeeded())) return {};
-    auto [graph, graph_status] = database.on().find<graph_collection_t>("hub");
-    if (!expect_true(graph_status.succeeded())) return {};
+    if (!expect_true(!reopen_status.failed())) return {};
+    auto [graph, graph_status] = database.find<graph_collection_t>("hub");
+    if (!expect_true(!graph_status.failed())) return {};
     check(graph);
     return {};
 }
@@ -253,31 +255,33 @@ case_result_t test_concurrent_adds_commit(char const* directory) {
     std::string const home = fmt::format("{}/{}", directory, "adds");
     if (!expect_true(scratch_directory_t::recreate(home.c_str()))) return {};
     auto [database, open_status] = open_nvme(home.c_str());
-    if (!expect_true(open_status.succeeded())) return {};
-    auto [graph, graph_status] = database.on().create<graph_collection_t>("adds");
-    if (!expect_true(graph_status.succeeded())) return {};
+    if (!expect_true(!open_status.failed())) return {};
+    auto [graph, graph_status] = database.create<graph_collection_t>("adds");
+    if (!expect_true(!graph_status.failed())) return {};
     std::array<ustore_key_t, 1> const hub {key_from_integer(0)};
-    expect_true(graph.write_vertices(strided(hub)).succeeded());
+    expect_true(!graph.write_vertices(strided(hub)).failed());
 
-    transaction_t first = *database.on().transaction();
-    transaction_t second = *database.on().transaction();
-    auto [first_graph, first_status] = first.on().find<graph_collection_t>("adds");
-    auto [second_graph, second_status] = second.on().find<graph_collection_t>("adds");
-    if (!expect_true(first_status.succeeded() && second_status.succeeded())) return {};
-    expect_true(first_graph.write_edge(edge_of(0, 1, 1)).succeeded());
-    expect_true(second_graph.write_edge(edge_of(0, 2, 2)).succeeded());
-    expect_true(first.on().commit().has_value());
-    expect_true(second.on().commit().has_value());
+    auto [first, first_begin_status] = database.transaction();
+    auto [second, second_begin_status] = database.transaction();
+    if (!expect_true(!first_begin_status.failed() && !second_begin_status.failed())) return {};
+    auto [first_graph, first_status] = first.find<graph_collection_t>("adds");
+    auto [second_graph, second_status] = second.find<graph_collection_t>("adds");
+    if (!expect_true(!first_status.failed() && !second_status.failed())) return {};
+    expect_true(!first_graph.write_edge(edge_of(0, 1, 1)).failed());
+    expect_true(!second_graph.write_edge(edge_of(0, 2, 2)).failed());
+    expect_true(!first.commit().status.failed());
+    expect_true(!second.commit().status.failed());
     expect_degree(graph, 0, 2);
 
     // A transaction reads its own changes merged into the committed adjacency
-    transaction_t reading = *database.on().transaction();
-    auto [reading_graph, reading_status] = reading.on().find<graph_collection_t>("adds");
-    if (!expect_true(reading_status.succeeded())) return {};
-    expect_true(reading_graph.write_edge(edge_of(3, 0, 3)).succeeded());
-    expect_equal(*reading_graph.degree(key_from_integer(0)), 3u);
-    expect_equal(*reading_graph.degree(key_from_integer(0), ustore_vertex_role_target_k), 1u);
-    expect_true(reading.on().commit().has_value());
+    auto [reading, reading_begin_status] = database.transaction();
+    if (!expect_true(!reading_begin_status.failed())) return {};
+    auto [reading_graph, reading_status] = reading.find<graph_collection_t>("adds");
+    if (!expect_true(!reading_status.failed())) return {};
+    expect_true(!reading_graph.write_edge(edge_of(3, 0, 3)).failed());
+    expect_degree(reading_graph, 0, 3);
+    expect_degree(reading_graph, 0, 1, ustore_vertex_role_target_k);
+    expect_true(!reading.commit().status.failed());
     expect_degree(graph, 0, 3);
 
     std::size_t refused = 0;
@@ -285,16 +289,15 @@ case_result_t test_concurrent_adds_commit(char const* directory) {
     for (std::size_t thread = 0; thread != adding_threads_k; ++thread)
         threads.emplace_back([&, thread] {
             for (std::size_t round = 0; round != transactions_per_thread_k; ++round) {
-                auto [transaction, begin_status] = database.on().transaction();
+                auto [transaction, begin_status] = database.transaction();
                 if (begin_status.failed()) {
                     fu::standard_atomic_ref<std::size_t> {refused}.store_add(1, std::memory_order_relaxed);
                     continue;
                 }
-                auto [adding, adding_status] = transaction.on().find<graph_collection_t>("adds");
+                auto [adding, adding_status] = transaction.find<graph_collection_t>("adds");
                 std::uint64_t const leaf = 1000 + thread * transactions_per_thread_k + round;
-                bool const committed = adding_status.succeeded() &&
-                                       adding.write_edge(edge_of(0, leaf, leaf)).succeeded() &&
-                                       transaction.on().commit().has_value();
+                bool const committed = !adding_status.failed() && !adding.write_edge(edge_of(0, leaf, leaf)).failed() &&
+                                       !transaction.commit().status.failed();
                 if (!committed) fu::standard_atomic_ref<std::size_t> {refused}.store_add(1, std::memory_order_relaxed);
             }
         });
@@ -311,34 +314,33 @@ case_result_t test_vertex_removal(char const* directory) {
     std::string const home = fmt::format("{}/{}", directory, "removal");
     if (!expect_true(scratch_directory_t::recreate(home.c_str()))) return {};
     auto [database, open_status] = open_nvme(home.c_str());
-    if (!expect_true(open_status.succeeded())) return {};
-    auto [graph, graph_status] = database.on().create<graph_collection_t>("removal");
-    if (!expect_true(graph_status.succeeded())) return {};
+    if (!expect_true(!open_status.failed())) return {};
+    auto [graph, graph_status] = database.create<graph_collection_t>("removal");
+    if (!expect_true(!graph_status.failed())) return {};
     // A vertex changes through the graph calls alone, as on the in-memory engine, never through a blobs write
-    blobs_collection_t vertices {database.receiver(), *graph.member_ptr()};
+    blobs_collection_t vertices {database.receiver(), graph.handle()};
     expect_true(vertices[key_from_integer(0)].assign("vertex") == status_code_t::invalid_argument_k);
     expect_true(vertices[key_from_integer(0)].remove() == status_code_t::invalid_argument_k);
 
     std::vector<edge_t> const star {edge_of(0, 1, 1), edge_of(0, 2, 2), edge_of(3, 0, 3), edge_of(0, 0, 4),
                                     edge_of(1, 2, 5)};
-    expect_true(graph.write_edges(edges_of(star)).succeeded());
+    expect_true(!graph.write_edges(edges_of(star)).failed());
     expect_degree(graph, 0, 5);
-    expect_true(graph.remove_vertex(key_from_integer(0)).succeeded());
-    expect_true(!*graph.present(key_from_integer(0)));
+    expect_true(!graph.remove_vertex(key_from_integer(0)).failed());
     expect_degree(graph, 0, ustore_vertex_degree_missing_k);
     expect_degree(graph, 1, 1);
     expect_degree(graph, 2, 1);
     expect_degree(graph, 3, 0);
-    expect_true(*graph.present(key_from_integer(3)));
 
     // The removal's own transaction reads the vertex, which an edge landing meanwhile changes
-    expect_true(graph.write_edge(edge_of(1, 3, 6)).succeeded());
-    transaction_t removing = *database.on().transaction();
-    auto [removing_graph, removing_status] = removing.on().find<graph_collection_t>("removal");
-    if (!expect_true(removing_status.succeeded())) return {};
-    expect_true(removing_graph.remove_vertex(key_from_integer(3)).succeeded());
-    expect_true(graph.write_edge(edge_of(3, 2, 7)).succeeded());
-    expect_true(removing.on().commit().failed());
+    expect_true(!graph.write_edge(edge_of(1, 3, 6)).failed());
+    auto [removing, removing_begin_status] = database.transaction();
+    if (!expect_true(!removing_begin_status.failed())) return {};
+    auto [removing_graph, removing_status] = removing.find<graph_collection_t>("removal");
+    if (!expect_true(!removing_status.failed())) return {};
+    expect_true(!removing_graph.remove_vertex(key_from_integer(3)).failed());
+    expect_true(!graph.write_edge(edge_of(3, 2, 7)).failed());
+    expect_true(removing.commit().status.failed());
     expect_degree(graph, 3, 2);
     expect_degree(graph, 2, 2);
     return {};
@@ -351,13 +353,14 @@ case_result_t test_fixed_width_refuses_graph(char const* directory) {
     std::string const home = fmt::format("{}/{}", directory, "fixed");
     if (!expect_true(scratch_directory_t::recreate(home.c_str()))) return {};
     auto [database, open_status] = open_nvme(home.c_str(), 0, 0, 8);
-    if (!expect_true(open_status.succeeded())) return {};
-    expect_true(database.on().create<graph_collection_t>("graph").status() == status_code_t::unsupported_k);
-    auto [blobs, blobs_status] = database.on().create<blobs_collection_t>("blobs");
-    if (!expect_true(blobs_status.succeeded())) return {};
+    if (!expect_true(!open_status.failed())) return {};
+    expect_true(database.create<graph_collection_t>("graph").status == status_code_t::unsupported_k);
+    auto [blobs, blobs_status] = database.create<blobs_collection_t>("blobs");
+    if (!expect_true(!blobs_status.failed())) return {};
     ustore_key_t const key = key_from_integer(1);
-    expect_true(blobs[key].assign("12345678").succeeded());
-    expect_true(blobs[key].value() == "12345678");
+    expect_true(!blobs[key].assign("12345678").failed());
+    auto [stored, stored_status] = blobs[key].value();
+    expect_true(!stored_status.failed() && stored == "12345678");
     return {};
 }
 
@@ -369,27 +372,27 @@ case_result_t test_bottom_applies_chains(char const* directory) {
     std::string const home = fmt::format("{}/{}", directory, "bottom");
     if (!expect_true(scratch_directory_t::recreate(home.c_str()))) return {};
     auto [database, open_status] = open_nvme(home.c_str(), small_memory_runs_bytes_k, 2);
-    if (!expect_true(open_status.succeeded())) return {};
-    auto [graph, graph_status] = database.on().create<graph_collection_t>("bottom");
-    if (!expect_true(graph_status.succeeded())) return {};
+    if (!expect_true(!open_status.failed())) return {};
+    auto [graph, graph_status] = database.create<graph_collection_t>("bottom");
+    if (!expect_true(!graph_status.failed())) return {};
 
     std::vector<edge_t> batch;
     for (std::size_t round = 0; round != bottom_rounds_k; ++round) {
         batch.clear();
         for (std::size_t index = 0; index != bottom_round_edges_k; ++index)
             batch.push_back(edge_of(0, 1, round * bottom_round_edges_k + index));
-        expect_true(graph.write_edges(edges_of(batch)).succeeded());
-        expect_true(graph.remove_edges(edges_of(batch)).succeeded());
+        expect_true(!graph.write_edges(edges_of(batch)).failed());
+        expect_true(!graph.remove_edges(edges_of(batch)).failed());
     }
-    expect_true(database.on().compact().succeeded());
+    expect_true(!database.compact().failed());
     expect_degree(graph, 0, 0);
     expect_degree(graph, 1, 0);
 
     // Unapplied, the newest record of every half-edge is its removal, two of 48 bytes per edge at the bottom
-    auto [description, describe_status] = database.on().describe();
-    expect_true(describe_status.succeeded());
+    auto [description, describe_status] = database.describe();
+    expect_true(!describe_status.failed());
     std::size_t const removal_bytes = 2 * bottom_rounds_k * bottom_round_edges_k * 48;
-    if (describe_status.succeeded()) expect_true(description.disk_bytes < removal_bytes / 2);
+    if (!describe_status.failed()) expect_true(description.disk_bytes < removal_bytes / 2);
     return {};
 }
 
@@ -402,13 +405,13 @@ case_result_t test_fold_survives_maintenance(char const* directory) {
     if (!expect_true(scratch_directory_t::recreate(home.c_str()))) return {};
     graph_model_t model;
     auto [arena, arena_status] = arena_t::make();
-    if (!expect_true(arena_status.succeeded())) return {};
+    if (!expect_true(!arena_status.failed())) return {};
 
     {
         auto [database, open_status] = open_nvme(home.c_str(), small_memory_runs_bytes_k, 2);
-        if (!expect_true(open_status.succeeded())) return {};
-        auto [graph, graph_status] = database.on().create<graph_collection_t>("maintenance");
-        if (!expect_true(graph_status.succeeded())) return {};
+        if (!expect_true(!open_status.failed())) return {};
+        auto [graph, graph_status] = database.create<graph_collection_t>("maintenance");
+        if (!expect_true(!graph_status.failed())) return {};
 
         std::vector<edge_t> batch;
         std::vector<graph_model_t::triple_t> drawn;
@@ -424,28 +427,28 @@ case_result_t test_fold_survives_maintenance(char const* directory) {
                 batch.push_back(edge_of(source, target, id));
             }
             if (draw < 70) {
-                expect_true(graph.write_edges(edges_of(batch)).succeeded());
+                expect_true(!graph.write_edges(edges_of(batch)).failed());
                 for (auto const& [source, target, id] : drawn) model.write_edge(source, target, id);
             }
             else if (draw < 90) {
-                expect_true(graph.remove_edges(edges_of(batch)).succeeded());
+                expect_true(!graph.remove_edges(edges_of(batch)).failed());
                 for (auto const& [source, target, id] : drawn) model.remove_edge(source, target, id);
             }
             else {
                 std::uint64_t const vertex = random.below(model_vertices_k);
-                expect_true(graph.remove_vertex(key_from_integer(vertex)).succeeded());
+                expect_true(!graph.remove_vertex(key_from_integer(vertex)).failed());
                 model.remove_vertex(vertex);
             }
             if (call == model_calls_k / 2) expect_model(graph, model, arena);
         }
         expect_model(graph, model, arena);
-        expect_true(database.on().compact().succeeded());
+        expect_true(!database.compact().failed());
         expect_model(graph, model, arena);
     }
     auto [database, reopen_status] = open_nvme(home.c_str(), small_memory_runs_bytes_k, 2);
-    if (!expect_true(reopen_status.succeeded())) return {};
-    auto [graph, graph_status] = database.on().find<graph_collection_t>("maintenance");
-    if (!expect_true(graph_status.succeeded())) return {};
+    if (!expect_true(!reopen_status.failed())) return {};
+    auto [graph, graph_status] = database.find<graph_collection_t>("maintenance");
+    if (!expect_true(!graph_status.failed())) return {};
     expect_model(graph, model, arena);
     return {};
 }
@@ -455,12 +458,12 @@ case_result_t test_fold_survives_maintenance(char const* directory) {
 int main(int argc, char** argv) {
     start_test_run(argc, argv);
 
-    st::expected<scratch_directory_t> const directory = scratch_directory_t::make(test_run.settings.directory);
-    if (!directory) {
+    auto [directory, directory_status] = scratch_directory_t::make(test_run.settings.directory);
+    if (st::failed(directory_status)) {
         fmt::println(stderr, "  the working directory would not open");
         return 1;
     }
-    char const* const home = directory->path();
+    char const* const home = directory.path();
     run_test_case("test_hub_past_value_bound", test_hub_past_value_bound, home);
     run_test_case("test_concurrent_adds_commit", test_concurrent_adds_commit, home);
     run_test_case("test_vertex_removal", test_vertex_removal, home);

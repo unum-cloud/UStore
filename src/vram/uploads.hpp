@@ -48,7 +48,7 @@ status_t upload_through_host(arguments_type_ const& arguments, rest_types_&... r
     if (!verbs) return {status_code_t::unsupported_k, "The engine keeps no collections of that modality"};
     auto const verb = verbs->*verb_slot<arguments_type_>::template verb<vendored_residency_t::host_k>;
     if (!verb) return {status_code_t::unsupported_k, "The engine does not implement this call"};
-    utilities::device_blocks_t* const blocks = utilities::device_blocks_of(arguments.arena, executor);
+    util::device_blocks_t* const blocks = util::device_blocks_of(arguments.arena, executor);
     if (!blocks) return {status_code_t::device_k, "The arena lives where another executor computes"};
 
     arguments_type_ hosted = arguments;

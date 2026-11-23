@@ -56,6 +56,10 @@ using utilities::loser_tree;
 
 #pragma region Vocabulary
 
+/** Bytes per row of the S+ trees a sorted run saves, fixed because the rows are part of the run's
+ *  on-disk layout. */
+inline constexpr std::size_t sorted_run_row_bytes_k = 512;
+
 /** A key slot shape compaction merges: trivially copyable and keyed by a stored key, with the kind of each delta in
  *  its run's kinds column. */
 template <typename key_slot_type_>
@@ -228,7 +232,7 @@ class range_tombstones {
             return status_t {status_code_t::out_of_memory_k, "No room for range tombstones"};
         for (std::size_t index = 0; index != ranges.size(); ++index) {
             if (!(ranges[index].start < ranges[index].end))
-                return status_t {status_code_t::invalid_argument_k, "A range tombstone ends at or before its start"};
+                return status_t {status_code_t::invalid_argument_k, "A range tombstone ends before it starts"};
             // Few tombstones arrive at once, so an insertion keeps both columns in step.
             std::size_t at = index;
             for (; at != 0 && ranges[index].start < made.ranges_[at - 1].start; --at) {
@@ -412,7 +416,7 @@ class range_tombstones<std::string_view, allocator_type_> {
         std::size_t tape_bytes = 0;
         for (range_t const& range : ranges) {
             if (!range.end.empty() && !(range.start < range.end))
-                return status_t {status_code_t::invalid_argument_k, "A range tombstone ends at or before its start"};
+                return status_t {status_code_t::invalid_argument_k, "A range tombstone ends before it starts"};
             tape_bytes += range.start.size() + range.end.size();
         }
         range_tombstones made {allocator};
@@ -1984,13 +1988,13 @@ class ring_sections_reader {
         if (reader.media_.resize(media.size()) != st::status_t::success_k)
             return status_t {status_code_t::out_of_memory_k, "The reader could not track its volumes"};
         for (std::size_t volume = 0; volume != media.size(); ++volume) {
-            expected<utilities::registered_medium_t> registered = reader.disk_.register_medium(media[volume]);
-            if (!registered) return registered.status();
-            reader.media_[volume] = std::move(*registered);
+            auto [registered, register_status] = reader.disk_.register_medium(media[volume]);
+            if (register_status.failed()) return register_status;
+            reader.media_[volume] = std::move(registered);
         }
-        expected<utilities::queue_pair_t> acquired = reader.disk_.acquire_queue_pair(depth_k);
-        if (!acquired) return acquired.status();
-        reader.queue_pair_ = std::move(*acquired);
+        auto [acquired, acquire_status] = reader.disk_.acquire_queue_pair(depth_k);
+        if (acquire_status.failed()) return acquire_status;
+        reader.queue_pair_ = std::move(acquired);
         return reader;
     }
 
@@ -2001,12 +2005,14 @@ class ring_sections_reader {
         ring_sections_reader reader;
         reader.disk_ = std::move(disk);
         reader.volume_ = &volume;
-        expected<utilities::queue_pair_t> acquired = reader.disk_.acquire_queue_pair(depth_k);
-        if (!acquired) return acquired.status();
-        reader.queue_pair_ = std::move(*acquired);
+        auto [acquired, status] = reader.disk_.acquire_queue_pair(depth_k);
+        if (status.failed()) return status;
+        reader.queue_pair_ = std::move(acquired);
         return reader;
     }
 
+    /** Holds nothing, as a moved-from reader does. */
+    ring_sections_reader() noexcept = default;
     ring_sections_reader(ring_sections_reader&& other) noexcept
         : disk_(std::move(other.disk_)), media_(std::move(other.media_)), runs_(std::move(other.runs_)),
           volume_(std::exchange(other.volume_, nullptr)), queue_pair_(std::move(other.queue_pair_)),
@@ -2029,10 +2035,9 @@ class ring_sections_reader {
         using utilities::request_t;
         if (registered_.held() && registered_.bytes().data() != scratch.data()) release();
         if (!registered_.held()) {
-            expected<utilities::registered_memory_t> registered = disk_.register_memory(
-                scratch, utilities::memory_space_t::gpu_k);
-            if (!registered) return st::status_t::input_output_k;
-            registered_ = std::move(*registered);
+            auto [registered, status] = disk_.register_memory(scratch, utilities::memory_space_t::gpu_k);
+            if (status.failed()) return st::status_t::input_output_k;
+            registered_ = std::move(registered);
         }
         std::array<request_t, depth_k> requests {};
         std::array<completion_t, depth_k> completions {};
@@ -2079,8 +2084,6 @@ class ring_sections_reader {
     }
 
   private:
-    ring_sections_reader() noexcept = default;
-
     /** One run file a merge reads, registered at its first section. */
     struct run_medium_t {
         utilities::uuid128_t run {};
@@ -2111,9 +2114,9 @@ class ring_sections_reader {
         utilities::medium_options_t request;
         request.name = path;
         request.access = utilities::medium_access_t::read_only_k;
-        expected<utilities::registered_medium_t> registered = disk_.register_medium(request);
-        if (!registered) return registered.status();
-        if (runs_.push_back(run_medium_t {section.run, std::move(*registered)}) != st::status_t::success_k)
+        auto [registered, status] = disk_.register_medium(request);
+        if (status.failed()) return status;
+        if (runs_.push_back(run_medium_t {section.run, std::move(registered)}) != st::status_t::success_k)
             return status_t {status_code_t::out_of_memory_k, "The reader could not track another run"};
         return runs_[runs_.size() - 1].medium.reference();
     }

@@ -29,6 +29,7 @@
 
 namespace unum::ustore::pages {
 
+using utilities::bytes_of;
 using utilities::chars_of;
 
 /** The kind of an edit, named after the call that makes it and numbered as its serialized form spells it. */
@@ -277,8 +278,9 @@ class edits_reader_t {
     /** Reads the next edit, which must exist. */
     expected<edit_t> next() noexcept {
         std::size_t consumed = 0;
-        auto edit = decode_edit(chain_.subspan(offset_), consumed);
-        if (edit) offset_ += consumed;
+        auto [edit, edit_status] = decode_edit(chain_.subspan(offset_), consumed);
+        if (edit_status.failed()) return edit_status;
+        offset_ += consumed;
         return edit;
     }
 };
@@ -288,9 +290,9 @@ template <typename callback_type_>
 status_t for_each_edit(std::span<byte_t const> chain, callback_type_&& callback) noexcept {
     edits_reader_t reader(chain);
     while (!reader.done()) {
-        auto edit = reader.next();
-        if (!edit) return edit.status();
-        if (status_t status = callback(*edit); status.failed()) return status;
+        auto [edit, edit_status] = reader.next();
+        if (edit_status.failed()) return edit_status;
+        if (status_t status = callback(edit); status.failed()) return status;
     }
     return {};
 }
@@ -305,7 +307,7 @@ expected<std::span<byte_t const>> encode_edits(std::span<edit_t const> edits, al
         size += encoded_size(edit);
     }
     byte_t* const block = size ? allocator.allocate(size) : nullptr;
-    if (size && !block) return status_t {status_code_t::out_of_memory_k, "Failed to allocate a delta"};
+    if (size && !block) return status_t {status_code_t::out_of_memory_k, "No room for the encoded delta"};
     std::size_t offset = 0;
     for (edit_t const& edit : edits) offset += encode_into(edit, block + offset);
     return std::span<byte_t const>(block, size);
@@ -315,9 +317,9 @@ expected<std::span<byte_t const>> encode_edits(std::span<edit_t const> edits, al
 template <typename callback_type_>
 status_t for_each_minted_key(edit_t const& edit, callback_type_&& callback) noexcept {
     if (edit.modification != modification_t::import_k && edit.modification != modification_t::insert_k) return {};
-    auto view = page_view_t::make(edit.value);
-    if (!view) return view.status();
-    for (std::uint32_t position = 1; position < view->size(); ++position) callback(view->record(position).key);
+    auto [view, view_status] = page_view_t::make(edit.value);
+    if (view_status.failed()) return view_status;
+    for (std::uint32_t position = 1; position < view.size(); ++position) callback(view.record(position).key);
     return {};
 }
 

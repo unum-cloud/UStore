@@ -76,10 +76,11 @@ UStore builds with CMake against StringZilla, ForkUnion and SmashTable, pulled a
 ```cmake
 FetchContent_Declare(ustore GIT_REPOSITORY https://github.com/unum-cloud/UStore.git)
 FetchContent_MakeAvailable(ustore)
-target_link_libraries(my_app PRIVATE ustore::static)
+target_link_libraries(my_app PRIVATE ustore::cpp)
 ```
 
-`ustore::static` is an archive that links the storage engines' archives installed beside it, `ustore::shared` exports the C ABI alone, and `-DUSTORE_INSTALL=ON` installs both with a CMake package for `find_package(ustore)`.
+`ustore::cpp` carries the C++ SDK, the C headers of `ustore::abi` and `ustore::static`, an archive that links the storage engines' archives installed beside it.
+`ustore::shared` exports the C ABI alone, `ustore::templates` names the header-only templates, and `-DUSTORE_INSTALL=ON` installs them all with a CMake package for `find_package(ustore)`.
 The program opens a database in memory, writes a blob, a document and an edge in one transaction, and reads them back, as every binding's Quickstart does.
 
 ```cpp
@@ -91,27 +92,30 @@ using namespace unum::ustore;
 
 int main() {
     auto [db, open_status] = database_t::init_ram();
-    auto posters = db.on().create<blobs_collection_t>("posters");
-    auto movies = db.on().create<docs_collection_t>("movies");
-    auto similar = db.on().create<graph_collection_t>("similar");
-    assert(open_status.succeeded() && posters && movies && similar);
+    auto [posters, posters_status] = db.create<blobs_collection_t>("posters");
+    auto [movies, movies_status] = db.create<docs_collection_t>("movies");
+    auto [similar, similar_status] = db.create<graph_collection_t>("similar");
+    assert(open_status.succeeded() && posters_status.succeeded() && movies_status.succeeded() &&
+           similar_status.succeeded());
 
     // One transaction writes a blob, a document and an edge, and commits all three or none
     ustore_key_t const avatar = key_from_integer(1), titanic = key_from_integer(2);
-    auto [transaction, transaction_status] = db.on().transaction();
-    transaction_ref_t const inside = transaction.on();
-    status_t const poster = inside["posters"]->at(avatar).assign("\x89PNG");
-    status_t const movie = inside.find<docs_collection_t>("movies")->at(avatar).assign(
+    auto [transaction, transaction_status] = db.transaction();
+    transaction_t const& inside = transaction;
+    status_t const poster = inside["posters"].value.at(avatar).assign("\x89PNG");
+    status_t const movie = inside.find<docs_collection_t>("movies").value.at(avatar).assign(
         R"({"title":"Avatar","year":2009})");
-    status_t const edge = inside.find<graph_collection_t>("similar")->write_edge(edge_t {avatar, titanic});
-    expected<commit_stamp_t> const committed = inside.commit();
-    assert(transaction_status.succeeded() && poster.succeeded() && movie.succeeded() && edge.succeeded() && committed);
+    status_t const edge = inside.find<graph_collection_t>("similar").value.write_edge(edge_t {avatar, titanic});
+    auto [committed, commit_status] = inside.commit();
+    assert(transaction_status.succeeded() && poster.succeeded() && movie.succeeded() && edge.succeeded() &&
+           commit_status.succeeded());
 
     // Reads at the head see the commit: the poster, the title and the one edge leaving Avatar
-    auto const stored = (*posters)[avatar].value();
-    auto const title = (*movies)[collection_key_field_t {avatar, "title"}].value(ustore_docs_field_type_string_k);
-    auto const degree = similar->degree(avatar, ustore_vertex_role_source_k);
-    assert(stored && *stored == "\x89PNG" && title && *title == "Avatar" && degree && *degree == 1);
+    auto [stored, stored_status] = posters[avatar].value();
+    auto [title, title_status] = movies[collection_key_field_t {avatar, "title"}].value(ustore_docs_field_type_string_k);
+    auto [degree, degree_status] = similar.degree(avatar, ustore_vertex_role_source_k);
+    assert(stored_status.succeeded() && stored == "\x89PNG" && title_status.succeeded() && title == "Avatar" &&
+           degree_status.succeeded() && degree == 1);
 }
 ```
 
@@ -159,7 +163,7 @@ A collection maps UUID keys to binary values, and a database holds any number of
 `find_or_create` opens one by name, creating it on first use.
 
 ```cpp
-blobs_collection_t archive = *db.find_or_create("archive");
+auto [archive, archive_status] = db.find_or_create("archive");
 status_t status = archive[key_from_integer(7)].assign("poster bytes");
 auto lengths = archive[{key_from_integer(1), key_from_integer(2), key_from_integer(7)}].length();
 status = archive[key_from_integer(7)].remove();
@@ -177,7 +181,7 @@ A document collection stores JSON, parsed and modified with yyjson.
 A field is either a top-level key or an RFC 6901 JSON Pointer starting with a slash.
 
 ```cpp
-docs_collection_t users = *db.find_or_create<docs_collection_t>("users");
+auto [users, users_status] = db.find_or_create<docs_collection_t>("users");
 status_t status = users[key_from_integer(1)].assign(R"({"name": "Alice", "follows": [2, 3]})");
 
 auto name = users[collection_key_field_t {key_from_integer(1), "/name"}].value();
@@ -203,7 +207,7 @@ Modifications follow open RFCs rather than a proprietary query language, and eac
 A graph collection stores a directed multigraph, where every edge carries a source, a target and its own identifier.
 
 ```cpp
-graph_collection_t friends = *db.find_or_create<graph_collection_t>("friends");
+auto [friends, friends_status] = db.find_or_create<graph_collection_t>("friends");
 status_t status = friends.write_edge(edge_t {key_from_integer(1), key_from_integer(2), key_from_integer(100)});
 status = friends.write_edge(edge_t {key_from_integer(2), key_from_integer(3), key_from_integer(101)});
 
@@ -224,9 +228,9 @@ Documents and graphs share one key type, so a user's profile and a user's vertex
 A transaction reads and writes through the same collection types as the database.
 
 ```cpp
-transaction_t transaction = *db.transaction();
-docs_collection_t users = *transaction.find<docs_collection_t>("users");
-graph_collection_t friends = *transaction.find<graph_collection_t>("friends");
+auto [transaction, transaction_status] = db.transaction();
+auto [users, users_status] = transaction.find<docs_collection_t>("users");
+auto [friends, friends_status] = transaction.find<graph_collection_t>("friends");
 
 status_t status = users[key_from_integer(4)].assign(R"({"name": "Dana"})");
 status = friends.write_edge(edge_t {key_from_integer(1), key_from_integer(4), key_from_integer(102)});

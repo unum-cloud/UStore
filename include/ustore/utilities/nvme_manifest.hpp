@@ -440,15 +440,15 @@ struct manifest_t {
                 laid = yyjson_mut_obj_add_strncpy(document, object, "sha256", printed_digest, sizeof(printed_digest));
             }
         }
-        if (!laid) return {status_code_t::out_of_memory_k, "No room to print the manifest"};
+        if (!laid) return {status_code_t::out_of_memory_k, "No room to lay the manifest document out"};
 
         std::size_t length = 0;
         yyjson_write_err error {};
         char* const text = yyjson_mut_write_opts(document, YYJSON_WRITE_NOFLAG, &table, &length, &error);
-        if (!text) return {status_code_t::out_of_memory_k, "No room to print the manifest"};
+        if (!text) return {status_code_t::out_of_memory_k, "No room for the printed manifest"};
         status_t copied;
         if (into.resize(length) != st::status_t::success_k)
-            copied = {status_code_t::out_of_memory_k, "No room to print the manifest"};
+            copied = {status_code_t::out_of_memory_k, "No room to copy the printed manifest"};
         else std::memcpy(into.data(), text, length);
         table.free(table.ctx, text);
         return copied;
@@ -525,7 +525,7 @@ struct manifest_t {
     }
 
     static status_t malformed_() noexcept {
-        return {status_code_t::malformed_k, "The manifest lacks a field or holds one out of range"};
+        return {status_code_t::malformed_k, "A manifest field is absent or invalid"};
     }
 
     static std::string_view text_of_(yyjson_val* value) noexcept {

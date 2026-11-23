@@ -59,7 +59,7 @@ namespace unum::ustore::bench {
 
 /** Half the logical cores this process may run on, at least one. */
 [[nodiscard]] std::size_t half_the_cores() noexcept {
-    auto const cores = executor_t::logical_cores_count();
+    auto const cores = util::executor_t::logical_cores_count();
     return cores && *cores > 1 ? *cores / 2 : 1;
 }
 
@@ -122,7 +122,7 @@ struct twitter_t {
     ustore_collection_id_t blobs {};
 
     /** Memory-mapped NDJSON files the tweets come from. */
-    st::vector<mapped_file_t> files;
+    st::vector<util::mapped_file_t> files;
 
     /** Generated tweets, one JSON object per line. */
     sz::string_t generated;
@@ -131,31 +131,31 @@ struct twitter_t {
     st::vector<st::vector<keyed_document_t>> documents;
 
     /** Edges indexed alongside @c documents. */
-    st::vector<st::vector<edge_t>> edges;
+    st::vector<st::vector<util::edge_t>> edges;
 };
 
 /** Indexes one tweet as documents and edges, answering false only when an allocation fails. */
 [[nodiscard]] bool index_tweet(yyjson_val* tweet, std::string_view body, st::vector<keyed_document_t>& documents,
-                               st::vector<edge_t>& edges) noexcept {
+                               st::vector<util::edge_t>& edges) noexcept {
     yyjson_val* const id = yyjson_obj_get(tweet, "id");
     yyjson_val* const user_id = yyjson_obj_get(yyjson_obj_get(tweet, "user"), "id");
     if (!yyjson_is_uint(id) || !yyjson_is_uint(user_id)) return true;
-    ustore_key_t const tweet_key = key_from_integer(yyjson_get_uint(id));
-    ustore_key_t const user_key = key_from_integer(yyjson_get_uint(user_id));
+    ustore_key_t const tweet_key = util::key_from_integer(yyjson_get_uint(id));
+    ustore_key_t const user_key = util::key_from_integer(yyjson_get_uint(user_id));
 
     if (st::failed(documents.push_back(keyed_document_t {tweet_key, body})) ||
         st::failed(documents.push_back(keyed_document_t {user_key, body})) ||
-        st::failed(edges.push_back(edge_t {tweet_key, user_key, ustore_edge_id_default_k})))
+        st::failed(edges.push_back(util::edge_t {tweet_key, user_key, ustore_edge_id_default_k})))
         return false;
 
     yyjson_val* const retweet = yyjson_obj_get(tweet, "retweeted_status");
     yyjson_val* const retweet_id = yyjson_obj_get(retweet, "id");
     yyjson_val* const retweet_user_id = yyjson_obj_get(yyjson_obj_get(retweet, "user"), "id");
     if (yyjson_is_uint(retweet_id) && yyjson_is_uint(retweet_user_id)) {
-        ustore_key_t const retweet_key = key_from_integer(yyjson_get_uint(retweet_id));
-        if (st::failed(edges.push_back(edge_t {tweet_key, retweet_key, ustore_edge_id_default_k})) ||
-            st::failed(
-                edges.push_back(edge_t {user_key, key_from_integer(yyjson_get_uint(retweet_user_id)), retweet_key})))
+        ustore_key_t const retweet_key = util::key_from_integer(yyjson_get_uint(retweet_id));
+        if (st::failed(edges.push_back(util::edge_t {tweet_key, retweet_key, ustore_edge_id_default_k})) ||
+            st::failed(edges.push_back(
+                util::edge_t {user_key, util::key_from_integer(yyjson_get_uint(retweet_user_id)), retweet_key})))
             return false;
     }
 
@@ -165,7 +165,8 @@ struct twitter_t {
     for (yyjson_val* mention = yyjson_arr_iter_next(&iterator); mention; mention = yyjson_arr_iter_next(&iterator)) {
         yyjson_val* const mentioned_id = yyjson_obj_get(mention, "id");
         if (!yyjson_is_uint(mentioned_id)) return true;
-        if (st::failed(edges.push_back(edge_t {user_key, key_from_integer(yyjson_get_uint(mentioned_id)), tweet_key})))
+        if (st::failed(edges.push_back(
+                util::edge_t {user_key, util::key_from_integer(yyjson_get_uint(mentioned_id)), tweet_key})))
             return false;
     }
     return true;
@@ -173,7 +174,7 @@ struct twitter_t {
 
 /** Indexes every line of @p text holding a tweet, answering false only when an allocation fails. */
 [[nodiscard]] bool index_tweets(std::string_view text, st::vector<keyed_document_t>& documents,
-                                st::vector<edge_t>& edges) noexcept {
+                                st::vector<util::edge_t>& edges) noexcept {
     for (sz::string_view_t line : sz::split(sz::string_view_t {text}, "\n")) {
         if (line.size() == 0) continue;
         json_document_t const document {yyjson_read(line.data(), line.size(), 0)};
@@ -283,7 +284,8 @@ constexpr std::string_view tweet_template_k =
 }
 
 /** Maps up to @c max_input_files_total NDJSON files from the dataset directory and indexes them on @p executor. */
-[[nodiscard]] bool load_dataset(twitter_settings_t const& settings, executor_t& executor, twitter_t& twitter) noexcept {
+[[nodiscard]] bool load_dataset(twitter_settings_t const& settings, util::executor_t& executor,
+                                twitter_t& twitter) noexcept {
     fmt::println("Will search for .ndjson files...");
     std::error_code error;
     std::filesystem::directory_iterator listing {std::filesystem::path {settings.dataset}, error};
@@ -297,7 +299,7 @@ constexpr std::string_view tweet_template_k =
         ++found;
         if (twitter.files.size() == settings.max_input_files_total.value) continue;
         std::string const path = listing->path().string();
-        auto [file, map_status] = mapped_file_t::map(path.c_str());
+        auto [file, map_status] = util::mapped_file_t::map(path.c_str());
         if (map_status.failed() || st::failed(twitter.files.push_back(std::move(file)))) {
             fmt::println(stderr, "Failed to map {}", path);
             return false;
@@ -335,7 +337,7 @@ constexpr std::string_view tweet_template_k =
 
 /** Upserts the documents into @p collection in transactional batches of @p batch_size committed as
  *  @p durability asks, each thread over its own share of batches. */
-void construct_docs(executor_t& executor, twitter_settings_t const& settings, twitter_t const& twitter,
+void construct_docs(util::executor_t& executor, twitter_settings_t const& settings, twitter_t const& twitter,
                     ustore_collection_id_t collection, std::size_t batch_size, ustore_durability_t durability) {
     std::string const name = fmt::format("construct_docs{}/{}",
                                          durability == ustore_durability_flushed_k ? "_flushed" : "", batch_size);
@@ -356,7 +358,7 @@ void construct_docs(executor_t& executor, twitter_settings_t const& settings, tw
 
 /** Writes the documents' JSON bodies as blobs at the head in batches of @p batch_size, each thread
  *  over its own share of batches. */
-void construct_blobs(executor_t& executor, twitter_settings_t const& settings, twitter_t const& twitter,
+void construct_blobs(util::executor_t& executor, twitter_settings_t const& settings, twitter_t const& twitter,
                      std::size_t batch_size) {
     std::string const name = fmt::format("construct_blobs/{}", batch_size);
     if (!settings.regex_filter.selects(name)) return;
@@ -367,7 +369,8 @@ void construct_blobs(executor_t& executor, twitter_settings_t const& settings, t
         ustore_outcome_t outcome {};
         for (std::size_t call : loop) {
             std::span<keyed_document_t const> const batch = staged.subspan(call * batch_size, batch_size);
-            strided_strings<std::string_view> const bodies {strided(batch).members(&keyed_document_t::body).begin()};
+            util::strided_strings<std::string_view> const bodies {
+                util::strided(batch).members(&keyed_document_t::body).begin()};
             ustore_blobs_write_t write {};
             write.database = twitter.database;
             write.outcome = &outcome;
@@ -383,19 +386,19 @@ void construct_blobs(executor_t& executor, twitter_settings_t const& settings, t
 }
 
 /** Upserts the edges in transactional batches of @p batch_size, each thread over its own share of batches. */
-void construct_graph(executor_t& executor, twitter_settings_t const& settings, twitter_t const& twitter,
+void construct_graph(util::executor_t& executor, twitter_settings_t const& settings, twitter_t const& twitter,
                      std::size_t batch_size) {
     std::string const name = fmt::format("construct_graph/{}", batch_size);
     if (!settings.regex_filter.selects(name)) return;
-    st::vector<edge_t> edges;
+    st::vector<util::edge_t> edges;
     if (!flatten(twitter.edges, edges)) return print(row_t {.name = name, .skipped = "no memory for batches"});
-    std::span<edge_t const> const staged {edges.begin(), edges.end()};
+    std::span<util::edge_t const> const staged {edges.begin(), edges.end()};
     print(run_pass(executor, name, staged.size() / batch_size, [&](loop_t& loop, std::size_t) noexcept {
         upsert_scratch_t scratch;
         for (std::size_t call : loop) {
-            std::span<edge_t const> const batch = staged.subspan(call * batch_size, batch_size);
+            std::span<util::edge_t const> const batch = staged.subspan(call * batch_size, batch_size);
             if (edges_upsert(twitter.database, twitter.graph, batch, scratch))
-                loop.count(batch.size(), batch.size() * sizeof(edge_t));
+                loop.count(batch.size(), batch.size() * sizeof(util::edge_t));
             else loop.fail();
         }
     }));
@@ -487,8 +490,8 @@ struct tweet_batches_t {
 using sample_read_t = void (*)(twitter_t const&, tweet_batches_t&, loop_t&, std::size_t) noexcept;
 
 /** Samples @p read on every thread once per batch size, each thread drawing its own keys above its loop. */
-void sample(executor_t& executor, twitter_settings_t const& settings, twitter_t const& twitter, std::string_view stem,
-            sample_read_t read, std::span<std::size_t const> batch_sizes) {
+void sample(util::executor_t& executor, twitter_settings_t const& settings, twitter_t const& twitter,
+            std::string_view stem, sample_read_t read, std::span<std::size_t const> batch_sizes) {
     for (std::size_t const batch_size : batch_sizes) {
         std::string const name = fmt::format("{}/{}", stem, batch_size);
         if (!settings.regex_filter.selects(name)) continue;
@@ -586,7 +589,7 @@ void docs_sample_objects(twitter_t const& twitter, tweet_batches_t& batches, loo
 /** Samples batches of tweets, reading one field out of each document. */
 void docs_sample_field(twitter_t const& twitter, tweet_batches_t& batches, loop_t& loop, std::size_t call) noexcept {
     std::string_view const field = "text";
-    strided_strings<std::string_view> const repeated {{&field, 0}};
+    util::strided_strings<std::string_view> const repeated {{&field, 0}};
     ustore_strings_view_t values {};
     ustore_docs_read_t read {};
     read.database = twitter.database;
@@ -606,7 +609,7 @@ void docs_sample_field(twitter_t const& twitter, tweet_batches_t& batches, loop_
 /** Samples batches of tweets, gathering four typed fields of each into a table. */
 void docs_sample_table(twitter_t const& twitter, tweet_batches_t& batches, loop_t& loop, std::size_t call) noexcept {
     std::string_view const names[table_columns_k] {"timestamp_ms", "reply_count", "retweet_count", "favorite_count"};
-    strided_strings<std::string_view> const fields {strided(names).begin()};
+    util::strided_strings<std::string_view> const fields {util::strided(names).begin()};
     ustore_docs_field_type_t const types[table_columns_k] {
         ustore_docs_field_type_string_k,
         ustore_docs_field_type_u32_k,
@@ -747,12 +750,12 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    auto maybe_executor = executor_t::make(settings.threads.value, caller_exclusivity_t::caller_inclusive_k);
-    if (!maybe_executor) {
+    auto [executor, executor_status] = util::executor_t::make(settings.threads.value,
+                                                              util::caller_exclusivity_t::caller_inclusive_k);
+    if (st::failed(executor_status)) {
         fmt::println(stderr, "Failed to spawn {} threads", settings.threads.value);
         return 1;
     }
-    executor_t& executor = *maybe_executor;
     twitter_t twitter;
     bool const indexed = settings.dataset.empty() ? generate_dataset(settings, twitter)
                                                   : load_dataset(settings, executor, twitter);

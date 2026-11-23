@@ -14,8 +14,8 @@
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 
-#include "ustore/ranges.hpp" // `strided`, `strided_iterator`
 #include "ustore/strings.h"
+#include "ustore/utilities/ranges.hpp" // `strided`, `strided_iterator`
 
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`
 
@@ -32,9 +32,9 @@ namespace unum::ustore::nvme {
 /** Lays the tasks of a strings write or removal out in the scratch of @p view, writing the keys of @p values, or
  *  removing the strings when @p values view none. */
 inline expected<std::span<string_task_t>> string_tasks(view_t const& view,
-                                                       strided_iterator<ustore_collection_id_t const> collections,
+                                                       util::strided_iterator<ustore_collection_id_t const> collections,
                                                        std::size_t count, strings_arg_t const& texts,
-                                                       strided_iterator<ustore_key_t const> values) noexcept {
+                                                       util::strided_iterator<ustore_key_t const> values) noexcept {
     auto [tasks, allocate_status] = arena_allocate<string_task_t>(view.scratch, count);
     if (allocate_status.failed()) return allocate_status;
     for (std::size_t index = 0; index != count; ++index)
@@ -48,8 +48,8 @@ inline expected<std::span<string_task_t>> string_tasks(view_t const& view,
  *  at all outside one, where the last writer wins. */
 template <cpu_class_t cpu_class_, typename arguments_type_>
 status_t serve_strings_write(arguments_type_ const& arguments, strings_arg_t const& texts,
-                             strided_iterator<ustore_key_t const> values, view_t const& view) noexcept {
-    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
+                             util::strided_iterator<ustore_key_t const> values, view_t const& view) noexcept {
+    util::strided_iterator<ustore_collection_id_t const> const collections = util::strided(arguments.collections);
     database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, ustore_modality_strings_k);
         resolved.failed())
@@ -68,10 +68,11 @@ status_t serve_strings_write(arguments_type_ const& arguments, strings_arg_t con
 template <cpu_class_t cpu_class_>
 status_t strings_write(ustore_strings_write_t const& arguments, strings_arg_t const& texts,
                        view_t const& view) noexcept {
-    if (status_t const status = validate_choices(view.transaction, arguments.durability, view.watch); status.failed())
+    if (status_t const status = util::validate_choices(view.transaction, arguments.durability, view.watch);
+        status.failed())
         return status;
     if (!arguments.count) return {};
-    strided_iterator<ustore_key_t const> const values = strided(arguments.values);
+    util::strided_iterator<ustore_key_t const> const values = util::strided(arguments.values);
     if (!texts || !values) return {status_code_t::invalid_argument_k, "Need the strings and their keys"};
     return serve_strings_write<cpu_class_>(arguments, texts, values, view);
 }
@@ -81,12 +82,13 @@ status_t strings_write(ustore_strings_write_t const& arguments, strings_arg_t co
 template <cpu_class_t cpu_class_>
 status_t strings_remove(ustore_strings_remove_t const& arguments, strings_arg_t const& texts,
                         strings_arg_t const& end_texts, view_t const& view) noexcept {
-    if (status_t const status = validate_choices(view.transaction, arguments.durability, view.watch); status.failed())
+    if (status_t const status = util::validate_choices(view.transaction, arguments.durability, view.watch);
+        status.failed())
         return status;
     if (!arguments.count) return {};
     if (!texts) return {status_code_t::invalid_argument_k, "No strings were provided"};
     if (end_texts) {
-        strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
+        util::strided_iterator<ustore_collection_id_t const> const collections = util::strided(arguments.collections);
         database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
         if (status_t const resolved = resolve_runs(state, view, collections, arguments.count,
                                                    ustore_modality_strings_k);
@@ -106,7 +108,7 @@ status_t strings_remove(ustore_strings_remove_t const& arguments, strings_arg_t 
                 return {};
             });
     }
-    return serve_strings_write<cpu_class_>(arguments, texts, strided_iterator<ustore_key_t const> {}, view);
+    return serve_strings_write<cpu_class_>(arguments, texts, util::strided_iterator<ustore_key_t const> {}, view);
 }
 
 /** Reads the keys of the strings @p texts holds from @p first up to @p last, all of @p collection,
@@ -114,7 +116,7 @@ status_t strings_remove(ustore_strings_remove_t const& arguments, strings_arg_t 
  *  a transaction's own string first, then the store's, watched as @p access watches. */
 template <cpu_class_t cpu_class_>
 status_t read_strings(call_access<cpu_class_> const& access, collection_id_t collection, strings_arg_t const& texts,
-                      std::size_t first, std::size_t last, strings_read_outputs_t& outputs) noexcept {
+                      std::size_t first, std::size_t last, util::strings_read_outputs_t& outputs) noexcept {
     transaction_stamp_t const watch_stamp = watch_stamp_of(access);
     return visit_strings(access, collection, [&](auto const& store, auto const& reading) noexcept -> status_t {
         for (std::size_t index = first; index != last; ++index) {
@@ -145,12 +147,12 @@ template <cpu_class_t cpu_class_>
 status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t const& texts, view_t const& view) noexcept {
     if (!arguments.count) return {};
     if (!texts) return {status_code_t::invalid_argument_k, "No strings were provided"};
-    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
+    util::strided_iterator<ustore_collection_id_t const> const collections = util::strided(arguments.collections);
     database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, ustore_modality_strings_k);
         resolved.failed())
         return resolved;
-    auto [outputs, outputs_status] = strings_read_outputs_t::make(arguments);
+    auto [outputs, outputs_status] = util::strings_read_outputs_t::make(arguments);
     if (outputs_status.failed()) return outputs_status;
     call_access<cpu_class_> access = access_of(state, view);
     collection_reading_of<cpu_class_> held;
@@ -170,7 +172,7 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
     };
     // A transaction's reads join its watch set, so only a read at one stamp splits the batch
     status_t const read = access.transaction ? read_slice(0, arguments.count, view)
-                                             : for_task_slices(view, arguments.count, read_slice);
+                                             : util::for_task_slices(view, arguments.count, read_slice);
     if (read.failed()) return read;
     outputs.finish(arguments);
     return {};
@@ -180,26 +182,26 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
 template <cpu_class_t cpu_class_>
 status_t strings_scan(ustore_strings_scan_t const& arguments, strings_arg_t const& prefixes,
                       strings_arg_t const& starts, strings_arg_t const& ends, view_t const& view) noexcept {
-    if (status_t const status = validate_direction(arguments.direction); status.failed() || !arguments.count)
+    if (status_t const status = util::validate_direction(arguments.direction); status.failed() || !arguments.count)
         return status;
     if (!arguments.offsets || !arguments.strings)
         return {status_code_t::invalid_argument_k, "Need outputs for the offsets and the strings"};
-    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
+    util::strided_iterator<ustore_collection_id_t const> const collections = util::strided(arguments.collections);
     database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, ustore_modality_strings_k);
         resolved.failed())
         return resolved;
-    auto [outputs, outputs_status] = strings_scan_outputs_t::make(arguments, view.scratch);
+    auto [outputs, outputs_status] = util::strings_scan_outputs_t::make(arguments, view.scratch);
     if (outputs_status.failed()) return outputs_status;
-    st::vector<strings_scan_slice_t, arena_allocator<strings_scan_slice_t>> slices {{view.scratch}};
-    if (st::failed(slices.resize(slice_slots(view))))
-        return {status_code_t::out_of_memory_k, "Failed to allocate the slices of a scan"};
-    progress_t progress {arguments.progress, arguments.progress_state, arguments.count};
+    st::vector<util::strings_scan_slice_t, arena_allocator<util::strings_scan_slice_t>> slices {{view.scratch}};
+    if (st::failed(slices.resize(util::slice_slots(view))))
+        return {status_code_t::out_of_memory_k, "No room for the scan slices"};
+    util::progress_t progress {arguments.progress, arguments.progress_state, arguments.count};
     call_access<cpu_class_> access = access_of(state, view);
     collection_reading_of<cpu_class_> held;
     if (status_t const one = read_at_one_state(access, collections, arguments.count, held); one.failed()) return one;
     auto scan_slice = [&](std::size_t first_task, std::size_t length, view_t const& slice) noexcept -> status_t {
-        strings_scan_slice_t& sliced = slices[slice.thread_index];
+        util::strings_scan_slice_t& sliced = slices[slice.thread_index];
         sliced = {first_task, length, outputs.slice_in(slice.scratch)};
         call_access<cpu_class_> const sliced_access {state,          access.transaction, access.schedule,
                                                      slice.scratch,  access.stamp,       thread_index_of(state, slice),
@@ -216,15 +218,15 @@ status_t strings_scan(ustore_strings_scan_t const& arguments, strings_arg_t cons
                                                       sliced.outputs);
                 scanned.failed())
                 return scanned;
-            if (!progress.advance(1)) return progress_cancelled_k;
+            if (!progress.advance(1)) return util::progress_cancelled_k;
         }
         return {};
     };
     // A transaction's reads join its watch set, so only a read at one stamp splits the batch
     status_t const scanned = access.transaction ? scan_slice(0, arguments.count, view)
-                                                : for_task_slices(view, arguments.count, scan_slice);
+                                                : util::for_task_slices(view, arguments.count, scan_slice);
     if (scanned.failed()) return scanned;
-    for (strings_scan_slice_t const& slice : slices)
+    for (util::strings_scan_slice_t const& slice : slices)
         if (status_t const adopted = outputs.adopt(slice.outputs, slice.first, slice.length); adopted.failed())
             return adopted;
     return outputs.finish(arguments);
@@ -237,22 +239,22 @@ status_t strings_sample(ustore_strings_sample_t const& arguments, view_t const& 
     if (!arguments.count) return {};
     if (!arguments.offsets || !arguments.strings)
         return {status_code_t::invalid_argument_k, "Need outputs for the offsets and the strings"};
-    sample_batch_t const samples = samples_of(arguments);
+    util::sample_batch_t const samples = util::samples_of(arguments);
     database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     if (status_t const resolved = resolve_runs(state, view, samples.collections, arguments.count,
                                                ustore_modality_strings_k);
         resolved.failed())
         return resolved;
-    auto [outputs, outputs_status] = strings_scan_outputs_t::make(arguments, view.scratch);
+    auto [outputs, outputs_status] = util::strings_scan_outputs_t::make(arguments, view.scratch);
     if (outputs_status.failed()) return outputs_status;
-    sample_generator_t generator = sample_generator_t::seeded(&outputs);
+    util::sample_generator_t generator = util::sample_generator_t::seeded(&outputs);
     call_access<cpu_class_> access = access_of(state, view);
     collection_reading_of<cpu_class_> held;
     if (status_t const one = read_at_one_state(access, samples.collections, arguments.count, held); one.failed())
         return one;
     st::vector<kept_string_t> kept;
     for (std::size_t task = 0; task != samples.size(); ++task) {
-        sample_task_t const sample = samples[task];
+        util::sample_task_t const sample = samples[task];
         outputs.open_task(task);
         kept.clear();
         std::size_t seen = 0;
@@ -287,14 +289,14 @@ status_t strings_sample(ustore_strings_sample_t const& arguments, view_t const& 
 template <cpu_class_t cpu_class_>
 status_t strings_measure(ustore_strings_measure_t const& arguments, strings_arg_t const& starts,
                          strings_arg_t const& ends, view_t const& view) noexcept {
-    if (status_t const status = validate_direction(arguments.direction); status.failed() || !arguments.count)
+    if (status_t const status = util::validate_direction(arguments.direction); status.failed() || !arguments.count)
         return status;
-    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
+    util::strided_iterator<ustore_collection_id_t const> const collections = util::strided(arguments.collections);
     database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, ustore_modality_strings_k);
         resolved.failed())
         return resolved;
-    auto [outputs, outputs_status] = measure_outputs_t::make(arguments);
+    auto [outputs, outputs_status] = util::measure_outputs_t::make(arguments);
     if (outputs_status.failed()) return outputs_status;
     call_access<cpu_class_> access = access_of(state, view);
     collection_reading_of<cpu_class_> held;

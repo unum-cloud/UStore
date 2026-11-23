@@ -110,7 +110,7 @@ struct json_value_t {
 inline void* json_allocate(void* context, std::size_t size) noexcept {
     auto [bytes, status] = arena_allocate<byte_t>(static_cast<ustore_arena_t>(context), size,
                                                   alignof(std::max_align_t));
-    return bytes.data();
+    return status.failed() ? nullptr : bytes.data();
 }
 
 inline void* json_reallocate(void* context, void* pointer, std::size_t old_size, std::size_t size) noexcept {
@@ -118,7 +118,7 @@ inline void* json_reallocate(void* context, void* pointer, std::size_t old_size,
     std::span<byte_t> const old_bytes {static_cast<byte_t*>(pointer), old_size};
     auto [bytes, status] = arena_grow(static_cast<ustore_arena_t>(context), old_bytes, size - old_size,
                                       alignof(std::max_align_t));
-    return bytes.data();
+    return status.failed() ? nullptr : bytes.data();
 }
 
 /** Arena memory is released with the arena, never one allocation at a time. */
@@ -179,7 +179,7 @@ inline expected<json_t> json_parse(value_view_t bytes, ustore_arena_t arena) noe
     // yyjson writes into its input only with `YYJSON_READ_INSITU`, which is never set.
     char* const text = const_cast<char*>(bytes.c_str());
     yyjson_doc* const handle = yyjson_read_opts(text, bytes.size(), flags, &allocator, nullptr);
-    if (!handle) return status_t {status_code_t::malformed_k, "Failed to parse the document"};
+    if (!handle) return status_t {status_code_t::malformed_k, "The document did not parse as strict JSON"};
     return json_t {handle, nullptr};
 }
 
@@ -191,8 +191,7 @@ inline expected<yyjson_mut_doc*> json_mutable(json_t& document, ustore_arena_t a
     document.mutable_handle = document.handle //
                                   ? yyjson_doc_mut_copy(document.handle, &allocator)
                                   : yyjson_mut_doc_new(&allocator);
-    if (!document.mutable_handle)
-        return status_t {status_code_t::out_of_memory_k, "Failed to allocate a mutable document"};
+    if (!document.mutable_handle) return status_t {status_code_t::out_of_memory_k, "No room for a mutable document"};
     return document.mutable_handle;
 }
 
@@ -210,7 +209,7 @@ inline expected<value_view_t> json_dump(json_value_t value, ustore_arena_t arena
     // A non-finite number has no strict JSON spelling, so a document holding one is refused like a lenient one
     if (!text && error.code == YYJSON_WRITE_ERROR_NAN_OR_INF)
         return status_t {status_code_t::malformed_k, "JSON spells no NaN or Infinity"};
-    if (!text) return status_t {status_code_t::out_of_memory_k, "Failed to serialize the document"};
+    if (!text) return status_t {status_code_t::out_of_memory_k, "The document writer gave no text"};
     return value_view_t {text, length};
 }
 
@@ -372,8 +371,7 @@ inline expected<json_t> any_parse(value_view_t bytes, ustore_docs_field_type_t t
     json_t document;
     yyjson_alc const allocator = json_allocator(arena);
     document.mutable_handle = yyjson_mut_doc_new(&allocator);
-    if (!document.mutable_handle)
-        return status_t {status_code_t::out_of_memory_k, "Failed to allocate a mutable document"};
+    if (!document.mutable_handle) return status_t {status_code_t::out_of_memory_k, "No room for a mutable document"};
 
     yyjson_mut_doc* const handle = document.mutable_handle;
     yyjson_mut_val* root = nullptr;
@@ -487,8 +485,7 @@ status_t extract_keys(documents_type_ const& documents, std::string_view id_fiel
         }
         bool const is_uuid = yyjson_is_str(identifier) &&
                              parse_uuid({yyjson_get_str(identifier), yyjson_get_len(identifier)}, keys[index].uuid);
-        if (!is_uuid)
-            return {status_code_t::malformed_k, "The id field holds neither a non-negative integer nor a UUID"};
+        if (!is_uuid) return {status_code_t::malformed_k, "The id is no unsigned integer or UUID"};
     }
     return {};
 }

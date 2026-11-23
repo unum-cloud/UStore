@@ -34,14 +34,13 @@ using blobs::hip_compactor_t;
 using blobs::sorted_run_bounds_t;
 using st::key128_t;
 
-expected<cuda_compactor_t> cuda_compactor_t::make(utilities::cuda_executor_t&, device_sections_reader_t) noexcept {
-    return status_t {status_code_t::unsupported_k, "The suite's host build carries no device compactor"};
+util::expected<cuda_compactor_t> cuda_compactor_t::make(util::cuda_executor_t&, device_sections_reader_t) noexcept {
+    return util::status_t {util::status_code_t::unsupported_k, "The suite's host build carries no device compactor"};
 }
 
 cuda_compactor_t::~cuda_compactor_t() noexcept {}
 
-template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
-          typename allocator_type_>
+template <typename key_slot_type_, util::fold_concept fold_type_, typename device_fold_type_, typename allocator_type_>
     requires compactable_key_slot_concept<key_slot_type_>
 st::status_t cuda_compactor_t::compact(compaction_kind_t, std::span<sorted_run_index_view<key_slot_type_> const>,
                                        std::span<sorted_run_index_view<key_slot_type_> const>,
@@ -52,14 +51,13 @@ st::status_t cuda_compactor_t::compact(compaction_kind_t, std::span<sorted_run_i
     return st::status_t::invalid_argument_k;
 }
 
-expected<hip_compactor_t> hip_compactor_t::make(utilities::hip_executor_t&, device_sections_reader_t) noexcept {
-    return status_t {status_code_t::unsupported_k, "The suite's host build carries no device compactor"};
+util::expected<hip_compactor_t> hip_compactor_t::make(util::hip_executor_t&, device_sections_reader_t) noexcept {
+    return util::status_t {util::status_code_t::unsupported_k, "The suite's host build carries no device compactor"};
 }
 
 hip_compactor_t::~hip_compactor_t() noexcept {}
 
-template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
-          typename allocator_type_>
+template <typename key_slot_type_, util::fold_concept fold_type_, typename device_fold_type_, typename allocator_type_>
     requires compactable_key_slot_concept<key_slot_type_>
 st::status_t hip_compactor_t::compact(compaction_kind_t, std::span<sorted_run_index_view<key_slot_type_> const>,
                                       std::span<sorted_run_index_view<key_slot_type_> const>,
@@ -165,12 +163,13 @@ template st::status_t blobs::hip_compactor_t::compact(
 } // namespace unum::ustore
 
 using namespace unum::ustore;
-using namespace unum::ustore::utilities;
 
-kernel_table<cuda_module_t> const* suite_kernels(gpu_drivers_t&, kernel_tables<cuda_module_t>&) noexcept {
+util::kernel_table<util::cuda_module_t> const* suite_kernels(util::gpu_drivers_t&,
+                                                             kernel_tables<util::cuda_module_t>&) noexcept {
     return nullptr;
 }
 
-kernel_table<hip_module_t> const* suite_kernels(gpu_drivers_t&, kernel_tables<hip_module_t>&) noexcept {
+util::kernel_table<util::hip_module_t> const* suite_kernels(util::gpu_drivers_t&,
+                                                            kernel_tables<util::hip_module_t>&) noexcept {
     return nullptr;
 }

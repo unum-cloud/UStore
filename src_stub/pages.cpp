@@ -727,7 +727,6 @@ struct ustore_pages_cursor_handle_t {
 };
 
 void ustore_pages_import(ustore_pages_import_t* arguments) {
-    if (submitted<&ustore_pages_import>(arguments)) return;
     call_t call(arguments->outcome);
     if (!check_page_edit(call, arguments, elements_t::optional_k)) return;
     std::size_t const count = arguments->count;
@@ -762,7 +761,6 @@ void ustore_pages_import(ustore_pages_import_t* arguments) {
 }
 
 void ustore_pages_insert(ustore_pages_insert_t* arguments) {
-    if (submitted<&ustore_pages_insert>(arguments)) return;
     call_t call(arguments->outcome);
     if (arguments->effective_keys) *arguments->effective_keys = nullptr;
     if (!check_page_edit(call, arguments, elements_t::optional_k)) return;
@@ -807,7 +805,6 @@ void ustore_pages_insert(ustore_pages_insert_t* arguments) {
 }
 
 void ustore_pages_remove(ustore_pages_remove_t* arguments) {
-    if (submitted<&ustore_pages_remove>(arguments)) return;
     call_t call(arguments->outcome);
     bool const ranges = arguments->end_keys.data != nullptr;
     if (!check_page_edit(call, arguments, ranges ? elements_t::optional_k : elements_t::required_k)) return;
@@ -840,7 +837,6 @@ void ustore_pages_remove(ustore_pages_remove_t* arguments) {
 }
 
 void ustore_pages_move(ustore_pages_move_t* arguments) {
-    if (submitted<&ustore_pages_move>(arguments)) return;
     call_t call(arguments->outcome);
     if (!check_page_edit(call, arguments, elements_t::required_k) || !claim_page_edit(call, arguments)) return;
     auto task_key = [](ustore_keys_view_t keys, std::size_t index) {
@@ -866,7 +862,6 @@ void ustore_pages_move(ustore_pages_move_t* arguments) {
 }
 
 void ustore_pages_splice(ustore_pages_splice_t* arguments) {
-    if (submitted<&ustore_pages_splice>(arguments)) return;
     call_t call(arguments->outcome);
     if (!check_page_edit(call, arguments, elements_t::required_k)) return;
     strings_in_t values;
@@ -890,7 +885,6 @@ void ustore_pages_splice(ustore_pages_splice_t* arguments) {
 }
 
 void ustore_pages_set_attributes(ustore_pages_set_attributes_t* arguments) {
-    if (submitted<&ustore_pages_set_attributes>(arguments)) return;
     call_t call(arguments->outcome);
     if (!check_page_edit(call, arguments, elements_t::required_k)) return;
     strings_in_t fields, values;
@@ -914,7 +908,6 @@ void ustore_pages_set_attributes(ustore_pages_set_attributes_t* arguments) {
 }
 
 void ustore_pages_remove_attributes(ustore_pages_remove_attributes_t* arguments) {
-    if (submitted<&ustore_pages_remove_attributes>(arguments)) return;
     call_t call(arguments->outcome);
     if (!check_page_edit(call, arguments, elements_t::required_k)) return;
     strings_in_t fields;
@@ -936,7 +929,6 @@ void ustore_pages_remove_attributes(ustore_pages_remove_attributes_t* arguments)
 }
 
 void ustore_pages_read(ustore_pages_read_t* arguments) {
-    if (submitted<&ustore_pages_read>(arguments)) return;
     call_t call(arguments->outcome);
     if (arguments->presences) *arguments->presences = nullptr;
     if (arguments->lengths) *arguments->lengths = nullptr;
@@ -987,7 +979,6 @@ void ustore_pages_read(ustore_pages_read_t* arguments) {
 }
 
 void ustore_pages_scan(ustore_pages_scan_t* arguments) {
-    if (submitted<&ustore_pages_scan>(arguments)) return;
     call_t call(arguments->outcome);
     if (!check_scan(call, arguments)) return;
     verdict_t verdict;
@@ -1011,7 +1002,6 @@ void ustore_pages_cursor_init(ustore_pages_cursor_init_t* arguments) {
 }
 
 void ustore_pages_cursor_next(ustore_pages_cursor_next_t* arguments) {
-    if (submitted<&ustore_pages_cursor_next>(arguments)) return;
     call_t call(arguments->outcome);
     keyed_cursor_t* const cursor = arguments->cursor ? &arguments->cursor->cursor : nullptr;
     if (refuse_unknown_encoding(call, arguments->outputs_encoding)) return;
@@ -1040,12 +1030,6 @@ void ustore_pages_cursor_free(ustore_pages_cursor_t cursor) {
     delete cursor;
 }
 
-void ustore_pages_sample(ustore_pages_sample_t* arguments) {
-    if (submitted<&ustore_pages_sample>(arguments)) return;
-    sample_keyed(arguments, ustore_modality_pages_k);
-}
+void ustore_pages_sample(ustore_pages_sample_t* arguments) { sample_keyed(arguments, ustore_modality_pages_k); }
 
-void ustore_pages_measure(ustore_pages_measure_t* arguments) {
-    if (submitted<&ustore_pages_measure>(arguments)) return;
-    measure_keyed(arguments, ustore_modality_pages_k);
-}
+void ustore_pages_measure(ustore_pages_measure_t* arguments) { measure_keyed(arguments, ustore_modality_pages_k); }

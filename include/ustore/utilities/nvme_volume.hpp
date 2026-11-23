@@ -153,7 +153,7 @@ inline expected<data_address_t> parse_data_address(std::string_view address) noe
         std::size_t const plus = extent.find('+');
         if ((plus != std::string_view::npos && !parse_byte_count(extent.substr(plus + 1), parsed.byte_limit)) ||
             !parse_byte_count(extent.substr(0, plus), parsed.byte_base))
-            return status_t {status_code_t::invalid_argument_k, "A data directory's base or length does not read"};
+            return status_t {status_code_t::invalid_argument_k, "A data directory base or length is unreadable"};
         location = location.substr(0, at);
         parsed.kind = data_address_kind_t::raw_k;
     }
@@ -301,7 +301,7 @@ class basic_slot_allocator {
         for (std::size_t index = 0; index != count; ++index) [[maybe_unused]]
             std::uint32_t const taken = made.slots_.take();
         if (made.touched_.resize((count + 63) / 64, 0) != st::status_t::success_k)
-            return status_t {status_code_t::out_of_memory_k, "No room for the slots of a medium"};
+            return status_t {status_code_t::out_of_memory_k, "No room for the medium touch bits"};
         made.medium_ = medium;
         return made;
     }
@@ -524,7 +524,7 @@ class basic_directory_volume {
             return status_t {status_code_t::malformed_k, "The manifest names another database or no paths"};
         for (manifest_file_t const& file : volume.manifest_.files)
             if (file.medium >= volume.directories_.size())
-                return status_t {status_code_t::malformed_k, "The manifest names a data directory this mount lacks"};
+                return status_t {status_code_t::malformed_k, "The manifest names an unmounted data directory"};
         if (status_t const swept = volume.sweep_leftovers_(); swept.failed()) return swept;
         return volume;
     }
@@ -625,7 +625,7 @@ class basic_directory_volume {
      *  an archive links. */
     status_t file_path(std::uint16_t medium, uuid128_t const& run, std::span<char> into) const noexcept {
         if (medium >= directories_.size())
-            return {status_code_t::invalid_argument_k, "The volume holds no data directory of that index"};
+            return {status_code_t::invalid_argument_k, "The volume lacks that data directory"};
         return run_path_(medium, run, into);
     }
 
@@ -694,13 +694,13 @@ class basic_directory_volume {
     [[nodiscard]] std::uint64_t free_bytes_(std::size_t index) const noexcept {
         directory_t const& directory = directories_[index];
         if (directory.quota != 0) return directory.quota > directory.used ? directory.quota - directory.used : 0;
-        expected<std::uint64_t> const free = free_bytes_of(directory.path.c_str());
-        if (!free) return 0;
+        auto const [free, status] = free_bytes_of(directory.path.c_str());
+        if (status.failed()) return 0;
         std::uint64_t claimed = 0;
         for (placement_handle_t const& handle : unflushed_)
             if (run_file_t const* const file = run_files_.at(handle_of_(handle)); file && file->data_directory == index)
                 claimed += file->bytes;
-        return *free > claimed ? *free - claimed : 0;
+        return free > claimed ? free - claimed : 0;
     }
 
     status_t manifest_path_(std::span<char> into) const noexcept {
@@ -760,7 +760,7 @@ class basic_directory_volume {
     status_t sweep_leftovers_() noexcept {
         st::vector<uuid128_t> named;
         if (named.reserve(manifest_.files.size()) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "No room to list the runs the manifest names"};
+            return {status_code_t::out_of_memory_k, "No room to list the manifest runs"};
         for (manifest_file_t const& file : manifest_.files) [[maybe_unused]]
             st::status_t const placed = named.push_back(st::assume_reserved, uuid128_t {file.run});
         utilities::radix_sort(
@@ -964,7 +964,7 @@ class basic_slotted_volume {
      *  medium, then points the manifest slot's owner block at the new copy and flushes again. */
     status_t publish_manifest(io_channel_t& channel, std::span<char const> json) noexcept {
         if (json.size() > manifest_region_bytes_k)
-            return {status_code_t::capacity_exhausted_k, "The manifest outgrew its region of the manifest slot"};
+            return {status_code_t::capacity_exhausted_k, "The manifest outgrew its slot region"};
         for (std::size_t index = 0; index != media_.size(); ++index)
             if (status_t const written = write_touched_(channel, index); written.failed()) return written;
 
@@ -1089,13 +1089,12 @@ class basic_slotted_volume {
         std::uint64_t const capacity = medium.medium.capacity();
         status_t refused;
         if (medium.block_bytes < sizeof(slot_owner_block_t) || medium.block_bytes > slot_payload_offset_k)
-            refused = {status_code_t::unsupported_k, "A raw medium's logical block does not hold an owner block"};
+            refused = {status_code_t::unsupported_k, "A raw medium's block fits no owner block"};
         else if (medium.base % medium.block_bytes != 0 || medium.base > capacity)
-            refused = {status_code_t::invalid_argument_k, "A raw medium's base is not a block inside it"};
+            refused = {status_code_t::invalid_argument_k, "A raw medium's base is misplaced"};
         // Another tool's file marks only the first slot it spans, so slots come from a named length
         else if (address.byte_limit == 0 || address.byte_limit > capacity - medium.base)
-            refused = {status_code_t::invalid_argument_k,
-                       "A raw medium needs a length that fits it, as in @64GiB+16GiB"};
+            refused = {status_code_t::invalid_argument_k, "A raw medium needs a fitting length"};
         std::uint64_t const usable = refused.failed() ? 0 : address.byte_limit;
         if (refused.succeeded()) {
             auto [slots, make_status] = slot_allocator_t::make(index, static_cast<std::size_t>(usable / slot_bytes_k),
@@ -1194,7 +1193,7 @@ class basic_slotted_volume {
             return parsed;
         if (manifest_.id != owner.database || manifest_.generation != owner.manifest_generation ||
             (!manifest_.files.empty() && manifest_.placement != manifest_placement_t::offsets_k))
-            return {status_code_t::malformed_k, "The manifest copy disagrees with the slot pointing at it"};
+            return {status_code_t::malformed_k, "The manifest copy disagrees with its slot"};
         manifest_.placement = manifest_placement_t::offsets_k;
         return {};
     }
@@ -1202,7 +1201,7 @@ class basic_slotted_volume {
     /** Credits the slot @p file lies in, refusing a file outside every slot. */
     status_t credit_(manifest_file_t const& file) noexcept {
         if (file.medium >= media_.size())
-            return {status_code_t::malformed_k, "The manifest names a data directory this mount lacks"};
+            return {status_code_t::malformed_k, "The manifest names an unmounted data directory"};
         raw_medium_t& medium = media_[file.medium];
         std::uint64_t const slots_end = medium.base + medium.slots.size() * slot_bytes_k;
         if (file.offset < medium.base || file.offset > slots_end || file.bytes > slots_end - file.offset)
@@ -1212,7 +1211,7 @@ class basic_slotted_volume {
         std::uint64_t const offset = inside % slot_bytes_k;
         std::uint64_t const bytes = round_up_to_multiple(file.bytes, portable_alignment_k);
         if (offset < slot_payload_offset_k || offset % portable_alignment_k != 0 || bytes > slot_bytes_k - offset)
-            return {status_code_t::malformed_k, "The manifest names a run across a slot's edge"};
+            return {status_code_t::malformed_k, "The manifest names a run past a slot"};
         medium.slots.credit(index, offset, bytes);
         return {};
     }
@@ -1253,7 +1252,7 @@ class basic_slotted_volume {
             if (owners[at] == owner_t::misplaced_k)
                 return {status_code_t::malformed_k, "The data directories are listed in another order"};
             if (named && owners[at] != owner_t::ours_k)
-                return {status_code_t::malformed_k, "The manifest names a slot this database does not hold"};
+                return {status_code_t::malformed_k, "The manifest names an unknown slot"};
             if (owners[at] == owner_t::ours_k && !named)
                 if (status_t const zeroed = free_on_device_(writer, medium, at); zeroed.failed()) return zeroed;
             if (owners[at] == owner_t::free_k || (owners[at] == owner_t::ours_k && !named)) medium.slots.release(at);

@@ -44,7 +44,7 @@
 
 namespace unum::ustore::nvme {
 
-using utilities::keyed_rows_t;
+using util::keyed_rows_t;
 
 #pragma region Deltas
 
@@ -95,7 +95,7 @@ struct kept_bytes_t {
     kept_bytes_t() noexcept = default;
     kept_bytes_t(kept_bytes_t const&) = delete;
     kept_bytes_t& operator=(kept_bytes_t const&) = delete;
-    ~kept_bytes_t() noexcept { arena_free_blocks(arena); }
+    ~kept_bytes_t() noexcept { util::arena_free_blocks(arena); }
 };
 
 /** A sorted ingest of blobs, documents or pages, every append handed to the store, which lays it out as it arrives. */
@@ -201,7 +201,7 @@ status_t hold_deltas(held_keyed_ingest<strings_kit_type_>& path, keyed_rows_t co
     for (std::size_t row = 0; status.succeeded() && row != rows.size(); ++row) {
         auto [value, value_status] = path.value_parser(rows, row);
         if ((status = value_status).failed()) break;
-        auto [kept, kept_status] = arena_copy<byte_t>(&path.kept.arena, value);
+        auto [kept, kept_status] = util::arena_copy<byte_t>(&path.kept.arena, value);
         if ((status = kept_status).failed()) break;
         [[maybe_unused]] st::status_t placed = path.keys.push_back(st::assume_reserved, held_row_t {rows.keys[row]});
         placed = path.values.push_back(st::assume_reserved, std::span<byte_t const> {kept});
@@ -255,8 +255,8 @@ inline status_t hold_strings(held_strings_ingest_t& path, keyed_rows_t const& ro
     status_t status = growth_status(path.deltas.reserve(before + rows.size()));
     for (std::size_t row = 0; status.succeeded() && row != rows.size(); ++row) {
         string_delta_t const given = string_delta_of(rows, row);
-        auto [text, text_status] = arena_copy<char>(&path.kept.arena, std::span<char const> {given.stored_key});
-        auto [key, key_status] = arena_copy<byte_t>(&path.kept.arena, given.delta.bytes);
+        auto [text, text_status] = util::arena_copy<char>(&path.kept.arena, std::span<char const> {given.stored_key});
+        auto [key, key_status] = util::arena_copy<byte_t>(&path.kept.arena, given.delta.bytes);
         status = text_status.failed() ? text_status : key_status;
         if (status.failed()) break;
         [[maybe_unused]] st::status_t const placed = path.deltas.push_back(
@@ -269,12 +269,12 @@ inline status_t hold_strings(held_strings_ingest_t& path, keyed_rows_t const& ro
 
 /** Holds the two half-edge records of every edge of @p edges into @p collection until the finish. */
 inline status_t hold_edges(held_edges_ingest_t& path, ustore_collection_id_t const& collection,
-                           edges_view_t const& edges) noexcept {
+                           util::edges_view_t const& edges) noexcept {
     if (status_t const sized = growth_status(path.records.reserve(path.records.size() + 2 * edges.size()));
         sized.failed())
         return sized;
     for (std::size_t index = 0; index != edges.size(); ++index) {
-        edge_t const given = edges[index];
+        util::edge_t const given = edges[index];
         labeled_edge_t edge;
         edge.id = given.id;
         edge.first = given.source;
@@ -335,7 +335,7 @@ status_t ingest_init(ustore_ingest_init_t const& arguments, view_t const& view) 
         .database = database,
         .collection = arguments.collection,
         .path = ingest_path_of<typename nvme_variant<cpu_class_>::strings_kit_t>(entry.modality, arguments.order)};
-    if (!ingest) return {status_code_t::out_of_memory_k, "Failed to allocate the ingest"};
+    if (!ingest) return {status_code_t::out_of_memory_k, "No room for the ingest"};
     status_t const begun = database.store->begin_ingest(any_collection_id_t {arguments.collection},
                                                         ingest->database_ingest);
     if (begun.failed()) {
@@ -352,7 +352,7 @@ template <cpu_class_t cpu_class_, typename path_type_>
 status_t append_rows(ingest_state<cpu_class_>& ingest, path_type_& path, ustore_ingest_append_t const& arguments,
                      strings_arg_t const& values) noexcept {
     using strings_kit_t = typename nvme_variant<cpu_class_>::strings_kit_t;
-    auto [rows, rows_status] = utilities::keyed_rows_of(arguments, values);
+    auto [rows, rows_status] = util::keyed_rows_of(arguments, values);
     if (rows_status.failed() || !rows.size()) return rows_status;
     if constexpr (std::is_same_v<path_type_, sorted_keyed_ingest<strings_kit_t>>)
         return write_deltas(ingest, path, rows);
@@ -368,7 +368,7 @@ status_t ingest_append(ustore_ingest_append_t const& arguments, strings_arg_t co
     return std::visit(
         [&]<typename path_type_>(path_type_& path) noexcept -> status_t {
             if constexpr (std::is_same_v<path_type_, held_edges_ingest_t>) {
-                auto [edges, edges_status] = utilities::ingest_edges_of(arguments);
+                auto [edges, edges_status] = util::ingest_edges_of(arguments);
                 if (edges_status.failed()) return edges_status;
                 return hold_edges(path, ingest.collection, edges);
             }

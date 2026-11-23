@@ -414,7 +414,7 @@ class xml_tokenizer {
         auto enlist = [&](std::uint32_t offset, std::uint32_t length, std::uint32_t& unescaped) noexcept -> status_t {
             if (!escaped(offset, length)) return {};
             if (!references_well_formed(document_.substr(offset, length)))
-                return {status_code_t::malformed_k, "The XML references an undeclared entity or a forbidden character"};
+                return {status_code_t::malformed_k, "The XML holds a bad entity or character"};
             unescaped = std::uint32_t(runs.size());
             return growth_status(runs.push_back(sz_string_view_t {document_.data() + offset, length}));
         };
@@ -432,7 +432,7 @@ class xml_tokenizer {
         if (sz_status_t const status = strings_kit_type_::strings_unescape(
                 &strings, nullptr, runs.size(), sz_escape_html_k, &c_allocator_, &tape_, &malformed_index, nullptr);
             status != sz_success_k)
-            return stringzilla_refusal(status, status_code_t::malformed_k, "Failed to unescape XML");
+            return stringzilla_refusal(status, status_code_t::malformed_k, "The XML escapes would not decode");
         return {};
     }
 
@@ -532,20 +532,20 @@ status_t import_xml(std::string_view xml, element_key_t const& root_key, placeme
         case xml_token_kind_t::open_k:
         case xml_token_kind_t::empty_k: {
             if (status_t status = flush(); status.failed()) return status;
-            auto element = tree.append(open.back(), mint(), element_kind_t::element_k, tokenizer.source_text(token), {},
-                                       placement);
-            if (!element) return element.status();
+            auto [element, element_status] = tree.append(open.back(), mint(), element_kind_t::element_k,
+                                                         tokenizer.source_text(token), {}, placement);
+            if (element_status.failed()) return element_status;
             for (std::uint32_t index = 0; index != token.attributes_count; ++index) {
                 xml_attribute_token_t const& attribute = tokenizer.attribute(token.first_attribute + index);
                 std::string_view const name = tokenizer.attribute_name(attribute);
-                if (tree.find_attribute(*element, name) != no_element_k)
+                if (tree.find_attribute(element, name) != no_element_k)
                     return {status_code_t::malformed_k, "An XML element repeats an attribute"};
-                if (status_t status = tree.set_attribute(*element, name, tokenizer.attribute_value(attribute));
+                if (status_t status = tree.set_attribute(element, name, tokenizer.attribute_value(attribute));
                     status.failed())
                     return status;
             }
             if (token.kind == xml_token_kind_t::open_k)
-                if (status_t status = growth_status(open.push_back(element_index_t(*element))); status.failed())
+                if (status_t status = growth_status(open.push_back(element_index_t(element))); status.failed())
                     return status;
             break;
         }
@@ -555,9 +555,9 @@ status_t import_xml(std::string_view xml, element_key_t const& root_key, placeme
             break;
         case xml_token_kind_t::comment_k: {
             if (status_t status = flush(); status.failed()) return status;
-            auto comment = tree.append(open.back(), mint(), element_kind_t::comment_k, {}, tokenizer.source_text(token),
-                                       placement);
-            if (!comment) return comment.status();
+            auto [comment, comment_status] = tree.append(open.back(), mint(), element_kind_t::comment_k, {},
+                                                         tokenizer.source_text(token), placement);
+            if (comment_status.failed()) return comment_status;
             break;
         }
         }
@@ -611,7 +611,7 @@ status_t append_escaped(st::vector<char, output_allocator_type_>& output, std::s
     if (sz_status_t const status = strings_kit_type_::strings_escape(&strings, nullptr, 1, sz_escape_html_k,
                                                                      &c_allocator, &escaped, nullptr);
         status != sz_success_k)
-        return stringzilla_refusal(status, status_code_t::malformed_k, "Failed to escape XML");
+        return stringzilla_refusal(status, status_code_t::malformed_k, "The text would not escape as XML");
     status_t const status = append_bytes(output, tape_string(escaped, 0));
     sz_strings_span_free(&escaped, &c_allocator, nullptr);
     return status;

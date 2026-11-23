@@ -43,7 +43,7 @@ namespace unum::ustore::bench {
 using namespace unum::ustore::docs;
 
 /** The widest StringZilla kernels this build compiled. */
-using strings_kit_t = utilities::strings_ladder<sz_capabilities_compiled_cpu_mask()>::strings_kit_t;
+using strings_kit_t = util::strings_ladder<sz_capabilities_compiled_cpu_mask()>::strings_kit_t;
 
 /** The StringZilla capabilities this machine runs among those the build compiled, which the engines
  *  compile for, while @c strings_kit_t keeps to a tier the build's own flags guarantee. */
@@ -77,7 +77,7 @@ struct corpus_t {
     /** The documents @b [first,first+count) as a read would answer them, all present. */
     json_documents_t batch(std::size_t first, std::size_t count) const noexcept {
         json_documents_t documents;
-        documents.tape = u64_tape(bytes.data(), offsets.data() + first);
+        documents.tape = util::u64_tape(bytes.data(), offsets.data() + first);
         documents.count = count;
         return documents;
     }
@@ -183,7 +183,7 @@ constexpr std::array<column_t, 4> columns_k {{
 
 /** Converts @p value into cell @p index of a column of @p type, as the docs gather does. */
 conversion_t gather_cell(ustore_docs_field_type_t type, json_cell_t const& value, ustore_byte_t* scalars,
-                         std::size_t index, growing_strings<arena_allocator<byte_t>>& strings) noexcept {
+                         std::size_t index, util::growing_strings<arena_allocator<byte_t>>& strings) noexcept {
     switch (type) {
     case ustore_docs_field_type_u64_k: return gather_scalar<std::uint64_t>(value, scalars, index);
     case ustore_docs_field_type_u32_k: return gather_scalar<std::uint32_t>(value, scalars, index);
@@ -192,8 +192,9 @@ conversion_t gather_cell(ustore_docs_field_type_t type, json_cell_t const& value
         printed_number_buffer_t buffer;
         std::string_view text;
         conversion_t const conversion = json_to_string(value, buffer, text);
-        return strings.push_back(bytes_of(text), string_end_t::null_terminated_k).failed() ? conversion_t::collides_k
-                                                                                           : conversion;
+        return strings.push_back(bytes_of(text), util::string_end_t::null_terminated_k).failed()
+                   ? conversion_t::collides_k
+                   : conversion;
     }
     }
 }
@@ -203,7 +204,7 @@ std::size_t fill_columns(std::span<column_t const> columns, std::span<json_cell_
                          std::span<ustore_byte_t> scalars, ustore_arena_t scratch) noexcept {
     std::size_t valid = 0;
     for (std::size_t column = 0; column != columns.size(); ++column) {
-        growing_strings<arena_allocator<byte_t>> strings {scratch};
+        util::growing_strings<arena_allocator<byte_t>> strings {scratch};
         for (std::size_t index = 0; index != count; ++index)
             valid += is_valid(
                 gather_cell(columns[column].type, values[column * count + index], scalars.data(), index, strings));
@@ -272,7 +273,7 @@ enum class resolver_t { yyjson_k, subdocuments_k };
 
 /** Runs one row: each call resolves the next batch of the corpus with @p resolver, then
  *  fills @p columns. */
-row_t run_row(executor_t& executor, docs_paths_settings_t const& settings, corpus_t const& corpus,
+row_t run_row(util::executor_t& executor, docs_paths_settings_t const& settings, corpus_t const& corpus,
               std::string_view name, std::span<column_t const> columns, resolver_t resolver) noexcept {
     std::size_t const batch_size = fu::min_of(settings.batch_size.value, settings.documents.value);
     std::array<std::string_view, columns_k.size()> fields;
@@ -290,7 +291,7 @@ row_t run_row(executor_t& executor, docs_paths_settings_t const& settings, corpu
         for (std::size_t call : loop) {
             std::size_t const first = (call % batches) * batch_size;
             json_documents_t const documents = corpus.batch(first, batch_size);
-            arena_rewind(scratch);
+            util::arena_rewind(scratch);
             bool const resolved = resolver == resolver_t::subdocuments_k
                                       ? resolve_with_subdocuments(documents, used_fields, scratch, values)
                                       : resolve_with_yyjson(documents, used_fields, scratch, values);
@@ -302,7 +303,7 @@ row_t run_row(executor_t& executor, docs_paths_settings_t const& settings, corpu
             if (valid != batch_size * columns.size()) loop.fail();
             loop.count(batch_size, corpus.bytes_in(first, batch_size));
         }
-        arena_free(scratch);
+        util::arena_free(scratch);
     });
 }
 
@@ -321,12 +322,11 @@ int main(int argc, char** argv) {
     }};
     std::array<char const*, 2> const variables {"USTORE_DOCUMENTS", "USTORE_BATCH_SIZE"};
     read_bench_settings(argc, argv, settings, flags, variables);
-    auto maybe_executor = executor_t::make(1, caller_exclusivity_t::caller_inclusive_k);
-    if (!maybe_executor) {
+    auto [executor, executor_status] = util::executor_t::make(1, util::caller_exclusivity_t::caller_inclusive_k);
+    if (st::failed(executor_status)) {
         fmt::println(stderr, "Failed to pin the calling thread");
         return 1;
     }
-    executor_t& executor = *maybe_executor;
     corpus_t corpus;
     if (!generate_corpus(settings.documents.value, settings.seed, corpus)) {
         fmt::println(stderr, "Failed to generate the documents");

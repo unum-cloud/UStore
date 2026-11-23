@@ -529,7 +529,7 @@ class nvme_store {
         auto [deferred_requests, requests_status] = utilities::arena_allocate<std::size_t>(scratch, stored_keys.size());
         auto [folded_requests, folded_status] = utilities::arena_allocate<std::size_t>(scratch, stored_keys.size());
         if (keys_status.failed() || requests_status.failed() || folded_status.failed())
-            return {status_code_t::out_of_memory_k, "A collection could not track the keys of a batch"};
+            return {status_code_t::out_of_memory_k, "No room to track the batch keys"};
         std::size_t deferred = 0;
         std::size_t folded = 0;
 
@@ -577,7 +577,7 @@ class nvme_store {
         auto [answers, answers_status] = utilities::arena_allocate<lookup_result_t>(scratch, deferred);
         auto [delivered, delivered_status] = utilities::arena_allocate<std::uint64_t>(scratch, deferred);
         if (answers_status.failed() || delivered_status.failed())
-            return {status_code_t::out_of_memory_k, "A collection could not track the keys of a batch"};
+            return {status_code_t::out_of_memory_k, "No room to track the batch keys"};
         for (std::size_t index = 0; index != deferred; ++index) {
             answers[index] = lookup_result_t::missing_k;
             delivered[index] = 0;
@@ -791,7 +791,7 @@ class nvme_store {
         located_changes_t selected {constrained_allocator<located_change_t, atomic_reference_> {runs_.constraint()}};
         stamped_ranges_t ranges {constrained_allocator<stamped_range_t, atomic_reference_> {runs_.constraint()}};
         if (selected.reserve(bound) != st::status_t::success_k || ranges.reserve(tombstones) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "No room to select the changes of a feed"};
+            return {status_code_t::out_of_memory_k, "No room to select the feed changes"};
 
         // A heap of the earliest changes offered so far, the latest of them on top.
         auto const earlier = [](located_change_t const& first, located_change_t const& second) noexcept {
@@ -956,10 +956,10 @@ class nvme_store {
      *  leader does before it publishes @p stamp itself, so a reader at the stamp finds the run. */
     void publish(sealed_commit_t& sealed, transaction_stamp_t stamp) noexcept {
         if (sealed.empty()) return;
-        expected<memory_run_t> stamped = memory_run_t::stamped(
+        auto [stamped, status] = memory_run_t::stamped(
             std::move(sealed.deltas), stamp, constrained_allocator<byte_t, atomic_reference_> {runs_.constraint()});
-        assert(stamped.has_value() && "A drawn stamp packs into no words");
-        runs_.publish(stamped ? std::move(*stamped) : memory_run_t {}, stamp);
+        assert(status.succeeded() && "A drawn stamp packs into no words");
+        runs_.publish(std::move(stamped), stamp);
     }
 
     /** Drops the view @c prepare laid out, which the leader does for a commit it then refuses. */
@@ -1155,15 +1155,14 @@ class nvme_store {
     status_t check_batch(std::span<stored_key_t const> stored_keys, std::span<byte_t const> stored_values,
                          std::span<stored_value_size_t const> sizes) const noexcept {
         if (sizes.size() != stored_keys.size())
-            return {status_code_t::invalid_argument_k, "A batched insert names the size of every value"};
+            return {status_code_t::invalid_argument_k, "A batched insert needs every value size"};
         std::uint64_t total = 0;
         for (std::size_t index = 0; index != sizes.size(); ++index) {
             if (!admits_(sizes[index]))
                 return {status_code_t::malformed_k, "This collection admits no value of that size"};
             total += sizes[index];
         }
-        if (total != stored_values.size())
-            return {status_code_t::invalid_argument_k, "The named sizes do not add up to the values"};
+        if (total != stored_values.size()) return {status_code_t::invalid_argument_k, "The sizes miss the value bytes"};
         return {};
     }
 
@@ -1781,7 +1780,7 @@ class nvme_store {
         // A change that closes the chain folds onto nothing, as a chain no version closes does.
         if (closed && closing.kind == delta_kind_t::change_k) {
             if (chain.push_back(delta_view_t {closing}) != st::status_t::success_k)
-                return status_t {status_code_t::out_of_memory_k, "No room to collect a key's changes"};
+                return status_t {status_code_t::out_of_memory_k, "No room to collect a key's closing change"};
             closing = delta_view_t {delta_kind_t::remove_k, {}};
         }
         if (chain.empty()) {
@@ -1815,10 +1814,10 @@ class nvme_store {
             }
             else return {status_code_t::io_k, "A change's value is read through a channel"};
         };
-        expected<lookup_result_t> const folded = fold_versions_(read, stored_key, bytes_of, arena, value);
-        if (!folded) return lookup_result_t::incomplete_k;
-        if (*folded == lookup_result_t::written_k) size = static_cast<stored_value_size_t>(value.size());
-        return *folded;
+        auto const [folded, status] = fold_versions_(read, stored_key, bytes_of, arena, value);
+        if (status.failed()) return lookup_result_t::incomplete_k;
+        if (folded == lookup_result_t::written_k) size = static_cast<stored_value_size_t>(value.size());
+        return folded;
     }
 
     /** The bytes of the version at sorted @p position of @p run, read on @p channel into @p arena where they sit apart

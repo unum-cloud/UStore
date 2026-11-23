@@ -393,21 +393,22 @@ st::status_t launch_folds(utilities::metal_executor_t& executor, blocks_type_& b
         std::uint64_t {256}));
     std::uint32_t const tiles = static_cast<std::uint32_t>(
         utilities::divide_round_up(std::uint64_t {regions.records_count}, std::uint64_t {tile}));
-    auto const flags = utilities::carve<std::uint8_t>(blocks, executor, regions.records_count);
-    auto const counts = utilities::carve<std::uint64_t>(blocks, executor, std::size_t {tiles} + 1);
-    auto const selected = utilities::carve<std::uint32_t>(blocks, executor, regions.records_count);
-    if (!flags || !counts || !selected) return status_t::out_of_memory_heap_k;
+    auto const [flags, flags_status] = utilities::carve<std::uint8_t>(blocks, executor, regions.records_count);
+    auto const [counts, counts_status] = utilities::carve<std::uint64_t>(blocks, executor, std::size_t {tiles} + 1);
+    auto const [selected, selected_status] = utilities::carve<std::uint32_t>(blocks, executor, regions.records_count);
+    if (flags_status.failed() || counts_status.failed() || selected_status.failed())
+        return status_t::out_of_memory_heap_k;
     if (status_t const sorted = launch_sort_steps(executor, regions); sorted != status_t::success_k) return sorted;
     unsigned const blocks_count = regions.chains_count < 65535 ? regions.chains_count : 65535;
     // Metal binds threadgroup memory in multiples of 16 bytes
     unsigned const sorted_bytes = utilities::round_up_to_multiple(regions.width * 4u, 16u);
     if (utilities::launch(executor, executor.kernels()->function("ustore_fold_chains"), blocks_count,
                           fold_block_threads_k, sorted_bytes, regions.records, regions.starts, regions.chains_count,
-                          regions.spill, regions.kept, regions.kept_counts, flags->data())
+                          regions.spill, regions.kept, regions.kept_counts, flags.data())
             .failed())
         return status_t::unknown_k;
-    if (utilities::select_flagged(executor, static_cast<std::uint8_t const*>(flags->data()), regions.records_count,
-                                  tile, tiles, counts->data(), selected->data())
+    if (utilities::select_flagged(executor, static_cast<std::uint8_t const*>(flags.data()), regions.records_count, tile,
+                                  tiles, counts.data(), selected.data())
             .failed())
         return status_t::unknown_k;
     std::uint64_t const groups = fu::min_of(
@@ -416,8 +417,8 @@ st::status_t launch_folds(utilities::metal_executor_t& executor, blocks_type_& b
     if (utilities::launch(executor, executor.kernels()->function("ustore_fold_write"), static_cast<unsigned>(groups),
                           fold_block_threads_k, 0u, regions.records, regions.starts,
                           static_cast<std::uint32_t const*>(regions.kept), regions.chains_count, tiles, regions.removal,
-                          regions.composed, regions.offsets, static_cast<std::uint32_t const*>(selected->data()),
-                          static_cast<std::uint64_t const*>(counts->data()))
+                          regions.composed, regions.offsets, static_cast<std::uint32_t const*>(selected.data()),
+                          static_cast<std::uint64_t const*>(counts.data()))
             .failed())
         return status_t::unknown_k;
     return status_t::success_k;
@@ -517,8 +518,8 @@ st::status_t vram_adjacency_fold_t::compose(executor_type_& executor, blocks_typ
     spilled_starts[spilled_chains_count] = spilled_indices;
 
     auto const device = [&]<typename element_type_>(std::size_t elements) noexcept {
-        auto const carved = utilities::carve<element_type_>(blocks, executor, elements);
-        return carved ? carved->data() : static_cast<element_type_*>(nullptr);
+        auto const [carved, carved_status] = utilities::carve<element_type_>(blocks, executor, elements);
+        return carved_status.failed() ? static_cast<element_type_*>(nullptr) : carved.data();
     };
     half_edge_record_t* const records = device.template operator()<half_edge_record_t>(records_count);
     std::uint32_t* const starts = device.template operator()<std::uint32_t>(chains_count + 1);

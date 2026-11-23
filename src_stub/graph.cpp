@@ -115,7 +115,6 @@ collection_t const* task_collection(call_t& call, reader_t const& reader, argume
 } // namespace unum::ustore::stub
 
 void ustore_graph_read_edges(ustore_graph_read_edges_t* arguments) {
-    if (submitted<&ustore_graph_read_edges>(arguments)) return;
     call_t call(arguments->outcome);
     if (arguments->degrees_per_vertex) *arguments->degrees_per_vertex = nullptr;
     if (arguments->edges_offsets) *arguments->edges_offsets = nullptr;
@@ -171,7 +170,6 @@ void ustore_graph_read_edges(ustore_graph_read_edges_t* arguments) {
 }
 
 void ustore_graph_write_edges(ustore_graph_write_edges_t* arguments) {
-    if (submitted<&ustore_graph_write_edges>(arguments)) return;
     call_t call(arguments->outcome);
     if (refuse_database(call, arguments->database)) return;
     std::size_t const count = arguments->count;
@@ -198,7 +196,6 @@ void ustore_graph_write_edges(ustore_graph_write_edges_t* arguments) {
 }
 
 void ustore_graph_remove_edges(ustore_graph_remove_edges_t* arguments) {
-    if (submitted<&ustore_graph_remove_edges>(arguments)) return;
     call_t call(arguments->outcome);
     if (refuse_database(call, arguments->database)) return;
     std::size_t const count = arguments->count;
@@ -224,7 +221,6 @@ void ustore_graph_remove_edges(ustore_graph_remove_edges_t* arguments) {
 }
 
 void ustore_graph_write_vertices(ustore_graph_write_vertices_t* arguments) {
-    if (submitted<&ustore_graph_write_vertices>(arguments)) return;
     call_t call(arguments->outcome);
     if (refuse_database(call, arguments->database)) return;
     std::size_t const count = arguments->count;
@@ -245,7 +241,6 @@ void ustore_graph_write_vertices(ustore_graph_write_vertices_t* arguments) {
 }
 
 void ustore_graph_remove_vertices(ustore_graph_remove_vertices_t* arguments) {
-    if (submitted<&ustore_graph_remove_vertices>(arguments)) return;
     call_t call(arguments->outcome);
     if (refuse_database(call, arguments->database)) return;
     std::size_t const count = arguments->count;
@@ -277,7 +272,6 @@ void ustore_graph_remove_vertices(ustore_graph_remove_vertices_t* arguments) {
 }
 
 void ustore_graph_scan_vertices(ustore_graph_scan_vertices_t* arguments) {
-    if (submitted<&ustore_graph_scan_vertices>(arguments)) return;
     call_t call(arguments->outcome);
     if (!check_scan(call, arguments)) return;
     scan_keyed(call, arguments, ustore_modality_graph_k, nullptr, {});
@@ -297,7 +291,6 @@ void ustore_graph_vertices_cursor_init(ustore_graph_vertices_cursor_init_t* argu
 }
 
 void ustore_graph_vertices_cursor_next(ustore_graph_vertices_cursor_next_t* arguments) {
-    if (submitted<&ustore_graph_vertices_cursor_next>(arguments)) return;
     call_t call(arguments->outcome);
     keyed_cursor_t* const cursor = arguments->cursor ? &arguments->cursor->cursor : nullptr;
     ustore_arena_handle_t* const arena = open_pull(call, arguments, cursor);
@@ -314,11 +307,9 @@ void ustore_graph_vertices_cursor_free(ustore_graph_vertices_cursor_t cursor) {
 }
 
 void ustore_graph_sample_vertices(ustore_graph_sample_vertices_t* arguments) {
-    if (submitted<&ustore_graph_sample_vertices>(arguments)) return;
     sample_keyed(arguments, ustore_modality_graph_k);
 }
 
 void ustore_graph_measure_vertices(ustore_graph_measure_vertices_t* arguments) {
-    if (submitted<&ustore_graph_measure_vertices>(arguments)) return;
     measure_keyed(arguments, ustore_modality_graph_k);
 }

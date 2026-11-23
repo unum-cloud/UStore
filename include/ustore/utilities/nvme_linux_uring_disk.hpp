@@ -298,13 +298,13 @@ class linux_uring_files_disk {
      */
     static expected<linux_uring_files_disk> make(linux_uring_disk_config_t const& config) noexcept {
         if (config.queue_pairs_limit == 0 || config.depth_limit == 0)
-            return status_t {status_code_t::invalid_argument_k, "A ring needs a queue pair and a request of depth"};
+            return status_t {status_code_t::invalid_argument_k, "A ring needs a queue pair and depth"};
         if (config.queue_pairs_limit == static_cast<std::uint16_t>(queue_pair_id_t::unallocated_k) ||
             config.registered_memory_limit == static_cast<std::uint16_t>(registered_memory_id_t::unregistered_k) ||
             config.media_limit == static_cast<std::uint16_t>(registered_medium_id_t::unregistered_k))
-            return status_t {status_code_t::invalid_argument_k, "A ring keeps one identifier for an empty handle"};
+            return status_t {status_code_t::invalid_argument_k, "A ring reserves one id for empty handles"};
         if (config.media_limit == 0 || config.registered_memory_limit == 0)
-            return status_t {status_code_t::invalid_argument_k, "A ring needs a medium and a range to move between"};
+            return status_t {status_code_t::invalid_argument_k, "A ring needs a medium and a range"};
         if (config.depth_limit > depth_ceiling_k)
             return status_t {status_code_t::invalid_argument_k, "A ring holds fewer requests than that"};
 
@@ -380,7 +380,7 @@ class linux_uring_files_disk {
      */
     expected<queue_pair_t> acquire_queue_pair(queue_depth_t depth) noexcept {
         if (depth == 0 || depth > depth_limit_)
-            return status_t {status_code_t::invalid_argument_k, "A queue pair asks for more depth than the ring has"};
+            return status_t {status_code_t::invalid_argument_k, "The queue pair depth exceeds the ring's"};
         thread_identity_t const identity = bound_thread_identity_();
         for (std::size_t index = 0; index != queue_pairs_.size(); ++index) {
             queue_pair_slot_t& slot = queue_pairs_[index];
@@ -399,7 +399,7 @@ class linux_uring_files_disk {
             slot.bound_thread = identity;
             return queue_pair_t {disk_handle_t {static_cast<std::uint16_t>(index), slot.generation}, depth};
         }
-        return status_t {status_code_t::capacity_exhausted_k, "Every queue pair of this ring is already held"};
+        return status_t {status_code_t::capacity_exhausted_k, "Every queue pair of the ring is held"};
     }
 
     /**
@@ -495,7 +495,7 @@ class linux_uring_files_disk {
         registered_memory_slot_t* const slot = slot_of_(registered_memory);
         if (!slot) return {status_code_t::invalid_argument_k, "The registered_memory is not this ring's"};
         if (in_flight_(*slot).load(std::memory_order_acquire) != 0)
-            return {status_code_t::invalid_argument_k, "The range is still a medium of requests in flight"};
+            return {status_code_t::invalid_argument_k, "Requests in flight still use the range"};
         std::size_t const pieces = divide_round_up(slot->length, linux_uring_registered_range_bytes_k);
         for (std::size_t piece = 1; piece != pieces; ++piece) {
             ++slot[piece].generation;
@@ -557,7 +557,7 @@ class linux_uring_files_disk {
         registered_medium_slot_t* const slot = slot_of_(registered_medium);
         if (!slot) return {status_code_t::invalid_argument_k, "The medium is not this ring's"};
         if (in_flight_(*slot).load(std::memory_order_acquire) != 0)
-            return {status_code_t::invalid_argument_k, "The medium is still named by requests in flight"};
+            return {status_code_t::invalid_argument_k, "Requests in flight still use the medium"};
         // Rings stop installing the file before it closes, so none hands the kernel a closed
         // one for long
         native_file_t const file = atomic_reference_<native_file_t> {slot->file}.exchange(invalid_native_file_k,
@@ -1312,7 +1312,7 @@ class linux_uring_files_disk {
             --slot.flights_count;
             return taken;
         }
-        return status_t {status_code_t::not_found_k, "A completion carries a token nothing is outstanding for"};
+        return status_t {status_code_t::not_found_k, "A completion carries an unknown token"};
     }
 
     /** Places @p completion at the back of @p slot's own queue, which poll drains after the kernel's. */
@@ -1470,10 +1470,10 @@ class linux_uring_files_disk {
         while (head != posted && moved != into.size()) {
             linux_uring_cqe_t const& entry = ring.completion_entries[head & ring.completion_mask];
             ++head;
-            expected<flight_t> const flight = retire_(slot, base, request_token_t {entry.user_data});
-            if (!flight) continue;
-            into[moved] = translate_(*flight, entry.res);
-            restore_(*flight);
+            auto const [flight, status] = retire_(slot, base, request_token_t {entry.user_data});
+            if (status.failed()) continue;
+            into[moved] = translate_(flight, entry.res);
+            restore_(flight);
             ++moved;
         }
         if (head != taken) atomic_reference_<unsigned> {*ring.completion_head}.store(head, std::memory_order_release);

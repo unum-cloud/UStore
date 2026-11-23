@@ -143,7 +143,7 @@ struct page_fold_t {
         if (status_t status = state.load(base); status.failed()) return status;
         for (delta_view_t const& delta : deltas)
             if (status_t status = state.apply(delta); status.failed()) return status;
-        if (!state.exists) return status_t {status_code_t::not_found_k, "The page does not exist"};
+        if (!state.exists) return status_t {status_code_t::not_found_k, "The edits leave no page"};
         return state.tree.encode(allocator);
     }
 
@@ -180,9 +180,9 @@ struct page_fold_t {
         for (delta_view_t const& delta : deltas) {
             status_t status;
             if (delta.kind == delta_kind_t::write_k) {
-                auto view = page_view_t::make(delta.bytes);
-                if (!view) return view.status();
-                status = growth_status(edits.push_back(import_edit({}, view->root_key(), delta.bytes)));
+                auto [view, view_status] = page_view_t::make(delta.bytes);
+                if (view_status.failed()) return view_status;
+                status = growth_status(edits.push_back(import_edit({}, view.root_key(), delta.bytes)));
             }
             else if (utilities::removes(delta.kind))
                 status = growth_status(edits.push_back(remove_edit({}, nil_key_k)));
@@ -205,11 +205,12 @@ struct page_fold_t {
             page_state<allocator_type_> state(allocator);
             for (std::size_t index = closing; index != edits.size(); ++index)
                 if (status_t status = state.apply(edits[index]); status.failed()) return status;
-            auto tree = state.tree.encode(allocator);
-            if (!tree) return tree.status();
-            edit_t const folded = import_edit(edits.back().placement, state.tree[state.tree.root()].key, *tree);
-            auto chain = encode_edits(std::span<edit_t const>(&folded, 1), allocator);
-            allocator.deallocate(const_cast<byte_t*>(tree->data()), tree->size());
+            auto [tree, tree_status] = state.tree.encode(allocator);
+            if (tree_status.failed()) return tree_status;
+            edit_t const folded = import_edit(edits.back().placement, state.tree[state.tree.root()].key, tree);
+            auto [chain, chain_status] = encode_edits(std::span<edit_t const>(&folded, 1), allocator);
+            allocator.deallocate(const_cast<byte_t*>(tree.data()), tree.size());
+            if (chain_status.failed()) return chain_status;
             return chain;
         }
 
@@ -223,8 +224,8 @@ struct page_fold_t {
         // An insertion landing the key again starts a new element that older edits never touched
         auto reincarnates = [](edit_t const& edit, element_key_t const& element) noexcept {
             if (edit.modification != modification_t::insert_k) return false;
-            auto view = page_view_t::make(edit.value);
-            return !view || view->find(element) != no_element_k;
+            auto [view, view_status] = page_view_t::make(edit.value);
+            return view_status.failed() || view.find(element) != no_element_k;
         };
 
         for (std::size_t newer = 0; newer != edits.size(); ++newer)
@@ -269,7 +270,8 @@ struct page_fold_t {
                 std::size_t const length = std::size_t(candidate.text_length);
                 std::size_t const size = inserted.size() - length + candidate.value.size();
                 byte_t* const block = size ? allocator.allocate(size) : nullptr;
-                if (size && !block) return release(), status_t {status_code_t::out_of_memory_k, "Failed to merge"};
+                if (size && !block)
+                    return release(), status_t {status_code_t::out_of_memory_k, "No room for the merged text"};
                 if (status_t status = growth_status(blocks.push_back(std::span<byte_t>(block, size)));
                     status.failed()) {
                     if (block) allocator.deallocate(block, size);
@@ -289,8 +291,9 @@ struct page_fold_t {
         std::size_t kept = 0;
         for (std::size_t index = 0; index != edits.size(); ++index)
             if (keep[index]) edits[kept++] = edits[index];
-        auto chain = encode_edits(std::span<edit_t const>(edits.data(), kept), allocator);
+        auto [chain, chain_status] = encode_edits(std::span<edit_t const>(edits.data(), kept), allocator);
         release();
+        if (chain_status.failed()) return chain_status;
         return chain;
     }
 };

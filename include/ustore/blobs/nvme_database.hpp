@@ -821,16 +821,16 @@ class basic_database {
         if (volume_ == nullptr) return {};
         status_t first;
         {
-            expected<claimed_channel_t> claimed = claim_channel_();
-            if (!claimed) first = claimed.status();
+            auto [claimed, claim_status] = claim_channel_();
+            if (claim_status.failed()) first = claim_status;
             else {
                 for (std::size_t index = 0; index != collections_.size(); ++index)
                     if (status_t const flushed = std::visit(
-                            [&](auto& held) noexcept { return held.flush(claimed->channel()); },
+                            [&](auto& held) noexcept { return held.flush(claimed.channel()); },
                             collections_[index]->held);
                         flushed.failed() && first.succeeded())
                         first = flushed;
-                if (status_t const saved = publish_manifest_(claimed->channel()); saved.failed() && first.succeeded())
+                if (status_t const saved = publish_manifest_(claimed.channel()); saved.failed() && first.succeeded())
                     first = saved;
             }
             // The entries outlive the publication that stops naming them, which waits out every reader of the
@@ -903,14 +903,14 @@ class basic_database {
                               std::size_t thread_index = outside_executor_k) noexcept {
         reader_t const inside = ledger_.epochs().enter(thread_index);
         collection_entry_t const* const found = entry_with_id_(collection_id);
-        if (!found) return {status_code_t::not_found_k, "The database lists no such collection at that stamp"};
+        if (!found) return {status_code_t::not_found_k, "The database names no such collection"};
         transaction_stamp_t const at = stamp == head_stamp_k ? ledger_.published() : stamp;
         transaction_stamp_t const listed = atomic_reference_<transaction_stamp_t const> {found->listed_stamp}.load(
             std::memory_order_acquire);
         transaction_stamp_t const unlisted = atomic_reference_<transaction_stamp_t const> {found->unlisted_stamp}.load(
             std::memory_order_acquire);
         if (at < listed || unlisted <= at)
-            return {status_code_t::not_found_k, "The database lists no such collection at that stamp"};
+            return {status_code_t::not_found_k, "The collection is not listed at that stamp"};
         store_tag = found->store_tag;
         return {};
     }
@@ -988,8 +988,8 @@ class basic_database {
             return status_t {status_code_t::invalid_argument_k, "That ID names no collection"};
         if (store_tags_type_::index_of(store_tag) >= sizeof...(store_types_))
             return status_t {status_code_t::invalid_argument_k, "That tag names no store this database keeps"};
-        expected<claimed_channel_t> claimed = claim_channel_();
-        if (!claimed) return claimed.status();
+        auto [claimed, claim_status] = claim_channel_();
+        if (claim_status.failed()) return claim_status;
         if (entry_named_(name) != nullptr || entry_with_id_(collection_id) != nullptr)
             return status_t {status_code_t::already_exists_k, "The database already names that collection"};
 
@@ -1005,13 +1005,13 @@ class basic_database {
             created = status_t {status_code_t::out_of_memory_k, "No room for a collection's name"};
         else if (status_t const mounted = mount_collection_(*entry); mounted.failed()) created = mounted;
         else if (collections_.push_back(std::move(entry)) != st::status_t::success_k)
-            created = status_t {status_code_t::out_of_memory_k, "No room for another collection"};
+            created = status_t {status_code_t::out_of_memory_k, "No room to list the new collection"};
         else {
             // Hidden from every pinned stamp until the commit below draws its listing stamp.
             entry->listed_stamp = invalid_transaction_stamp_k;
-            if (status_t const flushed = flush_into_publication_(claimed->channel(), flushed_with); flushed.failed())
+            if (status_t const flushed = flush_into_publication_(claimed.channel(), flushed_with); flushed.failed())
                 created = flushed;
-            else if (status_t const saved = publish_manifest_(claimed->channel()); saved.failed()) created = saved;
+            else if (status_t const saved = publish_manifest_(claimed.channel()); saved.failed()) created = saved;
             else created = publish_collections_();
             if (created.failed()) collections_.erase(collections_.size() - 1);
         }
@@ -1025,11 +1025,11 @@ class basic_database {
      *  the create does. */
     status_t drop_collection(any_collection_id_t const& id,
                              collection_id_t flushed_with = collection_invalid_id_k) noexcept {
-        expected<claimed_channel_t> claimed = claim_channel_();
-        if (!claimed) return claimed.status();
+        auto [claimed, claim_status] = claim_channel_();
+        if (claim_status.failed()) return claim_status;
         collection_entry_t* doomed = entry_at_(id);
         if (!doomed) return {status_code_t::not_found_k, "The database names no such collection"};
-        if (status_t const flushed = flush_into_publication_(claimed->channel(), flushed_with); flushed.failed())
+        if (status_t const flushed = flush_into_publication_(claimed.channel(), flushed_with); flushed.failed())
             return flushed;
 
         // The manifest stops naming the runs before a single one of them is handed back. The
@@ -1044,7 +1044,7 @@ class basic_database {
             [[maybe_unused]] st::status_t const returned = collections_.push_back(std::move(doomed));
             return publication;
         }
-        if (status_t const saved = publish_manifest_(claimed->channel()); saved.failed()) {
+        if (status_t const saved = publish_manifest_(claimed.channel()); saved.failed()) {
             [[maybe_unused]] st::status_t const returned = collections_.push_back(std::move(doomed));
             [[maybe_unused]] status_t const restored = publish_collections_();
             return saved;
@@ -1163,15 +1163,15 @@ class basic_database {
         return found == lookup_result_t::written_k || found == lookup_result_t::incomplete_k;
     }
 
-    /** Bytes the value of @p stored_key takes in @p id as a reader pinned at @p stamp sees it, or @c not_found_k for a
-     *  miss and a removal; a chain of changes reaching values apart from their key slots is folded through a channel
-     *  to be measured. */
+    /** Bytes the value of @p stored_key takes in @p id as a reader pinned at @p stamp sees it,
+     *  @c not_found_k for a miss and a removal, or the failure that stopped the read; a chain of
+     *  changes reaching values apart from their key slots folds through a channel to measure. */
     status_t stored_value_size(any_collection_id_t const& id, stored_key_t stored_key, stored_value_size_t& size,
                                transaction_stamp_t stamp = head_stamp_k,
                                std::size_t thread_index = outside_executor_k) noexcept {
         size = 0;
         auto [read, read_status] = read_collection(id, stamp, thread_index);
-        if (read_status.failed()) return {status_code_t::not_found_k, "That collection misses it"};
+        if (read_status.failed()) return read_status;
         return stored_value_size(read, stored_key, size, thread_index);
     }
 
@@ -1182,7 +1182,8 @@ class basic_database {
                                std::size_t thread_index = outside_executor_k) noexcept {
         lookup_result_t const found = find(read, stored_key, size);
         if (found == lookup_result_t::written_k) return {};
-        if (found != lookup_result_t::incomplete_k) return {status_code_t::not_found_k, "That collection misses it"};
+        if (found != lookup_result_t::incomplete_k)
+            return {status_code_t::not_found_k, "The key is missing or removed"};
         std::uint64_t measured = 0;
         lookup_result_t folded = lookup_result_t::missing_k;
         auto const count = [&](std::size_t, std::uint64_t offset, std::span<byte_t const> bytes) noexcept {
@@ -1194,7 +1195,8 @@ class basic_database {
                                              std::span<lookup_result_t> {&folded, 1}, count, thread_index);
             selected.failed())
             return selected;
-        if (folded != lookup_result_t::written_k) return {status_code_t::not_found_k, "That collection misses it"};
+        if (folded != lookup_result_t::written_k)
+            return {status_code_t::not_found_k, "The folded key is missing or removed"};
         size = static_cast<stored_value_size_t>(measured);
         return {};
     }
@@ -1535,9 +1537,9 @@ class basic_database {
 
     /** Writes the memory runs of every collection as one run of its level zero. */
     status_t flush() noexcept {
-        expected<claimed_channel_t> claimed = claim_channel_();
-        if (!claimed) return claimed.status();
-        return flush_holding_(claimed->channel());
+        auto [claimed, claim_status] = claim_channel_();
+        if (claim_status.failed()) return claim_status;
+        return flush_holding_(claimed.channel());
     }
 
     /** An ingest under way into one collection: the claim it holds until destroyed, and the rows and runs so far. */
@@ -1599,15 +1601,15 @@ class basic_database {
             auto [guard, acquire_status] = channels_->acquire();
             if (acquire_status.failed()) return ingest_outcome_t {invalid_transaction_stamp_k, acquire_status};
             io_channel_t& channel = guard.channel();
-            expected<transaction_stamp_t> const published = with_ingest_<expected<transaction_stamp_t>>(
+            auto const [published, publish_status] = with_ingest_<expected<transaction_stamp_t>>(
                 ingest,
                 [&]<typename held_type_>(held_type_& held, typename held_type_::ingest_runs_t& ingested) noexcept {
                     return held.publish_ingest(channel, ingested);
                 });
             // The stamp is final once published, so a failed flush is retried as a flush
-            if (!published) return ingest_outcome_t {invalid_transaction_stamp_k, published.status()};
-            if (durability != ustore_durability_flushed_k) return ingest_outcome_t {*published, {}};
-            return ingest_outcome_t {*published, flush_holding_(channel)};
+            if (publish_status.failed()) return ingest_outcome_t {invalid_transaction_stamp_k, publish_status};
+            if (durability != ustore_durability_flushed_k) return ingest_outcome_t {published, {}};
+            return ingest_outcome_t {published, flush_holding_(channel)};
         }();
         ingest.claim_ = claim_guard_t {};
         return landed;
@@ -1637,12 +1639,12 @@ class basic_database {
      *  once, fanning each merge on the host out over @p fan_out. */
     status_t compact(compaction_fan_out_t const& fan_out = compaction_fan_out_t {}) noexcept {
         // The claim the channel comes with lends the database's one set of merge buffers.
-        expected<claimed_channel_t> reading = claim_channel_();
-        if (!reading) return reading.status();
+        auto [reading, claim_status] = claim_channel_();
+        if (claim_status.failed()) return claim_status;
         auto [writing, acquire_status] = channels_->acquire();
         if (acquire_status.failed()) return acquire_status;
 
-        manifest_write_t recording {this, &reading->channel()};
+        manifest_write_t recording {this, &reading.channel()};
         lsm_tree_publication_hook_t published;
         published.notify = &record_manifest_;
         published.context = &recording;
@@ -1653,7 +1655,7 @@ class basic_database {
                 [&]<typename store_type_>(store_type_& collection) noexcept -> expected<compaction_outcome_t> {
                     auto [buffers, lent_status] = lent_merge_buffers_<store_type_>(fan_out.slices());
                     if (lent_status.failed()) return lent_status;
-                    return collection.compact(reading->channel(), writing.channel(), buffers, compactor_, published,
+                    return collection.compact(reading.channel(), writing.channel(), buffers, compactor_, published,
                                               fan_out);
                 },
                 collections_[index]->held);
@@ -1931,7 +1933,7 @@ class basic_database {
         claim_guard_t const held = claim_guard_t::taken_if_free(*this);
         if (!held.holding()) return {};
         collection_entry_t* const claimed_entry = entry_with_id_(collection_id);
-        if (!claimed_entry) return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
+        if (!claimed_entry) return {status_code_t::write_conflict_k, "A written collection is gone before the claim"};
         if (status_t const done = std::visit([&](auto& collection) noexcept { return flush_and_compact_(collection); },
                                              claimed_entry->held);
             done.failed())
@@ -1954,38 +1956,38 @@ class basic_database {
      *  entry of no collection; none clears it. */
     status_t save_user_data(bytes_view_t bytes) noexcept {
         if (bytes.empty()) return clear_user_data();
-        expected<claimed_channel_t> claimed = claim_channel_();
-        if (!claimed) return claimed.status();
+        auto [claimed, claim_status] = claim_channel_();
+        if (claim_status.failed()) return claim_status;
         uuid128_t const run = uuid_generator();
         auto [written, allocate_status] = volume_->allocate(run, bytes.size());
         if (allocate_status.failed()) return allocate_status;
-        if (status_t const filled = write_extent<disk_t, waiter_type_>(volume_->disk(), claimed->channel(), written,
+        if (status_t const filled = write_extent<disk_t, waiter_type_>(volume_->disk(), claimed.channel(), written,
                                                                        bytes);
             filled.failed()) {
             volume_->deallocate(written);
             return filled;
         }
-        return replace_user_data_(claimed->channel(), run, written, bytes.size());
+        return replace_user_data_(claimed.channel(), run, written, bytes.size());
     }
 
     /** Reads the caller's own data into @p into, which must hold @c user_data_size_bytes of it. */
     status_t load_user_data(bytes_span_t into) noexcept {
-        expected<claimed_channel_t> claimed = claim_channel_();
-        if (!claimed) return claimed.status();
+        auto [claimed, claim_status] = claim_channel_();
+        if (claim_status.failed()) return claim_status;
         if (user_data_bytes_ == 0) return {status_code_t::not_found_k, "The database holds no user data"};
         if (into.size() < user_data_bytes_)
             return {status_code_t::invalid_argument_k, "A buffer shorter than the data"};
-        return read_extent<disk_t>(volume_->disk(), claimed->channel(), user_data_,
+        return read_extent<disk_t>(volume_->disk(), claimed.channel(), user_data_,
                                    into.first(static_cast<std::size_t>(user_data_bytes_)));
     }
 
     /** Forgets the caller's own data and returns its bytes to the volume once the manifest
      *  stops naming it. */
     status_t clear_user_data() noexcept {
-        expected<claimed_channel_t> claimed = claim_channel_();
-        if (!claimed) return claimed.status();
+        auto [claimed, claim_status] = claim_channel_();
+        if (claim_status.failed()) return claim_status;
         if (user_data_bytes_ == 0) return {status_code_t::not_found_k, "The database holds no user data"};
-        return replace_user_data_(claimed->channel(), uuid128_t {}, medium_extent_t {}, 0);
+        return replace_user_data_(claimed.channel(), uuid128_t {}, medium_extent_t {}, 0);
     }
 
 #pragma endregion User Data
@@ -2027,9 +2029,9 @@ class basic_database {
     template <typename progress_type_, typename digester_type_>
     expected<archive_report_t> save(volume_config_t const& target, transaction_stamp_t stamp, progress_type_&& progress,
                                     digester_type_ const& digester) noexcept {
-        expected<claimed_channel_t> claimed = claim_channel_();
-        if (!claimed) return claimed.status();
-        io_channel_t& channel = claimed->channel();
+        auto [claimed, claim_status] = claim_channel_();
+        if (claim_status.failed()) return claim_status;
+        io_channel_t& channel = claimed.channel();
         auto [writing, acquire_status] = channels_->acquire();
         if (acquire_status.failed()) return acquire_status;
         // Memory runs reach the runs first, so the files below hold every version at or
@@ -2175,6 +2177,8 @@ class basic_database {
     class claimed_channel_t {
       public:
 
+        /** Holds nothing, as a moved-from claim does. */
+        claimed_channel_t() noexcept = default;
         claimed_channel_t(claim_guard_t&& claim, channel_guard_t&& channel) noexcept
             : claim_(std::move(claim)), channel_(std::move(channel)) {}
 
@@ -2255,7 +2259,7 @@ class basic_database {
         auto [by_id, ids_status] = ids_index_t::make(collections_.size(), {}, allocator);
         auto [by_name, names_status] = names_index_t::make(collections_.size(), {}, allocator);
         if (ids_status != st::status_t::success_k || names_status != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "No room to publish the collections"};
+            return {status_code_t::out_of_memory_k, "No room for the published lookup indexes"};
         for (collection_entry_t* entry : collections_) {
             std::uint32_t const index = entries_.index_of(*entry);
             [[maybe_unused]] st::status_t const listed = next->entries.push_back(st::assume_reserved, std::move(entry));
@@ -2462,7 +2466,7 @@ class basic_database {
                 continue;
             }
             collection_entry_t* const claimed = entry_with_id_(collection_id);
-            if (!claimed) return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
+            if (!claimed) return {status_code_t::write_conflict_k, "A written collection is gone before the claim"};
             if (status_t const flushed = std::visit(
                     [&](auto& collection) noexcept { return flush_and_compact_(collection); }, claimed->held);
                 flushed.failed())
@@ -2758,7 +2762,7 @@ class basic_database {
                 hashed.failed())
                 return hashed;
             if (!(digest == file.sha256))
-                return {status_code_t::malformed_k, "A run's bytes differ from the SHA-256 its manifest names"};
+                return {status_code_t::malformed_k, "The run bytes differ from the manifest SHA-256"};
             return {};
         }
     }
@@ -2799,7 +2803,7 @@ class basic_database {
             constrained_allocator<std::uint64_t, atomic_reference_> {resources_->memory_constraint}};
         if (waiting.resize(hashed_window_k * block_bytes) != st::status_t::success_k ||
             waiting_bytes.resize(hashed_window_k, 0) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "No room for the blocks a hash waits on"};
+            return {status_code_t::out_of_memory_k, "No room for the hash wait blocks"};
         sz_sha256_state_t state;
         digester.init(state);
         std::uint64_t hashed = 0;
@@ -2882,16 +2886,16 @@ class basic_database {
     /** Names @p manifest after @p identity and lists every collection of this database in it. */
     status_t lay_out_collections_(manifest_t const& identity, manifest_t& manifest) noexcept {
         if (sz::failed(manifest.database.assign(identity.database.view())))
-            return {status_code_t::out_of_memory_k, "No room to lay the manifest out"};
+            return {status_code_t::out_of_memory_k, "No room for the manifest database name"};
         manifest.id = identity.id;
         if (manifest.collections.reserve(collections_.size()) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "No room to lay the manifest out"};
+            return {status_code_t::out_of_memory_k, "No room for the manifest collections"};
         for (collection_entry_t const* held : collections_) {
             collection_entry_t const& entry = *held;
             manifest_collection_t record;
             std::memcpy(record.id.bytes, entry.id.uuid.bytes, sizeof(record.id.bytes));
             if (sz::failed(record.name.assign(entry.name.view())))
-                return {status_code_t::out_of_memory_k, "No room to lay the manifest out"};
+                return {status_code_t::out_of_memory_k, "No room for a manifest collection name"};
             record.store = entry.store_tag;
             record.value_size = entry.config.lsm_tree.lsm_level_0.sorted_run.value_size;
             record.value_max_size = entry.config.lsm_tree.lsm_level_0.sorted_run.value_max_size;
@@ -2921,14 +2925,14 @@ class basic_database {
                                               static_cast<std::uint32_t>(index), run.level_number, run.stamp),
                                      run.extent};
                 if (into.push_back(std::move(entry)) != st::status_t::success_k)
-                    return {status_code_t::out_of_memory_k, "No room to lay the manifest out"};
+                    return {status_code_t::out_of_memory_k, "No room to list a run file"};
             }
         }
         if (user_data_bytes_ == 0) return {};
         placed_file_t entry {file_of_(user_data_, user_data_run_, user_data_bytes_, manifest_no_collection_k, 0, 0),
                              user_data_};
         if (into.push_back(std::move(entry)) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "No room to lay the manifest out"};
+            return {status_code_t::out_of_memory_k, "No room to list the user data file"};
         return {};
     }
 
@@ -2957,10 +2961,10 @@ class basic_database {
             reserved.failed())
             return reserved;
         if (status_t const made = make_run_pools_(); made.failed()) return made;
-        expected<claimed_channel_t> claimed = claim_channel_();
-        if (!claimed) return claimed.status();
+        auto [claimed, claim_status] = claim_channel_();
+        if (claim_status.failed()) return claim_status;
         std::uint64_t const durable_stamp = volume_->manifest().durable_stamp;
-        if (status_t const adopted = adopt_manifest_(claimed->channel(), digester); adopted.failed()) return adopted;
+        if (status_t const adopted = adopt_manifest_(claimed.channel(), digester); adopted.failed()) return adopted;
 
         // The stamps continue above the durable stamp, and every version above it is a commit a
         // crash tore, which is dropped before anything draws a stamp; resuming first is what lets
@@ -2968,7 +2972,7 @@ class basic_database {
         if (status_t const resumed = ledger_.resume(durable_stamp); resumed.failed()) return resumed;
         auto [writing, acquire_status] = channels_->acquire();
         if (acquire_status.failed()) return acquire_status;
-        manifest_write_t recording {this, &claimed->channel()};
+        manifest_write_t recording {this, &claimed.channel()};
         lsm_tree_publication_hook_t published;
         published.notify = &record_manifest_;
         published.context = &recording;
@@ -2977,7 +2981,7 @@ class basic_database {
                     [&]<typename store_type_>(store_type_& collection) noexcept -> status_t {
                         auto [buffers, lent_status] = lent_merge_buffers_<store_type_>(1);
                         if (lent_status.failed()) return lent_status;
-                        return collection.truncate_above(claimed->channel(), writing.channel(), buffers, durable_stamp,
+                        return collection.truncate_above(claimed.channel(), writing.channel(), buffers, durable_stamp,
                                                          published);
                     },
                     collections_[index]->held);
@@ -3049,9 +3053,9 @@ class basic_database {
     status_t adopt_(io_channel_t& channel, manifest_collection_t const& record,
                     std::span<lsm_tree_run_record_t const> runs) noexcept {
         if (store_tags_type_::index_of(record.store) >= sizeof...(store_types_))
-            return {status_code_t::malformed_k, "The manifest names a store this database does not keep"};
+            return {status_code_t::malformed_k, "The manifest names an unknown store"};
         if (record.name.size() == 0 || record.name.size() > collection_name_max_bytes_k)
-            return {status_code_t::malformed_k, "The manifest names a collection by no name or too long a one"};
+            return {status_code_t::malformed_k, "A manifest collection name is empty or long"};
 
         // A refusal below leaves the record taken; the failed mount gives up every record at once.
         collection_entry_t* entry = take_entry_();
@@ -3067,7 +3071,7 @@ class basic_database {
             restored.failed())
             return restored;
         if (collections_.push_back(std::move(entry)) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "No room for another collection"};
+            return {status_code_t::out_of_memory_k, "No room to list the restored collection"};
         return {};
     }
 

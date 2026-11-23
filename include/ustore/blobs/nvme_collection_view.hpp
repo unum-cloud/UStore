@@ -69,7 +69,7 @@ class collection_view {
     static expected<collection_view> extended(collection_view const& older, run_t const& newest,
                                               allocator_t allocator = {}) noexcept {
         if (newest.oldest_stamp() <= older.newest_stamp())
-            return status_t {status_code_t::invalid_argument_k, "A newer run starts past every stamp of the view"};
+            return status_t {status_code_t::invalid_argument_k, "A newer run starts past the view stamps"};
         collection_view view {typename runs_t::allocator_t(allocator)};
         if (view.runs_.resize(older.runs_.size() + 1) != st::status_t::success_k)
             return status_t {status_code_t::out_of_memory_k, "No room to extend a view"};

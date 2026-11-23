@@ -31,8 +31,8 @@
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/graph.h"    // `ustore_graph_read_edges_t`, `ustore_vertex_role_t`
-#include "ustore/ranges.hpp" // `strided`, `strided_iterator`
+#include "ustore/graph.h"              // `ustore_graph_read_edges_t`, `ustore_vertex_role_t`
+#include "ustore/utilities/ranges.hpp" // `strided`, `strided_iterator`
 
 #include "ustore/graph/adjacency_fold.hpp"  // `adjacency_fold_t`, `vertex_adjacency_t`, `deltas_of_edge`
 #include "ustore/utilities/algorithm.hpp"   // `radix_sort`, `word_byte`
@@ -147,7 +147,7 @@ status_t read_vertices(call_access<cpu_class_> const& access, collection_id_t co
 
     for (std::size_t index = 0; index != keys.size(); ++index) {
         if (results[index] == lookup_result_t::incomplete_k)
-            return {status_code_t::io_k, "The medium moved fewer bytes than a vertex claims"};
+            return {status_code_t::io_k, "The medium moved fewer bytes than claimed"};
         vertex_read_t& read = reads[index];
         read = vertex_read_t {};
         if (results[index] == lookup_result_t::written_k)
@@ -167,7 +167,7 @@ status_t read_vertices(call_access<cpu_class_> const& access, collection_id_t co
 /** Reads the vertices of every run of tasks on one collection, @p keys naming them in task order, into @p reads. */
 template <cpu_class_t cpu_class_>
 status_t read_task_vertices(call_access<cpu_class_> const& access,
-                            strided_iterator<ustore_collection_id_t const> collections,
+                            util::strided_iterator<ustore_collection_id_t const> collections,
                             std::span<stored_key_t const> keys, std::span<vertex_read_t> reads) noexcept {
     for (std::size_t first = 0; first != keys.size();) {
         std::size_t const end = run_end(collections, first, keys.size());
@@ -210,14 +210,14 @@ status_t chain_by_vertex(std::span<vertex_delta_t> deltas, ustore_arena_t scratc
     auto const digit_of = [](vertex_delta_t const& delta, std::size_t digit) noexcept -> std::size_t {
         if (digit < uuid_bytes_k) return delta.collection.uuid.bytes[digit];
         if (digit < 2 * uuid_bytes_k) return delta.vertex.uuid.bytes[digit - uuid_bytes_k];
-        return utilities::word_byte(delta.sequence, digit - 2 * uuid_bytes_k);
+        return util::word_byte(delta.sequence, digit - 2 * uuid_bytes_k);
     };
     auto const precedes = [](vertex_delta_t const& first, vertex_delta_t const& second) noexcept {
         if (first.collection != second.collection) return first.collection < second.collection;
         if (first.vertex != second.vertex) return first.vertex < second.vertex;
         return first.sequence < second.sequence;
     };
-    utilities::radix_sort(deltas, 2 * uuid_bytes_k + sizeof(std::uint64_t), digit_of, precedes);
+    util::radix_sort(deltas, 2 * uuid_bytes_k + sizeof(std::uint64_t), digit_of, precedes);
     arena_allocator<byte_t> arena {scratch};
     for (std::size_t first = 0; first != deltas.size();) {
         std::size_t end = first + 1;
@@ -267,10 +267,10 @@ expected<std::span<vertex_delta_t>> edge_deltas(arguments_type_ const& arguments
                                                 ustore_arena_t scratch) noexcept {
     auto [deltas, allocate_status] = arena_allocate<vertex_delta_t>(scratch, 2 * arguments.count);
     if (allocate_status.failed()) return allocate_status;
-    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
-    strided_iterator<ustore_key_t const> const sources = strided(arguments.sources);
-    strided_iterator<ustore_key_t const> const targets = strided(arguments.targets);
-    strided_iterator<ustore_key_t const> const identifiers = strided(arguments.edges);
+    util::strided_iterator<ustore_collection_id_t const> const collections = util::strided(arguments.collections);
+    util::strided_iterator<ustore_key_t const> const sources = util::strided(arguments.sources);
+    util::strided_iterator<ustore_key_t const> const targets = util::strided(arguments.targets);
+    util::strided_iterator<ustore_key_t const> const identifiers = util::strided(arguments.edges);
     std::size_t count = 0;
     for (std::size_t index = 0; index != arguments.count; ++index) {
         labeled_edge_t edge;
@@ -297,10 +297,10 @@ status_t graph_read_edges(ustore_graph_read_edges_t const& arguments, view_t con
     std::size_t const count = arguments.count;
     if (!count) return {};
     if (!arguments.vertices.data || !arguments.degrees_per_vertex)
-        return {status_code_t::invalid_argument_k, "Need the vertices and an output for their degrees"};
+        return {status_code_t::invalid_argument_k, "Needs the vertices and a degrees output"};
     if (arguments.edges_per_vertex && !arguments.edges_offsets)
-        return {status_code_t::invalid_argument_k, "Need an output for the offsets of the edges"};
-    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
+        return {status_code_t::invalid_argument_k, "Needs an output for the edge offsets"};
+    util::strided_iterator<ustore_collection_id_t const> const collections = util::strided(arguments.collections);
     database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     if (status_t const resolved = resolve_runs(state, view, collections, count, ustore_modality_graph_k);
         resolved.failed())
@@ -309,8 +309,8 @@ status_t graph_read_edges(ustore_graph_read_edges_t const& arguments, view_t con
     collection_reading_of<cpu_class_> held;
     if (status_t const one = read_at_one_state(access, collections, count, held); one.failed()) return one;
 
-    strided_iterator<ustore_key_t const> const vertices = strided(arguments.vertices);
-    strided_iterator<ustore_vertex_role_t const> const roles = strided(arguments.roles);
+    util::strided_iterator<ustore_key_t const> const vertices = util::strided(arguments.vertices);
+    util::strided_iterator<ustore_vertex_role_t const> const roles = util::strided(arguments.roles);
     auto [keys, keys_status] = arena_allocate<stored_key_t>(view.scratch, count);
     if (keys_status.failed()) return keys_status;
     auto [reads, reads_status] = arena_allocate<vertex_read_t>(view.scratch, count);
@@ -340,18 +340,18 @@ status_t graph_read_edges(ustore_graph_read_edges_t const& arguments, view_t con
                 degrees[index] = ustore_vertex_degree_missing_k;
                 continue;
             }
-            expected<vertex_adjacency_t> const adjacency = vertex_adjacency_t::make(vertices[index], reads[index].base,
-                                                                                    reads[index].pending);
-            if (!adjacency) return adjacency.status();
-            std::construct_at(&adjacencies[index], *adjacency);
+            auto const [adjacency, adjacency_status] = vertex_adjacency_t::make(vertices[index], reads[index].base,
+                                                                                reads[index].pending);
+            if (adjacency_status.failed()) return adjacency_status;
+            std::construct_at(&adjacencies[index], adjacency);
             degrees[index] = static_cast<ustore_vertex_degree_t>(
-                adjacency->degree(half_edge_roles_of(roles ? roles[index] : ustore_vertex_role_any_k)));
+                adjacency.degree(half_edge_roles_of(roles ? roles[index] : ustore_vertex_role_any_k)));
         }
         return {};
     };
     // A transaction's reads join its watch set, so only a read at one stamp splits the batch
     status_t const measured = access.transaction ? measure_slice(0, count, view)
-                                                 : for_task_slices(view, count, measure_slice);
+                                                 : util::for_task_slices(view, count, measure_slice);
     if (measured.failed()) return measured;
     std::size_t exported = 0;
     for (std::size_t index = 0; index != count; ++index) {
@@ -388,7 +388,7 @@ status_t graph_read_edges(ustore_graph_read_edges_t const& arguments, view_t con
         }
         return {};
     };
-    if (status_t const filled = for_task_slices(view, count, fill_slice); filled.failed()) return filled;
+    if (status_t const filled = util::for_task_slices(view, count, fill_slice); filled.failed()) return filled;
     *arguments.edges_per_vertex = tape.data();
     return {};
 }
@@ -397,13 +397,13 @@ status_t graph_read_edges(ustore_graph_read_edges_t const& arguments, view_t con
  *  lacked, watching the ends it creates and that the ends it extends are not removed meanwhile. */
 template <cpu_class_t cpu_class_>
 status_t graph_write_edges(ustore_graph_write_edges_t const& arguments, view_t const& view) noexcept {
-    if (status_t const valid = validate_choices(view.transaction, arguments.durability, view.watch);
+    if (status_t const valid = util::validate_choices(view.transaction, arguments.durability, view.watch);
         valid.failed() || !arguments.count)
         return valid;
     if (!arguments.sources.data || !arguments.targets.data)
-        return {status_code_t::invalid_argument_k, "Need the sources and the targets of the edges"};
+        return {status_code_t::invalid_argument_k, "Needs the edge sources and targets"};
     database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
-    if (status_t const resolved = resolve_runs(state, view, strided(arguments.collections), arguments.count,
+    if (status_t const resolved = resolve_runs(state, view, util::strided(arguments.collections), arguments.count,
                                                ustore_modality_graph_k);
         resolved.failed())
         return resolved;
@@ -436,13 +436,13 @@ status_t graph_write_edges(ustore_graph_write_edges_t const& arguments, view_t c
  *  vertices and skips the ends a graph lacks, watching the ends it changes. */
 template <cpu_class_t cpu_class_>
 status_t graph_remove_edges(ustore_graph_remove_edges_t const& arguments, view_t const& view) noexcept {
-    if (status_t const valid = validate_choices(view.transaction, arguments.durability, view.watch);
+    if (status_t const valid = util::validate_choices(view.transaction, arguments.durability, view.watch);
         valid.failed() || !arguments.count)
         return valid;
     if (!arguments.sources.data || !arguments.targets.data)
-        return {status_code_t::invalid_argument_k, "Need the sources and the targets of the edges"};
+        return {status_code_t::invalid_argument_k, "Needs the edge sources and targets"};
     database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
-    if (status_t const resolved = resolve_runs(state, view, strided(arguments.collections), arguments.count,
+    if (status_t const resolved = resolve_runs(state, view, util::strided(arguments.collections), arguments.count,
                                                ustore_modality_graph_k);
         resolved.failed())
         return resolved;
@@ -471,16 +471,16 @@ status_t graph_remove_edges(ustore_graph_remove_edges_t const& arguments, view_t
  *  the edges of those it holds, and watching the vertices it creates. */
 template <cpu_class_t cpu_class_>
 status_t graph_write_vertices(ustore_graph_write_vertices_t const& arguments, view_t const& view) noexcept {
-    if (status_t const valid = validate_choices(view.transaction, arguments.durability, view.watch);
+    if (status_t const valid = util::validate_choices(view.transaction, arguments.durability, view.watch);
         valid.failed() || !arguments.count)
         return valid;
     if (!arguments.vertices.data) return {status_code_t::invalid_argument_k, "No vertices were provided"};
-    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
+    util::strided_iterator<ustore_collection_id_t const> const collections = util::strided(arguments.collections);
     database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     if (status_t const resolved = resolve_runs(state, view, collections, arguments.count, ustore_modality_graph_k);
         resolved.failed())
         return resolved;
-    strided_iterator<ustore_key_t const> const vertices = strided(arguments.vertices);
+    util::strided_iterator<ustore_key_t const> const vertices = util::strided(arguments.vertices);
     return serve_write(
         state, view, arguments.durability, arguments.count, 1, graph_write_schedule(view),
         [&](call_access<cpu_class_> const& access) noexcept -> status_t {
@@ -522,19 +522,19 @@ status_t graph_write_vertices(ustore_graph_write_vertices_t const& arguments, vi
  */
 template <cpu_class_t cpu_class_>
 status_t graph_remove_vertices(ustore_graph_remove_vertices_t const& arguments, view_t const& view) noexcept {
-    if (status_t const valid = validate_choices(view.transaction, arguments.durability, view.watch);
+    if (status_t const valid = util::validate_choices(view.transaction, arguments.durability, view.watch);
         valid.failed() || !arguments.count)
         return valid;
     if (!arguments.vertices.data) return {status_code_t::invalid_argument_k, "No vertices were provided"};
     std::size_t const count = arguments.count;
-    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
+    util::strided_iterator<ustore_collection_id_t const> const collections = util::strided(arguments.collections);
     database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
     if (status_t const resolved = resolve_runs(state, view, collections, count, ustore_modality_graph_k);
         resolved.failed())
         return resolved;
-    strided_iterator<ustore_key_t const> const vertices = strided(arguments.vertices);
-    strided_iterator<ustore_key_t const> const end_vertices = strided(arguments.end_vertices);
-    strided_iterator<ustore_vertex_role_t const> const roles = strided(arguments.roles);
+    util::strided_iterator<ustore_key_t const> const vertices = util::strided(arguments.vertices);
+    util::strided_iterator<ustore_key_t const> const end_vertices = util::strided(arguments.end_vertices);
+    util::strided_iterator<ustore_vertex_role_t const> const roles = util::strided(arguments.roles);
     auto const inside_ranges = [&](ustore_collection_id_t const& collection, ustore_key_t const& vertex) noexcept {
         if (!end_vertices) return false;
         for (std::size_t task = 0; task != count; ++task)
@@ -557,7 +557,7 @@ status_t graph_remove_vertices(ustore_graph_remove_vertices_t const& arguments, 
                 if (!end_vertices) listed = growth_status(keys.push_back(stored_of(vertices[task].uuid)));
                 else if (vertices[task] < end_vertices[task])
                     listed = collect_keys(access, collections[task], stored_of(vertices[task].uuid),
-                                          stored_of(key_before(end_vertices[task]).uuid),
+                                          stored_of(util::key_before(end_vertices[task]).uuid),
                                           (std::numeric_limits<std::size_t>::max)(), keys);
                 if (listed.failed()) return listed;
             }
@@ -578,10 +578,10 @@ status_t graph_remove_vertices(ustore_graph_remove_vertices_t const& arguments, 
                 for (std::size_t index = firsts[task]; index != firsts[task + 1]; ++index) {
                     if (!reads[index].present) continue;
                     ustore_key_t const vertex = key_of(keys[index]);
-                    expected<vertex_adjacency_t> const adjacency = vertex_adjacency_t::make(vertex, reads[index].base,
-                                                                                            reads[index].pending);
-                    if (!adjacency) return adjacency.status();
-                    for (half_edge_cursor_t cursor = adjacency->half_edges(); cursor.valid(); cursor.next()) {
+                    auto const [adjacency, adjacency_status] = vertex_adjacency_t::make(vertex, reads[index].base,
+                                                                                        reads[index].pending);
+                    if (adjacency_status.failed()) return adjacency_status;
+                    for (half_edge_cursor_t cursor = adjacency.half_edges(); cursor.valid(); cursor.next()) {
                         graph::labeled_half_edge_t const half_edge = cursor.current();
                         if (!(half_edge.role & wanted) || half_edge.neighbor_id == vertex ||
                             inside_ranges(collections[task], half_edge.neighbor_id))

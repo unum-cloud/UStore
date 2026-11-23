@@ -41,6 +41,8 @@
 namespace unum::ustore::docs {
 
 using utilities::arena_allocator;
+using utilities::bytes_of;
+using utilities::chars_of;
 using utilities::growth_status;
 using utilities::strings_kit_concept;
 using utilities::stringzilla_allocator;
@@ -339,7 +341,7 @@ status_t extract_fields(json_documents_t const& documents, std::span<std::string
     sz_strings_from_string_views(paths.data(), paths.size(), &paths_view);
     if (sz_status_t const compiled = engine.compile(paths_view, allocator, strings); compiled != sz_success_k)
         return stringzilla_refusal(compiled, status_code_t::invalid_argument_k,
-                                   "The fields compile into no path the engine takes");
+                                   "The fields compile into no usable path");
 
     // With first members only, a field path selects at most one node of a document
     std::size_t const slots_count = walked.size() * paths.size();
@@ -350,7 +352,7 @@ status_t extract_fields(json_documents_t const& documents, std::span<std::string
     sz_strings_view_t walked_view {};
     sz_strings_from_string_views(walked.data(), walked.size(), &walked_view);
     if (sz_status_t const found = engine.find(walked_view, matches, matches_offsets); found != sz_success_k)
-        return stringzilla_refusal(found, status_code_t::malformed_k, "Failed to parse the document");
+        return stringzilla_refusal(found, status_code_t::malformed_k, "The field path search refused its documents");
     std::size_t const matches_count = static_cast<std::size_t>(matches_offsets[walked.size()]);
     if (matches_count > slots_count) return {status_code_t::internal_k, "A field path selected more than one node"};
     auto [match_of_slot, slots_status] = arena_allocate<std::size_t>(scratch, slots_count);
@@ -375,7 +377,7 @@ status_t extract_fields(json_documents_t const& documents, std::span<std::string
         std::string_view const token = documents[cell.document].substr(match.byte_offset, match.byte_length);
         json_cell_t const classified = json_classify(token);
         if (classified.token == json_token_t::malformed_k)
-            return {status_code_t::malformed_k, "Failed to parse the document"};
+            return {status_code_t::malformed_k, "A field's token is not JSON"};
         tokens[cell_index] = classified.token, bytes[cell_index] = classified.bytes,
         numbers[cell_index] = classified.number;
         if (classified.token != json_token_t::string_k) continue;
@@ -395,7 +397,7 @@ status_t extract_fields(json_documents_t const& documents, std::span<std::string
     if (sz_status_t const status = strings_kit_type_::utf8_count_strings(&escaped_view, nullptr, escaped.size(),
                                                                          nullptr, &malformed_index, nullptr);
         status != sz_success_k)
-        return stringzilla_refusal(status, status_code_t::malformed_k, "Failed to parse the document");
+        return stringzilla_refusal(status, status_code_t::malformed_k, "Field strings failed the UTF-8 check");
     sz_byteset_t controls;
     sz_byteset_init(&controls);
     for (unsigned control = 0; control != 0x20; ++control) sz_byteset_add_u8(&controls, static_cast<sz_u8_t>(control));
@@ -404,16 +406,15 @@ status_t extract_fields(json_documents_t const& documents, std::span<std::string
         if (sz_status_t const status = strings_kit_type_::find_byteset(body.start, body.length, &controls, &control,
                                                                        nullptr);
             status != sz_success_k)
-            return stringzilla_refusal(status, status_code_t::malformed_k,
-                                       "The strings of the fields could not be checked");
-        if (control) return {status_code_t::malformed_k, "Failed to parse the document"};
+            return stringzilla_refusal(status, status_code_t::malformed_k, "The field strings could not be checked");
+        if (control) return {status_code_t::malformed_k, "A field string holds a raw control byte"};
     }
     sz_strings_span_t unescaped {};
     if (sz_status_t const status = strings_kit_type_::strings_unescape(&escaped_view, nullptr, escaped.size(),
                                                                        sz_escape_json_k, &allocator, &unescaped,
                                                                        &malformed_index, nullptr);
         status != sz_success_k)
-        return stringzilla_refusal(status, status_code_t::malformed_k, "Failed to parse the document");
+        return stringzilla_refusal(status, status_code_t::malformed_k, "Field strings failed to unescape");
     for (std::size_t string_index = 0; string_index != string_cells.size(); ++string_index)
         bytes[string_cells[string_index]] = tape_string(unescaped, string_index);
     return {};
@@ -544,7 +545,7 @@ expected<value_view_t> json_text_of(json_cell_t const& value, ustore_arena_t scr
             status = append_text(
                 text, print_number(printed, printed + sizeof(printed), std::get<std::uint64_t>(value.number)));
         break;
-    default: return status_t {status_code_t::malformed_k, "Failed to parse the document"};
+    default: return status_t {status_code_t::malformed_k, "A JSON token has no spelling"};
     }
     if (status.failed()) return status;
     return value_view_t {std::as_bytes(std::span<char const> {text})};

@@ -31,7 +31,6 @@
 using namespace unum::ustore;
 using namespace unum::ustore::test;
 using namespace unum::ustore::test::abi;
-using namespace unum::ustore::utilities;
 using namespace unum;
 
 #pragma region Ranges
@@ -63,32 +62,31 @@ void check_binary_collection(blobs_collection_t& collection) {
     round_trip(reference, triplet);
 
     // Empty values keep their keys
-    expect_true(reference.clear_values().succeeded());
+    expect_true(!reference.clear_values().failed());
     check_length(reference, 0);
 
-    auto maybe_present = collection.members().keys_begin();
-    expect_true(maybe_present.has_value());
-    if (!maybe_present) return;
-    keys_stream_t& present_iterator = *maybe_present;
+    keys_range_t present_keys = collection.keys();
+    auto present_iterator = present_keys.begin();
     for (ustore_key_t const expected_key : triplet.keys) {
+        if (!expect_true(present_iterator != present_keys.end())) break;
         expect_equal(*present_iterator, expected_key);
         ++present_iterator;
     }
-    ++present_iterator;
-    expect_true(present_iterator.is_end());
+    expect_true(present_iterator == present_keys.end());
+    expect_true(!present_keys.status().failed());
 
-    expect_true(reference.remove().succeeded());
+    expect_true(!reference.remove().failed());
     check_length(reference, missing_length_k);
 }
 
 /** Opens and clears a database, then round-trips values through a blobs collection. */
 void test_database_open_clear_close(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return;
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
+    if (!expect_true(!open_status.failed())) return;
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
 
-    auto [collection, create_status] = database.on().create("blobs");
-    expect_true(create_status.succeeded());
+    auto [collection, create_status] = database.create("blobs");
+    expect_true(!create_status.failed());
     check_binary_collection(collection);
 }
 
@@ -96,34 +94,34 @@ void test_database_open_clear_close(config_t const& config) {
  *  collections drops it. */
 void test_database_clear_collection_by_clearing_database(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return;
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
+    if (!expect_true(!open_status.failed())) return;
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
 
-    auto [collection, create_status] = database.on().create("blobs");
-    expect_true(create_status.succeeded());
+    auto [collection, create_status] = database.create("blobs");
+    expect_true(!create_status.failed());
     triplet_t triplet;
     auto reference = collection[triplet.keys];
     round_trip(reference, triplet);
 
-    expect_true(collection.keys().size() == 3u);
-    expect_true(collection.pairs().size() == 3u);
+    expect_true(answers(collection.keys().size(), 3u));
+    expect_true(answers(collection.pairs().size(), 3u));
 
-    expect_true(database.on().clear(ustore_drop_pairs_k).succeeded());
+    expect_true(!database.clear(ustore_drop_pairs_k).failed());
     check_length(reference, missing_length_k);
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
-    expect_true(!*database.on().contains("blobs"));
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
+    expect_true(answers(database.contains("blobs"), false));
 }
 
 /** A description names the engine the suite opened, whether the head describes itself
  *  blocking or deferred. */
 void test_database_describe(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    auto [executor, executor_status] = executor_handle_t::for_ram({.threads = 2});
-    if (!expect_true(open_status.succeeded() && executor_status.succeeded())) return;
+    auto [executor, executor_status] = executor_t::for_ram({.threads = 2});
+    if (!expect_true(!open_status.failed() && !executor_status.failed())) return;
 
-    auto [description, describe_status] = database.on().describe();
+    auto [description, describe_status] = database.describe();
     auto [deferred_description, deferred_status] = database.deferred(executor).describe().wait();
-    expect_true(describe_status.succeeded() && deferred_status.succeeded());
+    expect_true(!describe_status.failed() && !deferred_status.failed());
     expect_equal(std::string_view {ustore_engine_name(description.engine)}, config.engine());
     expect_equal(std::string_view {ustore_engine_name(deferred_description.engine)}, config.engine());
 }
@@ -132,19 +130,19 @@ void test_database_describe(config_t const& config) {
  *  collections drops it. */
 case_result_t test_database_clear_modes(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    auto [executor, executor_status] = executor_handle_t::for_ram({.threads = 2});
-    if (!expect_true(open_status.succeeded() && executor_status.succeeded())) return {};
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
-    auto [kept, create_status] = database.on().create("kept");
-    if (!expect_true(create_status.succeeded())) return {};
-    expect_true(kept[key_from_integer(5)].assign("value").succeeded());
+    auto [executor, executor_status] = executor_t::for_ram({.threads = 2});
+    if (!expect_true(!open_status.failed() && !executor_status.failed())) return {};
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
+    auto [kept, create_status] = database.create("kept");
+    if (!expect_true(!create_status.failed())) return {};
+    expect_true(!kept[key_from_integer(5)].assign("value").failed());
 
-    expect_true(database.on().clear(ustore_drop_pairs_k).succeeded());
-    expect_true(*database.on().contains("kept"));
-    expect_true(kept.keys().size() == 0u);
+    expect_true(!database.clear(ustore_drop_pairs_k).failed());
+    expect_true(answers(database.contains("kept"), true));
+    expect_true(answers(kept.keys().size(), 0u));
 
-    expect_true(database.deferred(executor).clear(ustore_drop_collection_k).wait().succeeded());
-    expect_true(!*database.on().contains("kept"));
+    expect_true(!database.deferred(executor).clear(ustore_drop_collection_k).wait().failed());
+    expect_true(answers(database.contains("kept"), false));
     return {};
 }
 
@@ -152,169 +150,180 @@ case_result_t test_database_clear_modes(config_t const& config) {
  *  deferred alike, and the data still reads. */
 void test_database_compact(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    auto [executor, executor_status] = executor_handle_t::for_ram({.threads = 2});
-    if (!expect_true(open_status.succeeded() && executor_status.succeeded())) return;
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
-    auto [collection, create_status] = database.on().create("blobs");
-    expect_true(create_status.succeeded());
-    expect_true(collection[key_from_integer(11)].assign("compacted").succeeded());
+    auto [executor, executor_status] = executor_t::for_ram({.threads = 2});
+    if (!expect_true(!open_status.failed() && !executor_status.failed())) return;
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
+    auto [collection, create_status] = database.create("blobs");
+    expect_true(!create_status.failed());
+    expect_true(!collection[key_from_integer(11)].assign("compacted").failed());
 
     std::size_t reports = 0;
     auto cancelling = [&](ustore_size_t, ustore_size_t) noexcept {
         ++reports;
         return ustore_cancel_k;
     };
-    expect_status(database.on().compact(cancelling), status_code_t::cancelled_k);
+    expect_status(database.compact(cancelling), status_code_t::cancelled_k);
     expect_status(database.deferred(executor).compact(cancelling).wait(), status_code_t::cancelled_k);
     expect_equal(reports, 2u);
-    expect_true(database.on().compact().succeeded());
-    expect_true(collection[key_from_integer(11)].value() == "compacted");
+    expect_true(!database.compact().failed());
+    auto [compacted, compacted_status] = collection[key_from_integer(11)].value();
+    expect_true(!compacted_status.failed() && compacted == "compacted");
 }
 
 /** Fills keys 1000 to 1100 and 900 down to 800, then overwrites every other key
  *  across both ranges. */
 void test_database_overwrite_with_step(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return;
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
+    if (!expect_true(!open_status.failed())) return;
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
 
-    auto [collection, create_status] = database.on().create("blobs");
-    expect_true(create_status.succeeded());
+    auto [collection, create_status] = database.create("blobs");
+    expect_true(!create_status.failed());
 
     for (std::uint64_t key = 1000; key != 1100; ++key)
-        expect_true(collection[key_from_integer(key)].assign("some").succeeded());
-    for (std::uint64_t key = 1000; key != 1100; ++key)
-        expect_true(*collection[key_from_integer(key)].value() == "some");
-    expect_true(collection.keys().size() == 100u);
-    expect_true(collection.pairs().size() == 100u);
+        expect_true(!collection[key_from_integer(key)].assign("some").failed());
+    for (std::uint64_t key = 1000; key != 1100; ++key) {
+        auto [value, value_status] = collection[key_from_integer(key)].value();
+        expect_true(!value_status.failed() && value == "some");
+    }
+    expect_true(answers(collection.keys().size(), 100u));
+    expect_true(answers(collection.pairs().size(), 100u));
 
     for (std::uint64_t key = 900; key != 800; --key)
-        expect_true(collection[key_from_integer(key)].assign("other").succeeded());
-    for (std::uint64_t key = 900; key != 800; --key) expect_true(*collection[key_from_integer(key)].value() == "other");
-    expect_true(collection.keys().size() == 200u);
-    expect_true(collection.pairs().size() == 200u);
+        expect_true(!collection[key_from_integer(key)].assign("other").failed());
+    for (std::uint64_t key = 900; key != 800; --key) {
+        auto [value, value_status] = collection[key_from_integer(key)].value();
+        expect_true(!value_status.failed() && value == "other");
+    }
+    expect_true(answers(collection.keys().size(), 200u));
+    expect_true(answers(collection.pairs().size(), 200u));
 
     for (std::uint64_t key = 800; key != 1100; key += 2)
-        expect_true(collection[key_from_integer(key)].assign("third").succeeded());
-    for (std::uint64_t key = 800; key != 1100; key += 2)
-        expect_true(*collection[key_from_integer(key)].value() == "third");
-    expect_true(collection.keys().size() == 250u);
-    expect_true(collection.pairs().size() == 250u);
+        expect_true(!collection[key_from_integer(key)].assign("third").failed());
+    for (std::uint64_t key = 800; key != 1100; key += 2) {
+        auto [value, value_status] = collection[key_from_integer(key)].value();
+        expect_true(!value_status.failed() && value == "third");
+    }
+    expect_true(answers(collection.keys().size(), 250u));
+    expect_true(answers(collection.pairs().size(), 250u));
 }
 
 /** Populates the database, closes and reopens it, and checks the contents survived. */
 void test_database_persistency(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return;
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
+    if (!expect_true(!open_status.failed())) return;
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
 
     triplet_t triplet;
     {
-        auto [kept_collection, kept_status] = database.on().create("kept");
-        expect_true(kept_status.succeeded());
+        auto [kept_collection, kept_status] = database.create("kept");
+        expect_true(!kept_status.failed());
         auto kept_reference = kept_collection[triplet.keys];
         check_length(kept_reference, missing_length_k);
         round_trip(kept_reference, triplet);
         check_length(kept_reference, triplet_t::value_size_k);
 
-        auto [emptied_collection, emptied_status] = database.on().create("emptied");
-        expect_true(emptied_status.succeeded());
+        auto [emptied_collection, emptied_status] = database.create("emptied");
+        expect_true(!emptied_status.failed());
         auto emptied_reference = emptied_collection[triplet.keys];
         check_length(emptied_reference, missing_length_k);
         round_trip(emptied_reference, triplet);
         check_length(emptied_reference, triplet_t::value_size_k);
-        expect_true(emptied_collection.clear_values().succeeded());
+        expect_true(!emptied_collection.clear_values().failed());
         check_length(emptied_reference, 0);
     }
     database.close();
     {
         auto [reopened, reopen_status] = open_database<database_t>(config);
-        if (!expect_true(reopen_status.succeeded())) return;
+        if (!expect_true(!reopen_status.failed())) return;
         database = std::move(reopened);
 
-        auto [kept_collection, kept_status] = database.on().find("kept");
-        expect_true(kept_status.succeeded());
+        auto [kept_collection, kept_status] = database.find("kept");
+        expect_true(!kept_status.failed());
         auto kept_reference = kept_collection[triplet.keys];
         check_equalities(kept_reference, triplet);
         check_length(kept_reference, triplet_t::value_size_k);
-        expect_true(kept_collection.keys().size() == 3u);
-        expect_true(kept_collection.pairs().size() == 3u);
+        expect_true(answers(kept_collection.keys().size(), 3u));
+        expect_true(answers(kept_collection.pairs().size(), 3u));
 
-        expect_true(database.on().contains("emptied").has_value());
-        expect_true(*database.on().contains("emptied"));
-        auto [emptied_collection, emptied_status] = database.on().find("emptied");
-        expect_true(emptied_status.succeeded());
+        expect_true(!database.contains("emptied").status.failed());
+        expect_true(answers(database.contains("emptied"), true));
+        auto [emptied_collection, emptied_status] = database.find("emptied");
+        expect_true(!emptied_status.failed());
         auto emptied_reference = emptied_collection[triplet.keys];
         check_length(emptied_reference, 0);
-        expect_true(emptied_collection.keys().size() == 3u);
-        expect_true(emptied_collection.pairs().size() == 3u);
+        expect_true(answers(emptied_collection.keys().size(), 3u));
+        expect_true(answers(emptied_collection.pairs().size(), 3u));
     }
 }
 
 /** Creates, looks up, drops and clears collections under unique names. */
 void test_database_named_collections(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return;
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
+    if (!expect_true(!open_status.failed())) return;
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
 
     // A missing collection can't be dropped, and the empty name carries none
-    expect_true(!*database.on().contains("unknown"));
-    expect_true(database.on().drop("unknown").failed());
-    expect_true(database.on().drop("").failed());
+    expect_true(answers(database.contains("unknown"), false));
+    expect_true(database.drop("unknown").failed());
+    expect_true(database.drop("").failed());
 
-    expect_true(database.on().find_or_create("col1").has_value());
-    expect_true(database.on().find_or_create("col2").has_value());
+    expect_true(!database.find_or_create("col1").status.failed());
+    expect_true(!database.find_or_create("col2").status.failed());
 
-    expect_true(!database.on().create("col1"));
-    blobs_collection_t first_collection = *database.on().find_or_create("col1");
-    expect_true(!database.on().create("col2"));
-    blobs_collection_t second_collection = *database.on().find_or_create("col2");
+    expect_true(database.create("col1").status.failed());
+    auto [first_collection, first_collection_status] = database.find_or_create("col1");
+    if (!expect_true(!first_collection_status.failed())) return;
+    expect_true(database.create("col2").status.failed());
+    auto [second_collection, second_collection_status] = database.find_or_create("col2");
+    if (!expect_true(!second_collection_status.failed())) return;
 
     check_binary_collection(first_collection);
     check_binary_collection(second_collection);
 
-    expect_true(database.on().drop("col1").succeeded());
-    expect_true(database.on().drop("col2").succeeded());
-    expect_true(!*database.on().contains(""));
-    expect_true(!*database.on().contains("col1"));
-    expect_true(!*database.on().contains("col2"));
+    expect_true(!database.drop("col1").failed());
+    expect_true(!database.drop("col2").failed());
+    expect_true(answers(database.contains(""), false));
+    expect_true(answers(database.contains("col1"), false));
+    expect_true(answers(database.contains("col2"), false));
 
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
-    expect_true(!*database.on().contains(""));
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
+    expect_true(answers(database.contains(""), false));
 }
 
 /** Threads racing to create one name leave exactly one collection behind, which
  *  the name addresses. */
 case_result_t test_database_named_collections_race(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return {};
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
+    if (!expect_true(!open_status.failed())) return {};
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
 
     constexpr std::size_t threads_count = 8;
     std::size_t created = 0;
     std::size_t refused = 0;
     auto task = [&](std::size_t) noexcept {
-        auto [collection, create_status] = database.on().create("contested");
-        if (create_status.succeeded())
+        auto [collection, create_status] = database.create("contested");
+        if (!create_status.failed())
             fu::standard_atomic_ref<std::size_t> {created}.store_add(1, std::memory_order_relaxed);
         else if (create_status == status_code_t::already_exists_k)
             fu::standard_atomic_ref<std::size_t> {refused}.store_add(1, std::memory_order_relaxed);
     };
-    auto maybe_executor = executor_t::make(threads_count, caller_exclusivity_t::caller_inclusive_k);
-    expect_true(maybe_executor.has_value());
-    if (!maybe_executor) return {};
-    expect_true(st::succeeded(maybe_executor->for_threads(task)));
+    auto [executor, executor_status] = util::executor_t::make(threads_count,
+                                                              util::caller_exclusivity_t::caller_inclusive_k);
+    expect_true(!st::failed(executor_status));
+    if (st::failed(executor_status)) return {};
+    expect_true(st::succeeded(executor.for_threads(task)));
 
     expect_equal(created, 1u);
     expect_equal(refused, threads_count - 1);
     auto [arena, arena_status] = arena_t::make();
-    if (!expect_true(arena_status.succeeded())) return {};
-    auto [collections, list_status] = database.on().collections(arena);
-    auto [found, find_status] = database.on().find("contested");
-    expect_true(list_status.succeeded() && find_status.succeeded());
+    if (!expect_true(!arena_status.failed())) return {};
+    auto [collections, list_status] = database.collections(arena);
+    auto [found, find_status] = database.find("contested");
+    expect_true(!list_status.failed() && !find_status.failed());
     expect_equal(collections.size(), 1u);
-    expect_true(collections.size() == 1 && ustore_collection_id_t(found) == collections[0]);
-    expect_true(database.on().drop("contested").succeeded());
+    expect_true(collections.size() == 1 && found.handle() == collections[0]);
+    expect_true(!database.drop("contested").failed());
     return {};
 }
 
@@ -322,20 +331,20 @@ case_result_t test_database_named_collections_race(config_t const& config) {
  *  empty name, where each kind of handle creates its own modality and finds no other. */
 case_result_t test_database_named_collections_list(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return {};
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
+    if (!expect_true(!open_status.failed())) return {};
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
 
     // Every kind of collection handle creates a collection of its own modality
     std::array<std::string_view, 3> const names {"col1", "col2", "col3"};
     std::array<ustore_modality_t, 3> const modalities {ustore_modality_blobs_k, ustore_modality_docs_k,
                                                        ustore_modality_graph_k};
-    expect_true(database.on().create<blobs_collection_t>(names[0]).has_value());
-    expect_true(database.on().create<docs_collection_t>(names[1]).has_value());
-    expect_true(database.on().create<graph_collection_t>(names[2]).has_value());
+    expect_true(!database.create<blobs_collection_t>(names[0]).status.failed());
+    expect_true(!database.create<docs_collection_t>(names[1]).status.failed());
+    expect_true(!database.create<graph_collection_t>(names[2]).status.failed());
     ustore_outcome_t outcome {};
     ustore_collection_id_t unnamed {};
     ustore_collection_create_t create {};
-    create.database = database;
+    create.database = database.handle();
     create.outcome = &outcome;
     create.modality = ustore_modality_strings_k;
     create.collection = &unnamed;
@@ -343,19 +352,19 @@ case_result_t test_database_named_collections_list(config_t const& config) {
     expect_success(outcome);
 
     auto [arena, arena_status] = arena_t::make();
-    if (!expect_true(arena_status.succeeded())) return {};
+    if (!expect_true(!arena_status.failed())) return {};
     ustore_size_t written = 0;
     ustore_collection_id_t const* ids = nullptr;
     ustore_modality_t const* listed_modalities = nullptr;
     ustore_strings_view_t listed_names {};
     ustore_collection_list_t list {};
-    list.database = database;
+    list.database = database.handle();
     list.outcome = &outcome;
     list.collections = &ids;
     list.modalities = &listed_modalities;
     list.names = &listed_names;
     list.written = &written;
-    list.arena = arena;
+    list.arena = arena.handle();
     ustore_collection_list(&list);
     expect_success(outcome);
     expect_equal(written, 4u);
@@ -364,7 +373,7 @@ case_result_t test_database_named_collections_list(config_t const& config) {
     // Every listed name resolves back to the identifier beside it, and the unnamed collection lists
     // an empty name
     for (std::size_t index = 0; index != written; ++index) {
-        std::string_view const name = chars_of(tape_string(listed_names, index));
+        std::string_view const name = util::chars_of(util::tape_string(listed_names, index));
         if (name.empty()) {
             expect_true(ids[index] == unnamed && listed_modalities[index] == ustore_modality_strings_k);
             continue;
@@ -373,20 +382,21 @@ case_result_t test_database_named_collections_list(config_t const& config) {
         expect_true(named != names.end());
         if (named == names.end()) continue;
         expect_true(listed_modalities[index] == modalities[named - names.begin()]);
-        auto maybe_found = collection_named(database.receiver(), name);
-        expect_true(maybe_found && *maybe_found == ids[index]);
+        auto const [found, find_status] = collection_named(database.handle(), name);
+        expect_true(!find_status.failed() && found == ids[index]);
     }
 
     // A typed lookup refuses a collection of another modality, and a typed creation makes one the
     // graph calls serve
-    expect_true(database.on().find<docs_collection_t>("col3") == status_code_t::invalid_argument_k);
-    expect_true(database.on().find<graph_collection_t>("col3").has_value());
-    auto friends = database.on().find_or_create<graph_collection_t>("friends");
-    expect_true(friends && friends->write_edge(edge_t {key_from_integer(1), key_from_integer(2)}).succeeded());
+    expect_true(database.find<docs_collection_t>("col3").status == status_code_t::invalid_argument_k);
+    expect_true(!database.find<graph_collection_t>("col3").status.failed());
+    auto [friends, friends_status] = database.find_or_create<graph_collection_t>("friends");
+    expect_true(!friends_status.failed() &&
+                !friends.write_edge(edge_t {key_from_integer(1), key_from_integer(2)}).failed());
 
-    expect_true(database.on().drop("col1").succeeded());
-    expect_true(!*database.on().contains("col1"));
-    expect_true(database.on().drop("").failed());
+    expect_true(!database.drop("col1").failed());
+    expect_true(answers(database.contains("col1"), false));
+    expect_true(database.drop("").failed());
     return {};
 }
 
@@ -394,8 +404,8 @@ case_result_t test_database_named_collections_list(config_t const& config) {
  *  the other way. */
 case_result_t test_database_collections_resolve(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return {};
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
+    if (!expect_true(!open_status.failed())) return {};
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
 
     // Nothing reaches an identifier the engine never handed out, the nil UUID among them, whatever
     // it keeps there itself
@@ -403,7 +413,7 @@ case_result_t test_database_collections_resolve(config_t const& config) {
          {ustore_collection_id_t {}, ustore_collection_id_t {uuid_from_integer(4242)},
           ustore_collection_id_t {largest_key_k.uuid}}) {
         blobs_collection_t keyed {database.receiver(), unknown};
-        expect_true(keyed[key_from_integer(1)].value() == status_code_t::not_found_k);
+        expect_true(keyed[key_from_integer(1)].value().status == status_code_t::not_found_k);
         expect_true(keyed[key_from_integer(1)].assign("intruder") == status_code_t::not_found_k);
         expect_true(keyed.clear() == status_code_t::not_found_k);
         strings_collection_t stringed {database.receiver(), unknown};
@@ -411,83 +421,84 @@ case_result_t test_database_collections_resolve(config_t const& config) {
     }
 
     // A modality fixes how a collection is keyed, and calls keyed the other way are refused
-    auto maybe_words = database.on().create<strings_collection_t>("words");
-    auto maybe_numbers = database.on().create("numbers");
-    expect_true(maybe_words && maybe_numbers);
-    if (!maybe_words || !maybe_numbers) return {};
-    ustore_collection_id_t const words = *maybe_words;
+    auto [words_collection, words_status] = database.create<strings_collection_t>("words");
+    auto [numbers_collection, numbers_status] = database.create("numbers");
+    expect_true(!words_status.failed() && !numbers_status.failed());
+    if (words_status.failed() || numbers_status.failed()) return {};
+    ustore_collection_id_t const words = words_collection.handle();
     blobs_collection_t keyed_words {database.receiver(), words};
     expect_true(keyed_words[key_from_integer(1)].assign("number") == status_code_t::invalid_argument_k);
-    strings_collection_t stringed_numbers {database.receiver(), *maybe_numbers};
+    strings_collection_t stringed_numbers {database.receiver(), numbers_collection.handle()};
     expect_true(stringed_numbers.assign("word", key_from_integer(1)) == status_code_t::invalid_argument_k);
-    expect_true(maybe_words->assign("word", key_from_integer(1)).succeeded());
+    expect_true(!words_collection.assign("word", key_from_integer(1)).failed());
 
     // A name is never a collection, and dropping a collection by identifier takes its name too
     auto [arena, arena_status] = arena_t::make();
-    if (!expect_true(arena_status.succeeded())) return {};
-    auto [listed, list_status] = database.on().collections(arena);
-    expect_true(list_status.succeeded());
+    if (!expect_true(!arena_status.failed())) return {};
+    auto [listed, list_status] = database.collections(arena);
+    expect_true(!list_status.failed());
     expect_equal(listed.size(), 2u);
     ustore_outcome_t outcome {};
     ustore_collection_drop_t drop {};
-    drop.database = database;
+    drop.database = database.handle();
     drop.outcome = &outcome;
     drop.collection = words;
     drop.mode = ustore_drop_collection_k;
     ustore_collection_drop(&drop);
     expect_success(outcome);
-    expect_true(!*database.on().contains("words"));
-    expect_true(database.on().drop("numbers").succeeded());
+    expect_true(answers(database.contains("words"), false));
+    expect_true(!database.drop("numbers").failed());
     return {};
 }
 
 /** Clearing values keeps the keys and empties their binary strings. */
 void test_database_clear_values(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return;
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
+    if (!expect_true(!open_status.failed())) return;
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
 
     triplet_t triplet;
-    auto [collection, create_status] = database.on().create("blobs");
-    expect_true(create_status.succeeded());
+    auto [collection, create_status] = database.create("blobs");
+    expect_true(!create_status.failed());
     auto reference = collection[triplet.keys];
 
     check_length(reference, missing_length_k);
     round_trip(reference, triplet);
     check_length(reference, triplet_t::value_size_k);
 
-    expect_true(collection.clear_values().succeeded());
+    expect_true(!collection.clear_values().failed());
     check_length(reference, 0);
-    expect_true(collection.clear().succeeded());
+    expect_true(!collection.clear().failed());
     check_length(reference, missing_length_k);
 }
 
 /** Reads presences through the C ABI and the C++ wrappers. */
 void test_database_presences(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return;
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
-    auto [collection, create_status] = database.on().create("blobs");
-    expect_true(create_status.succeeded());
+    if (!expect_true(!open_status.failed())) return;
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
+    auto [collection, create_status] = database.create("blobs");
+    expect_true(!create_status.failed());
 
     constexpr std::size_t keys_count = 1000;
     for (std::size_t index = 0; index != keys_count; ++index)
-        if (index % 10) expect_true(collection[key_from_integer(index)].assign("value").succeeded());
+        if (index % 10) expect_true(!collection[key_from_integer(index)].assign("value").failed());
 
     std::array<ustore_key_t, keys_count> keys;
     for (std::size_t index = 0; index != keys_count; ++index) keys[index] = key_from_integer(index);
     auto [arena, arena_status] = arena_t::make();
-    if (!expect_true(arena_status.succeeded())) return;
+    if (!expect_true(!arena_status.failed())) return;
     ustore_octet_t const* found_presences = nullptr;
     ustore_outcome_t outcome {};
+    ustore_collection_id_t const collection_id = collection.handle();
     ustore_blobs_read_t read {};
-    read.database = database;
+    read.database = database.handle();
     read.outcome = &outcome;
     read.count = keys_count;
-    read.collections = {collection.member_ptr(), 0};
+    read.collections = {&collection_id, 0};
     read.keys = {keys.data(), sizeof(ustore_key_t)};
     read.presences = &found_presences;
-    read.arena = arena;
+    read.arena = arena.handle();
 
     ustore_blobs_read(&read);
     expect_success(outcome);
@@ -495,9 +506,8 @@ void test_database_presences(config_t const& config) {
     for (std::size_t index = 0; found_presences && index != keys_count; ++index)
         expect_true(bits_view_t {found_presences}[index] == (index % 10 != 0));
 
-    auto maybe_presences = collection[keys].present();
-    expect_true(maybe_presences.has_value());
-    auto const& presences = *maybe_presences;
+    auto [presences, presences_status] = collection[keys].present();
+    expect_true(!presences_status.failed());
     for (std::size_t index = 0; index != keys_count; ++index)
         expect_true(static_cast<bool>(presences[index]) == (index % 10 != 0));
 }
@@ -507,11 +517,11 @@ void test_database_presences(config_t const& config) {
  *  the values out of memory. */
 void test_database_batched_read_matches_single(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return;
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
-    auto [first, first_status] = database.on().create("first");
-    auto [second, second_status] = database.on().create("second");
-    if (!expect_true(first_status.succeeded() && second_status.succeeded())) return;
+    if (!expect_true(!open_status.failed())) return;
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
+    auto [first, first_status] = database.create("first");
+    auto [second, second_status] = database.create("second");
+    if (!expect_true(!first_status.failed() && !second_status.failed())) return;
 
     // Every seventh key stays missing, every eleventh holds an empty value, the rest grow with it.
     constexpr std::size_t keys_count = 3000;
@@ -520,27 +530,27 @@ void test_database_batched_read_matches_single(config_t const& config) {
         std::string const value = index % 11 == 0 ? std::string {}
                                                   : std::string(1 + index % 600, char('a' + index % 26));
         auto& collection = index % 2 ? first : second;
-        expect_true(collection[key_from_integer(index)]
-                        .assign(value_view_t {reinterpret_cast<ustore_byte_t const*>(value.data()), value.size()})
-                        .succeeded());
+        expect_true(!collection[key_from_integer(index)]
+                         .assign(value_view_t {reinterpret_cast<ustore_byte_t const*>(value.data()), value.size()})
+                         .failed());
     }
     std::array<ustore_key_t, keys_count + 64> keys;
     std::array<ustore_collection_id_t, keys_count + 64> collections;
     for (std::size_t index = 0; index != keys.size(); ++index) {
         std::size_t const key = (index * 7919) % keys_count;
         keys[index] = key_from_integer(key);
-        collections[index] = key % 2 ? *first.member_ptr() : *second.member_ptr();
+        collections[index] = key % 2 ? first.handle() : second.handle();
     }
     auto [arena, arena_status] = arena_t::make();
     auto [single_arena, single_arena_status] = arena_t::make();
-    if (!expect_true(arena_status.succeeded() && single_arena_status.succeeded())) return;
+    if (!expect_true(!arena_status.failed() && !single_arena_status.failed())) return;
 
     auto compare = [&]() {
         ustore_outcome_t outcome {};
         ustore_octet_t const* presences = nullptr;
         ustore_length_t const* lengths = nullptr;
         ustore_strings_view_t tape {};
-        ustore_blobs_read_t read {.database = database,
+        ustore_blobs_read_t read {.database = database.handle(),
                                   .outcome = &outcome,
                                   .count = keys.size(),
                                   .collections = {collections.data(), sizeof(ustore_collection_id_t)},
@@ -548,7 +558,7 @@ void test_database_batched_read_matches_single(config_t const& config) {
                                   .presences = &presences,
                                   .lengths = &lengths,
                                   .values = &tape,
-                                  .arena = arena};
+                                  .arena = arena.handle()};
         ustore_blobs_read(&read);
         if (!expect_success(outcome)) return;
         std::size_t mismatches = 0;
@@ -556,7 +566,7 @@ void test_database_batched_read_matches_single(config_t const& config) {
             ustore_octet_t const* single_presences = nullptr;
             ustore_length_t const* single_lengths = nullptr;
             ustore_strings_view_t single_tape {};
-            ustore_blobs_read_t alone {.database = database,
+            ustore_blobs_read_t alone {.database = database.handle(),
                                        .outcome = &outcome,
                                        .count = 1,
                                        .collections = {&collections[index], 0},
@@ -564,21 +574,21 @@ void test_database_batched_read_matches_single(config_t const& config) {
                                        .presences = &single_presences,
                                        .lengths = &single_lengths,
                                        .values = &single_tape,
-                                       .arena = single_arena};
+                                       .arena = single_arena.handle()};
             ustore_blobs_read(&alone);
             if (outcome.status != ustore_status_success_k) {
                 ++mismatches;
                 continue;
             }
-            std::string_view const batched = chars_of(tape_string(tape, index));
-            std::string_view const single = chars_of(tape_string(single_tape, 0));
+            std::string_view const batched = util::chars_of(util::tape_string(tape, index));
+            std::string_view const single = util::chars_of(util::tape_string(single_tape, 0));
             mismatches += batched != single || lengths[index] != single_lengths[0] ||
                           bits_view_t {presences}[index] != bits_view_t {single_presences}[0];
         }
         expect_equal(mismatches, std::size_t {0});
     };
     compare();
-    expect_true(database.on().compact().succeeded());
+    expect_true(!database.compact().failed());
     compare();
 }
 
@@ -586,60 +596,60 @@ void test_database_batched_read_matches_single(config_t const& config) {
  *  reads keep no arena anywhere and own the one-off arena they answer from. */
 case_result_t test_database_arena_reuse(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return {};
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
+    if (!expect_true(!open_status.failed())) return {};
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
 
-    auto [first, first_status] = database.on().create("first");
-    auto [second, second_status] = database.on().create("second");
-    if (!expect_true(first_status.succeeded() && second_status.succeeded())) return {};
+    auto [first, first_status] = database.create("first");
+    auto [second, second_status] = database.create("second");
+    if (!expect_true(!first_status.failed() && !second_status.failed())) return {};
     std::array<ustore_key_t, 2> const keys {key_from_integer(1), key_from_integer(2)};
     std::array<value_view_t, 2> const first_values {"alpha", "beta"};
     std::array<value_view_t, 2> const second_values {"gamma", "a much longer delta"};
-    expect_true(first[keys].assign(first_values).succeeded());
-    expect_true(second[keys].assign(second_values).succeeded());
+    expect_true(!first[keys].assign(first_values).failed());
+    expect_true(!second[keys].assign(second_values).failed());
 
     auto [arena, arena_status] = arena_t::make();
-    if (!expect_true(arena_status.succeeded())) return {};
+    if (!expect_true(!arena_status.failed())) return {};
     for (std::size_t round = 0; round != 2; ++round) {
         auto [from_first, first_read_status] = first.read(keys, arena);
-        expect_true(first_read_status.succeeded());
-        for (std::size_t index = 0; first_read_status.succeeded() && index != keys.size(); ++index)
+        expect_true(!first_read_status.failed());
+        for (std::size_t index = 0; !first_read_status.failed() && index != keys.size(); ++index)
             expect_true(from_first[index] == first_values[index]);
 
         auto [from_second, second_read_status] = second.read(keys, arena);
-        expect_true(second_read_status.succeeded());
-        for (std::size_t index = 0; second_read_status.succeeded() && index != keys.size(); ++index)
+        expect_true(!second_read_status.failed());
+        for (std::size_t index = 0; !second_read_status.failed() && index != keys.size(); ++index)
             expect_true(from_second[index] == second_values[index]);
     }
 
     // The shorthand answers outlive the collection handles that read them, since each owns
     // its own arena
-    expected<owned_value_t> kept = first[keys[0]].value();
-    expected<owned<values_view_t>> kept_batch = second[keys].value();
+    auto [kept, kept_status] = first[keys[0]].value();
+    auto [kept_batch, batch_status] = second[keys].value();
     first = blobs_collection_t {};
     second = blobs_collection_t {};
-    expect_true(kept == first_values[0]);
-    expect_true(kept_batch && kept_batch->size() == 2 && (*kept_batch)[1] == second_values[1]);
-    expect_true(database.on().drop("first").succeeded() && database.on().drop("second").succeeded());
+    expect_true(!kept_status.failed() && kept == first_values[0]);
+    expect_true(!batch_status.failed() && kept_batch.size() == 2 && kept_batch[1] == second_values[1]);
+    expect_true(!database.drop("first").failed() && !database.drop("second").failed());
     return {};
 }
 
 /** A key stream visits every written key in order. */
 void test_database_scan(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return;
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
-    auto [collection, create_status] = database.on().create("blobs");
-    expect_true(create_status.succeeded());
+    if (!expect_true(!open_status.failed())) return;
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
+    auto [collection, create_status] = database.create("blobs");
+    expect_true(!create_status.failed());
 
     constexpr std::size_t keys_count = 1000;
     std::array<ustore_key_t, keys_count> keys;
     for (std::size_t index = 0; index != keys_count; ++index) keys[index] = key_from_integer(index);
     auto reference = collection[keys];
     value_view_t const value("value");
-    expect_true(reference.assign(value).succeeded());
-    auto [stream, stream_status] = keys_stream_t::make(database.receiver(), collection, smallest_key_k, 256);
-    expect_true(stream_status.succeeded());
+    expect_true(!reference.assign(value).failed());
+    auto [stream, stream_status] = keys_stream_t::make(database.receiver(), collection.handle(), smallest_key_k, 256);
+    expect_true(!stream_status.failed());
     std::size_t count = 0;
     while (!stream.is_end()) {
         expect_equal(stream.key(), key_from_integer(count++));
@@ -651,30 +661,30 @@ void test_database_scan(config_t const& config) {
 /** Ordered batched scan over a blobs collection. */
 void test_database_batch_scan(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return;
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
-    auto [collection, create_status] = database.on().create("blobs");
-    expect_true(create_status.succeeded());
+    if (!expect_true(!open_status.failed())) return;
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
+    auto [collection, create_status] = database.create("blobs");
+    expect_true(!create_status.failed());
 
     std::array<ustore_key_t, 512> keys;
     for (std::size_t index = 0; index != keys.size(); ++index) keys[index] = key_from_integer(index);
     auto reference = collection[keys];
     value_view_t const value("value");
-    expect_true(reference.assign(value).succeeded());
-    auto [stream, stream_status] = keys_stream_t::make(database.receiver(), collection, smallest_key_k, 256);
-    expect_true(stream_status.succeeded());
+    expect_true(!reference.assign(value).failed());
+    auto [stream, stream_status] = keys_stream_t::make(database.receiver(), collection.handle(), smallest_key_k, 256);
+    expect_true(!stream_status.failed());
     auto batch = stream.keys_batch();
     expect_equal(batch.size(), 256u);
     expect_true(!stream.is_end());
     for (std::size_t index = 0; index != 256; ++index) expect_equal(batch[index], key_from_integer(index));
 
-    expect_true(stream.seek_to_next_batch().succeeded());
+    expect_true(!stream.seek_to_next_batch().failed());
     batch = stream.keys_batch();
     expect_equal(batch.size(), 256u);
     expect_true(!stream.is_end());
     for (std::size_t index = 0; index != 256; ++index) expect_equal(batch[index], key_from_integer(index + 256));
 
-    expect_true(stream.seek_to_next_batch().succeeded());
+    expect_true(!stream.seek_to_next_batch().failed());
     batch = stream.keys_batch();
     expect_equal(batch.size(), 0u);
     expect_true(stream.is_end());
@@ -687,23 +697,24 @@ void test_database_batch_scan(config_t const& config) {
  */
 case_result_t test_database_transaction_read_committed(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return {};
-    if (!database.on().supports_transactions()) return case_result_t::skipped(needs_transactions_k);
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
-    expect_true(database.on().transaction().has_value());
-    transaction_t transaction = *database.on().transaction();
-    auto [collection, create_status] = database.on().create("blobs");
-    expect_true(create_status.succeeded());
+    if (!expect_true(!open_status.failed())) return {};
+    if (!probed(database.supports_transactions())) return case_result_t::skipped(needs_transactions_k);
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
+    expect_true(!database.transaction().status.failed());
+    auto [transaction, transaction_status] = database.transaction();
+    if (!expect_true(!transaction_status.failed())) return {};
+    auto [collection, create_status] = database.create("blobs");
+    expect_true(!create_status.failed());
 
     triplet_t triplet;
-    auto transaction_reference = blobs_collection_t {transaction.receiver(), collection}[triplet.keys];
+    auto transaction_reference = blobs_collection_t {transaction.receiver(), collection.handle()}[triplet.keys];
     round_trip(transaction_reference, triplet);
 
     auto collection_reference = collection[triplet.keys];
 
     check_length(collection_reference, missing_length_k);
-    expect_true(transaction.on().commit().has_value());
-    expect_true(transaction.on().reset().has_value());
+    expect_true(!transaction.commit().status.failed());
+    expect_true(!transaction.reset().status.failed());
 
     check_equalities(collection_reference, triplet);
     return {};
@@ -716,30 +727,30 @@ case_result_t test_database_transaction_read_committed(config_t const& config) {
  */
 case_result_t test_database_transaction_snapshot_isolation(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return {};
-    if (!database.on().supports_snapshots()) return case_result_t::skipped(needs_snapshots_k);
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
+    if (!expect_true(!open_status.failed())) return {};
+    if (!probed(database.supports_snapshots())) return case_result_t::skipped(needs_snapshots_k);
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
 
     triplet_t triplet;
     triplet_t same_values_triplet;
     same_values_triplet.values = {'D', 'D', 'D'};
 
-    auto [collection, create_status] = database.on().create("blobs");
-    expect_true(create_status.succeeded());
+    auto [collection, create_status] = database.create("blobs");
+    expect_true(!create_status.failed());
     auto collection_reference = collection[triplet.keys];
 
     check_length(collection_reference, missing_length_k);
     round_trip(collection_reference, triplet);
 
-    auto snapshot = *database.on().snapshot();
-    auto snapshot_reference = blobs_read_collection_t {snapshot.receiver(), collection}[triplet.keys];
+    auto [snapshot, snapshot_status] = database.snapshot();
+    if (!expect_true(!snapshot_status.failed())) return {};
+    auto snapshot_reference = blobs_read_collection_t {snapshot.receiver(), collection.handle()}[triplet.keys];
     check_equalities(snapshot_reference, triplet);
     round_trip(collection_reference, same_values_triplet);
 
-    auto maybe_retrieved = snapshot_reference.value();
-    expect_true(maybe_retrieved.has_value());
-    if (!maybe_retrieved) return {};
-    auto const& retrieved = *maybe_retrieved;
+    auto [retrieved, retrieve_status] = snapshot_reference.value();
+    expect_true(!retrieve_status.failed());
+    if (retrieve_status.failed()) return {};
     auto iterator = retrieved.begin();
     for (value_view_t const newer_view : same_values_triplet.views()) {
         value_view_t const retrieved_view = *iterator;
@@ -748,8 +759,10 @@ case_result_t test_database_transaction_snapshot_isolation(config_t const& confi
         ++iterator;
     }
 
-    snapshot = *database.on().snapshot();
-    auto reference = blobs_read_collection_t {snapshot.receiver(), collection}[same_values_triplet.keys];
+    auto [renewed, renewed_status] = database.snapshot();
+    if (!expect_true(!renewed_status.failed())) return {};
+    snapshot = std::move(renewed);
+    auto reference = blobs_read_collection_t {snapshot.receiver(), collection.handle()}[same_values_triplet.keys];
     check_equalities(reference, same_values_triplet);
     return {};
 }
@@ -757,36 +770,40 @@ case_result_t test_database_transaction_snapshot_isolation(config_t const& confi
 /** A transaction reads the head while a snapshot reads its own view. */
 case_result_t test_database_transaction_with_snapshot(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return {};
-    if (!database.on().supports_snapshots()) return case_result_t::skipped(needs_snapshots_k);
-    if (!database.on().supports_transactions()) return case_result_t::skipped(needs_transactions_k);
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
+    if (!expect_true(!open_status.failed())) return {};
+    if (!probed(database.supports_snapshots())) return case_result_t::skipped(needs_snapshots_k);
+    if (!probed(database.supports_transactions())) return case_result_t::skipped(needs_transactions_k);
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
 
     triplet_t triplet;
     triplet_t same_values_triplet;
     same_values_triplet.values = {'D', 'D', 'D'};
 
-    auto [collection, create_status] = database.on().create("blobs");
-    expect_true(create_status.succeeded());
+    auto [collection, create_status] = database.create("blobs");
+    expect_true(!create_status.failed());
     auto collection_reference = collection[triplet.keys];
 
     check_length(collection_reference, missing_length_k);
     round_trip(collection_reference, triplet);
 
-    auto snapshot = *database.on().snapshot();
-    auto snapshot_reference = blobs_read_collection_t {snapshot.receiver(), collection}[triplet.keys];
+    auto [snapshot, snapshot_status] = database.snapshot();
+    if (!expect_true(!snapshot_status.failed())) return {};
+    auto snapshot_reference = blobs_read_collection_t {snapshot.receiver(), collection.handle()}[triplet.keys];
     check_equalities(snapshot_reference, triplet);
 
     round_trip(collection_reference, same_values_triplet);
 
-    transaction_t transaction = *database.on().transaction();
-    auto head_reference = blobs_collection_t {transaction.receiver(), collection}[triplet.keys];
+    auto [transaction, transaction_status] = database.transaction();
+    if (!expect_true(!transaction_status.failed())) return {};
+    auto head_reference = blobs_collection_t {transaction.receiver(), collection.handle()}[triplet.keys];
     check_equalities(head_reference, same_values_triplet);
-    auto older_reference = blobs_read_collection_t {snapshot.receiver(), collection}[triplet.keys];
+    auto older_reference = blobs_read_collection_t {snapshot.receiver(), collection.handle()}[triplet.keys];
     check_equalities(older_reference, triplet);
 
-    snapshot = *database.on().snapshot();
-    auto newer_reference = blobs_read_collection_t {snapshot.receiver(), collection}[triplet.keys];
+    auto [renewed, renewed_status] = database.snapshot();
+    if (!expect_true(!renewed_status.failed())) return {};
+    snapshot = std::move(renewed);
+    auto newer_reference = blobs_read_collection_t {snapshot.receiver(), collection.handle()}[triplet.keys];
     check_equalities(newer_reference, same_values_triplet);
     return {};
 }
@@ -802,42 +819,44 @@ case_result_t test_database_save_snapshot(config_t const& config) {
 
     config_t const original_config {config.options(), original_directory.c_str()};
     auto [database, open_status] = open_database<database_t>(original_config);
-    if (!expect_true(open_status.succeeded())) return {};
-    if (!database.on().supports_snapshots()) return case_result_t::skipped(needs_snapshots_k);
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
+    if (!expect_true(!open_status.failed())) return {};
+    if (!probed(database.supports_snapshots())) return case_result_t::skipped(needs_snapshots_k);
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
 
     triplet_t triplet;
     triplet_t same_values_triplet;
     same_values_triplet.values = {'D', 'D', 'D'};
 
-    auto [collection, create_status] = database.on().create("blobs");
-    expect_true(create_status.succeeded());
+    auto [collection, create_status] = database.create("blobs");
+    expect_true(!create_status.failed());
     auto collection_reference = collection[triplet.keys];
     round_trip(collection_reference, triplet);
 
-    auto first_snapshot = *database.on().snapshot();
-    expect_true(first_snapshot.on().save(save_target(config, first_saved_directory).c_str()).succeeded());
+    auto [first_snapshot, first_snapshot_status] = database.snapshot();
+    if (!expect_true(!first_snapshot_status.failed())) return {};
+    expect_true(!first_snapshot.save(save_target(config, first_saved_directory).c_str()).failed());
     check_equalities(collection_reference, triplet);
 
     config_t const first_config {config.options(), first_saved_directory.c_str()};
     auto [first_saved, first_saved_status] = open_database<database_t>(first_config);
-    if (!expect_true(first_saved_status.succeeded())) return {};
-    auto [first_collection, first_find_status] = first_saved.on().find("blobs");
-    expect_true(first_find_status.succeeded());
+    if (!expect_true(!first_saved_status.failed())) return {};
+    auto [first_collection, first_find_status] = first_saved.find("blobs");
+    expect_true(!first_find_status.failed());
     auto first_reference = first_collection[triplet.keys];
     check_equalities(first_reference, triplet);
 
     round_trip(collection_reference, same_values_triplet);
 
-    auto second_snapshot = *database.on().snapshot();
-    expect_true(second_snapshot.on().save(save_target(config, second_saved_directory).c_str()).succeeded());
+    auto [second_snapshot, second_snapshot_status] = database.snapshot();
+    if (!expect_true(!second_snapshot_status.failed())) return {};
+    expect_true(!second_snapshot.save(save_target(config, second_saved_directory).c_str()).failed());
     check_equalities(collection_reference, same_values_triplet);
 
     config_t const second_config {config.options(), second_saved_directory.c_str()};
     auto [second_saved, second_saved_status] = open_database<database_t>(second_config);
-    if (!expect_true(second_saved_status.succeeded())) return {};
-    auto [second_collection, second_find_status] = second_saved.on().find("blobs");
-    expect_true(second_find_status.succeeded());
+    if (!expect_true(!second_saved_status.failed())) return {};
+    auto [second_collection, second_find_status] = second_saved.find("blobs");
+    expect_true(!second_find_status.failed());
     auto second_reference = second_collection[same_values_triplet.keys];
     check_equalities(second_reference, same_values_triplet);
 
@@ -859,20 +878,20 @@ case_result_t test_database_save_progress(config_t const& config) {
     expect_true(scratch_directory_t::recreate(blocking_directory.c_str()));
     expect_true(scratch_directory_t::recreate(deferred_directory.c_str()));
     auto [database, open_status] = open_database<database_t>(config);
-    auto [executor, executor_status] = executor_handle_t::for_ram({.threads = 2});
-    if (!expect_true(open_status.succeeded() && executor_status.succeeded())) return {};
-    if (!database.on().supports_snapshots()) return case_result_t::skipped(needs_snapshots_k);
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
+    auto [executor, executor_status] = executor_t::for_ram({.threads = 2});
+    if (!expect_true(!open_status.failed() && !executor_status.failed())) return {};
+    if (!probed(database.supports_snapshots())) return case_result_t::skipped(needs_snapshots_k);
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
     triplet_t triplet;
-    auto [collection, create_status] = database.on().create("blobs");
-    expect_true(create_status.succeeded());
+    auto [collection, create_status] = database.create("blobs");
+    expect_true(!create_status.failed());
     auto reference = collection[triplet.keys];
     round_trip(reference, triplet);
 
     // Engines reporting per collection then report before the end, where the order of
     // the counts shows
-    auto [named, named_status] = database.on().create("saved");
-    if (!expect_true(named_status.succeeded())) return {};
+    auto [named, named_status] = database.create("saved");
+    if (!expect_true(!named_status.failed())) return {};
     auto named_reference = named[triplet.keys];
     round_trip(named_reference, triplet);
 
@@ -885,14 +904,15 @@ case_result_t test_database_save_progress(config_t const& config) {
         last_total = total;
         return ustore_continue_k;
     };
-    auto snapshot = *database.on().snapshot();
-    expect_true(snapshot.on().save(save_target(config, blocking_directory).c_str(), recording).succeeded());
+    auto [snapshot, snapshot_status] = database.snapshot();
+    if (!expect_true(!snapshot_status.failed())) return {};
+    expect_true(!snapshot.save(save_target(config, blocking_directory).c_str(), recording).failed());
     expect_true(last_total != 0 && last_finished == last_total);
 
     last_finished = 0;
     last_total = 0;
     std::string const deferred_target = save_target(config, deferred_directory);
-    expect_true(snapshot.deferred(executor).save(deferred_target.c_str(), recording).wait().succeeded());
+    expect_true(!snapshot.deferred(executor).save(deferred_target.c_str(), recording).wait().failed());
     expect_true(last_total != 0 && last_finished == last_total);
     expect_equal(misordered, 0u);
     return {};
@@ -901,21 +921,22 @@ case_result_t test_database_save_progress(config_t const& config) {
 /** One thread reads through a snapshot while another replaces it with a newer one. */
 case_result_t test_database_snapshot_with_threads(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return {};
-    if (!database.on().supports_snapshots()) return case_result_t::skipped(needs_snapshots_k);
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
+    if (!expect_true(!open_status.failed())) return {};
+    if (!probed(database.supports_snapshots())) return case_result_t::skipped(needs_snapshots_k);
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
 
     triplet_t triplet;
     triplet_t same_values_triplet;
     same_values_triplet.values = {'D', 'D', 'D'};
 
-    auto [collection, create_status] = database.on().create("blobs");
-    expect_true(create_status.succeeded());
+    auto [collection, create_status] = database.create("blobs");
+    expect_true(!create_status.failed());
     auto reference = collection[triplet.keys];
     round_trip(reference, triplet);
 
-    auto snapshot = *database.on().snapshot();
-    auto snapshot_reference = blobs_read_collection_t {snapshot.receiver(), collection}[triplet.keys];
+    auto [snapshot, snapshot_status] = database.snapshot();
+    if (!expect_true(!snapshot_status.failed())) return {};
+    auto snapshot_reference = blobs_read_collection_t {snapshot.receiver(), collection.handle()}[triplet.keys];
 
     round_trip(reference, same_values_triplet);
 
@@ -931,7 +952,8 @@ case_result_t test_database_snapshot_with_threads(config_t const& config) {
             while (true) {
                 if (!expect_true(acquire(), "the snapshot lock stayed taken")) break;
                 if (is_reset) {
-                    auto head_reference = blobs_read_collection_t {snapshot.receiver(), collection}[triplet.keys];
+                    auto head_reference = blobs_read_collection_t {snapshot.receiver(),
+                                                                   collection.handle()}[triplet.keys];
                     check_equalities(head_reference, same_values_triplet);
                     fu::standard_atomic_ref<bool> {snapshot_locked}.store(false, std::memory_order_release);
                     break;
@@ -941,61 +963,73 @@ case_result_t test_database_snapshot_with_threads(config_t const& config) {
             }
         }
         else if (expect_true(acquire(), "the snapshot lock stayed taken")) {
-            snapshot = *database.on().snapshot();
+            auto [renewed, renewed_status] = database.snapshot();
+            expect_true(!renewed_status.failed());
+            snapshot = std::move(renewed);
             is_reset = true;
             fu::standard_atomic_ref<bool> {snapshot_locked}.store(false, std::memory_order_release);
         }
     };
 
-    auto maybe_executor = executor_t::make(2, caller_exclusivity_t::caller_inclusive_k);
-    if (!expect_true(maybe_executor.has_value())) return {};
-    expect_true(st::succeeded(maybe_executor->for_threads(task)));
+    auto [executor, executor_status] = util::executor_t::make(2, util::caller_exclusivity_t::caller_inclusive_k);
+    if (!expect_true(!st::failed(executor_status))) return {};
+    expect_true(st::succeeded(executor.for_threads(task)));
     return {};
 }
 
 /** Concurrent transactions erasing missing keys both commit and leave the database empty. */
 case_result_t test_database_transaction_erase_missing(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return {};
-    if (!database.on().supports_transactions()) return case_result_t::skipped(needs_transactions_k);
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
-    expect_true(database.on().transaction().has_value());
-    auto [collection, create_status] = database.on().create("blobs");
-    expect_true(create_status.succeeded());
-    transaction_t first_transaction = *database.on().transaction();
-    transaction_t second_transaction = *database.on().transaction();
-    blobs_collection_t first_inside {first_transaction.receiver(), collection};
-    blobs_collection_t second_inside {second_transaction.receiver(), collection};
+    if (!expect_true(!open_status.failed())) return {};
+    if (!probed(database.supports_transactions())) return case_result_t::skipped(needs_transactions_k);
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
+    expect_true(!database.transaction().status.failed());
+    auto [collection, create_status] = database.create("blobs");
+    expect_true(!create_status.failed());
+    auto [first_transaction, first_transaction_status] = database.transaction();
+    if (!expect_true(!first_transaction_status.failed())) return {};
+    auto [second_transaction, second_transaction_status] = database.transaction();
+    if (!expect_true(!second_transaction_status.failed())) return {};
+    blobs_collection_t first_inside {first_transaction.receiver(), collection.handle()};
+    blobs_collection_t second_inside {second_transaction.receiver(), collection.handle()};
 
-    expect_true(second_inside.at(key_from_integer(7297309151944849401)).remove().succeeded());
-    expect_true(first_inside.at(key_from_integer(8640850744835793378)).remove().succeeded());
-    expect_true(first_transaction.on().commit().has_value());
-    expect_true(second_transaction.on().commit().has_value());
+    expect_true(!second_inside.at(key_from_integer(7297309151944849401)).remove().failed());
+    expect_true(!first_inside.at(key_from_integer(8640850744835793378)).remove().failed());
+    expect_true(!first_transaction.commit().status.failed());
+    expect_true(!second_transaction.commit().status.failed());
 
-    expect_true(collection.at(key_from_integer(8640850744835793378)).value() == value_view_t {});
-    expect_true(collection.at(key_from_integer(7297309151944849401)).value() == value_view_t {});
-    expect_true(collection.keys().size() == 0u);
+    auto [first_value, first_status] = collection.at(key_from_integer(8640850744835793378)).value();
+    auto [second_value, second_status] = collection.at(key_from_integer(7297309151944849401)).value();
+    expect_true(!first_status.failed() && first_value == value_view_t {});
+    expect_true(!second_status.failed() && second_value == value_view_t {});
+    expect_true(answers(collection.keys().size(), 0u));
     return {};
 }
 
 /** Of two transactions writing the same key, the later commit fails. */
 case_result_t test_database_transaction_write_conflicting(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return {};
-    if (!database.on().supports_transactions()) return case_result_t::skipped(needs_transactions_k);
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
-    expect_true(database.on().transaction().has_value());
-    auto [collection, create_status] = database.on().create("blobs");
-    expect_true(create_status.succeeded());
-    transaction_t first_transaction = *database.on().transaction();
-    transaction_t second_transaction = *database.on().transaction();
+    if (!expect_true(!open_status.failed())) return {};
+    if (!probed(database.supports_transactions())) return case_result_t::skipped(needs_transactions_k);
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
+    expect_true(!database.transaction().status.failed());
+    auto [collection, create_status] = database.create("blobs");
+    expect_true(!create_status.failed());
+    auto [first_transaction, first_transaction_status] = database.transaction();
+    if (!expect_true(!first_transaction_status.failed())) return {};
+    auto [second_transaction, second_transaction_status] = database.transaction();
+    if (!expect_true(!second_transaction_status.failed())) return {};
 
-    expect_true(
-        blobs_collection_t {second_transaction.receiver(), collection}.at(key_from_integer(6)).assign("a").succeeded());
-    expect_true(
-        blobs_collection_t {first_transaction.receiver(), collection}.at(key_from_integer(6)).assign("b").succeeded());
-    expect_true(first_transaction.on().commit().has_value());
-    expect_true(second_transaction.on().commit().failed());
+    expect_true(!blobs_collection_t {second_transaction.receiver(), collection.handle()}
+                     .at(key_from_integer(6))
+                     .assign("a")
+                     .failed());
+    expect_true(!blobs_collection_t {first_transaction.receiver(), collection.handle()}
+                     .at(key_from_integer(6))
+                     .assign("b")
+                     .failed());
+    expect_true(!first_transaction.commit().status.failed());
+    expect_true(second_transaction.commit().status.failed());
     return {};
 }
 
@@ -1003,30 +1037,31 @@ case_result_t test_database_transaction_write_conflicting(config_t const& config
  *  snapshot reads at or above that position. */
 case_result_t test_database_transaction_stamps(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return {};
-    if (!database.on().supports_transactions()) return case_result_t::skipped(needs_transactions_k);
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
+    if (!expect_true(!open_status.failed())) return {};
+    if (!probed(database.supports_transactions())) return case_result_t::skipped(needs_transactions_k);
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
 
-    expect_true(database.on().transaction().has_value());
-    transaction_t transaction = *database.on().transaction();
-    auto [collection, create_status] = database.on().create("blobs");
-    expect_true(create_status.succeeded());
+    expect_true(!database.transaction().status.failed());
+    auto [transaction, transaction_status] = database.transaction();
+    if (!expect_true(!transaction_status.failed())) return {};
+    auto [collection, create_status] = database.create("blobs");
+    expect_true(!create_status.failed());
 
     triplet_t triplet;
-    auto transaction_reference = blobs_collection_t {transaction.receiver(), collection}[triplet.keys];
+    auto transaction_reference = blobs_collection_t {transaction.receiver(), collection.handle()}[triplet.keys];
 
-    expect_true(transaction_reference.assign(triplet.u64_layout()).succeeded());
-    auto [read_stamp, stage_status] = transaction.on().stage();
-    expect_true(stage_status.succeeded());
-    auto [commit_stamp, commit_status] = transaction.on().commit();
-    expect_true(commit_status.succeeded());
+    expect_true(!transaction_reference.assign(triplet.u64_layout()).failed());
+    auto [read_stamp, stage_status] = transaction.stage();
+    expect_true(!stage_status.failed());
+    auto [commit_stamp, commit_status] = transaction.commit();
+    expect_true(!commit_status.failed());
     expect_true(static_cast<ustore_stamp_t>(commit_stamp) > 0);
     expect_true(static_cast<ustore_stamp_t>(read_stamp) <= static_cast<ustore_stamp_t>(commit_stamp));
-    expect_true(transaction.on().reset().has_value());
+    expect_true(!transaction.reset().status.failed());
 
-    if (!database.on().supports_snapshots()) return {};
-    auto [snapshot, snapshot_status] = database.on().snapshot();
-    expect_true(snapshot_status.succeeded());
+    if (!probed(database.supports_snapshots())) return {};
+    auto [snapshot, snapshot_status] = database.snapshot();
+    expect_true(!snapshot_status.failed());
     expect_true(static_cast<ustore_stamp_t>(commit_stamp) <= static_cast<ustore_stamp_t>(snapshot.read_stamp()));
     return {};
 }
@@ -1036,37 +1071,37 @@ case_result_t test_database_transaction_stamps(config_t const& config) {
  *  what it pinned. */
 case_result_t test_database_freed_first(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return {};
-    if (!database.on().supports_transactions() && !database.on().supports_snapshots())
+    if (!expect_true(!open_status.failed())) return {};
+    if (!probed(database.supports_transactions()) && !probed(database.supports_snapshots()))
         return case_result_t::skipped("needs transactions and snapshots");
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
     ustore_key_t const key = key_from_integer(91);
-    auto [head, create_status] = database.on().create("blobs");
-    expect_true(create_status.succeeded());
-    expect_true(head[key].assign("before").succeeded());
+    auto [head, create_status] = database.create("blobs");
+    expect_true(!create_status.failed());
+    expect_true(!head[key].assign("before").failed());
 
-    expected<transaction_t> transaction = status_code_t::unsupported_k;
-    expected<snapshot_t> snapshot = status_code_t::unsupported_k;
-    if (database.on().supports_transactions()) {
-        transaction = database.on().transaction();
-        expect_true(transaction.has_value());
-    }
-    if (database.on().supports_snapshots()) {
-        snapshot = database.on().snapshot();
-        expect_true(snapshot.has_value());
-    }
+    bool const transacts = probed(database.supports_transactions());
+    bool const snapshots = probed(database.supports_snapshots());
+    auto [transaction, transaction_status] = transacts ? database.transaction()
+                                                       : expected<transaction_t> {{}, status_code_t::unsupported_k};
+    auto [snapshot, snapshot_status] = snapshots ? database.snapshot()
+                                                 : expected<snapshot_t> {{}, status_code_t::unsupported_k};
+    expect_true(!transacts || !transaction_status.failed());
+    expect_true(!snapshots || !snapshot_status.failed());
     { database_t const freed = std::move(database); }
 
-    if (transaction) {
-        blobs_collection_t inside {transaction->receiver(), head};
-        expect_true(inside[key].assign("after").succeeded());
-        expect_true(transaction->on().commit().has_value());
-        expect_true(transaction->on().reset().has_value());
-        expect_true(inside[key].value() == "after");
+    if (!transaction_status.failed()) {
+        blobs_collection_t inside {transaction.receiver(), head.handle()};
+        expect_true(!inside[key].assign("after").failed());
+        expect_true(!transaction.commit().status.failed());
+        expect_true(!transaction.reset().status.failed());
+        auto [after, after_status] = inside[key].value();
+        expect_true(!after_status.failed() && after == "after");
     }
-    if (snapshot) {
-        blobs_read_collection_t pinned {snapshot->receiver(), head};
-        expect_true(pinned[key].value() == "before");
+    if (!snapshot_status.failed()) {
+        blobs_read_collection_t pinned {snapshot.receiver(), head.handle()};
+        auto [before, before_status] = pinned[key].value();
+        expect_true(!before_status.failed() && before == "before");
     }
     return {};
 }
@@ -1079,13 +1114,13 @@ case_result_t test_database_freed_first(config_t const& config) {
 void write_range_keys(compared_collections_t& compared) {
     std::array<ustore_key_t, 20> const keys = keys_of_integers<20>(0);
     for (std::size_t side = 0; side != 2; ++side)
-        write_text(compared.databases[side], compared.collections[side], keys, "value");
+        write_text(compared.databases[side].handle(), compared.collections[side], keys, "value");
 }
 
 /** A scan stops before its end key and lists nothing when the end is not past the start. */
 void test_blobs_range_end_bound(config_t const& config) {
     auto [compared, compared_status] = open_compared(config, ustore_modality_blobs_k);
-    if (!expect_true(compared_status.succeeded())) return;
+    if (!expect_true(!compared_status.failed())) return;
     write_range_keys(compared);
     ustore_key_t const start = key_from_integer(5), end = key_from_integer(9), early = key_from_integer(3);
     expect_same_scan(ustore_blobs_scan, compared, {&start, &end, ustore_scan_ascending_k, 10}, keys_of_integers<4>(5));
@@ -1098,7 +1133,7 @@ void test_blobs_range_end_bound(config_t const& config) {
 /** A descending scan lists its range largest first from the start key down to past the end key. */
 void test_blobs_range_descending(config_t const& config) {
     auto [compared, compared_status] = open_compared(config, ustore_modality_blobs_k);
-    if (!expect_true(compared_status.succeeded())) return;
+    if (!expect_true(!compared_status.failed())) return;
     write_range_keys(compared);
     ustore_key_t const start = key_from_integer(14), end = key_from_integer(4), late = key_from_integer(17);
     expect_same_scan(ustore_blobs_scan, compared, {&start, &end, ustore_scan_descending_k, 20},
@@ -1113,7 +1148,7 @@ void test_blobs_range_descending(config_t const& config) {
 /** A range removal removes the keys from each start up to its end, atomically with other ranges. */
 void test_blobs_range_remove(config_t const& config) {
     auto [compared, compared_status] = open_compared(config, ustore_modality_blobs_k);
-    if (!expect_true(compared_status.succeeded())) return;
+    if (!expect_true(!compared_status.failed())) return;
     write_range_keys(compared);
     std::array<ustore_key_t, 2> const starts {key_from_integer(3), key_from_integer(12)};
     std::array<ustore_key_t, 2> const ends {key_from_integer(7), key_from_integer(14)};
@@ -1128,7 +1163,7 @@ void test_blobs_range_remove(config_t const& config) {
 /** A measure counts the keys of its range with the end excluded, in either direction. */
 void test_blobs_range_measure(config_t const& config) {
     auto [compared, compared_status] = open_compared(config, ustore_modality_blobs_k);
-    if (!expect_true(compared_status.succeeded())) return;
+    if (!expect_true(!compared_status.failed())) return;
     write_range_keys(compared);
     ustore_key_t const lower = key_from_integer(5), upper = key_from_integer(9);
     expect_measure_holds(ustore_blobs_measure, compared, {&lower, &upper, ustore_scan_ascending_k}, 4);
@@ -1140,7 +1175,7 @@ void test_blobs_range_measure(config_t const& config) {
 /** A read with offsets and limits answers each value's byte range, clipped, and its length. */
 void test_blobs_byte_range_read(config_t const& config) {
     auto [compared, compared_status] = open_compared(config, ustore_modality_blobs_k);
-    if (!expect_true(compared_status.succeeded())) return;
+    if (!expect_true(!compared_status.failed())) return;
     write_range_keys(compared);
     std::array<ustore_key_t, 5> const keys {key_from_integer(1), key_from_integer(2), key_from_integer(3),
                                             key_from_integer(4), key_from_integer(40)};
@@ -1151,8 +1186,8 @@ void test_blobs_byte_range_read(config_t const& config) {
         read_columns_t columns;
         ustore_length_t const* lengths = nullptr;
         ustore_outcome_t outcome {};
-        ustore_blobs_read_t read = read_of(compared.databases[side], compared.collections[side], keys, columns,
-                                           compared.arenas[side], outcome);
+        ustore_blobs_read_t read = read_of(compared.databases[side].handle(), compared.collections[side], keys, columns,
+                                           compared.arenas[side].handle(), outcome);
         read.offsets = {offsets.data(), sizeof(ustore_length_t)};
         read.limits = {limits.data(), sizeof(ustore_length_t)};
         read.lengths = &lengths;
@@ -1192,29 +1227,30 @@ void resize_values(resizing_writer_t& writer) noexcept {
  *  one stamp, so all of one result come from one commit. */
 void test_blobs_read_one_stamp_under_resizes(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    st::expected<executor_t> writing_thread = executor_t::make(1, caller_exclusivity_t::caller_exclusive_k);
+    auto [writing_thread, thread_status] = util::executor_t::make(1, util::caller_exclusivity_t::caller_exclusive_k);
     auto [arena, arena_status] = arena_t::make();
-    if (!expect_true(open_status.succeeded() && writing_thread.has_value() && arena_status.succeeded())) return;
-    auto [collection, collection_status] = create_collection(database, "one_stamp.blobs", ustore_modality_blobs_k);
-    if (!expect_true(collection_status.succeeded())) return;
+    if (!expect_true(!open_status.failed() && !st::failed(thread_status) && !arena_status.failed())) return;
+    auto [collection, collection_status] = create_collection(database.handle(), "one_stamp.blobs",
+                                                             ustore_modality_blobs_k);
+    if (!expect_true(!collection_status.failed())) return;
     std::array<ustore_key_t, 64> const keys = keys_of_integers<64>(0);
-    write_text(database, collection, keys, "seed");
+    write_text(database.handle(), collection, keys, "seed");
 
-    resizing_writer_t writer {.database = database, .collection = collection, .keys = keys};
-    st::expected<fu_generation_t> const generation = writing_thread->start<&resize_values>(writer);
-    expect_true(generation.has_value());
+    resizing_writer_t writer {.database = database.handle(), .collection = collection, .keys = keys};
+    auto const [generation, start_status] = writing_thread.start<&resize_values>(writer);
+    expect_true(!st::failed(start_status));
     std::size_t mixed = 0;
-    for (std::size_t round = 0; generation && round != 2000; ++round) {
+    for (std::size_t round = 0; !st::failed(start_status) && round != 2000; ++round) {
         read_columns_t columns;
         ustore_outcome_t outcome {};
-        ustore_blobs_read_t read = read_of(database, collection, keys, columns, arena, outcome);
+        ustore_blobs_read_t read = read_of(database.handle(), collection, keys, columns, arena.handle(), outcome);
         ustore_blobs_read(&read);
         if (!expect_success(outcome)) break;
         std::string_view const first = columns.value(0);
         for (std::size_t index = 1; index != keys.size(); ++index) mixed += columns.value(index) != first;
     }
     fu::standard_atomic_ref<std::uint32_t> {writer.stopped}.store(1, std::memory_order_release);
-    if (generation) writing_thread->join(*generation);
+    if (!st::failed(start_status)) writing_thread.join(generation);
     expect_equal(mixed, 0u);
 }
 
@@ -1261,33 +1297,33 @@ void swap_halves(swapping_writer_t& writer) noexcept {
  *  halves of the keys in each commit, lists and reads at one stamp, so it keeps one half. */
 case_result_t test_blobs_filtered_scan_one_stamp_under_swaps(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    st::expected<executor_t> writing_thread = executor_t::make(1, caller_exclusivity_t::caller_exclusive_k);
+    auto [writing_thread, thread_status] = util::executor_t::make(1, util::caller_exclusivity_t::caller_exclusive_k);
     auto [arena, arena_status] = arena_t::make();
-    if (!expect_true(open_status.succeeded() && writing_thread.has_value() && arena_status.succeeded())) return {};
-    if (!database.on().supports_transactions()) return case_result_t::skipped(needs_transactions_k);
-    auto [collection, collection_status] = create_collection(database, "swaps.blobs", ustore_modality_blobs_k);
-    if (!expect_true(collection_status.succeeded())) return {};
+    if (!expect_true(!open_status.failed() && !st::failed(thread_status) && !arena_status.failed())) return {};
+    if (!probed(database.supports_transactions())) return case_result_t::skipped(needs_transactions_k);
+    auto [collection, collection_status] = create_collection(database.handle(), "swaps.blobs", ustore_modality_blobs_k);
+    if (!expect_true(!collection_status.failed())) return {};
     std::array<ustore_key_t, 64> const keys = keys_of_integers<64>(0);
     std::span<ustore_key_t const> const lower {keys.data(), 32}, upper {keys.data() + 32, 32};
-    write_text(database, collection, lower, "apple");
+    write_text(database.handle(), collection, lower, "apple");
 
     std::string_view const pattern = "apple";
     std::array<std::uint32_t, 2> const pattern_offsets {0, static_cast<std::uint32_t>(pattern.size())};
-    swapping_writer_t writer {.database = database, .collection = collection, .lower = lower, .upper = upper};
-    st::expected<fu_generation_t> const generation = writing_thread->start<&swap_halves>(writer);
-    expect_true(generation.has_value());
+    swapping_writer_t writer {.database = database.handle(), .collection = collection, .lower = lower, .upper = upper};
+    auto const [generation, start_status] = writing_thread.start<&swap_halves>(writer);
+    expect_true(!st::failed(start_status));
     std::size_t torn = 0;
-    for (std::size_t round = 0; generation && round != 2000; ++round) {
+    for (std::size_t round = 0; !st::failed(start_status) && round != 2000; ++round) {
         ustore_outcome_t outcome {};
         ustore_length_t const* offsets = nullptr;
         ustore_key_t const* found = nullptr;
         ustore_blobs_scan_t scan {};
-        scan.database = database, scan.outcome = &outcome, scan.count = 1, scan.collections = {&collection, 0};
-        scan.patterns = {.patterns = u32_tape(pattern.data(), pattern_offsets.data()),
+        scan.database = database.handle(), scan.outcome = &outcome, scan.count = 1, scan.collections = {&collection, 0};
+        scan.patterns = {.patterns = util::u32_tape(pattern.data(), pattern_offsets.data()),
                          .count = 1,
                          .kind = ustore_pattern_substrings_k,
                          .sensitivity = ustore_cased_k};
-        scan.offsets = &offsets, scan.keys = &found, scan.arena = arena, scan.wanted = keys.size();
+        scan.offsets = &offsets, scan.keys = &found, scan.arena = arena.handle(), scan.wanted = keys.size();
         ustore_blobs_scan(&scan);
         expect_success(outcome);
         if (outcome.status != ustore_status_success_k || !offsets) break;
@@ -1297,7 +1333,7 @@ case_result_t test_blobs_filtered_scan_one_stamp_under_swaps(config_t const& con
         torn += !one_half;
     }
     fu::standard_atomic_ref<std::uint32_t> {writer.stopped}.store(1, std::memory_order_release);
-    if (generation) writing_thread->join(*generation);
+    if (!st::failed(start_status)) writing_thread.join(generation);
     expect_equal(torn, 0u);
     return {};
 }
@@ -1305,7 +1341,7 @@ case_result_t test_blobs_filtered_scan_one_stamp_under_swaps(config_t const& con
 /** A descending cursor with an end key pages its range largest first and stops past the end key. */
 void test_blobs_cursor_descending_end(config_t const& config) {
     auto [compared, compared_status] = open_compared(config, ustore_modality_blobs_k);
-    if (!expect_true(compared_status.succeeded())) return;
+    if (!expect_true(!compared_status.failed())) return;
     write_range_keys(compared);
     ustore_key_t const end = key_from_integer(8);
     std::array<ustore_key_t, 9> const pinned = keys_of_integers<9>(9, ustore_scan_descending_k);
@@ -1314,7 +1350,7 @@ void test_blobs_cursor_descending_end(config_t const& config) {
         ustore_outcome_t outcome {};
         ustore_blobs_cursor_init_t init {};
         init.cursor = &cursor;
-        init.database = compared.databases[side];
+        init.database = compared.databases[side].handle();
         init.outcome = &outcome;
         init.collection = compared.collections[side];
         init.start_key = key_from_integer(17);
@@ -1325,8 +1361,8 @@ void test_blobs_cursor_descending_end(config_t const& config) {
         std::size_t first = 0;
         for (std::size_t const count : {4, 4, 1, 0}) {
             pulled_keys_t pulled;
-            ustore_blobs_cursor_next_t next = pull_of(compared.databases[side], cursor, pulled, compared.arenas[side],
-                                                      4, outcome);
+            ustore_blobs_cursor_next_t next = pull_of(compared.databases[side].handle(), cursor, pulled,
+                                                      compared.arenas[side].handle(), 4, outcome);
             ustore_blobs_cursor_next(&next);
             expect_success(outcome);
             expect_page(pulled, std::span {pinned}.subspan(first, count), "value");
@@ -1341,12 +1377,12 @@ void test_blobs_cursor_descending_end(config_t const& config) {
 int main(int argc, char** argv) {
     start_test_run(argc, argv);
 
-    auto const maybe_directory = scratch_directory_t::make(test_run.settings.directory);
-    if (!maybe_directory) {
+    auto [scratch, scratch_status] = scratch_directory_t::make(test_run.settings.directory);
+    if (st::failed(scratch_status)) {
         fmt::println(stderr, "Cannot create a unique directory under {}", test_run.settings.directory);
         return 1;
     }
-    char const* const directory = maybe_directory->path();
+    char const* const directory = scratch.path();
     config_t const config {test_run.settings.engine, directory};
 
     run_test_case("test_strided_iterator_postfix_steps", test_strided_iterator_postfix_steps);

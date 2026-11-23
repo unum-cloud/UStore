@@ -30,7 +30,6 @@ using namespace unum::ustore;
 using namespace unum::ustore::test;
 using namespace unum::ustore::test::pages;
 using namespace unum::ustore::test::abi;
-using namespace unum::ustore::utilities;
 using namespace unum;
 
 #pragma region Pages Modality
@@ -72,8 +71,8 @@ struct pages_client_t {
     arena_t arena;
 
     /** Replaces the page keyed @p page with @p markup. */
-    status_t import(element_key_t const& page, std::string_view markup,
-                    ustore_page_encoding_t encoding = ustore_page_encoding_xml_k) {
+    ustore::status_t import(element_key_t const& page, std::string_view markup,
+                            ustore_page_encoding_t encoding = ustore_page_encoding_xml_k) {
         ustore_key_t const key = page_key_of(page);
         strided_strings<std::string_view> const values {{&markup, 0}};
         ustore_outcome_t outcome {};
@@ -82,13 +81,14 @@ struct pages_client_t {
         import.count = 1, import.collections = {&collection, 0}, import.keys = {&key, 0};
         import.values = values.view(), import.encoding = encoding;
         ustore_pages_import(&import);
-        return status_t {outcome};
+        return status_of<ustore::status_t, ustore::status_code_t>(outcome);
     }
 
     /** Applies @p tasks of @p verb to the page keyed @p page in one call, the effective keys of an
      *  insertion landing in @p effective. */
-    status_t edit(modification_t verb, element_key_t const& page, std::vector<page_task_t> const& tasks,
-                  std::vector<element_key_t>* effective = nullptr, key_source_t key_source = key_source_t::given_k) {
+    ustore::status_t edit(modification_t verb, element_key_t const& page, std::vector<page_task_t> const& tasks,
+                          std::vector<element_key_t>* effective = nullptr,
+                          key_source_t key_source = key_source_t::given_k) {
         ustore_key_t const key = page_key_of(page);
         std::vector<ustore_key_t> elements, parents, anchors;
         std::vector<ustore_length_t> starts, lengths;
@@ -116,7 +116,7 @@ struct pages_client_t {
             insert.elements = key_source == key_source_t::minted_k ? ustore_keys_view_t {} : elements_view;
             insert.parents = parents_view, insert.anchors = anchors_view;
             insert.values = values_strings.view(), insert.encoding = ustore_page_encoding_xml_k;
-            insert.effective_keys = &landed, insert.arena = arena;
+            insert.effective_keys = &landed, insert.arena = arena.handle();
             ustore_pages_insert(&insert);
             if (effective && outcome.status == ustore_status_success_k)
                 for (std::size_t index = 0; index != tasks.size(); ++index)
@@ -161,9 +161,9 @@ struct pages_client_t {
             ustore_pages_remove_attributes(&remove);
             break;
         }
-        default: return {status_code_t::invalid_argument_k, "Imports go through their own call"};
+        default: return {ustore::status_code_t::invalid_argument_k, "Imports go through their own call"};
         }
-        return status_t {outcome};
+        return status_of<ustore::status_t, ustore::status_code_t>(outcome);
     }
 
     /** The rendering of @p element of the page keyed @p page, the whole page for
@@ -178,11 +178,12 @@ struct pages_client_t {
         ustore_pages_read_t read {};
         read.database = database, read.outcome = &outcome, read.view = view;
         read.count = 1, read.collections = {&collection, 0}, read.keys = {&key, 0}, read.elements = {&wanted, 0};
-        read.presences = &presences, read.values = &values, read.arena = arena, read.outputs_encoding = encoding;
+        read.presences = &presences, read.values = &values, read.arena = arena.handle(),
+        read.outputs_encoding = encoding;
         ustore_pages_read(&read);
         if (outcome.status != ustore_status_success_k) return ustore_status_name(outcome.status);
         if (!(presences[0] & 1)) return std::string(page_absent_k);
-        return std::string(chars_of(tape_string(values, 0)));
+        return std::string(util::chars_of(util::tape_string(values, 0)));
     }
 };
 
@@ -197,15 +198,16 @@ bool serves_pages(ustore_database_t database) {
 }
 
 /** Creates a collection named @p name holding pages. */
-expected<ustore_collection_id_t> create_pages_collection(ustore_database_t database, std::string_view name) {
+ustore::expected<ustore_collection_id_t> create_pages_collection(ustore_database_t database, std::string_view name) {
     ustore_collection_id_t created {};
     ustore_outcome_t outcome {};
     ustore_collection_create_t create {};
-    create.database = database, create.outcome = &outcome, create.name = bytes_of(name);
+    create.database = database, create.outcome = &outcome, create.name = ustore::bytes_of(name);
     create.modality = ustore_modality_pages_k, create.collection = &created;
     ustore_collection_create(&create);
-    if (status_t const status {outcome}; status.failed()) return status;
-    return created;
+    if (ustore::status_t const status = status_of<ustore::status_t, ustore::status_code_t>(outcome); status.failed())
+        return {{}, status};
+    return {std::move(created)};
 }
 
 /** What a random text is for: an element's content, or a comment body, which may hold no double
@@ -333,19 +335,20 @@ class page_stream_t {
  *  as it was. */
 case_result_t test_database_pages_random_streams(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return {};
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
-    if (!serves_pages(database)) return case_result_t::skipped(needs_pages_k);
-    bool const snapshots = database.on().supports_snapshots();
+    if (!expect_true(!open_status.failed())) return {};
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
+    if (!serves_pages(database.handle())) return case_result_t::skipped(needs_pages_k);
+    bool const snapshots = probed(database.supports_snapshots());
 
     split_mix_generator_t random {case_stream_key()};
     for (std::uint64_t stream_index = 0; stream_index != 8; ++stream_index) {
-        pages_client_t client {database};
+        pages_client_t client {database.handle()};
         auto [arena, arena_status] = arena_t::make();
-        if (!expect_true(arena_status.succeeded())) return {};
+        if (!expect_true(!arena_status.failed())) return {};
         client.arena = std::move(arena);
-        auto [created, create_status] = create_pages_collection(database, fmt::format("pages-{}", stream_index));
-        if (!expect_true(create_status.succeeded())) return {};
+        auto [created, create_status] = create_pages_collection(database.handle(),
+                                                                fmt::format("pages-{}", stream_index));
+        if (!expect_true(!create_status.failed())) return {};
         client.collection = created;
 
         page_stream_t stream(random, stream_index);
@@ -356,7 +359,7 @@ case_result_t test_database_pages_random_streams(config_t const& config) {
             if (snapshots && call == 60) {
                 ustore_outcome_t outcome {};
                 ustore_snapshot_init_t init {};
-                init.snapshot = &snapshot, init.database = database, init.outcome = &outcome;
+                init.snapshot = &snapshot, init.database = database.handle(), init.outcome = &outcome;
                 ustore_snapshot_init(&init);
                 agrees = expect_success(outcome) && agrees;
                 snapshot_rendering = client.read(stream.page);
@@ -367,7 +370,7 @@ case_result_t test_database_pages_random_streams(config_t const& config) {
             std::vector<page_task_t> tasks;
             modification_t verb = modification_t::import_k;
             std::size_t const count = random.below(3) + 1;
-            status_t status;
+            ustore::status_t status;
             key_source_t key_source = key_source_t::given_k;
             std::vector<element_key_t> effective;
 
@@ -466,7 +469,7 @@ case_result_t test_database_pages_random_streams(config_t const& config) {
                 status = client.edit(verb, stream.page, tasks, &effective, key_source);
             }
 
-            if (!expect_status(status, status_code_t::success_k)) {
+            if (!expect_status(status, ustore::status_code_t::success_k)) {
                 agrees = false;
                 break;
             }
@@ -491,7 +494,7 @@ case_result_t test_database_pages_random_streams(config_t const& config) {
         // Editing a removed page answers that it is missing
         if (!stream.model.exists && agrees)
             agrees = expect_status(client.edit(modification_t::splice_k, stream.page, {{}}),
-                                   status_code_t::not_found_k);
+                                   ustore::status_code_t::not_found_k);
 
         // A snapshot keeps reading the page as it was when it was taken
         if (snapshot) {
@@ -514,50 +517,50 @@ case_result_t test_database_pages_random_streams(config_t const& config) {
  *  or lands beside the first, where the engine keeps a page as its edits. */
 case_result_t test_database_pages_transactions(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return {};
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
-    if (!serves_pages(database)) return case_result_t::skipped(needs_pages_k);
-    if (!database.on().supports_transactions()) return case_result_t::skipped(needs_transactions_k);
+    if (!expect_true(!open_status.failed())) return {};
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
+    if (!serves_pages(database.handle())) return case_result_t::skipped(needs_pages_k);
+    if (!probed(database.supports_transactions())) return case_result_t::skipped(needs_transactions_k);
 
-    auto [pages, pages_status] = create_pages_collection(database, "pages");
-    pages_client_t head {database, pages};
+    auto [pages, pages_status] = create_pages_collection(database.handle(), "pages");
+    pages_client_t head {database.handle(), pages};
     auto [arena, arena_status] = arena_t::make();
-    if (!expect_true(pages_status.succeeded() && arena_status.succeeded())) return {};
+    if (!expect_true(!pages_status.failed() && !arena_status.failed())) return {};
     head.arena = std::move(arena);
     element_key_t const page = element_key_of(key_from_integer(7));
-    expect_true(head.import(page, "<doc><p>one</p></doc>").succeeded());
+    expect_true(!head.import(page, "<doc><p>one</p></doc>").failed());
 
-    auto [first, first_status] = database.on().transaction();
-    auto [second, second_status] = database.on().transaction();
-    if (!expect_true(first_status.succeeded() && second_status.succeeded())) return {};
-    pages_client_t first_client {database, pages, first.transaction()};
-    pages_client_t second_client {database, pages, second.transaction()};
+    auto [first, first_status] = database.transaction();
+    auto [second, second_status] = database.transaction();
+    if (!expect_true(!first_status.failed() && !second_status.failed())) return {};
+    pages_client_t first_client {database.handle(), pages, first.handle()};
+    pages_client_t second_client {database.handle(), pages, second.handle()};
     auto [first_arena, first_arena_status] = arena_t::make();
     auto [second_arena, second_arena_status] = arena_t::make();
-    if (!expect_true(first_arena_status.succeeded() && second_arena_status.succeeded())) return {};
+    if (!expect_true(!first_arena_status.failed() && !second_arena_status.failed())) return {};
     first_client.arena = std::move(first_arena), second_client.arena = std::move(second_arena);
 
     page_task_t inserted;
     inserted.value = "<p>two</p>";
     std::vector<element_key_t> effective;
     expect_true(
-        first_client.edit(modification_t::insert_k, page, {inserted}, &effective, key_source_t::minted_k).succeeded());
+        !first_client.edit(modification_t::insert_k, page, {inserted}, &effective, key_source_t::minted_k).failed());
     expect_equal(effective.size(), 1u);
     expect_true(!effective.empty() && !effective[0].is_nil());
     page_task_t spliced;
     spliced.element = page, spliced.value = "lead";
-    expect_true(second_client.edit(modification_t::splice_k, page, {spliced}).succeeded());
+    expect_true(!second_client.edit(modification_t::splice_k, page, {spliced}).failed());
 
     expect_equal(head.read(page), std::string("<doc><p>one</p></doc>"));
     expect_equal(first_client.read(page, {}, ustore_page_encoding_xml_k,
-                                   ustore_transaction_view(first.transaction(), ustore_watch_none_k)),
+                                   ustore_transaction_view(first.handle(), ustore_watch_none_k)),
                  std::string("<p>two</p><doc><p>one</p></doc>"));
-    expect_true(first.on().commit().has_value());
+    expect_true(!first.commit().status.failed());
     expect_equal(head.read(page), std::string("<p>two</p><doc><p>one</p></doc>"));
 
     // A page rewritten whole conflicts, while a page kept as its edits lands both, folded
     // in commit order
-    bool const both_landed = second.on().commit().has_value();
+    bool const both_landed = !second.commit().status.failed();
     expect_equal(head.read(page),
                  std::string(both_landed ? "lead<p>two</p><doc><p>one</p></doc>" : "<p>two</p><doc><p>one</p></doc>"));
     return {};
@@ -567,31 +570,31 @@ case_result_t test_database_pages_transactions(config_t const& config) {
  *  page stays removed rather than coming back with the edit. */
 case_result_t test_database_pages_edit_after_removal(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return {};
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
-    if (!serves_pages(database)) return case_result_t::skipped(needs_pages_k);
-    if (!database.on().supports_transactions()) return case_result_t::skipped(needs_transactions_k);
+    if (!expect_true(!open_status.failed())) return {};
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
+    if (!serves_pages(database.handle())) return case_result_t::skipped(needs_pages_k);
+    if (!probed(database.supports_transactions())) return case_result_t::skipped(needs_transactions_k);
 
-    auto [pages, pages_status] = create_pages_collection(database, "pages");
-    pages_client_t head {database, pages};
+    auto [pages, pages_status] = create_pages_collection(database.handle(), "pages");
+    pages_client_t head {database.handle(), pages};
     auto [arena, arena_status] = arena_t::make();
-    if (!expect_true(pages_status.succeeded() && arena_status.succeeded())) return {};
+    if (!expect_true(!pages_status.failed() && !arena_status.failed())) return {};
     head.arena = std::move(arena);
     element_key_t const page = element_key_of(key_from_integer(9));
-    expect_true(head.import(page, "<doc><p>one</p></doc>").succeeded());
+    expect_true(!head.import(page, "<doc><p>one</p></doc>").failed());
 
-    auto [editing, editing_status] = database.on().transaction();
+    auto [editing, editing_status] = database.transaction();
     auto [editing_arena, editing_arena_status] = arena_t::make();
-    if (!expect_true(editing_status.succeeded() && editing_arena_status.succeeded())) return {};
-    pages_client_t editing_client {database, pages, editing.transaction()};
+    if (!expect_true(!editing_status.failed() && !editing_arena_status.failed())) return {};
+    pages_client_t editing_client {database.handle(), pages, editing.handle()};
     editing_client.arena = std::move(editing_arena);
     page_task_t spliced;
     spliced.element = page, spliced.value = "lead";
-    expect_true(editing_client.edit(modification_t::splice_k, page, {spliced}).succeeded());
+    expect_true(!editing_client.edit(modification_t::splice_k, page, {spliced}).failed());
 
-    expect_true(head.edit(modification_t::remove_k, page, {{}}).succeeded());
+    expect_true(!head.edit(modification_t::remove_k, page, {{}}).failed());
     expect_equal(head.read(page), std::string(page_absent_k));
-    expect_status(editing.on().commit(), status_code_t::write_conflict_k);
+    expect_status(editing.commit(), ustore::status_code_t::write_conflict_k);
     expect_equal(head.read(page), std::string(page_absent_k));
     return {};
 }
@@ -600,41 +603,41 @@ case_result_t test_database_pages_edit_after_removal(config_t const& config) {
  *  shape, which a removal of the page takes away. */
 case_result_t test_database_pages_all_or_nothing(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return {};
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
-    if (!serves_pages(database)) return case_result_t::skipped(needs_pages_k);
+    if (!expect_true(!open_status.failed())) return {};
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
+    if (!serves_pages(database.handle())) return case_result_t::skipped(needs_pages_k);
 
-    auto [pages, pages_status] = create_pages_collection(database, "pages");
-    pages_client_t client {database, pages};
+    auto [pages, pages_status] = create_pages_collection(database.handle(), "pages");
+    pages_client_t client {database.handle(), pages};
     auto [arena, arena_status] = arena_t::make();
-    if (!expect_true(pages_status.succeeded() && arena_status.succeeded())) return {};
+    if (!expect_true(!pages_status.failed() && !arena_status.failed())) return {};
     client.arena = std::move(arena);
     auto stored_keys = [&] {
         std::vector<ustore_key_t> keys;
         auto [stream, stream_status] = keys_stream_t::make(database.receiver(), pages, smallest_key_k, 256,
                                                            ustore_modality_pages_k);
-        expect_true(stream_status.succeeded());
-        for (; stream_status.succeeded() && !stream.is_end(); ++stream) keys.push_back(stream.key());
+        expect_true(!stream_status.failed());
+        for (; !stream_status.failed() && !stream.is_end(); ++stream) keys.push_back(stream.key());
         return keys;
     };
     element_key_t const page = element_key_of(key_from_integer(8));
-    expect_true(client.import(page, "<a>x</a>").succeeded());
+    expect_true(!client.import(page, "<a>x</a>").failed());
     std::vector<page_task_t> tasks(3);
     tasks[0].value = "<b/>", tasks[1].value = "<c>", tasks[2].value = "<d/>";
     expect_status(client.edit(modification_t::insert_k, page, tasks, nullptr, key_source_t::minted_k),
-                  status_code_t::malformed_k);
+                  ustore::status_code_t::malformed_k);
     expect_equal(client.read(page), std::string("<a>x</a>"));
     expect_true(stored_keys() == std::vector<ustore_key_t> {key_from_integer(8)});
 
     // Removing the page by a Nil element empties it until the next import, and the page key empties
     // only its root
-    expect_true(client.edit(modification_t::remove_k, page, {{}}).succeeded());
+    expect_true(!client.edit(modification_t::remove_k, page, {{}}).failed());
     expect_equal(client.read(page), std::string(page_absent_k));
     expect_true(stored_keys().empty());
-    expect_true(client.import(page, "<a>x</a><b/>").succeeded());
+    expect_true(!client.import(page, "<a>x</a><b/>").failed());
     page_task_t root;
     root.element = page;
-    expect_true(client.edit(modification_t::remove_k, page, {root}).succeeded());
+    expect_true(!client.edit(modification_t::remove_k, page, {root}).failed());
     expect_equal(client.read(page), std::string(""));
     expect_true(stored_keys() == std::vector<ustore_key_t> {key_from_integer(8)});
     return {};
@@ -650,11 +653,11 @@ case_result_t test_database_pages_all_or_nothing(config_t const& config) {
 case_result_t test_pages_refusals(config_t const& config) {
     auto [owner, open_status] = open_database<database_t>(config);
     auto [arena, arena_status] = arena_t::make();
-    if (!expect_true(open_status.succeeded() && arena_status.succeeded())) return {};
-    expect_true(owner.on().clear(ustore_drop_collection_k).succeeded());
-    ustore_database_t const database = owner;
+    if (!expect_true(!open_status.failed() && !arena_status.failed())) return {};
+    expect_true(!owner.clear(ustore_drop_collection_k).failed());
+    ustore_database_t const database = owner.handle();
     auto [pages, pages_status] = create_collection(database, "pages", ustore_modality_pages_k);
-    if (!expect_true(pages_status.succeeded())) return {};
+    if (!expect_true(!pages_status.failed())) return {};
 
     ustore_key_t const page = key_from_integer(901);
     ustore_key_t const missing = key_from_integer(902);
@@ -669,21 +672,21 @@ case_result_t test_pages_refusals(config_t const& config) {
         import.keys = {key, 0}, import.values = values.view();
         std::memcpy(reinterpret_cast<std::byte*>(&import.encoding), &encoding, sizeof(encoding));
         ustore_pages_import(&import);
-        return status_t {outcome};
+        return status_of<ustore::status_t, ustore::status_code_t>(outcome);
     };
     // A probe through an encoding every engine serving pages takes tells apart an
     // engine serving none
-    if (import("<a/>", ustore_page_encoding_xml_k, &page).code == status_code_t::unsupported_k)
+    if (import("<a/>", ustore_page_encoding_xml_k, &page).code == ustore::status_code_t::unsupported_k)
         return case_result_t::skipped(needs_pages_k);
 
-    expect_status(import("<a/>", ustore_page_encoding_html_k, &page), status_code_t::unsupported_k);
-    expect_status(import("# a", ustore_page_encoding_markdown_k, &page), status_code_t::unsupported_k);
-    expect_status(import("{}", ustore_page_encoding_json_k, &page), status_code_t::unsupported_k);
-    expect_status(import("<a/>", 42, &page), status_code_t::invalid_argument_k);
-    expect_status(import("<a/>", ustore_page_encoding_xml_k, nullptr), status_code_t::invalid_argument_k);
+    expect_status(import("<a/>", ustore_page_encoding_html_k, &page), ustore::status_code_t::unsupported_k);
+    expect_status(import("# a", ustore_page_encoding_markdown_k, &page), ustore::status_code_t::unsupported_k);
+    expect_status(import("{}", ustore_page_encoding_json_k, &page), ustore::status_code_t::unsupported_k);
+    expect_status(import("<a/>", 42, &page), ustore::status_code_t::invalid_argument_k);
+    expect_status(import("<a/>", ustore_page_encoding_xml_k, nullptr), ustore::status_code_t::invalid_argument_k);
     for (std::string_view malformed : {"<a>", "<a>&nbsp;</a>", "<a b=\"<\"/>", "<a>&#0;</a>", "a & b"})
-        expect_status(import(malformed, ustore_page_encoding_xml_k, &page), status_code_t::malformed_k);
-    expect_status(import("a & b", ustore_page_encoding_text_k, &page), status_code_t::success_k);
+        expect_status(import(malformed, ustore_page_encoding_xml_k, &page), ustore::status_code_t::malformed_k);
+    expect_status(import("a & b", ustore_page_encoding_text_k, &page), ustore::status_code_t::success_k);
 
     // An insertion refused anywhere leaves its effective keys unwritten
     std::string_view const fragment = "<b/>";
@@ -694,14 +697,14 @@ case_result_t test_pages_refusals(config_t const& config) {
     insert.database = database, insert.outcome = &outcome, insert.count = 1, insert.collections = {&pages, 0};
     insert.keys = {&missing, 0};
     insert.values = fragments.view(), insert.encoding = ustore_page_encoding_xml_k;
-    insert.effective_keys = &effective, insert.arena = arena;
+    insert.effective_keys = &effective, insert.arena = arena.handle();
     ustore_pages_insert(&insert);
-    expect_status(outcome, status_code_t::not_found_k);
+    expect_status(outcome, ustore::status_code_t::not_found_k);
     expect_true(effective == nullptr);
     insert.keys = {&page, 0};
     insert.values = {};
     ustore_pages_insert(&insert);
-    expect_status(outcome, status_code_t::invalid_argument_k);
+    expect_status(outcome, ustore::status_code_t::invalid_argument_k);
     insert.values = fragments.view();
     ustore_pages_insert(&insert);
     expect_success(outcome);
@@ -711,7 +714,7 @@ case_result_t test_pages_refusals(config_t const& config) {
     remove.database = database, remove.outcome = &outcome, remove.count = 1, remove.collections = {&pages, 0};
     remove.keys = {&page, 0};
     ustore_pages_remove(&remove);
-    expect_status(outcome, status_code_t::invalid_argument_k);
+    expect_status(outcome, ustore::status_code_t::invalid_argument_k);
 
     ustore_key_t const element = page;
     ustore_pages_splice_t splice {};
@@ -719,16 +722,16 @@ case_result_t test_pages_refusals(config_t const& config) {
     splice.keys = {&missing, 0};
     splice.elements = {&element, 0};
     ustore_pages_splice(&splice);
-    expect_status(outcome, status_code_t::not_found_k);
+    expect_status(outcome, ustore::status_code_t::not_found_k);
 
     ustore_octet_t const* presences = nullptr;
     ustore_strings_view_t values {};
     ustore_pages_read_t read {};
     read.database = database, read.outcome = &outcome, read.count = 1, read.collections = {&pages, 0};
-    read.keys = {&page, 0}, read.presences = &presences, read.values = &values, read.arena = arena;
+    read.keys = {&page, 0}, read.presences = &presences, read.values = &values, read.arena = arena.handle();
     read.outputs_encoding = ustore_page_encoding_html_k;
     ustore_pages_read(&read);
-    expect_status(outcome, status_code_t::unsupported_k);
+    expect_status(outcome, ustore::status_code_t::unsupported_k);
     expect_true(presences == nullptr && !tape_written(values));
     read.values = nullptr;
     ustore_pages_read(&read);
@@ -743,30 +746,30 @@ case_result_t test_pages_refusals(config_t const& config) {
 
 /** Imports a one-element page under each key of the integers [0, 20) into both collections of
  *  @p compared, answering whether the engine under test serves pages at all. */
-expected<bool> import_range_pages(compared_collections_t& compared) {
+ustore::expected<bool> import_range_pages(compared_collections_t& compared) {
     std::array<ustore_key_t, 20> const keys = keys_of_integers<20>(0);
     std::string_view const markup = "<a/>";
     strided_strings<std::string_view> const values {{&markup, 0}};
     for (std::size_t side = 0; side != 2; ++side) {
         ustore_outcome_t outcome {};
         ustore_pages_import_t import {};
-        import.database = compared.databases[side], import.outcome = &outcome, import.count = keys.size();
+        import.database = compared.databases[side].handle(), import.outcome = &outcome, import.count = keys.size();
         import.collections = {&compared.collections[side], 0}, import.keys = {keys.data(), sizeof(ustore_key_t)};
         import.values = values.view(), import.encoding = ustore_page_encoding_xml_k;
         ustore_pages_import(&import);
-        status_t const imported {outcome};
-        if (side == 0 && imported.code == status_code_t::unsupported_k) return false;
-        if (imported.failed()) return imported;
+        ustore::status_t const imported = status_of<ustore::status_t, ustore::status_code_t>(outcome);
+        if (side == 0 && imported.code == ustore::status_code_t::unsupported_k) return {false};
+        if (imported.failed()) return {{}, imported};
     }
-    return true;
+    return {true};
 }
 
 /** A pages scan stops before its end key. */
 case_result_t test_pages_range_end_bound(config_t const& config) {
     auto [compared, compared_status] = open_compared(config, ustore_modality_pages_k);
-    if (!expect_true(compared_status.succeeded())) return {};
+    if (!expect_true(!compared_status.failed())) return {};
     auto [served, import_status] = import_range_pages(compared);
-    if (!expect_true(import_status.succeeded())) return {};
+    if (!expect_true(!import_status.failed())) return {};
     if (!served) return case_result_t::skipped(needs_pages_k);
     ustore_key_t const start = key_from_integer(5), end = key_from_integer(9);
     expect_same_scan(ustore_pages_scan, compared, {&start, &end, ustore_scan_ascending_k, 10}, keys_of_integers<4>(5));
@@ -776,9 +779,9 @@ case_result_t test_pages_range_end_bound(config_t const& config) {
 /** A descending pages scan lists its range largest first. */
 case_result_t test_pages_range_descending(config_t const& config) {
     auto [compared, compared_status] = open_compared(config, ustore_modality_pages_k);
-    if (!expect_true(compared_status.succeeded())) return {};
+    if (!expect_true(!compared_status.failed())) return {};
     auto [served, import_status] = import_range_pages(compared);
-    if (!expect_true(import_status.succeeded())) return {};
+    if (!expect_true(!import_status.failed())) return {};
     if (!served) return case_result_t::skipped(needs_pages_k);
     ustore_key_t const start = key_from_integer(14), end = key_from_integer(4);
     expect_same_scan(ustore_pages_scan, compared, {&start, &end, ustore_scan_descending_k, 3},
@@ -789,19 +792,19 @@ case_result_t test_pages_range_descending(config_t const& config) {
 /** A range removal removes whole pages from the start key up to the end key, refusing elements. */
 case_result_t test_pages_range_remove(config_t const& config) {
     auto [compared, compared_status] = open_compared(config, ustore_modality_pages_k);
-    if (!expect_true(compared_status.succeeded())) return {};
+    if (!expect_true(!compared_status.failed())) return {};
     auto [served, import_status] = import_range_pages(compared);
-    if (!expect_true(import_status.succeeded())) return {};
+    if (!expect_true(!import_status.failed())) return {};
     if (!served) return case_result_t::skipped(needs_pages_k);
     ustore_key_t const start = key_from_integer(2), end = key_from_integer(18);
     for (std::size_t side = 0; side != 2; ++side) {
         ustore_outcome_t outcome {};
         ustore_pages_remove_t remove {};
-        remove.database = compared.databases[side], remove.outcome = &outcome, remove.count = 1;
+        remove.database = compared.databases[side].handle(), remove.outcome = &outcome, remove.count = 1;
         remove.collections = {&compared.collections[side], 0}, remove.keys = {&start, 0};
         remove.end_keys = {&end, 0}, remove.elements = {&start, 0};
         ustore_pages_remove(&remove);
-        expect_status(status_t {outcome}, status_code_t::invalid_argument_k);
+        expect_status(outcome, ustore::status_code_t::invalid_argument_k);
     }
     remove_ranges(ustore_pages_remove, compared, {&start, 1}, {&end, 1});
     std::array<ustore_key_t, 4> const remaining {key_from_integer(0), key_from_integer(1), key_from_integer(18),
@@ -813,9 +816,9 @@ case_result_t test_pages_range_remove(config_t const& config) {
 /** A pages measure counts the pages of its range with the end excluded. */
 case_result_t test_pages_range_measure(config_t const& config) {
     auto [compared, compared_status] = open_compared(config, ustore_modality_pages_k);
-    if (!expect_true(compared_status.succeeded())) return {};
+    if (!expect_true(!compared_status.failed())) return {};
     auto [served, import_status] = import_range_pages(compared);
-    if (!expect_true(import_status.succeeded())) return {};
+    if (!expect_true(!import_status.failed())) return {};
     if (!served) return case_result_t::skipped(needs_pages_k);
     ustore_key_t const lower = key_from_integer(5), upper = key_from_integer(9);
     expect_measure_holds(ustore_pages_measure, compared, {&lower, &upper, ustore_scan_ascending_k}, 4);
@@ -826,9 +829,9 @@ case_result_t test_pages_range_measure(config_t const& config) {
 /** A pages sample draws distinct written pages, as many as asked or all when fewer exist. */
 case_result_t test_pages_sample(config_t const& config) {
     auto [compared, compared_status] = open_compared(config, ustore_modality_pages_k);
-    if (!expect_true(compared_status.succeeded())) return {};
+    if (!expect_true(!compared_status.failed())) return {};
     auto [served, import_status] = import_range_pages(compared);
-    if (!expect_true(import_status.succeeded())) return {};
+    if (!expect_true(!import_status.failed())) return {};
     if (!served) return case_result_t::skipped(needs_pages_k);
     std::array<ustore_key_t, 20> const written = keys_of_integers<20>(0);
     expect_samples_of(ustore_pages_sample, compared, written, 5, 5);
@@ -841,12 +844,12 @@ case_result_t test_pages_sample(config_t const& config) {
 int main(int argc, char** argv) {
     start_test_run(argc, argv);
 
-    auto const maybe_directory = scratch_directory_t::make(test_run.settings.directory);
-    if (!maybe_directory) {
+    auto [directory, directory_status] = scratch_directory_t::make(test_run.settings.directory);
+    if (st::failed(directory_status)) {
         fmt::println(stderr, "Cannot create a unique directory under {}", test_run.settings.directory);
         return 1;
     }
-    config_t const config {test_run.settings.engine, maybe_directory->path()};
+    config_t const config {test_run.settings.engine, directory.path()};
 
     run_test_case(engine_label_t {"test_database_pages_random_streams"}.c_str(), test_database_pages_random_streams,
                   config);

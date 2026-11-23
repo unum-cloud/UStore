@@ -119,7 +119,7 @@ inline status_t modify(json_t& original, yyjson_mut_val* modifier, std::string_v
         }
         if (!modified && modification == modification_t::patch_k)
             return {status_code_t::invalid_argument_k, "The patch does not apply to the document"};
-        if (!modified) return {status_code_t::out_of_memory_k, "Failed to modify the document"};
+        if (!modified) return {status_code_t::out_of_memory_k, "No room to edit the document"};
         yyjson_mut_doc_set_root(document, modified);
         return {};
     }
@@ -153,7 +153,7 @@ inline status_t modify(json_t& original, yyjson_mut_val* modifier, std::string_v
         break;
     default: succeeded = yyjson_mut_doc_ptr_setn(document, pointer.data(), pointer.size(), replacement); break;
     }
-    if (!succeeded) return {status_code_t::not_found_k, "The field path does not resolve inside the document"};
+    if (!succeeded) return {status_code_t::not_found_k, "The field path misses the document"};
     return {};
 }
 

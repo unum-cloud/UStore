@@ -68,7 +68,7 @@ class countdown {
 
     /** Arms the counter for @p parts reports, forgetting whatever the last round recorded. */
     void reset(std::size_t parts = 1) noexcept {
-        message_ = nullptr;
+        note_ = nullptr;
         code_reference_().store(0, std::memory_order_relaxed);
         remaining_reference_().store(static_cast<std::int32_t>(parts), std::memory_order_release);
     }
@@ -108,7 +108,7 @@ class countdown {
     status_t release_status() noexcept {
         int const code = code_reference_().exchange(0, std::memory_order_acquire);
         if (code == 0) return {};
-        return {static_cast<status_code_t>(code), std::exchange(message_, nullptr)};
+        return {static_cast<status_code_t>(code), std::exchange(note_, nullptr)};
     }
 
   private:
@@ -121,8 +121,8 @@ class countdown {
     /** The @c ustore_status_t of the first failure, or zero while none has been reported. */
     int code_ = 0;
 
-    /** The static message of the first failure, stored before the code that publishes it. */
-    char const* message_ = nullptr;
+    /** The static note of the first failure, written before the release that ends the wait. */
+    char const* note_ = nullptr;
 
     atomic_reference_<std::int32_t> remaining_reference_() noexcept {
         return atomic_reference_<std::int32_t> {remaining_};
@@ -172,11 +172,11 @@ class notifier {
      */
     void fail(status_t status) const noexcept {
         if (status.succeeded()) return;
-        countdown_.message_ = status.message;
         int expected = 0;
         if (!countdown_.code_reference_().compare_exchange_strong(expected, static_cast<int>(status.code),
                                                                   std::memory_order_release, std::memory_order_relaxed))
             return;
+        countdown_.note_ = status.note;
         countdown_.remaining_reference_().store(0, std::memory_order_release);
     }
 
@@ -955,7 +955,7 @@ expected<std::size_t> poll_completions_at_least(disk_type_& disk, queue_pair_t c
                                                 std::span<completion_t> into, std::size_t wanted,
                                                 std::size_t spins_limit = poll_spin_limit_k) noexcept {
     if (wanted > into.size())
-        return status_t {status_code_t::invalid_argument_k, "A bounded wait needs room for what it wants"};
+        return status_t {status_code_t::invalid_argument_k, "A bounded wait needs room for its request"};
     std::size_t completed = 0;
     for (std::size_t spins = 0; completed < wanted && spins != spins_limit; ++spins) {
         auto [moved, poll_completions_status] = disk.poll_completions(queue_pair, into.subspan(completed));

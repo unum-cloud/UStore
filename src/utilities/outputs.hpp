@@ -19,9 +19,8 @@
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/ranges.hpp" // `bits_span_t`, `bytes_of`
-#include "ustore/status.hpp" // `expected`, `status_t`
-#include "ustore/types.hpp"  // `value_view_t`, `chars_of`, `round_up_to_multiple`
+#include "ustore/utilities/ranges.hpp" // `bits_span_t`, `bytes_of`
+#include "ustore/utilities/types.hpp"  // `expected`, `status_t`, `value_view_t`, `chars_of`, `round_up_to_multiple`
 
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `growing_strings`, `export_strings`
 

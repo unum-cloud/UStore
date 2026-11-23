@@ -19,8 +19,8 @@
 
 #include <span> // `std::span`
 
-#include "ustore/pages.h"    // `ustore_pages_import_t`, `ustore_pages_read_t`
-#include "ustore/ranges.hpp" // `place_batch_t`, `values_view_t`, `strided_iterator`
+#include "ustore/pages.h"              // `ustore_pages_import_t`, `ustore_pages_read_t`
+#include "ustore/utilities/ranges.hpp" // `place_batch_t`, `values_view_t`, `strided_iterator`
 
 #include "ustore/pages/ram_store.hpp" // `page_pair_t`
 
@@ -34,8 +34,8 @@ namespace unum::ustore::ram {
 /** Reads the trees of the pages at @p places through @p source watching as @p view asks, appending
  *  them to its scratch, and recording into @p failure the failure of the stores. */
 template <typename source_type_>
-expected<values_view_t> read_page_trees(source_type_& source, place_batch_t const& places, view_t const& view,
-                                        store_status_t& failure) noexcept {
+expected<util::values_view_t> read_page_trees(source_type_& source, util::place_batch_t const& places,
+                                              view_t const& view, store_status_t& failure) noexcept {
     return read_into_scratch<pages::page_pair_t>(source, places, view, failure);
 }
 
@@ -51,7 +51,7 @@ struct pages_in_store {
     store_status_t& failure;
 
     /** Reads the trees of the pages at @p places through @p view. */
-    expected<values_view_t> read(place_batch_t const& places, view_t const& view) const noexcept {
+    expected<util::values_view_t> read(util::place_batch_t const& places, view_t const& view) const noexcept {
         return read_page_trees(source, places, view, failure);
     }
 
@@ -59,10 +59,10 @@ struct pages_in_store {
     template <typename arguments_type_>
     status_t operator()(arguments_type_ const&, std::span<touched_page_t> pages, view_t const& view) const noexcept {
         page_allocator_t allocator {view.scratch};
-        strided_iterator<touched_page_t const> const touched {pages.data(), sizeof(touched_page_t)};
+        util::strided_iterator<touched_page_t const> const touched {pages.data(), sizeof(touched_page_t)};
         status_t outcome;
         store_status_t const staged = stage_runs_of<pages::page_pair_t>(
-            source, touched.members(&touched_page_t::place).members(&collection_key_t::collection), pages.size(),
+            source, touched.members(&touched_page_t::place).members(&util::collection_key_t::collection), pages.size(),
             outcome, [&](auto& part, std::size_t first, std::size_t end) noexcept -> store_status_t {
                 for (std::size_t index = first; index != end; ++index) {
                     touched_page_t& page = pages[index];
@@ -176,8 +176,9 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_pages_read_
                view_t const& view) noexcept {
     return with_source(state, view, [&]<typename source_type_>(source_type_& source) noexcept -> status_t {
         store_status_t failure = store_status_t::success_k;
-        return read_pages<typename ram_variant<cpu_class_, isolation_>::strings_kit_t>(
-            arguments, view, [&]() noexcept { return read_page_trees(source, places_of(arguments), view, failure); });
+        return read_pages<typename ram_variant<cpu_class_, isolation_>::strings_kit_t>(arguments, view, [&]() noexcept {
+            return read_page_trees(source, util::places_of(arguments), view, failure);
+        });
     });
 }
 

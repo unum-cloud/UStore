@@ -456,13 +456,15 @@ class metal_executor_t {
         executor.queue_ = borrowed;
         if (!borrowed) {
             executor.owned_queue_ = metal_send(api, handle, "newCommandQueue");
-            if (!executor.owned_queue_) return status_t {status_code_t::device_k, "Failed to create a queue"};
+            if (!executor.owned_queue_) return status_t {status_code_t::device_k, "The device gave no command queue"};
             executor.queue_ = executor.owned_queue_;
         }
         executor.bounce_.memory = host_blocks_t {.newest = nullptr, .memory_domain = 0};
         return executor;
     }
 
+    /** Holds nothing, as a moved-from executor does. */
+    metal_executor_t() noexcept = default;
     metal_executor_t(metal_executor_t&& other) noexcept { swap(other); }
     metal_executor_t& operator=(metal_executor_t&& other) noexcept {
         swap(other);
@@ -481,8 +483,7 @@ class metal_executor_t {
     /** Waits until everything committed to the queue ran, reporting a failure among it
      *  as @c device_k. */
     status_t wait() noexcept {
-        if (!metal_synchronize(queue_))
-            return {status_code_t::device_k, "The device failed a call queued on the executor"};
+        if (!metal_synchronize(queue_)) return {status_code_t::device_k, "A device call on the executor failed"};
         return {};
     }
 
@@ -567,8 +568,6 @@ class metal_executor_t {
     managed_blocks_t& managed() noexcept { return managed_; }
 
   private:
-    metal_executor_t() noexcept = default;
-
     void swap(metal_executor_t& other) noexcept {
         std::swap(api_, other.api_), std::swap(owned_queue_, other.owned_queue_), std::swap(queue_, other.queue_);
         std::swap(device_, other.device_), std::swap(scratch_limit_, other.scratch_limit_);

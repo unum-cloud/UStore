@@ -59,7 +59,7 @@ using wide_path_t = std::unique_ptr<wchar_t[]>;
 /** Converts the null-terminated UTF-8 @p path into a wide one, refusing one that will not fit. */
 inline expected<wide_path_t> widen_path(char const* path) noexcept {
     wide_path_t wide {new (std::nothrow) wchar_t[path_capacity_k]};
-    if (!wide) return status_t {status_code_t::out_of_memory_k, "Failed to allocate the wide path"};
+    if (!wide) return status_t {status_code_t::out_of_memory_k, "No room for the wide path"};
     if (!::MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide.get(), static_cast<int>(path_capacity_k)))
         return status_t {status_code_t::invalid_argument_k, "The path is not valid UTF-8"};
     return wide;
@@ -76,7 +76,7 @@ inline status_t join_path(char const* directory, char const* name, std::span<cha
     std::size_t const directory_bytes = std::strlen(directory);
     std::size_t const name_bytes = std::strlen(name);
     if (directory_bytes + name_bytes + 2 > into.size())
-        return {status_code_t::invalid_argument_k, "A path of the database outgrew the platform's limit"};
+        return {status_code_t::invalid_argument_k, "A database path outgrew the platform limit"};
 
     std::memcpy(into.data(), directory, directory_bytes);
     std::size_t written = directory_bytes;
@@ -110,10 +110,10 @@ inline status_t absolute_path_of(std::string_view path, std::span<char> into, st
     }
 #if USTORE_OS_WINDOWS_
     DWORD const written = ::GetCurrentDirectoryA(static_cast<DWORD>(into.size()), into.data());
-    if (written == 0 || written >= into.size()) return {status_code_t::io_k, "Failed to read the working directory"};
+    if (written == 0 || written >= into.size()) return {status_code_t::io_k, "The working directory is unreadable"};
     std::size_t prefix = written;
 #else
-    if (!::getcwd(into.data(), into.size())) return {status_code_t::io_k, "Failed to read the working directory"};
+    if (!::getcwd(into.data(), into.size())) return {status_code_t::io_k, "The working directory is unreadable"};
     std::size_t prefix = std::strlen(into.data());
 #endif
     if (prefix + 1 + path.size() + 1 > into.size())
@@ -488,7 +488,7 @@ inline expected<std::uint64_t> write_native_file(native_file_t file, std::uint64
 inline status_t truncate_native_file(native_file_t file, std::uint64_t bytes) noexcept {
     struct stat description {};
     if (::fstat(file, &description) == 0 && S_ISBLK(description.st_mode))
-        return {status_code_t::invalid_argument_k, "A block device keeps the capacity of its medium"};
+        return {status_code_t::invalid_argument_k, "A block device keeps its medium capacity"};
     if (::ftruncate(file, static_cast<off_t>(bytes)) != 0)
         return native_file_failure(errno, "The file would not resize");
     return {};
@@ -524,11 +524,10 @@ class seekable_file_t {
 
     /** Opens the existing null-terminated @p path for reading. */
     static expected<seekable_file_t> open(char const* path) noexcept {
-        expected<native_file_t> const file = open_native_file(path, file_access_t::read_only_k,
-                                                              file_buffering_t::buffered_k);
-        if (!file) return file.status();
+        auto const [file, status] = open_native_file(path, file_access_t::read_only_k, file_buffering_t::buffered_k);
+        if (status.failed()) return status;
         seekable_file_t opened;
-        opened.file_ = *file;
+        opened.file_ = file;
         return opened;
     }
 
@@ -624,10 +623,10 @@ inline expected<mapped_file_t> mapped_file_t::map(char const* path) noexcept {
     if (length == 0) return mapped;
     // A view keeps its mapping alive, and the mapping its file, so both handles close on return
     HANDLE const mapping = ::CreateFileMappingW(file.file_, nullptr, PAGE_READONLY, 0, 0, nullptr);
-    if (!mapping) return status_t {status_code_t::io_k, "Failed to map the file"};
+    if (!mapping) return status_t {status_code_t::io_k, "The file does not map into memory"};
     void const* const begin = ::MapViewOfFile(mapping, FILE_MAP_READ, 0, 0, 0);
     [[maybe_unused]] BOOL const closed = ::CloseHandle(mapping);
-    if (!begin) return status_t {status_code_t::io_k, "Failed to map the file"};
+    if (!begin) return status_t {status_code_t::io_k, "The file does not map into memory"};
     mapped.data_ = static_cast<char const*>(begin);
     mapped.size_ = length;
     return mapped;
@@ -649,7 +648,7 @@ inline expected<mapped_file_t> mapped_file_t::map(char const* path) noexcept {
     if (*length == 0) return mapped;
     // A mapping outlives the descriptor it came from, which closes on return
     void* const begin = ::mmap(nullptr, *length, PROT_READ, MAP_PRIVATE, file->file_, 0);
-    if (begin == MAP_FAILED) return status_t {status_code_t::io_k, "Failed to map the file"};
+    if (begin == MAP_FAILED) return status_t {status_code_t::io_k, "The file does not map into memory"};
     [[maybe_unused]] int const advised = ::madvise(begin, *length, MADV_SEQUENTIAL);
     mapped.data_ = static_cast<char const*>(begin);
     mapped.size_ = *length;
@@ -672,25 +671,25 @@ inline expected<bool> directory_exists(char const* path) noexcept {
     if (attributes != INVALID_FILE_ATTRIBUTES) return (attributes & FILE_ATTRIBUTE_DIRECTORY) != 0;
     DWORD const failure = ::GetLastError();
     if (failure == ERROR_FILE_NOT_FOUND || failure == ERROR_PATH_NOT_FOUND) return false;
-    return status_t {status_code_t::io_k, "Failed to inspect the path"};
+    return status_t {status_code_t::io_k, "The path would not report its kind"};
 }
 
 /** Creates @p path alone, treating a directory that is already there as success. */
 inline status_t create_directory(char const* path) noexcept {
     if (CreateDirectoryA(path, nullptr) != 0 || GetLastError() == ERROR_ALREADY_EXISTS) return {};
-    return {status_code_t::io_k, "A directory of the database would not be created"};
+    return {status_code_t::io_k, "The directory would not be created"};
 }
 
 /** Removes the file @p path, treating one that is already gone as success. */
 inline status_t remove_file(char const* path) noexcept {
     if (DeleteFileA(path) != 0 || GetLastError() == ERROR_FILE_NOT_FOUND) return {};
-    return {status_code_t::io_k, "A file of the database would not be removed"};
+    return {status_code_t::io_k, "The file would not be removed"};
 }
 
 /** Removes the empty directory @p path, treating one that is already gone as success. */
 inline status_t remove_directory(char const* path) noexcept {
     if (RemoveDirectoryA(path) != 0 || GetLastError() == ERROR_FILE_NOT_FOUND) return {};
-    return {status_code_t::io_k, "A directory of the database would not be removed"};
+    return {status_code_t::io_k, "The directory would not be removed"};
 }
 
 /** Moves @p source over @p target in one step, replacing a target that exists, and returns once
@@ -726,25 +725,25 @@ inline expected<bool> directory_exists(char const* path) noexcept {
     struct stat information;
     if (::stat(path, &information) == 0) return S_ISDIR(information.st_mode) != 0;
     if (errno == ENOENT || errno == ENOTDIR) return false;
-    return status_t {status_code_t::io_k, "Failed to inspect the path"};
+    return status_t {status_code_t::io_k, "The path would not report its kind"};
 }
 
 /** Creates @p path alone, treating a directory that is already there as success. */
 inline status_t create_directory(char const* path) noexcept {
     if (::mkdir(path, 0755) == 0 || errno == EEXIST) return {};
-    return {status_code_t::io_k, "A directory of the database would not be created"};
+    return {status_code_t::io_k, "The directory would not be created"};
 }
 
 /** Removes the file @p path, treating one that is already gone as success. */
 inline status_t remove_file(char const* path) noexcept {
     if (::unlink(path) == 0 || errno == ENOENT) return {};
-    return {status_code_t::io_k, "A file of the database would not be removed"};
+    return {status_code_t::io_k, "The file would not be removed"};
 }
 
 /** Removes the empty directory @p path, treating one that is already gone as success. */
 inline status_t remove_directory(char const* path) noexcept {
     if (::rmdir(path) == 0 || errno == ENOENT) return {};
-    return {status_code_t::io_k, "A directory of the database would not be removed"};
+    return {status_code_t::io_k, "The directory would not be removed"};
 }
 
 /** Moves @p source over @p target in one step, replacing a target that exists; the move is
@@ -776,7 +775,7 @@ inline status_t create_directories(char const* path) noexcept {
     char components[path_max_bytes_k];
     std::size_t const length = std::strlen(path);
     if (length == 0 || length >= sizeof(components))
-        return {status_code_t::invalid_argument_k, "A directory path is one byte to the platform's limit"};
+        return {status_code_t::invalid_argument_k, "The directory path is empty or too long"};
     std::memcpy(components, path, length + 1);
 
     for (std::size_t index = 1; index != length; ++index) {
@@ -975,7 +974,7 @@ status_t list_directory(char const* path, visitor_type_&& visitor) noexcept {
 inline expected<std::uint64_t> free_bytes_of(char const* directory) noexcept {
     ULARGE_INTEGER available {};
     if (!::GetDiskFreeSpaceExA(directory, &available, nullptr, nullptr))
-        return status_t {status_code_t::io_k, "A data directory would not report its free space"};
+        return status_t {status_code_t::io_k, "The data directory reported no free space"};
     return static_cast<std::uint64_t>(available.QuadPart);
 }
 
@@ -995,7 +994,7 @@ status_t list_directory(char const* path, visitor_type_&& visitor) noexcept {
 inline expected<std::uint64_t> free_bytes_of(char const* directory) noexcept {
     struct statvfs information;
     if (::statvfs(directory, &information) != 0)
-        return status_t {status_code_t::io_k, "A data directory would not report its free space"};
+        return status_t {status_code_t::io_k, "The data directory reported no free space"};
     return static_cast<std::uint64_t>(information.f_bavail) * information.f_frsize;
 }
 

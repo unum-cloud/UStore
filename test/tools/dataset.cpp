@@ -35,7 +35,8 @@
 #include <stringzilla/stringzilla.hpp>
 
 #include "ustore/db.h"
-#include "ustore/ranges.hpp" // `strided_strings`, `u64_tape`
+#include "ustore/utilities/ranges.hpp" // `strided_strings`, `strided`
+#include "ustore/utilities/types.hpp"  // `u64_tape`
 #include "ustore/strings.h"
 
 #if !USTORE_OS_WINDOWS_
@@ -54,7 +55,6 @@
 namespace unum::ustore::test {
 
 using namespace unum::ustore::tools;
-using namespace unum::ustore::utilities;
 
 /** The reason every case driving the CLI reports when the suite ran without the @c CLI setting. */
 constexpr char const* needs_cli_k = "needs USTORE_CLI";
@@ -245,7 +245,7 @@ class test_database_t {
     /** Opens the database @p config describes and answers whether it opened. */
     [[nodiscard]] bool open(config_t const& config) noexcept {
         auto [opened, open_status] = open_raw(config);
-        if (!expect_status(open_status, status_code_t::success_k)) return false;
+        if (!expect_status(open_status, util::status_code_t::success_k)) return false;
         database_ = opened;
         return true;
     }
@@ -349,7 +349,7 @@ struct json_document_t {
     find.database = database;
     find.outcome = &outcome;
     find.count = 1;
-    find.names = u64_tape(text.data(), offsets);
+    find.names = util::u64_tape(text.data(), offsets);
     find.presences = &presences;
     find.collections = &ids;
     find.arena = arena;
@@ -514,11 +514,11 @@ void test_graph_round_trip(config_t const& config, char const* input, char const
     importing.database = database.get();
     importing.outcome = &outcome;
     importing.collection = graph;
-    importing.path = bytes_of(input);
+    importing.path = util::bytes_of(input);
     importing.max_batch_size = max_batch_size_k;
-    importing.source_id_field = bytes_of(source_field_k);
-    importing.target_id_field = bytes_of(target_field_k);
-    importing.edge_id_field = bytes_of(edge_field_k);
+    importing.source_id_field = util::bytes_of(source_field_k);
+    importing.target_id_field = util::bytes_of(target_field_k);
+    importing.edge_id_field = util::bytes_of(edge_field_k);
     ustore_graph_import(&importing);
     expect_success(outcome);
 
@@ -526,11 +526,11 @@ void test_graph_round_trip(config_t const& config, char const* input, char const
     exporting.database = database.get();
     exporting.outcome = &outcome;
     exporting.collection = graph;
-    exporting.path = bytes_of(output);
+    exporting.path = util::bytes_of(output);
     exporting.max_batch_size = max_batch_size_k;
-    exporting.source_id_field = bytes_of(source_field_k);
-    exporting.target_id_field = bytes_of(target_field_k);
-    exporting.edge_id_field = bytes_of(edge_field_k);
+    exporting.source_id_field = util::bytes_of(source_field_k);
+    exporting.target_id_field = util::bytes_of(target_field_k);
+    exporting.edge_id_field = util::bytes_of(edge_field_k);
     ustore_graph_export(&exporting);
     expect_success(outcome);
 
@@ -552,7 +552,7 @@ void test_documents_round_trip(config_t const& config, char const* input, char c
                                                          ? std::span<std::string_view const>(selected_columns_k)
                                                          : std::span<std::string_view const>(selected_paths_k);
     bool const selects = selection == field_selection_t::selected_k;
-    strided_strings<std::string_view> const names {strided(fields).begin()};
+    util::strided_strings<std::string_view> const names {util::strided(fields).begin()};
 
     ustore_outcome_t outcome {};
     ustore_collection_id_t const documents = database.create(ustore_modality_docs_k, outcome);
@@ -562,11 +562,11 @@ void test_documents_round_trip(config_t const& config, char const* input, char c
     importing.database = database.get();
     importing.outcome = &outcome;
     importing.collection = documents;
-    importing.path = bytes_of(input);
+    importing.path = util::bytes_of(input);
     importing.max_batch_size = max_batch_size_k;
     importing.fields_count = selects ? fields.size() : 0;
     importing.fields = selects ? names.view() : ustore_strings_view_t {};
-    importing.id_field = bytes_of("id");
+    importing.id_field = util::bytes_of("id");
     ustore_docs_import(&importing);
     expect_success(outcome);
 
@@ -574,7 +574,7 @@ void test_documents_round_trip(config_t const& config, char const* input, char c
     exporting.database = database.get();
     exporting.outcome = &outcome;
     exporting.collection = documents;
-    exporting.path = bytes_of(output);
+    exporting.path = util::bytes_of(output);
     exporting.max_batch_size = max_batch_size_k;
     exporting.fields_count = importing.fields_count;
     exporting.fields = importing.fields;
@@ -604,26 +604,26 @@ void test_graph_import_rejects_invalid_tasks(config_t const& config, char const*
     valid.database = database.get();
     valid.outcome = &outcome;
     valid.collection = graph;
-    valid.path = bytes_of(input);
+    valid.path = util::bytes_of(input);
     valid.max_batch_size = max_batch_size_k;
-    valid.source_id_field = bytes_of(source_field_k);
-    valid.target_id_field = bytes_of(target_field_k);
-    valid.edge_id_field = bytes_of(edge_field_k);
+    valid.source_id_field = util::bytes_of(source_field_k);
+    valid.target_id_field = util::bytes_of(target_field_k);
+    valid.edge_id_field = util::bytes_of(edge_field_k);
 
     ustore_graph_import_t without_path = valid;
     without_path.path = {};
     ustore_graph_import(&without_path);
-    expect_status(outcome, status_code_t::invalid_argument_k);
+    expect_status(outcome, util::status_code_t::invalid_argument_k);
 
     ustore_graph_import_t without_source = valid;
     without_source.source_id_field = {};
     ustore_graph_import(&without_source);
-    expect_status(outcome, status_code_t::invalid_argument_k);
+    expect_status(outcome, util::status_code_t::invalid_argument_k);
 
     ustore_graph_import_t without_target = valid;
     without_target.target_id_field = {};
     ustore_graph_import(&without_target);
-    expect_status(outcome, status_code_t::invalid_argument_k);
+    expect_status(outcome, util::status_code_t::invalid_argument_k);
 
     ustore_graph_import_t without_edge = valid;
     without_edge.edge_id_field = {};
@@ -633,7 +633,7 @@ void test_graph_import_rejects_invalid_tasks(config_t const& config, char const*
     ustore_graph_import_t without_database = valid;
     without_database.database = nullptr;
     ustore_graph_import(&without_database);
-    expect_status(outcome, status_code_t::uninitialized_k);
+    expect_status(outcome, util::status_code_t::uninitialized_k);
 
     database.drop(graph, outcome);
     expect_success(outcome);
@@ -653,31 +653,31 @@ void test_graph_export_rejects_invalid_tasks(config_t const& config, char const*
     valid.database = database.get();
     valid.outcome = &outcome;
     valid.collection = graph;
-    valid.path = bytes_of(output);
+    valid.path = util::bytes_of(output);
     valid.max_batch_size = max_batch_size_k;
-    valid.source_id_field = bytes_of(source_field_k);
-    valid.target_id_field = bytes_of(target_field_k);
-    valid.edge_id_field = bytes_of(edge_field_k);
+    valid.source_id_field = util::bytes_of(source_field_k);
+    valid.target_id_field = util::bytes_of(target_field_k);
+    valid.edge_id_field = util::bytes_of(edge_field_k);
 
     ustore_graph_export_t without_path = valid;
     without_path.path = {};
     ustore_graph_export(&without_path);
-    expect_status(outcome, status_code_t::invalid_argument_k);
+    expect_status(outcome, util::status_code_t::invalid_argument_k);
 
     ustore_graph_export_t without_source = valid;
     without_source.source_id_field = {};
     ustore_graph_export(&without_source);
-    expect_status(outcome, status_code_t::invalid_argument_k);
+    expect_status(outcome, util::status_code_t::invalid_argument_k);
 
     ustore_graph_export_t without_target = valid;
     without_target.target_id_field = {};
     ustore_graph_export(&without_target);
-    expect_status(outcome, status_code_t::invalid_argument_k);
+    expect_status(outcome, util::status_code_t::invalid_argument_k);
 
     ustore_graph_export_t with_pointer_field = valid;
-    with_pointer_field.source_id_field = bytes_of("/id");
+    with_pointer_field.source_id_field = util::bytes_of("/id");
     ustore_graph_export(&with_pointer_field);
-    expect_status(outcome, status_code_t::invalid_argument_k);
+    expect_status(outcome, util::status_code_t::invalid_argument_k);
 
     ustore_graph_export_t without_edge = valid;
     without_edge.edge_id_field = {};
@@ -687,7 +687,7 @@ void test_graph_export_rejects_invalid_tasks(config_t const& config, char const*
     ustore_graph_export_t without_database = valid;
     without_database.database = nullptr;
     ustore_graph_export(&without_database);
-    expect_status(outcome, status_code_t::uninitialized_k);
+    expect_status(outcome, util::status_code_t::uninitialized_k);
 
     [[maybe_unused]] int const removed = std::remove(output);
 }
@@ -700,48 +700,48 @@ void test_docs_import_rejects_invalid_tasks(config_t const& config, char const* 
     database.clear();
 
     ustore_outcome_t outcome {};
-    strided_strings<std::string_view> const names {strided(selected_columns_k).begin()};
+    util::strided_strings<std::string_view> const names {util::strided(selected_columns_k).begin()};
     ustore_collection_id_t const documents = database.create(ustore_modality_docs_k, outcome);
     expect_success(outcome);
     ustore_docs_import_t valid {};
     valid.database = database.get();
     valid.outcome = &outcome;
     valid.collection = documents;
-    valid.path = bytes_of(input);
+    valid.path = util::bytes_of(input);
     valid.max_batch_size = max_batch_size_k;
     valid.fields_count = std::size(selected_columns_k);
     valid.fields = names.view();
-    valid.id_field = bytes_of("id");
+    valid.id_field = util::bytes_of("id");
 
     ustore_docs_import_t without_path = valid;
     without_path.path = {};
     ustore_docs_import(&without_path);
-    expect_status(outcome, status_code_t::invalid_argument_k);
+    expect_status(outcome, util::status_code_t::invalid_argument_k);
 
     ustore_docs_import_t without_count = valid;
     without_count.fields_count = 0;
     ustore_docs_import(&without_count);
-    expect_status(outcome, status_code_t::invalid_argument_k);
+    expect_status(outcome, util::status_code_t::invalid_argument_k);
 
     ustore_docs_import_t without_fields = valid;
     without_fields.fields = {};
     ustore_docs_import(&without_fields);
-    expect_status(outcome, status_code_t::invalid_argument_k);
+    expect_status(outcome, util::status_code_t::invalid_argument_k);
 
     ustore_docs_import_t without_accessor = valid;
     without_accessor.fields.data.accessor.get = nullptr;
     ustore_docs_import(&without_accessor);
-    expect_status(outcome, status_code_t::invalid_argument_k);
+    expect_status(outcome, util::status_code_t::invalid_argument_k);
 
     ustore_docs_import_t without_id_among_fields = valid;
-    without_id_among_fields.id_field = bytes_of("missing");
+    without_id_among_fields.id_field = util::bytes_of("missing");
     ustore_docs_import(&without_id_among_fields);
-    expect_status(outcome, status_code_t::invalid_argument_k);
+    expect_status(outcome, util::status_code_t::invalid_argument_k);
 
     ustore_docs_import_t without_database = valid;
     without_database.database = nullptr;
     ustore_docs_import(&without_database);
-    expect_status(outcome, status_code_t::uninitialized_k);
+    expect_status(outcome, util::status_code_t::uninitialized_k);
 
     database.clear();
 }
@@ -754,14 +754,14 @@ void test_docs_export_rejects_invalid_tasks(config_t const& config, char const* 
     database.clear();
 
     ustore_outcome_t outcome {};
-    strided_strings<std::string_view> const names {strided(selected_columns_k).begin()};
+    util::strided_strings<std::string_view> const names {util::strided(selected_columns_k).begin()};
     ustore_collection_id_t const documents = database.create(ustore_modality_docs_k, outcome);
     expect_success(outcome);
     ustore_docs_export_t valid {};
     valid.database = database.get();
     valid.outcome = &outcome;
     valid.collection = documents;
-    valid.path = bytes_of(output);
+    valid.path = util::bytes_of(output);
     valid.max_batch_size = max_batch_size_k;
     valid.fields_count = std::size(selected_columns_k);
     valid.fields = names.view();
@@ -769,33 +769,33 @@ void test_docs_export_rejects_invalid_tasks(config_t const& config, char const* 
     ustore_docs_export_t without_path = valid;
     without_path.path = {};
     ustore_docs_export(&without_path);
-    expect_status(outcome, status_code_t::invalid_argument_k);
+    expect_status(outcome, util::status_code_t::invalid_argument_k);
 
     ustore_docs_export_t without_count = valid;
     without_count.fields_count = 0;
     ustore_docs_export(&without_count);
-    expect_status(outcome, status_code_t::invalid_argument_k);
+    expect_status(outcome, util::status_code_t::invalid_argument_k);
 
     ustore_docs_export_t without_fields = valid;
     without_fields.fields = {};
     ustore_docs_export(&without_fields);
-    expect_status(outcome, status_code_t::invalid_argument_k);
+    expect_status(outcome, util::status_code_t::invalid_argument_k);
 
     ustore_docs_export_t without_accessor = valid;
     without_accessor.fields.data.accessor.get = nullptr;
     ustore_docs_export(&without_accessor);
-    expect_status(outcome, status_code_t::invalid_argument_k);
+    expect_status(outcome, util::status_code_t::invalid_argument_k);
 
     std::string const unknown_format_output = fmt::format("{}/{}", config.directory(), exported_parquet_k);
     ustore_docs_export_t with_unknown_format = valid;
-    with_unknown_format.path = bytes_of(unknown_format_output.c_str());
+    with_unknown_format.path = util::bytes_of(unknown_format_output.c_str());
     ustore_docs_export(&with_unknown_format);
-    expect_status(outcome, status_code_t::unsupported_k);
+    expect_status(outcome, util::status_code_t::unsupported_k);
 
     ustore_docs_export_t without_database = valid;
     without_database.database = nullptr;
     ustore_docs_export(&without_database);
-    expect_status(outcome, status_code_t::uninitialized_k);
+    expect_status(outcome, util::status_code_t::uninitialized_k);
 }
 
 #pragma endregion Invalid Tasks
@@ -1832,12 +1832,12 @@ int main(int argc, char** argv) {
     start_test_run(argc, argv);
     char const* const cli = setting_text(argc, argv, "USTORE_CLI", "--cli");
 
-    auto const maybe_directory = scratch_directory_t::make(test_run.settings.directory);
-    if (!maybe_directory) {
+    auto [scratch, scratch_status] = scratch_directory_t::make(test_run.settings.directory);
+    if (st::failed(scratch_status)) {
         fmt::println(stderr, "Cannot create a unique directory under {}", test_run.settings.directory);
         return 1;
     }
-    char const* const directory = maybe_directory->path();
+    char const* const directory = scratch.path();
     config_t const config {test_run.settings.engine, directory};
 
     if (directory) run_cases(config, cli ? cli : "");

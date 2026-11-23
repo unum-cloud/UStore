@@ -345,7 +345,7 @@ class lsm_tree {
         // The enlarge factor sizes every level and level zero's run count alike, so a tree without one has no shape
         if (config.level_enlarge_factor < storage_limits_t::level_min_enlarge_factor_k ||
             config.level_enlarge_factor > storage_limits_t::level_max_enlarge_factor_k)
-            return status_t {status_code_t::invalid_argument_k, "A tree grows its levels by a factor in its bounds"};
+            return status_t {status_code_t::invalid_argument_k, "The level growth factor is out of bounds"};
         if (slot_bytes <= utilities::slot_payload_offset_k)
             return status_t {status_code_t::invalid_argument_k, "A slot holds more than its owner block"};
         lsm_tree tree;
@@ -562,8 +562,7 @@ class lsm_tree {
         st::vector<run_handle_t> taken;
         status_t status = taken.reserve(runs.size()) == st::status_t::success_k
                               ? status_t {}
-                              : status_t {status_code_t::out_of_memory_k,
-                                          "A tree could not track the runs a flush wrote"};
+                              : status_t {status_code_t::out_of_memory_k, "No room to track the flushed runs"};
         for (std::size_t index = 0; index != runs.size() && status.succeeded(); ++index) {
             auto [handle, take_status] = runs_->take(std::move(runs[index]));
             status = take_status;
@@ -593,7 +592,7 @@ class lsm_tree {
     status_t restore(io_channel_t& channel, std::span<lsm_tree_run_record_t const> runs,
                      lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {}) noexcept {
         if (levels().size() != 1 || !levels().level(0).empty())
-            return {status_code_t::invalid_argument_k, "A tree takes its stored runs only while it holds none"};
+            return {status_code_t::invalid_argument_k, "A tree restores runs only while empty"};
         if (runs.empty()) return {};
 
         std::uint32_t deepest = 0;
@@ -602,7 +601,7 @@ class lsm_tree {
 
         level_set_t& next = spare_();
         if (next.levels_.reserve(std::size_t {deepest} + 1) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A tree could not hold the levels it restores"};
+            return {status_code_t::out_of_memory_k, "No room for the restored levels"};
         for (std::uint32_t number = 0; number <= deepest; ++number) [[maybe_unused]]
             st::status_t const placed = next.levels_.push_back(level_t::of(
                 *runs_, number, number == 0 ? lsm_level_order_t::overlapping_k : lsm_level_order_t::sorted_k));
@@ -635,7 +634,7 @@ class lsm_tree {
     status_t prepare_ingest(std::span<sorted_run_t> runs) noexcept {
         if (runs.empty()) return {status_code_t::invalid_argument_k, "An ingest publishes at least one run"};
         if (!spare_().levels_.empty())
-            return {status_code_t::invalid_argument_k, "A tree retires one set before it prepares another"};
+            return {status_code_t::invalid_argument_k, "A tree retires a set before the next"};
         std::uint64_t bytes = 0;
         for (sorted_run_t const& run : runs) bytes += run.size_bytes();
         std::size_t const target = ingest_level_(levels(), runs.front().lower_stored_key(),
@@ -643,7 +642,7 @@ class lsm_tree {
 
         st::vector<run_handle_t> taken;
         if (taken.reserve(runs.size()) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A tree could not track the runs an ingest wrote"};
+            return {status_code_t::out_of_memory_k, "No room to track the ingested runs"};
         for (sorted_run_t& run : runs) {
             auto [handle, take_status] = runs_->take(std::move(run));
             if (take_status.failed()) {
@@ -705,11 +704,12 @@ class lsm_tree {
         compaction_fan_out_t const& fan_out = compaction_fan_out_t {}) noexcept {
         if (!claim_compaction_()) return compaction_outcome_t::nothing_to_compact_k;
 
-        expected<compaction_outcome_t> const outcome = compact_once_(
-            reading_channel, writing_channel, buffers, placement, compactor, cancellation, fold, device_fold, published,
-            stamps, fan_out, merge_choice_t::overfull_k);
+        auto const [outcome, status] = compact_once_(reading_channel, writing_channel, buffers, placement, compactor,
+                                                     cancellation, fold, device_fold, published, stamps, fan_out,
+                                                     merge_choice_t::overfull_k);
         atomic_reference_<std::int32_t> {compacting_}.store(static_cast<std::int32_t>(compaction_state_t::idle_k),
                                                             std::memory_order_release);
+        if (status.failed()) return status;
         return outcome;
     }
 
@@ -733,10 +733,10 @@ class lsm_tree {
         status_t result;
         while (result.succeeded() && above_(levels(), ceiling) != levels().size()) {
             // A mount truncates on the host, so no device composes a change
-            expected<compaction_outcome_t> const outcome = compact_once_(
+            auto const [outcome, status] = compact_once_(
                 reading_channel, writing_channel, buffers, compaction_placement_t::host_k, {}, nullptr, fold,
                 no_device_fold_t {}, published, stamps, compaction_fan_out_t {}, merge_choice_t::above_ceiling_k);
-            if (!outcome) result = outcome.status();
+            if (status.failed()) result = status;
         }
         atomic_reference_<std::int32_t> {compacting_}.store(static_cast<std::int32_t>(compaction_state_t::idle_k),
                                                             std::memory_order_release);
@@ -897,7 +897,7 @@ class lsm_tree {
         level_set_t& next = spare_();
         std::size_t const deepest = !placed.empty() && number >= source.size() ? number + 1 : source.size();
         if (next.levels_.reserve(deepest) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A tree could not prepare its next level set"};
+            return {status_code_t::out_of_memory_k, "No room for the next level set"};
         for (std::size_t index = 0; index != deepest; ++index) {
             lsm_level_order_t const order = index == 0 ? lsm_level_order_t::overlapping_k : lsm_level_order_t::sorted_k;
             [[maybe_unused]] st::status_t const pushed = next.levels_.push_back(
@@ -1033,7 +1033,7 @@ class lsm_tree {
         std::span<run_handle_t const> const below_runs = below != nullptr ? below->runs()
                                                                           : std::span<run_handle_t const> {};
         if (picked.runs.reserve(from.size() + lower_runs) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A tree could not list the runs a merge consumes"};
+            return {status_code_t::out_of_memory_k, "No room to list the merged runs"};
 
         if (upper == 0)
             for (std::size_t index = 0; index != from.size(); ++index) [[maybe_unused]]
@@ -1208,7 +1208,7 @@ status_t record_lsm_tree_runs(tree_type_ const& tree, st::vector<lsm_tree_run_re
     std::size_t counted = 0;
     for (std::size_t number = 0; number != taken.size(); ++number) counted += taken.level(number).size();
     if (into.reserve(into.size() + counted) != st::status_t::success_k)
-        return {status_code_t::out_of_memory_k, "No room to name the runs a tree holds"};
+        return {status_code_t::out_of_memory_k, "No room to name the tree runs"};
 
     for (std::size_t number = 0; number != taken.size(); ++number) {
         typename tree_type_::level_t const& level = taken.level(number);

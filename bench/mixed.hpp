@@ -19,8 +19,8 @@
 #include "ustore/db.h"
 #include "ustore/docs.h"
 #include "ustore/graph.h"
-#include "ustore/ranges.hpp"
-#include "ustore/types.hpp"
+#include "ustore/utilities/ranges.hpp" // `strided_strings`, `strided`
+#include "ustore/utilities/types.hpp"  // `edge_t`
 
 namespace unum::ustore::bench {
 
@@ -98,7 +98,8 @@ struct upsert_scratch_t {
                                       std::span<keyed_document_t const> batch, ustore_durability_t durability,
                                       upsert_scratch_t& scratch) noexcept {
     if (!scratch.begin(database)) return false;
-    strided_strings<std::string_view> const bodies {strided(batch).members(&keyed_document_t::body).begin()};
+    util::strided_strings<std::string_view> const bodies {
+        util::strided(batch).members(&keyed_document_t::body).begin()};
     ustore_docs_write_t write {};
     write.database = database;
     write.outcome = &scratch.outcome;
@@ -115,7 +116,7 @@ struct upsert_scratch_t {
 
 /** Upserts @p batch into @p collection in one transaction, answering whether it committed. */
 [[nodiscard]] inline bool edges_upsert(ustore_database_t database, ustore_collection_id_t collection,
-                                       std::span<edge_t const> batch, upsert_scratch_t& scratch) noexcept {
+                                       std::span<util::edge_t const> batch, upsert_scratch_t& scratch) noexcept {
     if (!scratch.begin(database)) return false;
     ustore_graph_write_edges_t write {};
     write.database = database;
@@ -123,9 +124,9 @@ struct upsert_scratch_t {
     write.transaction = scratch.transaction;
     write.count = batch.size();
     write.collections = {&collection, 0};
-    write.edges = {&batch.front().id, sizeof(edge_t)};
-    write.sources = {&batch.front().source, sizeof(edge_t)};
-    write.targets = {&batch.front().target, sizeof(edge_t)};
+    write.edges = {&batch.front().id, sizeof(util::edge_t)};
+    write.sources = {&batch.front().source, sizeof(util::edge_t)};
+    write.targets = {&batch.front().target, sizeof(util::edge_t)};
     ustore_graph_write_edges(&write);
     return !scratch.failed() && scratch.commit(database, ustore_durability_buffered_k);
 }

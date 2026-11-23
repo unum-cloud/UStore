@@ -16,7 +16,7 @@
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/graph.h"
-#include "ustore/ranges.hpp" // `edges_view_t`, `strided`
+#include "ustore/utilities/ranges.hpp" // `edges_view_t`, `strided`
 
 #include "ustore/graph/half_edges.hpp"      // `half_edge_t`
 #include "ustore/graph/ram_store.hpp"       // `export_edges`, `stage_edges`, `stage_vertex_removal`
@@ -36,18 +36,19 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_read_
                view_t const& view) noexcept {
     if (!arguments.count) return {};
     if (!arguments.vertices.data || !arguments.degrees_per_vertex)
-        return {status_code_t::invalid_argument_k, "Need the vertices and an output for their degrees"};
+        return {status_code_t::invalid_argument_k, "Needs the vertices and a degrees output"};
     if (arguments.edges_per_vertex && !arguments.edges_offsets)
-        return {status_code_t::invalid_argument_k, "Need an output for the offsets of the edges"};
-    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
-    edges_batch_t const tasks {collections, strided(arguments.vertices), strided(arguments.roles), arguments.count};
+        return {status_code_t::invalid_argument_k, "Needs an output for the edge offsets"};
+    util::strided_iterator<ustore_collection_id_t const> const collections = util::strided(arguments.collections);
+    util::edges_batch_t const tasks {collections, util::strided(arguments.vertices), util::strided(arguments.roles),
+                                     arguments.count};
     auto [degrees, degrees_status] = arena_allocate<ustore_vertex_degree_t>(arguments.arena, arguments.count);
     if (degrees_status.failed()) return degrees_status;
     // Each slice exports its edges into its thread's scratch, joined in task order once all return
     using edges_tape_t = st::vector<ustore_key_t, arena_allocator<ustore_key_t>>;
     st::vector<edges_tape_t, arena_allocator<edges_tape_t>> slices_edges {{view.scratch}};
-    if (st::failed(slices_edges.resize(slice_slots(view))))
-        return {status_code_t::out_of_memory_k, "Failed to allocate the slices of an edges read"};
+    if (st::failed(slices_edges.resize(util::slice_slots(view))))
+        return {status_code_t::out_of_memory_k, "No room for the edge slices"};
 
     status_t outcome;
     store_status_t const exported = with_source(state, view, [&]<typename source_type_>(source_type_& source) noexcept {
@@ -73,7 +74,7 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_read_
         };
         // A transaction's reads join its watch set, so only a reader at one stamp splits the batch
         if constexpr (std::is_same_v<source_type_, reader_source<cpu_class_, isolation_>>)
-            outcome = for_task_slices(view, arguments.count, export_slice);
+            outcome = util::for_task_slices(view, arguments.count, export_slice);
         else outcome = export_slice(0, arguments.count, view);
         return store_status_t::success_k;
     });
@@ -108,9 +109,9 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_write
                view_t const& view) noexcept {
     if (!arguments.count) return {};
     if (!arguments.sources.data || !arguments.targets.data)
-        return {status_code_t::invalid_argument_k, "Need the sources and the targets of the edges"};
-    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
-    edges_view_t const edges = edges_of(arguments);
+        return {status_code_t::invalid_argument_k, "Needs the edge sources and targets"};
+    util::strided_iterator<ustore_collection_id_t const> const collections = util::strided(arguments.collections);
+    util::edges_view_t const edges = util::edges_of(arguments);
     return serve_write(state, arguments.durability, view, [&](auto& source, status_t& outcome) noexcept {
         return stage_runs_of<half_edge_t>(source, collections, arguments.count, outcome,
                                           [&](auto& part, std::size_t first, std::size_t end) noexcept {
@@ -125,9 +126,9 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_remov
                view_t const& view) noexcept {
     if (!arguments.count) return {};
     if (!arguments.sources.data || !arguments.targets.data)
-        return {status_code_t::invalid_argument_k, "Need the sources and the targets of the edges"};
-    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
-    edges_view_t const edges = edges_of(arguments);
+        return {status_code_t::invalid_argument_k, "Needs the edge sources and targets"};
+    util::strided_iterator<ustore_collection_id_t const> const collections = util::strided(arguments.collections);
+    util::edges_view_t const edges = util::edges_of(arguments);
     return serve_write(state, arguments.durability, view, [&](auto& source, status_t& outcome) noexcept {
         return stage_runs_of<half_edge_t>(source, collections, arguments.count, outcome,
                                           [&](auto& part, std::size_t first, std::size_t end) noexcept {
@@ -142,8 +143,8 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_write
                view_t const& view) noexcept {
     if (!arguments.count) return {};
     if (!arguments.vertices.data) return {status_code_t::invalid_argument_k, "No vertices were provided"};
-    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
-    strided_iterator<ustore_key_t const> const vertices = strided(arguments.vertices);
+    util::strided_iterator<ustore_collection_id_t const> const collections = util::strided(arguments.collections);
+    util::strided_iterator<ustore_key_t const> const vertices = util::strided(arguments.vertices);
     return serve_write(state, arguments.durability, view, [&](auto& source, status_t& outcome) noexcept {
         return stage_runs_of<half_edge_t>(source, collections, arguments.count, outcome,
                                           [&](auto& part, std::size_t first, std::size_t end) noexcept {
@@ -189,10 +190,10 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_graph_remov
                view_t const& view) noexcept {
     if (!arguments.count) return {};
     if (!arguments.vertices.data) return {status_code_t::invalid_argument_k, "No vertices were provided"};
-    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
-    strided_iterator<ustore_key_t const> const vertices = strided(arguments.vertices);
-    strided_iterator<ustore_key_t const> const end_vertices = strided(arguments.end_vertices);
-    strided_iterator<ustore_vertex_role_t const> const roles = strided(arguments.roles);
+    util::strided_iterator<ustore_collection_id_t const> const collections = util::strided(arguments.collections);
+    util::strided_iterator<ustore_key_t const> const vertices = util::strided(arguments.vertices);
+    util::strided_iterator<ustore_key_t const> const end_vertices = util::strided(arguments.end_vertices);
+    util::strided_iterator<ustore_vertex_role_t const> const roles = util::strided(arguments.roles);
     st::vector<ustore_key_t, arena_allocator<ustore_key_t>> listed {{view.scratch}};
     st::vector<half_edge_t, arena_allocator<half_edge_t>> walked {{view.scratch}};
     return serve_write(state, arguments.durability, view, [&](auto& source, status_t& outcome) noexcept {

@@ -32,7 +32,7 @@
 #include <cstddef> // `std::size_t`
 #include <cstdio>  // `stderr`
 
-#include <algorithm>   // `std::sort`, `std::unique`, `std::remove_if`, `std::lower_bound`
+#include <algorithm>   // `std::sort`, `std::unique`, `std::remove_if`, `std::lower_bound`, `std::copy`
 #include <array>       // `std::array`
 #include <charconv>    // `std::from_chars`
 #include <compare>     // `std::strong_ordering`
@@ -53,6 +53,13 @@
 #include "harness.hpp"
 
 namespace unum::ustore::bench {
+
+using ustore::edge_t;
+using ustore::edges_view_t;
+using ustore::expected;
+using ustore::key_from_integer;
+using ustore::status_code_t;
+using ustore::status_t;
 
 #pragma region Settings
 
@@ -140,8 +147,8 @@ struct input_edge_t {
  *  @param[out] edges Receives one entry per kept pair.
  */
 status_t read_edge_list(char const* path, std::size_t max_edges, st::vector<input_edge_t>& edges) noexcept {
-    auto [file, map_status] = mapped_file_t::map(path);
-    if (map_status.failed()) return map_status;
+    auto [file, map_status] = util::mapped_file_t::map(path);
+    if (map_status.failed()) return {static_cast<status_code_t>(map_status.code), map_status.note};
 
     for (sz::string_view_t line : sz::split(file.view(), "\n")) {
         if (edges.size() == max_edges) break;
@@ -266,7 +273,7 @@ class adjacency_graph_t {
         if (st::failed(graph.keys_.reserve(entries.size() + 1)) ||
             st::failed(graph.row_offsets_.reserve(entries.size() + 2)) ||
             st::failed(graph.neighbors_.reserve(entries.size())))
-            return status_code_t::out_of_memory_k;
+            return {{}, status_code_t::out_of_memory_k};
 
         for (std::size_t index = 0; index != entries.size(); ++index) {
             weighted_entry_t const& entry = entries[index];
@@ -296,7 +303,7 @@ class adjacency_graph_t {
             graph.neighbors_[neighbor].vertex_index = graph.index_of(entries[index].target);
             ++neighbor;
         }
-        return graph;
+        return {std::move(graph)};
     }
 
     /** Vertices the graph numbers. */
@@ -330,26 +337,28 @@ class stored_graph_t {
     /** Arena every neighborhood read reuses, rewound by each. */
     arena_t arena_;
 
+    /** The neighbors of the vertex read last, sorted and distinct, reused by every read. */
+    st::vector<ustore_key_t> neighbors_;
+
   public:
     stored_graph_t() noexcept = default;
 
     /** Streams every vertex key of @p collection into the numbering the levels run over. */
     static expected<stored_graph_t> make(graph_collection_t& collection) noexcept {
-        auto maybe_stream = collection.vertex_stream();
-        if (!maybe_stream) return maybe_stream.status();
-        keys_stream_t stream = *std::move(maybe_stream);
+        auto [stream, stream_status] = collection.vertex_stream();
+        if (stream_status.failed()) return {{}, stream_status};
         auto [arena, arena_status] = arena_t::make();
-        if (arena_status.failed()) return arena_status;
+        if (arena_status.failed()) return {{}, arena_status};
 
         stored_graph_t graph;
         graph.collection_ = &collection;
         graph.arena_ = std::move(arena);
         while (!stream.is_end()) {
             for (ustore_key_t key : stream.keys_batch())
-                if (st::failed(graph.keys_.push_back(ustore_key_t {key}))) return status_code_t::out_of_memory_k;
-            if (status_t const sought = stream.seek_to_next_batch(); sought.failed()) return sought;
+                if (st::failed(graph.keys_.push_back(ustore_key_t {key}))) return {{}, status_code_t::out_of_memory_k};
+            if (status_t const sought = stream.seek_to_next_batch(); sought.failed()) return {{}, sought};
         }
-        return graph;
+        return {std::move(graph)};
     }
 
     /** Vertices the collection holds. */
@@ -360,9 +369,14 @@ class stored_graph_t {
     status_t for_each_neighbor(std::size_t vertex_index, visitor_type_&& visit) noexcept {
         auto [neighbors, neighbors_status] = collection_->neighbors(keys_[vertex_index], arena_);
         if (neighbors_status.failed()) return neighbors_status;
-        for (std::size_t index = 0; index != neighbors.size(); ++index) {
-            ustore_key_t const* const found = std::lower_bound(keys_.begin(), keys_.end(), neighbors[index]);
-            if (found == keys_.end() || *found != neighbors[index]) continue;
+        // The view lists every edge as stored, so the distinct neighbors are sorted out here
+        if (st::failed(neighbors_.resize(neighbors.size()))) return status_code_t::out_of_memory_k;
+        std::copy(neighbors.begin(), neighbors.end(), neighbors_.begin());
+        std::sort(neighbors_.begin(), neighbors_.end());
+        ustore_key_t const* const distinct_end = std::unique(neighbors_.begin(), neighbors_.end());
+        for (ustore_key_t const* neighbor = neighbors_.begin(); neighbor != distinct_end; ++neighbor) {
+            ustore_key_t const* const found = std::lower_bound(keys_.begin(), keys_.end(), *neighbor);
+            if (found == keys_.end() || *found != *neighbor) continue;
             visit(static_cast<std::size_t>(found - keys_.begin()), 1.0);
         }
         return {};
@@ -419,14 +433,14 @@ expected<level_t> optimize_level(graph_type_& graph) noexcept {
     if (st::failed(level.communities.resize(count)) || st::failed(level.vertex_degrees.resize(count, 0.0)) ||
         st::failed(community_degrees.resize(count, 0.0)) || st::failed(degrees_into_communities.resize(count, 0.0)) ||
         st::failed(touched_communities.reserve(count)))
-        return status_code_t::out_of_memory_k;
+        return {{}, status_code_t::out_of_memory_k};
 
     double degrees_sum = 0.0;
     for (std::size_t vertex = 0; vertex != count; ++vertex) {
         double degree = 0.0;
         status_t const walked = graph.for_each_neighbor(vertex,
                                                         [&](std::size_t, double weight) noexcept { degree += weight; });
-        if (walked.failed()) return walked;
+        if (walked.failed()) return {{}, walked};
         level.communities[vertex] = vertex;
         level.vertex_degrees[vertex] = degree;
         community_degrees[vertex] = degree;
@@ -434,7 +448,7 @@ expected<level_t> optimize_level(graph_type_& graph) noexcept {
     }
 
     double const edges_weight = degrees_sum / 2.0;
-    if (edges_weight == 0.0) return level;
+    if (edges_weight == 0.0) return {std::move(level)};
 
     std::size_t moved = 1;
     while (moved != 0) {
@@ -449,7 +463,7 @@ expected<level_t> optimize_level(graph_type_& graph) noexcept {
                 }
                 degrees_into_communities[community] += weight;
             });
-            if (walked.failed()) return walked;
+            if (walked.failed()) return {{}, walked};
 
             std::size_t const own_community = level.communities[vertex];
             double const vertex_degree = level.vertex_degrees[vertex];
@@ -477,7 +491,7 @@ expected<level_t> optimize_level(graph_type_& graph) noexcept {
             level.progress = level_progress_t::moved_k;
         }
     }
-    return level;
+    return {std::move(level)};
 }
 
 /** Scores @p level over @p graph in one pass, summing each community's inner weight and total degree. */
@@ -489,7 +503,7 @@ expected<score_t> score_level(graph_type_& graph, level_t const& level) noexcept
     st::vector<std::size_t> member_counts;
     if (st::failed(inner_weights.resize(count, 0.0)) || st::failed(total_degrees.resize(count, 0.0)) ||
         st::failed(member_counts.resize(count, 0)))
-        return status_code_t::out_of_memory_k;
+        return {{}, status_code_t::out_of_memory_k};
 
     double degrees_sum = 0.0;
     for (std::size_t vertex = 0; vertex != count; ++vertex) {
@@ -500,7 +514,7 @@ expected<score_t> score_level(graph_type_& graph, level_t const& level) noexcept
         status_t const walked = graph.for_each_neighbor(vertex, [&](std::size_t neighbor, double weight) noexcept {
             if (level.communities[neighbor] == community) inner_weights[community] += weight;
         });
-        if (walked.failed()) return walked;
+        if (walked.failed()) return {{}, walked};
     }
 
     score_t score;
@@ -512,7 +526,7 @@ expected<score_t> score_level(graph_type_& graph, level_t const& level) noexcept
         double const share = total_degrees[community] / (2.0 * edges_weight);
         score.modularity += inner_weights[community] / (2.0 * edges_weight) - share * share;
     }
-    return score;
+    return {score};
 }
 
 /** The graph of @p level's communities, whose weights sum the edges between and inside their members. */
@@ -527,8 +541,8 @@ expected<adjacency_graph_t> aggregate_level(graph_type_& graph, level_t const& l
             ustore_key_t const target = key_from_integer(level.communities[neighbor]);
             if (st::succeeded(pushed)) pushed = entries.push_back(weighted_entry_t {source, target, weight});
         });
-        if (walked.failed()) return walked;
-        if (st::failed(pushed)) return status_code_t::out_of_memory_k;
+        if (walked.failed()) return {{}, walked};
+        if (st::failed(pushed)) return {{}, status_code_t::out_of_memory_k};
     }
     return adjacency_graph_t::make(entries);
 }
@@ -559,24 +573,24 @@ expected<run_result_t> run_louvain(graph_type_& graph, louvain_settings_t const&
     double const min_growth = static_cast<double>(settings.min_modularity_growth_per_billion.value) / 1e9;
 
     auto [level, optimize_level_status] = optimize_level(graph);
-    if (optimize_level_status.failed()) return optimize_level_status;
+    if (optimize_level_status.failed()) return {{}, optimize_level_status};
     auto [score, score_level_status] = score_level(graph, level);
-    if (score_level_status.failed()) return score_level_status;
+    if (score_level_status.failed()) return {{}, score_level_status};
 
     run_result_t result;
     result.modularity = score.modularity;
     result.communities_count = score.communities_count;
     result.levels_count = 1;
-    if (level.progress == level_progress_t::settled_k) return result;
+    if (level.progress == level_progress_t::settled_k) return {result};
 
     auto [coarse, aggregate_level_status] = aggregate_level(graph, level);
-    if (aggregate_level_status.failed()) return aggregate_level_status;
+    if (aggregate_level_status.failed()) return {{}, aggregate_level_status};
 
     while (result.levels_count != settings.max_levels.value) {
         auto [coarse_level, optimize_coarse_status] = optimize_level(coarse);
-        if (optimize_coarse_status.failed()) return optimize_coarse_status;
+        if (optimize_coarse_status.failed()) return {{}, optimize_coarse_status};
         auto [coarse_score, score_coarse_status] = score_level(coarse, coarse_level);
-        if (score_coarse_status.failed()) return score_coarse_status;
+        if (score_coarse_status.failed()) return {{}, score_coarse_status};
         if (coarse_level.progress == level_progress_t::settled_k ||
             coarse_score.modularity - result.modularity <= min_growth)
             break;
@@ -585,10 +599,10 @@ expected<run_result_t> run_louvain(graph_type_& graph, louvain_settings_t const&
         result.communities_count = coarse_score.communities_count;
         ++result.levels_count;
         auto [coarser, aggregate_coarse_status] = aggregate_level(coarse, coarse_level);
-        if (aggregate_coarse_status.failed()) return aggregate_coarse_status;
+        if (aggregate_coarse_status.failed()) return {{}, aggregate_coarse_status};
         coarse = std::move(coarser);
     }
-    return result;
+    return {result};
 }
 
 #pragma endregion Louvain
@@ -606,11 +620,8 @@ void louvain_call(loop_t& loop, graph_type_& graph, louvain_settings_t const& se
 
 #pragma endregion Benchmarks
 
-} // namespace unum::ustore::bench
-
-int main(int argc, char** argv) {
-    using namespace unum::ustore;
-    using namespace unum::ustore::bench;
+/** Runs the benchmark the command line @p argv selects, answering the process's exit code. */
+int run_louvain(int argc, char** argv) {
 
     louvain_settings_t settings;
     std::array<flag_t, 13> const flags {{
@@ -638,19 +649,18 @@ int main(int argc, char** argv) {
                                                  "USTORE_MAX_LEVELS"};
 
     read_bench_settings(argc, argv, settings, flags, variables);
-    auto maybe_executor = executor_t::make(1, caller_exclusivity_t::caller_inclusive_k);
-    if (!maybe_executor) {
+    auto [executor, executor_status] = util::executor_t::make(1, util::caller_exclusivity_t::caller_inclusive_k);
+    if (st::failed(executor_status)) {
         fmt::println(stderr, "Failed to pin the calling thread");
         return 1;
     }
-    executor_t& executor = *maybe_executor;
 
     st::vector<input_edge_t> edges;
     status_t const loaded = settings.dataset.empty()
                                 ? generate_edge_list(settings, edges)
                                 : read_edge_list(settings.dataset.data(), settings.max_edges.value, edges);
     if (loaded.failed()) {
-        fmt::println(stderr, "Failed to prepare the edge list: {}", loaded.message ? loaded.message : "unknown");
+        fmt::println(stderr, "Failed to prepare the edge list: {}", loaded.note ? loaded.note : "unknown");
         return 1;
     }
     canonicalize_edges(edges);
@@ -672,12 +682,11 @@ int main(int argc, char** argv) {
             st::assume_reserved, weighted_entry_t {edge.upper, edge.lower, 1.0});
     }
 
-    auto maybe_memory_graph = adjacency_graph_t::make(entries);
-    if (!maybe_memory_graph) {
+    auto [memory_graph, memory_graph_status] = adjacency_graph_t::make(entries);
+    if (memory_graph_status.failed()) {
         fmt::println(stderr, "Failed to lay out the in-memory adjacency");
         return 1;
     }
-    adjacency_graph_t memory_graph = *std::move(maybe_memory_graph);
     fmt::println("Graph: {} vertices, {} edges", memory_graph.vertices_count(), edges.size());
 
     ustore_database_t handle = nullptr;
@@ -689,13 +698,13 @@ int main(int argc, char** argv) {
         return 1;
     }
     database_t database {handle};
-    if (status_t const cleared = database.on().clear(ustore_drop_collection_k); cleared.failed()) {
-        fmt::println(stderr, "Failed to clear the database: {}", cleared.message ? cleared.message : "unknown");
+    if (status_t const cleared = database.clear(ustore_drop_collection_k); cleared.failed()) {
+        fmt::println(stderr, "Failed to clear the database: {}", cleared.note ? cleared.note : "unknown");
         return 1;
     }
-    auto [graph, graph_status] = database.on().create<graph_collection_t>("graph");
+    auto [graph, graph_status] = database.create<graph_collection_t>("graph");
     if (graph_status.failed()) {
-        fmt::println(stderr, "Failed to create the graph: {}", graph_status.message ? graph_status.message : "unknown");
+        fmt::println(stderr, "Failed to create the graph: {}", graph_status.note ? graph_status.note : "unknown");
         return 1;
     }
 
@@ -705,7 +714,7 @@ int main(int argc, char** argv) {
         std::size_t const batch_size = settings.batch_size_upsert.value;
         std::span<edge_t const> const batches {staged.begin(), staged.end()};
         row_t const upserted = run_pass(
-            executor, "graph_upsert", divide_round_up(batches.size(), batch_size),
+            executor, "graph_upsert", util::divide_round_up(batches.size(), batch_size),
             [&](loop_t& loop, std::size_t) noexcept {
                 for (std::size_t call : loop) {
                     std::span<edge_t const> const batch = batches.subspan(
@@ -738,4 +747,11 @@ int main(int argc, char** argv) {
         fmt::println("Over UStore: modularity {:.6f}, {} communities, {} levels", stored_result.modularity,
                      stored_result.communities_count, stored_result.levels_count);
     return 0;
+}
+
+} // namespace unum::ustore::bench
+
+int main(int argc, char** argv) {
+    using namespace unum::ustore::bench;
+    return run_louvain(argc, argv);
 }

@@ -100,6 +100,8 @@ namespace unum::ustore::blobs {
 
 using utilities::basic_read_pipeline;
 using utilities::basic_write_pipeline;
+using utilities::bytes_of;
+using utilities::chars_of;
 using utilities::completed_buffer_t;
 using utilities::completion_t;
 using utilities::extent_t;
@@ -576,17 +578,17 @@ inline expected<stamps_column_t> pack_stamps(std::span<std::uint64_t const> stam
         return st::expected<std::span<std::uint64_t const>>(std::span<std::uint64_t const> {raised.data(), count},
                                                             st::status_t::success_k);
     };
-    st::expected<stamps_column_t> packed = stamps_column_t::make(stamps.size(), floor, newest, fill);
-    if (!packed) return status_t {status_code_t::out_of_memory_k, "No room to pack a run's stamps"};
-    return std::move(*packed);
+    auto [packed, status] = stamps_column_t::make(stamps.size(), floor, newest, fill);
+    if (st::failed(status)) return status_t {status_code_t::out_of_memory_k, "No room to pack a run's stamps"};
+    return std::move(packed);
 }
 
 /** Packs @p kinds, each a @c delta_kind_t, into the column a run saves in its trailer after the stamps, from the least
  *  kind present, so a run of writes alone spends no bits on it. */
 inline expected<kinds_column_t> pack_kinds(std::span<std::uint8_t const> kinds) noexcept {
-    st::expected<kinds_column_t> packed = kinds_column_t::make(kinds);
-    if (!packed) return status_t {status_code_t::out_of_memory_k, "No room to pack a run's kinds"};
-    return std::move(*packed);
+    auto [packed, status] = kinds_column_t::make(kinds);
+    if (st::failed(status)) return status_t {status_code_t::out_of_memory_k, "No room to pack a run's kinds"};
+    return std::move(packed);
 }
 
 #pragma endregion Layout
@@ -676,11 +678,11 @@ class lsm_sorted_run {
 
     /** The heads of a run of strings, or of one of its layers, searched in place. */
     using heads_view_t =
-        st::immutable_splus_tree_view<st::key128_t, st::keys_per_row<st::key128_t>(st::default_row_bytes_k), row_kit_t>;
+        st::immutable_splus_tree_view<st::key128_t, st::keys_per_row<st::key128_t>(sorted_run_row_bytes_k), row_kit_t>;
 
     /** The saved S+ tree every lookup descends: of the keys, or of a run of strings' heads. */
     using keys_view_t =
-        st::immutable_splus_tree_view<stored_key_t, st::keys_per_row<stored_key_t>(st::default_row_bytes_k), row_kit_t>;
+        st::immutable_splus_tree_view<stored_key_t, st::keys_per_row<stored_key_t>(sorted_run_row_bytes_k), row_kit_t>;
 
 #pragma endregion Types
 
@@ -786,10 +788,13 @@ class lsm_sorted_run {
                                                      tombstones);
         if (reserve_status.failed()) return reserve_status;
         status_t const written = write_sections(volume, channel, reservation, key_slots, stored_values, value_offsets);
-        expected<lsm_sorted_run> opened = written.failed() ? expected<lsm_sorted_run> {written}
-                                                           : open(volume, channel, reservation.extent);
-        if (!opened) volume.deallocate(reservation.extent);
-        return opened;
+        auto [opened, open_status] = written.failed() ? expected<lsm_sorted_run> {written}
+                                                      : open(volume, channel, reservation.extent);
+        if (open_status.failed()) {
+            volume.deallocate(reservation.extent);
+            return open_status;
+        }
+        return std::move(opened);
     }
 
     /**
@@ -812,14 +817,13 @@ class lsm_sorted_run {
             checked.failed())
             return checked;
         if (stamps.size() != key_slots.size() || kinds.size() != key_slots.size())
-            return status_t {status_code_t::invalid_argument_k, "A run takes one stamp and one kind per key slot"};
+            return status_t {status_code_t::invalid_argument_k, "A run needs stamps and kinds per slot"};
         if (status_t const checked = check_tails_(tails, key_slots.size()); checked.failed()) return checked;
         for (std::size_t index = 1; index < key_slots.size(); ++index) {
             int const order = key_order_(key_slots, tails, index);
-            if (order < 0)
-                return status_t {status_code_t::invalid_argument_k, "A run takes its key slots in ascending order"};
+            if (order < 0) return status_t {status_code_t::invalid_argument_k, "A run's key slots must ascend"};
             if (order == 0 && stamps[index] >= stamps[index - 1])
-                return status_t {status_code_t::invalid_argument_k, "A run takes the versions of a key newest first"};
+                return status_t {status_code_t::invalid_argument_k, "A run's key versions must descend by stamp"};
         }
 
         sorted_run_reservation_t reservation;
@@ -831,7 +835,7 @@ class lsm_sorted_run {
         if (pack_kinds_status.failed()) return pack_kinds_status;
         reservation.kinds = std::move(kinds_column);
         if (block_bytes_of_(channel) < sorted_run_layout_t::header_bytes())
-            return status_t {status_code_t::capacity_exhausted_k, "A channel's block is shorter than a run's header"};
+            return status_t {status_code_t::capacity_exhausted_k, "The channel block is under a run header"};
 
         sorted_run_header_t& header = reservation.header;
         header.magic = sorted_run_magic_k;
@@ -863,8 +867,7 @@ class lsm_sorted_run {
             std::uint64_t const layers_bytes = reservation.strings.layers.size() * sizeof(std::uint64_t);
             if (reservation.strings.keys.size() > (std::numeric_limits<std::uint32_t>::max)() ||
                 layers_bytes > (std::numeric_limits<std::uint32_t>::max)())
-                return status_t {status_code_t::capacity_exhausted_k,
-                                 "A run of strings outgrows what its header counts"};
+                return status_t {status_code_t::capacity_exhausted_k, "A string run outgrows its header counts"};
             header.key_tape_bytes = static_cast<std::uint32_t>(reservation.strings.keys.size());
             header.layers_bytes = static_cast<std::uint32_t>(layers_bytes);
             reserved_bytes = strings_layout_t::blob_bytes(header);
@@ -898,7 +901,7 @@ class lsm_sorted_run {
                                    std::span<stored_value_offset_t const> value_offsets) noexcept {
         std::uint64_t const block_bytes = block_bytes_of_(channel);
         if (block_bytes < sorted_run_layout_t::header_bytes())
-            return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than a run's header"};
+            return {status_code_t::capacity_exhausted_k, "The channel block is under a run header"};
         medium_extent_t const& extent = reservation.extent;
         sorted_run_header_t const& header = reservation.header;
         auto [writer_channel, writer_channel_status] = channel.acquire();
@@ -956,8 +959,8 @@ class lsm_sorted_run {
      *  @param[in,out] volume The volume the run reads through afterwards, borrowed and outliving it.
      *  @param[in,out] channel The channel the header and the index are read on, held by the calling thread.
      *  @param[in] extent Where the run lies, as an allocation or a manifest handed it over.
-     *  @return The run, or @c status_code_t::malformed_k for an extent shorter than the
-     *      run it claims.
+     *  @return The run, @c status_code_t::malformed_k for an extent shorter than the run it
+     *      claims, or the transfer's own failure when any read does not complete whole.
      */
     static expected<lsm_sorted_run> open(volume_type_& volume, io_channel_t& channel,
                                          medium_extent_t const& extent) noexcept {
@@ -1007,11 +1010,11 @@ class lsm_sorted_run {
             if (run.cells_.assign(cells) != st::status_t::success_k)
                 return status_t {status_code_t::out_of_memory_k, "A run could not hold its index"};
         run.tree_words_ = std::move(tree_words);
-        st::expected<keys_view_t> const tree = keys_view_t::make(
-            std::as_bytes(std::span<std::uint64_t const> {run.tree_words_}));
-        if (!tree || tree->size() != header.key_slots_count)
+        auto const [tree,
+                    tree_status] = keys_view_t::make(std::as_bytes(std::span<std::uint64_t const> {run.tree_words_}));
+        if (st::failed(tree_status) || tree.size() != header.key_slots_count)
             return status_t {status_code_t::internal_k, "A merged run's tree disagrees with it"};
-        run.tree_ = *tree;
+        run.tree_ = tree;
         run.value_offsets_ = std::move(value_offsets);
         run.stamps_ = std::move(stamps);
         run.kinds_ = std::move(kinds);
@@ -1388,10 +1391,10 @@ class lsm_sorted_run {
     status_t assign_stamp(std::uint64_t stamp) noexcept {
         if (stamp == 0) return {status_code_t::invalid_argument_k, "A run is assigned a stamp above zero"};
         if (header_.newest_stamp != 0 || assigned_stamp_ != 0)
-            return {status_code_t::invalid_argument_k, "Only a run written at stamp zero is assigned a stamp"};
-        st::expected<stamps_column_t> column = stamps_column_t::make(stamps_.size(), stamp);
-        if (!column) return {status_code_t::out_of_memory_k, "A run could not hold its assigned stamps"};
-        stamps_ = std::move(*column);
+            return {status_code_t::invalid_argument_k, "Only stamp zero runs are assigned stamps"};
+        auto [column, status] = stamps_column_t::make(stamps_.size(), stamp);
+        if (st::failed(status)) return {status_code_t::out_of_memory_k, "A run could not hold its assigned stamps"};
+        stamps_ = std::move(column);
         header_.stamps_floor = stamp;
         header_.newest_stamp = stamp;
         assigned_stamp_ = stamp;
@@ -1491,8 +1494,7 @@ class lsm_sorted_run {
         if constexpr (carries_value_offsets_k) {
             if (value_offsets.size() != key_slots_count + 1 || value_offsets.front() != 0 ||
                 value_offsets.back() != stored_values_bytes)
-                return {status_code_t::invalid_argument_k,
-                        "A run takes one value offset per key slot and one past them"};
+                return {status_code_t::invalid_argument_k, "A run needs value offsets, one past slots"};
             for (std::size_t index = 1; index != value_offsets.size(); ++index)
                 if (value_offsets[index] < value_offsets[index - 1])
                     return {status_code_t::invalid_argument_k, "A run takes its value offsets ascending"};
@@ -1608,7 +1610,7 @@ class lsm_sorted_run {
         }
         if (tails.offsets.size() != key_slots_count + 1 || tails.offsets.front() != 0 ||
             tails.offsets.back() != tails.bytes.size())
-            return {status_code_t::invalid_argument_k, "A run takes one tail offset per key slot and one past them"};
+            return {status_code_t::invalid_argument_k, "A run needs tail offsets, one past slots"};
         for (std::size_t index = 1; index != tails.offsets.size(); ++index)
             if (tails.offsets[index] < tails.offsets[index - 1])
                 return {status_code_t::invalid_argument_k, "A run takes its tail offsets ascending"};
@@ -1729,7 +1731,7 @@ class lsm_sorted_run {
             sections.key_offsets.resize(count + 1) != st::status_t::success_k ||
             sections.keys.resize(static_cast<std::size_t>(keys_bytes)) != st::status_t::success_k ||
             sections.values.resize(count * strings_layout_t::value_bytes_k) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A run of strings could not lay its keys out"};
+            return {status_code_t::out_of_memory_k, "No room to lay out the string keys"};
 
         std::uint32_t written = 0;
         for (std::size_t index = 0; index != count; ++index) {
@@ -1759,7 +1761,7 @@ class lsm_sorted_run {
         std::size_t const header_words = sizeof(layers_header) / sizeof(std::uint64_t);
         std::size_t const list_words = layers.size() * sizeof(head_layer_t) / sizeof(std::uint64_t);
         if (sections.layers.resize(header_words + list_words + trees.size()) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A run of strings could not lay its layers out"};
+            return {status_code_t::out_of_memory_k, "No room to lay out the string layers"};
         std::memcpy(sections.layers.data(), &layers_header, sizeof(layers_header));
         if (!layers.empty())
             std::memcpy(sections.layers.data() + header_words, layers.data(), layers.size() * sizeof(head_layer_t));
@@ -1773,14 +1775,14 @@ class lsm_sorted_run {
     template <typename key_type_>
     static status_t save_tree_(std::span<key_type_ const> keys, st::vector<std::uint64_t>& words) noexcept {
         using tree_t =
-            st::immutable_splus_tree<key_type_, st::keys_per_row<key_type_>(st::default_row_bytes_k), row_kit_t>;
-        st::expected<tree_t> tree = tree_t::make(keys);
-        if (!tree) return {status_code_t::out_of_memory_k, "A run could not build the tree of its keys"};
-        std::size_t const saved = tree->saved_bytes();
+            st::immutable_splus_tree<key_type_, st::keys_per_row<key_type_>(sorted_run_row_bytes_k), row_kit_t>;
+        auto [tree, status] = tree_t::make(keys);
+        if (st::failed(status)) return {status_code_t::out_of_memory_k, "No room to build the key tree"};
+        std::size_t const saved = tree.saved_bytes();
         if (words.resize(divide_round_up(saved, sizeof(std::uint64_t))) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A run could not save the tree of its keys"};
-        if (tree->save(std::as_writable_bytes(std::span<std::uint64_t> {words})) != st::status_t::success_k)
-            return {status_code_t::internal_k, "A tree of keys outgrew the bytes it reported"};
+            return {status_code_t::out_of_memory_k, "No room to save the key tree"};
+        if (tree.save(std::as_writable_bytes(std::span<std::uint64_t> {words})) != st::status_t::success_k)
+            return {status_code_t::internal_k, "The key tree outgrew its reported bytes"};
         return {};
     }
 
@@ -1805,7 +1807,7 @@ class lsm_sorted_run {
             if (wide && key_of_(sections, tie_first) != key_of_(sections, tie_first + tie - 1)) {
                 st::vector<st::key128_t> deeper;
                 if (deeper.resize(tie) != st::status_t::success_k)
-                    return {status_code_t::out_of_memory_k, "A run of strings could not lay out a layer"};
+                    return {status_code_t::out_of_memory_k, "No room for deeper string heads"};
                 for (std::size_t index = 0; index != tie; ++index)
                     deeper[index] = strings::head_of(key_of_(sections, tie_first + index).substr(skipped));
                 st::vector<std::uint64_t> saved;
@@ -1819,7 +1821,7 @@ class lsm_sorted_run {
                 layer.heads_bytes = saved.size() * sizeof(std::uint64_t);
                 if (layers.push_back(std::move(layer)) != st::status_t::success_k ||
                     trees.reserve(trees.size() + saved.size()) != st::status_t::success_k)
-                    return {status_code_t::out_of_memory_k, "A run of strings could not lay out a layer"};
+                    return {status_code_t::out_of_memory_k, "No room to record a string layer"};
                 for (std::uint64_t const word : saved) [[maybe_unused]]
                     st::status_t const placed = trees.push_back(st::assume_reserved, std::uint64_t {word});
                 if (status_t const nested = lay_out_layers_(sections, std::span<st::key128_t const> {deeper}, tie_first,
@@ -1900,7 +1902,7 @@ class lsm_sorted_run {
                                 std::span<std::uint64_t const> keys) noexcept {
         std::uint64_t const count = header.key_slots_count;
         if (cells.size() != count || keys.size_bytes() < sorted_run_layout_t::keys_saved_bytes(count))
-            return {status_code_t::invalid_argument_k, "A run's index takes one cell per key slot and their tree"};
+            return {status_code_t::invalid_argument_k, "A run's index needs a cell per slot"};
         if (status_t const written = write_bytes_(writer, extent, sorted_run_layout_t::index_offset(),
                                                   sorted_run_layout_t::index_section_bytes(count),
                                                   std::as_bytes(cells));
@@ -1917,7 +1919,7 @@ class lsm_sorted_run {
                                         std::span<stored_value_offset_t const> value_offsets) noexcept {
         std::uint64_t const offsets_bytes = sorted_run_layout_t::value_offsets_bytes(header.key_slots_count);
         if (value_offsets.size_bytes() != offsets_bytes)
-            return {status_code_t::internal_k, "A run's value offsets disagree with the key slots its header names"};
+            return {status_code_t::internal_k, "The value offsets disagree with the header slots"};
         return write_bytes_(writer, extent, sorted_run_layout_t::value_offsets_offset(header.key_slots_count),
                             round_up_to_multiple(offsets_bytes, portable_alignment_k), std::as_bytes(value_offsets));
     }
@@ -1935,7 +1937,7 @@ class lsm_sorted_run {
         if (stamps.save(room.first(kinds_begin)) != st::status_t::success_k ||
             kinds.save(room.subspan(kinds_begin, static_cast<std::size_t>(header.kinds_bytes))) !=
                 st::status_t::success_k)
-            return {status_code_t::internal_k, "A run's columns outgrew the bytes its header names"};
+            return {status_code_t::internal_k, "The run columns outgrew the header bytes"};
 
         return write_bytes_(writer, extent, stamps_offset_(header),
                             round_up_to_multiple(header.stamps_bytes + header.kinds_bytes, portable_alignment_k),
@@ -1954,7 +1956,7 @@ class lsm_sorted_run {
             for (range_t const& range : tombstones.ranges()) tape_bytes += range.start.size() + range.end.size();
             std::size_t const offsets_bytes = count == 0 ? 0 : (2 * count + 1) * sizeof(std::uint32_t);
             if (into.resize(stamps_bytes + offsets_bytes + tape_bytes) != st::status_t::success_k)
-                return {status_code_t::out_of_memory_k, "A run could not lay its range tombstones out"};
+                return {status_code_t::out_of_memory_k, "No room to lay out range tombstones"};
             if (count == 0) return {};
             std::memcpy(into.data(), tombstones.stamps().data(), stamps_bytes);
             std::uint32_t offset = 0;
@@ -1975,7 +1977,7 @@ class lsm_sorted_run {
         else {
             std::size_t const bounds_bytes = count * sizeof(range_t);
             if (into.resize(bounds_bytes + stamps_bytes) != st::status_t::success_k)
-                return {status_code_t::out_of_memory_k, "A run could not lay its range tombstones out"};
+                return {status_code_t::out_of_memory_k, "No room to lay out range tombstones"};
             if (count == 0) return {};
             std::memcpy(into.data(), tombstones.ranges().data(), bounds_bytes);
             std::memcpy(into.data() + bounds_bytes, tombstones.stamps().data(), stamps_bytes);
@@ -1999,7 +2001,7 @@ class lsm_sorted_run {
     status_t read_header_(io_channel_t& channel) noexcept {
         std::uint64_t const head_bytes = sorted_run_layout_t::header_bytes();
         if (channel.requests().buffer_bytes() < head_bytes)
-            return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than a run's header"};
+            return {status_code_t::capacity_exhausted_k, "The channel block is under a run header"};
         extent_t const piece = extent_.slice(0, head_bytes);
         if (piece.length != head_bytes) return {status_code_t::malformed_k, "The run is shorter than its header"};
 
@@ -2019,7 +2021,7 @@ class lsm_sorted_run {
             std::memcpy(&header, completed.bytes.data(), sizeof(header));
         };
         if (status_t const polled = reader.poll_all_completions(sink); polled.failed()) return polled;
-        if (moved.failed()) return {status_code_t::malformed_k, "A run's header did not read whole"};
+        if (moved.failed()) return moved;
 
         if (header.magic != sorted_run_magic_k) return {status_code_t::malformed_k, "The extent holds no sorted run"};
         if (header.format_version != sorted_run_format_version_k)
@@ -2029,21 +2031,21 @@ class lsm_sorted_run {
         std::uint64_t const keys_per_row = tailed_k ? strings_layout_t::keys_per_row_k
                                                     : sorted_run_layout_t::branching_k;
         if (header.branching != keys_per_row)
-            return {status_code_t::malformed_k, "The run's tree rows match no tree of this build"};
+            return {status_code_t::malformed_k, "The run's tree rows match no tree here"};
         if (tailed_k != (header.layers_bytes >= sizeof(head_layers_header_t)))
-            return {status_code_t::malformed_k, "The run's layers do not match its key slots"};
+            return {status_code_t::malformed_k, "The run's layers do not match its slots"};
         if (carries_value_offsets_k && header.stored_values_bytes > (std::numeric_limits<stored_value_offset_t>::max)())
-            return {status_code_t::malformed_k, "The run claims more values than its offsets reach"};
+            return {status_code_t::malformed_k, "The run claims more values than offsets"};
         if (is_fixed(value_layout_k) && header.stored_values_bytes != header.key_slots_count * header.value_max_size)
-            return {status_code_t::malformed_k, "The run's values are not one width per key slot"};
+            return {status_code_t::malformed_k, "The run's values vary in width"};
         // Each length is held to the extent alone first, so no sum of them below can wrap past it
         std::uint64_t const room = extent_.extent.length;
         if (header.key_slots_count > room || header.stored_values_bytes > room || header.stamps_bytes > room ||
             header.kinds_bytes > room || header.key_tape_bytes > room || header.layers_bytes > room ||
             header.range_tombstones_count > room || header.range_tombstones_bytes > room)
-            return {status_code_t::malformed_k, "A section of the run is longer than its extent"};
+            return {status_code_t::malformed_k, "A run section outgrows the run extent"};
         if (sections_end_(header) > room)
-            return {status_code_t::malformed_k, "The run claims more bytes than its extent holds"};
+            return {status_code_t::malformed_k, "The run claims more bytes than its extent"};
         if (header.newest_stamp < header.stamps_floor)
             return {status_code_t::malformed_k, "The run's newest stamp is below its floor"};
 
@@ -2059,20 +2061,20 @@ class lsm_sorted_run {
             if (status_t const cells = read_cells_(channel); cells.failed()) return cells;
         if (tree_words_.resize(static_cast<std::size_t>(sorted_run_layout_t::keys_section_bytes(count) /
                                                         sizeof(std::uint64_t))) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A run could not hold the tree of its keys"};
+            return {status_code_t::out_of_memory_k, "No room for the key tree"};
         if (status_t const read = read_bytes_(channel, sorted_run_layout_t::keys_offset(count),
                                               std::as_writable_bytes(std::span<std::uint64_t> {tree_words_}));
             read.failed())
             return read;
-        st::expected<keys_view_t> const tree = keys_view_t::make(
-            std::as_bytes(std::span<std::uint64_t const> {tree_words_}));
-        if (!tree || tree->size() != count) return {status_code_t::malformed_k, "A run's tree disagrees with it"};
+        auto const [tree, tree_status] = keys_view_t::make(std::as_bytes(std::span<std::uint64_t const> {tree_words_}));
+        if (st::failed(tree_status) || tree.size() != count)
+            return {status_code_t::malformed_k, "A run's tree disagrees with it"};
         if constexpr (keeps_cells_k)
             for (std::uint64_t position = 0; position != count; ++position)
-                if (!(tree->select(static_cast<std::size_t>(position)) ==
+                if (!(tree.select(static_cast<std::size_t>(position)) ==
                       cells_[static_cast<std::size_t>(position)].stored_key))
                     return {status_code_t::malformed_k, "A run's tree disagrees with its cells"};
-        tree_ = *tree;
+        tree_ = tree;
         return {};
     }
 
@@ -2109,7 +2111,7 @@ class lsm_sorted_run {
             if (!completion.completed_in_full())
                 return completion.status.failed()
                            ? completion.status
-                           : status_t {status_code_t::malformed_k, "The run is shorter than its index"};
+                           : status_t {status_code_t::malformed_k, "A run index read came back short"};
 
             if (read < wanted) {
                 std::uint64_t const usable = wanted - read < chunk ? wanted - read : chunk;
@@ -2121,7 +2123,7 @@ class lsm_sorted_run {
     }
 
     /** Reads the @p into.size() bytes from @p offset of the extent, a whole number of pages,
-     *  into @p into. */
+     *  into @p into. A section that does not read whole forwards the transfer's own failure. */
     status_t read_bytes_(io_channel_t& channel, std::uint64_t offset, std::span<byte_t> into) noexcept {
         std::uint64_t const section = into.size();
         std::uint64_t const block = round_down_to_multiple(channel.requests().buffer_bytes(), portable_alignment_k);
@@ -2150,7 +2152,7 @@ class lsm_sorted_run {
             if (status_t const flushed = reader.submit(); flushed.failed()) return flushed;
             if (status_t const polled = reader.poll_all_completions(sink); polled.failed()) return polled;
         }
-        if (moved.failed()) return {status_code_t::malformed_k, "A run's section did not read whole"};
+        if (moved.failed()) return moved;
         return {};
     }
 
@@ -2164,14 +2166,14 @@ class lsm_sorted_run {
                                                                portable_alignment_k);
             if (value_offsets_.resize(static_cast<std::size_t>(section / sizeof(stored_value_offset_t))) !=
                 st::status_t::success_k)
-                return {status_code_t::out_of_memory_k, "A run could not hold its value offsets"};
+                return {status_code_t::out_of_memory_k, "No room for the value offset pages"};
             if (status_t const read = read_bytes_(channel, sorted_run_layout_t::value_offsets_offset(count),
                                                   bytes_of(value_offsets_.data(), value_offsets_.size()));
                 read.failed())
                 return read;
             // The section's last page is padded past the offsets, which the run keeps no copy of.
             if (value_offsets_.resize(static_cast<std::size_t>(count + 1)) != st::status_t::success_k)
-                return {status_code_t::out_of_memory_k, "A run could not hold its value offsets"};
+                return {status_code_t::out_of_memory_k, "A run could not trim its value offsets"};
             bool ascending = value_offsets_.front() == 0 && value_offsets_.back() == header_.stored_values_bytes;
             for (std::size_t index = 1; ascending && index != value_offsets_.size(); ++index)
                 ascending = value_offsets_[index - 1] <= value_offsets_[index];
@@ -2192,15 +2194,16 @@ class lsm_sorted_run {
                                               std::as_writable_bytes(std::span<std::uint64_t> {tree_words_}));
             read.failed())
             return read;
-        st::expected<heads_view_t> const heads = heads_view_t::make(
-            std::as_bytes(std::span<std::uint64_t const> {tree_words_}));
-        if (!heads || heads->size() != count) return {status_code_t::malformed_k, "A run's heads disagree with it"};
-        tree_ = *heads;
+        auto const [heads,
+                    heads_status] = heads_view_t::make(std::as_bytes(std::span<std::uint64_t const> {tree_words_}));
+        if (st::failed(heads_status) || heads.size() != count)
+            return {status_code_t::malformed_k, "A run's heads disagree with it"};
+        tree_ = heads;
 
         std::uint64_t const values_section = strings_layout_t::key_offsets_offset(count) -
                                              strings_layout_t::values_offset(count);
         if (values_.resize(static_cast<std::size_t>(values_section)) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A run could not hold its values"};
+            return {status_code_t::out_of_memory_k, "A run could not hold its values section"};
         if (status_t const read = read_bytes_(channel, strings_layout_t::values_offset(count),
                                               std::span<byte_t> {values_});
             read.failed())
@@ -2208,19 +2211,19 @@ class lsm_sorted_run {
         // The section's last page is padded past the values, which the run keeps no copy of.
         if (values_.resize(static_cast<std::size_t>(count * strings_layout_t::value_bytes_k)) !=
             st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A run could not hold its values"};
+            return {status_code_t::out_of_memory_k, "A run could not trim its values"};
 
         std::uint64_t const offsets_section = strings_layout_t::keys_offset(count) -
                                               strings_layout_t::key_offsets_offset(count);
         if (key_offsets_.resize(static_cast<std::size_t>(offsets_section / sizeof(std::uint32_t))) !=
             st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A run could not hold its key offsets"};
+            return {status_code_t::out_of_memory_k, "No room for the key offset pages"};
         if (status_t const read = read_bytes_(channel, strings_layout_t::key_offsets_offset(count),
                                               std::as_writable_bytes(std::span<std::uint32_t> {key_offsets_}));
             read.failed())
             return read;
         if (key_offsets_.resize(static_cast<std::size_t>(count + 1)) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A run could not hold its key offsets"};
+            return {status_code_t::out_of_memory_k, "A run could not trim its key offsets"};
         bool ascending = key_offsets_.front() == 0 && key_offsets_.back() == header_.key_tape_bytes;
         for (std::size_t index = 1; ascending && index != key_offsets_.size(); ++index)
             ascending = key_offsets_[index - 1] <= key_offsets_[index];
@@ -2229,12 +2232,12 @@ class lsm_sorted_run {
         std::uint64_t const keys_section = strings_layout_t::stamps_offset(count, header_.key_tape_bytes) -
                                            strings_layout_t::keys_offset(count);
         if (keys_.resize(static_cast<std::size_t>(keys_section)) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A run could not hold its keys"};
+            return {status_code_t::out_of_memory_k, "A run could not hold its keys section"};
         if (status_t const read = read_bytes_(channel, strings_layout_t::keys_offset(count), std::span<byte_t> {keys_});
             read.failed())
             return read;
         if (keys_.resize(static_cast<std::size_t>(header_.key_tape_bytes)) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A run could not hold its keys"};
+            return {status_code_t::out_of_memory_k, "A run could not trim its keys"};
         return read_layers_(channel);
     }
 
@@ -2245,7 +2248,7 @@ class lsm_sorted_run {
         std::uint64_t const section = round_up_to_multiple(header_.layers_bytes, portable_alignment_k);
         st::vector<std::uint64_t> words;
         if (words.resize(static_cast<std::size_t>(section / sizeof(std::uint64_t))) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A run could not hold its layers"};
+            return {status_code_t::out_of_memory_k, "A run could not hold its layer words"};
         if (status_t const read = read_bytes_(channel, offset,
                                               std::as_writable_bytes(std::span<std::uint64_t> {words}));
             read.failed())
@@ -2257,12 +2260,12 @@ class lsm_sorted_run {
         if (layers_header.layers_count > section / sizeof(head_layer_t) ||
             sizeof(layers_header) + list_bytes + layers_header.trees_bytes != header_.layers_bytes ||
             layers_header.trees_bytes % sizeof(std::uint64_t) != 0)
-            return {status_code_t::malformed_k, "A run's layers claim more bytes than they hold"};
+            return {status_code_t::malformed_k, "The run layers claim more bytes than exist"};
         byte_t const* const bytes = bytes_of(words.data(), words.size()).data();
         if (layers_.resize(static_cast<std::size_t>(layers_header.layers_count)) != st::status_t::success_k ||
             layer_words_.resize(static_cast<std::size_t>(layers_header.trees_bytes / sizeof(std::uint64_t))) !=
                 st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A run could not hold its layers"};
+            return {status_code_t::out_of_memory_k, "A run could not hold its layer trees"};
         if (list_bytes != 0)
             std::memcpy(layers_.data(), bytes + sizeof(layers_header), static_cast<std::size_t>(list_bytes));
         if (layers_header.trees_bytes != 0)
@@ -2274,8 +2277,8 @@ class lsm_sorted_run {
                 layer.heads_offset + layer.heads_bytes > layers_header.trees_bytes ||
                 layer.first + layer.count > header_.key_slots_count || layer.depth == 0)
                 return {status_code_t::malformed_k, "A run's layer reaches past its run"};
-            st::expected<heads_view_t> const heads = heads_view_t::make(layer_bytes_(layer));
-            if (!heads || heads->size() != layer.count)
+            auto const [heads, heads_status] = heads_view_t::make(layer_bytes_(layer));
+            if (st::failed(heads_status) || heads.size() != layer.count)
                 return {status_code_t::malformed_k, "A run's layer heads disagree with it"};
         }
         return {};
@@ -2292,36 +2295,34 @@ class lsm_sorted_run {
             return {status_code_t::out_of_memory_k, "A run could not hold its trailer"};
         if (status_t const read = read_bytes_(channel, offset, std::span<byte_t> {saved}); read.failed()) return read;
 
-        st::expected<st::immutable_packed_array_view<std::uint64_t>> view =
-            st::immutable_packed_array_view<std::uint64_t>::make(
-                std::span<byte_t const> {saved.data(), static_cast<std::size_t>(header_.stamps_bytes)});
-        if (!view || view->size() != header_.key_slots_count || view->base() != header_.stamps_floor)
+        auto const [view, view_status] = st::immutable_packed_array_view<std::uint64_t>::make(
+            std::span<byte_t const> {saved.data(), static_cast<std::size_t>(header_.stamps_bytes)});
+        if (st::failed(view_status) || view.size() != header_.key_slots_count || view.base() != header_.stamps_floor)
             return {status_code_t::malformed_k, "A run's stamps disagree with its header"};
         std::array<std::uint64_t, 64> unpacked {};
         auto fill = [&](std::size_t position) noexcept {
-            std::size_t const count = fu::min_of(unpacked.size(), view->size() - position);
-            for (std::size_t index = 0; index != count; ++index) unpacked[index] = (*view)[position + index];
+            std::size_t const count = fu::min_of(unpacked.size(), view.size() - position);
+            for (std::size_t index = 0; index != count; ++index) unpacked[index] = view[position + index];
             return st::expected<std::span<std::uint64_t const>>(std::span<std::uint64_t const> {unpacked.data(), count},
                                                                 st::status_t::success_k);
         };
-        st::expected<stamps_column_t> column = stamps_column_t::make(view->size(), header_.stamps_floor,
-                                                                     header_.newest_stamp, fill);
-        if (!column)
-            return column.status() == st::status_t::out_of_memory_heap_k
+        auto [column, column_status] = stamps_column_t::make(view.size(), header_.stamps_floor, header_.newest_stamp,
+                                                             fill);
+        if (st::failed(column_status))
+            return column_status == st::status_t::out_of_memory_heap_k
                        ? status_t {status_code_t::out_of_memory_k, "A run could not hold its stamps"}
                        : status_t {status_code_t::malformed_k, "A run carries a stamp past its newest"};
-        stamps_ = std::move(*column);
+        stamps_ = std::move(column);
 
-        st::expected<st::immutable_packed_array_view<std::uint8_t>> kinds =
-            st::immutable_packed_array_view<std::uint8_t>::make(std::span<byte_t const> {
-                saved.data() + header_.stamps_bytes, static_cast<std::size_t>(header_.kinds_bytes)});
-        if (!kinds || kinds->size() != header_.key_slots_count)
+        auto const [kinds, kinds_status] = st::immutable_packed_array_view<std::uint8_t>::make(std::span<byte_t const> {
+            saved.data() + header_.stamps_bytes, static_cast<std::size_t>(header_.kinds_bytes)});
+        if (st::failed(kinds_status) || kinds.size() != header_.key_slots_count)
             return {status_code_t::malformed_k, "A run's kinds disagree with its header"};
         std::array<std::uint8_t, 64> unpacked_kinds {};
         auto fill_kinds = [&](std::size_t position) noexcept {
-            std::size_t const count = fu::min_of(unpacked_kinds.size(), kinds->size() - position);
+            std::size_t const count = fu::min_of(unpacked_kinds.size(), kinds.size() - position);
             for (std::size_t index = 0; index != count; ++index) {
-                unpacked_kinds[index] = (*kinds)[position + index];
+                unpacked_kinds[index] = kinds[position + index];
                 if (unpacked_kinds[index] > static_cast<std::uint8_t>(delta_kind_t::change_k))
                     return st::expected<std::span<std::uint8_t const>>(st::status_t::invalid_argument_k);
             }
@@ -2329,14 +2330,14 @@ class lsm_sorted_run {
                 std::span<std::uint8_t const> {unpacked_kinds.data(), count}, st::status_t::success_k);
         };
         // Rebuilt as wide as it was saved, so the kinds the column can hold read the same.
-        std::uint64_t const widest = kinds->bits() != 0 ? (std::uint64_t {1} << kinds->bits()) - 1 : 0;
-        st::expected<kinds_column_t> kinds_column = kinds_column_t::make(
-            kinds->size(), kinds->base(), static_cast<std::uint8_t>(kinds->base() + widest), fill_kinds);
-        if (!kinds_column)
-            return kinds_column.status() == st::status_t::out_of_memory_heap_k
+        std::uint64_t const widest = kinds.bits() != 0 ? (std::uint64_t {1} << kinds.bits()) - 1 : 0;
+        auto [kinds_column, kinds_column_status] = kinds_column_t::make(
+            kinds.size(), kinds.base(), static_cast<std::uint8_t>(kinds.base() + widest), fill_kinds);
+        if (st::failed(kinds_column_status))
+            return kinds_column_status == st::status_t::out_of_memory_heap_k
                        ? status_t {status_code_t::out_of_memory_k, "A run could not hold its kinds"}
                        : status_t {status_code_t::malformed_k, "A run carries a kind no delta has"};
-        kinds_ = std::move(*kinds_column);
+        kinds_ = std::move(kinds_column);
         return {};
     }
 
@@ -2349,14 +2350,14 @@ class lsm_sorted_run {
         st::vector<byte_t> saved;
         if (saved.resize(static_cast<std::size_t>(
                 round_up_to_multiple(header_.range_tombstones_bytes, portable_alignment_k))) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A run could not hold its range tombstones"};
+            return {status_code_t::out_of_memory_k, "A run could not hold its tombstone section"};
         if (status_t const read = read_bytes_(channel, range_tombstones_offset_(header_), std::span<byte_t> {saved});
             read.failed())
             return read;
         st::vector<range_t> ranges;
         st::vector<std::uint64_t> stamps;
         if (ranges.resize(count) != st::status_t::success_k || stamps.resize(count) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A run could not hold its range tombstones"};
+            return {status_code_t::out_of_memory_k, "A run could not hold its tombstone bounds"};
         std::size_t const stamps_bytes = count * sizeof(std::uint64_t);
         if constexpr (tailed_k) {
             std::size_t const offsets_bytes = (2 * count + 1) * sizeof(std::uint32_t);

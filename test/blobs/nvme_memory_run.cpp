@@ -108,38 +108,38 @@ static void test_refusals() {
     expect_true(sealed_t::seal(loaded_removal).code() == status_code_t::invalid_argument_k);
 
     std::vector<keyed_delta_t> deltas {{3, {delta_kind_t::write_k, payload}}};
-    expected<sealed_t> sealed = sealed_t::seal(deltas);
-    if (!expect_true(sealed.has_value())) return;
-    expect_true(run_t::stamped(std::move(*sealed), unwritten_stamp_k).code() == status_code_t::invalid_argument_k);
+    auto [sealed, seal_status] = sealed_t::seal(deltas);
+    if (!expect_true(seal_status.succeeded())) return;
+    expect_true(run_t::stamped(std::move(sealed), unwritten_stamp_k).code() == status_code_t::invalid_argument_k);
 
     std::vector<keyed_delta_t> newer {{3, {delta_kind_t::write_k, payload}}};
     std::vector<keyed_delta_t> older {{4, {delta_kind_t::write_k, payload}}};
-    expected<run_t> newer_run = run_t::stamped(*sealed_t::seal(newer), 9);
-    expected<run_t> older_run = run_t::stamped(*sealed_t::seal(older), 9);
-    if (!expect_true(newer_run.has_value() && older_run.has_value())) return;
+    auto [newer_run, stamp_newer_status] = run_t::stamped(*sealed_t::seal(newer), 9);
+    auto [older_run, stamp_older_status] = run_t::stamped(*sealed_t::seal(older), 9);
+    if (!expect_true(stamp_newer_status.succeeded() && stamp_older_status.succeeded())) return;
     view_t const empty;
-    expected<view_t> holding = view_t::extended(empty, *newer_run);
-    if (!expect_true(holding.has_value())) return;
-    expect_true(view_t::extended(*holding, *older_run).code() == status_code_t::invalid_argument_k);
+    auto [holding, extend_status] = view_t::extended(empty, newer_run);
+    if (!expect_true(extend_status.succeeded())) return;
+    expect_true(view_t::extended(holding, older_run).code() == status_code_t::invalid_argument_k);
 }
 
 /** A removal and a write of no bytes read back apart, which a sentinel offset or size used to decide. */
 static void test_removal_and_empty_value_differ() {
     std::vector<keyed_delta_t> deltas {{20, {delta_kind_t::remove_k, {}}}, {10, {delta_kind_t::write_k, {}}}};
-    expected<sealed_t> sealed = sealed_t::seal(deltas);
-    if (!expect_true(sealed.has_value())) return;
-    expected<run_t> stamped = run_t::stamped(std::move(*sealed), 5);
-    if (!expect_true(stamped.has_value())) return;
+    auto [sealed, seal_status] = sealed_t::seal(deltas);
+    if (!expect_true(seal_status.succeeded())) return;
+    auto [stamped, stamp_status] = run_t::stamped(std::move(sealed), 5);
+    if (!expect_true(stamp_status.succeeded())) return;
     view_t const empty;
-    expected<view_t> view = view_t::extended(empty, *stamped);
-    if (!expect_true(view.has_value())) return;
+    auto [view, extend_status] = view_t::extended(empty, stamped);
+    if (!expect_true(extend_status.succeeded())) return;
 
     delta_view_t found;
-    expect_true(view->find(10, 5, found) && found.kind == delta_kind_t::write_k && found.bytes.empty());
-    expect_true(view->find(20, 5, found) && found.kind == delta_kind_t::remove_k && found.bytes.empty());
-    expect_true(!view->find(10, 4, found) && !view->find(30, 5, found));
-    expect_true(view->written_since(20, 4) && !view->written_since(20, 5) && !view->written_since(30, 0));
-    expect_true(view->range_written_since(11, 20, 4) && !view->range_written_since(11, 19, 4));
+    expect_true(view.find(10, 5, found) && found.kind == delta_kind_t::write_k && found.bytes.empty());
+    expect_true(view.find(20, 5, found) && found.kind == delta_kind_t::remove_k && found.bytes.empty());
+    expect_true(!view.find(10, 4, found) && !view.find(30, 5, found));
+    expect_true(view.written_since(20, 4) && !view.written_since(20, 5) && !view.written_since(30, 0));
+    expect_true(view.range_written_since(11, 20, 4) && !view.range_written_since(11, 19, 4));
 }
 
 /** Sorting orders deltas by key, by insertion below 64 entries and by radix from there, through
@@ -159,7 +159,7 @@ static void test_sort_orders_by_key() {
         std::sort(reference.begin(), reference.end(), [](wide_delta_t const& first, wide_delta_t const& second) {
             return first.stored_key < second.stored_key;
         });
-        utilities::sort_by_stored_key(std::span<wide_delta_t> {deltas});
+        util::sort_by_stored_key(std::span<wide_delta_t> {deltas});
         std::size_t mismatched = 0;
         for (std::size_t index = 0; index != count; ++index)
             mismatched += deltas[index].stored_key != reference[index].stored_key;
@@ -185,30 +185,30 @@ static void test_range_tombstones_hide_older_runs() {
     range_t const backwards {35, 15};
     expect_true(sealed_t::seal(ranged, std::span<range_t const> {&backwards, 1}).code() ==
                 status_code_t::invalid_argument_k);
-    expected<run_t> first = run_t::stamped(*sealed_t::seal(oldest), 5);
-    expected<run_t> second = run_t::stamped(*sealed_t::seal(ranged, std::span<range_t const> {&range, 1}), 7);
-    expected<run_t> third = run_t::stamped(*sealed_t::seal(newest), 9);
-    if (!expect_true(first.has_value() && second.has_value() && third.has_value())) return;
-    expect_true(second->newest_stamp() == 7 && second->range_tombstones().size() == 1);
+    auto [first, first_status] = run_t::stamped(*sealed_t::seal(oldest), 5);
+    auto [second, second_status] = run_t::stamped(*sealed_t::seal(ranged, std::span<range_t const> {&range, 1}), 7);
+    auto [third, third_status] = run_t::stamped(*sealed_t::seal(newest), 9);
+    if (!expect_true(first_status.succeeded() && second_status.succeeded() && third_status.succeeded())) return;
+    expect_true(second.newest_stamp() == 7 && second.range_tombstones().size() == 1);
 
     view_t const empty;
-    expected<view_t> one = view_t::extended(empty, *first);
-    if (!expect_true(one.has_value())) return;
-    expected<view_t> two = view_t::extended(*one, *second);
-    if (!expect_true(two.has_value())) return;
-    expected<view_t> view = view_t::extended(*two, *third);
-    if (!expect_true(view.has_value())) return;
-    expect_true(view->covering_stamp(20, 9) == 7 && view->covering_stamp(20, 6) == unwritten_stamp_k);
-    expect_true(view->covering_stamp(10, 9) == unwritten_stamp_k && view->covering_stamp(35, 9) == 0);
-    expect_true(view->written_since(20, 6) && !view->written_since(20, 7) && !view->written_since(10, 5));
-    expect_true(view->range_written_since(16, 18, 6) && !view->range_written_since(16, 18, 7));
+    auto [one, extend_one_status] = view_t::extended(empty, first);
+    if (!expect_true(extend_one_status.succeeded())) return;
+    auto [two, extend_two_status] = view_t::extended(one, second);
+    if (!expect_true(extend_two_status.succeeded())) return;
+    auto [view, extend_status] = view_t::extended(two, third);
+    if (!expect_true(extend_status.succeeded())) return;
+    expect_true(view.covering_stamp(20, 9) == 7 && view.covering_stamp(20, 6) == unwritten_stamp_k);
+    expect_true(view.covering_stamp(10, 9) == unwritten_stamp_k && view.covering_stamp(35, 9) == 0);
+    expect_true(view.written_since(20, 6) && !view.written_since(20, 7) && !view.written_since(10, 5));
+    expect_true(view.range_written_since(16, 18, 6) && !view.range_written_since(16, 18, 7));
 
-    run_t const* const runs[3] {std::addressof(*third), std::addressof(*second), std::addressof(*first)};
+    run_t const* const runs[3] {std::addressof(third), std::addressof(second), std::addressof(first)};
     auto const kept_keys = [&](compaction_stamps_t const& survival, std::span<stored_key_t const> wanted) {
         versions_t versions;
         // The last-write fold composes nothing, so it never allocates from the arena it is given.
-        utilities::arena_allocator<byte_t> folded_bytes;
-        if (!expect_true(kept_versions(std::span<run_t const* const> {runs}, survival, utilities::last_write_fold_t {},
+        util::arena_allocator<byte_t> folded_bytes;
+        if (!expect_true(kept_versions(std::span<run_t const* const> {runs}, survival, util::last_write_fold_t {},
                                        versions, folded_bytes)
                              .succeeded()))
             return;
@@ -268,14 +268,14 @@ static void test_random_streams_match_model() {
                 model[stored_key].push_back(model_version_t {stamp, kind, payload});
             }
 
-            expected<sealed_t> sealed = sealed_t::seal(deltas);
-            if (!expect_true(sealed.has_value())) return;
-            expected<run_t> stamped = run_t::stamped(std::move(*sealed), stamp);
-            if (!expect_true(stamped.has_value())) return;
-            runs.push_back(std::move(*stamped));
-            expected<view_t> extended = view_t::extended(views.back(), runs.back());
-            if (!expect_true(extended.has_value())) return;
-            views.push_back(std::move(*extended));
+            auto [sealed, seal_status] = sealed_t::seal(deltas);
+            if (!expect_true(seal_status.succeeded())) return;
+            auto [stamped, stamp_status] = run_t::stamped(std::move(sealed), stamp);
+            if (!expect_true(stamp_status.succeeded())) return;
+            runs.push_back(std::move(stamped));
+            auto [extended, extend_status] = view_t::extended(views.back(), runs.back());
+            if (!expect_true(extend_status.succeeded())) return;
+            views.push_back(std::move(extended));
             view_t const& view = views.back();
             if (!expect_true(view.newest_stamp() == stamp && view.runs().size() == stamp)) return;
 
@@ -313,7 +313,7 @@ struct appending_fold_t {
     std::vector<bytes_t>* folded = nullptr;
 
     expected<std::span<byte_t const>> apply(std::span<byte_t const> base, std::span<delta_view_t const> deltas,
-                                            utilities::arena_allocator<byte_t>&) const noexcept {
+                                            util::arena_allocator<byte_t>&) const noexcept {
         bytes_t& joined = folded->emplace_back(base.begin(), base.end());
         for (delta_view_t const& delta : deltas) {
             if (delta.kind != delta_kind_t::change_k) joined.clear();
@@ -323,7 +323,7 @@ struct appending_fold_t {
     }
 
     expected<std::span<byte_t const>> compose(std::span<delta_view_t const> deltas,
-                                              utilities::arena_allocator<byte_t>& arena) const noexcept {
+                                              util::arena_allocator<byte_t>& arena) const noexcept {
         return apply({}, deltas, arena);
     }
 
@@ -406,33 +406,33 @@ static void test_merges_keep_values_intact() {
             }
         }
         byte_t const* const lent_bytes = lent.data();
-        expected<sealed_t> sealed = sealed_t::seal(deltas, {}, {}, std::span<byte_t const> {lent});
-        if (!expect_true(sealed.has_value())) return;
-        sealed->adopt(lent);
-        if (!expect_true(lent_bytes == nullptr || (lent.empty() && sealed->bases().front() == lent_bytes))) return;
-        expected<run_t> stamped = run_t::stamped(std::move(*sealed), stamp);
-        if (!expect_true(stamped.has_value())) return;
-        runs.push_back(std::make_unique<run_t>(std::move(*stamped)));
+        auto [sealed, seal_status] = sealed_t::seal(deltas, {}, {}, std::span<byte_t const> {lent});
+        if (!expect_true(seal_status.succeeded())) return;
+        sealed.adopt(lent);
+        if (!expect_true(lent_bytes == nullptr || (lent.empty() && sealed.bases().front() == lent_bytes))) return;
+        auto [stamped, stamp_status] = run_t::stamped(std::move(sealed), stamp);
+        if (!expect_true(stamp_status.succeeded())) return;
+        runs.push_back(std::make_unique<run_t>(std::move(stamped)));
 
         while (runs.size() >= fan_in_k && runs[runs.size() - fan_in_k]->tier() == runs.back()->tier()) {
             std::vector<run_t const*> const listed = newest_first();
             std::span<run_t const* const> const group {listed.data(), fan_in_k};
             st::vector<stamped_delta<stored_key_t>> versions;
             std::vector<bytes_t> folded;
-            utilities::arena_allocator<byte_t> unused;
+            util::arena_allocator<byte_t> unused;
             if (!expect_true(kept_versions(group, compaction_stamps_t {}, appending_fold_t {&folded}, versions, unused)
                                  .succeeded()))
                 return;
             auto [tombstones, tombstones_status] = gathered_range_tombstones(group, st::default_allocator<byte_t> {});
             if (!expect_true(tombstones_status.succeeded())) return;
-            expected<run_t> merged = run_t::merged(group, std::span<stamped_delta<stored_key_t> const> {versions},
-                                                   std::move(tombstones), group.back()->oldest_stamp(),
-                                                   group.back()->tier());
-            if (!expect_true(merged.has_value())) return;
+            auto [merged, merge_status] = run_t::merged(group, std::span<stamped_delta<stored_key_t> const> {versions},
+                                                        std::move(tombstones), group.back()->oldest_stamp(),
+                                                        group.back()->tier());
+            if (!expect_true(merge_status.succeeded())) return;
             for (std::size_t index = runs.size() - fan_in_k; index != runs.size(); ++index)
-                merged->inherit(std::move(*runs[index]));
+                merged.inherit(std::move(*runs[index]));
             runs.resize(runs.size() - fan_in_k);
-            runs.push_back(std::make_unique<run_t>(std::move(*merged)));
+            runs.push_back(std::make_unique<run_t>(std::move(merged)));
         }
 
         std::vector<run_t const*> const listed = newest_first();
@@ -505,26 +505,26 @@ static void test_readers_against_one_publisher() {
                                                                                  : std::span<byte_t const>(payload);
             keyed_delta_t first_delta {key_of(stamp), {kind, bytes}};
             keyed_delta_t second_delta {key_of(stamp), {kind, bytes}};
-            expected<sealed_t> first_sealed = sealed_t::seal(std::span<keyed_delta_t>(&first_delta, 1));
-            expected<sealed_t> second_sealed = sealed_t::seal(std::span<keyed_delta_t>(&second_delta, 1));
-            if (!expect_true(first_sealed.has_value() && second_sealed.has_value())) return;
+            auto [first_sealed, seal_first_status] = sealed_t::seal(std::span<keyed_delta_t>(&first_delta, 1));
+            auto [second_sealed, seal_second_status] = sealed_t::seal(std::span<keyed_delta_t>(&second_delta, 1));
+            if (!expect_true(seal_first_status.succeeded() && seal_second_status.succeeded())) return;
 
             st::commit_order_t::commit_in_flight_t in_flight;
             order.begin_commit(in_flight);
             transaction_stamp_t const drawn = static_cast<transaction_stamp_t>(in_flight.stamp());
             if (!expect_true(drawn == stamp)) return;
-            expected<run_t> first_run = run_t::stamped(std::move(*first_sealed), drawn);
-            expected<run_t> second_run = run_t::stamped(std::move(*second_sealed), drawn);
-            if (!expect_true(first_run.has_value() && second_run.has_value())) return;
-            first_runs.push_back(std::move(*first_run));
-            second_runs.push_back(std::move(*second_run));
-            expected<view_t> first_view = view_t::extended(first_current->view, first_runs.back());
-            expected<view_t> second_view = view_t::extended(second_current->view, second_runs.back());
-            if (!expect_true(first_view.has_value() && second_view.has_value())) return;
+            auto [first_run, stamp_first_status] = run_t::stamped(std::move(first_sealed), drawn);
+            auto [second_run, stamp_second_status] = run_t::stamped(std::move(second_sealed), drawn);
+            if (!expect_true(stamp_first_status.succeeded() && stamp_second_status.succeeded())) return;
+            first_runs.push_back(std::move(first_run));
+            second_runs.push_back(std::move(second_run));
+            auto [first_view, extend_first_status] = view_t::extended(first_current->view, first_runs.back());
+            auto [second_view, extend_second_status] = view_t::extended(second_current->view, second_runs.back());
+            if (!expect_true(extend_first_status.succeeded() && extend_second_status.succeeded())) return;
             held_view_t* const first_next = held();
             held_view_t* const second_next = held();
-            first_next->view = std::move(*first_view);
-            second_next->view = std::move(*second_view);
+            first_next->view = std::move(first_view);
+            second_next->view = std::move(second_view);
             [[maybe_unused]] view_t const* const first_replaced = first.replace(first_next->view);
             [[maybe_unused]] view_t const* const second_replaced = second.replace(second_next->view);
             order.end_commit(in_flight);

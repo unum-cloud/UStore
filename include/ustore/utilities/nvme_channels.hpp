@@ -729,11 +729,11 @@ class basic_io_channel_pool {
                                                 std::size_t shared_io_channels,
                                                 io_channel_config_t const& config) noexcept {
         if (shared_io_channels == 0)
-            return status_t {status_code_t::invalid_argument_k, "A mount keeps a channel for its own threads"};
+            return status_t {status_code_t::invalid_argument_k, "A mount keeps a channel per thread"};
         std::size_t const wanted = threads + shared_io_channels;
         std::uint64_t const per_channel = config.arena_bytes();
         if (per_channel == 0 || range.bytes().size() / per_channel < wanted)
-            return status_t {status_code_t::capacity_exhausted_k, "The arena does not hold a block for every channel"};
+            return status_t {status_code_t::capacity_exhausted_k, "The arena lacks a block per channel"};
 
         basic_io_channel_pool pool;
         pool.disk_ = &disk;
@@ -882,7 +882,7 @@ inline status_t require_completed_in_full(completed_buffer_t const& completed) n
     if (completed.state == completion_state_t::cancelled_k)
         return {status_code_t::uninitialized_k, "The queue_pair cancelled this transfer"};
     if (completed.status.failed()) return completed.status;
-    return {status_code_t::io_k, "The device moved fewer bytes than the request asked for"};
+    return {status_code_t::io_k, "The device moved fewer bytes than asked"};
 }
 
 #pragma endregion Polling
@@ -1027,7 +1027,7 @@ class basic_read_pipeline {
         std::size_t const before = outstanding_;
         while (outstanding_ == before) {
             if (disk_.outstanding(channel_.queue_pair()) == 0)
-                return {status_code_t::io_k, "The ring answered for every request, one of which never retired here"};
+                return {status_code_t::io_k, "The ring answered a request not retired here"};
             auto [seen, wait_completions_status] = wait_completions(sink);
             if (wait_completions_status.failed()) return wait_completions_status;
         }
@@ -1060,7 +1060,7 @@ class basic_read_pipeline {
     status_t offer_(medium_reference_t medium, extent_t extent, memory_reference_t into, std::span<byte_t> landing,
                     pooled_buffer_t&& block, request_tag_t tag) noexcept {
         if (extent.length > (std::numeric_limits<std::uint32_t>::max)())
-            return {status_code_t::invalid_argument_k, "A read asks for more bytes than one request carries"};
+            return {status_code_t::invalid_argument_k, "A read exceeds the bytes of one request"};
         std::size_t const position = position_(next_slot_);
         channel_.read_requests_[position] = read_request(medium, extent, into, channel_.token(next_slot_));
         channel_.read_blocks_[position] = std::move(block);
@@ -1305,7 +1305,7 @@ class basic_write_pipeline {
         if (completion.state == completion_state_t::cancelled_k)
             return {status_code_t::uninitialized_k, "The queue_pair cancelled this write"};
         if (completion.status.failed()) return completion.status;
-        return {status_code_t::capacity_exhausted_k, "The volume took fewer bytes than the write asked for"};
+        return {status_code_t::capacity_exhausted_k, "The volume took fewer bytes than written"};
     }
 
     /** The entry a completion belongs to, found by the ring tag it was minted with. */

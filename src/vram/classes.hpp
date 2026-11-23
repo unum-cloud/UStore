@@ -20,24 +20,21 @@
 
 namespace unum::ustore {
 
-using utilities::byte_t;
-using utilities::cuda_context_handle_t;
-using utilities::cuda_executor_t;
-using utilities::cuda_module_t;
-using utilities::expected;
-using utilities::gpu_device_t;
-using utilities::gpu_devices_capacity_k;
-using utilities::gpu_drivers_t;
-using utilities::gpu_vendor_t;
-using utilities::hip_executor_t;
-using utilities::hip_module_t;
-using utilities::kernel_table;
-using utilities::metal_executor_t;
-using utilities::metal_module_t;
-using utilities::status_code_t;
-using utilities::status_t;
-using utilities::vram_apple_kernel_names_k;
-using utilities::vram_kernel_names_k;
+using util::byte_t;
+using util::cuda_context_handle_t;
+using util::cuda_executor_t;
+using util::cuda_module_t;
+using util::gpu_device_t;
+using util::gpu_devices_capacity_k;
+using util::gpu_drivers_t;
+using util::gpu_vendor_t;
+using util::hip_executor_t;
+using util::hip_module_t;
+using util::kernel_table;
+using util::metal_executor_t;
+using util::metal_module_t;
+using util::vram_apple_kernel_names_k;
+using util::vram_kernel_names_k;
 
 /** The GPU generations UStore tells apart, the device twin of its CPU classes: a class implies its
  *  vendor, and a device takes its vendor's newest class whose code it runs. */
@@ -179,21 +176,21 @@ class kernel_tables {
      *    the bundle, an empty one included, or the bundle exports no kernel of a name.
      */
     template <typename api_type_, typename place_type_>
-    status_t load(api_type_ const& api, place_type_ place, int device, gpu_class_t gpu_class,
-                  std::span<char const* const> names) noexcept {
+    util::status_t load(api_type_ const& api, place_type_ place, int device, gpu_class_t gpu_class,
+                        std::span<char const* const> names) noexcept {
         if (device < 0 || device >= static_cast<int>(gpu_devices_capacity_k))
-            return {status_code_t::device_k, "The ordinal passes the devices UStore lists"};
+            return {util::status_code_t::device_k, "The ordinal passes the devices UStore lists"};
         if (table_of(device, gpu_class)) return {};
         std::span<byte_t const> const bundle = gpu_class_bundle(gpu_class);
-        expected<module_type_> loaded = module_type_::load(api, place, bundle);
-        if (!loaded) return loaded.status();
+        auto [bundle_module, status] = module_type_::load(api, place, bundle);
+        if (status.failed()) return status;
         kernel_table<module_type_>& table = tables_[device][static_cast<std::size_t>(gpu_class)];
         if (st::failed(table.functions.resize(names.size())))
-            return {status_code_t::out_of_memory_k, "No room for the kernel table of a bundle"};
+            return {util::status_code_t::out_of_memory_k, "No room for the bundle kernel table"};
         for (std::size_t index = 0; index != names.size(); ++index)
-            if (!(table.functions[index] = loaded->function(names[index])))
-                return {status_code_t::device_k, "The bundle exports no kernel of a name"};
-        table.device = device, table.module = std::move(*loaded), table.names = names;
+            if (!(table.functions[index] = bundle_module.function(names[index])))
+                return {util::status_code_t::device_k, "The bundle exports no kernel of a name"};
+        table.device = device, table.module = std::move(bundle_module), table.names = names;
         table.bundle = bundle.data();
         return {};
     }
@@ -223,30 +220,31 @@ class kernel_tables {
  *  - @c status_code_t::device_k The driver refused an NVIDIA device's primary context, or serves
  *    no such vendor.
  */
-inline status_t open_gpu_device(gpu_drivers_t& drivers, gpu_device_t const& device, gpu_class_t gpu_class,
-                                kernel_tables<cuda_module_t>& cuda_kernels, kernel_tables<hip_module_t>& hip_kernels,
-                                kernel_tables<metal_module_t>& metal_kernels) noexcept {
+inline util::status_t open_gpu_device(gpu_drivers_t& drivers, gpu_device_t const& device, gpu_class_t gpu_class,
+                                      kernel_tables<cuda_module_t>& cuda_kernels,
+                                      kernel_tables<hip_module_t>& hip_kernels,
+                                      kernel_tables<metal_module_t>& metal_kernels) noexcept {
     int const ordinal = static_cast<int>(device.vendor_ordinal);
     if (device.vendor == gpu_vendor_t::nvidia_k) {
         cuda_context_handle_t const context = drivers.retain_context(ordinal);
-        if (!context) return {status_code_t::device_k, "The driver refused the device's primary context"};
-        [[maybe_unused]] status_t const loaded = cuda_kernels.load(drivers.cuda, context, ordinal, gpu_class,
-                                                                   vram_kernel_names_k);
+        if (!context) return {util::status_code_t::device_k, "The driver refused the device's primary context"};
+        [[maybe_unused]] util::status_t const loaded = cuda_kernels.load(drivers.cuda, context, ordinal, gpu_class,
+                                                                         vram_kernel_names_k);
         return {};
     }
     if (device.vendor == gpu_vendor_t::amd_k) {
-        [[maybe_unused]] status_t const loaded = hip_kernels.load(drivers.hip, ordinal, ordinal, gpu_class,
-                                                                  vram_kernel_names_k);
+        [[maybe_unused]] util::status_t const loaded = hip_kernels.load(drivers.hip, ordinal, ordinal, gpu_class,
+                                                                        vram_kernel_names_k);
         return {};
     }
     if (device.vendor == gpu_vendor_t::apple_k) {
         void* const handle = drivers.metal_devices.device(ordinal);
-        if (!handle) return {status_code_t::device_k, "Metal lists no device of the ordinal"};
-        [[maybe_unused]] status_t const loaded = metal_kernels.load(drivers.metal, handle, ordinal, gpu_class,
-                                                                    vram_apple_kernel_names_k);
+        if (!handle) return {util::status_code_t::device_k, "Metal lists no device of the ordinal"};
+        [[maybe_unused]] util::status_t const loaded = metal_kernels.load(drivers.metal, handle, ordinal, gpu_class,
+                                                                          vram_apple_kernel_names_k);
         return {};
     }
-    return {status_code_t::device_k, "No driver serves the device's vendor"};
+    return {util::status_code_t::device_k, "No driver serves the device's vendor"};
 }
 
 /** Spawns into @p into the executor of @p device, which @c open_gpu_device opened for
@@ -256,38 +254,38 @@ inline status_t open_gpu_device(gpu_drivers_t& drivers, gpu_device_t const& devi
  *  launching the library's kernels from the table of its device and class in @p cuda_kernels,
  *  @p hip_kernels or @p metal_kernels, if one loaded. */
 template <typename variant_type_>
-status_t spawn_gpu_executor(gpu_drivers_t const& drivers, kernel_tables<cuda_module_t> const& cuda_kernels,
-                            kernel_tables<hip_module_t> const& hip_kernels,
-                            kernel_tables<metal_module_t> const& metal_kernels, gpu_device_t const& device,
-                            gpu_class_t gpu_class, void* stream, std::size_t scratch_limit, ustore_gds_t gds,
-                            variant_type_& into) noexcept {
+util::status_t spawn_gpu_executor(gpu_drivers_t const& drivers, kernel_tables<cuda_module_t> const& cuda_kernels,
+                                  kernel_tables<hip_module_t> const& hip_kernels,
+                                  kernel_tables<metal_module_t> const& metal_kernels, gpu_device_t const& device,
+                                  gpu_class_t gpu_class, void* stream, std::size_t scratch_limit, ustore_gds_t gds,
+                                  variant_type_& into) noexcept {
     int const ordinal = static_cast<int>(device.vendor_ordinal);
     if (device.vendor == gpu_vendor_t::nvidia_k) {
         if (device.vendor_ordinal >= gpu_devices_capacity_k)
-            return {status_code_t::device_k, "The CUDA ordinal passes the devices UStore lists"};
+            return {util::status_code_t::device_k, "The CUDA ordinal passes the devices UStore lists"};
         cuda_context_handle_t const context = drivers.cuda_contexts[device.vendor_ordinal];
-        expected<cuda_executor_t> spawned = cuda_executor_t::spawn(drivers.cuda, context, device, stream, scratch_limit,
-                                                                   gds, cuda_kernels.table_of(ordinal, gpu_class));
-        if (!spawned) return spawned.status();
-        into.template emplace<cuda_executor_t>(std::move(*spawned));
+        auto [executor, status] = cuda_executor_t::spawn(drivers.cuda, context, device, stream, scratch_limit, gds,
+                                                         cuda_kernels.table_of(ordinal, gpu_class));
+        if (status.failed()) return status;
+        into.template emplace<cuda_executor_t>(std::move(executor));
         return {};
     }
     if (device.vendor == gpu_vendor_t::amd_k) {
-        expected<hip_executor_t> spawned = hip_executor_t::spawn(drivers.hip, device, stream, scratch_limit,
-                                                                 hip_kernels.table_of(ordinal, gpu_class));
-        if (!spawned) return spawned.status();
-        into.template emplace<hip_executor_t>(std::move(*spawned));
+        auto [executor, status] = hip_executor_t::spawn(drivers.hip, device, stream, scratch_limit,
+                                                        hip_kernels.table_of(ordinal, gpu_class));
+        if (status.failed()) return status;
+        into.template emplace<hip_executor_t>(std::move(executor));
         return {};
     }
     if (device.vendor == gpu_vendor_t::apple_k) {
-        expected<metal_executor_t> spawned = metal_executor_t::spawn(
-            drivers.metal, drivers.metal_devices.device(ordinal), device, stream, scratch_limit,
-            metal_kernels.table_of(ordinal, gpu_class));
-        if (!spawned) return spawned.status();
-        into.template emplace<metal_executor_t>(std::move(*spawned));
+        auto [executor, status] = metal_executor_t::spawn(drivers.metal, drivers.metal_devices.device(ordinal), device,
+                                                          stream, scratch_limit,
+                                                          metal_kernels.table_of(ordinal, gpu_class));
+        if (status.failed()) return status;
+        into.template emplace<metal_executor_t>(std::move(executor));
         return {};
     }
-    return {status_code_t::device_k, "No driver serves the device's vendor"};
+    return {util::status_code_t::device_k, "No driver serves the device's vendor"};
 }
 
 } // namespace unum::ustore

@@ -17,7 +17,7 @@
 #include <leveldb/db.h>
 #include <leveldb/write_batch.h>
 
-#include "ustore/ranges.hpp" // `strided`, `strided_iterator`
+#include "ustore/utilities/ranges.hpp" // `strided`, `strided_iterator`
 
 #include "database.hpp"           // `database_t`, `string_key`, `seek_towards`, `seek_before`, `step_towards`
 #include "utilities/batches.hpp"  // `validate_choices`, `validate_direction`, `samples_of`, `sample_generator_t`

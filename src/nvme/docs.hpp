@@ -27,8 +27,8 @@
 
 #include <span> // `std::span`
 
-#include "ustore/docs.h"     // `ustore_docs_write_t`
-#include "ustore/ranges.hpp" // `place_batch_t`, `strided`
+#include "ustore/docs.h"               // `ustore_docs_write_t`
+#include "ustore/utilities/ranges.hpp" // `place_batch_t`, `strided`
 
 #include "ustore/docs/json_fold.hpp"        // `json_fold_t`, `json_delta_t`, `encode_deltas`, `encoded_size`
 #include "ustore/docs/json_values.hpp"      // `extract_keys`
@@ -89,7 +89,7 @@ status_t docs_write(ustore_docs_write_t const& arguments, strings_arg_t const& f
     if (!arguments.keys.data && id_field.empty())
         return {status_code_t::invalid_argument_k, "Documents without keys need an id field"};
     database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
-    if (status_t const resolved = resolve_runs(state, view, strided(arguments.collections), count,
+    if (status_t const resolved = resolve_runs(state, view, util::strided(arguments.collections), count,
                                                ustore_modality_docs_k);
         resolved.failed())
         return resolved;
@@ -97,7 +97,7 @@ status_t docs_write(ustore_docs_write_t const& arguments, strings_arg_t const& f
         return {status_code_t::invalid_argument_k, "Unknown modification"};
 
     ustore_arena_t const scratch = view.scratch;
-    place_batch_t places = places_of(arguments);
+    util::place_batch_t places = util::places_of(arguments);
     if (!arguments.keys.data) {
         auto [extracted, extract_status] = arena_allocate<ustore_key_t>(scratch, count);
         if (extract_status.failed()) return extract_status;

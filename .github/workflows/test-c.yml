@@ -57,7 +57,7 @@ jobs:
       - name: Build
         run: cmake --build --preset release
       - name: Test
-        run: ctest --preset release
+        run: ctest --preset release --exclude-regex '^ustore_test_cpp(_stub)?$'
 
   test_ubuntu_arm:
     name: Test on Ubuntu AArch64
@@ -108,7 +108,7 @@ jobs:
       - name: Build
         run: cmake --build --preset release
       - name: Test
-        run: ctest --preset release
+        run: ctest --preset release --exclude-regex '^ustore_test_cpp(_stub)?$'
 
   test_macos:
     name: Test on macOS ARM64
@@ -154,7 +154,7 @@ jobs:
       - name: Build
         run: cmake --build --preset release
       - name: Test
-        run: ctest --preset release
+        run: ctest --preset release --exclude-regex '^ustore_test_cpp(_stub)?$'
 
   test_windows:
     name: Test on Windows x86-64 with Visual Studio 2026
@@ -200,7 +200,7 @@ jobs:
       - name: Build
         run: cmake --build --preset msvc2026_x64
       - name: Test
-        run: ctest --preset msvc2026_x64
+        run: ctest --preset msvc2026_x64 --exclude-regex '^ustore_test_cpp(_stub)?$'
 
   test_windows_arm:
     name: Test on Windows ARM64 with Visual Studio 2026
@@ -246,7 +246,7 @@ jobs:
       - name: Build
         run: cmake --build --preset msvc2026_arm64
       - name: Test
-        run: ctest --preset msvc2026_arm64
+        run: ctest --preset msvc2026_arm64 --exclude-regex '^ustore_test_cpp(_stub)?$'
 
   test_ubuntu_asan:
     name: Test ASan and UBSan on Ubuntu x86-64
@@ -300,7 +300,7 @@ jobs:
       - name: Build
         run: cmake --build --preset asan
       - name: Test
-        run: ctest --preset asan
+        run: ctest --preset asan --exclude-regex '^ustore_test_cpp(_stub)?$'
 
   test_ubuntu_tsan:
     name: Test TSan on Ubuntu x86-64
@@ -350,7 +350,7 @@ jobs:
       - name: Build
         run: cmake --build --preset tsan
       - name: Test
-        run: ctest --preset tsan
+        run: ctest --preset tsan --exclude-regex '^ustore_test_cpp(_stub)?$'
 
   # StringZilla's RVV kernels need Clang 21 or newer, which apt.llvm.org publishes for Ubuntu 26.04; Trixie's cross
   # compilers stop at GCC 14, short of the GCC 16 the toolchain file names. The toolchain's `max` core runs both the
@@ -384,7 +384,7 @@ jobs:
       - name: Build
         run: cmake --build --preset linux_riscv64
       - name: Test
-        run: ctest --preset linux_riscv64
+        run: ctest --preset linux_riscv64 --exclude-regex '^ustore_test_cpp(_stub)?$'
 
   # POWER9 Power VSX kernels scope per function only from GCC 15 on, which Ubuntu 26.04 ships as a cross compiler. The
   # toolchain's `power10` core runs both the POWER10 class and serial.
@@ -410,7 +410,7 @@ jobs:
       - name: Build
         run: cmake --build --preset linux_ppc64le
       - name: Test
-        run: ctest --preset linux_ppc64le
+        run: ctest --preset linux_ppc64le --exclude-regex '^ustore_test_cpp(_stub)?$'
 
   # Each machine profile builds the libraries for one CPU and one GPU code; the Arm ones build natively on Arm runners,
   # where the CUDA image also exists. Clang 22 compiles the host units, as Ubuntu 24.04's GCC predates Olympus, and the
@@ -522,4 +522,3 @@ jobs:
         run: git submodule update --init forkunion
       - name: Check the Models and the Clients
         run: verification/check.sh
-

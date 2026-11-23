@@ -37,7 +37,6 @@ namespace unum::ustore {
 using namespace unum::ustore::blobs;
 using namespace unum::ustore::test;
 using namespace unum::ustore::test::nvme;
-using namespace unum::ustore::utilities;
 
 #pragma region Shape
 
@@ -45,7 +44,7 @@ using namespace unum::ustore::utilities;
 using stored_key_t = std::uint64_t;
 
 /** The sole collection the multi-collection registry is driven over here. */
-constexpr collection_id_t collection_k {uuid_from_integer(7)};
+constexpr collection_id_t collection_k {util::uuid_from_integer(7)};
 
 /** Bytes one value of this suite occupies, which is one word. */
 constexpr std::size_t value_bytes_k = sizeof(std::uint64_t);
@@ -127,35 +126,36 @@ class test_store_t {
     }
 
     /** Seals @p written for the commit that follows, flushing the collection first when it reports itself full. */
-    status_t seal_collection(collection_id_t collection_id,
-                             transaction_deltas<stored_key_t, atomic_reference, waiter_t> const& written,
-                             sealed_commit<stored_key_t, atomic_reference>& sealed) noexcept {
+    util::status_t seal_collection(collection_id_t collection_id,
+                                   transaction_deltas<stored_key_t, atomic_reference, waiter_t> const& written,
+                                   sealed_commit<stored_key_t, atomic_reference>& sealed) noexcept {
         if (behaviour == store_behaviour_t::always_flushing_k || behaviour == store_behaviour_t::refusing_flushes_k) {
             ++flushes;
             if (behaviour == store_behaviour_t::refusing_flushes_k)
-                return {status_code_t::device_k, "Refusing to flush"};
+                return {util::status_code_t::device_k, "Refusing to flush"};
         }
         st::vector<keyed_delta<stored_key_t>> deltas;
-        written.for_each_delta(collection_id, [&](stored_key_t stored_key, delta_view_t delta) noexcept {
+        written.for_each_delta(collection_id, [&](stored_key_t stored_key, util::delta_view_t delta) noexcept {
             [[maybe_unused]] st::status_t const kept = deltas.push_back(keyed_delta<stored_key_t> {stored_key, delta});
         });
         if (deltas.empty() && written.ranges(collection_id).empty()) return {};
         auto [sealed_deltas, seal_status] =
-            blobs::sealed_deltas<stored_key_t, constrained_allocator<byte_t, atomic_reference>>::seal(
+            blobs::sealed_deltas<stored_key_t, util::constrained_allocator<util::byte_t, atomic_reference>>::seal(
                 std::span<keyed_delta<stored_key_t>> {deltas}, written.ranges(collection_id),
-                constrained_allocator<byte_t, atomic_reference> {budget_});
+                util::constrained_allocator<util::byte_t, atomic_reference> {budget_});
         if (seal_status.failed()) return seal_status;
         sealed.deltas = std::move(sealed_deltas);
         return {};
     }
 
     /** Claims nothing, since balances live in place and need no memory-run record. */
-    status_t claim_memory_record(collection_id_t, memory_run_claim_t&) noexcept { return {}; }
+    util::status_t claim_memory_record(collection_id_t, memory_run_claim_t&) noexcept { return {}; }
 
     /** Takes the sealed changes for the commit that follows, or refuses them. */
-    status_t prepare_collection(collection_id_t, sealed_commit<stored_key_t, atomic_reference>&,
-                                memory_run_claim_t&&) noexcept {
-        if (behaviour == store_behaviour_t::refusing_applies_k) return {status_code_t::device_k, "Refusing to write"};
+    util::status_t prepare_collection(collection_id_t, sealed_commit<stored_key_t, atomic_reference>&,
+                                      memory_run_claim_t&&) noexcept {
+        if (behaviour == store_behaviour_t::refusing_applies_k)
+            return {util::status_code_t::device_k, "Refusing to write"};
         return {};
     }
 
@@ -165,9 +165,9 @@ class test_store_t {
         for (std::size_t position = 0; position != sealed.deltas.size(); ++position) {
             if (behaviour == store_behaviour_t::pausing_in_apply_k) wait_for_the_suite_();
             stored_key_t const stored_key = sealed.deltas.stored_key(position);
-            delta_view_t const delta = sealed.deltas.delta(position);
+            util::delta_view_t const delta = sealed.deltas.delta(position);
             std::uint64_t word = 0;
-            if (delta.kind == delta_kind_t::write_k && delta.bytes.size() == value_bytes_k)
+            if (delta.kind == util::delta_kind_t::write_k && delta.bytes.size() == value_bytes_k)
                 std::memcpy(&word, delta.bytes.data(), value_bytes_k);
             stamps_[stored_key] = stamp;
             balance_(stored_key).store(word, std::memory_order_release);
@@ -178,7 +178,7 @@ class test_store_t {
     void forget_collection(collection_id_t) noexcept {}
 
     /** Maintains nothing, since balances live in place. */
-    status_t maintain(collection_id_t) noexcept { return {}; }
+    util::status_t maintain(collection_id_t) noexcept { return {}; }
 
     /** The balance @p stored_key holds right now, which a later commit may already have moved. */
     std::uint64_t balance(stored_key_t stored_key) const noexcept {
@@ -284,9 +284,9 @@ class test_transaction_t {
 
     /** Watches @p stored_key on @p schedule for @p purpose, the way the real front ends do. */
     template <watch_schedule_t watch_schedule_>
-    status_t watch(stored_key_t stored_key, watch_purpose_t purpose) noexcept {
+    util::status_t watch(stored_key_t stored_key, watch_purpose_t purpose) noexcept {
         std::array<stored_key_t, 1> const only {stored_key};
-        status_t const prepared = core_.watch_now_or_prepare<watch_schedule_>(collection_k, only);
+        util::status_t const prepared = core_.watch_now_or_prepare<watch_schedule_>(collection_k, only);
         if (prepared.failed()) return prepared;
         core_.watch_later<watch_schedule_>(collection_k, only, core_.watch_stamp_for<watch_schedule_>(), purpose);
         return {};
@@ -294,7 +294,7 @@ class test_transaction_t {
 
     /** Writes @p word under @p stored_key, watching the key on @p watch_schedule_ beside the write. */
     template <watch_schedule_t watch_schedule_ = watch_schedule_t::on_commit_k>
-    status_t insert(stored_key_t stored_key, std::uint64_t word) noexcept {
+    util::status_t insert(stored_key_t stored_key, std::uint64_t word) noexcept {
         std::byte payload[value_bytes_k];
         std::memcpy(payload, &word, value_bytes_k);
         return core_.state().deltas.write(collection_k, widths_k, stored_key,
@@ -304,17 +304,17 @@ class test_transaction_t {
 
     /** Drops @p stored_key, watching the key on @p watch_schedule_ beside the write. */
     template <watch_schedule_t watch_schedule_ = watch_schedule_t::on_commit_k>
-    status_t remove(stored_key_t stored_key) noexcept {
+    util::status_t remove(stored_key_t stored_key) noexcept {
         return core_.state().deltas.remove(collection_k, widths_k, stored_key,
                                            core_.watch_stamp_for<watch_schedule_>());
     }
 
     /** Checks the watched keys and makes room in the store, holding the write path once it answers. */
-    status_t stage() noexcept { return core_.stage(); }
+    util::status_t stage() noexcept { return core_.stage(); }
 
     /** Lands the changes in the store, through the stage already holding the write path or
      *  on its own. */
-    status_t commit() noexcept { return core_.commit(); }
+    util::status_t commit() noexcept { return core_.commit(); }
 
     /** Drops every change and every watch, leaving the registry with no trace of the transaction. */
     void rollback() noexcept { core_.rollback(); }
@@ -323,7 +323,7 @@ class test_transaction_t {
     void unstage() noexcept { core_.unstage(); }
 
     /** Starts over with the changes kept, which a caller retrying a conflict asks for. */
-    status_t renew() noexcept { return core_.renew(); }
+    util::status_t renew() noexcept { return core_.renew(); }
 
     /** The stamp of the last commit this transaction landed. */
     transaction_stamp_t last_commit_stamp() const noexcept { return core_.last_commit_stamp(); }
@@ -356,7 +356,7 @@ struct fixture_t {
         : resources(std::make_shared<resources_t>(1ull << 30, 0)), store(), registry(store, resources) {}
 
     /** A transaction, or nothing when the registry refuses it. */
-    expected<std::unique_ptr<transaction_t>> open() noexcept {
+    util::expected<std::unique_ptr<transaction_t>> open() noexcept {
         transaction_config_t const config {deltas_bytes_k, deltas_max_count_k};
         return registry.create_transaction<transaction_t>(config);
     }
@@ -370,7 +370,7 @@ struct fixture_t {
 using transaction_deltas_t = transaction_deltas<stored_key_t, atomic_reference, waiter_t>;
 
 /** A second collection, whose keys the deltas keep apart from those of @c collection_k. */
-constexpr collection_id_t other_collection_k {uuid_from_integer(8)};
+constexpr collection_id_t other_collection_k {util::uuid_from_integer(8)};
 
 /** The last delta of a key wins inside its own collection alone, an empty value reads back empty, a value past the
  *  collection's width is refused, and every byte returns to the budget once the deltas die. */
@@ -379,23 +379,23 @@ static void test_deltas_read_back_per_collection() {
     {
         transaction_deltas_t deltas(deltas_bytes_k, deltas_max_count_k, resources);
         transaction_deltas_t::value_widths_t const widths {0, 4};
-        std::array<byte_t, 3> const first {byte_t {1}, byte_t {2}, byte_t {3}};
-        std::array<byte_t, 2> const second {byte_t {7}, byte_t {8}};
-        std::array<byte_t, 5> too_wide {};
+        std::array<util::byte_t, 3> const first {util::byte_t {1}, util::byte_t {2}, util::byte_t {3}};
+        std::array<util::byte_t, 2> const second {util::byte_t {7}, util::byte_t {8}};
+        std::array<util::byte_t, 5> too_wide {};
         expect_true(deltas.write(collection_k, widths, 1, first).succeeded());
         expect_true(deltas.write(other_collection_k, widths, 1, first).succeeded());
         expect_true(deltas.remove(collection_k, widths, 1).succeeded());
         expect_true(deltas.write(collection_k, widths, 1, second).succeeded());
         expect_true(deltas.remove(collection_k, widths, 2).succeeded());
         expect_true(deltas.write(collection_k, widths, 3, stored_value_view_t {}).succeeded());
-        expect_status(deltas.write(collection_k, widths, 4, too_wide), status_code_t::malformed_k);
+        expect_status(deltas.write(collection_k, widths, 4, too_wide), util::status_code_t::malformed_k);
         expect_equal(deltas.count(), std::size_t {4});
         expect_equal(deltas.count(collection_k), std::size_t {3});
         expect_true(deltas.lookup(collection_k, 2) == lookup_result_t::removed_k);
         expect_true(deltas.lookup(collection_k, 4) == lookup_result_t::missing_k);
         expect_true(deltas.lookup(other_collection_k, 2) == lookup_result_t::missing_k);
 
-        std::array<byte_t, 4> into {};
+        std::array<util::byte_t, 4> into {};
         stored_value_size_t size = 0;
         expect_true(deltas.select(collection_k, 1, into, size).succeeded());
         expect_equal(std::size_t {size}, second.size());
@@ -405,7 +405,7 @@ static void test_deltas_read_back_per_collection() {
         expect_true(std::memcmp(into.data(), first.data(), first.size()) == 0);
         expect_true(deltas.select(collection_k, 3, into, size).succeeded());
         expect_equal(std::size_t {size}, std::size_t {0});
-        expect_status(deltas.select(collection_k, 2, into, size), status_code_t::not_found_k);
+        expect_status(deltas.select(collection_k, 2, into, size), util::status_code_t::not_found_k);
     }
     expect_equal(resources->memory_constraint.used(), std::size_t {0});
 }
@@ -420,7 +420,7 @@ static void test_deltas_refuse_past_their_bound() {
     transaction_deltas_t::value_widths_t const widths {value_bytes_k, 0};
     for (stored_key_t key = 0; key != bound_k; ++key) expect_true(deltas.remove(collection_k, widths, key).succeeded());
     expect_equal(deltas.wanted_shape().max_deltas, std::size_t {0});
-    expect_status(deltas.remove(collection_k, widths, bound_k), status_code_t::capacity_exhausted_k);
+    expect_status(deltas.remove(collection_k, widths, bound_k), util::status_code_t::capacity_exhausted_k);
     expect_equal(deltas.wanted_shape().max_deltas, bound_k + 1);
     expect_equal(deltas.count(), bound_k);
     expect_true(deltas.lookup(collection_k, bound_k - 1) == lookup_result_t::removed_k);
@@ -432,7 +432,7 @@ static void test_deltas_refuse_past_their_bound() {
 #pragma region Ordering Cases
 
 /** A request that checks nothing and publishes nothing, which the sequencer still gives a stamp of its own. */
-static status_t prepare_nothing(void*) noexcept { return {}; }
+static util::status_t prepare_nothing(void*) noexcept { return {}; }
 static void publish_nothing(void*, transaction_stamp_t) noexcept {}
 
 /** Commits of many threads, combined by whichever of them leads, draw distinct stamps, and the watermark covers every
@@ -453,10 +453,10 @@ static void test_commit_stamps_are_distinct() {
                 commit_request_t request;
                 request.prepare = &prepare_nothing;
                 request.publish = &publish_nothing;
-                expected<transaction_stamp_t> const stamp = ledger.submit(request);
-                if (stamp) claimed[thread_index].push_back(*stamp);
+                auto const [stamp, status] = ledger.submit(request);
+                if (status.succeeded()) claimed[thread_index].push_back(stamp);
                 // The stamp is published on return, so the committer reads what it wrote.
-                if (!stamp || ledger.published() < *stamp)
+                if (status.failed() || ledger.published() < stamp)
                     atomic_reference<std::size_t> {unpublished}.fetch_add(1, std::memory_order_relaxed);
             }
         });
@@ -509,8 +509,8 @@ static void test_pins_answer_the_ledger() {
     request.context = &bounding;
     request.prepare = &prepare_nothing;
     request.publish = &publish_bounding;
-    expected<transaction_stamp_t> const landed = ledger.submit(request);
-    expect_true(landed && *landed == transaction_stamp_t {42});
+    auto const [landed, status] = ledger.submit(request);
+    expect_true(status.succeeded() && landed == transaction_stamp_t {42});
     expect_equal(ledger.published(), transaction_stamp_t {42});
     expect_equal(ledger.durable_stamp(), transaction_stamp_t {41});
     expect_equal(ledger.horizon_besides(view), transaction_stamp_t {42});
@@ -553,9 +553,9 @@ static void test_read_write_conflict_is_caught() {
     expect_true(writer->get()->insert(5, 42).succeeded());
     expect_true(writer->get()->commit().succeeded());
 
-    status_t const staged = reader->get()->stage();
+    util::status_t const staged = reader->get()->stage();
     expect_true(staged.failed());
-    expect_status(staged, status_code_t::write_conflict_k);
+    expect_status(staged, util::status_code_t::write_conflict_k);
     reader->get()->rollback();
 }
 
@@ -651,8 +651,8 @@ static void test_watch_schedules_behave() {
             expect_true(reader->get()->watch<watch_schedule_t::now_k>(5, watch_purpose_t::read_k).succeeded());
             expect_true(writer->get()->insert(5, 1).succeeded());
             expect_true(writer->get()->commit().succeeded());
-            status_t const late = reader->get()->watch<watch_schedule_t::now_k>(5, watch_purpose_t::read_k);
-            expect_status(late, status_code_t::write_conflict_k);
+            util::status_t const late = reader->get()->watch<watch_schedule_t::now_k>(5, watch_purpose_t::read_k);
+            expect_status(late, util::status_code_t::write_conflict_k);
             // Nothing was recorded for later, so the stage itself has nothing to refuse.
             expect_equal(reader->get()->state().read_set.count(), std::size_t {0});
             expect_true(reader->get()->stage().succeeded());
@@ -669,8 +669,8 @@ static void test_watch_schedules_behave() {
             expect_true(writer->get()->insert(5, 1).succeeded());
             expect_true(writer->get()->commit().succeeded());
             expect_true(reader->get()->watch<watch_schedule_t::on_commit_k>(5, watch_purpose_t::read_k).succeeded());
-            status_t const staged = reader->get()->stage();
-            expect_status(staged, status_code_t::write_conflict_k);
+            util::status_t const staged = reader->get()->stage();
+            expect_status(staged, util::status_code_t::write_conflict_k);
             reader->get()->rollback();
         }
     }
@@ -698,7 +698,7 @@ static void test_watch_schedules_behave() {
                                 .succeeded());
                 expect_true(second_writer->get()->insert(5, 2).succeeded());
                 expect_true(second_writer->get()->commit().succeeded());
-                expect_status(reader->get()->stage(), status_code_t::write_conflict_k);
+                expect_status(reader->get()->stage(), util::status_code_t::write_conflict_k);
                 reader->get()->rollback();
             }
         }
@@ -736,7 +736,7 @@ static void test_failed_commit_keeps_changes() {
 
     // A refused stage leaves them too, which is the other half of the same promise.
     fixture.store.behaviour = store_behaviour_t::refusing_flushes_k;
-    expect_status(transaction->get()->stage(), status_code_t::device_k);
+    expect_status(transaction->get()->stage(), util::status_code_t::device_k);
     expect_equal(transaction->get()->state().deltas.count(), std::size_t {2});
 
     // The refused stage handed the write path back, so the retry can still take it.
@@ -821,7 +821,7 @@ static void test_long_watchers_stay_exact() {
         if (writer->get()->commit().failed()) expect_true(false);
     }
 
-    expect_status(lingering->get()->stage(), status_code_t::write_conflict_k);
+    expect_status(lingering->get()->stage(), util::status_code_t::write_conflict_k);
     lingering->get()->rollback();
     expect_true(untouched->get()->stage().succeeded());
     untouched->get()->rollback();
@@ -946,7 +946,7 @@ static void test_start_during_apply_still_conflicts() {
     expect_equal(seen, initial_balance_k);
     if (reader.has_value()) {
         fixture.store.behaviour = store_behaviour_t::accepting_k;
-        expect_status(reader->get()->stage(), status_code_t::write_conflict_k);
+        expect_status(reader->get()->stage(), util::status_code_t::write_conflict_k);
         reader->get()->rollback();
     }
 }
@@ -969,7 +969,7 @@ static void test_pins_survive_churn() {
                 ++opened[thread_index];
                 if (transaction->get()->insert((thread_index * rounds_k + round) % accounts_k, round).succeeded())
                     [[maybe_unused]]
-                    status_t const committed = transaction->get()->commit();
+                    util::status_t const committed = transaction->get()->commit();
             }
         });
     for (std::thread& worker : workers) worker.join();
@@ -988,7 +988,6 @@ int main(int argc, char** argv) {
     using namespace unum::ustore;
     using namespace unum::ustore::test;
     using namespace unum::ustore::blobs;
-    using namespace unum::ustore::utilities;
 
     start_test_run(argc, argv);
 

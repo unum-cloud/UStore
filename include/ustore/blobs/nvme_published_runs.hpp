@@ -396,10 +396,10 @@ class commit_ledger {
      */
     status_t resume(transaction_stamp_t published) noexcept {
         if (published >= static_cast<transaction_stamp_t>(st::latest_snapshot_k))
-            return {status_code_t::invalid_argument_k, "A stamp past what the commit order can draw"};
+            return {status_code_t::invalid_argument_k, "The stamp is past the commit order"};
         st::status_t const resumed = order_.resume(static_cast<st::generation_t>(published));
         if (resumed == st::status_t::success_k) return {};
-        return {status_code_t::already_exists_k, "A ledger resumes only before it hands out a stamp"};
+        return {status_code_t::already_exists_k, "A ledger resumes only before issuing stamps"};
     }
 
     /** Pins @p pin at the newest published stamp for a reader, giving back what it held, and answers that stamp. */
@@ -1060,7 +1060,7 @@ class published_runs {
         constraint_ = &constraint;
         ledger_ = &ledger;
         if (config.memory_runs_max_deltas == 0)
-            return {status_code_t::invalid_argument_k, "A collection holds at least one write in memory"};
+            return {status_code_t::invalid_argument_k, "A collection holds a write in memory"};
 
         auto [tree, mount_tree_status] = tree_t::mount(volume, config.lsm_tree, runs);
         if (mount_tree_status.failed()) return mount_tree_status;
@@ -1478,7 +1478,7 @@ class published_runs {
     expected<transaction_stamp_t> publish_ingest(runs_type_& runs, flush_type_&& flush) noexcept {
         if (runs.empty()) return ledger_->published();
         expected<transaction_stamp_t> landed = status_t {status_code_t::contended_k,
-                                                         "Commits kept refilling the memory runs an ingest waits out"};
+                                                         "Commits kept refilling the ingest's memory runs"};
         for (std::size_t attempt = 0; attempt != ingest_attempts_k; ++attempt) {
             if (status_t const flushed = flush(); flushed.failed()) {
                 landed = flushed;
@@ -1830,7 +1830,7 @@ class published_runs {
                "A flush writes out the oldest memory runs");
         if (publication.freed.reserve(publication.flushed.size()) != st::status_t::success_k) {
             owner.ledger_->stop_leading();
-            return {status_code_t::out_of_memory_k, "A flush could not take its memory runs over"};
+            return {status_code_t::out_of_memory_k, "The flush could not take the memory runs"};
         }
         auto [next, next_status] = owner.next_view_(
             runs.first(kept), fu::max_of(owner.current_->oldest_readable, publication.oldest_readable),

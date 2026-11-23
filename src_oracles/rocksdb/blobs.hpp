@@ -18,9 +18,8 @@
 
 #include <rocksdb/db.h>
 
-#include "ustore/ranges.hpp" // `place_batch_t`, `strided`
-
 #include "ustore/utilities/algorithm.hpp" // `reservoir_sample_iterator`
+#include "ustore/utilities/ranges.hpp"    // `place_batch_t`, `strided`
 
 #include "database.hpp"          // `database_t`, `transaction_t`, `seek_towards`, `buffer_remove`, `get_many`
 #include "utilities/batches.hpp" // `validate_write`, `places_of`, `scans_of`, `measures_of`

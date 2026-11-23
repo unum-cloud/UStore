@@ -43,7 +43,7 @@ namespace unum::ustore::ram {
 
 #pragma region Ingest
 
-using utilities::keyed_rows_t;
+using util::keyed_rows_t;
 
 /** The entries an ingest gathered for one collection, in the order of their rows. */
 template <typename entry_type_>
@@ -70,8 +70,7 @@ bool precedes(entry_type_ const& first, entry_type_ const& second) noexcept {
 }
 
 /** What an ingest refuses a row for when its key does not strictly ascend under @c ustore_ingest_sorted_k. */
-inline constexpr status_t descending_key_k {status_code_t::invalid_argument_k,
-                                            "A key descends or repeats in a stream ingested as sorted"};
+inline constexpr status_t descending_key_k {status_code_t::invalid_argument_k, "A sorted ingest has an unsorted key"};
 
 /** Appends the entries of @p rows to @p entries, as a store of @p store_type_ files them, parsing every document and
  *  page through @p value_parser, and refusing a key that does not ascend when @p order promises it. */
@@ -108,7 +107,7 @@ status_t gather_rows(keyed_rows_t const& rows, ustore_ingest_order_t order,
  *  vertices, then the half-edge under the source and the one under the target, ordered by the half-edges under their
  *  sources when @p order promises it. */
 template <typename store_type_>
-status_t gather_edges(edges_view_t const& edges, ustore_ingest_order_t order,
+status_t gather_edges(util::edges_view_t const& edges, ustore_ingest_order_t order,
                       ingested_entries<half_edge_t>& entries) noexcept {
     constexpr std::size_t per_edge_k = 4;
     if (status_t const reserved = growth_status(entries.reserve(entries.size() + edges.size() * per_edge_k));
@@ -164,7 +163,7 @@ std::size_t settle_partition(ingested_entries<typename store_type_::value_t>& bu
     };
     // A stable sort keeps a repeated key's rows in their order, so the last of each run is the last row
     if (!std::is_sorted(begin + first, begin + end, ordered))
-        utilities::merge_sort(std::span<entry_t> {bucketed}.subspan(first, end - first), scratch, ordered);
+        util::merge_sort(std::span<entry_t> {bucketed}.subspan(first, end - first), scratch, ordered);
     std::size_t kept = first;
     for (std::size_t index = first; index != end; ++index) {
         if (index + 1 != end && !ordered(begin[index], begin[index + 1])) continue;
@@ -229,7 +228,7 @@ status_t with_ingested_store(database_state<cpu_class_, isolation_>& database, u
                              view_t const& view, action_type_&& action) noexcept {
     status_t outcome;
     store_status_t const visited = with_source(database, view, [&](auto& source) noexcept {
-        return for_each_run(source, strided_iterator<ustore_collection_id_t const> {&collection, 0}, 1, outcome,
+        return for_each_run(source, util::strided_iterator<ustore_collection_id_t const> {&collection, 0}, 1, outcome,
                             [&]<typename store_type_>(store_type_& store, std::size_t, std::size_t) noexcept {
                                 outcome = action(store);
                                 return outcome.failed() ? store_status_t::invalid_argument_k
@@ -256,7 +255,7 @@ status_t ingest_init(ustore_ingest_init_t const& arguments, view_t const& view) 
     ingest_state<cpu_class_, isolation_>* const ingest = new (std::nothrow) ingest_state<cpu_class_, isolation_> {
         database, arguments.collection, arguments.order, ingest_value_parser<strings_kit_of<cpu_class_>> {values},
         std::move(entries)};
-    if (!ingest) return {status_code_t::out_of_memory_k, "Failed to allocate the ingest"};
+    if (!ingest) return {status_code_t::out_of_memory_k, "No room for the ingest"};
     (*arguments.ingest)->state = ingest;
     return {};
 }
@@ -274,12 +273,12 @@ status_t ingest_append(ustore_ingest_append_t const& arguments, strings_arg_t co
             std::size_t const before = entries->size();
             status_t gathered;
             if constexpr (std::is_same_v<entry_t, half_edge_t>) {
-                auto [edges, edges_status] = utilities::ingest_edges_of(arguments);
+                auto [edges, edges_status] = util::ingest_edges_of(arguments);
                 gathered = edges_status.failed() ? edges_status
                                                  : gather_edges<store_type_>(edges, ingest.order, *entries);
             }
             else {
-                auto [rows, rows_status] = utilities::keyed_rows_of(arguments, values);
+                auto [rows, rows_status] = util::keyed_rows_of(arguments, values);
                 gathered = rows_status.failed()
                                ? rows_status
                                : gather_rows<store_type_>(rows, ingest.order, *entries, ingest.value_parser);
@@ -299,13 +298,13 @@ status_t ingest_finish(ustore_ingest_finish_t const& arguments, view_t const&) n
     transaction_source<cpu_class_, isolation_> source {ingest.database, *opened, ustore_watch_none_k};
     status_t outcome;
     store_status_t const landed = for_each_run(
-        source, strided_iterator<ustore_collection_id_t const> {&ingest.collection, 0}, 1, outcome,
+        source, util::strided_iterator<ustore_collection_id_t const> {&ingest.collection, 0}, 1, outcome,
         [&]<typename store_type_>(store_type_& store, std::size_t, std::size_t) noexcept -> store_status_t {
             ingested_entries<entry_of<store_type_>>* const entries =
                 std::get_if<ingested_entries<entry_of<store_type_>>>(&ingest.entries);
             if (!entries) outcome = replaced_collection();
-            else if (auto part = source.part(store); !part) return part.status();
-            else outcome = stage_ingest(store, **part, ingest.order, *entries);
+            else if (auto [part, part_status] = source.part(store); st::failed(part_status)) return part_status;
+            else outcome = stage_ingest(store, *part, ingest.order, *entries);
             return outcome.failed() ? store_status_t::invalid_argument_k : store_status_t::success_k;
         });
     if (status_t const status = reported(landed, outcome); status.failed()) return status;

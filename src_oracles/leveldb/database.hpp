@@ -25,8 +25,8 @@
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/db.h"
-#include "ustore/ranges.hpp" // `place_batch_t`, `strided`
-#include "ustore/status.hpp" // `expected`, `status_t`
+#include "ustore/utilities/ranges.hpp" // `place_batch_t`, `strided`
+#include "ustore/utilities/types.hpp"  // `expected`, `status_t`
 
 #include "ustore/utilities/blocking_files.hpp" // `directory_exists`
 #include "ustore/utilities/ram_buffers.hpp"    // `arena_allocate`, `growth_status`

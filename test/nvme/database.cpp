@@ -44,7 +44,6 @@ namespace unum::ustore::test {
 using namespace unum::ustore::test::nvme;
 
 using namespace unum::ustore::blobs;
-using namespace unum::ustore::utilities;
 
 #pragma region Shape
 
@@ -67,8 +66,8 @@ struct database_types {
     using volume_t = typename fixture_t::volume_t;
     template <value_layout_t value_layout_>
     using blobs_store_of = nvme_store<key_slot<stored_key_t, value_layout_>, volume_t, atomic_reference, waiter_t,
-                                      last_write_fold_t, no_device_fold_t>;
-    using strings_kit_t = utilities::strings_ladder<sz_capabilities_compiled_cpu_mask()>::strings_kit_t;
+                                      util::last_write_fold_t, no_device_fold_t>;
+    using strings_kit_t = util::strings_ladder<sz_capabilities_compiled_cpu_mask()>::strings_kit_t;
     using strings_store_t = strings::nvme_store<volume_t, atomic_reference, waiter_t, strings_kit_t>;
     template <typename... store_types_>
     using basic_database_of = basic_database<stored_key_t, volume_t, atomic_reference, waiter_t, st::native_row_kit_t,
@@ -115,21 +114,21 @@ struct database_types {
 }
 
 /** The collection name @p text, owned, as a lookup by name takes it; a suite's literals always fit. */
-string_t owned_name(std::string_view text) noexcept {
-    string_t owned;
-    [[maybe_unused]] sz::status_t const assigned = owned.assign(string_view_t {text});
+util::string_t owned_name(std::string_view text) noexcept {
+    util::string_t owned;
+    [[maybe_unused]] sz::status_t const assigned = owned.assign(util::string_view_t {text});
     return owned;
 }
 
 /** Creates the collection @p name in @p store under an ID minted for it, answering the ID or why it was refused. */
 template <typename store_type_>
-expected<collection_id_t> create_named(store_type_& store, string_view_t name,
-                                       collection_config_t const& config) noexcept {
+util::expected<collection_id_t> create_named(store_type_& store, util::string_view_t name,
+                                             collection_config_t const& config) noexcept {
     collection_id_t collection_id;
-    std::memcpy(collection_id.uuid.bytes, uuid_generator().bytes, sizeof(collection_id.uuid.bytes));
+    std::memcpy(collection_id.uuid.bytes, util::uuid_generator().bytes, sizeof(collection_id.uuid.bytes));
     value_layout_t const layout = resolve_value_layout(config.lsm_tree.lsm_level_0.sorted_run.value_size);
-    if (status_t const created = store.create_collection(collection_id, name, static_cast<std::uint16_t>(layout),
-                                                         config);
+    if (util::status_t const created = store.create_collection(collection_id, name, static_cast<std::uint16_t>(layout),
+                                                               config);
         created.failed())
         return created;
     return collection_id;
@@ -144,14 +143,14 @@ expected<collection_id_t> create_named(store_type_& store, string_view_t name,
 }
 
 /** @p value as the eight bytes an inline collection of that width stores. */
-[[nodiscard]] std::array<byte_t, 8> counted(std::uint64_t value) noexcept {
-    std::array<byte_t, 8> bytes {};
+[[nodiscard]] std::array<util::byte_t, 8> counted(std::uint64_t value) noexcept {
+    std::array<util::byte_t, 8> bytes {};
     std::memcpy(bytes.data(), &value, sizeof(value));
     return bytes;
 }
 
 /** The number @p bytes carries, which is zero for a span of another width. */
-[[nodiscard]] std::uint64_t counter_of(std::span<byte_t const> bytes) noexcept {
+[[nodiscard]] std::uint64_t counter_of(std::span<util::byte_t const> bytes) noexcept {
     std::uint64_t value = 0;
     if (bytes.size() == sizeof(value)) std::memcpy(&value, bytes.data(), sizeof(value));
     return value;
@@ -176,12 +175,12 @@ struct painted_collections_t {
 /** Writes @p key into all three collections of @p store, painted from @p round. */
 template <typename database_type_>
 void write_painted(database_type_& store, painted_collections_t const& named, std::uint64_t key, std::uint64_t round) {
-    std::array<byte_t, 8> const counter = counted(key * 7 + round);
+    std::array<util::byte_t, 8> const counter = counted(key * 7 + round);
     expect_true(
         store.insert(any_collection_id_t {named.numbers}, static_cast<stored_key_t>(key), stored_value_view_t {counter})
             .succeeded());
 
-    std::array<byte_t, 512> value {};
+    std::array<util::byte_t, 512> value {};
     std::size_t const width = blob_bytes_of(key);
     for (std::size_t position = 0; position != width; ++position)
         value[position] = painted(key + round * 1000, position);
@@ -200,25 +199,27 @@ void write_painted(database_type_& store, painted_collections_t const& named, st
 /** Reads @p key back out of all three collections and checks every byte against @p round. */
 template <typename database_type_>
 void check_painted(database_type_& store, painted_collections_t const& named, std::uint64_t key, std::uint64_t round) {
-    std::array<byte_t, 1024> into {};
+    std::array<util::byte_t, 1024> into {};
     stored_value_size_t size = 0;
-    expect_true(
-        store
-            .select(any_collection_id_t {named.numbers}, static_cast<stored_key_t>(key), std::span<byte_t> {into}, size)
-            .succeeded());
-    expect_equal(counter_of(std::span<byte_t const> {into.data(), size}), key * 7 + round);
+    expect_true(store
+                    .select(any_collection_id_t {named.numbers}, static_cast<stored_key_t>(key),
+                            std::span<util::byte_t> {into}, size)
+                    .succeeded());
+    expect_equal(counter_of(std::span<util::byte_t const> {into.data(), size}), key * 7 + round);
 
     std::size_t mismatches = 0;
-    expect_true(
-        store.select(any_collection_id_t {named.blobs}, static_cast<stored_key_t>(key), std::span<byte_t> {into}, size)
-            .succeeded());
+    expect_true(store
+                    .select(any_collection_id_t {named.blobs}, static_cast<stored_key_t>(key),
+                            std::span<util::byte_t> {into}, size)
+                    .succeeded());
     expect_equal(std::size_t {size}, blob_bytes_of(key));
     for (std::uint64_t position = 0; position != size; ++position)
         if (into[static_cast<std::size_t>(position)] != painted(key + round * 1000, position)) ++mismatches;
 
-    expect_true(
-        store.select(any_collection_id_t {named.fixed}, static_cast<stored_key_t>(key), std::span<byte_t> {into}, size)
-            .succeeded());
+    expect_true(store
+                    .select(any_collection_id_t {named.fixed}, static_cast<stored_key_t>(key),
+                            std::span<util::byte_t> {into}, size)
+                    .succeeded());
     expect_equal(std::size_t {size}, std::size_t {512});
     for (std::uint64_t position = 0; position != size; ++position)
         if (into[static_cast<std::size_t>(position)] != painted(key + round * 1000 + 99, position)) ++mismatches;
@@ -231,7 +232,7 @@ void check_painted(database_type_& store, painted_collections_t const& named, st
 
 /** Mounts the volume of @p stack again, as a process starting after a close or a crash does. */
 template <typename stack_type_>
-status_t remount_volume(stack_type_& stack) noexcept {
+util::status_t remount_volume(stack_type_& stack) noexcept {
     stack.volume = decltype(stack.volume) {};
     auto [guard, acquire_status] = stack.fixture->channels.acquire();
     if (acquire_status.failed()) return acquire_status;
@@ -243,12 +244,12 @@ status_t remount_volume(stack_type_& stack) noexcept {
 
 /** Mounts the volume of @p stack again and a database over it and the channels of @p stack. */
 template <typename stack_type_>
-expected<std::unique_ptr<typename stack_type_::database_t>> open_database(stack_type_& stack) noexcept {
+util::expected<std::unique_ptr<typename stack_type_::database_t>> open_database(stack_type_& stack) noexcept {
     using database_t = typename stack_type_::database_t;
-    if (status_t const remounted = remount_volume(stack); remounted.failed()) return remounted;
+    if (util::status_t const remounted = remount_volume(stack); remounted.failed()) return remounted;
     auto store = std::unique_ptr<database_t> {new (std::nothrow) database_t {stack.fixture->resources}};
-    if (!store) return status_t {status_code_t::out_of_memory_k, "The database did not fit"};
-    if (status_t const mounted = store->mount(stack.volume, stack.fixture->channels, test_database_config());
+    if (!store) return util::status_t {util::status_code_t::out_of_memory_k, "The database did not fit"};
+    if (util::status_t const mounted = store->mount(stack.volume, stack.fixture->channels, test_database_config());
         mounted.failed())
         return mounted;
     return store;
@@ -256,12 +257,12 @@ expected<std::unique_ptr<typename stack_type_::database_t>> open_database(stack_
 
 /** Mounts a fixture through @p mount and opens one database over its volume. */
 template <typename mount_type_>
-expected<std::unique_ptr<typename database_types<typename mount_type_::fixture_t>::stack_t>> make_stack(
+util::expected<std::unique_ptr<typename database_types<typename mount_type_::fixture_t>::stack_t>> make_stack(
     mount_type_ const& mount) noexcept {
     using types_t = database_types<typename mount_type_::fixture_t>;
     using stack_t = typename types_t::stack_t;
     auto stack = std::unique_ptr<stack_t> {new (std::nothrow) stack_t {}};
-    if (!stack) return status_t {status_code_t::out_of_memory_k, "The stack did not fit"};
+    if (!stack) return util::status_t {util::status_code_t::out_of_memory_k, "The stack did not fit"};
 
     auto [fixture, mount_status] = mount();
     if (mount_status.failed()) return mount_status;
@@ -283,46 +284,45 @@ void test_named_collections_round_trip(mount_type_ const& mount) {
     using types_t = database_types<typename mount_type_::fixture_t>;
     using database_t = typename types_t::database_t;
     using stack_t = typename types_t::stack_t;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return;
-    database_t& store = *(*stack)->store;
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return;
+    database_t& store = *stack->store;
 
-    expected<collection_id_t> const numbers = create_named(store, "numbers", test_config(8, 0));
-    expected<collection_id_t> const blobs = create_named(store, "blobs", test_config(0, value_max_size_k));
-    expected<collection_id_t> const fixed = create_named(store, "fixed", test_config(512, 0));
-    expect_true(numbers.has_value());
-    expect_true(blobs.has_value());
-    if (!expect_true(fixed.has_value())) return;
+    auto const [numbers, numbers_status] = create_named(store, "numbers", test_config(8, 0));
+    auto const [blobs, blobs_status] = create_named(store, "blobs", test_config(0, value_max_size_k));
+    auto const [fixed, fixed_status] = create_named(store, "fixed", test_config(512, 0));
+    expect_true(numbers_status.succeeded());
+    expect_true(blobs_status.succeeded());
+    if (!expect_true(fixed_status.succeeded())) return;
 
     // A name is taken once, and a collection nobody created is named by nothing.
-    expect_status(create_named(store, "numbers", test_config(8, 0)), status_code_t::already_exists_k);
+    expect_status(create_named(store, "numbers", test_config(8, 0)), util::status_code_t::already_exists_k);
     expect_true(store.has_collection(any_collection_id_t {owned_name("blobs")}));
     expect_true(!store.has_collection(any_collection_id_t {owned_name("missing")}));
-    expect_equal(store.collection_id(any_collection_id_t {owned_name("numbers")}), *numbers);
+    expect_equal(store.collection_id(any_collection_id_t {owned_name("numbers")}), numbers);
     expect_equal(store.list_collections().size(), std::size_t {3});
     expect_equal(store.size(), std::size_t {3});
 
     constexpr std::size_t keys_k = 200;
-    st::vector<byte_t> value;
+    st::vector<util::byte_t> value;
     expect_true(value.resize(value_max_size_k) == st::status_t::success_k);
     for (std::size_t index = 0; index != keys_k; ++index) {
-        std::array<byte_t, 8> const counter = counted(index * 7 + 1);
+        std::array<util::byte_t, 8> const counter = counted(index * 7 + 1);
         expect_true(
-            store
-                .insert(any_collection_id_t {*numbers}, static_cast<stored_key_t>(index), stored_value_view_t {counter})
+            store.insert(any_collection_id_t {numbers}, static_cast<stored_key_t>(index), stored_value_view_t {counter})
                 .succeeded());
 
         std::size_t const width = 1 + index % 1000;
         for (std::size_t position = 0; position != width; ++position) value[position] = painted(index, position);
         expect_true(store
-                        .insert(any_collection_id_t {*blobs}, static_cast<stored_key_t>(index),
+                        .insert(any_collection_id_t {blobs}, static_cast<stored_key_t>(index),
                                 stored_value_view_t {value.data(), width})
                         .succeeded());
 
         for (std::size_t position = 0; position != 512; ++position) value[position] = painted(index + 99, position);
         expect_true(store
-                        .insert(any_collection_id_t {*fixed}, static_cast<stored_key_t>(index),
+                        .insert(any_collection_id_t {fixed}, static_cast<stored_key_t>(index),
                                 stored_value_view_t {value.data(), 512})
                         .succeeded());
     }
@@ -330,30 +330,32 @@ void test_named_collections_round_trip(mount_type_ const& mount) {
 
     // A value of the wrong width is refused by the layout rather than stored short.
     expect_status(
-        store.insert(any_collection_id_t {*fixed}, stored_key_t {9999}, stored_value_view_t {value.data(), 511}),
-        status_code_t::malformed_k);
+        store.insert(any_collection_id_t {fixed}, stored_key_t {9999}, stored_value_view_t {value.data(), 511}),
+        util::status_code_t::malformed_k);
 
-    st::vector<byte_t> into;
+    st::vector<util::byte_t> into;
     expect_true(into.resize(value_max_size_k) == st::status_t::success_k);
     std::size_t mismatches = 0;
     for (std::size_t index = 0; index != keys_k; ++index) {
         stored_value_size_t size = 0;
         expect_true(store
-                        .select(any_collection_id_t {*numbers}, static_cast<stored_key_t>(index),
-                                std::span<byte_t> {into}, size)
+                        .select(any_collection_id_t {numbers}, static_cast<stored_key_t>(index),
+                                std::span<util::byte_t> {into}, size)
                         .succeeded());
-        if (counter_of(std::span<byte_t const> {into.data(), size}) != index * 7 + 1) ++mismatches;
+        if (counter_of(std::span<util::byte_t const> {into.data(), size}) != index * 7 + 1) ++mismatches;
 
-        expect_true(
-            store.select(any_collection_id_t {*blobs}, static_cast<stored_key_t>(index), std::span<byte_t> {into}, size)
-                .succeeded());
+        expect_true(store
+                        .select(any_collection_id_t {blobs}, static_cast<stored_key_t>(index),
+                                std::span<util::byte_t> {into}, size)
+                        .succeeded());
         if (size != 1 + index % 1000) ++mismatches;
         for (std::uint64_t position = 0; position != size; ++position)
             if (into[static_cast<std::size_t>(position)] != painted(index, position)) ++mismatches;
 
-        expect_true(
-            store.select(any_collection_id_t {*fixed}, static_cast<stored_key_t>(index), std::span<byte_t> {into}, size)
-                .succeeded());
+        expect_true(store
+                        .select(any_collection_id_t {fixed}, static_cast<stored_key_t>(index),
+                                std::span<util::byte_t> {into}, size)
+                        .succeeded());
         if (size != 512) ++mismatches;
     }
     expect_equal(mismatches, std::size_t {0});
@@ -363,9 +365,11 @@ void test_named_collections_round_trip(mount_type_ const& mount) {
     std::array<lookup_result_t, 3> answers {lookup_result_t::missing_k, lookup_result_t::missing_k,
                                             lookup_result_t::missing_k};
     std::size_t carried = 0;
-    auto sink = [&](std::size_t, std::uint64_t, std::span<byte_t const> bytes) noexcept { carried += bytes.size(); };
+    auto sink = [&](std::size_t, std::uint64_t, std::span<util::byte_t const> bytes) noexcept {
+        carried += bytes.size();
+    };
     expect_true(store
-                    .select(any_collection_id_t {*blobs}, std::span<stored_key_t const> {batch},
+                    .select(any_collection_id_t {blobs}, std::span<stored_key_t const> {batch},
                             std::span<lookup_result_t> {answers}, sink)
                     .succeeded());
     expect_true(answers[0] == lookup_result_t::written_k);
@@ -374,9 +378,9 @@ void test_named_collections_round_trip(mount_type_ const& mount) {
     expect_equal(carried, std::size_t {1} + (1 + (keys_k - 1) % 1000));
 
     // A removal hides the key in the collection it names and leaves the others alone.
-    expect_true(store.remove(any_collection_id_t {*numbers}, stored_key_t {0}).succeeded());
-    expect_true(!store.contains(any_collection_id_t {*numbers}, stored_key_t {0}));
-    expect_true(store.contains(any_collection_id_t {*blobs}, stored_key_t {0}));
+    expect_true(store.remove(any_collection_id_t {numbers}, stored_key_t {0}).succeeded());
+    expect_true(!store.contains(any_collection_id_t {numbers}, stored_key_t {0}));
+    expect_true(store.contains(any_collection_id_t {blobs}, stored_key_t {0}));
 }
 
 /**
@@ -393,9 +397,9 @@ case_result_t test_catalog_survives_reopen(mount_type_ const& mount) {
     using stack_t = typename types_t::stack_t;
     if (mount.transport == transport_t::memory_k) return case_result_t::skipped(memory_volumes_vanish_k);
     constexpr std::uint64_t keys_k = 300;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return {};
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return {};
 
     collection_config_t numbers_config = test_config(8, 0);
     collection_config_t blobs_config = test_config(0, value_max_size_k);
@@ -405,60 +409,60 @@ case_result_t test_catalog_survives_reopen(mount_type_ const& mount) {
     blobs_config.lsm_tree.level_enlarge_factor = storage_limits_t::level_min_enlarge_factor_k;
     fixed_config.lsm_tree.level_enlarge_factor = storage_limits_t::level_min_enlarge_factor_k;
 
-    expected<collection_id_t> const numbers = create_named(*(*stack)->store, "numbers", numbers_config);
-    expected<collection_id_t> const blobs = create_named(*(*stack)->store, "blobs", blobs_config);
-    expected<collection_id_t> const fixed = create_named(*(*stack)->store, "fixed", fixed_config);
-    expect_true(numbers.has_value());
-    expect_true(blobs.has_value());
-    if (!expect_true(fixed.has_value())) return {};
-    painted_collections_t const named {*numbers, *blobs, *fixed};
+    auto const [numbers, numbers_status] = create_named(*stack->store, "numbers", numbers_config);
+    auto const [blobs, blobs_status] = create_named(*stack->store, "blobs", blobs_config);
+    auto const [fixed, fixed_status] = create_named(*stack->store, "fixed", fixed_config);
+    expect_true(numbers_status.succeeded());
+    expect_true(blobs_status.succeeded());
+    if (!expect_true(fixed_status.succeeded())) return {};
+    painted_collections_t const named {numbers, blobs, fixed};
 
     // Two flushed rounds are merged into a second level, and a third round lands on level zero over them.
     for (std::uint64_t round = 0; round != 2; ++round) {
-        for (std::uint64_t key = 0; key != keys_k; ++key) write_painted(*(*stack)->store, named, key, round);
-        expect_true((*stack)->store->flush().succeeded());
+        for (std::uint64_t key = 0; key != keys_k; ++key) write_painted(*stack->store, named, key, round);
+        expect_true(stack->store->flush().succeeded());
     }
-    expect_true((*stack)->store->compact().succeeded());
+    expect_true(stack->store->compact().succeeded());
 
     // A merge publishes its new set before it drops what it consumed, so the manifest names every
     // run file left.
-    expect_equal(run_count_of(*(*stack)->fixture), run_files_of(*(*stack)->fixture));
-    for (std::uint64_t key = 0; key < keys_k; key += 3) write_painted(*(*stack)->store, named, key, 2);
-    if (!expect_true((*stack)->store->flush().succeeded())) return {};
+    expect_equal(run_count_of(*stack->fixture), run_files_of(*stack->fixture));
+    for (std::uint64_t key = 0; key < keys_k; key += 3) write_painted(*stack->store, named, key, 2);
+    if (!expect_true(stack->store->flush().succeeded())) return {};
 
     // The runs and their bytes are what a reopen must take back, level for level.
-    std::size_t const runs_before = run_count_of(*(*stack)->fixture);
-    std::uint64_t const bytes_before = (*stack)->store->size_bytes();
+    std::size_t const runs_before = run_count_of(*stack->fixture);
+    std::uint64_t const bytes_before = stack->store->size_bytes();
     expect_true(runs_before != std::size_t {0});
 
     // A key of every third is answered from level zero, and every other key from the level below it.
     auto round_of = [](std::uint64_t key) noexcept -> std::uint64_t { return key % 3 == 0 ? 2 : 1; };
-    for (std::uint64_t key = 0; key != keys_k; ++key) check_painted(*(*stack)->store, named, key, round_of(key));
+    for (std::uint64_t key = 0; key != keys_k; ++key) check_painted(*stack->store, named, key, round_of(key));
 
-    expect_true((*stack)->store->unmount().succeeded());
-    (*stack)->store.reset();
+    expect_true(stack->store->unmount().succeeded());
+    stack->store.reset();
 
-    expected<std::unique_ptr<database_t>> reopened = open_database(**stack);
-    expect_true(reopened.has_value());
-    if (!reopened) return {};
-    database_t& store = **reopened;
+    auto [reopened, reopen_status] = open_database(*stack);
+    expect_true(reopen_status.succeeded());
+    if (reopen_status.failed()) return {};
+    database_t& store = *reopened;
 
     expect_equal(store.size(), std::size_t {3});
-    expect_equal(store.collection_id(any_collection_id_t {owned_name("numbers")}), *numbers);
-    expect_equal(store.collection_id(any_collection_id_t {owned_name("blobs")}), *blobs);
-    expect_true(store.collection_name(*blobs) == owned_name("blobs"));
+    expect_equal(store.collection_id(any_collection_id_t {owned_name("numbers")}), numbers);
+    expect_equal(store.collection_id(any_collection_id_t {owned_name("blobs")}), blobs);
+    expect_true(store.collection_name(blobs) == owned_name("blobs"));
 
     collection_config_t restored;
-    expect_true(store.collection_config(*blobs, restored).succeeded());
+    expect_true(store.collection_config(blobs, restored).succeeded());
     expect_equal(restored.lsm_tree.lsm_level_0.sorted_run.value_max_size, value_max_size_k);
     expect_equal(restored.memory_runs_max_deltas, std::size_t {4096});
-    expect_equal(store.buffer_size_for_any_stored_value(any_collection_id_t {*numbers}), stored_value_size_t {12});
+    expect_equal(store.buffer_size_for_any_stored_value(any_collection_id_t {numbers}), stored_value_size_t {12});
     std::uint16_t store_tag = 0;
-    expect_true(store.collection_store_tag(*blobs, store_tag).succeeded());
+    expect_true(store.collection_store_tag(blobs, store_tag).succeeded());
     expect_equal(store_tag, static_cast<std::uint16_t>(value_layout_t::variable_width_k));
 
     // Every run the close left behind is back, and the reads below tell their levels apart.
-    expect_equal(run_count_of(*(*stack)->fixture), runs_before);
+    expect_equal(run_count_of(*stack->fixture), runs_before);
     expect_equal(store.size_bytes(), bytes_before);
     for (std::uint64_t key = 0; key != keys_k; ++key) check_painted(store, named, key, round_of(key));
 
@@ -466,16 +470,16 @@ case_result_t test_catalog_survives_reopen(mount_type_ const& mount) {
     for (std::uint64_t key = 0; key != 4; ++key) write_painted(store, named, key, 3);
     for (std::uint64_t key = 0; key != 4; ++key) check_painted(store, named, key, 3);
     expect_true(store.unmount().succeeded());
-    (*reopened).reset();
+    reopened.reset();
 
     // A database of fewer stores refuses a catalog naming a store it lacks, and leaves it whole for one that has.
     using numbers_only_t = typename types_t::template basic_database_of<
         typename types_t::template blobs_store_of<value_layout_t::inline_12_bytes_k>>;
     {
-        numbers_only_t narrow {(*stack)->fixture->resources};
-        expect_true(remount_volume(**stack).succeeded());
-        expect_status(narrow.mount((*stack)->volume, (*stack)->fixture->channels, test_database_config()),
-                      status_code_t::malformed_k);
+        numbers_only_t narrow {stack->fixture->resources};
+        expect_true(remount_volume(*stack).succeeded());
+        expect_status(narrow.mount(stack->volume, stack->fixture->channels, test_database_config()),
+                      util::status_code_t::malformed_k);
     }
 
     // A database listing its stores in another order mounts every collection in the store its tag names.
@@ -484,20 +488,20 @@ case_result_t test_catalog_survives_reopen(mount_type_ const& mount) {
         typename types_t::template blobs_store_of<value_layout_t::fixed_width_k>,
         typename types_t::template blobs_store_of<value_layout_t::inline_12_bytes_k>>;
     {
-        reordered_t reordered {(*stack)->fixture->resources};
-        expect_true(remount_volume(**stack).succeeded());
-        expect_true(reordered.mount((*stack)->volume, (*stack)->fixture->channels, test_database_config()).succeeded());
+        reordered_t reordered {stack->fixture->resources};
+        expect_true(remount_volume(*stack).succeeded());
+        expect_true(reordered.mount(stack->volume, stack->fixture->channels, test_database_config()).succeeded());
         expect_equal(reordered.size(), std::size_t {3});
-        expect_equal(reordered.buffer_size_for_any_stored_value(any_collection_id_t {*numbers}),
+        expect_equal(reordered.buffer_size_for_any_stored_value(any_collection_id_t {numbers}),
                      stored_value_size_t {12});
         for (std::uint64_t key = 0; key != 4; ++key) check_painted(reordered, named, key, 3);
         expect_true(reordered.unmount().succeeded());
     }
-    expected<std::unique_ptr<database_t>> again = open_database(**stack);
-    expect_true(again.has_value());
-    if (!again) return {};
-    expect_equal((*again)->size(), std::size_t {3});
-    for (std::uint64_t key = 0; key != 4; ++key) check_painted(**again, named, key, 3);
+    auto [again, again_status] = open_database(*stack);
+    expect_true(again_status.succeeded());
+    if (again_status.failed()) return {};
+    expect_equal(again->size(), std::size_t {3});
+    for (std::uint64_t key = 0; key != 4; ++key) check_painted(*again, named, key, 3);
     return {};
 }
 
@@ -514,69 +518,70 @@ case_result_t test_range_removal_survives_reopen(mount_type_ const& mount) {
     constexpr stored_key_t end_k = 160;
     constexpr stored_key_t dropped_k = 150;
     constexpr stored_key_t kept_k = 120;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return {};
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return {};
 
     collection_config_t config = test_config(8, 0);
     config.lsm_tree.level_enlarge_factor = storage_limits_t::level_min_enlarge_factor_k;
-    expected<collection_id_t> const ranged = create_named(*(*stack)->store, "ranged", config);
-    expect_true(ranged.has_value());
-    if (!ranged) return {};
-    any_collection_id_t const id {*ranged};
+    auto const [ranged, create_status] = create_named(*stack->store, "ranged", config);
+    expect_true(create_status.succeeded());
+    if (create_status.failed()) return {};
+    any_collection_id_t const id {ranged};
     for (std::uint64_t round = 0; round != 2; ++round) {
         for (std::uint64_t key = 0; key != keys_k; ++key) {
-            std::array<byte_t, 8> const counter = counted(key + round);
+            std::array<util::byte_t, 8> const counter = counted(key + round);
             expect_true(
-                (*stack)->store->insert(id, static_cast<stored_key_t>(key), stored_value_view_t {counter}).succeeded());
+                stack->store->insert(id, static_cast<stored_key_t>(key), stored_value_view_t {counter}).succeeded());
         }
-        expect_true((*stack)->store->flush().succeeded());
+        expect_true(stack->store->flush().succeeded());
     }
-    expect_true((*stack)->store->compact().succeeded());
+    expect_true(stack->store->compact().succeeded());
 
-    expected<typename database_t::transaction_unique_ptr_t> transaction = (*stack)->store->create_transaction();
-    expect_true(transaction.has_value());
-    if (!transaction) return {};
-    std::array<byte_t, 8> const before = counted(7000);
-    std::array<byte_t, 8> const after = counted(9000);
-    expect_true((*transaction)->insert(id, dropped_k, stored_value_view_t {before}).succeeded());
-    expect_true((*transaction)->remove_range(id, start_k, end_k).succeeded());
-    expect_true((*transaction)->insert(id, kept_k, stored_value_view_t {after}).succeeded());
-    expect_true((*transaction)->lookup_uncommitted(*ranged, dropped_k) == lookup_result_t::removed_k);
-    expect_true((*transaction)->lookup_uncommitted(*ranged, start_k) == lookup_result_t::removed_k);
-    expect_true((*transaction)->lookup_uncommitted(*ranged, end_k) == lookup_result_t::missing_k);
-    expect_true((*transaction)->commit().succeeded());
+    auto [transaction, begin_status] = stack->store->create_transaction();
+    expect_true(begin_status.succeeded());
+    if (begin_status.failed()) return {};
+    std::array<util::byte_t, 8> const before = counted(7000);
+    std::array<util::byte_t, 8> const after = counted(9000);
+    expect_true(transaction->insert(id, dropped_k, stored_value_view_t {before}).succeeded());
+    expect_true(transaction->remove_range(id, start_k, end_k).succeeded());
+    expect_true(transaction->insert(id, kept_k, stored_value_view_t {after}).succeeded());
+    expect_true(transaction->lookup_uncommitted(ranged, dropped_k) == lookup_result_t::removed_k);
+    expect_true(transaction->lookup_uncommitted(ranged, start_k) == lookup_result_t::removed_k);
+    expect_true(transaction->lookup_uncommitted(ranged, end_k) == lookup_result_t::missing_k);
+    expect_true(transaction->commit().succeeded());
 
     auto const check = [&](database_t& store) {
-        std::array<byte_t, 8> into {};
+        std::array<util::byte_t, 8> into {};
         for (std::uint64_t key = 0; key != keys_k; ++key) {
             stored_value_size_t size = 0;
-            status_t const read = store.select(id, static_cast<stored_key_t>(key), std::span<byte_t> {into}, size);
+            util::status_t const read = store.select(id, static_cast<stored_key_t>(key), std::span<util::byte_t> {into},
+                                                     size);
             if (key == kept_k) {
                 expect_true(read.succeeded());
-                expect_equal(counter_of(std::span<byte_t const> {into.data(), size}), std::uint64_t {9000});
+                expect_equal(counter_of(std::span<util::byte_t const> {into.data(), size}), std::uint64_t {9000});
             }
-            else if (key >= start_k && key < end_k) expect_true(read == status_code_t::not_found_k);
+            else if (key >= start_k && key < end_k) expect_true(read == util::status_code_t::not_found_k);
             else {
                 expect_true(read.succeeded());
-                expect_equal(counter_of(std::span<byte_t const> {into.data(), size}), key + 1);
+                expect_equal(counter_of(std::span<util::byte_t const> {into.data(), size}), key + 1);
             }
         }
     };
-    check(*(*stack)->store);
-    expect_true((*stack)->store->flush().succeeded());
-    check(*(*stack)->store);
-    (*transaction).reset();
-    expect_true((*stack)->store->unmount().succeeded());
-    (*stack)->store.reset();
+    check(*stack->store);
+    expect_true(stack->store->flush().succeeded());
+    check(*stack->store);
+    transaction.reset();
+    expect_true(stack->store->unmount().succeeded());
+    stack->store.reset();
 
-    expected<std::unique_ptr<database_t>> reopened = open_database(**stack);
-    expect_true(reopened.has_value());
-    if (!reopened) return {};
-    check(**reopened);
-    expect_true((*reopened)->flush().succeeded());
-    expect_true((*reopened)->compact().succeeded());
-    check(**reopened);
+    auto [reopened, reopen_status] = open_database(*stack);
+    expect_true(reopen_status.succeeded());
+    if (reopen_status.failed()) return {};
+    check(*reopened);
+    expect_true(reopened->flush().succeeded());
+    expect_true(reopened->compact().succeeded());
+    check(*reopened);
     return {};
 }
 
@@ -592,50 +597,49 @@ case_result_t test_strings_survive_reopen(mount_type_ const& mount) {
     using key_slot_t = typename strings_store_t::key_slot_t;
     constexpr std::size_t strings_k = 64;
     if (mount.transport == transport_t::memory_k) return case_result_t::skipped(memory_volumes_vanish_k);
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return {};
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return {};
 
     collection_id_t names;
-    std::memcpy(names.uuid.bytes, uuid_generator().bytes, sizeof(names.uuid.bytes));
-    if (!expect_true((*stack)
-                         ->store
+    std::memcpy(names.uuid.bytes, util::uuid_generator().bytes, sizeof(names.uuid.bytes));
+    if (!expect_true(stack->store
                          ->create_collection(names, "names", static_cast<std::uint16_t>(value_layout_t::uuid_k),
                                              test_config(sizeof(ustore_uuid_t), 0))
                          .succeeded()))
         return {};
 
     std::array<std::string, strings_k> texts;
-    std::array<std::array<byte_t, key_slot_t::size>, strings_k> keys;
+    std::array<std::array<util::byte_t, key_slot_t::size>, strings_k> keys;
     for (std::size_t index = 0; index != strings_k; ++index) {
         texts[index] = "collection-name" + std::to_string(index);
         for (std::size_t position = 0; position != key_slot_t::size; ++position)
             keys[index][position] = painted(index, position);
     }
     {
-        strings::nvme_transaction<database_t, strings_store_t> written {*(*stack)->store};
-        auto [held, begin_status] = (*stack)->store->create_transaction(test_database_config().default_transaction);
+        strings::nvme_transaction<database_t, strings_store_t> written {*stack->store};
+        auto [held, begin_status] = stack->store->create_transaction(test_database_config().default_transaction);
         if (!expect_true(begin_status.succeeded())) return {};
         written.join(*held);
         for (std::size_t index = 0; index != strings_k; ++index)
             expect_true(written
-                            .write(names, texts[index], delta_view_t {delta_kind_t::write_k, keys[index]},
+                            .write(names, texts[index], util::delta_view_t {util::delta_kind_t::write_k, keys[index]},
                                    invalid_transaction_stamp_k)
                             .succeeded());
         expect_true(written.commit(*held).succeeded());
     }
-    expect_true((*stack)->store->flush().succeeded());
-    expect_true((*stack)->store->unmount().succeeded());
-    (*stack)->store.reset();
+    expect_true(stack->store->flush().succeeded());
+    expect_true(stack->store->unmount().succeeded());
+    stack->store.reset();
 
-    expected<std::unique_ptr<database_t>> reopened = open_database(**stack);
-    expect_true(reopened.has_value());
-    if (!reopened) return {};
-    expect_equal((*reopened)->collection_id(any_collection_id_t {owned_name("names")}), names);
-    status_t const visited = (*reopened)->visit_store(
+    auto [reopened, reopen_status] = open_database(*stack);
+    expect_true(reopen_status.succeeded());
+    if (reopen_status.failed()) return {};
+    expect_equal(reopened->collection_id(any_collection_id_t {owned_name("names")}), names);
+    util::status_t const visited = reopened->visit_store(
         any_collection_id_t {names}, [&]<typename store_type_>(store_type_& store) noexcept -> status_t {
             if constexpr (!std::is_same_v<store_type_, strings_store_t>)
-                return {status_code_t::invalid_argument_k, "A strings collection mounted in another store"};
+                return {util::status_code_t::invalid_argument_k, "A strings collection mounted in another store"};
             else {
                 typename strings_store_t::tree_t::level_t const& level = store.tree().levels().level(0);
                 expect_equal(level.size(), std::size_t {1});
@@ -645,11 +649,11 @@ case_result_t test_strings_survive_reopen(mount_type_ const& mount) {
                     expect_equal(level.run(0).header().stored_values_bytes, std::uint64_t {0});
                 }
                 for (std::size_t index = 0; index != strings_k; ++index) {
-                    std::array<byte_t, key_slot_t::size> value {};
+                    std::array<util::byte_t, key_slot_t::size> value {};
                     expect_true(store.find(texts[index], value) == lookup_result_t::written_k);
                     expect_true(value == keys[index]);
                 }
-                std::array<byte_t, key_slot_t::size> missing {};
+                std::array<util::byte_t, key_slot_t::size> missing {};
                 expect_true(store.find("collection-name", missing) == lookup_result_t::missing_k);
                 return {};
             }
@@ -668,20 +672,19 @@ case_result_t test_strings_range_removal_survives_reopen(mount_type_ const& moun
     using stack_t = typename types_t::stack_t;
     using strings_store_t = typename types_t::strings_store_t;
     using key_slot_t = typename strings_store_t::key_slot_t;
-    using value_t = std::array<byte_t, key_slot_t::size>;
+    using value_t = std::array<util::byte_t, key_slot_t::size>;
     constexpr std::size_t strings_k = 100;
     if (mount.transport == transport_t::memory_k) return case_result_t::skipped(memory_volumes_vanish_k);
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return {};
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return {};
 
     collection_id_t words;
-    std::memcpy(words.uuid.bytes, uuid_generator().bytes, sizeof(words.uuid.bytes));
+    std::memcpy(words.uuid.bytes, util::uuid_generator().bytes, sizeof(words.uuid.bytes));
     collection_config_t config = test_config(sizeof(ustore_uuid_t), 0);
     config.lsm_tree.level_enlarge_factor = storage_limits_t::level_min_enlarge_factor_k;
     if (!expect_true(
-            (*stack)
-                ->store->create_collection(words, "words", static_cast<std::uint16_t>(value_layout_t::uuid_k), config)
+            stack->store->create_collection(words, "words", static_cast<std::uint16_t>(value_layout_t::uuid_k), config)
                 .succeeded()))
         return {};
     auto const text_of = [](std::size_t index) { return fmt::format("item-{:03}", index); };
@@ -699,33 +702,37 @@ case_result_t test_strings_range_removal_survives_reopen(mount_type_ const& moun
         expect_true(written.commit(*held).succeeded());
     };
     for (std::size_t round = 0; round != 2; ++round) {
-        commit(*(*stack)->store, [&](auto& written) {
+        commit(*stack->store, [&](auto& written) {
             for (std::size_t index = 0; index != strings_k; ++index) {
                 std::string const text = text_of(index);
                 value_t const value = value_of(index);
-                expect_true(
-                    written.write(words, text, delta_view_t {delta_kind_t::write_k, value}, invalid_transaction_stamp_k)
-                        .succeeded());
+                expect_true(written
+                                .write(words, text, util::delta_view_t {util::delta_kind_t::write_k, value},
+                                       invalid_transaction_stamp_k)
+                                .succeeded());
             }
         });
-        expect_true((*stack)->store->flush().succeeded());
+        expect_true(stack->store->flush().succeeded());
     }
-    expect_true((*stack)->store->compact().succeeded());
+    expect_true(stack->store->compact().succeeded());
 
     std::string const start = text_of(40), end = text_of(60), tail = text_of(90);
     std::string const dropped = text_of(50), kept = text_of(45);
     value_t const before = value_of(7000), after = value_of(9000);
-    commit(*(*stack)->store, [&](auto& written) {
-        expect_true(
-            written.write(words, dropped, delta_view_t {delta_kind_t::write_k, before}, invalid_transaction_stamp_k)
-                .succeeded());
+    commit(*stack->store, [&](auto& written) {
+        expect_true(written
+                        .write(words, dropped, util::delta_view_t {util::delta_kind_t::write_k, before},
+                               invalid_transaction_stamp_k)
+                        .succeeded());
         expect_true(written.remove_range(words, start, end).succeeded());
         expect_true(written.remove_range(words, tail, {}).succeeded());
-        expect_true(written.write(words, kept, delta_view_t {delta_kind_t::write_k, after}, invalid_transaction_stamp_k)
+        expect_true(written
+                        .write(words, kept, util::delta_view_t {util::delta_kind_t::write_k, after},
+                               invalid_transaction_stamp_k)
                         .succeeded());
-        delta_view_t own;
-        expect_true(written.uncommitted(words, dropped, own) && own.kind == delta_kind_t::remove_k);
-        expect_true(written.uncommitted(words, text_of(99), own) && own.kind == delta_kind_t::remove_k);
+        util::delta_view_t own;
+        expect_true(written.uncommitted(words, dropped, own) && own.kind == util::delta_kind_t::remove_k);
+        expect_true(written.uncommitted(words, text_of(99), own) && own.kind == util::delta_kind_t::remove_k);
         expect_true(!written.uncommitted(words, text_of(60), own));
     });
 
@@ -736,7 +743,7 @@ case_result_t test_strings_range_removal_survives_reopen(mount_type_ const& moun
                     any_collection_id_t {words},
                     [&]<typename store_type_>(store_type_& held) noexcept -> status_t {
                         if constexpr (!std::is_same_v<store_type_, strings_store_t>)
-                            return {status_code_t::invalid_argument_k, "Another store"};
+                            return {util::status_code_t::invalid_argument_k, "Another store"};
                         else {
                             for (std::size_t index = 0; index != strings_k; ++index) {
                                 value_t value {};
@@ -747,10 +754,10 @@ case_result_t test_strings_range_removal_survives_reopen(mount_type_ const& moun
                                 else expect_true(value == value_of(index));
                             }
                             // A walk down starts at the last string spared.
-                            utilities::local_arena_t walk;
+                            util::local_arena_t walk;
                             typename store_type_::page_t page {walk.allocator().arena};
                             expect_true(
-                                held.read_page_down({}, {}, head_stamp_k, outside_executor_k, page).succeeded());
+                                held.read_page_down({}, {}, head_stamp_k, util::outside_executor_k, page).succeeded());
                             std::string_view previous;
                             std::size_t written = 0;
                             for (std::size_t index = 0; index != page.size(); ++index) {
@@ -767,24 +774,25 @@ case_result_t test_strings_range_removal_survives_reopen(mount_type_ const& moun
                     })
                 .succeeded());
     };
-    check(*(*stack)->store);
-    expect_true((*stack)->store->flush().succeeded());
-    check(*(*stack)->store);
-    expect_true((*stack)->store->unmount().succeeded());
-    (*stack)->store.reset();
+    check(*stack->store);
+    expect_true(stack->store->flush().succeeded());
+    check(*stack->store);
+    expect_true(stack->store->unmount().succeeded());
+    stack->store.reset();
 
-    expected<std::unique_ptr<database_t>> reopened = open_database(**stack);
-    expect_true(reopened.has_value());
-    if (!reopened) return {};
-    check(**reopened);
-    commit(**reopened, [&](auto& written) {
-        return expect_true(
-            written.write(words, kept, delta_view_t {delta_kind_t::write_k, after}, invalid_transaction_stamp_k)
-                .succeeded());
+    auto [reopened, reopen_status] = open_database(*stack);
+    expect_true(reopen_status.succeeded());
+    if (reopen_status.failed()) return {};
+    check(*reopened);
+    commit(*reopened, [&](auto& written) {
+        return expect_true(written
+                               .write(words, kept, util::delta_view_t {util::delta_kind_t::write_k, after},
+                                      invalid_transaction_stamp_k)
+                               .succeeded());
     });
-    expect_true((*reopened)->flush().succeeded());
-    expect_true((*reopened)->compact().succeeded());
-    check(**reopened);
+    expect_true(reopened->flush().succeeded());
+    expect_true(reopened->compact().succeeded());
+    check(*reopened);
     return {};
 }
 
@@ -795,74 +803,72 @@ case_result_t test_dropped_collection_is_gone(mount_type_ const& mount) {
     using database_t = typename types_t::database_t;
     using stack_t = typename types_t::stack_t;
     if (mount.transport == transport_t::memory_k) return case_result_t::skipped(memory_volumes_vanish_k);
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return {};
-    auto const& fixture = *(*stack)->fixture;
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return {};
+    auto const& fixture = *stack->fixture;
 
-    expected<collection_id_t> const kept = create_named(*(*stack)->store, "kept", test_config(8, 0));
-    expected<collection_id_t> const doomed = create_named(*(*stack)->store, "doomed", test_config(0, value_max_size_k));
-    expect_true(kept.has_value());
-    if (!expect_true(doomed.has_value())) return {};
+    auto const [kept, kept_status] = create_named(*stack->store, "kept", test_config(8, 0));
+    auto const [doomed, doomed_status] = create_named(*stack->store, "doomed", test_config(0, value_max_size_k));
+    expect_true(kept_status.succeeded());
+    if (!expect_true(doomed_status.succeeded())) return {};
 
-    st::vector<byte_t> value;
+    st::vector<util::byte_t> value;
     expect_true(value.resize(value_max_size_k) == st::status_t::success_k);
     for (std::size_t index = 0; index != 400; ++index) {
         for (std::size_t position = 0; position != value.size(); ++position) value[position] = painted(index, position);
         expect_true(
-            (*stack)
-                ->store
-                ->insert(any_collection_id_t {*doomed}, static_cast<stored_key_t>(index), stored_value_view_t {value})
+            stack->store
+                ->insert(any_collection_id_t {doomed}, static_cast<stored_key_t>(index), stored_value_view_t {value})
                 .succeeded());
     }
-    expect_true((*stack)->store->flush().succeeded());
+    expect_true(stack->store->flush().succeeded());
     expect_true(run_bytes_of(fixture) != std::uint64_t {0});
 
     // What a drop must reclaim are runs this database took back from its schema rather than wrote itself.
-    expect_true((*stack)->store->unmount().succeeded());
-    (*stack)->store.reset();
-    expected<std::unique_ptr<database_t>> reopened = open_database(**stack);
-    expect_true(reopened.has_value());
-    if (!reopened) return {};
+    expect_true(stack->store->unmount().succeeded());
+    stack->store.reset();
+    auto [reopened, reopen_status] = open_database(*stack);
+    expect_true(reopen_status.succeeded());
+    if (reopen_status.failed()) return {};
 
     expect_true(run_bytes_of(fixture) != std::uint64_t {0});
-    expect_true((*reopened)->drop_collection(any_collection_id_t {*doomed}).succeeded());
-    expect_true(!(*reopened)->has_collection(any_collection_id_t {owned_name("doomed")}));
+    expect_true(reopened->drop_collection(any_collection_id_t {doomed}).succeeded());
+    expect_true(!reopened->has_collection(any_collection_id_t {owned_name("doomed")}));
     expect_equal(run_bytes_of(fixture), std::uint64_t {0});
     expect_equal(run_files_of(fixture), std::size_t {0});
-    expect_status((*reopened)->drop_collection(any_collection_id_t {*doomed}), status_code_t::not_found_k);
+    expect_status(reopened->drop_collection(any_collection_id_t {doomed}), util::status_code_t::not_found_k);
 
     // The name returns under a new UUID in the record the drop freed, which the old UUID misses.
-    expected<collection_id_t> const reborn = create_named(**reopened, "doomed", test_config(8, 0));
-    expect_true(reborn.has_value());
-    if (!reborn) return {};
-    expect_true(!(*reopened)->has_collection(any_collection_id_t {*doomed}));
-    expect_true((*reopened)->collection_name(*doomed).empty());
-    expect_true((*reopened)->collection_id(any_collection_id_t {owned_name("doomed")}) == *reborn);
-    expect_true((*reopened)->drop_collection(any_collection_id_t {*reborn}).succeeded());
+    auto const [reborn, reborn_status] = create_named(*reopened, "doomed", test_config(8, 0));
+    expect_true(reborn_status.succeeded());
+    if (reborn_status.failed()) return {};
+    expect_true(!reopened->has_collection(any_collection_id_t {doomed}));
+    expect_true(reopened->collection_name(doomed).empty());
+    expect_true(reopened->collection_id(any_collection_id_t {owned_name("doomed")}) == reborn);
+    expect_true(reopened->drop_collection(any_collection_id_t {reborn}).succeeded());
 
-    expect_true((*reopened)->unmount().succeeded());
-    (*reopened).reset();
-    expected<std::unique_ptr<database_t>> again = open_database(**stack);
-    expect_true(again.has_value());
-    if (!again) return {};
+    expect_true(reopened->unmount().succeeded());
+    reopened.reset();
+    auto [again, again_status] = open_database(*stack);
+    expect_true(again_status.succeeded());
+    if (again_status.failed()) return {};
 
-    expect_equal((*again)->size(), std::size_t {1});
-    expect_true(!(*again)->has_collection(any_collection_id_t {owned_name("doomed")}));
-    expect_true((*again)->has_collection(any_collection_id_t {owned_name("kept")}));
+    expect_equal(again->size(), std::size_t {1});
+    expect_true(!again->has_collection(any_collection_id_t {owned_name("doomed")}));
+    expect_true(again->has_collection(any_collection_id_t {owned_name("kept")}));
 
     // The bytes the dropped runs held are handed out again rather than lost to the catalog.
-    expected<collection_id_t> const fresh = create_named(**again, "fresh", test_config(0, value_max_size_k));
-    expect_true(fresh.has_value());
-    if (!fresh) return {};
+    auto const [fresh, fresh_status] = create_named(*again, "fresh", test_config(0, value_max_size_k));
+    expect_true(fresh_status.succeeded());
+    if (fresh_status.failed()) return {};
     for (std::size_t index = 0; index != 400; ++index) {
         for (std::size_t position = 0; position != value.size(); ++position) value[position] = painted(index, position);
         expect_true(
-            (*again)
-                ->insert(any_collection_id_t {*fresh}, static_cast<stored_key_t>(index), stored_value_view_t {value})
+            again->insert(any_collection_id_t {fresh}, static_cast<stored_key_t>(index), stored_value_view_t {value})
                 .succeeded());
     }
-    expect_true((*again)->flush().succeeded());
+    expect_true(again->flush().succeeded());
     return {};
 }
 
@@ -882,29 +888,28 @@ case_result_t test_crash_between_seal_and_schema(mount_type_ const& mount) {
     if (mount.transport == transport_t::memory_k) return case_result_t::skipped(memory_volumes_vanish_k);
 
     {
-        expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-        expect_status(stack, status_code_t::success_k);
-        if (!stack) return {};
-        auto const& fixture = *(*stack)->fixture;
+        auto [stack, make_status] = make_stack(mount);
+        expect_status(make_status, util::status_code_t::success_k);
+        if (make_status.failed()) return {};
+        auto const& fixture = *stack->fixture;
 
-        expected<collection_id_t> const lost = create_named(*(*stack)->store, "lost", test_config(8, 0));
-        expect_true(lost.has_value());
-        if (!lost) return {};
+        auto const [lost, lost_status] = create_named(*stack->store, "lost", test_config(8, 0));
+        expect_true(lost_status.succeeded());
+        if (lost_status.failed()) return {};
         for (std::uint64_t key = 0; key != 200; ++key) {
-            std::array<byte_t, 8> const counter = counted(key);
+            std::array<util::byte_t, 8> const counter = counted(key);
             expect_true(
-                (*stack)
-                    ->store
-                    ->insert(any_collection_id_t {*lost}, static_cast<stored_key_t>(key), stored_value_view_t {counter})
+                stack->store
+                    ->insert(any_collection_id_t {lost}, static_cast<stored_key_t>(key), stored_value_view_t {counter})
                     .succeeded());
         }
-        expect_true((*stack)->store->flush().succeeded());
+        expect_true(stack->store->flush().succeeded());
 
         // A flush writes its runs and publishes the manifest second, so the manifest already
         // names every run.
         expect_equal(run_count_of(fixture), run_files_of(fixture));
-        expect_true((*stack)->store->unmount().succeeded());
-        (*stack)->store.reset();
+        expect_true(stack->store->unmount().succeeded());
+        stack->store.reset();
 
         std::size_t const runs = run_count_of(fixture);
         expect_true(runs != std::size_t {0});
@@ -912,11 +917,11 @@ case_result_t test_crash_between_seal_and_schema(mount_type_ const& mount) {
 
         // A mount keeps every run the schema names.
         {
-            expected<std::unique_ptr<database_t>> kept = open_database(**stack);
-            expect_true(kept.has_value());
-            if (!kept) return {};
+            auto [kept, kept_status] = open_database(*stack);
+            expect_true(kept_status.succeeded());
+            if (kept_status.failed()) return {};
             expect_equal(run_count_of(fixture), runs);
-            expect_true((*kept)->unmount().succeeded());
+            expect_true(kept->unmount().succeeded());
         }
 
         // No manifest that would have named those runs ever landed.
@@ -928,63 +933,61 @@ case_result_t test_crash_between_seal_and_schema(mount_type_ const& mount) {
             expect_true(std::filesystem::remove(manifest.c_str()));
         }
 
-        expected<std::unique_ptr<database_t>> reopened = open_database(**stack);
-        expect_true(reopened.has_value());
-        if (!reopened) return {};
-        expect_equal((*reopened)->size(), std::size_t {0});
-        expect_true(!(*reopened)->has_collection(any_collection_id_t {owned_name("lost")}));
+        auto [reopened, reopen_status] = open_database(*stack);
+        expect_true(reopen_status.succeeded());
+        if (reopen_status.failed()) return {};
+        expect_equal(reopened->size(), std::size_t {0});
+        expect_true(!reopened->has_collection(any_collection_id_t {owned_name("lost")}));
         expect_equal(run_files_of(fixture), std::size_t {0});
 
         // The volume is still a volume: a fresh collection writes, flushes and answers over it.
-        expected<collection_id_t> const fresh = create_named(**reopened, "fresh", test_config(8, 0));
-        expect_true(fresh.has_value());
-        if (!fresh) return {};
-        std::array<byte_t, 8> const counter = counted(77);
-        expect_true((*reopened)
-                        ->insert(any_collection_id_t {*fresh}, stored_key_t {1}, stored_value_view_t {counter})
-                        .succeeded());
-        expect_true((*reopened)->flush().succeeded());
-        std::array<byte_t, 8> into {};
+        auto const [fresh, fresh_status] = create_named(*reopened, "fresh", test_config(8, 0));
+        expect_true(fresh_status.succeeded());
+        if (fresh_status.failed()) return {};
+        std::array<util::byte_t, 8> const counter = counted(77);
+        expect_true(
+            reopened->insert(any_collection_id_t {fresh}, stored_key_t {1}, stored_value_view_t {counter}).succeeded());
+        expect_true(reopened->flush().succeeded());
+        std::array<util::byte_t, 8> into {};
         stored_value_size_t size = 0;
-        expect_true((*reopened)
-                        ->select(any_collection_id_t {*fresh}, stored_key_t {1}, std::span<byte_t> {into}, size)
-                        .succeeded());
-        expect_equal(counter_of(std::span<byte_t const> {into.data(), size}), std::uint64_t {77});
+        expect_true(
+            reopened->select(any_collection_id_t {fresh}, stored_key_t {1}, std::span<util::byte_t> {into}, size)
+                .succeeded());
+        expect_equal(counter_of(std::span<util::byte_t const> {into.data(), size}), std::uint64_t {77});
     }
 
     {
-        expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-        expect_status(stack, status_code_t::success_k);
-        if (!stack) return {};
-        auto const& fixture = *(*stack)->fixture;
+        auto [stack, make_status] = make_stack(mount);
+        expect_status(make_status, util::status_code_t::success_k);
+        if (make_status.failed()) return {};
+        auto const& fixture = *stack->fixture;
 
-        expected<collection_id_t> const torn = create_named(*(*stack)->store, "torn", test_config(8, 0));
-        expect_true(torn.has_value());
-        if (!torn) return {};
+        auto const [torn, torn_status] = create_named(*stack->store, "torn", test_config(8, 0));
+        expect_true(torn_status.succeeded());
+        if (torn_status.failed()) return {};
         for (std::uint64_t key = 0; key != 200; ++key) {
-            std::array<byte_t, 8> const counter = counted(key);
+            std::array<util::byte_t, 8> const counter = counted(key);
             expect_true(
-                (*stack)
-                    ->store
-                    ->insert(any_collection_id_t {*torn}, static_cast<stored_key_t>(key), stored_value_view_t {counter})
+                stack->store
+                    ->insert(any_collection_id_t {torn}, static_cast<stored_key_t>(key), stored_value_view_t {counter})
                     .succeeded());
         }
-        expect_true((*stack)->store->flush().succeeded());
-        expect_true((*stack)->store->unmount().succeeded());
-        (*stack)->store.reset();
+        expect_true(stack->store->flush().succeeded());
+        expect_true(stack->store->unmount().succeeded());
+        stack->store.reset();
 
-        manifest_t const manifest = manifest_on_disk(fixture);
+        util::manifest_t const manifest = manifest_on_disk(fixture);
         expect_true(!manifest.files.empty());
         if (manifest.files.empty()) return {};
 
         // The file of one run the manifest names never reached the environment.
-        char name[path_max_bytes_k];
+        char name[util::path_max_bytes_k];
         expect_true(manifest.file_name(manifest.files[0].run, name).succeeded());
         std::string const run_path = fmt::format("{}/{}", fixture.data_directory_path(0).c_str(), name);
         expect_true(std::filesystem::remove(run_path.c_str()));
 
-        expected<std::unique_ptr<database_t>> const reopened = open_database(**stack);
-        expect_true(!reopened.has_value());
+        auto [reopened, reopen_status] = open_database(*stack);
+        expect_true(reopen_status.failed());
     }
     return {};
 }
@@ -997,26 +1000,26 @@ void test_collections_list_by_stamp(mount_type_ const& mount) {
     using types_t = database_types<typename mount_type_::fixture_t>;
     using database_t = typename types_t::database_t;
     using stack_t = typename types_t::stack_t;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return;
-    database_t& store = *(*stack)->store;
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return;
+    database_t& store = *stack->store;
 
     transaction_stamp_t const before = store.ledger().published();
-    expected<collection_id_t> const listed = create_named(store, "listed", test_config(8, 0));
-    expect_true(listed.has_value());
-    if (!listed) return;
+    auto const [listed, create_status] = create_named(store, "listed", test_config(8, 0));
+    expect_true(create_status.succeeded());
+    if (create_status.failed()) return;
     transaction_stamp_t const created = store.ledger().published();
     std::uint16_t tag = 0;
-    expect_status(store.listed_store_tag(*listed, before, tag), status_code_t::not_found_k);
-    expect_true(store.listed_store_tag(*listed, created, tag).succeeded());
-    expect_true(store.listed_store_tag(*listed, head_stamp_k, tag).succeeded());
+    expect_status(store.listed_store_tag(listed, before, tag), util::status_code_t::not_found_k);
+    expect_true(store.listed_store_tag(listed, created, tag).succeeded());
+    expect_true(store.listed_store_tag(listed, head_stamp_k, tag).succeeded());
     expect_equal(tag, static_cast<std::uint16_t>(value_layout_t::inline_12_bytes_k));
 
-    expect_true(store.unlist_collection(*listed).succeeded());
-    expect_true(store.listed_store_tag(*listed, created, tag).succeeded());
-    expect_status(store.listed_store_tag(*listed, head_stamp_k, tag), status_code_t::not_found_k);
-    expect_status(store.listed_store_tag(*listed, store.ledger().published(), tag), status_code_t::not_found_k);
+    expect_true(store.unlist_collection(listed).succeeded());
+    expect_true(store.listed_store_tag(listed, created, tag).succeeded());
+    expect_status(store.listed_store_tag(listed, head_stamp_k, tag), util::status_code_t::not_found_k);
+    expect_status(store.listed_store_tag(listed, store.ledger().published(), tag), util::status_code_t::not_found_k);
 }
 
 /**
@@ -1032,62 +1035,62 @@ case_result_t test_crash_keeps_a_prefix_of_commits(mount_type_ const& mount) {
     using database_t = typename types_t::database_t;
     using stack_t = typename types_t::stack_t;
     if (mount.transport == transport_t::memory_k) return case_result_t::skipped(memory_volumes_vanish_k);
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return {};
-    database_t& store = *(*stack)->store;
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return {};
+    database_t& store = *stack->store;
 
     // The first collection flushes once its buffer holds its few writes, the second never does on its own.
     collection_config_t narrow = test_config(8, 0);
     narrow.memory_runs_max_deltas = 4;
-    expected<collection_id_t> const first = create_named(store, "first", narrow);
-    expected<collection_id_t> const second = create_named(store, "second", test_config(8, 0));
-    if (!expect_true(first.has_value() && second.has_value())) return {};
-    any_collection_id_t const left {*first};
-    any_collection_id_t const right {*second};
+    auto const [first, first_status] = create_named(store, "first", narrow);
+    auto const [second, second_status] = create_named(store, "second", test_config(8, 0));
+    if (!expect_true(first_status.succeeded() && second_status.succeeded())) return {};
+    any_collection_id_t const left {first};
+    any_collection_id_t const right {second};
 
     auto commit_both = [&](std::uint64_t value) noexcept {
-        expected<typename database_t::transaction_unique_ptr_t> transaction = store.create_transaction();
-        if (!expect_true(transaction.has_value())) return;
-        std::array<byte_t, 8> const counter = counted(value);
-        expect_true((*transaction)->insert(left, stored_key_t {0}, stored_value_view_t {counter}).succeeded());
-        expect_true((*transaction)->insert(right, stored_key_t {0}, stored_value_view_t {counter}).succeeded());
-        expect_true((*transaction)->commit().succeeded());
+        auto [transaction, begin_status] = store.create_transaction();
+        if (!expect_true(begin_status.succeeded())) return;
+        std::array<util::byte_t, 8> const counter = counted(value);
+        expect_true(transaction->insert(left, stored_key_t {0}, stored_value_view_t {counter}).succeeded());
+        expect_true(transaction->insert(right, stored_key_t {0}, stored_value_view_t {counter}).succeeded());
+        expect_true(transaction->commit().succeeded());
     };
     commit_both(1);
     expect_true(store.flush().succeeded());
     commit_both(2);
     for (std::uint64_t key = 100; key != 104; ++key) {
-        std::array<byte_t, 8> const counter = counted(key);
+        std::array<util::byte_t, 8> const counter = counted(key);
         expect_true(store.insert(left, static_cast<stored_key_t>(key), stored_value_view_t {counter}).succeeded());
     }
     expect_true(create_named(store, "saved", test_config(8, 0)).has_value());
 
     // Before the crash both collections answer the second commit, the first from a run, the second from its buffer.
-    std::array<byte_t, 8> into {};
+    std::array<util::byte_t, 8> into {};
     stored_value_size_t size = 0;
-    expect_true(store.select(left, stored_key_t {0}, std::span<byte_t> {into}, size).succeeded());
-    expect_equal(counter_of(std::span<byte_t const> {into.data(), size}), std::uint64_t {2});
-    expect_true(capture_data_directory(*(*stack)->fixture).succeeded());
-    (*stack)->store.reset();
-    (*stack)->volume = typename types_t::volume_t {};
-    expect_true(restore_data_directory(*(*stack)->fixture).succeeded());
-    expected<std::unique_ptr<database_t>> reopened = open_database(**stack);
-    if (!expect_true(reopened.has_value())) return {};
+    expect_true(store.select(left, stored_key_t {0}, std::span<util::byte_t> {into}, size).succeeded());
+    expect_equal(counter_of(std::span<util::byte_t const> {into.data(), size}), std::uint64_t {2});
+    expect_true(capture_data_directory(*stack->fixture).succeeded());
+    stack->store.reset();
+    stack->volume = typename types_t::volume_t {};
+    expect_true(restore_data_directory(*stack->fixture).succeeded());
+    auto [reopened, reopen_status] = open_database(*stack);
+    if (!expect_true(reopen_status.succeeded())) return {};
 
     // The first commit is whole, the second gone from both sides, and the writes after it gone with it.
-    expect_true((*reopened)->has_collection(any_collection_id_t {owned_name("saved")}));
-    expect_true((*reopened)->select(left, stored_key_t {0}, std::span<byte_t> {into}, size).succeeded());
-    expect_equal(counter_of(std::span<byte_t const> {into.data(), size}), std::uint64_t {1});
-    expect_true((*reopened)->select(right, stored_key_t {0}, std::span<byte_t> {into}, size).succeeded());
-    expect_equal(counter_of(std::span<byte_t const> {into.data(), size}), std::uint64_t {1});
-    for (std::uint64_t key = 100; key != 104; ++key) expect_true(!(*reopened)->contains(left, key));
+    expect_true(reopened->has_collection(any_collection_id_t {owned_name("saved")}));
+    expect_true(reopened->select(left, stored_key_t {0}, std::span<util::byte_t> {into}, size).succeeded());
+    expect_equal(counter_of(std::span<util::byte_t const> {into.data(), size}), std::uint64_t {1});
+    expect_true(reopened->select(right, stored_key_t {0}, std::span<util::byte_t> {into}, size).succeeded());
+    expect_equal(counter_of(std::span<util::byte_t const> {into.data(), size}), std::uint64_t {1});
+    for (std::uint64_t key = 100; key != 104; ++key) expect_true(!reopened->contains(left, key));
 
     // A commit after the reopen lands under a fresh stamp and reads back.
-    std::array<byte_t, 8> const counter = counted(3);
-    expect_true((*reopened)->insert(left, stored_key_t {0}, stored_value_view_t {counter}).succeeded());
-    expect_true((*reopened)->select(left, stored_key_t {0}, std::span<byte_t> {into}, size).succeeded());
-    expect_equal(counter_of(std::span<byte_t const> {into.data(), size}), std::uint64_t {3});
+    std::array<util::byte_t, 8> const counter = counted(3);
+    expect_true(reopened->insert(left, stored_key_t {0}, stored_value_view_t {counter}).succeeded());
+    expect_true(reopened->select(left, stored_key_t {0}, std::span<util::byte_t> {into}, size).succeeded());
+    expect_equal(counter_of(std::span<util::byte_t const> {into.data(), size}), std::uint64_t {3});
     return {};
 }
 
@@ -1105,45 +1108,45 @@ case_result_t test_merges_keep_what_the_flush_promises(mount_type_ const& mount)
     using database_t = typename types_t::database_t;
     using stack_t = typename types_t::stack_t;
     if (mount.transport == transport_t::memory_k) return case_result_t::skipped(memory_volumes_vanish_k);
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return {};
-    database_t& store = *(*stack)->store;
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return {};
+    database_t& store = *stack->store;
 
     // Two runs of tier zero merge, and the merged run with one more delta makes a flush due.
     collection_config_t merging = test_config(8, 0);
     merging.lsm_tree.level_enlarge_factor = storage_limits_t::level_min_enlarge_factor_k;
     merging.memory_runs_max_deltas = 2;
-    expected<collection_id_t> const merged = create_named(store, "merged", merging);
-    expected<collection_id_t> const beside = create_named(store, "beside", test_config(8, 0));
-    if (!expect_true(merged.has_value() && beside.has_value())) return {};
-    any_collection_id_t const id {*merged};
+    auto const [merged, merged_status] = create_named(store, "merged", merging);
+    auto const [beside, beside_status] = create_named(store, "beside", test_config(8, 0));
+    if (!expect_true(merged_status.succeeded() && beside_status.succeeded())) return {};
+    any_collection_id_t const id {merged};
 
     auto write = [&](any_collection_id_t const& written_id, stored_key_t key, std::uint64_t value) noexcept {
-        std::array<byte_t, 8> const counter = counted(value);
+        std::array<util::byte_t, 8> const counter = counted(value);
         return expect_true(store.insert(written_id, key, stored_value_view_t {counter}).succeeded());
     };
     write(id, stored_key_t {0}, 1);
-    write(any_collection_id_t {*beside}, stored_key_t {0}, 2);
+    write(any_collection_id_t {beside}, stored_key_t {0}, 2);
     write(id, stored_key_t {0}, 3);
     write(id, stored_key_t {1}, 4);
 
-    std::array<byte_t, 8> into {};
+    std::array<util::byte_t, 8> into {};
     stored_value_size_t size = 0;
-    expect_true(store.select(id, stored_key_t {0}, std::span<byte_t> {into}, size).succeeded());
-    expect_equal(counter_of(std::span<byte_t const> {into.data(), size}), std::uint64_t {3});
-    expect_true(capture_data_directory(*(*stack)->fixture).succeeded());
-    (*stack)->store.reset();
-    (*stack)->volume = typename types_t::volume_t {};
-    expect_true(restore_data_directory(*(*stack)->fixture).succeeded());
-    expected<std::unique_ptr<database_t>> reopened = open_database(**stack);
-    if (!expect_true(reopened.has_value())) return {};
+    expect_true(store.select(id, stored_key_t {0}, std::span<util::byte_t> {into}, size).succeeded());
+    expect_equal(counter_of(std::span<util::byte_t const> {into.data(), size}), std::uint64_t {3});
+    expect_true(capture_data_directory(*stack->fixture).succeeded());
+    stack->store.reset();
+    stack->volume = typename types_t::volume_t {};
+    expect_true(restore_data_directory(*stack->fixture).succeeded());
+    auto [reopened, reopen_status] = open_database(*stack);
+    if (!expect_true(reopen_status.succeeded())) return {};
 
     // The second collection's commit was never durable, so the mount resumes below it, at
     // the first write.
-    expect_true((*reopened)->select(id, stored_key_t {0}, std::span<byte_t> {into}, size).succeeded());
-    expect_equal(counter_of(std::span<byte_t const> {into.data(), size}), std::uint64_t {1});
-    expect_true(!(*reopened)->contains(any_collection_id_t {*beside}, stored_key_t {0}));
+    expect_true(reopened->select(id, stored_key_t {0}, std::span<util::byte_t> {into}, size).succeeded());
+    expect_equal(counter_of(std::span<util::byte_t const> {into.data(), size}), std::uint64_t {1});
+    expect_true(!reopened->contains(any_collection_id_t {beside}, stored_key_t {0}));
     return {};
 }
 
@@ -1154,30 +1157,30 @@ case_result_t test_user_data_round_trips(mount_type_ const& mount) {
     using database_t = typename types_t::database_t;
     using stack_t = typename types_t::stack_t;
     if (mount.transport == transport_t::memory_k) return case_result_t::skipped(memory_volumes_vanish_k);
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return {};
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return {};
 
-    st::vector<byte_t> saved;
+    st::vector<util::byte_t> saved;
     expect_true(saved.resize(3000) == st::status_t::success_k);
     for (std::size_t index = 0; index != saved.size(); ++index) saved[index] = painted(77, index);
-    expect_true((*stack)->store->save_user_data(bytes_view_t {saved}).succeeded());
-    expect_equal((*stack)->store->user_data_size_bytes(), std::uint64_t {3000});
+    expect_true(stack->store->save_user_data(bytes_view_t {saved}).succeeded());
+    expect_equal(stack->store->user_data_size_bytes(), std::uint64_t {3000});
 
-    expect_true((*stack)->store->unmount().succeeded());
-    (*stack)->store.reset();
-    expected<std::unique_ptr<database_t>> reopened = open_database(**stack);
-    expect_true(reopened.has_value());
-    if (!reopened) return {};
+    expect_true(stack->store->unmount().succeeded());
+    stack->store.reset();
+    auto [reopened, reopen_status] = open_database(*stack);
+    expect_true(reopen_status.succeeded());
+    if (reopen_status.failed()) return {};
 
-    st::vector<byte_t> loaded;
+    st::vector<util::byte_t> loaded;
     expect_true(loaded.resize(3000) == st::status_t::success_k);
-    expect_true((*reopened)->load_user_data(bytes_span_t {loaded}).succeeded());
+    expect_true(reopened->load_user_data(bytes_span_t {loaded}).succeeded());
     expect_equal(std::memcmp(loaded.data(), saved.data(), saved.size()), 0);
 
-    expect_true((*reopened)->clear_user_data().succeeded());
-    expect_equal((*reopened)->user_data_size_bytes(), std::uint64_t {0});
-    expect_true((*reopened)->load_user_data(bytes_span_t {loaded}) == status_code_t::not_found_k);
+    expect_true(reopened->clear_user_data().succeeded());
+    expect_equal(reopened->user_data_size_bytes(), std::uint64_t {0});
+    expect_true(reopened->load_user_data(bytes_span_t {loaded}) == util::status_code_t::not_found_k);
     return {};
 }
 
@@ -1185,40 +1188,41 @@ case_result_t test_user_data_round_trips(mount_type_ const& mount) {
  *  media and back. */
 template <typename fixture_type_>
 struct archive_types {
-    using volume_t = any_volume<typename fixture_type_::disk_t, waiter_t, volume_allocator_t>;
+    using volume_t = util::any_volume<typename fixture_type_::disk_t, waiter_t, volume_allocator_t>;
     using store_t = nvme_store<key_slot<stored_key_t, value_layout_t::variable_width_k>, volume_t, atomic_reference,
-                               waiter_t, last_write_fold_t, no_device_fold_t>;
+                               waiter_t, util::last_write_fold_t, no_device_fold_t>;
     using database_t = basic_database<stored_key_t, volume_t, atomic_reference, waiter_t, st::native_row_kit_t,
                                       layout_store_tags<store_t>, store_t>;
 };
 
 /** Steps the serial SHA-256 kernels, counting every block it hashes into @c blocks. */
 struct counted_sha256_t {
-    strings_kit_sha256<serial_strings_kit_t> kernels;
+    util::strings_kit_sha256<util::serial_strings_kit_t> kernels;
     std::size_t* blocks = nullptr;
 
     void init(sz_sha256_state_t& state) const noexcept { kernels.init(state); }
 
-    void update(sz_sha256_state_t& state, std::span<byte_t const> bytes) const noexcept {
+    void update(sz_sha256_state_t& state, std::span<util::byte_t const> bytes) const noexcept {
         ++*blocks;
         kernels.update(state, bytes);
     }
 
-    [[nodiscard]] sha256_t digest(sz_sha256_state_t const& state) const noexcept { return kernels.digest(state); }
+    [[nodiscard]] util::sha256_t digest(sz_sha256_state_t const& state) const noexcept { return kernels.digest(state); }
 };
 
 /** Mounts a volume over @p address and a database over it, which checks the runs with
  *  @p digester, answering both or why either was refused. */
 template <typename types_type_, typename fixture_type_,
-          typename digester_type_ = strings_kit_sha256<serial_strings_kit_t>>
-status_t open_archive(fixture_type_& fixture, io_channel_t& channel, char const* database, char const* address,
-                      typename types_type_::volume_t& volume, std::unique_ptr<typename types_type_::database_t>& store,
-                      digester_type_ const& digester = {}) noexcept {
-    auto [parsed, parse_status] = parse_data_address(address);
+          typename digester_type_ = util::strings_kit_sha256<util::serial_strings_kit_t>>
+util::status_t open_archive(fixture_type_& fixture, util::io_channel_t& channel, char const* database,
+                            char const* address, typename types_type_::volume_t& volume,
+                            std::unique_ptr<typename types_type_::database_t>& store,
+                            digester_type_ const& digester = {}) noexcept {
+    auto [parsed, parse_status] = util::parse_data_address(address);
     if (parse_status.failed()) return parse_status;
-    data_address_t const addresses[] {parsed};
-    volume_config_t config;
-    config.database = string_view_t {database};
+    util::data_address_t const addresses[] {parsed};
+    util::volume_config_t config;
+    config.database = util::string_view_t {database};
     config.data_directories = addresses;
     config.runs_capacity = fixture.config.runs_capacity;
     auto [mounted, mount_status] = types_type_::volume_t::mount(
@@ -1226,26 +1230,26 @@ status_t open_archive(fixture_type_& fixture, io_channel_t& channel, char const*
     if (mount_status.failed()) return mount_status;
     volume = std::move(mounted);
     store.reset(new (std::nothrow) typename types_type_::database_t {fixture.resources});
-    if (!store) return {status_code_t::out_of_memory_k, "The database did not fit"};
+    if (!store) return {util::status_code_t::out_of_memory_k, "The database did not fit"};
     return store->mount(volume, fixture.channels, test_database_config(), {}, digester);
 }
 
 /** Saves the head of @p store as the database @p database at @p address, answering what
  *  the save placed. */
 template <typename database_type_>
-expected<typename database_type_::archive_report_t> save_head(database_type_& store, char const* database,
-                                                              char const* address) noexcept {
-    auto [parsed, parse_status] = parse_data_address(address);
+util::expected<typename database_type_::archive_report_t> save_head(database_type_& store, char const* database,
+                                                                    char const* address) noexcept {
+    auto [parsed, parse_status] = util::parse_data_address(address);
     if (parse_status.failed()) return parse_status;
-    data_address_t const addresses[] {parsed};
-    volume_config_t target;
-    target.database = string_view_t {database};
+    util::data_address_t const addresses[] {parsed};
+    util::volume_config_t target;
+    target.database = util::string_view_t {database};
     target.data_directories = addresses;
-    expected<typename database_type_::snapshot_t> pinned = store.pin_stamp();
-    if (!pinned) return pinned.status();
+    auto [pinned, pin_status] = store.pin_stamp();
+    if (pin_status.failed()) return pin_status;
     return store.save(
-        target, pinned->stamp(), [](std::uint64_t, std::uint64_t) noexcept { return true; },
-        strings_kit_sha256<serial_strings_kit_t> {});
+        target, pinned.stamp(), [](std::uint64_t, std::uint64_t) noexcept { return true; },
+        util::strings_kit_sha256<util::serial_strings_kit_t> {});
 }
 
 /** Counts the keys below @p count whose values in @p store differ from the painted ones of
@@ -1253,11 +1257,11 @@ expected<typename database_type_::archive_report_t> save_head(database_type_& st
 template <typename database_type_>
 [[nodiscard]] std::size_t differing_keys(database_type_& store, collection_id_t collection, std::uint64_t count) {
     std::size_t differing = 0;
-    std::array<byte_t, 512> into {};
+    std::array<util::byte_t, 512> into {};
     for (std::uint64_t key = 0; key != count; ++key) {
         stored_value_size_t size = 0;
-        status_t const read = store.select(any_collection_id_t {collection}, static_cast<stored_key_t>(key),
-                                           std::span<byte_t> {into}, size);
+        util::status_t const read = store.select(any_collection_id_t {collection}, static_cast<stored_key_t>(key),
+                                                 std::span<util::byte_t> {into}, size);
         bool same = read.succeeded() && size == blob_bytes_of(key);
         for (std::size_t position = 0; same && position != size; ++position)
             same = into[position] == painted(key, position);
@@ -1283,7 +1287,7 @@ case_result_t test_archive_saves_incrementally_both_ways(mount_type_ const& moun
     auto [guard, acquire_status] = fixture->channels.acquire();
     expect_true(acquire_status.succeeded());
     if (acquire_status.failed()) return {};
-    io_channel_t& channel = guard.channel();
+    util::io_channel_t& channel = guard.channel();
 
     std::string const source = fixture->data_directory_path(0), restored = fixture->data_directory_path(1);
     std::string const device = fmt::format("{}/archive.raw", fixture->directory);
@@ -1292,7 +1296,7 @@ case_result_t test_archive_saves_incrementally_both_ways(mount_type_ const& moun
         std::FILE* const file = std::fopen(device.c_str(), "wb");
         if (file) std::fclose(file);
         std::error_code error;
-        std::filesystem::resize_file(device.c_str(), 4 * slot_bytes_k, error);
+        std::filesystem::resize_file(device.c_str(), 4 * util::slot_bytes_k, error);
         expect_true(!error);
     }
     std::string const raw = fmt::format("{}@0+4GiB", device);
@@ -1308,7 +1312,7 @@ case_result_t test_archive_saves_incrementally_both_ways(mount_type_ const& moun
         expect_true(create_status.succeeded());
         if (create_status.failed()) return {};
         collection = created;
-        st::vector<byte_t> value;
+        st::vector<util::byte_t> value;
         expect_true(value.resize(512) == st::status_t::success_k);
         auto write = [&](std::uint64_t begin, std::uint64_t end) noexcept {
             for (std::uint64_t key = begin; key != end; ++key) {
@@ -1342,7 +1346,7 @@ case_result_t test_archive_saves_incrementally_both_ways(mount_type_ const& moun
         if (!expect_true(open_archive<types_t>(*fixture, channel, "archived", raw.data(), volume, store).succeeded()))
             return {};
         expect_equal(differing_keys(*store, collection, 300), std::size_t {0});
-        for (manifest_file_t const& file : volume.manifest().files) expect_true(!file.sha256.empty());
+        for (util::manifest_file_t const& file : volume.manifest().files) expect_true(!file.sha256.empty());
 
         // The raw copy saves back into a directory, which restores every byte again.
         auto [back, back_status] = save_head(*store, "archived", restored.c_str());
@@ -1388,7 +1392,7 @@ case_result_t test_archive_saves_incrementally_both_ways(mount_type_ const& moun
     volume_t volume;
     std::unique_ptr<database_t> store;
     expect_status(open_archive<types_t>(*fixture, channel, "archived", corrupted.c_str(), volume, store),
-                  status_code_t::malformed_k);
+                  util::status_code_t::malformed_k);
     return {};
 }
 
@@ -1412,33 +1416,33 @@ void test_commit_is_all_or_nothing(mount_type_ const& mount) {
     constexpr std::size_t rounds_k = 10;
     constexpr std::size_t band_k = 24;
     constexpr std::size_t keys_k = rounds_k * band_k;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return;
-    database_t& store = *(*stack)->store;
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return;
+    database_t& store = *stack->store;
 
     collection_config_t narrow = test_config(8, 0);
     narrow.memory_runs_max_deltas = 6;
     narrow.memory_runs_max_bytes = 8ull * 1024ull;
-    expected<collection_id_t> const first = create_named(store, "first", narrow);
-    expected<collection_id_t> const second = create_named(store, "second", narrow);
-    expect_true(first.has_value());
-    if (!expect_true(second.has_value())) return;
+    auto const [first, first_status] = create_named(store, "first", narrow);
+    auto const [second, second_status] = create_named(store, "second", narrow);
+    expect_true(first_status.succeeded());
+    if (!expect_true(second_status.succeeded())) return;
 
     bool writing {true};
     std::size_t half_applied {0};
     std::size_t observations {0};
     std::thread reader {[&]() noexcept {
         while (atomic_reference<bool> {writing}.load(std::memory_order_acquire)) {
-            expected<typename database_t::snapshot_t> taken = store.pin_stamp();
-            if (!taken) continue;
+            auto [taken, pin_status] = store.pin_stamp();
+            if (pin_status.failed()) continue;
             stored_value_size_t left = 0;
             stored_value_size_t right = 0;
             for (std::size_t key = 0; key != keys_k; ++key) {
-                lookup_result_t const here = taken->find(any_collection_id_t {*first}, static_cast<stored_key_t>(key),
-                                                         left);
-                lookup_result_t const there = taken->find(any_collection_id_t {*second}, static_cast<stored_key_t>(key),
-                                                          right);
+                lookup_result_t const here = taken.find(any_collection_id_t {first}, static_cast<stored_key_t>(key),
+                                                        left);
+                lookup_result_t const there = taken.find(any_collection_id_t {second}, static_cast<stored_key_t>(key),
+                                                         right);
                 if ((here == lookup_result_t::written_k) != (there == lookup_result_t::written_k))
                     atomic_reference<std::size_t> {half_applied}.fetch_add(1, std::memory_order_relaxed);
             }
@@ -1447,18 +1451,18 @@ void test_commit_is_all_or_nothing(mount_type_ const& mount) {
     }};
 
     for (std::size_t round = 0; round != rounds_k; ++round) {
-        expected<typename database_t::transaction_unique_ptr_t> transaction = store.create_transaction();
-        expect_true(transaction.has_value());
-        if (!transaction) break;
+        auto [transaction, begin_status] = store.create_transaction();
+        expect_true(begin_status.succeeded());
+        if (begin_status.failed()) break;
         for (std::size_t step = 0; step != band_k; ++step) {
             stored_key_t const key = static_cast<stored_key_t>(round * band_k + step);
-            std::array<byte_t, 8> const counter = counted(key);
+            std::array<util::byte_t, 8> const counter = counted(key);
             expect_true(
-                (*transaction)->insert(any_collection_id_t {*first}, key, stored_value_view_t {counter}).succeeded());
+                transaction->insert(any_collection_id_t {first}, key, stored_value_view_t {counter}).succeeded());
             expect_true(
-                (*transaction)->insert(any_collection_id_t {*second}, key, stored_value_view_t {counter}).succeeded());
+                transaction->insert(any_collection_id_t {second}, key, stored_value_view_t {counter}).succeeded());
         }
-        expect_true((*transaction)->commit().succeeded());
+        expect_true(transaction->commit().succeeded());
     }
     atomic_reference<bool> {writing}.store(false, std::memory_order_release);
     reader.join();
@@ -1467,19 +1471,21 @@ void test_commit_is_all_or_nothing(mount_type_ const& mount) {
     expect_true(atomic_reference<std::size_t> {observations}.load(std::memory_order_relaxed) != 0);
 
     // Every write of every committed transaction is in the store afterwards.
-    st::vector<byte_t> into;
+    st::vector<util::byte_t> into;
     expect_true(into.resize(8) == st::status_t::success_k);
     std::size_t mismatches = 0;
     for (std::size_t key = 0; key != keys_k; ++key) {
         stored_value_size_t size = 0;
-        expect_true(
-            store.select(any_collection_id_t {*first}, static_cast<stored_key_t>(key), std::span<byte_t> {into}, size)
-                .succeeded());
-        if (counter_of(std::span<byte_t const> {into.data(), size}) != key) ++mismatches;
-        expect_true(
-            store.select(any_collection_id_t {*second}, static_cast<stored_key_t>(key), std::span<byte_t> {into}, size)
-                .succeeded());
-        if (counter_of(std::span<byte_t const> {into.data(), size}) != key) ++mismatches;
+        expect_true(store
+                        .select(any_collection_id_t {first}, static_cast<stored_key_t>(key),
+                                std::span<util::byte_t> {into}, size)
+                        .succeeded());
+        if (counter_of(std::span<util::byte_t const> {into.data(), size}) != key) ++mismatches;
+        expect_true(store
+                        .select(any_collection_id_t {second}, static_cast<stored_key_t>(key),
+                                std::span<util::byte_t> {into}, size)
+                        .succeeded());
+        if (counter_of(std::span<util::byte_t const> {into.data(), size}) != key) ++mismatches;
     }
     expect_equal(mismatches, std::size_t {0});
 }
@@ -1493,12 +1499,12 @@ void test_single_collection_commit_keeps_its_bytes(mount_type_ const& mount) {
     using database_t = typename types_t::database_t;
     using stack_t = typename types_t::stack_t;
     constexpr std::size_t keys_k = 6;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return;
-    database_t& store = *(*stack)->store;
-    expected<collection_id_t> const own = create_named(store, "own", test_config(0, value_max_size_k));
-    if (!expect_true(own.has_value())) return;
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return;
+    database_t& store = *stack->store;
+    auto const [own, create_status] = create_named(store, "own", test_config(0, value_max_size_k));
+    if (!expect_true(create_status.succeeded())) return;
 
     // Commits a transaction of @p capacity bytes over the keys of @p round, answering how many
     // values a read views outside the bytes the transaction wrote.
@@ -1507,35 +1513,36 @@ void test_single_collection_commit_keeps_its_bytes(mount_type_ const& mount) {
         transaction_config_t shape;
         shape.max_bytes = capacity;
         shape.max_deltas = keys_k;
-        expected<typename database_t::transaction_unique_ptr_t> transaction = store.create_transaction(shape);
-        expect_true(transaction.has_value());
-        if (!transaction) return moved;
+        auto [transaction, begin_status] = store.create_transaction(shape);
+        expect_true(begin_status.succeeded());
+        if (begin_status.failed()) return moved;
         std::array<stored_key_t, keys_k> keys {};
-        std::array<byte_t const*, keys_k> written {};
+        std::array<util::byte_t const*, keys_k> written {};
         for (std::size_t key = 0; key != keys_k; ++key) {
-            std::array<byte_t, 512> value {};
+            std::array<util::byte_t, 512> value {};
             std::size_t const width = blob_bytes_of(key);
             for (std::size_t position = 0; position != width; ++position)
                 value[position] = painted(key + round, position);
             keys[key] = static_cast<stored_key_t>(key);
-            expect_true((*transaction)
-                            ->insert(any_collection_id_t {*own}, keys[key], stored_value_view_t {value.data(), width})
-                            .succeeded());
-            delta_view_t held;
-            expect_true((*transaction)->uncommitted_delta(*own, keys[key], held));
+            expect_true(
+                transaction->insert(any_collection_id_t {own}, keys[key], stored_value_view_t {value.data(), width})
+                    .succeeded());
+            util::delta_view_t held;
+            expect_true(transaction->uncommitted_delta(own, keys[key], held));
             written[key] = held.bytes.data();
         }
-        expect_true((*transaction)->commit().succeeded());
+        expect_true(transaction->commit().succeeded());
 
         std::array<lookup_result_t, keys_k> results {};
-        std::array<byte_t const*, keys_k> viewed {};
-        expect_true(store
-                        .select(any_collection_id_t {*own}, std::span<stored_key_t const> {keys},
-                                std::span<lookup_result_t> {results},
-                                [&](std::size_t request, std::uint64_t offset, std::span<byte_t const> bytes) noexcept {
-                                    if (offset == 0) viewed[request] = bytes.data();
-                                })
-                        .succeeded());
+        std::array<util::byte_t const*, keys_k> viewed {};
+        expect_true(
+            store
+                .select(any_collection_id_t {own}, std::span<stored_key_t const> {keys},
+                        std::span<lookup_result_t> {results},
+                        [&](std::size_t request, std::uint64_t offset, std::span<util::byte_t const> bytes) noexcept {
+                            if (offset == 0) viewed[request] = bytes.data();
+                        })
+                .succeeded());
         moved = 0;
         for (std::size_t key = 0; key != keys_k; ++key)
             moved += results[key] != lookup_result_t::written_k || viewed[key] != written[key];
@@ -1557,19 +1564,19 @@ void test_merged_and_flushed_values_read_back(mount_type_ const& mount) {
     using stack_t = typename types_t::stack_t;
     constexpr std::size_t rounds_k = 64;
     constexpr std::uint64_t keys_k = 40;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return;
-    database_t& store = *(*stack)->store;
-    expected<collection_id_t> const own = create_named(store, "own", test_config(0, value_max_size_k));
-    expected<collection_id_t> const beside = create_named(store, "beside", test_config(0, value_max_size_k));
-    expect_true(own.has_value());
-    if (!expect_true(beside.has_value())) return;
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return;
+    database_t& store = *stack->store;
+    auto const [own, own_status] = create_named(store, "own", test_config(0, value_max_size_k));
+    auto const [beside, beside_status] = create_named(store, "beside", test_config(0, value_max_size_k));
+    expect_true(own_status.succeeded());
+    if (!expect_true(beside_status.succeeded())) return;
 
     // The round that last wrote each key, plus one, so zero stands for a key never written.
     std::array<std::uint64_t, keys_k> own_rounds {};
     std::array<std::uint64_t, keys_k> beside_rounds {};
-    auto paint = [](std::uint64_t key, std::uint64_t round, std::array<byte_t, 512>& value) noexcept {
+    auto paint = [](std::uint64_t key, std::uint64_t round, std::array<util::byte_t, 512>& value) noexcept {
         std::size_t const width = blob_bytes_of(key + round);
         for (std::size_t position = 0; position != width; ++position) value[position] = painted(key + round, position);
         return width;
@@ -1578,12 +1585,12 @@ void test_merged_and_flushed_values_read_back(mount_type_ const& mount) {
         std::size_t mismatches = 0;
         for (std::uint64_t key = 0; key != keys_k; ++key) {
             if (rounds[key] == 0) continue;
-            std::array<byte_t, 512> wanted {};
+            std::array<util::byte_t, 512> wanted {};
             std::size_t const width = paint(key, rounds[key] - 1, wanted);
-            std::array<byte_t, 512> into {};
+            std::array<util::byte_t, 512> into {};
             stored_value_size_t size = 0;
-            status_t const selected = store.select(any_collection_id_t {collection}, static_cast<stored_key_t>(key),
-                                                   std::span<byte_t> {into}, size);
+            util::status_t const selected = store.select(
+                any_collection_id_t {collection}, static_cast<stored_key_t>(key), std::span<util::byte_t> {into}, size);
             mismatches += selected.failed() || size != width || std::memcmp(into.data(), wanted.data(), width) != 0;
         }
         return expect_equal(mismatches, std::size_t {0});
@@ -1594,32 +1601,31 @@ void test_merged_and_flushed_values_read_back(mount_type_ const& mount) {
         transaction_config_t shape;
         shape.max_deltas = (round % 6 == 5 ? 2 : 1) * (1 + round % 5);
         shape.max_bytes = shape.max_deltas * blob_bytes_of(96);
-        expected<typename database_t::transaction_unique_ptr_t> transaction = store.create_transaction(shape);
-        expect_true(transaction.has_value());
-        if (!transaction) break;
+        auto [transaction, begin_status] = store.create_transaction(shape);
+        expect_true(begin_status.succeeded());
+        if (begin_status.failed()) break;
         for (std::uint64_t step = 0; step != 1 + round % 5; ++step) {
             stored_key_t const key = static_cast<stored_key_t>((round * 7 + step * 3) % keys_k);
-            std::array<byte_t, 512> value {};
+            std::array<util::byte_t, 512> value {};
             std::size_t const width = paint(key, round, value);
-            expect_true((*transaction)
-                            ->insert(any_collection_id_t {*own}, key, stored_value_view_t {value.data(), width})
+            expect_true(transaction->insert(any_collection_id_t {own}, key, stored_value_view_t {value.data(), width})
                             .succeeded());
             own_rounds[key] = round + 1;
             if (round % 6 != 5) continue;
-            expect_true((*transaction)
-                            ->insert(any_collection_id_t {*beside}, key, stored_value_view_t {value.data(), width})
-                            .succeeded());
+            expect_true(
+                transaction->insert(any_collection_id_t {beside}, key, stored_value_view_t {value.data(), width})
+                    .succeeded());
             beside_rounds[key] = round + 1;
         }
-        if (!expect_true((*transaction)->commit().succeeded())) break;
+        if (!expect_true(transaction->commit().succeeded())) break;
         if (round % 16 != 15) continue;
-        bool const own_held = read_back(*own, own_rounds);
-        if (!read_back(*beside, beside_rounds) || !own_held) break;
+        bool const own_held = read_back(own, own_rounds);
+        if (!read_back(beside, beside_rounds) || !own_held) break;
     }
-    expect_true(store.memory_shape(any_collection_id_t {*own}).runs < rounds_k / 4);
+    expect_true(store.memory_shape(any_collection_id_t {own}).runs < rounds_k / 4);
     expect_true(store.flush().succeeded());
-    read_back(*own, own_rounds);
-    read_back(*beside, beside_rounds);
+    read_back(own, own_rounds);
+    read_back(beside, beside_rounds);
 }
 
 /** A transaction that conflicts on one collection stages nothing, and leaves the other untouched. */
@@ -1628,52 +1634,49 @@ void test_conflict_leaves_the_other_collection_untouched(mount_type_ const& moun
     using types_t = database_types<typename mount_type_::fixture_t>;
     using database_t = typename types_t::database_t;
     using stack_t = typename types_t::stack_t;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return;
-    database_t& store = *(*stack)->store;
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return;
+    database_t& store = *stack->store;
 
-    expected<collection_id_t> const contested = create_named(store, "contested", test_config(8, 0));
-    expected<collection_id_t> const quiet = create_named(store, "quiet", test_config(8, 0));
-    expect_true(contested.has_value());
-    if (!expect_true(quiet.has_value())) return;
+    auto const [contested, contested_status] = create_named(store, "contested", test_config(8, 0));
+    auto const [quiet, quiet_status] = create_named(store, "quiet", test_config(8, 0));
+    expect_true(contested_status.succeeded());
+    if (!expect_true(quiet_status.succeeded())) return;
 
-    expected<typename database_t::transaction_unique_ptr_t> loser = store.create_transaction();
-    expected<typename database_t::transaction_unique_ptr_t> winner = store.create_transaction();
-    expect_true(loser.has_value());
-    if (!expect_true(winner.has_value())) return;
+    auto [loser, loser_status] = store.create_transaction();
+    auto [winner, winner_status] = store.create_transaction();
+    expect_true(loser_status.succeeded());
+    if (!expect_true(winner_status.succeeded())) return;
 
     // Both transactions start before either commits, so the second to stage sees the first's write.
-    std::array<byte_t, 8> const mine = counted(111);
-    std::array<byte_t, 8> const theirs = counted(222);
+    std::array<util::byte_t, 8> const mine = counted(111);
+    std::array<util::byte_t, 8> const theirs = counted(222);
     expect_true(
-        (*loser)->insert(any_collection_id_t {*contested}, stored_key_t {1}, stored_value_view_t {mine}).succeeded());
+        loser->insert(any_collection_id_t {contested}, stored_key_t {1}, stored_value_view_t {mine}).succeeded());
+    expect_true(loser->insert(any_collection_id_t {quiet}, stored_key_t {2}, stored_value_view_t {mine}).succeeded());
+
     expect_true(
-        (*loser)->insert(any_collection_id_t {*quiet}, stored_key_t {2}, stored_value_view_t {mine}).succeeded());
+        winner->insert(any_collection_id_t {contested}, stored_key_t {1}, stored_value_view_t {theirs}).succeeded());
+    expect_true(winner->commit().succeeded());
 
-    expect_true((*winner)
-                    ->insert(any_collection_id_t {*contested}, stored_key_t {1}, stored_value_view_t {theirs})
-                    .succeeded());
-    expect_true((*winner)->commit().succeeded());
-
-    expect_status((*loser)->stage(), status_code_t::write_conflict_k);
-    expect_status((*loser)->commit(), status_code_t::write_conflict_k);
+    expect_status(loser->stage(), util::status_code_t::write_conflict_k);
+    expect_status(loser->commit(), util::status_code_t::write_conflict_k);
 
     // The quiet collection never saw the refused transaction's write.
-    expect_true(!store.contains(any_collection_id_t {*quiet}, stored_key_t {2}));
-    st::vector<byte_t> into;
+    expect_true(!store.contains(any_collection_id_t {quiet}, stored_key_t {2}));
+    st::vector<util::byte_t> into;
     expect_true(into.resize(8) == st::status_t::success_k);
     stored_value_size_t size = 0;
-    expect_true(
-        store.select(any_collection_id_t {*contested}, stored_key_t {1}, std::span<byte_t> {into}, size).succeeded());
-    expect_equal(counter_of(std::span<byte_t const> {into.data(), size}), std::uint64_t {222});
+    expect_true(store.select(any_collection_id_t {contested}, stored_key_t {1}, std::span<util::byte_t> {into}, size)
+                    .succeeded());
+    expect_equal(counter_of(std::span<util::byte_t const> {into.data(), size}), std::uint64_t {222});
 
     // Rolled back, the refused transaction is usable again and its second try lands.
-    (*loser)->rollback();
-    expect_true(
-        (*loser)->insert(any_collection_id_t {*quiet}, stored_key_t {2}, stored_value_view_t {mine}).succeeded());
-    expect_true((*loser)->commit().succeeded());
-    expect_true(store.contains(any_collection_id_t {*quiet}, stored_key_t {2}));
+    loser->rollback();
+    expect_true(loser->insert(any_collection_id_t {quiet}, stored_key_t {2}, stored_value_view_t {mine}).succeeded());
+    expect_true(loser->commit().succeeded());
+    expect_true(store.contains(any_collection_id_t {quiet}, stored_key_t {2}));
 }
 
 /** A rollback drops the writes, and a renewal keeps them while a read refuses one. */
@@ -1683,59 +1686,59 @@ void test_rollback_and_renew_behave(mount_type_ const& mount) {
     using database_t = typename types_t::database_t;
     using transaction_t = typename types_t::transaction_t;
     using stack_t = typename types_t::stack_t;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return;
-    database_t& store = *(*stack)->store;
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return;
+    database_t& store = *stack->store;
 
-    expected<collection_id_t> const only = create_named(store, "only", test_config(8, 0));
-    expect_true(only.has_value());
-    if (!only) return;
+    auto const [only, create_status] = create_named(store, "only", test_config(8, 0));
+    expect_true(create_status.succeeded());
+    if (create_status.failed()) return;
 
-    expected<typename database_t::transaction_unique_ptr_t> transaction = store.create_transaction();
-    expect_true(transaction.has_value());
-    if (!transaction) return;
-    transaction_t& handler = **transaction;
-    std::array<byte_t, 8> const counter = counted(7);
+    auto [transaction, begin_status] = store.create_transaction();
+    expect_true(begin_status.succeeded());
+    if (begin_status.failed()) return;
+    transaction_t& handler = *transaction;
+    std::array<util::byte_t, 8> const counter = counted(7);
 
     // A rollback drops what was written and leaves the transaction ready for more.
     expect_true(
-        handler.insert(any_collection_id_t {*only}, stored_key_t {1}, stored_value_view_t {counter}).succeeded());
-    expect_true(handler.contains_uncommitted(any_collection_id_t {*only}, stored_key_t {1}));
+        handler.insert(any_collection_id_t {only}, stored_key_t {1}, stored_value_view_t {counter}).succeeded());
+    expect_true(handler.contains_uncommitted(any_collection_id_t {only}, stored_key_t {1}));
     handler.rollback();
-    expect_true(!handler.contains_uncommitted(any_collection_id_t {*only}, stored_key_t {1}));
+    expect_true(!handler.contains_uncommitted(any_collection_id_t {only}, stored_key_t {1}));
     expect_true(handler.commit().succeeded());
-    expect_true(!store.contains(any_collection_id_t {*only}, stored_key_t {1}));
+    expect_true(!store.contains(any_collection_id_t {only}, stored_key_t {1}));
 
     // A renewal keeps the writes of a transaction that read nothing, and its start stamp moves.
     expect_true(
-        handler.insert(any_collection_id_t {*only}, stored_key_t {2}, stored_value_view_t {counter}).succeeded());
+        handler.insert(any_collection_id_t {only}, stored_key_t {2}, stored_value_view_t {counter}).succeeded());
     transaction_stamp_t const before = handler.start_stamp();
     expect_true(handler.renew().succeeded());
     expect_true(handler.start_stamp() >= before);
-    expect_true(handler.contains_uncommitted(any_collection_id_t {*only}, stored_key_t {2}));
+    expect_true(handler.contains_uncommitted(any_collection_id_t {only}, stored_key_t {2}));
     expect_true(handler.commit().succeeded());
-    expect_true(store.contains(any_collection_id_t {*only}, stored_key_t {2}));
+    expect_true(store.contains(any_collection_id_t {only}, stored_key_t {2}));
     expect_true(handler.last_commit_stamp() != invalid_transaction_stamp_k);
 
     // A transaction that has read something cannot move its watches, so a renewal refuses it.
-    st::vector<byte_t> into;
+    st::vector<util::byte_t> into;
     expect_true(into.resize(8) == st::status_t::success_k);
     stored_value_size_t size = 0;
     expect_true(
-        handler.select(any_collection_id_t {*only}, stored_key_t {2}, stored_value_span_t {into}, size).succeeded());
-    expect_status(handler.renew(), status_code_t::invalid_argument_k);
+        handler.select(any_collection_id_t {only}, stored_key_t {2}, stored_value_span_t {into}, size).succeeded());
+    expect_status(handler.renew(), util::status_code_t::invalid_argument_k);
 
     // A staged transaction takes no more writes until it commits or rolls back.
     expect_true(handler.stage().succeeded());
-    expect_true(handler.insert(any_collection_id_t {*only}, stored_key_t {3}, stored_value_view_t {counter}) ==
-                status_code_t::invalid_argument_k);
-    expect_status(handler.stage(), status_code_t::invalid_argument_k);
+    expect_true(handler.insert(any_collection_id_t {only}, stored_key_t {3}, stored_value_view_t {counter}) ==
+                util::status_code_t::invalid_argument_k);
+    expect_status(handler.stage(), util::status_code_t::invalid_argument_k);
     handler.rollback();
     expect_true(
-        handler.insert(any_collection_id_t {*only}, stored_key_t {3}, stored_value_view_t {counter}).succeeded());
+        handler.insert(any_collection_id_t {only}, stored_key_t {3}, stored_value_view_t {counter}).succeeded());
     expect_true(handler.commit().succeeded());
-    expect_true(store.contains(any_collection_id_t {*only}, stored_key_t {3}));
+    expect_true(store.contains(any_collection_id_t {only}, stored_key_t {3}));
 }
 
 /** A snapshot keeps answering the database of its moment while later writes land beside it. */
@@ -1744,59 +1747,59 @@ void test_snapshot_holds_its_moment(mount_type_ const& mount) {
     using types_t = database_types<typename mount_type_::fixture_t>;
     using database_t = typename types_t::database_t;
     using stack_t = typename types_t::stack_t;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return;
-    database_t& store = *(*stack)->store;
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return;
+    database_t& store = *stack->store;
 
-    expected<collection_id_t> const left = create_named(store, "left", test_config(8, 0));
-    expected<collection_id_t> const right = create_named(store, "right", test_config(0, value_max_size_k));
-    expect_true(left.has_value());
-    if (!expect_true(right.has_value())) return;
+    auto const [left, left_status] = create_named(store, "left", test_config(8, 0));
+    auto const [right, right_status] = create_named(store, "right", test_config(0, value_max_size_k));
+    expect_true(left_status.succeeded());
+    if (!expect_true(right_status.succeeded())) return;
 
-    std::array<byte_t, 8> const older = counted(1);
-    std::array<byte_t, 8> const newer = counted(2);
-    expect_true(store.insert(any_collection_id_t {*left}, stored_key_t {1}, stored_value_view_t {older}).succeeded());
-    expect_true(store.insert(any_collection_id_t {*right}, stored_key_t {1}, stored_value_view_t {older}).succeeded());
+    std::array<util::byte_t, 8> const older = counted(1);
+    std::array<util::byte_t, 8> const newer = counted(2);
+    expect_true(store.insert(any_collection_id_t {left}, stored_key_t {1}, stored_value_view_t {older}).succeeded());
+    expect_true(store.insert(any_collection_id_t {right}, stored_key_t {1}, stored_value_view_t {older}).succeeded());
 
-    expected<typename database_t::snapshot_t> taken = store.pin_stamp();
-    expect_true(taken.has_value());
-    if (!taken) return;
+    auto [taken, pin_status] = store.pin_stamp();
+    if (!expect_true(pin_status.succeeded())) return;
     expect_equal(store.population_count(), std::uint64_t {2});
 
     // Later commits and a flush land beside the snapshot, which publishes over nothing it waits for.
-    expect_true(store.insert(any_collection_id_t {*left}, stored_key_t {1}, stored_value_view_t {newer}).succeeded());
-    expect_true(store.insert(any_collection_id_t {*left}, stored_key_t {2}, stored_value_view_t {newer}).succeeded());
-    expect_true(store.remove(any_collection_id_t {*right}, stored_key_t {1}).succeeded());
+    expect_true(store.insert(any_collection_id_t {left}, stored_key_t {1}, stored_value_view_t {newer}).succeeded());
+    expect_true(store.insert(any_collection_id_t {left}, stored_key_t {2}, stored_value_view_t {newer}).succeeded());
+    expect_true(store.remove(any_collection_id_t {right}, stored_key_t {1}).succeeded());
 
-    st::vector<byte_t> into;
+    st::vector<util::byte_t> into;
     expect_true(into.resize(8) == st::status_t::success_k);
     for (std::size_t round = 0; round != 2; ++round) {
         stored_value_size_t size = 0;
-        expect_true(
-            taken->select(any_collection_id_t {*left}, stored_key_t {1}, std::span<byte_t> {into}, size).succeeded());
-        expect_equal(counter_of(std::span<byte_t const> {into.data(), size}), std::uint64_t {1});
-        expect_true(taken->find(any_collection_id_t {*left}, stored_key_t {2}, size) == lookup_result_t::missing_k);
-        expect_true(taken->find(any_collection_id_t {*right}, stored_key_t {1}, size) == lookup_result_t::written_k);
+        expect_true(taken.select(any_collection_id_t {left}, stored_key_t {1}, std::span<util::byte_t> {into}, size)
+                        .succeeded());
+        expect_equal(counter_of(std::span<util::byte_t const> {into.data(), size}), std::uint64_t {1});
+        expect_true(taken.find(any_collection_id_t {left}, stored_key_t {2}, size) == lookup_result_t::missing_k);
+        expect_true(taken.find(any_collection_id_t {right}, stored_key_t {1}, size) == lookup_result_t::written_k);
         // The second round reads what the flush wrote, which kept every version the snapshot pins.
         if (round == 0) expect_true(store.flush().succeeded());
     }
-    expect_true(taken->contains(any_collection_id_t {owned_name("right")}));
-    expect_true(!taken->contains(any_collection_id_t {owned_name("absent")}));
+    expect_true(taken.contains(any_collection_id_t {owned_name("right")}));
+    expect_true(!taken.contains(any_collection_id_t {owned_name("absent")}));
 
     // The store itself has moved on, which is what makes the snapshot's answers its own.
     stored_value_size_t size = 0;
     expect_true(
-        store.select(any_collection_id_t {*left}, stored_key_t {1}, std::span<byte_t> {into}, size).succeeded());
-    expect_equal(counter_of(std::span<byte_t const> {into.data(), size}), std::uint64_t {2});
-    expect_true(!store.contains(any_collection_id_t {*right}, stored_key_t {1}));
+        store.select(any_collection_id_t {left}, stored_key_t {1}, std::span<util::byte_t> {into}, size).succeeded());
+    expect_equal(counter_of(std::span<util::byte_t const> {into.data(), size}), std::uint64_t {2});
+    expect_true(!store.contains(any_collection_id_t {right}, stored_key_t {1}));
 
-    taken = expected<typename database_t::snapshot_t> {status_t {status_code_t::uninitialized_k, "Let go"}};
+    // Letting the snapshot go unpins the versions the flush below may drop
+    taken = {};
     expect_true(store.flush().succeeded());
     expect_true(
-        store.select(any_collection_id_t {*left}, stored_key_t {1}, std::span<byte_t> {into}, size).succeeded());
-    expect_equal(counter_of(std::span<byte_t const> {into.data(), size}), std::uint64_t {2});
-    expect_true(!store.contains(any_collection_id_t {*right}, stored_key_t {1}));
+        store.select(any_collection_id_t {left}, stored_key_t {1}, std::span<util::byte_t> {into}, size).succeeded());
+    expect_equal(counter_of(std::span<util::byte_t const> {into.data(), size}), std::uint64_t {2});
+    expect_true(!store.contains(any_collection_id_t {right}, stored_key_t {1}));
 }
 
 /** An unordered scan walks every run on its own: a key two runs carry comes out twice, a removal comes out as one, a
@@ -1806,16 +1809,16 @@ void test_runs_scan_one_at_a_time(mount_type_ const& mount) {
     using types_t = database_types<typename mount_type_::fixture_t>;
     using database_t = typename types_t::database_t;
     using stack_t = typename types_t::stack_t;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return;
-    database_t& store = *(*stack)->store;
-    expected<collection_id_t> const created = create_named(store, "runs", test_config(0, value_max_size_k));
-    expect_true(created.has_value());
-    if (!created) return;
-    any_collection_id_t const runs {*created};
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return;
+    database_t& store = *stack->store;
+    auto const [created, create_status] = create_named(store, "runs", test_config(0, value_max_size_k));
+    expect_true(create_status.succeeded());
+    if (create_status.failed()) return;
+    any_collection_id_t const runs {created};
 
-    std::array<byte_t, 8> const value = counted(7);
+    std::array<util::byte_t, 8> const value = counted(7);
     for (std::uint64_t key = 1; key <= 4; ++key)
         expect_true(store.insert(runs, stored_key_t {key}, stored_value_view_t {value}).succeeded());
     expect_true(store.flush().succeeded());
@@ -1823,10 +1826,10 @@ void test_runs_scan_one_at_a_time(mount_type_ const& mount) {
     expect_true(store.insert(runs, stored_key_t {2}, stored_value_view_t {value}).succeeded());
     expect_true(store.remove(runs, stored_key_t {3}).succeeded());
 
-    expected<counted_runs_t> const counted_runs = store.runs_count(runs);
-    expect_true(counted_runs.has_value());
-    if (!counted_runs) return;
-    expect_true(counted_runs->count >= 3);
+    auto const [counted_runs, count_status] = store.runs_count(runs);
+    expect_true(count_status.succeeded());
+    if (count_status.failed()) return;
+    expect_true(counted_runs.count >= 3);
     std::array<std::size_t, 5> written {};
     std::array<std::size_t, 5> removed {};
     auto const tally = [&](stored_key_t key, lookup_result_t state, stored_value_size_t size) noexcept {
@@ -1835,8 +1838,8 @@ void test_runs_scan_one_at_a_time(mount_type_ const& mount) {
         if (state == lookup_result_t::removed_k) ++removed[index];
         return true;
     };
-    for (std::uint64_t run = 0; run != counted_runs->count; ++run)
-        expect_true(store.scan_run(runs, *counted_runs, run, stored_key_t {1}, tally).succeeded());
+    for (std::uint64_t run = 0; run != counted_runs.count; ++run)
+        expect_true(store.scan_run(runs, counted_runs, run, stored_key_t {1}, tally).succeeded());
     expect_equal(written[1], std::size_t {1});
     expect_equal(written[2], std::size_t {2});
     expect_equal(written[3], std::size_t {1});
@@ -1846,11 +1849,11 @@ void test_runs_scan_one_at_a_time(mount_type_ const& mount) {
 
     // A commit only puts a newer run ahead, while a flush rearranges the runs the count named.
     expect_true(store.insert(runs, stored_key_t {5}, stored_value_view_t {value}).succeeded());
-    expect_true(store.scan_run(runs, *counted_runs, 0, stored_key_t {1}, tally).succeeded());
+    expect_true(store.scan_run(runs, counted_runs, 0, stored_key_t {1}, tally).succeeded());
     expect_true(store.flush().succeeded());
-    expect_true(store.scan_run(runs, *counted_runs, 0, stored_key_t {1}, tally) == status_code_t::contended_k);
-    expect_true(store.scan_run(runs, *counted_runs, counted_runs->count, stored_key_t {1}, tally) ==
-                status_code_t::invalid_argument_k);
+    expect_true(store.scan_run(runs, counted_runs, 0, stored_key_t {1}, tally) == util::status_code_t::contended_k);
+    expect_true(store.scan_run(runs, counted_runs, counted_runs.count, stored_key_t {1}, tally) ==
+                util::status_code_t::invalid_argument_k);
 }
 
 /** A head read of one collection through one reading pins no stamp in the ledger: its lookups,
@@ -1860,16 +1863,16 @@ void test_head_reading_pins_nothing(mount_type_ const& mount) {
     using types_t = database_types<typename mount_type_::fixture_t>;
     using database_t = typename types_t::database_t;
     using stack_t = typename types_t::stack_t;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return;
-    database_t& store = *(*stack)->store;
-    expected<collection_id_t> const created = create_named(store, "unpinned", test_config(0, value_max_size_k));
-    expect_true(created.has_value());
-    if (!created) return;
-    any_collection_id_t const unpinned {*created};
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return;
+    database_t& store = *stack->store;
+    auto const [created, create_status] = create_named(store, "unpinned", test_config(0, value_max_size_k));
+    expect_true(create_status.succeeded());
+    if (create_status.failed()) return;
+    any_collection_id_t const unpinned {created};
 
-    std::array<byte_t, 8> const value = counted(7);
+    std::array<util::byte_t, 8> const value = counted(7);
     for (std::uint64_t key = 1; key <= 4; ++key)
         expect_true(store.insert(unpinned, stored_key_t {key}, stored_value_view_t {value}).succeeded());
     expect_true(store.flush().succeeded());
@@ -1882,12 +1885,12 @@ void test_head_reading_pins_nothing(mount_type_ const& mount) {
     expect_true(store.find(read, stored_key_t {1}, size) == lookup_result_t::written_k);
     expect_equal(size, static_cast<stored_value_size_t>(value.size()));
     expect_true(store.stored_value_size(read, stored_key_t {5}, size).succeeded());
-    std::array<byte_t, 8> copied {};
-    expect_true(store.select(read, stored_key_t {3}, std::span<byte_t> {copied}, size).succeeded());
+    std::array<util::byte_t, 8> copied {};
+    expect_true(store.select(read, stored_key_t {3}, std::span<util::byte_t> {copied}, size).succeeded());
     expect_true(copied == value);
     std::size_t walked = 0;
     std::size_t pinned_inside = 0;
-    utilities::local_arena_t walk;
+    util::local_arena_t walk;
     expect_true(store
                     .scan(read, walk.allocator().arena, stored_key_t {1},
                           [&](stored_key_t, lookup_result_t state, stored_value_size_t) noexcept {
@@ -1910,18 +1913,18 @@ void test_warm_batched_select_allocates_nothing(mount_type_ const& mount) {
     using types_t = database_types<typename mount_type_::fixture_t>;
     using database_t = typename types_t::database_t;
     using stack_t = typename types_t::stack_t;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return;
-    database_t& store = *(*stack)->store;
-    expected<collection_id_t> const created = create_named(store, "warm", test_config(0, value_max_size_k));
-    expect_true(created.has_value());
-    if (!created) return;
-    any_collection_id_t const warm {*created};
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return;
+    database_t& store = *stack->store;
+    auto const [created, create_status] = create_named(store, "warm", test_config(0, value_max_size_k));
+    expect_true(create_status.succeeded());
+    if (create_status.failed()) return;
+    any_collection_id_t const warm {created};
 
     constexpr std::size_t keys_k = 64;
     std::array<stored_key_t, keys_k> keys {};
-    std::array<byte_t, value_max_size_k> value {};
+    std::array<util::byte_t, value_max_size_k> value {};
     std::size_t expected_bytes = 0;
     for (std::size_t index = 0; index != keys_k; ++index) {
         keys[index] = stored_key_t {index};
@@ -1932,9 +1935,9 @@ void test_warm_batched_select_allocates_nothing(mount_type_ const& mount) {
     }
     expect_true(store.flush().succeeded());
     // A single select files its value in the cache; a write after the flush stays in memory.
-    std::array<byte_t, value_max_size_k> into {};
+    std::array<util::byte_t, value_max_size_k> into {};
     stored_value_size_t size = 0;
-    expect_true(store.select(warm, keys[0], std::span<byte_t> {into}, size).succeeded());
+    expect_true(store.select(warm, keys[0], std::span<util::byte_t> {into}, size).succeeded());
     expect_true(store.insert(warm, keys[1], stored_value_view_t {value.data(), blob_bytes_of(1)}).succeeded());
 
     auto [read, read_status] = store.read_collection(warm, head_stamp_k);
@@ -1942,11 +1945,13 @@ void test_warm_batched_select_allocates_nothing(mount_type_ const& mount) {
     if (read_status.failed()) return;
     std::array<lookup_result_t, keys_k> results {};
     std::size_t carried = 0;
-    auto sink = [&](std::size_t, std::uint64_t, std::span<byte_t const> bytes) noexcept { carried += bytes.size(); };
+    auto sink = [&](std::size_t, std::uint64_t, std::span<util::byte_t const> bytes) noexcept {
+        carried += bytes.size();
+    };
     ustore_arena_handle_t scratch {};
     auto select_once = [&]() noexcept {
         carried = 0;
-        arena_rewind(&scratch);
+        util::arena_rewind(&scratch);
         return store.select(read, &scratch, std::span<stored_key_t const> {keys}, std::span<lookup_result_t> {results},
                             sink);
     };
@@ -1960,7 +1965,7 @@ void test_warm_batched_select_allocates_nothing(mount_type_ const& mount) {
     fmt::println("    warm batched select: {} calls of operator new", allocated);
     expect_equal(allocated, std::size_t {0});
     expect_equal(carried, expected_bytes);
-    arena_free_blocks(scratch);
+    util::arena_free_blocks(scratch);
 }
 
 /**
@@ -1974,35 +1979,35 @@ void test_drop_proceeds_beside_the_snapshot(mount_type_ const& mount) {
     using types_t = database_types<typename mount_type_::fixture_t>;
     using database_t = typename types_t::database_t;
     using stack_t = typename types_t::stack_t;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return;
-    database_t& store = *(*stack)->store;
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return;
+    database_t& store = *stack->store;
 
-    expected<collection_id_t> const doomed = create_named(store, "doomed", test_config(8, 0));
-    if (!expect_true(doomed.has_value())) return;
-    std::array<byte_t, 8> const value = counted(1);
-    expect_true(store.insert(any_collection_id_t {*doomed}, stored_key_t {1}, stored_value_view_t {value}).succeeded());
+    auto const [doomed, create_status] = create_named(store, "doomed", test_config(8, 0));
+    if (!expect_true(create_status.succeeded())) return;
+    std::array<util::byte_t, 8> const value = counted(1);
+    expect_true(store.insert(any_collection_id_t {doomed}, stored_key_t {1}, stored_value_view_t {value}).succeeded());
 
     bool dropped {false};
     bool succeeded {false};
     std::thread dropper;
     {
-        expected<typename database_t::snapshot_t> taken = store.pin_stamp();
-        expect_true(taken.has_value());
-        if (!taken) return;
+        auto [taken, pin_status] = store.pin_stamp();
+        expect_true(pin_status.succeeded());
+        if (pin_status.failed()) return;
         dropper = std::thread {[&]() noexcept {
-            atomic_reference<bool> {succeeded}.store(store.drop_collection(any_collection_id_t {*doomed}).succeeded(),
+            atomic_reference<bool> {succeeded}.store(store.drop_collection(any_collection_id_t {doomed}).succeeded(),
                                                      std::memory_order_relaxed);
             atomic_reference<bool> {dropped}.store(true, std::memory_order_release);
         }};
         dropper.join();
         stored_value_size_t size = 0;
-        expect_true(taken->find(any_collection_id_t {*doomed}, stored_key_t {1}, size) == lookup_result_t::missing_k);
+        expect_true(taken.find(any_collection_id_t {doomed}, stored_key_t {1}, size) == lookup_result_t::missing_k);
     }
     expect_true(atomic_reference<bool> {dropped}.load(std::memory_order_acquire));
     expect_true(atomic_reference<bool> {succeeded}.load(std::memory_order_relaxed));
-    expect_true(!store.has_collection(any_collection_id_t {*doomed}));
+    expect_true(!store.has_collection(any_collection_id_t {doomed}));
 }
 
 /**
@@ -2019,60 +2024,60 @@ void test_threads_commit_serializably(mount_type_ const& mount) {
     using stack_t = typename types_t::stack_t;
     constexpr std::size_t threads_k = 4;
     constexpr std::size_t increments_k = 25;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return;
-    database_t& store = *(*stack)->store;
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return;
+    database_t& store = *stack->store;
 
-    expected<collection_id_t> const left = create_named(store, "left", test_config(8, 0));
-    expected<collection_id_t> const right = create_named(store, "right", test_config(8, 0));
-    expect_true(left.has_value());
-    if (!expect_true(right.has_value())) return;
+    auto const [left, left_status] = create_named(store, "left", test_config(8, 0));
+    auto const [right, right_status] = create_named(store, "right", test_config(8, 0));
+    expect_true(left_status.succeeded());
+    if (!expect_true(right_status.succeeded())) return;
 
-    std::array<byte_t, 8> const zero = counted(0);
-    expect_true(store.insert(any_collection_id_t {*left}, stored_key_t {0}, stored_value_view_t {zero}).succeeded());
-    expect_true(store.insert(any_collection_id_t {*right}, stored_key_t {0}, stored_value_view_t {zero}).succeeded());
+    std::array<util::byte_t, 8> const zero = counted(0);
+    expect_true(store.insert(any_collection_id_t {left}, stored_key_t {0}, stored_value_view_t {zero}).succeeded());
+    expect_true(store.insert(any_collection_id_t {right}, stored_key_t {0}, stored_value_view_t {zero}).succeeded());
 
     std::size_t landed {0};
     std::size_t refused {0};
     std::array<std::thread, threads_k> workers;
     for (std::size_t worker = 0; worker != threads_k; ++worker)
         workers[worker] = std::thread {[&]() noexcept {
-            expected<typename database_t::transaction_unique_ptr_t> transaction = store.create_transaction();
-            if (!expect_true(transaction.has_value())) return;
-            transaction_t& handler = **transaction;
-            std::array<byte_t, 8> buffer {};
+            auto [transaction, begin_status] = store.create_transaction();
+            if (!expect_true(begin_status.succeeded())) return;
+            transaction_t& handler = *transaction;
+            std::array<util::byte_t, 8> buffer {};
 
             for (std::size_t step = 0; step != increments_k; ++step) {
                 bool committed = false;
                 while (!committed) {
                     stored_value_size_t size = 0;
-                    status_t read = handler.template select<watch_schedule_t::on_commit_k>(
-                        any_collection_id_t {*left}, stored_key_t {0}, stored_value_span_t {buffer}, size);
+                    util::status_t read = handler.template select<watch_schedule_t::on_commit_k>(
+                        any_collection_id_t {left}, stored_key_t {0}, stored_value_span_t {buffer}, size);
                     if (!expect_true(read.succeeded())) return;
-                    std::uint64_t const here = counter_of(std::span<byte_t const> {buffer.data(), size});
+                    std::uint64_t const here = counter_of(std::span<util::byte_t const> {buffer.data(), size});
 
                     read = handler.template select<watch_schedule_t::on_commit_k>(
-                        any_collection_id_t {*right}, stored_key_t {0}, stored_value_span_t {buffer}, size);
+                        any_collection_id_t {right}, stored_key_t {0}, stored_value_span_t {buffer}, size);
                     if (!expect_true(read.succeeded())) return;
-                    std::uint64_t const there = counter_of(std::span<byte_t const> {buffer.data(), size});
+                    std::uint64_t const there = counter_of(std::span<util::byte_t const> {buffer.data(), size});
 
-                    std::array<byte_t, 8> const raised_here = counted(here + 1);
-                    std::array<byte_t, 8> const raised_there = counted(there + 1);
-                    status_t written = handler.insert(any_collection_id_t {*left}, stored_key_t {0},
-                                                      stored_value_view_t {raised_here});
+                    std::array<util::byte_t, 8> const raised_here = counted(here + 1);
+                    std::array<util::byte_t, 8> const raised_there = counted(there + 1);
+                    util::status_t written = handler.insert(any_collection_id_t {left}, stored_key_t {0},
+                                                            stored_value_view_t {raised_here});
                     if (written.succeeded())
-                        written = handler.insert(any_collection_id_t {*right}, stored_key_t {0},
+                        written = handler.insert(any_collection_id_t {right}, stored_key_t {0},
                                                  stored_value_view_t {raised_there});
                     if (!expect_true(written.succeeded())) return;
 
-                    status_t const commit = handler.commit();
+                    util::status_t const commit = handler.commit();
                     if (commit.succeeded()) {
                         atomic_reference<std::size_t> {landed}.fetch_add(1, std::memory_order_relaxed);
                         committed = true;
                         continue;
                     }
-                    if (!expect_status(commit, status_code_t::write_conflict_k)) return;
+                    if (!expect_status(commit, util::status_code_t::write_conflict_k)) return;
                     atomic_reference<std::size_t> {refused}.fetch_add(1, std::memory_order_relaxed);
                     handler.rollback();
                 }
@@ -2082,15 +2087,15 @@ void test_threads_commit_serializably(mount_type_ const& mount) {
 
     expect_equal(atomic_reference<std::size_t> {landed}.load(std::memory_order_relaxed), threads_k * increments_k);
 
-    st::vector<byte_t> into;
+    st::vector<util::byte_t> into;
     expect_true(into.resize(8) == st::status_t::success_k);
     stored_value_size_t size = 0;
     expect_true(
-        store.select(any_collection_id_t {*left}, stored_key_t {0}, std::span<byte_t> {into}, size).succeeded());
-    std::uint64_t const here = counter_of(std::span<byte_t const> {into.data(), size});
+        store.select(any_collection_id_t {left}, stored_key_t {0}, std::span<util::byte_t> {into}, size).succeeded());
+    std::uint64_t const here = counter_of(std::span<util::byte_t const> {into.data(), size});
     expect_true(
-        store.select(any_collection_id_t {*right}, stored_key_t {0}, std::span<byte_t> {into}, size).succeeded());
-    std::uint64_t const there = counter_of(std::span<byte_t const> {into.data(), size});
+        store.select(any_collection_id_t {right}, stored_key_t {0}, std::span<util::byte_t> {into}, size).succeeded());
+    std::uint64_t const there = counter_of(std::span<util::byte_t const> {into.data(), size});
 
     // Every commit that landed raised both counters exactly once, so no update was lost.
     expect_equal(here, static_cast<std::uint64_t>(threads_k * increments_k));
@@ -2112,14 +2117,14 @@ void test_head_writes_wait_for_records(mount_type_ const& mount) {
     using stack_t = typename types_t::stack_t;
     constexpr std::size_t threads_k = 8;
     constexpr std::size_t writes_k = 200;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return;
-    database_t& store = *(*stack)->store;
-    expected<collection_id_t> const written = create_named(store, "written", test_config(8, 0));
-    expect_true(written.has_value());
-    if (!written) return;
-    any_collection_id_t const id {*written};
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return;
+    database_t& store = *stack->store;
+    auto const [written, create_status] = create_named(store, "written", test_config(8, 0));
+    expect_true(create_status.succeeded());
+    if (create_status.failed()) return;
+    any_collection_id_t const id {written};
 
     std::size_t refused {0};
     std::array<std::thread, threads_k> writers;
@@ -2127,10 +2132,11 @@ void test_head_writes_wait_for_records(mount_type_ const& mount) {
         writers[writer] = std::thread {[&, writer]() noexcept {
             for (std::size_t step = 0; step != writes_k; ++step) {
                 stored_key_t const key = static_cast<stored_key_t>(writer * writes_k + step);
-                std::array<byte_t, 8> const counter = counted(key);
-                if (status_t const inserted = store.insert(id, key, stored_value_view_t {counter}); inserted.failed()) {
+                std::array<util::byte_t, 8> const counter = counted(key);
+                if (util::status_t const inserted = store.insert(id, key, stored_value_view_t {counter});
+                    inserted.failed()) {
                     if (atomic_reference<std::size_t> {refused}.fetch_add(1, std::memory_order_relaxed) == 0)
-                        fmt::println(stderr, "  first refused write: {}", inserted.message);
+                        fmt::println(stderr, "  first refused write: {}", inserted.note);
                 }
             }
         }};
@@ -2138,11 +2144,11 @@ void test_head_writes_wait_for_records(mount_type_ const& mount) {
     expect_equal(atomic_reference<std::size_t> {refused}.load(std::memory_order_relaxed), std::size_t {0});
 
     std::size_t missing = 0;
-    std::array<byte_t, 8> into {};
+    std::array<util::byte_t, 8> into {};
     for (stored_key_t key = 0; key != threads_k * writes_k; ++key) {
         stored_value_size_t size = 0;
-        if (store.select(id, key, std::span<byte_t> {into}, size).failed() ||
-            counter_of(std::span<byte_t const> {into.data(), size}) != key)
+        if (store.select(id, key, std::span<util::byte_t> {into}, size).failed() ||
+            counter_of(std::span<util::byte_t const> {into.data(), size}) != key)
             ++missing;
     }
     expect_equal(missing, std::size_t {0});
@@ -2169,22 +2175,22 @@ void test_strings_shares_wait_for_records(mount_type_ const& mount) {
     constexpr std::size_t writers_k = 8;
     // One run below the stall bound of test_config, (F - 1)(T + 1) runs for F = 4 and T = 7.
     constexpr std::size_t filled_runs_k = 23;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return;
-    database_t& store = *(*stack)->store;
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return;
+    database_t& store = *stack->store;
     collection_id_t names;
-    std::memcpy(names.uuid.bytes, uuid_generator().bytes, sizeof(names.uuid.bytes));
+    std::memcpy(names.uuid.bytes, util::uuid_generator().bytes, sizeof(names.uuid.bytes));
     expect_true(store
                     .create_collection(names, "names", static_cast<std::uint16_t>(value_layout_t::uuid_k),
                                        test_config(sizeof(ustore_uuid_t), 0))
                     .succeeded());
-    expected<collection_id_t> const held = create_named(store, "held", test_config(8, 0));
-    if (!expect_true(held.has_value())) return;
+    auto const [held, create_status] = create_named(store, "held", test_config(8, 0));
+    if (!expect_true(create_status.succeeded())) return;
 
     auto text_of = [](std::size_t index) { return fmt::format("string-{}", index); };
     auto value_of = [](std::size_t index) {
-        std::array<byte_t, key_slot_t::size> value {};
+        std::array<util::byte_t, key_slot_t::size> value {};
         for (std::size_t position = 0; position != value.size(); ++position) value[position] = painted(index, position);
         return value;
     };
@@ -2192,14 +2198,15 @@ void test_strings_shares_wait_for_records(mount_type_ const& mount) {
     // stages or commits.
     auto begin_write = [&](strings_transaction_t& written, std::size_t index) {
         auto [transaction, begin_status] = store.create_transaction();
-        if (begin_status.failed()) return expected<typename database_t::transaction_unique_ptr_t> {begin_status};
+        if (begin_status.failed()) return util::expected<typename database_t::transaction_unique_ptr_t> {begin_status};
         written.join(*transaction);
-        std::array<byte_t, key_slot_t::size> const value = value_of(index);
-        if (status_t const wrote = written.write(names, text_of(index), delta_view_t {delta_kind_t::write_k, value},
-                                                 invalid_transaction_stamp_k);
+        std::array<util::byte_t, key_slot_t::size> const value = value_of(index);
+        if (util::status_t const wrote = written.write(names, text_of(index),
+                                                       util::delta_view_t {util::delta_kind_t::write_k, value},
+                                                       invalid_transaction_stamp_k);
             wrote.failed())
-            return expected<typename database_t::transaction_unique_ptr_t> {wrote};
-        return expected<typename database_t::transaction_unique_ptr_t> {std::move(transaction)};
+            return util::expected<typename database_t::transaction_unique_ptr_t> {wrote};
+        return util::expected<typename database_t::transaction_unique_ptr_t> {std::move(transaction)};
     };
 
     std::size_t refused {0};
@@ -2207,7 +2214,7 @@ void test_strings_shares_wait_for_records(mount_type_ const& mount) {
     std::array<std::thread, writers_k> writers;
     {
         typename database_t::ingest_t ingest;
-        expect_true(store.begin_ingest(any_collection_id_t {*held}, ingest).succeeded());
+        expect_true(store.begin_ingest(any_collection_id_t {held}, ingest).succeeded());
         for (std::size_t index = 0; index != filled_runs_k; ++index) {
             strings_transaction_t written {store};
             auto transaction = begin_write(written, index);
@@ -2223,10 +2230,10 @@ void test_strings_shares_wait_for_records(mount_type_ const& mount) {
                 strings_transaction_t written {store};
                 auto transaction = begin_write(written, filled_runs_k + 1 + writer);
                 atomic_reference<std::size_t> {started}.fetch_add(1, std::memory_order_release);
-                status_t const committed = transaction ? written.commit(**transaction) : transaction.status();
+                util::status_t const committed = transaction ? written.commit(**transaction) : transaction.status();
                 if (committed.failed() &&
                     atomic_reference<std::size_t> {refused}.fetch_add(1, std::memory_order_relaxed) == 0)
-                    fmt::println(stderr, "  first refused share: {}", committed.message);
+                    fmt::println(stderr, "  first refused share: {}", committed.note);
             }};
         // Every writer seals past the stall check and parks behind the staged transaction or
         // on a record.
@@ -2239,11 +2246,11 @@ void test_strings_shares_wait_for_records(mount_type_ const& mount) {
     expect_equal(atomic_reference<std::size_t> {refused}.load(std::memory_order_relaxed), std::size_t {0});
 
     std::size_t missing = 0;
-    status_t const visited = store.visit_store(
+    util::status_t const visited = store.visit_store(
         any_collection_id_t {names}, [&]<typename store_type_>(store_type_& visited_store) noexcept -> status_t {
             if constexpr (std::is_same_v<store_type_, strings_store_t>)
                 for (std::size_t index = 0; index != filled_runs_k + 1 + writers_k; ++index) {
-                    std::array<byte_t, key_slot_t::size> value {};
+                    std::array<util::byte_t, key_slot_t::size> value {};
                     if (visited_store.find(text_of(index), value) != lookup_result_t::written_k ||
                         value != value_of(index))
                         ++missing;
@@ -2279,21 +2286,21 @@ void test_readers_beside_committers_and_flushes(mount_type_ const& mount) {
     constexpr std::uint64_t keys_k = 64;
     constexpr std::uint64_t no_round_k = (std::numeric_limits<std::uint64_t>::max)();
 
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return;
-    database_t& store = *(*stack)->store;
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return;
+    database_t& store = *stack->store;
 
     // Memory runs of a few dozen deltas, so the committers merge, flush and compact beside the flusher.
     collection_config_t config = test_config(0, value_max_size_k);
     config.memory_runs_max_deltas = 32;
     std::array<collection_id_t, committers_k> named {};
     for (std::size_t committer = 0; committer != committers_k; ++committer) {
-        expected<collection_id_t> const created = create_named(
-            store, committer == 0 ? string_view_t {"left"} : string_view_t {"right"}, config);
-        expect_true(created.has_value());
-        if (!created) return;
-        named[committer] = *created;
+        auto const [created, create_status] = create_named(
+            store, committer == 0 ? util::string_view_t {"left"} : util::string_view_t {"right"}, config);
+        expect_true(create_status.succeeded());
+        if (create_status.failed()) return;
+        named[committer] = created;
     }
 
     std::array<std::uint64_t, committers_k> started {};
@@ -2309,7 +2316,7 @@ void test_readers_beside_committers_and_flushes(mount_type_ const& mount) {
     std::array<std::thread, committers_k> committers;
     for (std::size_t committer = 0; committer != committers_k; ++committer)
         committers[committer] = std::thread {[&, committer]() noexcept {
-            std::array<byte_t, 128> value {};
+            std::array<util::byte_t, 128> value {};
             for (std::uint64_t round = 0; round != rounds_k; ++round) {
                 std::size_t const bytes = round_bytes_of(round);
                 std::memcpy(value.data(), &round, sizeof(round));
@@ -2337,7 +2344,7 @@ void test_readers_beside_committers_and_flushes(mount_type_ const& mount) {
     std::array<std::thread, readers_k> readers;
     for (std::size_t reader = 0; reader != readers_k; ++reader)
         readers[reader] = std::thread {[&, reader]() noexcept {
-            std::array<byte_t, 128> into {};
+            std::array<util::byte_t, 128> into {};
             for (std::uint64_t step = reader;
                  atomic_reference<std::size_t> {committing}.load(std::memory_order_acquire) != 0; ++step) {
                 std::size_t const committer = step % committers_k;
@@ -2345,8 +2352,8 @@ void test_readers_beside_committers_and_flushes(mount_type_ const& mount) {
                 std::uint64_t const before = atomic_reference<std::uint64_t> {returned[committer]}.load(
                     std::memory_order_acquire);
                 stored_value_size_t size = 0;
-                status_t const read = store.select(any_collection_id_t {named[committer]}, stored_key_t {key},
-                                                   std::span<byte_t> {into}, size);
+                util::status_t const read = store.select(any_collection_id_t {named[committer]}, stored_key_t {key},
+                                                         std::span<util::byte_t> {into}, size);
                 std::uint64_t const after = atomic_reference<std::uint64_t> {started[committer]}.load(
                     std::memory_order_acquire);
                 atomic_reference<std::size_t> {reads}.fetch_add(1, std::memory_order_relaxed);
@@ -2355,7 +2362,7 @@ void test_readers_beside_committers_and_flushes(mount_type_ const& mount) {
                 bool const owed = before != no_round_k && before >= key;
                 std::uint64_t const least = owed ? before - (before - key) % keys_k : no_round_k;
                 if (read.failed()) {
-                    if (owed || !(read == status_code_t::not_found_k))
+                    if (owed || !(read == util::status_code_t::not_found_k))
                         atomic_reference<std::size_t> {wrong}.fetch_add(1, std::memory_order_relaxed);
                     continue;
                 }
@@ -2389,13 +2396,14 @@ void test_readers_beside_committers_and_flushes(mount_type_ const& mount) {
     }
 
     // Once everything returned, every key holds its last round, wherever the flushes left it.
-    std::array<byte_t, 128> into {};
+    std::array<util::byte_t, 128> into {};
     for (std::size_t committer = 0; committer != committers_k; ++committer)
         for (std::uint64_t key = 0; key != keys_k; ++key) {
             stored_value_size_t size = 0;
-            expect_true(
-                store.select(any_collection_id_t {named[committer]}, stored_key_t {key}, std::span<byte_t> {into}, size)
-                    .succeeded());
+            expect_true(store
+                            .select(any_collection_id_t {named[committer]}, stored_key_t {key},
+                                    std::span<util::byte_t> {into}, size)
+                            .succeeded());
             std::uint64_t round = 0;
             std::memcpy(&round, into.data(), sizeof(round));
             expect_equal(round, (rounds_k - 1) - (rounds_k - 1 - key) % keys_k);
@@ -2429,14 +2437,14 @@ void test_lookups_outrun_the_write_path(mount_type_ const& mount) {
     constexpr std::size_t churns_k = 64;
     constexpr std::chrono::seconds patience_k {5};
 
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return;
-    database_t& store = *(*stack)->store;
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return;
+    database_t& store = *stack->store;
 
-    expected<collection_id_t> const left = create_named(store, "left", test_config(8, 0));
-    expect_true(left.has_value());
-    if (!left) return;
+    auto const [left, left_status] = create_named(store, "left", test_config(8, 0));
+    expect_true(left_status.succeeded());
+    if (left_status.failed()) return;
 
     any_collection_id_t const by_name {owned_name("left")};
     any_collection_id_t const churned {owned_name("churn")};
@@ -2451,10 +2459,10 @@ void test_lookups_outrun_the_write_path(mount_type_ const& mount) {
         readers[reader] = std::thread {[&]() noexcept {
             while (atomic_reference<reader_phase_t> {phase}.load(std::memory_order_relaxed) ==
                    reader_phase_t::racing_k) {
-                if (store.collection_id(by_name) != *left)
+                if (store.collection_id(by_name) != left)
                     atomic_reference<std::size_t> {mismatched}.fetch_add(1, std::memory_order_relaxed);
                 collection_config_t shape;
-                if (store.collection_config(*left, shape).failed())
+                if (store.collection_config(left, shape).failed())
                     atomic_reference<std::size_t> {mismatched}.fetch_add(1, std::memory_order_relaxed);
                 [[maybe_unused]] bool const seen = store.has_collection(churned);
                 atomic_reference<std::size_t> {answered}.fetch_add(1, std::memory_order_relaxed);
@@ -2473,17 +2481,17 @@ void test_lookups_outrun_the_write_path(mount_type_ const& mount) {
 
     // Every create and every drop republishes the catalog with the readers already inside one.
     for (std::size_t round = 0; round != churns_k; ++round) {
-        expected<collection_id_t> const created = create_named(store, "churn", test_config(8, 0));
-        expect_true(created.has_value());
-        if (!created) break;
-        expect_true(store.drop_collection(any_collection_id_t {*created}).succeeded());
+        auto const [created, created_status] = create_named(store, "churn", test_config(8, 0));
+        expect_true(created_status.succeeded());
+        if (created_status.failed()) break;
+        expect_true(store.drop_collection(any_collection_id_t {created}).succeeded());
     }
 
     atomic_reference<reader_phase_t> {phase}.store(reader_phase_t::retiring_k, std::memory_order_relaxed);
     for (std::size_t reader = 0; reader != readers_k; ++reader) readers[reader].join();
 
     expect_equal(atomic_reference<std::size_t> {mismatched}.load(std::memory_order_relaxed), std::size_t {0});
-    expect_true(store.collection_id(by_name) == *left);
+    expect_true(store.collection_id(by_name) == left);
     expect_true(!store.has_collection(churned));
 }
 
@@ -2506,12 +2514,13 @@ void pull_changes(database_type_& store, any_collection_id_t const& id, stored_c
         stored_change<stored_key_t> const after = handed;
         auto const take = [&]<typename read_type_>(stored_change<stored_key_t> const& change, std::uint64_t value_bytes,
                                                    read_type_&& read) noexcept -> status_t {
-            std::array<byte_t, 8> bytes {};
-            if (value_bytes > bytes.size()) return {status_code_t::invalid_argument_k, "A value wider than a counter"};
-            std::span<byte_t> const value {bytes.data(), static_cast<std::size_t>(value_bytes)};
-            if (status_t const copied = read(value); copied.failed()) return copied;
+            std::array<util::byte_t, 8> bytes {};
+            if (value_bytes > bytes.size())
+                return {util::status_code_t::invalid_argument_k, "A value wider than a counter"};
+            std::span<util::byte_t> const value {bytes.data(), static_cast<std::size_t>(value_bytes)};
+            if (util::status_t const copied = read(value); copied.failed()) return copied;
             if (fed.push_back(fed_change_t {change, counter_of(value)}) != st::status_t::success_k)
-                return {status_code_t::out_of_memory_k, "No room for the changes fed"};
+                return {util::status_code_t::out_of_memory_k, "No room for the changes fed"};
             handed = change;
             ++pulled;
             return {};
@@ -2543,19 +2552,19 @@ void test_feed_reads_across_flushes_and_merges(mount_type_ const& mount) {
     using stack_t = typename types_t::stack_t;
     constexpr stored_key_t keys_k = 6, ranged_from_k = 3, ranged_to_k = 8, removed_k = 3, beside_k = 2;
     constexpr stored_key_t rewritten_k = 4, hidden_k = 5;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return;
-    database_t& store = *(*stack)->store;
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return;
+    database_t& store = *stack->store;
     collection_config_t config = test_config(8, 0);
     config.lsm_tree.level_enlarge_factor = storage_limits_t::level_min_enlarge_factor_k;
-    expected<collection_id_t> const fed_collection = create_named(store, "fed", config);
-    expect_true(fed_collection.has_value());
-    if (!fed_collection) return;
-    any_collection_id_t const id {*fed_collection};
+    auto const [fed_collection, create_status] = create_named(store, "fed", config);
+    expect_true(create_status.succeeded());
+    if (create_status.failed()) return;
+    any_collection_id_t const id {fed_collection};
 
     for (stored_key_t key = 0; key != keys_k; ++key) {
-        std::array<byte_t, 8> const counter = counted(key + 100);
+        std::array<util::byte_t, 8> const counter = counted(key + 100);
         expect_true(store.insert(id, key, stored_value_view_t {counter}).succeeded());
     }
     transaction_stamp_t const since = store.ledger().published();
@@ -2563,35 +2572,35 @@ void test_feed_reads_across_flushes_and_merges(mount_type_ const& mount) {
     expect_true(store.pin_feed(id, pin, since).succeeded());
 
     st::vector<fed_change_t> logged;
-    auto const log = [&](stored_key_t key, delta_kind_t kind, std::uint64_t counter) {
+    auto const log = [&](stored_key_t key, util::delta_kind_t kind, std::uint64_t counter) {
         stored_change<stored_key_t> const change {store.ledger().published(), key, kind};
         return expect_true(logged.push_back(fed_change_t {change, counter}) == st::status_t::success_k);
     };
     for (std::uint64_t round = 1; round != 3; ++round) {
         for (stored_key_t key = 0; key != keys_k; ++key) {
-            std::array<byte_t, 8> const counter = counted(key + 100 * round);
+            std::array<util::byte_t, 8> const counter = counted(key + 100 * round);
             expect_true(store.insert(id, key, stored_value_view_t {counter}).succeeded());
-            log(key, delta_kind_t::write_k, key + 100 * round);
+            log(key, util::delta_kind_t::write_k, key + 100 * round);
         }
         expect_true(store.flush().succeeded());
     }
     expect_true(store.compact().succeeded());
     expect_true(store.remove(id, removed_k).succeeded());
-    log(removed_k, delta_kind_t::remove_k, 0);
+    log(removed_k, util::delta_kind_t::remove_k, 0);
 
-    expected<typename database_t::transaction_unique_ptr_t> transaction = store.create_transaction();
-    expect_true(transaction.has_value());
-    if (!transaction) return;
-    std::array<byte_t, 8> const beside = counted(2000);
-    std::array<byte_t, 8> const rewritten = counted(4000);
-    expect_true((*transaction)->insert(id, beside_k, stored_value_view_t {beside}).succeeded());
-    expect_true((*transaction)->remove_range(id, ranged_from_k, ranged_to_k).succeeded());
-    expect_true((*transaction)->insert(id, rewritten_k, stored_value_view_t {rewritten}).succeeded());
-    expect_true((*transaction)->commit().succeeded());
-    log(beside_k, delta_kind_t::write_k, 2000);
-    log(rewritten_k, delta_kind_t::write_k, 4000);
-    log(hidden_k, delta_kind_t::remove_k, 0);
-    (*transaction).reset();
+    auto [transaction, begin_status] = store.create_transaction();
+    expect_true(begin_status.succeeded());
+    if (begin_status.failed()) return;
+    std::array<util::byte_t, 8> const beside = counted(2000);
+    std::array<util::byte_t, 8> const rewritten = counted(4000);
+    expect_true(transaction->insert(id, beside_k, stored_value_view_t {beside}).succeeded());
+    expect_true(transaction->remove_range(id, ranged_from_k, ranged_to_k).succeeded());
+    expect_true(transaction->insert(id, rewritten_k, stored_value_view_t {rewritten}).succeeded());
+    expect_true(transaction->commit().succeeded());
+    log(beside_k, util::delta_kind_t::write_k, 2000);
+    log(rewritten_k, util::delta_kind_t::write_k, 4000);
+    log(hidden_k, util::delta_kind_t::remove_k, 0);
+    transaction.reset();
     expect_true(store.flush().succeeded());
     if (!expect_true(store.compact().succeeded())) return;
 
@@ -2614,20 +2623,20 @@ void test_freed_feed_lets_merges_fold(mount_type_ const& mount) {
     using stack_t = typename types_t::stack_t;
     constexpr stored_key_t key_k = 1;
     constexpr std::uint64_t rewrites_k = 4;
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return;
-    database_t& store = *(*stack)->store;
-    expected<collection_id_t> const folded = create_named(store, "folded", test_config(8, 0));
-    expect_true(folded.has_value());
-    if (!folded) return;
-    expected<collection_id_t> const beside = create_named(store, "beside", test_config(8, 0));
-    expect_true(beside.has_value());
-    if (!beside) return;
-    any_collection_id_t const id {*folded};
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return;
+    database_t& store = *stack->store;
+    auto const [folded, folded_status] = create_named(store, "folded", test_config(8, 0));
+    expect_true(folded_status.succeeded());
+    if (folded_status.failed()) return;
+    auto const [beside, beside_status] = create_named(store, "beside", test_config(8, 0));
+    expect_true(beside_status.succeeded());
+    if (beside_status.failed()) return;
+    any_collection_id_t const id {folded};
     auto const rewrite = [&](any_collection_id_t const& written_id, std::uint64_t first) {
         for (std::uint64_t round = first; round != first + rewrites_k; ++round) {
-            std::array<byte_t, 8> const counter = counted(round);
+            std::array<util::byte_t, 8> const counter = counted(round);
             expect_true(store.insert(written_id, key_k, stored_value_view_t {counter}).succeeded());
         }
     };
@@ -2641,7 +2650,7 @@ void test_freed_feed_lets_merges_fold(mount_type_ const& mount) {
     std::uint64_t const pinned_population = store.population_count();
     // The version the head read at the feed's stamp, and every rewrite above it.
     expect_equal(pinned_population, rewrites_k + 1);
-    rewrite(any_collection_id_t {*beside}, 0);
+    rewrite(any_collection_id_t {beside}, 0);
     expect_true(store.flush().succeeded());
     expect_equal(store.population_count(), pinned_population + 1);
     st::vector<fed_change_t> fed;
@@ -2653,7 +2662,7 @@ void test_freed_feed_lets_merges_fold(mount_type_ const& mount) {
     rewrite(id, 2 * rewrites_k);
     expect_true(store.flush().succeeded());
     expect_equal(store.population_count(), pinned_population + 2);
-    expect_status(store.pin_feed(id, pin, since), status_code_t::write_conflict_k);
+    expect_status(store.pin_feed(id, pin, since), util::status_code_t::write_conflict_k);
     expect_true(!pin.held());
     expect_true(store.pin_feed(id, pin, store.ledger().published()).succeeded());
 }
@@ -2668,8 +2677,8 @@ int main(int argc, char** argv) {
 
     start_test_run(argc, argv);
 
-    st::expected<scratch_directory_t> const directory = scratch_directory_t::make(test_run.settings.directory);
-    if (!directory) {
+    auto [directory, directory_status] = scratch_directory_t::make(test_run.settings.directory);
+    if (st::failed(directory_status)) {
         fmt::println(stderr, "  the working directory would not open");
         return 1;
     }
@@ -2712,7 +2721,7 @@ int main(int argc, char** argv) {
         report_on_mount(mount, "test_freed_feed_lets_merges_fold", test_freed_feed_lets_merges_fold);
     };
     for (transport_t const transport : every_transport_k)
-        run_on_transport(transport, directory->path(), database_config_k, 1, "database", cases);
+        run_on_transport(transport, directory.path(), database_config_k, 1, "database", cases);
 
     return finish_test_run();
 }

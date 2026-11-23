@@ -15,35 +15,36 @@
 #include "ustore/utilities/vram_matching.cuh"      // `substrings_per_thread`, `matching_page_t` & kin
 #include "ustore/utilities/vram_nvidia_scan.cuh"   // `ampere_scan_t`
 
-using namespace unum::ustore::utilities;
+using namespace unum::ustore;
 
 /** Scans the lengths of @p count sources into 32-bit @p offsets and cuts the segments,
  *  on one block. */
-extern "C" __global__ void __launch_bounds__(tape_block_threads_k)
-    ustore_tape_offsets_u32(tape_source_t const* sources, std::uint64_t count, std::uint32_t sources_per_segment,
-                            std::uint32_t* offsets, tape_segment_t* segments) {
-    tape_offsets_block<std::uint32_t, tape_block_threads_k, ampere_scan_t>(sources, count, sources_per_segment, offsets,
-                                                                           segments);
+extern "C" __global__ void __launch_bounds__(util::tape_block_threads_k)
+    ustore_tape_offsets_u32(util::tape_source_t const* sources, std::uint64_t count, std::uint32_t sources_per_segment,
+                            std::uint32_t* offsets, util::tape_segment_t* segments) {
+    util::tape_offsets_block<std::uint32_t, util::tape_block_threads_k, util::ampere_scan_t>(
+        sources, count, sources_per_segment, offsets, segments);
 }
 
 /** Scans the lengths of @p count sources into 64-bit @p offsets and cuts the segments,
  *  on one block. */
-extern "C" __global__ void __launch_bounds__(tape_block_threads_k)
-    ustore_tape_offsets_u64(tape_source_t const* sources, std::uint64_t count, std::uint32_t sources_per_segment,
-                            std::uint64_t* offsets, tape_segment_t* segments) {
-    tape_offsets_block<std::uint64_t, tape_block_threads_k, ampere_scan_t>(sources, count, sources_per_segment, offsets,
-                                                                           segments);
+extern "C" __global__ void __launch_bounds__(util::tape_block_threads_k)
+    ustore_tape_offsets_u64(util::tape_source_t const* sources, std::uint64_t count, std::uint32_t sources_per_segment,
+                            std::uint64_t* offsets, util::tape_segment_t* segments) {
+    util::tape_offsets_block<std::uint64_t, util::tape_block_threads_k, util::ampere_scan_t>(
+        sources, count, sources_per_segment, offsets, segments);
 }
 
 /** Copies the strings of every segment into @p bytes, one block per segment. */
-extern "C" __global__ void __launch_bounds__(tape_block_threads_k)
-    ustore_tape_gather(tape_source_t const* sources, tape_segment_t const* segments, std::byte* bytes) {
-    tape_gather_block(sources, segments, bytes);
+extern "C" __global__ void __launch_bounds__(util::tape_block_threads_k)
+    ustore_tape_gather(util::tape_source_t const* sources, util::tape_segment_t const* segments, std::byte* bytes) {
+    util::tape_gather_block(sources, segments, bytes);
 }
 
 /** Copies fixed-width rows a stride apart into one dense run, one row per thread. */
-extern "C" __global__ void __launch_bounds__(tape_block_threads_k) ustore_tape_densify(strided_rows_t rows) {
-    densify_rows(rows);
+extern "C" __global__ void __launch_bounds__(util::tape_block_threads_k)
+    ustore_tape_densify(util::strided_rows_t rows) {
+    util::densify_rows(rows);
 }
 
 #pragma region Merge Kernels
@@ -72,8 +73,8 @@ extern "C" __global__ void __launch_bounds__(merge_block_threads_k) ustore_merge
     located_key_slot<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::inline_12_bytes_k>>* survivors,
     std::uint64_t* prefix, std::uint8_t* shares, std::uint64_t* chains) {
     merge_pack<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::inline_12_bytes_k>, merge_block_threads_k,
-               ampere_scan_t>(merged, flags, records_count, replaced, replacements, replaced_count, tickets, survivors,
-                              prefix, shares, chains);
+               util::ampere_scan_t>(merged, flags, records_count, replaced, replacements, replaced_count, tickets,
+                                    survivors, prefix, shares, chains);
 }
 
 /** Writes every cell of the new runs of a merge of inline 12 key slots. */
@@ -107,8 +108,8 @@ extern "C" __global__ void __launch_bounds__(merge_block_threads_k) ustore_merge
     located_key_slot<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::inline_44_bytes_k>>* survivors,
     std::uint64_t* prefix, std::uint8_t* shares, std::uint64_t* chains) {
     merge_pack<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::inline_44_bytes_k>, merge_block_threads_k,
-               ampere_scan_t>(merged, flags, records_count, replaced, replacements, replaced_count, tickets, survivors,
-                              prefix, shares, chains);
+               util::ampere_scan_t>(merged, flags, records_count, replaced, replacements, replaced_count, tickets,
+                                    survivors, prefix, shares, chains);
 }
 
 /** Writes every cell of the new runs of a merge of inline 44 key slots. */
@@ -141,8 +142,8 @@ extern "C" __global__ void __launch_bounds__(merge_block_threads_k) ustore_merge
     located_key_slot<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::fixed_width_k>>* survivors,
     std::uint64_t* prefix, std::uint8_t* shares, std::uint64_t* chains) {
     merge_pack<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::fixed_width_k>, merge_block_threads_k,
-               ampere_scan_t>(merged, flags, records_count, replaced, replacements, replaced_count, tickets, survivors,
-                              prefix, shares, chains);
+               util::ampere_scan_t>(merged, flags, records_count, replaced, replacements, replaced_count, tickets,
+                                    survivors, prefix, shares, chains);
 }
 
 /** Writes every cell of the new runs of a merge of fixed width key slots. */
@@ -176,8 +177,8 @@ extern "C" __global__ void __launch_bounds__(merge_block_threads_k) ustore_merge
     located_key_slot<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::variable_width_k>>* survivors,
     std::uint64_t* prefix, std::uint8_t* shares, std::uint64_t* chains) {
     merge_pack<key_slot<ashvardanian::smashtable::key128_t, value_layout_t::variable_width_k>, merge_block_threads_k,
-               ampere_scan_t>(merged, flags, records_count, replaced, replacements, replaced_count, tickets, survivors,
-                              prefix, shares, chains);
+               util::ampere_scan_t>(merged, flags, records_count, replaced, replacements, replaced_count, tickets,
+                                    survivors, prefix, shares, chains);
 }
 
 /** Writes every cell of the new runs of a merge of variable width key slots. */
@@ -215,7 +216,8 @@ extern "C" __global__ void __launch_bounds__(merge_block_threads_k)
 extern "C" __global__ void __launch_bounds__(merge_block_threads_k)
     ustore_merge_strings_pack(strings_version_t const* merged, std::uint8_t const* flags, std::uint64_t records_count,
                               std::uint64_t tickets, strings_version_t* survivors, std::uint64_t* chain) {
-    merge_strings_pack<merge_block_threads_k, ampere_scan_t>(merged, flags, records_count, tickets, survivors, chain);
+    merge_strings_pack<merge_block_threads_k, util::ampere_scan_t>(merged, flags, records_count, tickets, survivors,
+                                                                   chain);
 }
 
 #pragma endregion Merge Kernels
@@ -238,7 +240,8 @@ extern "C" __global__ void __launch_bounds__(fold_block_threads_k)
     ustore_fold_chains(half_edge_record_t const* records, std::uint32_t const* starts, std::uint32_t chains_count,
                        fold_spill_t spill, std::uint32_t* kept, std::uint32_t* kept_counts) {
     extern __shared__ std::uint32_t sorted[];
-    fold_chains<fold_block_threads_k, ampere_scan_t>(records, starts, chains_count, spill, sorted, kept, kept_counts);
+    fold_chains<fold_block_threads_k, util::ampere_scan_t>(records, starts, chains_count, spill, sorted, kept,
+                                                           kept_counts);
 }
 
 /** Writes the kept records of every chain of a graph merge back to back, one tile
@@ -248,8 +251,8 @@ extern "C" __global__ void __launch_bounds__(fold_block_threads_k)
                       std::uint32_t const* kept_counts, std::uint32_t chains_count, std::uint64_t tickets,
                       half_edge_record_t removal, half_edge_record_t* composed, std::uint64_t* offsets,
                       std::uint64_t* chain) {
-    fold_write<fold_block_threads_k, ampere_scan_t>(records, starts, kept, kept_counts, chains_count, tickets, removal,
-                                                    composed, offsets, chain);
+    fold_write<fold_block_threads_k, util::ampere_scan_t>(records, starts, kept, kept_counts, chains_count, tickets,
+                                                          removal, composed, offsets, chain);
 }
 
 #pragma endregion Fold Kernels
@@ -258,8 +261,8 @@ extern "C" __global__ void __launch_bounds__(fold_block_threads_k)
 
 /** This vendor's 32 lanes as one group of the walks. */
 __device__ inline sz_simt_group_t matching_group() noexcept {
-    return {matching_group_lanes_k,
-            threadIdx.x % matching_group_lanes_k,
+    return {util::matching_group_lanes_k,
+            threadIdx.x % util::matching_group_lanes_k,
             sz_lanes_any_cuda_,
             sz_lanes_ballot_cuda_,
             sz_lanes_first_cuda_,
@@ -273,83 +276,84 @@ __device__ inline sz_simt_group_t matching_group() noexcept {
 }
 
 /** Marks the short values of @p page holding a needle of @p engine, a lane each. */
-extern "C" __global__ void __launch_bounds__(matching_block_threads_k)
-    ustore_substrings_contains_per_thread(sz_substrings_engine_t engine, matching_page_t page,
+extern "C" __global__ void __launch_bounds__(util::matching_block_threads_k)
+    ustore_substrings_contains_per_thread(sz_substrings_engine_t engine, util::matching_page_t page,
                                           std::uint32_t staged_count) {
-    substrings_per_thread(engine, page, staged_count);
+    util::substrings_per_thread(engine, page, staged_count);
 }
 
 /** Marks the medium values of @p page holding a needle of @p engine, a group each. */
-extern "C" __global__ void __launch_bounds__(matching_block_threads_k)
-    ustore_substrings_contains_per_group(sz_substrings_engine_t engine, matching_page_t page,
+extern "C" __global__ void __launch_bounds__(util::matching_block_threads_k)
+    ustore_substrings_contains_per_group(sz_substrings_engine_t engine, util::matching_page_t page,
                                          std::uint32_t staged_count) {
-    substrings_per_group(engine, page, staged_count, matching_group());
+    util::substrings_per_group(engine, page, staged_count, matching_group());
 }
 
 /** Marks the long values of @p chunks holding a needle of @p engine, a lane per chunk. */
-extern "C" __global__ void __launch_bounds__(matching_block_threads_k)
-    ustore_substrings_contains_per_chunk(sz_substrings_engine_t engine, matching_chunks_t chunks,
+extern "C" __global__ void __launch_bounds__(util::matching_block_threads_k)
+    ustore_substrings_contains_per_chunk(sz_substrings_engine_t engine, util::matching_chunks_t chunks,
                                          std::uint32_t staged_count) {
-    substrings_per_chunk(engine, chunks, staged_count);
+    util::substrings_per_chunk(engine, chunks, staged_count);
 }
 
 /** Marks the values of @p page a pattern of @p engine matches in, a lane each. */
-extern "C" __global__ void __launch_bounds__(matching_block_threads_k)
-    ustore_regex_contains_per_thread(sz_regex_engine_t engine, matching_page_t page, std::uint32_t cells) {
-    regex_per_thread(engine, page, cells);
+extern "C" __global__ void __launch_bounds__(util::matching_block_threads_k)
+    ustore_regex_contains_per_thread(sz_regex_engine_t engine, util::matching_page_t page, std::uint32_t cells) {
+    util::regex_per_thread(engine, page, cells);
 }
 
 /** Marks the values of @p page a pattern of @p engine matches in, a group each primed from its
  *  column @p images. */
-extern "C" __global__ void __launch_bounds__(matching_block_threads_k)
-    ustore_regex_contains_per_group(sz_regex_engine_t engine, matching_page_t page, std::uint32_t const* images,
+extern "C" __global__ void __launch_bounds__(util::matching_block_threads_k)
+    ustore_regex_contains_per_group(sz_regex_engine_t engine, util::matching_page_t page, std::uint32_t const* images,
                                     std::uint32_t cells) {
-    regex_per_group(engine, page, images, cells, matching_group());
+    util::regex_per_group(engine, page, images, cells, matching_group());
 }
 
 /** Marks the values of @p chunks a pattern of @p engine matches in, a lane per chunk primed from
  *  its column @p images, raising @p refused where a chunk cannot answer alone. */
-extern "C" __global__ void __launch_bounds__(matching_block_threads_k)
-    ustore_regex_contains_per_chunk(sz_regex_engine_t engine, matching_chunks_t chunks, std::uint32_t const* images,
-                                    std::uint32_t cells, std::uint32_t* refused) {
-    regex_per_chunk(engine, chunks, images, cells, refused);
+extern "C" __global__ void __launch_bounds__(util::matching_block_threads_k)
+    ustore_regex_contains_per_chunk(sz_regex_engine_t engine, util::matching_chunks_t chunks,
+                                    std::uint32_t const* images, std::uint32_t cells, std::uint32_t* refused) {
+    util::regex_per_chunk(engine, chunks, images, cells, refused);
 }
 
 /** Marks the XML values of @p page a path of @p engine selects in, a lane each. */
-extern "C" __global__ void __launch_bounds__(matching_block_threads_k)
-    ustore_subdocuments_contains_per_thread(sz_subdocuments_engine_t engine, matching_page_t page,
-                                            matching_walkers_t walkers) {
-    subdocuments_per_thread(engine, page, walkers);
+extern "C" __global__ void __launch_bounds__(util::matching_block_threads_k)
+    ustore_subdocuments_contains_per_thread(sz_subdocuments_engine_t engine, util::matching_page_t page,
+                                            util::matching_walkers_t walkers) {
+    util::subdocuments_per_thread(engine, page, walkers);
 }
 
 /** Marks the JSON values of @p page a path of @p engine selects in, a group each. */
-extern "C" __global__ void __launch_bounds__(matching_block_threads_k)
-    ustore_subdocuments_contains_per_group(sz_subdocuments_engine_t engine, matching_page_t page,
-                                           matching_walkers_t walkers) {
-    subdocuments_per_group(engine, page, walkers, 0, matching_group());
+extern "C" __global__ void __launch_bounds__(util::matching_block_threads_k)
+    ustore_subdocuments_contains_per_group(sz_subdocuments_engine_t engine, util::matching_page_t page,
+                                           util::matching_walkers_t walkers) {
+    util::subdocuments_per_group(engine, page, walkers, 0, matching_group());
 }
 
 /** Marks the long JSON values of @p page a path of @p engine selects in, a group each walking them
  *  in chunks of @p chunk_bytes. */
-extern "C" __global__ void __launch_bounds__(matching_block_threads_k)
-    ustore_subdocuments_contains_per_chunk(sz_subdocuments_engine_t engine, matching_page_t page,
-                                           matching_walkers_t walkers, std::uint64_t chunk_bytes) {
-    subdocuments_per_group(engine, page, walkers, chunk_bytes, matching_group());
+extern "C" __global__ void __launch_bounds__(util::matching_block_threads_k)
+    ustore_subdocuments_contains_per_chunk(sz_subdocuments_engine_t engine, util::matching_page_t page,
+                                           util::matching_walkers_t walkers, std::uint64_t chunk_bytes) {
+    util::subdocuments_per_group(engine, page, walkers, chunk_bytes, matching_group());
 }
 
 /** Stores the nodes @p engine's paths select in @p page's JSON values into @p found, per group. */
-extern "C" __global__ void __launch_bounds__(matching_block_threads_k)
-    ustore_subdocuments_find_per_group(sz_subdocuments_engine_t engine, matching_page_t page,
-                                       matching_walkers_t walkers, matching_found_t found) {
-    subdocuments_find_per_group(engine, page, walkers, found, 0, matching_group());
+extern "C" __global__ void __launch_bounds__(util::matching_block_threads_k)
+    ustore_subdocuments_find_per_group(sz_subdocuments_engine_t engine, util::matching_page_t page,
+                                       util::matching_walkers_t walkers, util::matching_found_t found) {
+    util::subdocuments_find_per_group(engine, page, walkers, found, 0, matching_group());
 }
 
 /** Stores the nodes the paths of @p engine select in the long JSON values of @p page into @p found,
  *  a group each walking them in chunks of @p chunk_bytes. */
-extern "C" __global__ void __launch_bounds__(matching_block_threads_k)
-    ustore_subdocuments_find_per_chunk(sz_subdocuments_engine_t engine, matching_page_t page,
-                                       matching_walkers_t walkers, matching_found_t found, std::uint64_t chunk_bytes) {
-    subdocuments_find_per_group(engine, page, walkers, found, chunk_bytes, matching_group());
+extern "C" __global__ void __launch_bounds__(util::matching_block_threads_k)
+    ustore_subdocuments_find_per_chunk(sz_subdocuments_engine_t engine, util::matching_page_t page,
+                                       util::matching_walkers_t walkers, util::matching_found_t found,
+                                       std::uint64_t chunk_bytes) {
+    util::subdocuments_find_per_group(engine, page, walkers, found, chunk_bytes, matching_group());
 }
 
 #pragma endregion Matching Kernels

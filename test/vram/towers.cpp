@@ -37,7 +37,6 @@
 
 using namespace unum::ustore;
 using namespace unum::ustore::test;
-using namespace unum::ustore::utilities;
 
 namespace unum::ustore::test {
 
@@ -57,7 +56,7 @@ struct tape_t {
         offsets.push_back(static_cast<std::uint32_t>(bytes.size()));
     }
     std::size_t size() const noexcept { return offsets.size() - 1; }
-    ustore_strings_view_t view() const noexcept { return u32_tape(bytes.data(), offsets.data()); }
+    ustore_strings_view_t view() const noexcept { return util::u32_tape(bytes.data(), offsets.data()); }
 };
 
 /** What the HIP stand-in counted, read through the library the runtime opened. */
@@ -69,7 +68,7 @@ struct fake_hip_counters_t {
 /** The stand-in's counters, or null when the real runtime or none is loaded. */
 fake_hip_counters_t const* fake_hip_counters() noexcept {
     fake_hip_counters_t const* counters = nullptr;
-    shared_library_t::open("libamdhip64.so").resolve("fake_hip_counters", counters);
+    util::shared_library_t::open("libamdhip64.so").resolve("fake_hip_counters", counters);
     return counters;
 }
 
@@ -78,21 +77,21 @@ template <typename body_type_>
 struct device_visitor {
     body_type_& body;
     void operator()(std::monostate) const noexcept {}
-    void operator()(cuda_executor_t& executor) const noexcept { body(executor); }
-    void operator()(hip_executor_t& executor) const noexcept { body(executor); }
-    void operator()(metal_executor_t& executor) const noexcept { body(executor); }
+    void operator()(util::cuda_executor_t& executor) const noexcept { body(executor); }
+    void operator()(util::hip_executor_t& executor) const noexcept { body(executor); }
+    void operator()(util::metal_executor_t& executor) const noexcept { body(executor); }
 };
 
 /** The suite's own executor on one listed device, which places inputs there and fetches outputs back. */
 class mover_t {
   public:
-    status_t open(ustore_gpu_device_t const& listed) noexcept {
-        gpu_device_t device;
-        device.vendor = static_cast<gpu_vendor_t>(listed.vendor);
+    util::status_t open(ustore_gpu_device_t const& listed) noexcept {
+        util::gpu_device_t device;
+        device.vendor = static_cast<util::gpu_vendor_t>(listed.vendor);
         device.vendor_ordinal = listed.vendor_ordinal;
         gpu_class_t const gpu_class = static_cast<gpu_class_t>(listed.gpu_class);
-        if (status_t const opened = open_gpu_device(drivers_, device, gpu_class, cuda_kernels_, hip_kernels_,
-                                                    metal_kernels_);
+        if (util::status_t const opened = open_gpu_device(drivers_, device, gpu_class, cuda_kernels_, hip_kernels_,
+                                                          metal_kernels_);
             opened.failed())
             return opened;
         return spawn_gpu_executor(drivers_, cuda_kernels_, hip_kernels_, metal_kernels_, device, gpu_class, nullptr, 0,
@@ -103,7 +102,7 @@ class mover_t {
         visit([&](auto& executor) noexcept {
             if (executor.bind().failed()) return;
             for (std::uintptr_t address : placed_) executor.free_async(address);
-            [[maybe_unused]] status_t const waited = executor.wait();
+            [[maybe_unused]] util::status_t const waited = executor.wait();
         });
     }
 
@@ -143,7 +142,7 @@ class mover_t {
     }
 
     /** The first failure of a copy, sticky until the mover dies. */
-    status_t status() const noexcept { return status_; }
+    util::status_t status() const noexcept { return status_; }
 
     /** Runs @p body's work on the device and waits for it, keeping the first failure. */
     template <typename body_type_>
@@ -167,13 +166,13 @@ class mover_t {
         std::visit(device_visitor<body_type_> {body}, executor_);
     }
 
-    gpu_drivers_t drivers_;
-    kernel_tables<cuda_module_t> cuda_kernels_;
-    kernel_tables<hip_module_t> hip_kernels_;
-    kernel_tables<metal_module_t> metal_kernels_;
-    std::variant<std::monostate, cuda_executor_t, hip_executor_t, metal_executor_t> executor_;
+    util::gpu_drivers_t drivers_;
+    kernel_tables<util::cuda_module_t> cuda_kernels_;
+    kernel_tables<util::hip_module_t> hip_kernels_;
+    kernel_tables<util::metal_module_t> metal_kernels_;
+    std::variant<std::monostate, util::cuda_executor_t, util::hip_executor_t, util::metal_executor_t> executor_;
     std::vector<std::uintptr_t> placed_;
-    status_t status_;
+    util::status_t status_;
 };
 
 /** Every listed GPU. */
@@ -194,7 +193,7 @@ std::vector<ustore_gpu_device_t> listed_devices() noexcept {
 struct device_call_t {
     ustore_executor_t executor = nullptr;
     ustore_arena_t arena = nullptr;
-    status_t status;
+    util::status_t status;
 
     explicit device_call_t(std::size_t ordinal) noexcept {
         ustore_outcome_t outcome {};
@@ -202,10 +201,10 @@ struct device_call_t {
                                           .outcome = &outcome,
                                           .device = static_cast<std::int32_t>(ordinal)};
         ustore_executor_for_vram(&spawn);
-        if ((status = status_t {outcome}).failed()) return;
+        if ((status = status_of(outcome)).failed()) return;
         ustore_arena_init_t init {.arena = &arena, .executor = executor, .outcome = &outcome};
         ustore_arena_init(&init);
-        status = status_t {outcome};
+        status = status_of(outcome);
     }
     ~device_call_t() noexcept {
         ustore_arena_free(arena);
@@ -245,7 +244,7 @@ struct fixture_t {
         if (!filled) return;
         database = opened;
         for (std::size_t index = 0; index != entries_k; ++index) {
-            keys.push_back(key_from_integer(index + 1));
+            keys.push_back(util::key_from_integer(index + 1));
             std::string const number = std::to_string(index + 1);
             values.push(std::string(index % 7, 'v') + number);
             texts.push("text:" + number);
@@ -293,7 +292,7 @@ struct fixture_t {
         ustore_outcome_t outcome {};
         ustore_collection_create_t create {.database = database,
                                            .outcome = &outcome,
-                                           .name = bytes_of(name),
+                                           .name = util::bytes_of(name),
                                            .modality = modality,
                                            .collection = &created};
         ustore_collection_create(&create);
@@ -519,7 +518,7 @@ void test_vram_reads(std::size_t ordinal, ustore_gpu_device_t listed, config_t c
     if (!fixture.filled) return;
     std::size_t const count = entries_k + 4;
     std::vector<ustore_key_t> asked = fixture.keys;
-    for (std::size_t extra = 0; extra != 4; ++extra) asked.push_back(key_from_integer(1000 + extra));
+    for (std::size_t extra = 0; extra != 4; ++extra) asked.push_back(util::key_from_integer(1000 + extra));
     ustore_keys_view_t const keys {asked.data(), sizeof(ustore_key_t)};
     host_arena_t const kept;
 
@@ -737,7 +736,7 @@ void test_vram_staging(std::size_t ordinal, ustore_gpu_device_t listed, std::vec
         ustore_strings_read_t host {.database = fixture.database, .count = entries_k}, device = host;
         host.collections = device.collections = {&fixture.strings, 0};
         host.strings = fixture.texts.view();
-        device.strings = u32_tape(placed_bytes, placed_offsets);
+        device.strings = util::u32_tape(placed_bytes, placed_offsets);
         host.values = &host_values, device.values = &device_values;
         ustore_outcome_t host_outcome {}, device_outcome {};
         host_arena_t const reference;
@@ -839,7 +838,7 @@ case_result_t test_vram_frees_everything(std::size_t ordinal, ustore_gpu_device_
         return case_result_t::skipped(needs_hip_stand_in_k);
     using live_ranges_t = std::size_t (*)();
     live_ranges_t live = nullptr;
-    shared_library_t::open("libamdhip64.so").resolve("fake_hip_live_ranges", live);
+    util::shared_library_t::open("libamdhip64.so").resolve("fake_hip_live_ranges", live);
     std::size_t const before = live();
     {
         device_call_t call {ordinal};
@@ -887,8 +886,8 @@ case_result_t test_vram_matching(std::size_t ordinal, ustore_gpu_device_t listed
     bool const loads_bundle = embeds_kernels(listed) &&
                               (listed.vendor == ustore_gpu_vendor_nvidia_k || !fake_hip_counters());
     device_service_t const matches_values = loads_bundle ? device_service_t::served_k : device_service_t::unsupported_k;
-    ustore_predicate_t const even_cheap {.callback = &admit_even_keys, .cost = ustore_predicate_cheap_k};
-    ustore_predicate_t const even_expensive {.callback = &admit_even_keys, .cost = ustore_predicate_expensive_k};
+    ustore_predicate_t const even_cheap {.callback = &admit_even_keys, .cost = ustore_predicate_cost_cheap_k};
+    ustore_predicate_t const even_expensive {.callback = &admit_even_keys, .cost = ustore_predicate_cost_expensive_k};
 
     // Every filtered listing wants a quarter of the collection, so a sparse filter pages through it several times
     auto const filtered = [&]<typename arguments_type_, typename narrow_type_>(
@@ -925,7 +924,9 @@ case_result_t test_vram_matching(std::size_t ordinal, ustore_gpu_device_t listed
     std::array<std::uint32_t, 2> pattern_offsets {};
     auto const patterns_of = [&](std::string_view text, ustore_pattern_kind_t kind) {
         pattern_offsets = {0, static_cast<std::uint32_t>(text.size())};
-        return ustore_patterns_t {.patterns = u32_tape(text.data(), pattern_offsets.data()), .count = 1, .kind = kind};
+        return ustore_patterns_t {.patterns = util::u32_tape(text.data(), pattern_offsets.data()),
+                                  .count = 1,
+                                  .kind = kind};
     };
     std::size_t const wanted = entries_k / 4;
     float const weight = 2.0f;
@@ -986,24 +987,25 @@ case_result_t test_vram_matching(std::size_t ordinal, ustore_gpu_device_t listed
     filtered(
         &ustore_docs_scan, fixture.docs,
         [&](ustore_docs_scan_t& scan) {
-            scan.filter = bytes_of("$[?@ > 40]");
+            scan.filter = util::bytes_of("$[?@ > 40]");
             scan.predicate = even_expensive;
         },
         matches_values, wanted, wanted);
     filtered(
-        &ustore_docs_scan, fixture.docs, [&](ustore_docs_scan_t& scan) { scan.filter = bytes_of("$.missing"); },
+        &ustore_docs_scan, fixture.docs, [&](ustore_docs_scan_t& scan) { scan.filter = util::bytes_of("$.missing"); },
         matches_values, 0, 0);
     // A filter the kernels do not walk matches on the host, so every device serving
     // matches serves it
     filtered(
-        &ustore_docs_scan, fixture.docs, [&](ustore_docs_scan_t& scan) { scan.filter = bytes_of("?@.score > 40"); },
-        matches_values, wanted, wanted);
+        &ustore_docs_scan, fixture.docs,
+        [&](ustore_docs_scan_t& scan) { scan.filter = util::bytes_of("?@.score > 40"); }, matches_values, wanted,
+        wanted);
     // Every page holds a bold element, and none an italic one
     filtered(
-        &ustore_pages_scan, fixture.pages, [&](ustore_pages_scan_t& scan) { scan.filter = bytes_of("//b"); },
+        &ustore_pages_scan, fixture.pages, [&](ustore_pages_scan_t& scan) { scan.filter = util::bytes_of("//b"); },
         matches_values, wanted, wanted);
     filtered(
-        &ustore_pages_scan, fixture.pages, [&](ustore_pages_scan_t& scan) { scan.filter = bytes_of("//i"); },
+        &ustore_pages_scan, fixture.pages, [&](ustore_pages_scan_t& scan) { scan.filter = util::bytes_of("//i"); },
         matches_values, 0, 0);
 
     // Strings holding a 7, whose keys the predicate sees
@@ -1043,12 +1045,12 @@ case_result_t test_vram_tapes(ustore_gpu_device_t listed) {
     if (!expect_true(mover.open(listed).succeeded())) return {};
     if (!mover.launches()) return case_result_t::skipped("needs library kernels for the device");
     std::vector<std::string> strings;
-    for (std::size_t index = 0; index != 3 * tape_block_threads_k + 5; ++index)
+    for (std::size_t index = 0; index != 3 * util::tape_block_threads_k + 5; ++index)
         strings.push_back(std::string(index % 11, static_cast<char>('a' + index % 26)));
     std::string joined;
     for (std::string const& string : strings) joined += string;
     char const* const placed = mover.place(std::span<char const> {joined});
-    std::vector<tape_source_t> host_sources, device_sources;
+    std::vector<util::tape_source_t> host_sources, device_sources;
     std::size_t offset = 0;
     for (std::string const& string : strings) {
         host_sources.push_back({reinterpret_cast<std::byte const*>(string.data()), string.size()});
@@ -1058,20 +1060,20 @@ case_result_t test_vram_tapes(ustore_gpu_device_t listed) {
 
     std::vector<std::uint32_t> host_offsets(strings.size() + 1);
     std::vector<std::byte> host_bytes(joined.size());
-    assemble_tape<std::uint32_t>(
+    util::assemble_tape<std::uint32_t>(
         strings.size(), [&](std::size_t index) noexcept { return host_sources[index]; },
         std::span<std::uint32_t> {host_offsets}, std::span<std::byte> {host_bytes});
 
     // The outputs start poisoned, so every byte the device leaves unwritten shows
     std::vector<std::uint32_t> const poisoned_offsets(host_offsets.size(), ~std::uint32_t {0});
     std::vector<std::byte> const poisoned_bytes(host_bytes.size(), std::byte {0xFF});
-    tape_source_t const* const sources = mover.place(std::span<tape_source_t const> {device_sources});
+    util::tape_source_t const* const sources = mover.place(std::span<util::tape_source_t const> {device_sources});
     std::uint32_t* const offsets = mover.place(std::span {poisoned_offsets});
     std::byte* const bytes = mover.place(std::span {poisoned_bytes});
     mover.copy([&](auto& executor) noexcept {
-        return assemble_tape<std::uint32_t>(executor, std::span<tape_source_t const> {sources, strings.size()},
-                                            std::span<std::uint32_t> {offsets, host_offsets.size()},
-                                            std::span<std::byte> {bytes, host_bytes.size()});
+        return util::assemble_tape<std::uint32_t>(
+            executor, std::span<util::tape_source_t const> {sources, strings.size()},
+            std::span<std::uint32_t> {offsets, host_offsets.size()}, std::span<std::byte> {bytes, host_bytes.size()});
     });
     expect_true(mover.status().succeeded());
     expect_true(mover.fetch(offsets, host_offsets.size()) == host_offsets);
@@ -1085,12 +1087,12 @@ case_result_t test_vram_tapes(ustore_gpu_device_t listed) {
 
 int main(int argc, char** argv) {
     start_test_run(argc, argv);
-    auto const maybe_test_directory = scratch_directory_t::make(test_run.settings.directory);
-    if (!maybe_test_directory) {
+    auto [directory, directory_status] = scratch_directory_t::make(test_run.settings.directory);
+    if (st::failed(directory_status)) {
         fmt::println(stderr, "Cannot create a unique directory under {}", test_run.settings.directory);
         return 1;
     }
-    config_t const config {test_run.settings.engine, maybe_test_directory->path()};
+    config_t const config {test_run.settings.engine, directory.path()};
 
     std::vector<ustore_gpu_device_t> const devices = listed_devices();
     if (devices.empty())

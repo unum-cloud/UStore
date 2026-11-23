@@ -6,9 +6,8 @@
  *      and collection IDs with their orders, hashes and spellings, edges, value views, byte views
  *      and the serialization over them, owned text, integer rounding, and the waiter.
  *
- *  The statuses and @c expected are re-exported into @c unum::ustore here, and
- *  <tt>cpp/ustore/types.hpp</tt> re-exports the rest, so the C++ SDK and these templates name one
- *  set of types.
+ *  Everything lives in @c unum::ustore::utilities, which every engine namespace names, so a
+ *  translation unit may also include the C++ SDK, whose own types live in @c unum::ustore.
  */
 
 #pragma once
@@ -109,6 +108,8 @@ namespace fu = ashvardanian::forkunion;
 namespace st = ashvardanian::smashtable;
 namespace sz = ashvardanian::stringzilla;
 
+namespace utilities {
+
 /** The base Linux adds to syscall numbers on MIPS and Alpha, so mirrored numbers add it too. */
 #if defined(_MIPS_SIM) && _MIPS_SIM == _ABIO32
 inline constexpr long linux_syscall_offset_k = 4000;
@@ -121,8 +122,6 @@ inline constexpr long linux_syscall_offset_k = 110;
 #else
 inline constexpr long linux_syscall_offset_k = 0;
 #endif
-
-namespace utilities {
 
 using f64_t = double;
 using f32_t = float;
@@ -140,7 +139,7 @@ using u8_t = std::uint8_t;
 /** A single byte of a stored value, kept distinct from characters and integers. */
 using byte_t = std::byte;
 
-#pragma region Statuses
+#pragma region Status Codes
 
 /** What went wrong, with one enumerator per @c ustore_status_t that the C header documents.
  *  Statuses fall into five categories. Resources: @c out_of_memory_k, @c io_k and @c device_k.
@@ -172,32 +171,27 @@ enum class status_code_t : int {
     capacity_exhausted_k = ustore_status_capacity_exhausted_k,
 };
 
-/** The C++ twin of @c ustore_outcome_t: a code and a static message, @c nullptr on success. */
+#pragma endregion Status Codes
+
+/** Why a call failed: a code recovery branches on, and an optional static note naming the broken
+ *  invariant, step or resource, for logs and regression analysis. */
 struct [[nodiscard]] status_t {
-
-    /** What went wrong, or @c status_code_t::success_k. */
     status_code_t code = status_code_t::success_k;
-
-    /** Static detail the code cannot carry, never freed. */
-    char const* message = nullptr;
+    char const* note = nullptr;
 
     constexpr status_t() noexcept = default;
-    constexpr status_t(status_code_t reason, char const* detail = nullptr) noexcept : code(reason), message(detail) {}
-    constexpr status_t(ustore_outcome_t const& outcome) noexcept
-        : code(static_cast<status_code_t>(outcome.status)), message(outcome.message) {}
-
-    /** The same status as the C ABI spells it, for writing into an outcome. */
-    constexpr operator ustore_outcome_t() const noexcept { return {static_cast<ustore_status_t>(code), message}; }
-
+    constexpr status_t(status_code_t reason, char const* detail = nullptr) noexcept : code(reason), note(detail) {}
     constexpr bool succeeded() const noexcept { return code == status_code_t::success_k; }
     constexpr bool failed() const noexcept { return code != status_code_t::success_k; }
-
     friend constexpr bool operator==(status_t const& status, status_code_t code) noexcept {
         return status.code == code;
     }
 };
 
-static_assert(std::is_trivially_copyable_v<status_t>);
+static_assert(sizeof(status_t) == 2 * sizeof(void*) && std::is_trivially_copyable_v<status_t>,
+              "a status is a code and a note pointer, returned in two registers");
+
+#pragma region Expected Values
 
 /**
  *  @brief A value, or the status that explains its absence.
@@ -225,7 +219,7 @@ class [[nodiscard]] expected {
     constexpr expected(status_t status) noexcept
         : status_(status.succeeded() ? status_t {status_code_t::internal_k, "An expected value is missing"} : status) {}
 
-    /** A failure without a message. */
+    /** A failure without a note. */
     constexpr expected(status_code_t code) noexcept : expected(status_t {code}) {}
 
     expected(value_t&& value) noexcept { new (&value_) value_t(std::move(value)); }
@@ -281,17 +275,21 @@ class [[nodiscard]] expected {
     constexpr value_t* operator->() noexcept { return &value_; }
     constexpr value_t const* operator->() const noexcept { return &value_; }
 
+    /** What @c auto @c [value, status] binds at @p index_: the value, then the status. */
+    template <std::size_t index_>
+    using element = std::conditional_t<index_ == 0, value_t, status_t>;
+
     /** The tuple protocol behind @c auto @c [value, status], default-constructing the value of a failure. */
     template <std::size_t index_>
         requires std::is_nothrow_default_constructible_v<value_t>
-    constexpr auto get() && noexcept {
+    constexpr element<index_> get() && noexcept {
         if constexpr (index_ == 0) return status_.succeeded() ? value_t {std::move(value_)} : value_t {};
         else return status_;
     }
 
     template <std::size_t index_>
         requires(std::is_nothrow_default_constructible_v<value_t> && std::is_nothrow_copy_constructible_v<value_t>)
-    constexpr auto get() const& noexcept {
+    constexpr element<index_> get() const& noexcept {
         if constexpr (index_ == 0) return status_.succeeded() ? value_t {value_} : value_t {};
         else return status_;
     }
@@ -317,7 +315,7 @@ constexpr bool operator==(expected<value_type_> const& result, comparable_type_ 
     else return *result == value;
 }
 
-#pragma endregion Statuses
+#pragma endregion Expected Values
 
 #pragma region SmashTable Status
 
@@ -326,19 +324,19 @@ constexpr bool operator==(expected<value_type_> const& result, comparable_type_ 
 constexpr status_t to_status(st::status_t failure) noexcept {
     switch (failure) {
     case st::status_t::success_k: return {};
-    case st::status_t::out_of_memory_heap_k: return {status_code_t::out_of_memory_k, "Out of memory"};
+    case st::status_t::out_of_memory_heap_k: return {status_code_t::out_of_memory_k, "A container ran out of heap"};
     case st::status_t::consistency_k: return {status_code_t::internal_k, "A container invariant did not hold"};
     case st::status_t::operation_not_permitted_k:
         return {status_code_t::invalid_argument_k, "The object does not admit the call"};
     case st::status_t::operation_would_block_k: return {status_code_t::internal_k, "A bounded retry gave up"};
-    case st::status_t::invalid_argument_k: return {status_code_t::invalid_argument_k, "Invalid argument"};
-    case st::status_t::capacity_exhausted_k: return {status_code_t::capacity_exhausted_k, "Capacity exhausted"};
-    case st::status_t::input_output_k: return {status_code_t::io_k, "Input or output failed"};
-    case st::status_t::key_already_exists_k: return {status_code_t::already_exists_k, "Key already exists"};
-    case st::status_t::key_not_found_k: return {status_code_t::not_found_k, "Key not found"};
-    case st::status_t::write_conflict_k: return {status_code_t::write_conflict_k, "Write conflict"};
-    case st::status_t::read_conflict_k: return {status_code_t::read_conflict_k, "Read conflict"};
-    case st::status_t::phantom_conflict_k: return {status_code_t::phantom_conflict_k, "Phantom conflict"};
+    case st::status_t::invalid_argument_k: return status_code_t::invalid_argument_k;
+    case st::status_t::capacity_exhausted_k: return status_code_t::capacity_exhausted_k;
+    case st::status_t::input_output_k: return status_code_t::io_k;
+    case st::status_t::key_already_exists_k: return status_code_t::already_exists_k;
+    case st::status_t::key_not_found_k: return status_code_t::not_found_k;
+    case st::status_t::write_conflict_k: return status_code_t::write_conflict_k;
+    case st::status_t::read_conflict_k: return status_code_t::read_conflict_k;
+    case st::status_t::phantom_conflict_k: return status_code_t::phantom_conflict_k;
     default: return {status_code_t::internal_k, "A container failed for an unknown reason"};
     }
 }
@@ -1203,28 +1201,18 @@ inline constexpr std::size_t gpu_devices_capacity_k = 64;
 
 } // namespace utilities
 
-/** The statuses and byte views every layer shares, in the namespace SDKs and engines open. */
-using utilities::bytes_of;
-using utilities::chars_of;
-using utilities::elements_of;
-using utilities::expected;
-using utilities::status_code_t;
-using utilities::status_t;
-
+namespace util = utilities;
 } // namespace unum::ustore
 
 template <typename value_type_>
-struct std::tuple_size<unum::ustore::expected<value_type_>> {
+struct std::tuple_size<unum::ustore::utilities::expected<value_type_>> {
     static constexpr std::size_t value = 2;
 };
 
-template <typename value_type_>
-struct std::tuple_element<0, unum::ustore::expected<value_type_>> {
-    using type = value_type_;
+template <std::size_t index_, typename value_type_>
+struct std::tuple_element<index_, unum::ustore::utilities::expected<value_type_>> {
+    using type = typename unum::ustore::utilities::expected<value_type_>::template element<index_>;
 };
-
-template <typename value_type_>
-struct std::tuple_element<1, unum::ustore::expected<value_type_>> : std::type_identity<unum::ustore::status_t> {};
 
 template <>
 struct std::hash<unum::ustore::utilities::collection_key_t> : unum::ustore::utilities::collection_key_hash_t {};

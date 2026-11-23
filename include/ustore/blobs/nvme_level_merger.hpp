@@ -213,7 +213,7 @@ inline status_t compaction_status(st::status_t status) noexcept {
     case st::status_t::capacity_exhausted_k:
         return {status_code_t::capacity_exhausted_k, "A compaction ran out of room"};
     case st::status_t::input_output_k: return {status_code_t::io_k, "A compaction could not move its key slots"};
-    default: return {status_code_t::device_k, "A compaction failed on the device it ran on"};
+    default: return {status_code_t::device_k, "The compaction failed on the device"};
     }
 }
 
@@ -554,7 +554,7 @@ class lsm_level_merger {
                                                 io_channel_t& writing_channel, merge_request_t const& request,
                                                 fold_type_ const& fold, device_fold_type_ const& device_fold) noexcept {
         if (request.buffers.empty())
-            return status_t {status_code_t::invalid_argument_k, "A merge writes into the buffers its tree keeps"};
+            return status_t {status_code_t::invalid_argument_k, "A merge writes into the tree buffers"};
         st::vector<run_handle_t> sources;
         st::vector<compaction_keys_t> keys;
         st::vector<sorted_run_index_view<key_slot_t>> views;
@@ -658,7 +658,7 @@ class lsm_level_merger {
         merged_runs_t merged;
         if (merged.reserve(runs_count) != st::status_t::success_k) {
             abandon_runs_(volume, buffers);
-            return status_t {status_code_t::out_of_memory_k, "A merge could not track the runs it writes"};
+            return status_t {status_code_t::out_of_memory_k, "No room to track the written runs"};
         }
         for (merge_buffers_t& sliced : buffers)
             for (laid_out_run_t& laid : sliced.laid_out_runs) {
@@ -712,10 +712,10 @@ class lsm_level_merger {
         for (std::uint32_t source = first; source != last; ++source)
             versions += runs[sources[source].index].population_count();
         if (versions > limit<std::uint32_t>::max_k)
-            return {status_code_t::capacity_exhausted_k, "A merge of strings holds more versions than it counts"};
+            return {status_code_t::capacity_exhausted_k, "A string merge holds more versions than counted"};
         if (side.versions.reserve(static_cast<std::size_t>(versions)) != st::status_t::success_k ||
             side.keys.reserve(static_cast<std::size_t>(versions)) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A merge of strings could not list its versions"};
+            return {status_code_t::out_of_memory_k, "No room to list the string versions"};
         for (std::uint32_t source = first; source != last; ++source)
             for (std::uint64_t position = 0; position != runs[sources[source].index].population_count(); ++position) {
                 strings_version_t const version {source, static_cast<std::uint32_t>(position)};
@@ -748,7 +748,7 @@ class lsm_level_merger {
             older_positions.resize(rows_max) != st::status_t::success_k ||
             joined.versions.reserve(newer.versions.size() + older.versions.size()) != st::status_t::success_k ||
             joined.keys.reserve(rows_max) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A merge of strings could not hold its union"};
+            return {status_code_t::out_of_memory_k, "No room for the string union"};
         std::size_t const rows = union_sorted_keys(reader_of(newer), newer.keys.size(), reader_of(older),
                                                    older.keys.size(), std::span<std::size_t> {newer_positions},
                                                    std::span<std::size_t> {older_positions});
@@ -813,10 +813,10 @@ class lsm_level_merger {
                 views.resize(sources.size()) != st::status_t::success_k)
                 return {status_code_t::out_of_memory_k, "A merge could not track its source runs"};
             for (std::size_t index = 0; index != sources.size(); ++index) {
-                st::expected<st::immutable_splus_tree_view<st::key128_t>> const viewed =
-                    st::immutable_splus_tree_view<st::key128_t>::make(runs[sources[index].index].keys_bytes());
-                if (!viewed) return {status_code_t::internal_k, "A source run's heads read as no tree"};
-                heads[index] = *viewed;
+                auto const [viewed, status] = st::immutable_splus_tree_view<st::key128_t>::make(
+                    runs[sources[index].index].keys_bytes());
+                if (st::failed(status)) return {status_code_t::internal_k, "A source run's heads read as no tree"};
+                heads[index] = viewed;
                 views[index] = strings_run_view {&heads[index],
                                                  runs[sources[index].index].key_offsets(),
                                                  runs[sources[index].index].key_tape(),
@@ -871,7 +871,7 @@ class lsm_level_merger {
         // The versions that survive, as the compaction of fixed-width keys decides it for each
         // key in turn.
         if (survivors.reserve(merged_side.versions.size()) != st::status_t::success_k)
-            return status_t {status_code_t::out_of_memory_k, "A merge of strings could not list its survivors"};
+            return status_t {status_code_t::out_of_memory_k, "No room to list the string survivors"};
         located_key_slot<key_slot_t> previous;
         for (std::size_t key = 0; key != merged_side.keys.size(); ++key) {
             std::size_t const begin = merged_side.keys[key];
@@ -918,7 +918,7 @@ class lsm_level_merger {
         st::vector<std::uint64_t> planned;
         if (depths.resize(survivors.size()) != st::status_t::success_k ||
             planned.resize(survivors.size() + 1) != st::status_t::success_k)
-            return status_t {status_code_t::out_of_memory_k, "A merge of strings could not plan its runs"};
+            return status_t {status_code_t::out_of_memory_k, "No room to plan the string runs"};
         for (std::uint32_t& depth : depths) depth = 0;
         count_layers_(runs, sources, std::span<strings_version_t const> {survivors}, 0, survivors.size(), 0,
                       std::span<std::uint32_t> {depths});
@@ -953,7 +953,7 @@ class lsm_level_merger {
 
         merged_runs_t merged;
         if (merged.reserve(cuts.size()) != st::status_t::success_k)
-            return status_t {status_code_t::out_of_memory_k, "A merge could not track the runs it writes"};
+            return status_t {status_code_t::out_of_memory_k, "No room to track the written runs"};
         std::size_t first = 0;
         for (std::size_t index = 0; index != cuts.size(); ++index) {
             compacted_sorted_run_t const& cut = cuts[index];
@@ -1014,7 +1014,7 @@ class lsm_level_merger {
             kinds.resize(count) != st::status_t::success_k ||
             tail_offsets.resize(count + 1) != st::status_t::success_k ||
             tails.resize(static_cast<std::size_t>(tails_bytes)) != st::status_t::success_k)
-            return status_t {status_code_t::out_of_memory_k, "A merge of strings could not lay out a run"};
+            return status_t {status_code_t::out_of_memory_k, "No room to lay out a string run"};
         std::uint32_t written = 0;
         for (std::size_t index = 0; index != count; ++index) {
             sorted_run_t const& source = runs[sources[versions[index].source].index];
@@ -1138,9 +1138,9 @@ class lsm_level_merger {
             sorted_run_t const& run = runs[sources[index].index];
             key_slot_t const* cells = nullptr;
             if constexpr (sorted_run_t::keeps_cells_k) cells = run.cells().data();
-            st::expected<compaction_keys_t> const viewed = compaction_keys_t::make(run.keys_bytes());
-            if (!viewed) return {status_code_t::internal_k, "A source run's tree of keys reads as no tree"};
-            keys[index] = *viewed;
+            auto const [viewed, status] = compaction_keys_t::make(run.keys_bytes());
+            if (st::failed(status)) return {status_code_t::internal_k, "The source key tree reads as no tree"};
+            keys[index] = viewed;
             views[index] = sorted_run_index_view<key_slot_t> {
                 cells, run.population_count(), &run.stamps(), &run.kinds(),
                 {},    run.value_offsets(),    &keys[index],  &run.range_tombstones()};
@@ -1203,7 +1203,7 @@ class lsm_level_merger {
         if (!on_device) return {};
         st::vector<sorted_run_extents_t> extents;
         if (extents.resize(sources.size()) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A merge could not track where its runs sit"};
+            return {status_code_t::out_of_memory_k, "No room to track the run places"};
         for (std::size_t index = 0; index != sources.size(); ++index)
             extents[index] = extents_of_(runs[sources[index].index]);
         compacted = std::visit(
@@ -1354,7 +1354,7 @@ class lsm_level_merger {
         buffers.laid_out_runs.clear();
         compaction_output_t const& output = buffers.output;
         if (buffers.laid_out_runs.reserve(output.sorted_runs.size()) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A merge could not track the runs it writes"};
+            return {status_code_t::out_of_memory_k, "No room to track the written runs"};
         planned_run_t planned;
         for (compacted_sorted_run_t const& cut : output.sorted_runs) {
             planned.key_slots_count = cut.key_slots_count;
@@ -1412,7 +1412,7 @@ class lsm_level_merger {
             std::uint64_t const begin = output.value_offsets[planned.first_key_slot];
             if (laid.value_offsets.resize(static_cast<std::size_t>(planned.key_slots_count + 1)) !=
                 st::status_t::success_k)
-                return {status_code_t::out_of_memory_k, "A merge could not lay out a run's value offsets"};
+                return {status_code_t::out_of_memory_k, "No room for the run value offsets"};
             for (std::uint64_t index = 0; index != laid.value_offsets.size(); ++index)
                 laid.value_offsets[index] = static_cast<stored_value_offset_t>(
                     output.value_offsets[planned.first_key_slot + index] - begin);
@@ -1422,7 +1422,7 @@ class lsm_level_merger {
                                                  static_cast<std::size_t>(planned.key_slots_count)};
         if (status_t const saved = sorted_run_t::save_keys(cells, laid.keys); saved.failed()) return saved;
         if (buffers.laid_out_runs.push_back(std::move(laid)) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A merge could not track the runs it writes"};
+            return {status_code_t::out_of_memory_k, "No room to track the written runs"};
         return {};
     }
 
@@ -1464,7 +1464,7 @@ class lsm_level_merger {
     static status_t place_run_(volume_t& volume, laid_out_run_t& laid, std::span<range_t const> ranges,
                                std::span<std::uint64_t const> stamps, stored_key_t lower, stored_key_t upper) noexcept {
         uuid128_t const content_id = uuid_generator();
-        if (!content_id.is_valid()) return {status_code_t::internal_k, "A merge could not name the run it writes"};
+        if (!content_id.is_valid()) return {status_code_t::internal_k, "No room to name the written run"};
         auto [pieces, pieces_status] = clipped_range_tombstones_(ranges, stamps, lower, upper);
         if (pieces_status.failed()) return pieces_status;
         laid.tombstones = std::move(pieces);
@@ -1505,7 +1505,7 @@ class lsm_level_merger {
         std::uint64_t const block_bytes = round_down_to_multiple(writing_channel.streams().buffer_bytes(),
                                                                  portable_alignment_k);
         if (block_bytes < sorted_run_layout_t::header_bytes())
-            return {status_code_t::capacity_exhausted_k, "A channel's streaming block is shorter than a run's header"};
+            return {status_code_t::capacity_exhausted_k, "The streaming block is under a run header"};
 
         auto [writer_channel, writer_channel_status] = writing_channel.acquire();
         if (writer_channel_status.failed()) return writer_channel_status;
@@ -1588,7 +1588,7 @@ class lsm_level_merger {
         heap.clear();
         if (heap.resize(st::assume_uninitialized, static_cast<std::size_t>(window_bytes * sources_count)) !=
             st::status_t::success_k)
-            return status_t {status_code_t::out_of_memory_k, "A merge could not hold the windows it reads through"};
+            return status_t {status_code_t::out_of_memory_k, "No room for the read windows"};
         for (std::size_t run = 0; run != sources_count; ++run)
             windows[run].bytes = std::span<byte_t> {heap}.subspan(static_cast<std::size_t>(run * window_bytes),
                                                                   static_cast<std::size_t>(window_bytes));
@@ -1633,7 +1633,7 @@ class lsm_level_merger {
         // A piece is written as its read is queued, while every window starts empty
         if (pending.resize(st::assume_uninitialized, depth) != st::status_t::success_k ||
             windows.resize(sources.size()) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A merge could not track its reads in flight"};
+            return {status_code_t::out_of_memory_k, "No room to track reads in flight"};
 
         // Both the windows' blocks and the block being gathered outlive the drain of every read
         // landing in them
@@ -1696,7 +1696,7 @@ class lsm_level_merger {
             sorted_run_t const& source = runs[sources[run].index];
             extent_t const span = source.extent().slice(begin, end - begin);
             if (span.length != end - begin)
-                return {status_code_t::malformed_k, "A source run is shorter than the values it copies"};
+                return {status_code_t::malformed_k, "A source run ends inside its value window"};
             std::uint64_t const half_offset = index * half_bytes;
             bool const shared = window.place.memory_id != utilities::registered_memory_id_t::unregistered_k;
             std::uint64_t const step = shared ? span.length : read_block;
@@ -1786,7 +1786,7 @@ class lsm_level_merger {
                 std::uint64_t const length = round_up_to_multiple(skipped + bytes, portable_alignment_k);
                 extent_t const piece = source.extent().slice(aligned, length);
                 if (piece.length != length)
-                    return {status_code_t::malformed_k, "A source run is shorter than the values it copies"};
+                    return {status_code_t::malformed_k, "A source run ends inside copied values"};
                 pending[tag % depth] = pending_piece_t {
                     static_cast<std::uint32_t>(gathered + carried), static_cast<std::uint32_t>(skipped),
                     static_cast<std::uint32_t>(bytes), static_cast<std::uint32_t>(sources.size())};

@@ -9,9 +9,8 @@
 
 #include <cstddef> // `std::size_t`
 
-#include "ustore/status.hpp"                // `status_t`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`
-#include "ustore/utilities/types.hpp"       // `divide_round_up`
+#include "ustore/utilities/types.hpp"       // `status_t`, `divide_round_up`
 
 #include "engine.hpp" // `view_t`, `view_of`
 

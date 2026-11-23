@@ -43,12 +43,11 @@
 using namespace unum::ustore;
 using namespace unum::ustore::test;
 using namespace unum::ustore::docs;
-using namespace unum::ustore::utilities;
 
 namespace unum::ustore::test {
 
 /** The widest StringZilla kernels this build compiled. */
-using strings_kit_t = strings_ladder<sz_capabilities_compiled_cpu_mask()>::strings_kit_t;
+using strings_kit_t = util::strings_ladder<sz_capabilities_compiled_cpu_mask()>::strings_kit_t;
 
 /** The StringZilla capabilities this machine runs among those the build compiled, which the engines
  *  compile for, while @c strings_kit_t keeps to a tier the build's own flags guarantee. */
@@ -66,7 +65,7 @@ class scoped_arena_t {
     scoped_arena_t() noexcept = default;
     scoped_arena_t(scoped_arena_t const&) = delete;
     scoped_arena_t& operator=(scoped_arena_t const&) = delete;
-    ~scoped_arena_t() noexcept { arena_free(arena_); }
+    ~scoped_arena_t() noexcept { util::arena_free(arena_); }
 
     operator ustore_arena_t() const noexcept { return arena_; }
 };
@@ -86,7 +85,7 @@ struct documents_batch_t {
             offsets.push_back(bytes.size());
         }
         json_documents_t documents;
-        documents.tape = u64_tape(bytes.data(), offsets.data());
+        documents.tape = util::u64_tape(bytes.data(), offsets.data());
         documents.presences = presences.data();
         documents.count = texts.size();
         return documents;
@@ -387,7 +386,7 @@ conversion_t print_on_host(cell_text_t text, json_cell_t const& value, ustore_ar
         printed = json_status.failed() ? std::string_view {} : std::string_view {json.c_str(), json.size()};
         return conversion_t::exact_k;
     }
-    auto [buffer, buffer_status] = arena_allocate<char>(arena, printed_number_length_limit_k);
+    auto [buffer, buffer_status] = util::arena_allocate<char>(arena, printed_number_length_limit_k);
     printed_number_buffer_t number;
     std::string_view printed_text;
     conversion_t const conversion = json_to_string(value, number, printed_text);
@@ -404,7 +403,7 @@ conversion_t print_on_host(cell_text_t text, json_cell_t const& value, ustore_ar
  *  subdocuments pass as a device walk stores it, and compares every row they convert with @p cells,
  *  which the host extracted for @p fields, the host's @p status refusing the batch. */
 void compare_device_rows(json_documents_t const& documents, std::span<std::string_view const> fields,
-                         json_cells_t const& cells, status_t const& status, ustore_arena_t arena) {
+                         json_cells_t const& cells, util::status_t const& status, ustore_arena_t arena) {
     std::uint32_t const rows = static_cast<std::uint32_t>(documents.count);
     auto [compiled, compiled_status] = compile_field_paths(fields, arena);
     expect_true(compiled_status.succeeded());
@@ -412,11 +411,11 @@ void compare_device_rows(json_documents_t const& documents, std::span<std::strin
     std::size_t const paths_count = compiled.paths.size();
 
     // The page as a walk leaves it: the documents back to back, each document's nodes in its slots
-    auto [offsets, offsets_status] = arena_allocate<std::uint64_t>(arena, rows + 1);
-    auto [found, found_status] = arena_allocate<std::uint32_t>(arena, rows);
-    auto [matches, matches_status] = arena_allocate<sz_match_t>(arena, std::size_t {rows} * paths_count + 1);
-    auto [walked, walked_status] = arena_allocate<sz_string_view_t>(arena, rows);
-    auto [walked_rows, walked_rows_status] = arena_allocate<std::size_t>(arena, rows);
+    auto [offsets, offsets_status] = util::arena_allocate<std::uint64_t>(arena, rows + 1);
+    auto [found, found_status] = util::arena_allocate<std::uint32_t>(arena, rows);
+    auto [matches, matches_status] = util::arena_allocate<sz_match_t>(arena, std::size_t {rows} * paths_count + 1);
+    auto [walked, walked_status] = util::arena_allocate<sz_string_view_t>(arena, rows);
+    auto [walked_rows, walked_rows_status] = util::arena_allocate<std::size_t>(arena, rows);
     if (!expect_true(offsets_status.succeeded() && found_status.succeeded() && matches_status.succeeded() &&
                      walked_status.succeeded() && walked_rows_status.succeeded()))
         return;
@@ -426,10 +425,10 @@ void compare_device_rows(json_documents_t const& documents, std::span<std::strin
         found[row] = 0;
         offsets[row + 1] = offsets[row] + documents[row].size();
         if (documents[row].empty()) continue;
-        walked[walked_count] = stringzilla_view(documents[row]);
+        walked[walked_count] = util::stringzilla_view(documents[row]);
         walked_rows[walked_count++] = row;
     }
-    auto [bytes, bytes_status] = arena_allocate<char>(arena, static_cast<std::size_t>(offsets[rows]));
+    auto [bytes, bytes_status] = util::arena_allocate<char>(arena, static_cast<std::size_t>(offsets[rows]));
     if (!expect_true(bytes_status.succeeded())) return;
     for (std::uint32_t row = 0; row != rows; ++row)
         if (!documents[row].empty())
@@ -439,11 +438,12 @@ void compare_device_rows(json_documents_t const& documents, std::span<std::strin
     if (paths_count && walked_count) {
         sz_strings_view_t paths_view {};
         sz_strings_from_string_views(compiled.paths.data(), paths_count, &paths_view);
-        sz_allocator_t allocator = stringzilla_allocator(arena);
+        sz_allocator_t allocator = util::stringzilla_allocator(arena);
         subdocuments_engine_t engine;
         expect_true(engine.compile(paths_view, allocator, strings_capabilities()) == sz_success_k);
-        auto [walk_matches, walk_matches_status] = arena_allocate<sz_match_t>(arena, walked_count * paths_count + 1);
-        auto [walk_offsets, walk_offsets_status] = arena_allocate<sz_size_t>(arena, walked_count + 1);
+        auto [walk_matches, walk_matches_status] = util::arena_allocate<sz_match_t>(arena,
+                                                                                    walked_count * paths_count + 1);
+        auto [walk_offsets, walk_offsets_status] = util::arena_allocate<sz_size_t>(arena, walked_count + 1);
         if (!expect_true(walk_matches_status.succeeded() && walk_offsets_status.succeeded())) return;
         sz_strings_view_t walked_view {};
         sz_strings_from_string_views(walked.data(), walked_count, &walked_view);
@@ -469,12 +469,12 @@ void compare_device_rows(json_documents_t const& documents, std::span<std::strin
     };
 
     std::size_t const stride = (rows + 7) / 8;
-    auto [bitmaps, bitmaps_status] = arena_allocate<ustore_octet_t>(arena, 3 * stride);
-    auto [presences, presences_status] = arena_allocate<ustore_octet_t>(arena, stride);
-    auto [lengths, lengths_status] = arena_allocate<ustore_length_t>(arena, rows);
-    auto [scalars, scalars_status] = arena_allocate<ustore_byte_t>(arena, std::size_t {rows} * uuid_bytes_k);
-    auto [measured, measured_status] = arena_allocate<tape_source_t>(arena, rows);
-    auto [text_offsets, text_offsets_status] = arena_allocate<std::uint64_t>(arena, rows + 1);
+    auto [bitmaps, bitmaps_status] = util::arena_allocate<ustore_octet_t>(arena, 3 * stride);
+    auto [presences, presences_status] = util::arena_allocate<ustore_octet_t>(arena, stride);
+    auto [lengths, lengths_status] = util::arena_allocate<ustore_length_t>(arena, rows);
+    auto [scalars, scalars_status] = util::arena_allocate<ustore_byte_t>(arena, std::size_t {rows} * uuid_bytes_k);
+    auto [measured, measured_status] = util::arena_allocate<util::tape_source_t>(arena, rows);
+    auto [text_offsets, text_offsets_status] = util::arena_allocate<std::uint64_t>(arena, rows + 1);
     if (!expect_true(bitmaps_status.succeeded() && presences_status.succeeded() && lengths_status.succeeded() &&
                      scalars_status.succeeded() && measured_status.succeeded() && text_offsets_status.succeeded()))
         return;
@@ -529,7 +529,7 @@ void compare_device_rows(json_documents_t const& documents, std::span<std::strin
                 text_offsets[0] = 0;
                 for (std::size_t row = 0; row != rows; ++row)
                     text_offsets[row + 1] = text_offsets[row] + measured[row].length;
-                auto [text_bytes, text_bytes_status] = arena_allocate<char>(
+                auto [text_bytes, text_bytes_status] = util::arena_allocate<char>(
                     arena, static_cast<std::size_t>(text_offsets[rows]));
                 expect_true(text_bytes_status.succeeded());
                 texts.offsets = text_offsets.data();
@@ -564,12 +564,12 @@ void compare_device_rows(json_documents_t const& documents, std::span<std::strin
     }
     // A batch the host refuses must never convert on a device
     if (status.failed() && !walk_refused && !any_refused)
-        expect_true(false, "device converted a batch the host refused: {}", status.message);
+        expect_true(false, "device converted a batch the host refused: {}", status.note);
 }
 
 /** Extracts every field of @p fields over @p batch and compares it with yyjson's lookup, answering the status of the
  *  extraction in @p status, which a batch of lenient documents may leave malformed. */
-void compare_batch(documents_batch_t& batch, std::span<std::string_view const> fields, status_t& status) {
+void compare_batch(documents_batch_t& batch, std::span<std::string_view const> fields, util::status_t& status) {
     scoped_arena_t arena;
     json_documents_t const documents = batch.view();
     std::size_t const cells_count = documents.count * fields.size();
@@ -625,7 +625,7 @@ void test_json_paths_translation() {
         {"/a~", ""},
     };
     for (translation_t const& translation : translations) {
-        st::vector<char, arena_allocator<char>> path {{ustore_arena_t {arena}}};
+        st::vector<char, util::arena_allocator<char>> path {{ustore_arena_t {arena}}};
         auto [valid, status] = json_path_of(translation.field, path);
         expect_true(status.succeeded());
         expect_equal(valid, !translation.path.empty());
@@ -647,7 +647,7 @@ void test_json_paths_comments() {
         R"({"x": {"y": "s3://z", "z": ["//", "/*"]}, "a": 2})",
     };
     strict.present.assign(strict.texts.size(), true);
-    status_t status;
+    util::status_t status;
     compare_batch(strict, fields, status);
     expect_true(status.succeeded());
 
@@ -663,12 +663,12 @@ void test_json_paths_comments() {
              "// c\n{\"a\": 3}",
          }) {
         // Writes parse strictly, so no such document reaches a read
-        expect_true(json_parse(text, arena).status() == status_code_t::malformed_k);
+        expect_true(json_parse(text, arena).status() == util::status_code_t::malformed_k);
         documents_batch_t batch;
         batch.texts = {R"({"a": 4})", std::string(text)};
         batch.present = {true, true};
         compare_batch(batch, fields, status);
-        expect_true(status == status_code_t::malformed_k);
+        expect_true(status == util::status_code_t::malformed_k);
     }
 }
 
@@ -682,7 +682,7 @@ void test_json_paths_duplicates() {
     };
     batch.present.assign(batch.texts.size(), true);
     std::string_view const fields[] = {"a", "/a", "/a/b", "/a/0", "/a/x", "/0/a", "/1/a", ""};
-    status_t status;
+    util::status_t status;
     compare_batch(batch, fields, status);
     expect_true(status.succeeded());
 }
@@ -693,7 +693,7 @@ void test_json_paths_missing() {
     batch.texts = {R"({"a": 1})", "", R"({"a": 2})", R"({"a": 3})"};
     batch.present = {true, true, false, true};
     std::string_view const fields[] = {"", "a", "/a"};
-    status_t status;
+    util::status_t status;
     compare_batch(batch, fields, status);
     expect_true(status.succeeded());
 }
@@ -714,9 +714,9 @@ void test_json_paths_refusals() {
         documents_batch_t batch;
         batch.texts = {std::string(text)};
         batch.present = {true};
-        status_t status;
+        util::status_t status;
         compare_batch(batch, fields, status);
-        expect_true(status == status_code_t::malformed_k);
+        expect_true(status == util::status_code_t::malformed_k);
     }
 
     // A selected container is not validated inside, which only documents no write would take could tell
@@ -751,7 +751,7 @@ void test_json_paths_printing() {
     };
     batch.present.assign(batch.texts.size(), true);
     std::string_view const fields[] = {"a"};
-    status_t status;
+    util::status_t status;
     compare_batch(batch, fields, status);
     expect_true(status.succeeded());
 }
@@ -772,7 +772,7 @@ void test_json_paths_random() {
             batch.texts.push_back(std::move(text));
             batch.present.push_back(random.below(10) != 0);
         }
-        status_t status;
+        util::status_t status;
         compare_batch(batch, fields_k, status);
         expect_true(status.succeeded());
     }

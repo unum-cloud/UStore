@@ -11,8 +11,8 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint8_t`
 
-#include "ustore/status.hpp" // `status_t`
-#include "ustore/types.h"    // `ustore_progress_callback_t`, `ustore_size_t`, `ustore_phase_progress_t`
+#include "ustore/types.h"             // `ustore_progress_callback_t`, `ustore_size_t`, `ustore_phase_progress_t`
+#include "ustore/utilities/types.hpp" // `status_t`
 
 #include "engine.hpp" // `floor_atomic_ref`, `phase_t`, `plan_verbs`, `view_t`, `view_of`
 

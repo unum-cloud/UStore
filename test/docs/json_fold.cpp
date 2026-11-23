@@ -43,23 +43,29 @@
 #include <sys/mman.h> // `mmap`, `munmap`
 #endif
 
-using namespace unum::ustore;
 using namespace unum::ustore::test;
 using namespace unum::ustore::docs;
+using us::arena_t;
+using us::database_t;
+using us::strided_strings;
 
 namespace unum::ustore::test {
+
+using util::expected;
+using util::status_code_t;
+using util::status_t;
 
 #pragma region Reference
 
 /** Creates a collection named @p name holding documents in @p database. */
-expected<ustore_collection_id_t> create_docs_collection(ustore_database_t database, std::string const& name) {
+util::expected<ustore_collection_id_t> create_docs_collection(ustore_database_t database, std::string const& name) {
     ustore_collection_id_t created {};
     ustore_outcome_t outcome {};
     ustore_collection_create_t create {};
-    create.database = database, create.outcome = &outcome, create.name = bytes_of(std::string_view(name));
+    create.database = database, create.outcome = &outcome, create.name = util::bytes_of(std::string_view(name));
     create.modality = ustore_modality_docs_k, create.collection = &created;
     ustore_collection_create(&create);
-    if (status_t const status {outcome}; status.failed()) return status;
+    if (util::status_t const status = status_of(outcome); status.failed()) return status;
     return created;
 }
 
@@ -68,24 +74,24 @@ expected<ustore_collection_id_t> create_docs_collection(ustore_database_t databa
 class reference_t {
     ustore_database_t database_ = nullptr;
     ustore_collection_id_t collection_ {};
-    ustore_key_t key_ = key_from_integer(7);
+    ustore_key_t key_ = util::key_from_integer(7);
 
   public:
     ustore_transaction_t transaction = nullptr;
 
     reference_t(ustore_database_t database, ustore_collection_id_t collection,
-                ustore_key_t key = key_from_integer(7)) noexcept
+                ustore_key_t key = util::key_from_integer(7)) noexcept
         : database_(database), collection_(collection), key_(key) {}
 
     /** Stores the JSON document @p bytes as written, or removes the document without them. */
-    status_t reset(std::optional<std::string> const& bytes) noexcept {
+    util::status_t reset(std::optional<std::string> const& bytes) noexcept {
         if (!bytes) return remove();
         return modify(ustore_docs_modify_upsert_k, {}, *bytes, ustore_docs_field_type_json_k);
     }
 
     /** Writes @p value of @p type into @p field with @p modification, the call a delta stands for. */
-    status_t modify(ustore_docs_modification_t modification, std::string_view field, std::string_view value,
-                    ustore_docs_field_type_t type) noexcept {
+    util::status_t modify(ustore_docs_modification_t modification, std::string_view field, std::string_view value,
+                          ustore_docs_field_type_t type) noexcept {
         ustore_outcome_t outcome {};
         strided_strings<std::string_view> const fields {{&field, 0}};
         strided_strings<std::string_view> const values {{&value, 0}};
@@ -97,17 +103,17 @@ class reference_t {
         write.type = type;
         write.modification = modification;
         ustore_docs_write(&write);
-        return status_t {outcome};
+        return status_of(outcome);
     }
 
     /** Removes the document whole through `ustore_docs_remove`. */
-    status_t remove() noexcept {
+    util::status_t remove() noexcept {
         ustore_outcome_t outcome {};
         ustore_docs_remove_t remove {};
         remove.database = database_, remove.outcome = &outcome, remove.transaction = transaction;
         remove.count = 1, remove.collections = {&collection_, 0}, remove.keys = {&key_, 0};
         ustore_docs_remove(&remove);
-        return status_t {outcome};
+        return status_of(outcome);
     }
 
     /** The stored bytes, read whole as JSON, which pass through as stored, or nothing for a missing document. */
@@ -121,10 +127,10 @@ class reference_t {
         read.database = database_, read.outcome = &outcome;
         read.view = transaction ? ustore_transaction_view(transaction, ustore_watch_none_k) : nullptr;
         read.count = 1, read.collections = {&collection_, 0}, read.keys = {&key_, 0};
-        read.presences = &presences, read.values = &values, read.arena = arena;
+        read.presences = &presences, read.values = &values, read.arena = arena.handle();
         ustore_docs_read(&read);
-        if (status_t {outcome}.failed() || !presences || !(presences[0] & 1)) return std::nullopt;
-        return std::string(chars_of(tape_string(values, 0)));
+        if (status_of(outcome).failed() || !presences || !(presences[0] & 1)) return std::nullopt;
+        return std::string(ustore::strings_view_t {values, 1}[0]);
     }
 };
 
@@ -332,60 +338,61 @@ operation_t random_operation(split_mix_generator_t& random, value_writer_t& writ
 
 /** One delta a collection holds: its kind and the bytes it carries. */
 struct pending_t {
-    delta_kind_t kind = delta_kind_t::change_k;
+    util::delta_kind_t kind = util::delta_kind_t::change_k;
     std::string bytes;
 };
 
 /** The views a fold reads over @p pending. */
-std::vector<delta_view_t> views_of(std::vector<pending_t> const& pending) {
-    std::vector<delta_view_t> views;
+std::vector<util::delta_view_t> views_of(std::vector<pending_t> const& pending) {
+    std::vector<util::delta_view_t> views;
     for (pending_t const& delta : pending)
-        views.push_back({delta.kind, {reinterpret_cast<byte_t const*>(delta.bytes.data()), delta.bytes.size()}});
+        views.push_back({delta.kind, {reinterpret_cast<util::byte_t const*>(delta.bytes.data()), delta.bytes.size()}});
     return views;
 }
 
 /** The bytes of @p base as a fold reads them, null for a missing document. */
-std::span<byte_t const> base_of(std::optional<std::string> const& base) noexcept {
+std::span<util::byte_t const> base_of(std::optional<std::string> const& base) noexcept {
     if (!base) return {};
-    return {reinterpret_cast<byte_t const*>(base->data()), base->size()};
+    return {reinterpret_cast<util::byte_t const*>(base->data()), base->size()};
 }
 
 /** Encodes @p deltas into one change delta, failing a check when it cannot. */
 pending_t change_of(std::span<json_delta_t const> deltas, ustore_arena_t arena) {
     auto [chain, status] = encode_deltas(deltas, arena);
-    expect_true(status.succeeded());
-    return {delta_kind_t::change_k, std::string(chars_of(chain))};
+    expect_true(!status.failed());
+    return {util::delta_kind_t::change_k, std::string(util::chars_of(chain))};
 }
 
 /** The store delta @p delta becomes, as the glue logs it: writes and removals as deltas of their own. */
 pending_t pending_of(json_delta_t const& delta, ustore_arena_t arena) {
-    if (delta.modification == delta_modification_t::write_k) return {delta_kind_t::write_k, std::string(delta.value)};
-    if (delta.modification == delta_modification_t::remove_k) return {delta_kind_t::remove_k, {}};
+    if (delta.modification == delta_modification_t::write_k)
+        return {util::delta_kind_t::write_k, std::string(delta.value)};
+    if (delta.modification == delta_modification_t::remove_k) return {util::delta_kind_t::remove_k, {}};
     return change_of(std::span<json_delta_t const>(&delta, 1), arena);
 }
 
 /** The records the encoded @p chain holds, failing a check on a malformed chain. */
-std::size_t count_records(std::span<byte_t const> chain) {
+std::size_t count_records(std::span<util::byte_t const> chain) {
     std::size_t count = 0;
-    status_t const status = for_each_delta(chain, [&](json_delta_t const&) noexcept {
+    util::status_t const status = for_each_delta(chain, [&](json_delta_t const&) noexcept {
         ++count;
-        return status_t {};
+        return util::status_t {};
     });
-    expect_true(status.succeeded());
+    expect_true(!status.failed());
     return count;
 }
 
 /** What applying a fold answered: a status code, and the bytes on success. */
 struct outcome_t {
-    status_code_t code = status_code_t::success_k;
+    util::status_code_t code = util::status_code_t::success_k;
     std::string bytes;
 
     bool operator==(outcome_t const&) const = default;
 };
 
-outcome_t outcome_of(expected<std::span<byte_t const>> const& result) {
+outcome_t outcome_of(util::expected<std::span<util::byte_t const>> const& result) {
     if (!result) return {result.status().code, {}};
-    return {status_code_t::success_k, std::string(chars_of(*result))};
+    return {util::status_code_t::success_k, std::string(util::chars_of(*result))};
 }
 
 /** Holds when @p actual matches @p wanted ; otherwise fails a check, printing both and
@@ -398,28 +405,28 @@ bool expect_outcome(outcome_t const& actual, outcome_t const& wanted, std::strin
 #if USTORE_OS_WINDOWS_
 
 /** Reserves @p size bytes of address space that fault when touched, or none when it runs out. */
-std::span<byte_t> reserve_unreadable_bytes(std::size_t size) noexcept {
+std::span<util::byte_t> reserve_unreadable_bytes(std::size_t size) noexcept {
     void* const reserved = ::VirtualAlloc(nullptr, size, MEM_RESERVE, PAGE_NOACCESS);
     if (!reserved) return {};
-    return {static_cast<byte_t*>(reserved), size};
+    return {static_cast<util::byte_t*>(reserved), size};
 }
 
 /** Releases what @c reserve_unreadable_bytes reserved. */
-void release_unreadable_bytes(std::span<byte_t> reserved) noexcept {
+void release_unreadable_bytes(std::span<util::byte_t> reserved) noexcept {
     [[maybe_unused]] BOOL const released = ::VirtualFree(reserved.data(), 0, MEM_RELEASE);
 }
 
 #else
 
 /** Reserves @p size bytes of address space that fault when touched, or none when it runs out. */
-std::span<byte_t> reserve_unreadable_bytes(std::size_t size) noexcept {
+std::span<util::byte_t> reserve_unreadable_bytes(std::size_t size) noexcept {
     void* const reserved = ::mmap(nullptr, size, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
     if (reserved == MAP_FAILED) return {};
-    return {static_cast<byte_t*>(reserved), size};
+    return {static_cast<util::byte_t*>(reserved), size};
 }
 
 /** Releases what @c reserve_unreadable_bytes reserved. */
-void release_unreadable_bytes(std::span<byte_t> reserved) noexcept {
+void release_unreadable_bytes(std::span<util::byte_t> reserved) noexcept {
     [[maybe_unused]] int const unmapped = ::munmap(reserved.data(), reserved.size());
 }
 
@@ -433,39 +440,40 @@ void release_unreadable_bytes(std::span<byte_t> reserved) noexcept {
  *  past 4 GiB, and close as documented. */
 void test_json_fold_codec() {
     auto [arena, arena_status] = arena_t::make();
-    expect_true(arena_status.succeeded());
+    expect_true(!arena_status.failed());
     json_delta_t const deltas[] = {
         {1, delta_modification_t::merge_k, "/a/b", "{\"x\":null}"},
         {2, delta_modification_t::upsert_k, "", "[1]"},
         {3, delta_modification_t::patch_k, "a", "[]"},
         {~std::uint64_t(0), delta_modification_t::remove_k, "", ""},
     };
-    auto [chain, status] = encode_deltas(deltas, arena);
-    expect_true(status.succeeded());
+    auto [chain, status] = encode_deltas(deltas, arena.handle());
+    expect_true(!status.failed());
     std::size_t index = 0;
-    expect_true(for_each_delta(chain, [&](json_delta_t const& delta) noexcept -> status_t {
-                    json_delta_t const& wanted = deltas[index++];
-                    bool const same = delta.stamp == wanted.stamp && delta.modification == wanted.modification &&
-                                      delta.field == wanted.field && delta.value == wanted.value;
-                    return same ? status_t {} : status_t {status_code_t::internal_k, "differs"};
-                }).succeeded());
+    expect_true(!for_each_delta(chain, [&](json_delta_t const& delta) noexcept -> status_t {
+                     json_delta_t const& wanted = deltas[index++];
+                     bool const same = delta.stamp == wanted.stamp && delta.modification == wanted.modification &&
+                                       delta.field == wanted.field && delta.value == wanted.value;
+                     return same ? util::status_t {} : util::status_t {util::status_code_t::internal_k, "differs"};
+                 }).failed());
     expect_equal(index, std::size_t(4));
     for (std::size_t prefix_length = 1; prefix_length != chain.size(); ++prefix_length) {
         std::size_t boundaries = 0, offset = 0;
         for (json_delta_t const& delta : deltas) boundaries += (offset += encoded_size(delta)) == prefix_length;
-        status_t const truncated = for_each_delta(chain.first(prefix_length),
-                                                  [](json_delta_t const&) noexcept { return status_t {}; });
-        expect_true(truncated.succeeded() == (boundaries == 1));
+        util::status_t const truncated = for_each_delta(chain.first(prefix_length),
+                                                        [](json_delta_t const&) noexcept { return util::status_t {}; });
+        expect_true(!truncated.failed() == (boundaries == 1));
     }
-    std::string unknown(chars_of(chain.first(encoded_size(deltas[0]))));
+    std::string unknown(util::chars_of(chain.first(encoded_size(deltas[0]))));
     unknown[sizeof(std::uint64_t)] = 9;
-    expect_status(for_each_delta(bytes_of_text(unknown), [](json_delta_t const&) noexcept { return status_t {}; }),
-                  status_code_t::malformed_k);
+    expect_status(
+        for_each_delta(bytes_of_text(unknown), [](json_delta_t const&) noexcept { return util::status_t {}; }),
+        util::status_code_t::malformed_k);
 
     json_fold_t const fold;
     auto const closes_chain = [&](json_delta_t const& delta) {
-        auto [encoded, encoded_status] = encode_deltas(std::span<json_delta_t const>(&delta, 1), arena);
-        return encoded_status.succeeded() && fold.closes({delta_kind_t::change_k, encoded});
+        auto [encoded, encoded_status] = encode_deltas(std::span<json_delta_t const>(&delta, 1), arena.handle());
+        return !encoded_status.failed() && fold.closes({util::delta_kind_t::change_k, encoded});
     };
     expect_true(closes_chain({0, delta_modification_t::upsert_k, "", "1"}));
     expect_true(closes_chain({0, delta_modification_t::write_k, "", "1"}));
@@ -473,14 +481,14 @@ void test_json_fold_codec() {
     expect_true(!closes_chain({0, delta_modification_t::upsert_k, "a", "1"}));
     expect_true(!closes_chain({0, delta_modification_t::insert_k, "", "1"}));
     expect_true(!closes_chain({0, delta_modification_t::merge_k, "", "1"}));
-    expect_true(fold.closes({delta_kind_t::write_k, {}}) && fold.closes({delta_kind_t::remove_k, {}}));
-    expect_true(!fold.closes({delta_kind_t::change_k, bytes_of_text(unknown)}));
+    expect_true(fold.closes({util::delta_kind_t::write_k, {}}) && fold.closes({util::delta_kind_t::remove_k, {}}));
+    expect_true(!fold.closes({util::delta_kind_t::change_k, bytes_of_text(unknown)}));
 
-    std::span<byte_t> const unreadable = reserve_unreadable_bytes((std::size_t(1) << 32) + 1);
+    std::span<util::byte_t> const unreadable = reserve_unreadable_bytes((std::size_t(1) << 32) + 1);
     expect_true(!unreadable.empty());
-    json_delta_t const oversized {0, delta_modification_t::upsert_k, "a", chars_of(unreadable)};
-    expect_status(encode_deltas(std::span<json_delta_t const>(&oversized, 1), arena),
-                  status_code_t::capacity_exhausted_k);
+    json_delta_t const oversized {0, delta_modification_t::upsert_k, "a", util::chars_of(unreadable)};
+    expect_status(encode_deltas(std::span<json_delta_t const>(&oversized, 1), arena.handle()),
+                  util::status_code_t::capacity_exhausted_k);
     release_unreadable_bytes(unreadable);
 }
 
@@ -494,18 +502,19 @@ struct composed_t {
 composed_t compose_and_apply(std::optional<std::string> const& base, std::span<json_delta_t const> deltas) {
     composed_t result;
     auto [arena, arena_status] = arena_t::make();
-    expect_true(arena_status.succeeded());
-    arena_allocator<byte_t> allocator {arena};
+    expect_true(!arena_status.failed());
+    util::arena_allocator<util::byte_t> allocator {arena.handle()};
     json_fold_t const fold;
     std::vector<pending_t> pending;
-    for (json_delta_t const& delta : deltas) pending.push_back(pending_of(delta, arena));
-    std::vector<delta_view_t> const views = views_of(pending);
+    for (json_delta_t const& delta : deltas) pending.push_back(pending_of(delta, arena.handle()));
+    std::vector<util::delta_view_t> const views = views_of(pending);
     result.sequential = outcome_of(fold.apply(base_of(base), views, allocator));
     auto [chain, status] = fold.compose(views, allocator);
-    expect_true(status.succeeded());
+    expect_true(!status.failed());
     result.records = count_records(chain);
-    delta_view_t const composed {delta_kind_t::change_k, chain};
-    result.applied = outcome_of(fold.apply(base_of(base), std::span<delta_view_t const>(&composed, 1), allocator));
+    util::delta_view_t const composed {util::delta_kind_t::change_k, chain};
+    result.applied = outcome_of(
+        fold.apply(base_of(base), std::span<util::delta_view_t const>(&composed, 1), allocator));
     return result;
 }
 
@@ -523,66 +532,66 @@ void test_json_fold_shapes() {
         {"merges compose",
          {{1, merge_k, "", R"({"a":{"b":null},"z":1})"}, {2, merge_k, "", R"({"a":{"e":2},"b":null})"}},
          1,
-         {status_code_t::success_k, R"({"c":{"d":3},"z":1,"a":{"c":[1,2],"e":2}})"}},
+         {util::status_code_t::success_k, R"({"c":{"d":3},"z":1,"a":{"c":[1,2],"e":2}})"}},
         {"a removed member takes no object",
          {{1, merge_k, "", R"({"c":null})"}, {2, merge_k, "", R"({"c":{"e":1}})"}},
          2,
-         {status_code_t::success_k, R"({"a":{"b":1,"c":[1,2]},"b":2,"c":{"e":1}})"}},
+         {util::status_code_t::success_k, R"({"a":{"b":1,"c":[1,2]},"b":2,"c":{"e":1}})"}},
         {"a scalar member takes no object",
          {{1, merge_k, "", R"({"c":5})"}, {2, merge_k, "", R"({"c":{"e":1}})"}},
          2,
-         {status_code_t::success_k, R"({"a":{"b":1,"c":[1,2]},"b":2,"c":{"e":1}})"}},
+         {util::status_code_t::success_k, R"({"a":{"b":1,"c":[1,2]},"b":2,"c":{"e":1}})"}},
         {"a repeated key keeps both",
          {{1, merge_k, "", R"({"b":1})"}, {2, merge_k, "", R"({"b":3,"b":4})"}},
          2,
-         {status_code_t::success_k, R"({"a":{"b":1,"c":[1,2]},"c":{"d":3},"b":3,"b":4})"}},
+         {util::status_code_t::success_k, R"({"a":{"b":1,"c":[1,2]},"c":{"d":3},"b":3,"b":4})"}},
         {"upserts of a field past a disjoint one",
          {{1, upsert_k, "/a/b", "5"}, {2, upsert_k, "/c/x", "6"}, {3, upsert_k, "/a/b", "7"}},
          2,
-         {status_code_t::success_k, R"({"a":{"b":7,"c":[1,2]},"b":2,"c":{"d":3,"x":6}})"}},
+         {util::status_code_t::success_k, R"({"a":{"b":7,"c":[1,2]},"b":2,"c":{"d":3,"x":6}})"}},
         {"a merge into an upsert",
          {{1, upsert_k, "z", R"({"p":1,"q":2})"}, {2, merge_k, "/z", R"({"p":null,"r":3})"}},
          1,
-         {status_code_t::success_k, R"({"a":{"b":1,"c":[1,2]},"b":2,"c":{"d":3},"z":{"q":2,"r":3}})"}},
+         {util::status_code_t::success_k, R"({"a":{"b":1,"c":[1,2]},"b":2,"c":{"d":3},"z":{"q":2,"r":3}})"}},
         {"array siblings stay apart",
          {{1, upsert_k, "/a/c/1", "9"}, {2, insert_k, "/a/c/0", "8"}, {3, upsert_k, "/a/c/1", "7"}},
          3,
-         {status_code_t::success_k, R"({"a":{"b":1,"c":[8,7,9]},"b":2,"c":{"d":3}})"}},
+         {util::status_code_t::success_k, R"({"a":{"b":1,"c":[8,7,9]},"b":2,"c":{"d":3}})"}},
         {"a nested field stays apart",
          {{1, upsert_k, "/a/b", "5"}, {2, upsert_k, "/a", "{}"}, {3, upsert_k, "/a/b", "7"}},
          3,
-         {status_code_t::success_k, R"({"a":{"b":7},"b":2,"c":{"d":3}})"}},
+         {util::status_code_t::success_k, R"({"a":{"b":7},"b":2,"c":{"d":3}})"}},
         {"adjacent patches concatenate",
          {{1, patch_k, "/a", R"([{"op":"add","path":"/e","value":1}])"},
           {2, patch_k, "a", R"([{"op":"test","path":"/e","value":1},{"op":"remove","path":"/b"}])"}},
          1,
-         {status_code_t::success_k, R"({"a":{"c":[1,2],"e":1},"b":2,"c":{"d":3}})"}},
+         {util::status_code_t::success_k, R"({"a":{"c":[1,2],"e":1},"b":2,"c":{"d":3}})"}},
         {"patches of two fields stay apart",
          {{1, patch_k, "/a", R"([{"op":"add","path":"/e","value":1}])"},
           {2, patch_k, "/c", R"([{"op":"add","path":"/e","value":2}])"}},
          2,
-         {status_code_t::success_k, R"({"a":{"b":1,"c":[1,2],"e":1},"b":2,"c":{"d":3,"e":2}})"}},
+         {util::status_code_t::success_k, R"({"a":{"b":1,"c":[1,2],"e":1},"b":2,"c":{"d":3,"e":2}})"}},
         {"a failing patch fails the composed chain",
          {{1, patch_k, "", R"([{"op":"remove","path":"/b"}])"},
           {2, patch_k, "", R"([{"op":"test","path":"/b","value":2}])"}},
          1,
-         {status_code_t::invalid_argument_k, {}}},
+         {util::status_code_t::invalid_argument_k, {}}},
         {"a whole upsert folds what follows",
          {{1, merge_k, "", R"({"q":1})"}, {2, upsert_k, "", R"({"k":1})"}, {3, upsert_k, "/l", "2"}},
          1,
-         {status_code_t::success_k, R"({"k":1,"l":2})"}},
+         {util::status_code_t::success_k, R"({"k":1,"l":2})"}},
         {"a failure after a closing delta keeps the rest",
          {{1, remove_k, "", ""}, {2, upsert_k, "/l", "2"}},
          2,
-         {status_code_t::not_found_k, {}}},
+         {util::status_code_t::not_found_k, {}}},
         {"a removal then an insertion",
          {{1, remove_k, "", ""}, {2, insert_k, "", "[1]"}},
          1,
-         {status_code_t::success_k, "[1]"}},
+         {util::status_code_t::success_k, "[1]"}},
         {"a malformed value stays",
          {{1, upsert_k, "/a/b", "{"}, {2, upsert_k, "/a/b", "1"}},
          2,
-         {status_code_t::malformed_k, {}}},
+         {util::status_code_t::malformed_k, {}}},
     };
     for (shape_t const& shape : shapes) {
         composed_t const result = compose_and_apply(base, shape.deltas);
@@ -599,32 +608,32 @@ void test_json_fold_reference(config_t const& config) {
     value_writer_t writer {random};
     json_fold_t const fold;
     std::size_t checked = 0, refused = 0, compositions = 0, records_before = 0, records_after = 0;
-    std::map<status_code_t, std::size_t> refusals;
+    std::map<util::status_code_t, std::size_t> refusals;
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return;
+    if (!expect_true(!open_status.failed())) return;
 
     for (std::size_t stream = 0; stream != streams_k; ++stream) {
-        auto [collection, create_status] = create_docs_collection(database, fmt::format("stream-{}", stream));
-        if (!expect_true(create_status.succeeded())) return;
-        reference_t reference {database, collection};
+        auto [collection, create_status] = create_docs_collection(database.handle(), fmt::format("stream-{}", stream));
+        if (!expect_true(!create_status.failed())) return;
+        reference_t reference {database.handle(), collection};
 
         std::optional<std::string> base;
         // Only the docs verbs reach a docs collection, so the engine's bases are documents or none, while empty and
         // malformed bases stay with the composition rounds below
         if (random.below(6) > 2) base = writer.document();
-        if (!expect_true(reference.reset(base).succeeded())) return;
+        if (!expect_true(!reference.reset(base).failed())) return;
         std::vector<pending_t> pending;
         std::vector<json_delta_t> history;
         std::vector<std::string> texts;
 
         for (std::size_t step = 0; step != steps_k; ++step) {
             auto [arena, arena_status] = arena_t::make();
-            if (!expect_true(arena_status.succeeded())) return;
-            arena_allocator<byte_t> allocator {arena};
+            if (!expect_true(!arena_status.failed())) return;
+            util::arena_allocator<util::byte_t> allocator {arena.handle()};
 
             // A closing upsert ignores the base the engine still parses, so none lands on a malformed document
             std::optional<std::string> const current = reference.read();
-            bool const parses = !current || json_parse(std::string_view(*current), arena).status().succeeded();
+            bool const parses = !current || !json_parse(std::string_view(*current), arena.handle()).status().failed();
             operation_t operation = random_operation(random, writer,
                                                      parses ? typed_upserts_t::allowed_k : typed_upserts_t::refused_k);
             // A whole JSON upsert passes through as written, so the glue logs it as a write
@@ -632,7 +641,7 @@ void test_json_fold_reference(config_t const& config) {
                 operation.type == ustore_docs_field_type_json_k)
                 operation.modification = delta_modification_t::write_k;
 
-            status_t wanted;
+            util::status_t wanted;
             if (operation.modification == delta_modification_t::remove_k) wanted = reference.remove();
             else if (operation.modification == delta_modification_t::write_k)
                 wanted = reference.modify(ustore_docs_modify_upsert_k, {}, operation.value,
@@ -643,23 +652,23 @@ void test_json_fold_reference(config_t const& config) {
 
             // A whole JSON upsert is checked as it is written, and a malformed one never becomes a delta
             if (operation.modification == delta_modification_t::write_k &&
-                json_parse(std::string_view(operation.value), arena).status().failed()) {
-                expect_status(wanted, status_code_t::malformed_k);
+                json_parse(std::string_view(operation.value), arena.handle()).status().failed()) {
+                expect_status(wanted, util::status_code_t::malformed_k);
                 ++refused;
                 continue;
             }
-            auto [text, text_status] = modifier_text(std::string_view(operation.value), operation.type, arena);
-            if (!expect_true(text_status.succeeded())) return;
+            auto [text, text_status] = modifier_text(std::string_view(operation.value), operation.type, arena.handle());
+            if (!expect_true(!text_status.failed())) return;
             json_delta_t const delta {stream * steps_k + step, operation.modification, operation.field, text};
 
             std::vector<pending_t> candidate = pending;
-            candidate.push_back(pending_of(delta, arena));
+            candidate.push_back(pending_of(delta, arena.handle()));
             outcome_t const folded = outcome_of(fold.apply(base_of(base), views_of(candidate), allocator));
             std::optional<std::string> const stored = reference.read();
             outcome_t expected_outcome {wanted.code, {}};
-            if (wanted.succeeded()) {
+            if (!wanted.failed()) {
                 if (stored) expected_outcome.bytes = *stored;
-                else expected_outcome.code = status_code_t::not_found_k;
+                else expected_outcome.code = util::status_code_t::not_found_k;
             }
             ++checked;
             if (!expect_outcome(folded, expected_outcome, "fold against the engine")) {
@@ -675,18 +684,19 @@ void test_json_fold_reference(config_t const& config) {
             pending = std::move(candidate);
 
             if (random.below(10) == 0) {
-                std::vector<delta_view_t> const views = views_of(pending);
+                std::vector<util::delta_view_t> const views = views_of(pending);
                 auto [chain, compose_status] = fold.compose(views, allocator);
-                if (!expect_true(compose_status.succeeded())) return;
-                delta_view_t const composed {delta_kind_t::change_k, chain};
+                if (!expect_true(!compose_status.failed())) return;
+                util::delta_view_t const composed {util::delta_kind_t::change_k, chain};
                 outcome_t const applied = outcome_of(
-                    fold.apply(base_of(base), std::span<delta_view_t const>(&composed, 1), allocator));
+                    fold.apply(base_of(base), std::span<util::delta_view_t const>(&composed, 1), allocator));
                 if (!expect_outcome(applied, expected_outcome, "composed chain against the engine")) return;
                 for (pending_t const& delta : pending)
-                    records_before += delta.kind != delta_kind_t::change_k ? 1
-                                                                           : count_records(bytes_of_text(delta.bytes));
+                    records_before += delta.kind != util::delta_kind_t::change_k
+                                          ? 1
+                                          : count_records(bytes_of_text(delta.bytes));
                 records_after += count_records(chain);
-                pending.assign(1, {delta_kind_t::change_k, std::string(chars_of(chain))});
+                pending.assign(1, {util::delta_kind_t::change_k, std::string(util::chars_of(chain))});
                 ++compositions;
             }
             if (random.below(25) == 0) base = stored, pending.clear();
@@ -710,8 +720,8 @@ void test_json_fold_compose() {
 
     for (std::size_t round = 0; round != 3000; ++round, ++rounds) {
         auto [arena, arena_status] = arena_t::make();
-        if (!expect_true(arena_status.succeeded())) return;
-        arena_allocator<byte_t> allocator {arena};
+        if (!expect_true(!arena_status.failed())) return;
+        util::arena_allocator<util::byte_t> allocator {arena.handle()};
 
         // Wild rounds draw anything, and clean ones upsert and merge valid values into an object so more chains
         // succeed. Array rounds set and insert siblings of one array, and nested rounds merge objects into objects.
@@ -750,8 +760,9 @@ void test_json_fold_compose() {
                                                          : delta_modification_t::merge_k,
                 operation.value = writer.merge_patch(), operation.type = ustore_docs_field_type_json_k;
             if (operation.type != ustore_docs_field_type_json_k) {
-                auto [text, text_status] = modifier_text(std::string_view(operation.value), operation.type, arena);
-                if (!expect_true(text_status.succeeded())) return;
+                auto [text, text_status] = modifier_text(std::string_view(operation.value), operation.type,
+                                                         arena.handle());
+                if (!expect_true(!text_status.failed())) return;
                 operation.value = std::string(text), operation.type = ustore_docs_field_type_json_k;
             }
             if (!operation.field.empty() && random.below(3)) operation.field = std::string(writer.pick(few_fields_k));
@@ -772,19 +783,19 @@ void test_json_fold_compose() {
         for (std::size_t index = 0; index != deltas.size();) {
             std::size_t const length = fu::min_of<std::size_t>(1 + random.below(4), deltas.size() - index);
             std::span<json_delta_t const> const run(deltas.data() + index, length);
-            if (length == 1) pending.push_back(pending_of(run.front(), arena));
-            else pending.push_back(change_of(run, arena));
+            if (length == 1) pending.push_back(pending_of(run.front(), arena.handle()));
+            else pending.push_back(change_of(run, arena.handle()));
             index += length;
         }
-        std::vector<delta_view_t> const views = views_of(pending);
+        std::vector<util::delta_view_t> const views = views_of(pending);
         outcome_t const sequential = outcome_of(fold.apply(base_of(base), views, allocator));
-        failing += sequential.code != status_code_t::success_k;
+        failing += sequential.code != util::status_code_t::success_k;
 
         auto [chain, status] = fold.compose(views, allocator);
-        if (!expect_true(status.succeeded())) return;
-        delta_view_t const composed {delta_kind_t::change_k, chain};
+        if (!expect_true(!status.failed())) return;
+        util::delta_view_t const composed {util::delta_kind_t::change_k, chain};
         outcome_t const applied = outcome_of(
-            fold.apply(base_of(base), std::span<delta_view_t const>(&composed, 1), allocator));
+            fold.apply(base_of(base), std::span<util::delta_view_t const>(&composed, 1), allocator));
         records_before += deltas.size();
         records_after += count_records(chain);
         if (!expect_outcome(applied, sequential, "composed chain against the chain")) {
@@ -797,15 +808,16 @@ void test_json_fold_compose() {
         // Composing a composed prefix with the rest answers the same again
         std::size_t const split = random.below(views.size() + 1);
         if (split == 0 || split == views.size()) continue;
-        auto [prefix, prefix_status] = fold.compose(std::span<delta_view_t const>(views.data(), split), allocator);
-        if (!expect_true(prefix_status.succeeded())) return;
-        std::vector<delta_view_t> resumed {{delta_kind_t::change_k, prefix}};
+        auto [prefix, prefix_status] = fold.compose(std::span<util::delta_view_t const>(views.data(), split),
+                                                    allocator);
+        if (!expect_true(!prefix_status.failed())) return;
+        std::vector<util::delta_view_t> resumed {{util::delta_kind_t::change_k, prefix}};
         resumed.insert(resumed.end(), views.begin() + std::ptrdiff_t(split), views.end());
         auto [again, again_status] = fold.compose(resumed, allocator);
-        if (!expect_true(again_status.succeeded())) return;
-        delta_view_t const recomposed {delta_kind_t::change_k, again};
+        if (!expect_true(!again_status.failed())) return;
+        util::delta_view_t const recomposed {util::delta_kind_t::change_k, again};
         if (!expect_outcome(
-                outcome_of(fold.apply(base_of(base), std::span<delta_view_t const>(&recomposed, 1), allocator)),
+                outcome_of(fold.apply(base_of(base), std::span<util::delta_view_t const>(&recomposed, 1), allocator)),
                 sequential, "chain composed in parts against the chain"))
             return;
     }
@@ -827,36 +839,36 @@ bool expect_document(reference_t& reference, std::optional<std::string> const& w
  *  it was, and the commit lands the rest. */
 case_result_t test_json_fold_own_changes(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return {};
-    if (!database.on().supports_transactions()) return case_result_t::skipped(needs_transactions_k);
-    auto [collection, create_status] = create_docs_collection(database, "own");
-    if (!expect_true(create_status.succeeded())) return {};
-    reference_t head {database, collection};
-    expect_true(head.reset(R"({"a":1})").succeeded());
+    if (!expect_true(!open_status.failed())) return {};
+    if (!probed(database.supports_transactions())) return case_result_t::skipped(needs_transactions_k);
+    auto [collection, create_status] = create_docs_collection(database.handle(), "own");
+    if (!expect_true(!create_status.failed())) return {};
+    reference_t head {database.handle(), collection};
+    expect_true(!head.reset(R"({"a":1})").failed());
 
-    auto [transaction, transaction_status] = database.on().transaction();
-    if (!expect_true(transaction_status.succeeded())) return {};
-    reference_t uncommitted {database, collection};
-    uncommitted.transaction = transaction.transaction();
+    auto [transaction, transaction_status] = database.transaction();
+    if (!expect_true(!transaction_status.failed())) return {};
+    reference_t uncommitted {database.handle(), collection};
+    uncommitted.transaction = transaction.handle();
     constexpr ustore_docs_field_type_t json_k = ustore_docs_field_type_json_k;
-    expect_true(uncommitted.modify(ustore_docs_modify_upsert_k, "b", "2", json_k).succeeded());
+    expect_true(!uncommitted.modify(ustore_docs_modify_upsert_k, "b", "2", json_k).failed());
     expect_document(uncommitted, R"({"a":1,"b":2})", "an upsert of a field");
-    expect_true(uncommitted.modify(ustore_docs_modify_merge_k, {}, R"({"c":3})", json_k).succeeded());
+    expect_true(!uncommitted.modify(ustore_docs_modify_merge_k, {}, R"({"c":3})", json_k).failed());
     expect_true(
-        uncommitted.modify(ustore_docs_modify_patch_k, {}, R"([{"op":"remove","path":"/a"}])", json_k).succeeded());
+        !uncommitted.modify(ustore_docs_modify_patch_k, {}, R"([{"op":"remove","path":"/a"}])", json_k).failed());
     expect_status(
         uncommitted.modify(ustore_docs_modify_patch_k, {}, R"([{"op":"test","path":"/a","value":1}])", json_k),
-        status_code_t::invalid_argument_k);
+        util::status_code_t::invalid_argument_k);
     expect_document(uncommitted, R"({"b":2,"c":3})", "a merge and a patch over it");
     expect_document(head, R"({"a":1})", "the head before the commit");
-    expect_true(transaction.on().commit().has_value());
+    expect_true(!transaction.commit().status.failed());
     expect_document(head, R"({"b":2,"c":3})", "the head after the commit");
     return {};
 }
 
 /** Opens the NVMe engine over a manifest in @p directory, every collection flushing past 64 KiB,
  *  every level twice the one above. */
-expected<database_t> open_small_nvme(char const* directory) noexcept {
+util::expected<database_t> open_small_nvme(char const* directory) noexcept {
     constexpr std::size_t memory_runs_bytes_k = 64 * 1024;
     ustore_database_t database = nullptr;
     ustore_outcome_t outcome {};
@@ -870,7 +882,7 @@ expected<database_t> open_small_nvme(char const* directory) noexcept {
     open.transaction_max_bytes = memory_runs_bytes_k / 2;
     open.collection_level_enlarge_factor = 2;
     ustore_database_open_nvme(&open);
-    if (status_t const status {outcome}; status.failed()) return status;
+    if (util::status_t const status = status_of(outcome); status.failed()) return status;
     return database_t {database};
 }
 
@@ -887,16 +899,16 @@ case_result_t test_json_fold_maintenance(config_t const& config) {
     value_writer_t writer {random};
 
     auto [memory, memory_status] = open_database<database_t>(config_t {engine_options_t {}, nullptr});
-    if (!expect_true(memory_status.succeeded())) return {};
-    auto [memory_collection, memory_create_status] = create_docs_collection(memory, "maintenance");
-    if (!expect_true(memory_create_status.succeeded())) return {};
+    if (!expect_true(!memory_status.failed())) return {};
+    auto [memory_collection, memory_create_status] = create_docs_collection(memory.handle(), "maintenance");
+    if (!expect_true(!memory_create_status.failed())) return {};
     auto const references_of = [&](ustore_database_t database, ustore_collection_id_t collection) {
         std::vector<reference_t> references;
         for (std::size_t index = 0; index != documents_k; ++index)
-            references.emplace_back(database, collection, key_from_integer(index));
+            references.emplace_back(database, collection, util::key_from_integer(index));
         return references;
     };
-    std::vector<reference_t> expected_documents = references_of(memory, memory_collection);
+    std::vector<reference_t> expected_documents = references_of(memory.handle(), memory_collection);
     std::vector<reference_t> stored_documents;
     std::size_t landed = 0;
     auto const compare_all = [&](std::string_view context) {
@@ -909,17 +921,17 @@ case_result_t test_json_fold_maintenance(config_t const& config) {
     ustore_collection_id_t drive_collection {};
     {
         auto [drive, drive_status] = open_small_nvme(home.c_str());
-        if (!expect_true(drive_status.succeeded())) return {};
-        auto [created, drive_create_status] = create_docs_collection(drive, "maintenance");
-        if (!expect_true(drive_create_status.succeeded())) return {};
+        if (!expect_true(!drive_status.failed())) return {};
+        auto [created, drive_create_status] = create_docs_collection(drive.handle(), "maintenance");
+        if (!expect_true(!drive_create_status.failed())) return {};
         drive_collection = created;
-        stored_documents = references_of(drive, drive_collection);
+        stored_documents = references_of(drive.handle(), drive_collection);
         for (std::size_t call = 0; call != calls_k; ++call) {
             std::size_t const index = random.below(documents_k);
             auto [arena, arena_status] = arena_t::make();
-            if (!expect_true(arena_status.succeeded())) return {};
+            if (!expect_true(!arena_status.failed())) return {};
             std::optional<std::string> const current = expected_documents[index].read();
-            bool const parses = !current || json_parse(std::string_view(*current), arena).status().succeeded();
+            bool const parses = !current || !json_parse(std::string_view(*current), arena.handle()).status().failed();
             operation_t const operation = random_operation(
                 random, writer, parses ? typed_upserts_t::allowed_k : typed_upserts_t::refused_k);
             auto const apply = [&](reference_t& reference) {
@@ -930,26 +942,26 @@ case_result_t test_json_fold_maintenance(config_t const& config) {
                 return reference.modify(static_cast<ustore_docs_modification_t>(operation.modification),
                                         operation.field, operation.value, operation.type);
             };
-            status_t const wanted = apply(expected_documents[index]);
-            status_t const answered = apply(stored_documents[index]);
+            util::status_t const wanted = apply(expected_documents[index]);
+            util::status_t const answered = apply(stored_documents[index]);
             if (!expect_true(answered.code == wanted.code, "call {}: wanted {}, got {} for {} `{}` of `{}` over `{}`",
                              call, status_name(wanted.code), status_name(answered.code), int(operation.modification),
                              operation.field, operation.value, current.value_or("missing")))
                 return {};
-            landed += wanted.succeeded();
+            landed += !wanted.failed();
             // A compaction flushes the memory runs first, so the records land in runs over bases in older ones
-            if (call % flush_k == 0 && !expect_true(drive.on().compact().succeeded())) return {};
+            if (call % flush_k == 0 && !expect_true(!drive.compact().failed())) return {};
             if (call % checkpoint_k == 0 && !compare_all("after a checkpoint")) return {};
         }
         fmt::println("  {} of {} modifications landed", landed, calls_k);
         expect_true(landed * 3 > calls_k);
         compare_all("after every call");
-        expect_true(drive.on().compact().succeeded());
+        expect_true(!drive.compact().failed());
         compare_all("after a compaction");
     }
     auto [reopened, reopen_status] = open_small_nvme(home.c_str());
-    if (!expect_true(reopen_status.succeeded())) return {};
-    stored_documents = references_of(reopened, drive_collection);
+    if (!expect_true(!reopen_status.failed())) return {};
+    stored_documents = references_of(reopened.handle(), drive_collection);
     compare_all("after a reopen");
     return {};
 }
@@ -960,12 +972,12 @@ case_result_t test_json_fold_maintenance(config_t const& config) {
 
 int main(int argc, char** argv) {
     start_test_run(argc, argv);
-    st::expected<scratch_directory_t> const directory = scratch_directory_t::make(test_run.settings.directory);
-    if (!directory) {
+    auto [directory, directory_status] = scratch_directory_t::make(test_run.settings.directory);
+    if (us::st::failed(directory_status)) {
         fmt::println(stderr, "  the working directory would not open");
         return 1;
     }
-    config_t const config {test_run.settings.engine, directory->path()};
+    config_t const config {test_run.settings.engine, directory.path()};
 
     run_test_case("test_json_fold_codec", test_json_fold_codec);
     run_test_case("test_json_fold_shapes", test_json_fold_shapes);

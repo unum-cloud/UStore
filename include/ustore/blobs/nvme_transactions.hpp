@@ -399,7 +399,7 @@ template <typename stored_key_type_, template <typename> typename atomic_referen
 inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::stored_value_size(
     collection_id_t id, stored_key_t stored_key, stored_value_size_t& size) const noexcept {
 
-    auto status = status_t {status_code_t::not_found_k, "Object not exists"};
+    auto status = status_t {status_code_t::not_found_k, "The object is absent"};
     auto iterator = collections_by_id.find(id);
     if (iterator == collections_by_id.end()) return status;
 
@@ -417,14 +417,14 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     collection_id_t id, stored_key_t stored_key, stored_value_span_t stored_value,
     stored_value_size_t& size) const noexcept {
 
-    status_t status = status_t {status_code_t::not_found_k, "Object not exists"};
+    status_t status = status_t {status_code_t::not_found_k, "The object is absent"};
     auto iterator = collections_by_id.find(id);
     if (iterator == collections_by_id.end()) return status;
 
     iterator.value().stored_values.probe_to_find(stored_key, [&](auto const& entry) noexcept {
         auto const& stored_value_place = entry.value();
         if (stored_value_place.kind == delta_kind_t::remove_k) {
-            status = status_t {status_code_t::not_found_k, "Object not exists"};
+            status = status_t {status_code_t::not_found_k, "The object is absent"};
             return;
         }
         if (stored_value_place.size == 0) {
@@ -527,7 +527,7 @@ transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_ty
         collections_by_id.emplace(id, std::move(fresh), st::assume_reserved);
         iterator = collections_by_id.find(id);
         if (iterator == collections_by_id.end())
-            return status_t {status_code_t::out_of_memory_k, "No room for another collection"};
+            return status_t {status_code_t::out_of_memory_k, "No room to seat the transaction collection"};
     }
     return &iterator.value_ref();
 }
@@ -1036,7 +1036,7 @@ class grouped_read_set {
             groups.emplace(id, read_set_t {resources}, st::assume_reserved);
             iterator = groups.find(id);
             if (iterator == groups.end())
-                return {status_code_t::out_of_memory_k, "No room for another watched collection"};
+                return {status_code_t::out_of_memory_k, "No room to seat the watched collection"};
         }
         return iterator.value_ref().reserve_more(count);
     }
@@ -1439,9 +1439,10 @@ transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_ty
     request.context = &committing;
     request.prepare = &prepare_commit_;
     request.publish = &publish_commit_;
-    expected<transaction_stamp_t> committed = store_->ledger().submit(request);
-    if (committed) maintain_(data);
+    auto const [committed, status] = store_->ledger().submit(request);
+    if (!status.failed()) maintain_(data);
     data.sealed.clear();
+    if (status.failed()) return status;
     return committed;
 }
 
@@ -1579,7 +1580,7 @@ transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_ty
                                                           std::span<stored_key_t const> stored_keys) noexcept {
     for (stored_key_t const& stored_key : stored_keys)
         if (store_->replaced_since(group_id, stored_key, start_stamp))
-            return status_t {status_code_t::write_conflict_k, "A key was removed or replaced since the start"};
+            return status_t {status_code_t::write_conflict_k, "A key changed since the start"};
     return status_t {};
 }
 
@@ -1825,7 +1826,7 @@ class transaction_core {
         if constexpr (watch_schedule_ == watch_schedule_t::never_k) return {};
         else if constexpr (watch_schedule_ == watch_schedule_t::now_k) {
             if (store().range_written_since(collection_id, lower, upper, start_stamp_))
-                return {status_code_t::write_conflict_k, "A commit landed in that range since the start"};
+                return {status_code_t::write_conflict_k, "A commit hit the range since the start"};
             return {};
         }
         else {

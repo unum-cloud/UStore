@@ -53,7 +53,7 @@ extern "C" std::size_t const vram_apple_metal10_bundle_bytes;
 
 /** The MSL source an Apple class unit embeds: @p bytes from @p start, its null byte included. */
 [[maybe_unused]] static std::span<byte_t const> source_bundle(unsigned char const* start, std::size_t bytes) noexcept {
-    return bytes_of(start, bytes);
+    return util::bytes_of(start, bytes);
 }
 
 std::span<byte_t const> gpu_class_bundle(gpu_class_t gpu_class) noexcept {

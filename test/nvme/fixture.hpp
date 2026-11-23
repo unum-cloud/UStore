@@ -52,7 +52,6 @@
 namespace unum::ustore::test::nvme {
 
 using namespace unum::ustore::blobs;
-using namespace unum::ustore::utilities;
 
 #pragma region Instantiation
 
@@ -64,18 +63,18 @@ using atomic_reference = fu::standard_atomic_ref<value_type_>;
 /** The waiter every suite instantiates the engine's templates with, yielding between attempts. */
 using waiter_t = fu::standard_yield_t;
 
-using memory_disk_t = memory_disk<atomic_reference, waiter_t>;
-using blocking_files_disk_t = blocking_files_disk<atomic_reference, waiter_t>;
-using linux_uring_files_disk_t = linux_uring_files_disk<atomic_reference, waiter_t>;
-using linux_aio_files_disk_t = linux_aio_files_disk<atomic_reference, waiter_t>;
-using resource_constraint_t = resource_constraint<atomic_reference>;
-using registered_memory_arena_t = registered_memory_arena<atomic_reference>;
-using resources_t = shared_resources<atomic_reference, waiter_t>;
-using resources_shared_ptr_t = resources_shared_ptr<atomic_reference, waiter_t>;
+using memory_disk_t = util::memory_disk<atomic_reference, waiter_t>;
+using blocking_files_disk_t = util::blocking_files_disk<atomic_reference, waiter_t>;
+using linux_uring_files_disk_t = util::linux_uring_files_disk<atomic_reference, waiter_t>;
+using linux_aio_files_disk_t = util::linux_aio_files_disk<atomic_reference, waiter_t>;
+using resource_constraint_t = util::resource_constraint<atomic_reference>;
+using registered_memory_arena_t = util::registered_memory_arena<atomic_reference>;
+using resources_t = util::shared_resources<atomic_reference, waiter_t>;
+using resources_shared_ptr_t = util::resources_shared_ptr<atomic_reference, waiter_t>;
 using commit_ledger_t = commit_ledger<atomic_reference, waiter_t>;
 using stamp_pin_t = stamp_pin<atomic_reference, waiter_t>;
-using countdown_t = countdown<atomic_reference, waiter_t>;
-using volume_allocator_t = constrained_allocator<byte_t, atomic_reference>;
+using countdown_t = util::countdown<atomic_reference, waiter_t>;
+using volume_allocator_t = util::constrained_allocator<util::byte_t, atomic_reference>;
 
 /** Where among @p store_types_ each tag's store sits, every store of a suite's database tagged by
  *  its value layout. */
@@ -246,17 +245,18 @@ constexpr std::uint64_t memory_filesystem_magic_k = 0x01021994ull;
 /** Why this machine offers no io_uring, or null when it does. */
 [[nodiscard]] inline char const* uring_refusal() noexcept {
     switch (linux_uring_files_disk_t::probe()) {
-    case linux_uring_probe_t::too_old_k: return "needs io_uring of Linux 6.12 or newer";
-    case linux_uring_probe_t::refused_k: return "io_uring is refused on this machine";
-    case linux_uring_probe_t::available_k: return nullptr;
+    case util::linux_uring_probe_t::too_old_k: return "needs io_uring of Linux 6.12 or newer";
+    case util::linux_uring_probe_t::refused_k: return "io_uring is refused on this machine";
+    case util::linux_uring_probe_t::available_k: return nullptr;
     }
     return nullptr;
 }
 
 /** Why this machine offers no Linux AIO, or null when it does. */
 [[nodiscard]] inline char const* aio_refusal() noexcept {
-    return linux_aio_files_disk_t::probe() == linux_aio_probe_t::available_k ? nullptr
-                                                                             : "Linux AIO is refused on this machine";
+    return linux_aio_files_disk_t::probe() == util::linux_aio_probe_t::available_k
+               ? nullptr
+               : "Linux AIO is refused on this machine";
 }
 
 /** Why @p transport cannot be mounted in @p directory, the suite's unique one or null, or null when
@@ -286,7 +286,7 @@ constexpr std::uint64_t memory_filesystem_magic_k = 0x01021994ull;
 struct fixture_config_t {
 
     /** Bytes of the page every header and slot begins on, which is also the alignment the RAM disk demands. */
-    std::uint64_t page_bytes = portable_alignment_k;
+    std::uint64_t page_bytes = util::portable_alignment_k;
 
     /** Bytes of one request block; the channels suite drops it to two pages so exhaustion is reachable. */
     std::uint64_t request_buffer_bytes = 64ull * 1024ull;
@@ -323,8 +323,8 @@ struct fixture_config_t {
     std::size_t memory_limit = 256ull * 1024ull * 1024ull;
 
     /** The channel config every channel of a fixture is carved to. */
-    [[nodiscard]] constexpr io_channel_config_t channels() const noexcept {
-        io_channel_config_t config;
+    [[nodiscard]] constexpr util::io_channel_config_t channels() const noexcept {
+        util::io_channel_config_t config;
         config.request_buffer_bytes = request_buffer_bytes;
         config.request_buffers_count = request_buffers;
         config.stream_buffer_bytes = stream_buffer_bytes;
@@ -334,8 +334,8 @@ struct fixture_config_t {
     }
 
     /** The ring config a disk of @p media volumes mounts with. */
-    [[nodiscard]] constexpr disk_config_t disk(std::size_t media) const noexcept {
-        disk_config_t config;
+    [[nodiscard]] constexpr util::disk_config_t disk(std::size_t media) const noexcept {
+        util::disk_config_t config;
         config.queue_pairs_limit = static_cast<std::uint16_t>(executor_threads + shared_io_channels);
         config.depth_limit = queue_depth;
         config.registered_memory_limit = registered_memory_limit;
@@ -344,24 +344,24 @@ struct fixture_config_t {
     }
 
     /** The same ring config for io_uring, which always runs unbuffered. */
-    [[nodiscard]] constexpr linux_uring_disk_config_t linux_uring(std::size_t media) const noexcept {
-        linux_uring_disk_config_t config;
+    [[nodiscard]] constexpr util::linux_uring_disk_config_t linux_uring(std::size_t media) const noexcept {
+        util::linux_uring_disk_config_t config;
         config.queue_pairs_limit = static_cast<std::uint16_t>(executor_threads + shared_io_channels);
         config.depth_limit = queue_depth;
         config.registered_memory_limit = registered_memory_limit;
         config.media_limit = static_cast<std::uint16_t>(media + runs_capacity);
-        config.buffering = file_buffering_t::unbuffered_k;
+        config.buffering = util::file_buffering_t::unbuffered_k;
         return config;
     }
 
     /** The same ring config for Linux AIO, which always runs unbuffered too. */
-    [[nodiscard]] constexpr linux_aio_disk_config_t linux_aio(std::size_t media) const noexcept {
-        linux_aio_disk_config_t config;
+    [[nodiscard]] constexpr util::linux_aio_disk_config_t linux_aio(std::size_t media) const noexcept {
+        util::linux_aio_disk_config_t config;
         config.queue_pairs_limit = static_cast<std::uint16_t>(executor_threads + shared_io_channels);
         config.depth_limit = queue_depth;
         config.registered_memory_limit = registered_memory_limit;
         config.media_limit = static_cast<std::uint16_t>(media + runs_capacity);
-        config.buffering = file_buffering_t::unbuffered_k;
+        config.buffering = util::file_buffering_t::unbuffered_k;
         return config;
     }
 };
@@ -375,12 +375,12 @@ constexpr std::size_t fixture_volumes_capacity_k = 16;
 
 /** A mounted disk, its arena, its channels and the media the volumes of a case occupy, torn down in order. */
 template <typename disk_type_>
-    requires ring_concept<disk_type_>
+    requires util::ring_concept<disk_type_>
 struct basic_fixture {
 
     using disk_t = disk_type_;
-    using volume_t = basic_directory_volume<disk_type_, waiter_t, volume_allocator_t>;
-    using channel_pool_t = basic_io_channel_pool<disk_type_, atomic_reference, waiter_t>;
+    using volume_t = util::basic_directory_volume<disk_type_, waiter_t, volume_allocator_t>;
+    using channel_pool_t = util::basic_io_channel_pool<disk_type_, atomic_reference, waiter_t>;
     using guard_t = typename channel_pool_t::guard_t;
 
     /** The budgets every allocation is charged to, shared so a case can hold them past the fixture's death. */
@@ -396,7 +396,7 @@ struct basic_fixture {
     channel_pool_t channels;
 
     /** One medium per volume, closed in the destructor. */
-    st::vector<registered_medium_t> media;
+    st::vector<util::registered_medium_t> media;
 
     /** The numbers this fixture was mounted with. */
     fixture_config_t config;
@@ -435,31 +435,32 @@ struct basic_fixture {
             std::size_t const held = resources->memory_constraint.used();
             expect_true(held == mounted_bytes, "the budgets hold {} bytes past the mount's {}", held, mounted_bytes);
         }
-        [[maybe_unused]] status_t const parked = channels.release_all();
-        [[maybe_unused]] status_t const unpinned = arena.unregister(disk);
+        [[maybe_unused]] util::status_t const parked = channels.release_all();
+        [[maybe_unused]] util::status_t const unpinned = arena.unregister(disk);
         for (std::size_t index = 0; index != media.size(); ++index)
             if (media[index].held()) [[maybe_unused]]
-                status_t const closed = disk.unregister_medium(media[index]);
+                util::status_t const closed = disk.unregister_medium(media[index]);
     }
 
     /** Mounts the directory volume of the suite's database over @p data_directories directories,
      *  which a second call reopens from its manifest. */
-    expected<volume_t> mount_volume(io_channel_t& channel, std::size_t data_directories = 1) noexcept {
-        if (!directory) return status_t {status_code_t::unsupported_k, needs_directory_k};
+    util::expected<volume_t> mount_volume(util::io_channel_t& channel, std::size_t data_directories = 1) noexcept {
+        if (!directory) return util::status_t {util::status_code_t::unsupported_k, needs_directory_k};
         if (data_directories == 0 || data_directories > fixture_volumes_capacity_k)
-            return status_t {status_code_t::invalid_argument_k, "A fixture's volume spans fewer directories"};
+            return util::status_t {util::status_code_t::invalid_argument_k,
+                                   "A fixture's volume spans fewer directories"};
         st::vector<std::string> paths;
-        std::array<data_address_t, fixture_volumes_capacity_k> addresses {};
+        std::array<util::data_address_t, fixture_volumes_capacity_k> addresses {};
         if (paths.reserve(data_directories) != st::status_t::success_k)
-            return status_t {status_code_t::out_of_memory_k, "No room for a volume's paths"};
+            return util::status_t {util::status_code_t::out_of_memory_k, "No room for a volume's paths"};
         for (std::size_t index = 0; index != data_directories; ++index) {
             [[maybe_unused]] st::status_t const placed = paths.push_back(st::assume_reserved,
                                                                          data_directory_path(index));
             addresses[index].location = paths[index].c_str();
         }
-        volume_config_t volume;
-        volume.database = string_view_t {suite};
-        volume.data_directories = std::span<data_address_t const> {addresses.data(), data_directories};
+        util::volume_config_t volume;
+        volume.database = util::string_view_t {suite};
+        volume.data_directories = std::span<util::data_address_t const> {addresses.data(), data_directories};
         volume.runs_capacity = config.runs_capacity;
         return volume_t::mount(disk, channel, volume, volume_allocator_t {resources->memory_constraint});
     }
@@ -486,15 +487,15 @@ struct basic_fixture {
 /** Opens the ring of @p disk_type_ shaped by @p config for @p media volumes, its pools charged
  *  to @p constraint. */
 template <typename disk_type_>
-expected<disk_type_> open_disk(fixture_config_t const& config, std::size_t media,
-                               resource_constraint_t& constraint) noexcept {
+util::expected<disk_type_> open_disk(fixture_config_t const& config, std::size_t media,
+                                     resource_constraint_t& constraint) noexcept {
     if constexpr (std::is_same_v<disk_type_, memory_disk_t>) {
-        auto [device, make_memory_device_status] = memory_device_t::make(config.page_bytes);
+        auto [device, make_memory_device_status] = util::memory_device_t::make(config.page_bytes);
         if (make_memory_device_status.failed()) return make_memory_device_status;
         return memory_disk_t::make(std::move(device), config.disk(media), constraint);
     }
     else if constexpr (std::is_same_v<disk_type_, blocking_files_disk_t>) {
-        auto [device, make_device_status] = blocking_files_device_t::make(file_buffering_t::buffered_k);
+        auto [device, make_device_status] = util::blocking_files_device_t::make(util::file_buffering_t::buffered_k);
         if (make_device_status.failed()) return make_device_status;
         return blocking_files_disk_t::make(std::move(device), config.disk(media), constraint);
     }
@@ -508,17 +509,18 @@ expected<disk_type_> open_disk(fixture_config_t const& config, std::size_t media
 
 /** Zeroes the head page of @p medium, so the next mount formats the medium as if it were new. */
 template <typename disk_type_>
-status_t blank_head(disk_type_& disk, io_channel_t& channel, medium_reference_t medium,
-                    std::uint64_t page_bytes) noexcept {
+util::status_t blank_head(disk_type_& disk, util::io_channel_t& channel, util::medium_reference_t medium,
+                          std::uint64_t page_bytes) noexcept {
     auto [writer_channel, writer_channel_status] = channel.acquire();
     if (writer_channel_status.failed()) return writer_channel_status;
-    basic_write_pipeline<disk_type_, waiter_t> writer {disk, std::move(writer_channel), medium};
+    util::basic_write_pipeline<disk_type_, waiter_t> writer {disk, std::move(writer_channel), medium};
     auto [block, acquire_buffer_status] = writer.acquire_buffer();
     if (acquire_buffer_status.failed()) return acquire_buffer_status;
     if (block.size() < page_bytes)
-        return {status_code_t::capacity_exhausted_k, "A channel's block is shorter than a volume's head"};
+        return {util::status_code_t::capacity_exhausted_k, "A channel's block is shorter than a volume's head"};
     std::memset(block.bytes().data(), 0, static_cast<std::size_t>(page_bytes));
-    if (status_t const queued = writer.enqueue_write(std::move(block), extent_t {0, page_bytes}); queued.failed())
+    if (util::status_t const queued = writer.enqueue_write(std::move(block), util::extent_t {0, page_bytes});
+        queued.failed())
         return queued;
     return writer.make_durable();
 }
@@ -530,7 +532,7 @@ status_t blank_head(disk_type_& disk, io_channel_t& channel, medium_reference_t 
  *  no case inherits the catalog its predecessor left; a volume in memory is blank by construction.
  */
 template <typename disk_type_>
-    requires ring_concept<disk_type_>
+    requires util::ring_concept<disk_type_>
 struct basic_mount {
 
     using fixture_t = basic_fixture<disk_type_>;
@@ -552,33 +554,33 @@ struct basic_mount {
     std::size_t volumes = 1;
 
     /** A fixture of @c volumes volumes of the suite's config. */
-    expected<fixture_unique_ptr_t> operator()() const noexcept { return (*this)(config); }
+    util::expected<fixture_unique_ptr_t> operator()() const noexcept { return (*this)(config); }
 
     /** A fixture of @c volumes volumes of @p reshaped, for a case that moves a number off the suite's. */
-    expected<fixture_unique_ptr_t> operator()(fixture_config_t const& reshaped) const noexcept {
+    util::expected<fixture_unique_ptr_t> operator()(fixture_config_t const& reshaped) const noexcept {
         if (volumes > fixture_volumes_capacity_k)
-            return status_t {status_code_t::invalid_argument_k, "A fixture holds fewer volumes than that"};
+            return util::status_t {util::status_code_t::invalid_argument_k, "A fixture holds fewer volumes than that"};
         std::array<std::uint64_t, fixture_volumes_capacity_k> capacities {};
         for (std::size_t index = 0; index != volumes; ++index) capacities[index] = reshaped.volume_bytes;
         return (*this)(reshaped, std::span<std::uint64_t const> {capacities.data(), volumes});
     }
 
     /** A fixture of one volume per entry of @p capacities, of the suite's config. */
-    expected<fixture_unique_ptr_t> operator()(std::span<std::uint64_t const> capacities) const noexcept {
+    util::expected<fixture_unique_ptr_t> operator()(std::span<std::uint64_t const> capacities) const noexcept {
         return (*this)(config, capacities);
     }
 
     /** A fixture of one volume per entry of @p capacities, shaped by @p reshaped. */
-    expected<fixture_unique_ptr_t> operator()(fixture_config_t const& reshaped,
-                                              std::span<std::uint64_t const> capacities) const noexcept {
+    util::expected<fixture_unique_ptr_t> operator()(fixture_config_t const& reshaped,
+                                                    std::span<std::uint64_t const> capacities) const noexcept {
         if (char const* const reason = refusal(capacities.size()))
-            return status_t {status_code_t::unsupported_k, reason};
+            return util::status_t {util::status_code_t::unsupported_k, reason};
         resources_shared_ptr_t resources = std::make_shared<resources_t>(reshaped.memory_limit);
-        expected<disk_type_> mounted = open_disk<disk_type_>(reshaped, capacities.size(), resources->memory_constraint);
-        if (!mounted) return mounted.status();
-        auto fixture = fixture_unique_ptr_t {new (std::nothrow) fixture_t {std::move(resources), std::move(*mounted),
+        auto [mounted, open_status] = open_disk<disk_type_>(reshaped, capacities.size(), resources->memory_constraint);
+        if (open_status.failed()) return open_status;
+        auto fixture = fixture_unique_ptr_t {new (std::nothrow) fixture_t {std::move(resources), std::move(mounted),
                                                                            reshaped, transport, case_stream_key()}};
-        if (!fixture) return status_t {status_code_t::out_of_memory_k, "The fixture did not fit"};
+        if (!fixture) return util::status_t {util::status_code_t::out_of_memory_k, "The fixture did not fit"};
         fixture->directory = directory;
         fixture->suite = suite;
         // Every case starts on empty data directories, so no volume inherits its
@@ -586,10 +588,11 @@ struct basic_mount {
         if (directory)
             for (std::size_t index = 0; index != fixture_volumes_capacity_k; ++index)
                 if (!scratch_directory_t::recreate(fixture->data_directory_path(index).c_str()))
-                    return status_t {status_code_t::io_k, "A fixture's data directory would not be emptied"};
+                    return util::status_t {util::status_code_t::io_k,
+                                           "A fixture's data directory would not be emptied"};
 
-        io_channel_config_t const channels = reshaped.channels();
-        memory_arena_config_t arena;
+        util::io_channel_config_t const channels = reshaped.channels();
+        util::memory_arena_config_t arena;
         arena.bytes = channels.arena_bytes() * (reshaped.executor_threads + reshaped.shared_io_channels);
         auto [pinned, make_arena_status] = registered_memory_arena_t::make(
             fixture->disk, fixture->resources->memory_constraint, arena);
@@ -606,14 +609,15 @@ struct basic_mount {
             auto [registered, register_volume_status] = register_volume_(fixture->disk, index, capacities[index]);
             if (register_volume_status.failed()) return register_volume_status;
             if (fixture->media.push_back(std::move(registered)) != st::status_t::success_k)
-                return status_t {status_code_t::out_of_memory_k, "The fixture could not track another medium"};
+                return util::status_t {util::status_code_t::out_of_memory_k,
+                                       "The fixture could not track another medium"};
         }
 
         if (transport == transport_t::device_k) {
             auto [guard, acquire_status] = fixture->channels.acquire();
             if (acquire_status.failed()) return acquire_status;
-            if (status_t const blanked = blank_head(fixture->disk, guard.channel(), fixture->media[0].reference(),
-                                                    reshaped.page_bytes);
+            if (util::status_t const blanked = blank_head(fixture->disk, guard.channel(), fixture->media[0].reference(),
+                                                          reshaped.page_bytes);
                 blanked.failed())
                 return blanked;
         }
@@ -633,15 +637,15 @@ struct basic_mount {
   private:
 
     /** Registers the medium of volume @p index on @p disk: a blank buffer, a fresh file, or the device itself. */
-    expected<registered_medium_t> register_volume_(disk_type_& disk, std::size_t index,
-                                                   std::uint64_t capacity) const noexcept {
-        medium_options_t request;
+    util::expected<util::registered_medium_t> register_volume_(disk_type_& disk, std::size_t index,
+                                                               std::uint64_t capacity) const noexcept {
+        util::medium_options_t request;
         request.length = capacity;
-        request.access = medium_access_t::create_read_write_k;
+        request.access = util::medium_access_t::create_read_write_k;
         if (transport == transport_t::device_k) {
             request.name = test_run.settings.device.data();
             request.length = 0;
-            request.access = medium_access_t::read_write_k;
+            request.access = util::medium_access_t::read_write_k;
             return disk.register_medium(request);
         }
         if (transport == transport_t::memory_k) {
@@ -665,27 +669,28 @@ struct basic_mount {
 /** Publishes a manifest naming @p files through @p volume, as the next generation of the
  *  one it read. */
 template <typename volume_type_, typename fixture_type_>
-status_t publish_naming(volume_type_& volume, fixture_type_& fixture, io_channel_t& channel,
-                        std::span<manifest_file_t const> files) noexcept {
-    manifest_t manifest;
+util::status_t publish_naming(volume_type_& volume, fixture_type_& fixture, util::io_channel_t& channel,
+                              std::span<util::manifest_file_t const> files) noexcept {
+    util::manifest_t manifest;
     if (sz::failed(manifest.database.assign(volume.manifest().database.view())))
-        return {status_code_t::out_of_memory_k, "No room for the database's name"};
+        return {util::status_code_t::out_of_memory_k, "No room for the database's name"};
     manifest.id = volume.manifest().id;
     manifest.generation = volume.generation() + 1;
     manifest.placement = volume.placement();
-    for (manifest_file_t const& file : files)
-        if (manifest.files.push_back(manifest_file_t {file}) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "No room for the manifest's files"};
+    for (util::manifest_file_t const& file : files)
+        if (manifest.files.push_back(util::manifest_file_t {file}) != st::status_t::success_k)
+            return {util::status_code_t::out_of_memory_k, "No room for the manifest's files"};
     st::vector<char> json;
-    if (status_t const printed = manifest.print(volume_allocator_t {fixture.resources->memory_constraint}, json);
+    if (util::status_t const printed = manifest.print(volume_allocator_t {fixture.resources->memory_constraint}, json);
         printed.failed())
         return printed;
     return volume.publish_manifest(channel, std::span<char const> {json});
 }
 
 /** The manifest entry of @p extent, written for @p run, as user data of no collection. */
-[[nodiscard]] inline manifest_file_t file_of(medium_extent_t const& extent, uuid128_t const& run) noexcept {
-    manifest_file_t file;
+[[nodiscard]] inline util::manifest_file_t file_of(util::medium_extent_t const& extent,
+                                                   util::uuid128_t const& run) noexcept {
+    util::manifest_file_t file;
     file.run = run;
     file.offset = extent.extent.offset;
     file.bytes = extent.extent.length;
@@ -695,15 +700,15 @@ status_t publish_naming(volume_type_& volume, fixture_type_& fixture, io_channel
 
 /** The manifest the database of @p fixture last published, or an empty one before its first. */
 template <typename fixture_type_>
-[[nodiscard]] manifest_t manifest_on_disk(fixture_type_ const& fixture) noexcept {
-    manifest_t manifest;
+[[nodiscard]] util::manifest_t manifest_on_disk(fixture_type_ const& fixture) noexcept {
+    util::manifest_t manifest;
     std::array<char, 96> name {};
     auto const written = fmt::format_to_n(name.data(), name.size() - 1, "{}.ustore.json", fixture.suite);
     *written.out = '\0';
     std::string const path = fmt::format("{}/{}", fixture.data_directory_path(0).c_str(), name.data());
     st::vector<char> text;
-    if (read_file(path.c_str(), text).succeeded()) [[maybe_unused]]
-        status_t const parsed = manifest.parse(text, volume_allocator_t {fixture.resources->memory_constraint});
+    if (util::read_file(path.c_str(), text).succeeded()) [[maybe_unused]]
+        util::status_t const parsed = manifest.parse(text, volume_allocator_t {fixture.resources->memory_constraint});
     return manifest;
 }
 
@@ -711,19 +716,20 @@ template <typename fixture_type_>
  *  to nor loses. */
 template <typename fixture_type_>
 [[nodiscard]] std::size_t run_count_of(fixture_type_ const& fixture) noexcept {
-    manifest_t const manifest = manifest_on_disk(fixture);
+    util::manifest_t const manifest = manifest_on_disk(fixture);
     std::size_t counted = 0;
-    for (manifest_file_t const& file : manifest.files) counted += file.collection != manifest_no_collection_k;
+    for (util::manifest_file_t const& file : manifest.files)
+        counted += file.collection != util::manifest_no_collection_k;
     return counted;
 }
 
 /** Bytes every run the last published manifest of @p fixture names takes. */
 template <typename fixture_type_>
 [[nodiscard]] std::uint64_t run_bytes_of(fixture_type_ const& fixture) noexcept {
-    manifest_t const manifest = manifest_on_disk(fixture);
+    util::manifest_t const manifest = manifest_on_disk(fixture);
     std::uint64_t counted = 0;
-    for (manifest_file_t const& file : manifest.files)
-        if (file.collection != manifest_no_collection_k) counted += file.bytes;
+    for (util::manifest_file_t const& file : manifest.files)
+        if (file.collection != util::manifest_no_collection_k) counted += file.bytes;
     return counted;
 }
 
@@ -755,23 +761,25 @@ template <typename fixture_type_>
 /** Copies the data directory of @p fixture aside, which is what a crash would leave on it
  *  at this moment. */
 template <typename fixture_type_>
-status_t capture_data_directory(fixture_type_ const& fixture) noexcept {
+util::status_t capture_data_directory(fixture_type_ const& fixture) noexcept {
     std::string const live = fixture.data_directory_path(0), aside = crash_copy_path(fixture);
     std::error_code error;
     std::filesystem::remove_all(aside.c_str(), error);
     std::filesystem::copy(live.c_str(), aside.c_str(), std::filesystem::copy_options::recursive, error);
-    return error ? status_t {status_code_t::io_k, "The data directory would not be copied"} : status_t {};
+    return error ? util::status_t {util::status_code_t::io_k, "The data directory would not be copied"}
+                 : util::status_t {};
 }
 
 /** Puts the copy @c capture_data_directory took back in place of the data directory, as a restart
  *  after a crash finds it. */
 template <typename fixture_type_>
-status_t restore_data_directory(fixture_type_ const& fixture) noexcept {
+util::status_t restore_data_directory(fixture_type_ const& fixture) noexcept {
     std::string const live = fixture.data_directory_path(0), aside = crash_copy_path(fixture);
     std::error_code error;
     std::filesystem::remove_all(live.c_str(), error);
     if (!error) std::filesystem::rename(aside.c_str(), live.c_str(), error);
-    return error ? status_t {status_code_t::io_k, "The data directory would not be restored"} : status_t {};
+    return error ? util::status_t {util::status_code_t::io_k, "The data directory would not be restored"}
+                 : util::status_t {};
 }
 
 #pragma endregion Crash Copies
@@ -798,8 +806,8 @@ void report_on_mount(basic_mount<disk_type_> const& mount, char const* name,
 /** Mounts one fixture and lets it go, which is the first case of every transport. */
 template <typename disk_type_>
 void test_mounts_a_fixture(basic_mount<disk_type_> const& mount) {
-    expected<typename basic_mount<disk_type_>::fixture_unique_ptr_t> const probe = mount();
-    expect_status(probe, status_code_t::success_k);
+    auto [probe, status] = mount();
+    expect_status(status, util::status_code_t::success_k);
 }
 
 /** Runs the transport's @c mount case, and hands @p cases the mount when it held. */
@@ -850,14 +858,15 @@ void run_on_transport(transport_t transport, char const* directory, fixture_conf
 #pragma region Byte Painters
 
 /** The byte a value of @p seed holds at @p position, which a read checks every byte against. */
-[[nodiscard]] inline byte_t painted(std::uint64_t seed, std::uint64_t position) noexcept {
+[[nodiscard]] inline util::byte_t painted(std::uint64_t seed, std::uint64_t position) noexcept {
     std::uint64_t mixed = position * 0x9E3779B97F4A7C15ull + seed * 0xBF58476D1CE4E5B9ull + 0x94D049BB133111EBull;
     mixed ^= mixed >> 29;
-    return static_cast<byte_t>(mixed & 0xFFull);
+    return static_cast<util::byte_t>(mixed & 0xFFull);
 }
 
 /** Whether the two spans hold the same bytes. */
-[[nodiscard]] inline bool same_bytes(std::span<byte_t const> first, std::span<byte_t const> second) noexcept {
+[[nodiscard]] inline bool same_bytes(std::span<util::byte_t const> first,
+                                     std::span<util::byte_t const> second) noexcept {
     if (first.size() != second.size()) return false;
     for (std::size_t index = 0; index != first.size(); ++index)
         if (first[index] != second[index]) return false;
@@ -881,7 +890,7 @@ struct expectation_t {
 };
 
 /** Paints the value @p entry describes into @p into, which must already hold room for it. */
-inline void paint_into(expectation_t const& entry, std::span<byte_t> into) noexcept {
+inline void paint_into(expectation_t const& entry, std::span<util::byte_t> into) noexcept {
     for (std::uint64_t position = 0; position != entry.bytes; ++position)
         into[static_cast<std::size_t>(position)] = painted(entry.seed, position);
 }

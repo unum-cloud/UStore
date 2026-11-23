@@ -39,7 +39,7 @@
 #include <smashtable/basic_vector.hpp>
 
 #include "ustore/db.h"
-#include "ustore/ranges.hpp" // `place_batch_t`, `strided`
+#include "ustore/utilities/ranges.hpp" // `place_batch_t`, `strided`
 
 #include "ustore/utilities/blocking_files.hpp" // `directory_exists`
 

@@ -153,6 +153,8 @@ class basic_disk {
     /** The budget the disk's pools are charged to. */
     using constraint_t = resource_constraint<atomic_reference_>;
 
+    /** Holds nothing, as a moved-from disk does. */
+    basic_disk() noexcept = default;
     basic_disk(basic_disk const&) = delete;
     basic_disk& operator=(basic_disk const&) = delete;
     basic_disk(basic_disk&&) noexcept = default;
@@ -168,13 +170,12 @@ class basic_disk {
     static expected<basic_disk> make(device_type_&& device, disk_config_t const& config,
                                      constraint_t& constraint) noexcept {
         if (config.queue_pairs_limit == 0 || config.depth_limit == 0)
-            return status_t {status_code_t::invalid_argument_k, "A ring needs a queue pair and a request of depth"};
+            return status_t {status_code_t::invalid_argument_k, "A ring needs a queue pair and depth"};
         if (config.queue_pairs_limit == static_cast<std::uint16_t>(queue_pair_id_t::unallocated_k) ||
             config.registered_memory_limit == static_cast<std::uint16_t>(registered_memory_id_t::unregistered_k) ||
             config.media_limit == static_cast<std::uint16_t>(registered_medium_id_t::unregistered_k))
-            return status_t {status_code_t::invalid_argument_k, "A ring keeps one identifier for an empty handle"};
-        if (config.media_limit == 0)
-            return status_t {status_code_t::invalid_argument_k, "A ring needs a medium to move bytes against"};
+            return status_t {status_code_t::invalid_argument_k, "A ring reserves one id for empty handles"};
+        if (config.media_limit == 0) return status_t {status_code_t::invalid_argument_k, "A ring needs a medium"};
 
         std::size_t const window = static_cast<std::size_t>(config.queue_pairs_limit) * config.depth_limit;
         basic_disk disk {std::move(device), config};
@@ -213,10 +214,10 @@ class basic_disk {
      */
     expected<queue_pair_t> acquire_queue_pair(queue_depth_t depth) noexcept {
         if (depth == 0 || depth > depth_limit_)
-            return status_t {status_code_t::invalid_argument_k, "A queue pair asks for more depth than the ring has"};
+            return status_t {status_code_t::invalid_argument_k, "The queue pair depth exceeds the ring's"};
         std::uint16_t const index = take_(queue_pairs_, queue_pairs_claim_);
         if (index == queue_pair_pool_t::absent_k)
-            return status_t {status_code_t::capacity_exhausted_k, "Every queue pair of this ring is already held"};
+            return status_t {status_code_t::capacity_exhausted_k, "Every queue pair of the ring is held"};
         queue_pair_record_t& record = queue_pairs_[index];
         record.cancelled = 0;
         record.depth = depth;
@@ -293,7 +294,7 @@ class basic_disk {
         registered_memory_record_t* const record = resolve_(registered_memory.reference());
         if (!record) return {status_code_t::invalid_argument_k, "The registered_memory is not this ring's"};
         if (in_flight_(*record).load(std::memory_order_acquire) != 0)
-            return {status_code_t::invalid_argument_k, "The range is still a medium of requests in flight"};
+            return {status_code_t::invalid_argument_k, "Requests in flight still use the range"};
         record->base = nullptr;
         record->length = 0;
         vacate_(registered_memories_, registered_memories_claim_, static_cast<std::uint16_t>(registered_memory.id()));
@@ -326,7 +327,7 @@ class basic_disk {
         registered_medium_record_t* const record = resolve_(registered_medium.reference());
         if (!record) return {status_code_t::invalid_argument_k, "The medium is not this ring's"};
         if (in_flight_(*record).load(std::memory_order_acquire) != 0)
-            return {status_code_t::invalid_argument_k, "The medium is still named by requests in flight"};
+            return {status_code_t::invalid_argument_k, "Requests in flight still use the medium"};
         std::uint16_t const index = static_cast<std::uint16_t>(registered_medium.id());
         if (status_t const detached = device_.close_medium(index); detached.failed()) return detached;
         vacate_(media_, media_claim_, index);
@@ -769,13 +770,13 @@ class memory_device_t {
      */
     status_t open_medium(std::uint16_t index, medium_options_t const& request) noexcept {
         if (index >= volumes_.size() || !volumes_[index].empty())
-            return {status_code_t::invalid_argument_k, "The slot is not an empty one of this device"};
+            return {status_code_t::invalid_argument_k, "The slot is not an empty device slot"};
         if (request.length == 0) return {status_code_t::invalid_argument_k, "A volume holds at least one byte"};
-        auto storage = storage_t::make(static_cast<std::size_t>(request.length));
-        if (!storage) return {status_code_t::out_of_memory_k, "A volume of that size does not fit"};
-        if (storage->resize(static_cast<std::size_t>(request.length)) != st::status_t::success_k)
+        auto [storage, storage_status] = storage_t::make(static_cast<std::size_t>(request.length));
+        if (storage_status != st::status_t::success_k ||
+            storage.resize(static_cast<std::size_t>(request.length)) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A volume of that size does not fit"};
-        volumes_[index] = std::move(*storage);
+        volumes_[index] = std::move(storage);
         return {};
     }
 
@@ -958,7 +959,7 @@ inline status_t deallocate_native_file(native_file_t file, extent_t extent) noex
 
 /** Refuses, since this platform offers no way to give a file's blocks back. */
 inline status_t deallocate_native_file(native_file_t, extent_t) noexcept {
-    return {status_code_t::unsupported_k, "This platform cannot punch a hole in a file"};
+    return {status_code_t::unsupported_k, "This platform cannot punch file holes"};
 }
 
 #endif
@@ -1096,7 +1097,7 @@ class blocking_files_device_t {
      */
     status_t open_medium(std::uint16_t index, medium_options_t const& request) noexcept {
         if (index >= files_.size() || files_[index] != invalid_native_file_k)
-            return {status_code_t::invalid_argument_k, "The slot is not an empty one of this device"};
+            return {status_code_t::invalid_argument_k, "The slot is not an empty device slot"};
         if (!request.name) return {status_code_t::invalid_argument_k, "A file medium needs a path"};
         auto [file, open_status] = open_native_file(request.name, file_access_of(request.access), buffering_);
         if (open_status.failed()) return open_status;

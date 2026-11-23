@@ -226,7 +226,7 @@ enum class linux_spdk_transport_t : std::uint8_t {
 /** Reads at most @p digits_limit hexadecimal digits of @p text, refusing anything else. */
 inline expected<std::uint64_t> hexadecimal_field(std::string_view text, std::size_t digits_limit) noexcept {
     if (text.empty() || text.size() > digits_limit)
-        return status_t {status_code_t::invalid_argument_k, "A PCIe address field is one to four hex digits"};
+        return status_t {status_code_t::invalid_argument_k, "PCIe fields are one to four hex digits"};
     std::uint64_t value = 0;
     for (char const character : text) {
         std::uint64_t digit = 0;
@@ -248,7 +248,7 @@ inline expected<pci_address_t> pci_address_parsed(std::string_view spelled) noex
     std::size_t colons = 0;
     for (char const character : spelled) colons += character == ':' ? 1u : 0u;
     if (colons != 1 && colons != 2)
-        return status_t {status_code_t::invalid_argument_k, "A PCIe address spells a bus, a device and a function"};
+        return status_t {status_code_t::invalid_argument_k, "A PCIe address names bus, device, function"};
 
     std::string_view rest = spelled;
     std::uint64_t domain = 0;
@@ -267,13 +267,13 @@ inline expected<pci_address_t> pci_address_parsed(std::string_view spelled) noex
 
     std::size_t const dot = rest.find('.');
     if (dot == std::string_view::npos)
-        return status_t {status_code_t::invalid_argument_k, "A PCIe address separates its function with a dot"};
+        return status_t {status_code_t::invalid_argument_k, "A PCIe address dots off its function"};
     auto [device, parse_device_status] = hexadecimal_field(rest.substr(0, dot), 2);
     if (parse_device_status.failed()) return parse_device_status;
     auto [function, parse_function_status] = hexadecimal_field(rest.substr(dot + 1), 1);
     if (parse_function_status.failed()) return parse_function_status;
     if (device > 0x1F || function > 7)
-        return status_t {status_code_t::invalid_argument_k, "A PCIe device is below 32 and a function below 8"};
+        return status_t {status_code_t::invalid_argument_k, "A PCIe device exceeds 31 or function 7"};
 
     pci_address_t address;
     fmt::format_to_n(address.text, sizeof(address.text) - 1, "{:04x}:{:02x}:{:02x}.{:x}", domain, bus, device,
@@ -453,11 +453,11 @@ linux_spdk_probe_t linux_spdk_environment<atomic_reference_, waiter_type_>::prob
     if (!address) return linux_spdk_probe_t::not_found_k;
     if (spdk_transport_named(address) == linux_spdk_transport_t::fabric_k) return linux_spdk_probe_t::available_k;
     std::string_view const named = transport_field(address, "traddr:");
-    expected<pci_address_t> const parsed = pci_address_parsed(named.empty() ? std::string_view {address} : named);
-    if (!parsed) return linux_spdk_probe_t::not_found_k;
+    auto const [parsed, status] = pci_address_parsed(named.empty() ? std::string_view {address} : named);
+    if (status.failed()) return linux_spdk_probe_t::not_found_k;
 
     char device_path[64] = {};
-    fmt::format_to_n(device_path, sizeof(device_path) - 1, "/sys/bus/pci/devices/{}", parsed->text);
+    fmt::format_to_n(device_path, sizeof(device_path) - 1, "/sys/bus/pci/devices/{}", parsed.text);
     if (!system_path_exists(device_path)) return linux_spdk_probe_t::not_found_k;
 
     std::array<char, meminfo_bytes_k> meminfo {};
@@ -466,7 +466,7 @@ linux_spdk_probe_t linux_spdk_environment<atomic_reference_, waiter_type_>::prob
     if (!system_path_exists("/sys/kernel/mm/hugepages")) return linux_spdk_probe_t::without_hugepages_k;
 
     char driver_path[80] = {};
-    fmt::format_to_n(driver_path, sizeof(driver_path) - 1, "/sys/bus/pci/devices/{}/driver", parsed->text);
+    fmt::format_to_n(driver_path, sizeof(driver_path) - 1, "/sys/bus/pci/devices/{}/driver", parsed.text);
     std::array<char, link_bytes_k> link {};
     pci_driver_t const driver = pci_driver_named(read_system_link(driver_path, link));
     if (driver != pci_driver_t::vfio_pci_k && driver != pci_driver_t::uio_generic_k)
@@ -573,7 +573,7 @@ status_t linux_spdk_environment<atomic_reference_, waiter_type_>::initialise_(
     linux_spdk_environment_config_t const& config) noexcept {
     bool const plain = config.memory == linux_spdk_memory_t::plain_pages_k;
     if (plain && config.plain_megabytes == 0)
-        return {status_code_t::invalid_argument_k, "Plain pages need a size the driver takes at once"};
+        return {status_code_t::invalid_argument_k, "Plain pages need a nonzero size"};
     if (!spdk_env_dpdk_external_init())
         return {status_code_t::unsupported_k, "The driver initialises its environment once per process"};
 
@@ -683,7 +683,7 @@ expected<linux_spdk_attachment_t*> linux_spdk_attach(spdk_nvme_transport_id cons
         if (!attached && refused.succeeded()) {
             std::uint32_t const index = process.attachments.take();
             if (index == records_t::absent_k)
-                refused = {status_code_t::capacity_exhausted_k, "The process holds as many controllers as it may"};
+                refused = {status_code_t::capacity_exhausted_k, "The process holds its most controllers"};
             else {
                 attached = &process.attachments[index];
                 attached->transport = transport;
@@ -703,7 +703,7 @@ expected<linux_spdk_attachment_t*> linux_spdk_attach(spdk_nvme_transport_id cons
         unlock_claim<atomic_reference_>(attached->claim);
         if (!failed && connected) return attached;
         linux_spdk_detach<atomic_reference_, waiter_type_>(*attached);
-        if (failed) return status_t {status_code_t::io_k, "The controller failed and its holders have not let go"};
+        if (failed) return status_t {status_code_t::io_k, "A failed controller still has holders"};
         return status_t {status_code_t::not_found_k, "No controller answered at that address"};
     }
 }
@@ -926,7 +926,7 @@ class linux_spdk_disk {
      */
     expected<queue_pair_t> acquire_queue_pair(queue_depth_t depth) noexcept {
         if (depth == 0 || depth > depth_limit_)
-            return status_t {status_code_t::invalid_argument_k, "A queue pair asks for more depth than the ring has"};
+            return status_t {status_code_t::invalid_argument_k, "The queue pair depth exceeds the ring's"};
         for (std::size_t seat = 0; seat != queue_pairs_.size(); ++seat) {
             queue_pair_slot_t& slot = queue_pairs_[seat];
             std::int32_t expected_free = 0;
@@ -948,7 +948,7 @@ class linux_spdk_disk {
             link_free_lists_(seat);
             return queue_pair_t {disk_handle_t {static_cast<std::uint16_t>(seat), slot.generation}, depth};
         }
-        return status_t {status_code_t::capacity_exhausted_k, "Every queue pair of this ring is already held"};
+        return status_t {status_code_t::capacity_exhausted_k, "Every queue pair of the ring is held"};
     }
 
     /**
@@ -1041,7 +1041,7 @@ class linux_spdk_disk {
         registered_memory_slot_t* const slot = slot_of_(registered_memory);
         if (!slot) return {status_code_t::invalid_argument_k, "The registered_memory is not this ring's"};
         if (in_flight_(*slot).load(std::memory_order_acquire) != 0)
-            return {status_code_t::invalid_argument_k, "The range is still a target of requests in flight"};
+            return {status_code_t::invalid_argument_k, "Requests in flight still target the range"};
         unmap_(*slot);
         ++slot->generation;
         slot->base = nullptr;
@@ -1071,7 +1071,7 @@ class linux_spdk_disk {
             return status_t {status_code_t::not_found_k, "The controller carries no such active namespace"};
         if (spdk_nvme_ns_get_sector_size(chosen) != sector_bytes_ ||
             spdk_nvme_ns_get_max_io_xfer_size(chosen) < max_transfer_bytes_)
-            return status_t {status_code_t::unsupported_k, "The namespace's sector or transfer differs from the first"};
+            return status_t {status_code_t::unsupported_k, "The namespace geometry differs from the first"};
         for (std::size_t index = 0; index != media_.size(); ++index) {
             registered_medium_slot_t& slot = media_[index];
             std::int32_t expected_free = 0;
@@ -1092,7 +1092,7 @@ class linux_spdk_disk {
             return registered_medium_t {disk_handle_t {static_cast<std::uint16_t>(index), slot.generation},
                                         slot.capacity, sector_bytes_};
         }
-        return status_t {status_code_t::capacity_exhausted_k, "This disk holds as many namespaces as it may"};
+        return status_t {status_code_t::capacity_exhausted_k, "The disk holds its most namespaces"};
     }
 
     /**
@@ -1103,7 +1103,7 @@ class linux_spdk_disk {
         registered_medium_slot_t* const slot = slot_of_(descriptor);
         if (!slot) return {status_code_t::invalid_argument_k, "The target is not this ring's"};
         if (in_flight_(*slot).load(std::memory_order_acquire) != 0)
-            return {status_code_t::invalid_argument_k, "The target is still named by requests in flight"};
+            return {status_code_t::invalid_argument_k, "Requests in flight still use the target"};
         linux_spdk_release_namespace<atomic_reference_, waiter_type_>(*attachment_, slot->namespace_id);
         ++slot->generation;
         slot->capacity = 0;
@@ -1476,12 +1476,11 @@ class linux_spdk_disk {
     /** Whatever a mount must refuse before it touches the controller at all. */
     static status_t inspect_config_(linux_spdk_disk_config_t const& config) noexcept {
         if (config.queue_pairs_limit == 0 || config.depth_limit == 0)
-            return {status_code_t::invalid_argument_k, "A ring needs a queue pair and a request of depth"};
+            return {status_code_t::invalid_argument_k, "A ring needs a queue pair and depth"};
         if (config.queue_pairs_limit == static_cast<std::uint16_t>(queue_pair_id_t::unallocated_k) ||
             config.registered_memory_limit == static_cast<std::uint16_t>(registered_memory_id_t::unregistered_k))
-            return {status_code_t::invalid_argument_k, "A ring keeps one identifier for an empty handle"};
-        if (config.registered_memory_limit == 0)
-            return {status_code_t::invalid_argument_k, "A ring needs a range to move bytes through"};
+            return {status_code_t::invalid_argument_k, "A ring reserves one id for empty handles"};
+        if (config.registered_memory_limit == 0) return {status_code_t::invalid_argument_k, "A ring needs a range"};
         if (config.depth_limit > depth_ceiling_k)
             return {status_code_t::invalid_argument_k, "A queue pair holds fewer requests than that"};
         return {};
@@ -1704,7 +1703,7 @@ class linux_spdk_disk {
         // The driver maps whole 2 MiB pages and refuses a range that starts or ends inside one
         constexpr std::uint64_t mapped_page_bytes = 2ull * 1024ull * 1024ull;
         if (chunk.size() % mapped_page_bytes != 0 || !is_address_aligned(chunk.data(), mapped_page_bytes))
-            return {status_code_t::invalid_argument_k, "A DMA range the driver maps spans whole 2 MiB pages"};
+            return {status_code_t::invalid_argument_k, "A DMA range spans whole 2 MiB pages"};
         if (spdk_mem_register(chunk.data(), chunk.size()) != 0)
             return {status_code_t::out_of_memory_k, "The driver would not map this range"};
         if (status_t const reachable = inspect_translation_(chunk); reachable.failed()) {
@@ -1753,15 +1752,15 @@ class linux_spdk_disk {
         if (request.kind == request_kind_t::deallocate_k) {
             if (!request.extent.aligned_to(sector_bytes_) ||
                 request.extent.length / sector_bytes_ > (std::numeric_limits<std::uint32_t>::max)())
-                return {status_code_t::invalid_argument_k, "A deallocation covers whole sectors, at most one range"};
+                return {status_code_t::invalid_argument_k, "A deallocation covers whole sectors"};
             if (!request.extent.fits_within(target->capacity))
-                return {status_code_t::invalid_argument_k, "The request runs past the namespace"};
+                return {status_code_t::invalid_argument_k, "The deallocation runs past the namespace"};
             return {};
         }
         registered_memory_slot_t const* const chunk = resolve_(request.buffer);
         if (!chunk) return {status_code_t::invalid_argument_k, "The request names no registered range"};
         if (request.extent.length == 0)
-            return {status_code_t::invalid_argument_k, "A transfer of no bytes is not a command"};
+            return {status_code_t::invalid_argument_k, "A zero byte transfer is no command"};
         if (request.buffer.offset > chunk->length || request.extent.length > chunk->length - request.buffer.offset)
             return {status_code_t::invalid_argument_k, "The request runs past its registered range"};
         if (request.extent.length > max_transfer_bytes_)
@@ -1771,7 +1770,7 @@ class linux_spdk_disk {
         if (!request.extent.fits_within(target->capacity))
             return {status_code_t::invalid_argument_k, "The request runs past the namespace"};
         if (!is_address_aligned(chunk->base + request.buffer.offset, portable_alignment_k))
-            return {status_code_t::invalid_argument_k, "The payload does not sit on a page boundary"};
+            return {status_code_t::invalid_argument_k, "The payload is not page aligned"};
         return {};
     }
 
@@ -1782,7 +1781,7 @@ class linux_spdk_disk {
     expected<std::uint32_t> start_(queue_pair_slot_t& slot, std::uint32_t base, request_t const& request) noexcept {
         std::uint32_t const index = take_flight_(slot, base);
         if (index == no_entry_k)
-            return status_t {status_code_t::capacity_exhausted_k, "This queue pair has no room for another command"};
+            return status_t {status_code_t::capacity_exhausted_k, "The queue pair is out of command slots"};
         flight_t& flight = flights_[base + index];
         flight.token = request.token;
         flight.length = request.kind == request_kind_t::flush_k || request.kind == request_kind_t::deallocate_k
@@ -1827,7 +1826,7 @@ class linux_spdk_disk {
         restore_(flight);
         free_flight_(slot, base, index);
         if (issued == -ENOMEM)
-            return status_t {status_code_t::capacity_exhausted_k, "The queue pair has no room for another command"};
+            return status_t {status_code_t::capacity_exhausted_k, "The queue pair is out of command slots"};
         return status_t {status_code_t::device_k, "The driver would not take this command"};
     }
 
@@ -1835,7 +1834,7 @@ class linux_spdk_disk {
     expected<std::uint32_t> hold_(queue_pair_slot_t& slot, std::uint32_t base, request_t const& request) noexcept {
         std::uint32_t const index = slot.staged_free;
         if (index == no_entry_k)
-            return status_t {status_code_t::capacity_exhausted_k, "This queue pair has no room to hold a chain"};
+            return status_t {status_code_t::capacity_exhausted_k, "The queue pair has no room for chains"};
         slot.staged_free = staged_[base + index].next_free;
         ++slot.staged_count;
         staged_[base + index].request = request;

@@ -26,10 +26,10 @@
 namespace unum::ustore {
 
 /** Moves output columns from the bounce into one device arena: each is carved there, copied once and repointed. */
-template <gpu_executor_concept executor_type_>
+template <util::gpu_executor_concept executor_type_>
 class column_uploader {
   public:
-    column_uploader(utilities::device_blocks_t& blocks, executor_type_& executor) noexcept
+    column_uploader(util::device_blocks_t& blocks, executor_type_& executor) noexcept
         : blocks_(blocks), executor_(executor) {}
 
     /** Moves the @p count elements @p column points to into the arena, answering where they
@@ -37,7 +37,7 @@ class column_uploader {
     template <typename element_type_>
     [[nodiscard]] std::span<element_type_ const> move(element_type_ const* column, std::size_t count) noexcept {
         if (status_.failed() || !column || !count) return {};
-        auto [device, device_status] = utilities::carve<element_type_>(blocks_, executor_, count);
+        auto [device, device_status] = util::carve<element_type_>(blocks_, executor_, count);
         if ((status_ = device_status).failed()) return {};
         std::span<element_type_ const> const host {column, count};
         status_ = executor_.upload_async(reinterpret_cast<std::uintptr_t>(device.data()), std::as_bytes(host));
@@ -61,13 +61,13 @@ class column_uploader {
     template <typename element_type_>
     std::span<element_type_> copy_into_bounce(element_type_ const* column, std::size_t count) noexcept {
         if (status_.failed()) return {};
-        auto [copy, copy_status] = utilities::arena_copy<element_type_>(executor_.bounce(), {column, count});
+        auto [copy, copy_status] = util::arena_copy<element_type_>(executor_.bounce(), {column, count});
         if ((status_ = copy_status).failed()) return {};
         status_ = executor_.pin_bounce();
         return copy;
     }
 
-    status_t status() const noexcept { return status_; }
+    util::status_t status() const noexcept { return status_; }
 
   private:
     template <typename tape_type_>
@@ -77,9 +77,9 @@ class column_uploader {
         tape.offsets = move(tape.offsets, count + 1).data();
     }
 
-    utilities::device_blocks_t& blocks_;
+    util::device_blocks_t& blocks_;
     executor_type_& executor_;
-    status_t status_;
+    util::status_t status_;
 };
 
 /** How many entries the @p count + 1 offsets an @p output points to list, read on the host before they move. */
@@ -96,7 +96,7 @@ template <typename arguments_type_, typename uploader_type_>
     }
 void output_columns(arguments_type_ const& arguments, uploader_type_& uploader) noexcept {
     std::size_t const count = static_cast<std::size_t>(arguments.count);
-    uploader.move_output(arguments.presences, divide_round_up(count, bits_in_byte_k));
+    uploader.move_output(arguments.presences, util::divide_round_up(count, util::bits_in_byte_k));
     uploader.move_output(arguments.lengths, count);
     if (arguments.values) uploader.move(*arguments.values, count);
 }
@@ -134,7 +134,7 @@ void output_columns(arguments_type_ const& arguments, uploader_type_& uploader) 
 template <typename uploader_type_>
 void output_columns(ustore_strings_read_t const& arguments, uploader_type_& uploader) noexcept {
     std::size_t const count = static_cast<std::size_t>(arguments.count);
-    uploader.move_output(arguments.presences, divide_round_up(count, bits_in_byte_k));
+    uploader.move_output(arguments.presences, util::divide_round_up(count, util::bits_in_byte_k));
     uploader.move_output(arguments.values, count);
 }
 
@@ -163,7 +163,7 @@ void output_columns(ustore_docs_gather_t const& arguments, uploader_type_& uploa
     if (!arguments.columns || !*arguments.columns) return;
     std::size_t const rows = static_cast<std::size_t>(arguments.count);
     std::size_t const fields = static_cast<std::size_t>(arguments.fields_count);
-    std::size_t const bitmap_bytes = divide_round_up(rows, bits_in_byte_k);
+    std::size_t const bitmap_bytes = util::divide_round_up(rows, util::bits_in_byte_k);
     std::span<ustore_docs_column_view_t> const views = uploader.copy_into_bounce(*arguments.columns, fields);
     for (std::size_t field = 0; field != views.size(); ++field) {
         ustore_docs_column_view_t& view = views[field];
@@ -179,14 +179,14 @@ void output_columns(ustore_docs_gather_t const& arguments, uploader_type_& uploa
 
 /** Moves every output column of @p hosted, which a host verb wrote into @p executor's bounce, into @p blocks, the
  *  call's device arena, one copy per column, and waits once. */
-template <typename arguments_type_, gpu_executor_concept executor_type_>
-status_t upload_output_columns(arguments_type_ const& hosted, utilities::device_blocks_t& blocks,
-                               executor_type_& executor) noexcept {
-    if (status_t const pinned = executor.pin_bounce(); pinned.failed()) return pinned;
+template <typename arguments_type_, util::gpu_executor_concept executor_type_>
+util::status_t upload_output_columns(arguments_type_ const& hosted, util::device_blocks_t& blocks,
+                                     executor_type_& executor) noexcept {
+    if (util::status_t const pinned = executor.pin_bounce(); pinned.failed()) return pinned;
     column_uploader<executor_type_> uploader {blocks, executor};
     output_columns(hosted, uploader);
     // Copies already queued read the bounce, which the next call rewinds, so a failure still waits for them
-    status_t const waited = executor.wait();
+    util::status_t const waited = executor.wait();
     return uploader.status().failed() ? uploader.status() : waited;
 }
 

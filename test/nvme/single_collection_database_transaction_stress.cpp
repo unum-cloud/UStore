@@ -35,7 +35,6 @@ namespace unum::ustore::test {
 using namespace unum::ustore::test::nvme;
 
 using namespace unum::ustore::blobs;
-using namespace unum::ustore::utilities;
 
 #pragma region Shape
 
@@ -60,7 +59,7 @@ struct stress_stack {
     using volume_t = typename fixture_t::volume_t;
     using database_t = basic_single_collection_database<
         stored_key_t, volume_t, atomic_reference, waiter_t,
-        nvme_store<inline_slot_t, volume_t, atomic_reference, waiter_t, last_write_fold_t, no_device_fold_t>>;
+        nvme_store<inline_slot_t, volume_t, atomic_reference, waiter_t, util::last_write_fold_t, no_device_fold_t>>;
 
     /** The disk, the arena and the channels. */
     std::unique_ptr<fixture_t> fixture;
@@ -78,7 +77,7 @@ struct stress_stack {
     std::unique_ptr<volume_t> volume;
 
     /** The channel of the calling thread, which every read of this stack takes. */
-    [[nodiscard]] io_channel_t& channel() noexcept { return reading.channel(); }
+    [[nodiscard]] util::io_channel_t& channel() noexcept { return reading.channel(); }
 };
 
 /** The database shape every case opens, whose small memory runs flush many times under the threads. */
@@ -95,13 +94,13 @@ struct stress_stack {
 }
 
 /** Writes @p counter into @p into, little end first, so a read of it needs no alignment. */
-void write_counter(std::uint64_t counter, std::span<byte_t> into) noexcept {
+void write_counter(std::uint64_t counter, std::span<util::byte_t> into) noexcept {
     for (std::size_t index = 0; index != value_bytes_k; ++index)
-        into[index] = static_cast<byte_t>((counter >> (index * 8)) & 0xFFull);
+        into[index] = static_cast<util::byte_t>((counter >> (index * 8)) & 0xFFull);
 }
 
 /** The counter @p from carries, which is zero for a span shorter than one. */
-[[nodiscard]] std::uint64_t read_counter(std::span<byte_t const> from) noexcept {
+[[nodiscard]] std::uint64_t read_counter(std::span<util::byte_t const> from) noexcept {
     if (from.size() < value_bytes_k) return 0;
     std::uint64_t counter = 0;
     for (std::size_t index = 0; index != value_bytes_k; ++index)
@@ -115,11 +114,12 @@ void write_counter(std::uint64_t counter, std::span<byte_t> into) noexcept {
 
 /** Mounts a fixture through @p mount, takes the three channels a case needs and opens the database over a volume. */
 template <typename mount_type_>
-expected<std::unique_ptr<stress_stack<typename mount_type_::fixture_t>>> make_stack(mount_type_ const& mount) noexcept {
+util::expected<std::unique_ptr<stress_stack<typename mount_type_::fixture_t>>> make_stack(
+    mount_type_ const& mount) noexcept {
     using stack_t = stress_stack<typename mount_type_::fixture_t>;
     using volume_t = typename stack_t::volume_t;
     auto stack = std::unique_ptr<stack_t> {new (std::nothrow) stack_t {}};
-    if (!stack) return status_t {status_code_t::out_of_memory_k, "The stack did not fit"};
+    if (!stack) return util::status_t {util::status_code_t::out_of_memory_k, "The stack did not fit"};
 
     auto [fixture, mount_status] = mount();
     if (mount_status.failed()) return mount_status;
@@ -135,16 +135,16 @@ expected<std::unique_ptr<stress_stack<typename mount_type_::fixture_t>>> make_st
     if (acquire_reading_status.failed()) return acquire_reading_status;
     stack->reading = std::move(reading);
 
-    expected<volume_t> volume = stack->fixture->mount_volume(stack->writing.channel());
-    if (!volume) return volume.status();
-    stack->volume = std::unique_ptr<volume_t> {new (std::nothrow) volume_t {std::move(*volume)}};
-    if (!stack->volume) return status_t {status_code_t::out_of_memory_k, "The volume did not fit"};
+    auto [volume, mount_volume_status] = stack->fixture->mount_volume(stack->writing.channel());
+    if (mount_volume_status.failed()) return mount_volume_status;
+    stack->volume = std::unique_ptr<volume_t> {new (std::nothrow) volume_t {std::move(volume)}};
+    if (!stack->volume) return util::status_t {util::status_code_t::out_of_memory_k, "The volume did not fit"};
     return stack;
 }
 
 /** Opens the database every case drives over the volume and the channels of @p stack. */
 template <typename stack_type_>
-expected<typename stack_type_::database_t::database_unique_ptr_t> open_over(stack_type_& stack) noexcept {
+util::expected<typename stack_type_::database_t::database_unique_ptr_t> open_over(stack_type_& stack) noexcept {
     return stack_type_::database_t::open(*stack.volume, stack.writing.channel(), stack.merging.channel(),
                                          stress_config(), stack.fixture->resources);
 }
@@ -155,24 +155,25 @@ expected<typename stack_type_::database_t::database_unique_ptr_t> open_over(stac
  *  @param[out] counters The counter every present key carries.
  */
 template <typename reader_type_>
-status_t read_counters(reader_type_& reader, io_channel_t& channel, std::span<stored_key_t const> keys,
-                       st::vector<bool>& present, st::vector<std::uint64_t>& counters) noexcept {
+util::status_t read_counters(reader_type_& reader, util::io_channel_t& channel, std::span<stored_key_t const> keys,
+                             st::vector<bool>& present, st::vector<std::uint64_t>& counters) noexcept {
     st::vector<lookup_result_t> results;
-    st::vector<std::array<byte_t, value_bytes_k>> values;
+    st::vector<std::array<util::byte_t, value_bytes_k>> values;
     if (results.resize(keys.size()) != st::status_t::success_k ||
         values.resize(keys.size()) != st::status_t::success_k ||
         present.resize(keys.size()) != st::status_t::success_k ||
         counters.resize(keys.size()) != st::status_t::success_k)
-        return {status_code_t::out_of_memory_k, "No room for the values of a batch"};
-    auto sink = [&](std::size_t request, std::uint64_t offset, std::span<byte_t const> bytes) noexcept {
+        return {util::status_code_t::out_of_memory_k, "No room for the values of a batch"};
+    auto sink = [&](std::size_t request, std::uint64_t offset, std::span<util::byte_t const> bytes) noexcept {
         for (std::size_t index = 0; index != bytes.size() && offset + index < value_bytes_k; ++index)
             values[request][static_cast<std::size_t>(offset + index)] = bytes[index];
     };
-    if (status_t const read = reader.select(channel, keys, std::span<lookup_result_t> {results}, sink); read.failed())
+    if (util::status_t const read = reader.select(channel, keys, std::span<lookup_result_t> {results}, sink);
+        read.failed())
         return read;
     for (std::size_t index = 0; index != keys.size(); ++index) {
         present[index] = results[index] == lookup_result_t::written_k;
-        counters[index] = present[index] ? read_counter(std::span<byte_t const> {values[index]}) : 0;
+        counters[index] = present[index] ? read_counter(std::span<util::byte_t const> {values[index]}) : 0;
     }
     return {};
 }
@@ -197,47 +198,47 @@ void test_chunks_land_whole(mount_type_ const& mount) {
     constexpr std::size_t keys_per_chunk_k = 100;
     constexpr std::size_t attempts_k = 1024;
 
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return;
-    expected<typename database_t::database_unique_ptr_t> store = open_over(**stack);
-    expect_true(store.has_value());
-    if (!store) return;
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return;
+    auto [store, open_status] = open_over(*stack);
+    expect_true(open_status.succeeded());
+    if (open_status.failed()) return;
 
     std::array<std::thread, worker_threads_k> workers;
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker)
         workers[worker] = std::thread {[&, worker]() noexcept {
-            expected<guard_t> guard = (*stack)->fixture->channels.acquire();
-            expect_true(guard.has_value());
-            if (!guard) return;
-            expected<typename database_t::transaction_unique_ptr_t> changing = (*store)->create_transaction();
-            expect_true(changing.has_value());
-            if (!changing) return;
+            auto [guard, acquire_status] = stack->fixture->channels.acquire();
+            expect_true(acquire_status.succeeded());
+            if (acquire_status.failed()) return;
+            auto [changing, begin_status] = store->create_transaction();
+            expect_true(begin_status.succeeded());
+            if (begin_status.failed()) return;
 
-            std::array<byte_t, value_bytes_k> value {};
+            std::array<util::byte_t, value_bytes_k> value {};
             st::vector<stored_key_t> keys;
             st::vector<bool> present;
             st::vector<std::uint64_t> counters;
             if (!expect_true(keys.resize(keys_per_chunk_k) == st::status_t::success_k)) return;
             for (std::size_t chunk = 0; chunk != chunks_k; ++chunk) {
-                write_counter(chunk * worker_threads_k + worker, std::span<byte_t> {value});
+                write_counter(chunk * worker_threads_k + worker, std::span<util::byte_t> {value});
                 for (std::size_t index = 0; index != keys_per_chunk_k; ++index)
                     keys[index] = static_cast<stored_key_t>(chunk * keys_per_chunk_k + index);
                 bool committed = false;
                 for (std::size_t attempt = 0; attempt != attempts_k && !committed; ++attempt) {
                     // A refused attempt is rolled back and written again, so its watches start from now.
                     for (std::size_t index = 0; index != keys_per_chunk_k; ++index)
-                        expect_true((*changing)->insert(keys[index], std::span<byte_t const> {value}).succeeded());
-                    status_t const landed = (*changing)->commit();
+                        expect_true(changing->insert(keys[index], std::span<util::byte_t const> {value}).succeeded());
+                    util::status_t const landed = changing->commit();
                     committed = landed.succeeded();
                     if (committed) break;
-                    expect_true(landed == status_code_t::write_conflict_k);
-                    (*changing)->rollback();
+                    expect_true(landed == util::status_code_t::write_conflict_k);
+                    changing->rollback();
                 }
                 expect_true(committed);
 
                 expect_true(
-                    read_counters(**store, guard->channel(), std::span<stored_key_t const> {keys}, present, counters)
+                    read_counters(*store, guard.channel(), std::span<stored_key_t const> {keys}, present, counters)
                         .succeeded());
                 for (std::size_t index = 0; index != present.size(); ++index) {
                     expect_true(present[index]);
@@ -252,9 +253,9 @@ void test_chunks_land_whole(mount_type_ const& mount) {
     st::vector<std::uint64_t> counters;
     if (!expect_true(keys.resize(chunks_k * keys_per_chunk_k) == st::status_t::success_k)) return;
     for (std::size_t index = 0; index != keys.size(); ++index) keys[index] = static_cast<stored_key_t>(index);
-    expect_true((*store)->flush().succeeded());
-    expect_true(read_counters(**store, (*stack)->channel(), std::span<stored_key_t const> {keys}, present, counters)
-                    .succeeded());
+    expect_true(store->flush().succeeded());
+    expect_true(
+        read_counters(*store, stack->channel(), std::span<stored_key_t const> {keys}, present, counters).succeeded());
     for (std::size_t index = 0; index != keys.size(); ++index) {
         std::size_t const chunk = index / keys_per_chunk_k;
         expect_true(present[index]);
@@ -313,29 +314,29 @@ void test_transactions_replay_in_commit_order(mount_type_ const& mount) {
     constexpr std::size_t inserters_k = 1;
     constexpr std::size_t removers_k = 1;
 
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return;
-    expected<typename database_t::database_unique_ptr_t> store = open_over(**stack);
-    expect_true(store.has_value());
-    if (!store) return;
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return;
+    auto [store, open_status] = open_over(*stack);
+    expect_true(open_status.succeeded());
+    if (open_status.failed()) return;
 
     std::array<st::vector<record_t>, worker_threads_k> records;
     std::array<std::thread, worker_threads_k> workers;
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker)
         workers[worker] = std::thread {[&, worker]() noexcept {
-            expected<guard_t> guard = (*stack)->fixture->channels.acquire();
-            expect_true(guard.has_value());
-            if (!guard) return;
-            expected<typename database_t::transaction_unique_ptr_t> changing = (*store)->create_transaction();
-            expect_true(changing.has_value());
-            if (!changing) return;
+            auto [guard, acquire_status] = stack->fixture->channels.acquire();
+            expect_true(acquire_status.succeeded());
+            if (acquire_status.failed()) return;
+            auto [changing, begin_status] = store->create_transaction();
+            expect_true(begin_status.succeeded());
+            if (begin_status.failed()) return;
 
             split_mix_generator_t random {case_stream_key(worker)};
             record_t::kind_t const kind = worker < inserters_k                ? record_t::kind_t::insert_k
                                           : worker < inserters_k + removers_k ? record_t::kind_t::remove_k
                                                                               : record_t::kind_t::read_k;
-            std::array<byte_t, value_bytes_k> value {};
+            std::array<util::byte_t, value_bytes_k> value {};
             for (std::size_t round = 0; round != transactions_k; ++round) {
                 record_t record;
                 record.kind = kind;
@@ -349,27 +350,27 @@ void test_transactions_replay_in_commit_order(mount_type_ const& mount) {
                 }
 
                 if (kind == record_t::kind_t::read_k) {
-                    expect_true(read_counters(**changing, guard->channel(), std::span<stored_key_t const> {record.keys},
+                    expect_true(read_counters(*changing, guard.channel(), std::span<stored_key_t const> {record.keys},
                                               record.present, record.counters)
                                     .succeeded());
                 }
                 else
                     for (std::size_t index = 0; index != operations; ++index) {
-                        write_counter(record.counters[index], std::span<byte_t> {value});
-                        status_t const written = kind == record_t::kind_t::insert_k
-                                                     ? (*changing)->insert(record.keys[index],
-                                                                           std::span<byte_t const> {value})
-                                                     : (*changing)->remove(record.keys[index]);
+                        write_counter(record.counters[index], std::span<util::byte_t> {value});
+                        util::status_t const written = kind == record_t::kind_t::insert_k
+                                                           ? changing->insert(record.keys[index],
+                                                                              std::span<util::byte_t const> {value})
+                                                           : changing->remove(record.keys[index]);
                         expect_true(written.succeeded());
                     }
 
-                status_t const committed = (*changing)->commit();
+                util::status_t const committed = changing->commit();
                 if (committed.failed()) {
-                    expect_true(committed == status_code_t::write_conflict_k);
-                    (*changing)->rollback();
+                    expect_true(committed == util::status_code_t::write_conflict_k);
+                    changing->rollback();
                     continue;
                 }
-                record.stamp = (*changing)->last_commit_stamp();
+                record.stamp = changing->last_commit_stamp();
                 expect_true(records[worker].push_back(std::move(record)) == st::status_t::success_k);
             }
         }};
@@ -410,9 +411,9 @@ void test_transactions_replay_in_commit_order(mount_type_ const& mount) {
     st::vector<std::uint64_t> counters;
     if (!expect_true(keys.resize(keys_k) == st::status_t::success_k)) return;
     for (std::size_t index = 0; index != keys_k; ++index) keys[index] = static_cast<stored_key_t>(index);
-    expect_true((*store)->flush().succeeded());
-    expect_true(read_counters(**store, (*stack)->channel(), std::span<stored_key_t const> {keys}, present, counters)
-                    .succeeded());
+    expect_true(store->flush().succeeded());
+    expect_true(
+        read_counters(*store, stack->channel(), std::span<stored_key_t const> {keys}, present, counters).succeeded());
     for (std::size_t index = 0; index != keys_k; ++index) {
         expect_equal(present[index], model_present[index]);
         if (model_present[index]) expect_equal(counters[index], model_counters[index]);
@@ -429,8 +430,8 @@ int main(int argc, char** argv) {
 
     start_test_run(argc, argv);
 
-    st::expected<scratch_directory_t> const directory = scratch_directory_t::make(test_run.settings.directory);
-    if (!directory) {
+    auto [directory, directory_status] = scratch_directory_t::make(test_run.settings.directory);
+    if (st::failed(directory_status)) {
         fmt::println(stderr, "  the working directory would not open");
         return 1;
     }
@@ -440,7 +441,7 @@ int main(int argc, char** argv) {
         report_on_mount(mount, "test_transactions_replay_in_commit_order", test_transactions_replay_in_commit_order);
     };
     for (transport_t const transport : every_transport_k)
-        run_on_transport(transport, directory->path(), stress_config_k, 1,
+        run_on_transport(transport, directory.path(), stress_config_k, 1,
                          "single_collection_database_transaction_stress", cases);
 
     return finish_test_run();

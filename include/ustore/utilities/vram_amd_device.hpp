@@ -314,11 +314,11 @@ class hip_executor_t {
         executor.stream_ = static_cast<hip_stream_handle_t>(borrowed);
         if (!borrowed) {
             if (api.stream_create_with_flags(&executor.owned_stream_, hip_stream_non_blocking_k) != hip_success_k)
-                return status_t {status_code_t::device_k, "Failed to create a stream on the device"};
+                return status_t {status_code_t::device_k, "The device gave no stream"};
             executor.stream_ = executor.owned_stream_;
         }
         executor.event_ = hip_event_t {api};
-        if (!executor.event_) return status_t {status_code_t::device_k, "Failed to create an event on the device"};
+        if (!executor.event_) return status_t {status_code_t::device_k, "The device gave no event"};
         // The bounce stays on node zero where the runtime places the device on no NUMA node
         int numa_node = -1;
         if (api.get_device_attribute(&numa_node, hip_attribute_host_numa_id_k, ordinal) != hip_success_k ||
@@ -328,6 +328,8 @@ class hip_executor_t {
         return executor;
     }
 
+    /** Holds nothing, as a moved-from executor does. */
+    hip_executor_t() noexcept = default;
     hip_executor_t(hip_executor_t&& other) noexcept { swap(other); }
     hip_executor_t& operator=(hip_executor_t&& other) noexcept {
         swap(other);
@@ -346,7 +348,7 @@ class hip_executor_t {
     status_t wait() noexcept {
         if (api_->set_device(static_cast<int>(device_.vendor_ordinal)) != hip_success_k ||
             !event_.record_and_wait(stream_))
-            return {status_code_t::device_k, "The device failed a call queued on the executor"};
+            return {status_code_t::device_k, "A device call on the executor failed"};
         return {};
     }
 
@@ -442,8 +444,6 @@ class hip_executor_t {
     managed_blocks_t& managed() noexcept { return managed_; }
 
   private:
-    hip_executor_t() noexcept = default;
-
     void swap(hip_executor_t& other) noexcept {
         std::swap(api_, other.api_), std::swap(owned_stream_, other.owned_stream_), std::swap(stream_, other.stream_);
         std::swap(event_, other.event_), std::swap(device_, other.device_);

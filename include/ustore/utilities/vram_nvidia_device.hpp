@@ -333,11 +333,11 @@ class cuda_executor_t {
         executor.stream_ = static_cast<cuda_stream_handle_t>(borrowed);
         if (!borrowed) {
             if (api.stream_create(&executor.owned_stream_, cuda_stream_non_blocking_k) != cuda_success_k)
-                return status_t {status_code_t::device_k, "Failed to create a stream on the device"};
+                return status_t {status_code_t::device_k, "The device gave no stream"};
             executor.stream_ = executor.owned_stream_;
         }
         executor.event_ = cuda_event_t {api};
-        if (!executor.event_) return status_t {status_code_t::device_k, "Failed to create an event on the device"};
+        if (!executor.event_) return status_t {status_code_t::device_k, "The device gave no event"};
         // The bounce stays on node zero where the driver places the device on no NUMA node
         int handle = 0, numa_node = -1;
         if (api.get_device(&handle, static_cast<int>(device.vendor_ordinal)) != cuda_success_k ||
@@ -348,6 +348,8 @@ class cuda_executor_t {
         return executor;
     }
 
+    /** Holds nothing, as a moved-from executor does. */
+    cuda_executor_t() noexcept = default;
     cuda_executor_t(cuda_executor_t&& other) noexcept { swap(other); }
     cuda_executor_t& operator=(cuda_executor_t&& other) noexcept {
         swap(other);
@@ -365,7 +367,7 @@ class cuda_executor_t {
     /** Waits until everything queued on the stream ran, reporting a failure among it as @c device_k. */
     status_t wait() noexcept {
         if (api_->set_current_context(context_) != cuda_success_k || !event_.record_and_wait(stream_))
-            return {status_code_t::device_k, "The device failed a call queued on the executor"};
+            return {status_code_t::device_k, "A device call on the executor failed"};
         return {};
     }
 
@@ -460,8 +462,6 @@ class cuda_executor_t {
     managed_blocks_t& managed() noexcept { return managed_; }
 
   private:
-    cuda_executor_t() noexcept = default;
-
     void swap(cuda_executor_t& other) noexcept {
         std::swap(api_, other.api_), std::swap(context_, other.context_);
         std::swap(owned_stream_, other.owned_stream_), std::swap(stream_, other.stream_);

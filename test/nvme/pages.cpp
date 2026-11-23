@@ -69,8 +69,8 @@ expected<database_t> open_small_nvme(char const* directory) noexcept {
     open.transaction_max_bytes = small_memory_runs_bytes_k / 2;
     open.collection_level_enlarge_factor = 2;
     ustore_database_open_nvme(&open);
-    if (status_t const status {outcome}; status.failed()) return status;
-    return database_t {database};
+    if (status_t const status = status_of<status_t, status_code_t>(outcome); status.failed()) return {{}, status};
+    return {database_t {database}};
 }
 
 /** Creates a collection named @p name holding pages in @p database. */
@@ -81,8 +81,8 @@ expected<ustore_collection_id_t> create_pages_collection(ustore_database_t datab
     create.database = database, create.outcome = &outcome, create.name = bytes_of(name);
     create.modality = ustore_modality_pages_k, create.collection = &created;
     ustore_collection_create(&create);
-    if (status_t const status {outcome}; status.failed()) return status;
-    return created;
+    if (status_t const status = status_of<status_t, status_code_t>(outcome); status.failed()) return {{}, status};
+    return {std::move(created)};
 }
 
 /** The Nil key, which stands for the root as a parent and for the front as an anchor. */
@@ -109,7 +109,7 @@ struct pages_client_t {
         address(import, outcome, page);
         import.values = values.view(), import.encoding = ustore_page_encoding_xml_k;
         ustore_pages_import(&import);
-        return status_t {outcome};
+        return status_of<status_t, status_code_t>(outcome);
     }
 
     status_t insert(ustore_key_t page, ustore_key_t element, ustore_key_t parent, ustore_key_t anchor,
@@ -119,9 +119,9 @@ struct pages_client_t {
         ustore_pages_insert_t insert {};
         address(insert, outcome, page);
         insert.elements = {&element, 0}, insert.parents = {&parent, 0}, insert.anchors = {&anchor, 0};
-        insert.values = values.view(), insert.encoding = ustore_page_encoding_xml_k, insert.arena = arena;
+        insert.values = values.view(), insert.encoding = ustore_page_encoding_xml_k, insert.arena = arena.handle();
         ustore_pages_insert(&insert);
-        return status_t {outcome};
+        return status_of<status_t, status_code_t>(outcome);
     }
 
     status_t remove(ustore_key_t page, ustore_key_t element) {
@@ -130,7 +130,7 @@ struct pages_client_t {
         address(remove, outcome, page);
         remove.elements = {&element, 0};
         ustore_pages_remove(&remove);
-        return status_t {outcome};
+        return status_of<status_t, status_code_t>(outcome);
     }
 
     status_t move(ustore_key_t page, ustore_key_t element, ustore_key_t parent, ustore_key_t anchor) {
@@ -139,7 +139,7 @@ struct pages_client_t {
         address(move, outcome, page);
         move.elements = {&element, 0}, move.parents = {&parent, 0}, move.anchors = {&anchor, 0};
         ustore_pages_move(&move);
-        return status_t {outcome};
+        return status_of<status_t, status_code_t>(outcome);
     }
 
     status_t splice(ustore_key_t page, ustore_key_t element, ustore_length_t start, ustore_length_t length,
@@ -151,7 +151,7 @@ struct pages_client_t {
         splice.elements = {&element, 0}, splice.values = values.view();
         splice.text_starts = {&start, 0}, splice.text_lengths = {&length, 0};
         ustore_pages_splice(&splice);
-        return status_t {outcome};
+        return status_of<status_t, status_code_t>(outcome);
     }
 
     status_t set_attribute(ustore_key_t page, ustore_key_t element, std::string_view name, std::string_view value) {
@@ -163,7 +163,7 @@ struct pages_client_t {
         set_attributes.elements = {&element, 0}, set_attributes.fields = fields.view(),
         set_attributes.values = values.view();
         ustore_pages_set_attributes(&set_attributes);
-        return status_t {outcome};
+        return status_of<status_t, status_code_t>(outcome);
     }
 
     status_t remove_attribute(ustore_key_t page, ustore_key_t element, std::string_view name) {
@@ -173,7 +173,7 @@ struct pages_client_t {
         address(remove, outcome, page);
         remove.elements = {&element, 0}, remove.fields = fields.view();
         ustore_pages_remove_attributes(&remove);
-        return status_t {outcome};
+        return status_of<status_t, status_code_t>(outcome);
     }
 
     /** The page keyed @p page rendered as XML, through the transaction when set, @c page_absent_k where missing, or
@@ -187,22 +187,22 @@ struct pages_client_t {
         read.database = database, read.outcome = &outcome;
         read.view = transaction ? ustore_transaction_view(transaction, ustore_watch_none_k) : nullptr;
         read.count = 1, read.collections = {&collection, 0}, read.keys = {&page, 0}, read.elements = {&root, 0};
-        read.presences = &presences, read.values = &values, read.arena = arena;
+        read.presences = &presences, read.values = &values, read.arena = arena.handle();
         read.outputs_encoding = ustore_page_encoding_xml_k;
         ustore_pages_read(&read);
         if (outcome.status != ustore_status_success_k) return ustore_status_name(outcome.status);
         if (!(presences[0] & 1)) return std::string(page_absent_k);
-        return std::string(chars_of(tape_string(values, 0)));
+        return std::string(strings_view_t {values, 1}[0]);
     }
 };
 
 /** A client of a fresh pages collection named @p name in @p database, or a failure. */
 expected<pages_client_t> pages_client(ustore_database_t database, std::string_view name) {
     auto [collection, create_status] = create_pages_collection(database, name);
-    if (create_status.failed()) return create_status;
+    if (create_status.failed()) return {{}, create_status};
     auto [arena, arena_status] = arena_t::make();
-    if (arena_status.failed()) return arena_status;
-    return pages_client_t {database, collection, nullptr, std::move(arena)};
+    if (arena_status.failed()) return {{}, arena_status};
+    return {pages_client_t {database, collection, nullptr, std::move(arena)}};
 }
 
 #pragma endregion Pages Client
@@ -217,35 +217,35 @@ case_result_t test_concurrent_edits_commit(char const* directory) {
     if (!expect_true(scratch_directory_t::recreate(home.c_str()))) return {};
     auto [memory, memory_status] = open_database<database_t>(config_t {engine_options_t {}, nullptr});
     auto [drive, drive_status] = open_small_nvme(home.c_str());
-    if (!expect_true(memory_status.succeeded() && drive_status.succeeded())) return {};
-    auto [expected_pages, expected_status] = pages_client(memory, "concurrent");
-    auto [stored_pages, stored_status] = pages_client(drive, "concurrent");
-    if (!expect_true(expected_status.succeeded() && stored_status.succeeded())) return {};
+    if (!expect_true(!memory_status.failed() && !drive_status.failed())) return {};
+    auto [expected_pages, expected_status] = pages_client(memory.handle(), "concurrent");
+    auto [stored_pages, stored_status] = pages_client(drive.handle(), "concurrent");
+    if (!expect_true(!expected_status.failed() && !stored_status.failed())) return {};
 
     ustore_key_t const page = key_from_integer(7);
     ustore_key_t const inserted = key_from_integer(70);
     std::string_view const markup = "<doc><p>one</p></doc>";
-    expect_true(expected_pages.import(page, markup).succeeded() && stored_pages.import(page, markup).succeeded());
-    expect_true(expected_pages.insert(page, inserted, nil_k, nil_k, "<p>two</p>").succeeded());
+    expect_true(!expected_pages.import(page, markup).failed() && !stored_pages.import(page, markup).failed());
+    expect_true(!expected_pages.insert(page, inserted, nil_k, nil_k, "<p>two</p>").failed());
     std::string const after_insert = expected_pages.read(page);
-    expect_true(expected_pages.set_attribute(page, page, "class", "x").succeeded());
+    expect_true(!expected_pages.set_attribute(page, page, "class", "x").failed());
     std::string const after_both = expected_pages.read(page);
 
-    auto [first, first_status] = drive.on().transaction();
-    auto [second, second_status] = drive.on().transaction();
-    if (!expect_true(first_status.succeeded() && second_status.succeeded())) return {};
-    pages_client_t first_pages {drive, stored_pages.collection, first.transaction(), std::move(stored_pages.arena)};
+    auto [first, first_status] = drive.transaction();
+    auto [second, second_status] = drive.transaction();
+    if (!expect_true(!first_status.failed() && !second_status.failed())) return {};
+    pages_client_t first_pages {drive.handle(), stored_pages.collection, first.handle(), std::move(stored_pages.arena)};
     auto [second_arena, second_arena_status] = arena_t::make();
-    if (!expect_true(second_arena_status.succeeded())) return {};
-    pages_client_t second_pages {drive, first_pages.collection, second.transaction(), std::move(second_arena)};
-    pages_client_t head_pages {drive, first_pages.collection, nullptr, std::move(expected_pages.arena)};
+    if (!expect_true(!second_arena_status.failed())) return {};
+    pages_client_t second_pages {drive.handle(), first_pages.collection, second.handle(), std::move(second_arena)};
+    pages_client_t head_pages {drive.handle(), first_pages.collection, nullptr, std::move(expected_pages.arena)};
 
-    expect_true(first_pages.insert(page, inserted, nil_k, nil_k, "<p>two</p>").succeeded());
-    expect_true(second_pages.set_attribute(page, page, "class", "x").succeeded());
+    expect_true(!first_pages.insert(page, inserted, nil_k, nil_k, "<p>two</p>").failed());
+    expect_true(!second_pages.set_attribute(page, page, "class", "x").failed());
     expect_equal(first_pages.read(page), after_insert);
     expect_equal(head_pages.read(page), std::string(markup));
-    expect_true(first.on().commit().has_value());
-    expect_true(second.on().commit().has_value());
+    expect_true(!first.commit().status.failed());
+    expect_true(!second.commit().status.failed());
     expect_equal(head_pages.read(page), after_both);
     return {};
 }
@@ -259,9 +259,9 @@ case_result_t test_fold_survives_maintenance(char const* directory) {
     std::string const home = fmt::format("{}/{}", directory, "maintenance");
     if (!expect_true(scratch_directory_t::recreate(home.c_str()))) return {};
     auto [memory, memory_status] = open_database<database_t>(config_t {engine_options_t {}, nullptr});
-    if (!expect_true(memory_status.succeeded())) return {};
-    auto [expected_pages, expected_status] = pages_client(memory, "maintenance");
-    if (!expect_true(expected_status.succeeded())) return {};
+    if (!expect_true(!memory_status.failed())) return {};
+    auto [expected_pages, expected_status] = pages_client(memory.handle(), "maintenance");
+    if (!expect_true(!expected_status.failed())) return {};
 
     std::array<ustore_key_t, model_pages_k> pages;
     std::array<std::vector<ustore_key_t>, model_pages_k> given;
@@ -303,9 +303,9 @@ case_result_t test_fold_survives_maintenance(char const* directory) {
     ustore_collection_id_t stored_collection {};
     {
         auto [drive, drive_status] = open_small_nvme(home.c_str());
-        if (!expect_true(drive_status.succeeded())) return {};
-        auto [stored_pages, stored_status] = pages_client(drive, "maintenance");
-        if (!expect_true(stored_status.succeeded())) return {};
+        if (!expect_true(!drive_status.failed())) return {};
+        auto [stored_pages, stored_status] = pages_client(drive.handle(), "maintenance");
+        if (!expect_true(!stored_status.failed())) return {};
         stored_collection = stored_pages.collection;
 
         for (std::size_t call = 0; call != model_calls_k; ++call) {
@@ -340,23 +340,23 @@ case_result_t test_fold_survives_maintenance(char const* directory) {
             if (!expect_true(answered.code == wanted.code, "call {} of roll {}: wanted {}, got {}", call, roll,
                              status_name(wanted.code), status_name(answered.code)))
                 break;
-            landed += wanted.succeeded();
+            landed += !wanted.failed();
             if (roll >= 6 && roll < 40 && !missing) given[index].push_back(key_from_integer(next_given++));
             // A compaction flushes the memory runs first, so the records land in runs over bases in older ones
-            if (call % flush_calls_k == 0 && !expect_true(drive.on().compact().succeeded())) break;
+            if (call % flush_calls_k == 0 && !expect_true(!drive.compact().failed())) break;
             if (call % checkpoint_calls_k == 0 && !compare_all(stored_pages, "after a checkpoint")) break;
         }
         expect_true(landed * 10 > model_calls_k * 9, "{} of {} calls landed", landed, model_calls_k);
         compare_all(stored_pages, "after every call");
-        expect_true(drive.on().compact().succeeded());
+        expect_true(!drive.compact().failed());
         compare_all(stored_pages, "after a compaction");
     }
 
     auto [reopened, reopen_status] = open_small_nvme(home.c_str());
-    if (!expect_true(reopen_status.succeeded())) return {};
+    if (!expect_true(!reopen_status.failed())) return {};
     auto [arena, arena_status] = arena_t::make();
-    if (!expect_true(arena_status.succeeded())) return {};
-    pages_client_t stored_pages {reopened, stored_collection, nullptr, std::move(arena)};
+    if (!expect_true(!arena_status.failed())) return {};
+    pages_client_t stored_pages {reopened.handle(), stored_collection, nullptr, std::move(arena)};
     compare_all(stored_pages, "after a reopen");
     return {};
 }
@@ -366,12 +366,12 @@ case_result_t test_fold_survives_maintenance(char const* directory) {
 int main(int argc, char** argv) {
     start_test_run(argc, argv);
 
-    st::expected<scratch_directory_t> const directory = scratch_directory_t::make(test_run.settings.directory);
-    if (!directory) {
+    auto [directory, directory_status] = scratch_directory_t::make(test_run.settings.directory);
+    if (st::failed(directory_status)) {
         fmt::println(stderr, "  the working directory would not open");
         return 1;
     }
-    char const* const home = directory->path();
+    char const* const home = directory.path();
     run_test_case("test_concurrent_edits_commit", test_concurrent_edits_commit, home);
     run_test_case("test_fold_survives_maintenance", test_fold_survives_maintenance, home);
     return finish_test_run();

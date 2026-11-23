@@ -123,26 +123,27 @@ typedef enum ustore_admission_t {
 
 } ustore_admission_t;
 
-/** Admits or rejects @p count listed keys at once, never zero, writing one admission per key into @p admissions, a
- *  buffer the library owns for the call. Runs on the thread running the call, never concurrently with itself within
- *  one call. */
+/** Admits or rejects @p count listed keys at once, never zero, writing one admission per key into
+ *  @p admissions, a buffer the library owns for the call and fills with @c ustore_reject_k first,
+ *  so a key the handler leaves unanswered stays rejected. Runs on the thread running the call and
+ *  never concurrently with itself within one call. */
 typedef void (*ustore_predicate_callback_t)(ustore_key_t const* keys, ustore_admission_t* admissions,
                                             ustore_size_t count, void* state);
 
-/** How costly one predicate call is, which decides where in a scan it is asked. */
+/** What one call costs the predicate's handler, which decides where in a scan it is asked. */
 typedef enum ustore_predicate_cost_t {
 
     /** Asked once per page of listed keys, before patterns or filters read any value, so it narrows those reads. */
-    ustore_predicate_cheap_k = 0,
+    ustore_predicate_cost_cheap_k = 0,
 
-    /** Asked once per page about the keys patterns and filters kept, for handlers that pay per call, such as a lookup
-     *  in an external database. */
-    ustore_predicate_expensive_k = 1,
+    /** Asked once per page about every key patterns and filters kept, for handlers that pay per
+     *  call, such as a lookup in an external database. */
+    ustore_predicate_cost_expensive_k = 1,
 
 } ustore_predicate_cost_t;
 
-/** The canonical spelling of a predicate cost, as @c ustore_predicate_expensive_k spells "expensive", or
- *  "unrecognized". */
+/** The canonical spelling of a predicate cost, as @c ustore_predicate_cost_expensive_k spells
+ *  "expensive", or "unrecognized". */
 USTORE_EXPORT char const* ustore_predicate_cost_name(ustore_predicate_cost_t cost);
 
 /** Reads a predicate cost back from its canonical spelling, or fails with
@@ -159,7 +160,7 @@ typedef struct ustore_predicate_t {
     /** Opaque pointer passed to every @c callback call. */
     void* state;
 
-    /** Where in a scan @c callback is asked. */
+    /** What one @c callback call costs the handler, which decides where in a scan it is asked. */
     ustore_predicate_cost_t cost;
 
 } ustore_predicate_t;

@@ -487,7 +487,7 @@ class basic_storage_mount {
     status_t mount(resources_config_t const& config, constraint_t& constraint, std::size_t threads,
                    std::size_t runs_capacity) noexcept {
         if (config.shared_io_channels == 0)
-            return {status_code_t::invalid_argument_k, "A mount keeps a channel for the threads outside its executor"};
+            return {status_code_t::invalid_argument_k, "A mount keeps a channel per outside thread"};
         auto [addresses, addresses_status] = addresses_of(config);
         if (addresses_status.failed()) return addresses_status;
 
@@ -636,12 +636,10 @@ class mounted_storage {
         for (data_address_t const& address : addresses.data_directories)
             if ((address.kind == data_address_kind_t::spdk_k) != on_spdk ||
                 (on_spdk && address.location != addresses.data_directories[0].location))
-                return {status_code_t::invalid_argument_k,
-                        "SPDK data directories name one controller and nothing else"};
+                return {status_code_t::invalid_argument_k, "SPDK directories must share one controller"};
         if (on_spdk != (config.io_transport == io_transport_t::linux_spdk_k) &&
             config.io_transport != io_transport_t::automatic_k)
-            return {status_code_t::invalid_argument_k,
-                    "SPDK and spdk:// data directories are taken together or not at all"};
+            return {status_code_t::invalid_argument_k, "The transport and SPDK directories disagree"};
 
         report_.linux_uring = files_disk_t::linux_uring_disk_t::probe();
         report_.linux_aio = files_disk_t::linux_aio_disk_t::probe();
@@ -659,7 +657,7 @@ class mounted_storage {
         std::size_t const volume_files = 2; // the lock, and one manifest file or directory at a time
         std::size_t const reserved = owners + volume_files;
         if (descriptors <= reserved)
-            return {status_code_t::capacity_exhausted_k, "The descriptor limit leaves no room for a run file"};
+            return {status_code_t::capacity_exhausted_k, "The descriptor limit leaves no run file"};
         std::uint16_t const targets = static_cast<std::uint16_t>(
             fu::min_of<std::size_t>(descriptors - reserved, (std::numeric_limits<std::uint16_t>::max)() - 1));
 
@@ -667,10 +665,10 @@ class mounted_storage {
         case io_transport_t::memory_k: {
             auto [device, make_memory_device_status] = memory_device_t::make(portable_alignment_k);
             if (make_memory_device_status.failed()) return make_memory_device_status;
-            expected<memory_disk_t> disk = memory_disk_t::make(std::move(device), ring_config_(config, owners, targets),
-                                                               constraint);
-            if (!disk) return disk.status();
-            return adopt_<memory_disk_t>(std::move(*disk), config, constraint, threads, targets);
+            auto [disk, make_disk_status] = memory_disk_t::make(std::move(device),
+                                                                ring_config_(config, owners, targets), constraint);
+            if (make_disk_status.failed()) return make_disk_status;
+            return adopt_<memory_disk_t>(std::move(disk), config, constraint, threads, targets);
         }
         case io_transport_t::blocking_k: return mount_blocking_(config, constraint, threads, owners, targets);
         case io_transport_t::linux_uring_k: return mount_linux_uring_(config, constraint, threads, owners, targets);
@@ -747,10 +745,10 @@ class mounted_storage {
         auto [device, make_device_status] = blocking_files_device_t::make(file_buffering_t::unbuffered_k);
         if (make_device_status.failed()) return make_device_status;
         using blocking_disk_t = typename files_disk_t::blocking_disk_t;
-        expected<blocking_disk_t> disk = blocking_disk_t::make(std::move(device), ring_config_(config, owners, targets),
-                                                               constraint);
-        if (!disk) return disk.status();
-        return adopt_<files_disk_t>(files_disk_t {std::move(*disk)}, config, constraint, threads, targets);
+        auto [disk, make_disk_status] = blocking_disk_t::make(std::move(device), ring_config_(config, owners, targets),
+                                                              constraint);
+        if (make_disk_status.failed()) return make_disk_status;
+        return adopt_<files_disk_t>(files_disk_t {std::move(disk)}, config, constraint, threads, targets);
     }
 
     /** Mounts io_uring on unbuffered files, one ring per queue pair, with @p owners queue pairs
@@ -761,8 +759,7 @@ class mounted_storage {
         std::uint16_t const ranges = bounded_count_(
             divide_round_up(config.channels.arena_bytes() * owners, linux_uring_registered_range_bytes_k),
             static_cast<std::size_t>(registered_memory_id_t::unregistered_k));
-        if (ranges == 0)
-            return {status_code_t::capacity_exhausted_k, "A ring registers fewer ranges than the arena spans"};
+        if (ranges == 0) return {status_code_t::capacity_exhausted_k, "The ring registers fewer ranges than the arena"};
         linux_uring_disk_config_t ring;
         ring.queue_pairs_limit = owners;
         ring.depth_limit = config.channels.depth;
@@ -809,7 +806,7 @@ class mounted_storage {
         case linux_spdk_probe_t::without_hugepages_k:
             return {status_code_t::unsupported_k, "The SPDK controller needs free hugepages"};
         case linux_spdk_probe_t::without_permission_k:
-            return {status_code_t::unsupported_k, "The SPDK controller is not bound to a user-space driver"};
+            return {status_code_t::unsupported_k, "The controller is not on a user-space driver"};
         case linux_spdk_probe_t::not_found_k: return {status_code_t::not_found_k, "No SPDK controller at that address"};
         }
         linux_spdk_environment_config_t pages;
@@ -927,7 +924,7 @@ expected<resources_shared_ptr<atomic_reference_, waiter_type_>> open_resources(
     resources_shared_ptr<atomic_reference_, waiter_type_> resources = std::make_shared<resources_t>(
         config.memory_limit, config.gpu_memory_limit);
     if (resources->gpu_devices.resize(config.gpu_devices.size()) != st::status_t::success_k)
-        return status_t {status_code_t::out_of_memory_k, "A database could not list the GPUs it may use"};
+        return status_t {status_code_t::out_of_memory_k, "No room to list the usable GPUs"};
     for (std::size_t index = 0; index != config.gpu_devices.size(); ++index)
         resources->gpu_devices[index] = config.gpu_devices[index];
 

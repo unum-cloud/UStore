@@ -28,9 +28,8 @@
 #include <stringzilla/subdocuments.h>  // `sz_subdocuments_engine_t`, `sz_subdocuments_contains`
 #include <stringzilla/substrings.h>    // `sz_substrings_engine_t`, `sz_substrings_contains`
 
-#include "ustore/types.hpp"                 // `key_after`, `key_before`, `largest_key_k`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `arena_rewind`
-#include "ustore/utilities/types.hpp"       // `stringzilla_refusal`
+#include "ustore/utilities/types.hpp"       // `key_after`, `key_before`, `largest_key_k`, `stringzilla_refusal`
 
 #include "engine.hpp"              // `vendored_residency_t`, `residency_tables`, `view_t`
 #include "utilities/arguments.hpp" // `matches_patterns_concept`, `matches_filter_concept`, `answers_scores_concept`
@@ -38,7 +37,6 @@
 #include "utilities/progress.hpp"  // `progress_t`, `progress_cancelled_k`
 
 namespace unum::ustore {
-using namespace unum::ustore::utilities;
 
 template <typename>
 struct verb_slot;
@@ -94,16 +92,16 @@ struct compiled_match<vendored_residency_t::host_k> {
     bool asks() const noexcept { return predicate.callback != nullptr; }
 
     /** Rewinds @p page, which a listing lays every page out in. */
-    void rewind_page(ustore_arena_t page) const noexcept { arena_rewind(page); }
+    void rewind_page(ustore_arena_t page) const noexcept { util::arena_rewind(page); }
 
     /** Keeps among @p candidates of the page listing @p keys those the predicate admits, when its cost places it at
      *  @p phase, gathering the asked keys and their admissions into @p work. */
-    status_t ask(ustore_predicate_cost_t phase, std::span<ustore_key_t const> keys, candidates_t& candidates,
-                 ustore_arena_t work) const noexcept {
+    util::status_t ask(ustore_predicate_cost_t phase, std::span<ustore_key_t const> keys, candidates_t& candidates,
+                       ustore_arena_t work) const noexcept {
         if (!predicate.callback || predicate.cost != phase || !candidates.count) return {};
-        auto [asked, asked_status] = arena_allocate<ustore_key_t>(work, candidates.count);
+        auto [asked, asked_status] = util::arena_allocate<ustore_key_t>(work, candidates.count);
         if (asked_status.failed()) return asked_status;
-        auto [admissions, admissions_status] = arena_allocate<ustore_admission_t>(work, candidates.count);
+        auto [admissions, admissions_status] = util::arena_allocate<ustore_admission_t>(work, candidates.count);
         if (admissions_status.failed()) return admissions_status;
         for (std::size_t index = 0; index != candidates.count; ++index) {
             asked[index] = keys[candidates.indices[index]];
@@ -122,16 +120,17 @@ struct compiled_match<vendored_residency_t::host_k> {
 
     /** Keeps among @p candidates those whose @p values, one per candidate in their order, the engine contains a match
      *  in, laying out their views and the bitmap of matches in @p work. */
-    status_t select(strings_arg_t const& values, candidates_t& candidates, ustore_arena_t work) const noexcept {
+    util::status_t select(strings_arg_t const& values, candidates_t& candidates, ustore_arena_t work) const noexcept {
         if (!reads_values() || !candidates.count) return {};
-        auto [views, views_status] = arena_allocate<sz_string_view_t>(work, candidates.count);
+        auto [views, views_status] = util::arena_allocate<sz_string_view_t>(work, candidates.count);
         if (views_status.failed()) return views_status;
         for (std::size_t index = 0; index != candidates.count; ++index) {
             ustore_bytes_view_t const value = values[index];
             views[index].start = reinterpret_cast<sz_cptr_t>(value.data);
             views[index].length = static_cast<sz_size_t>(value.length);
         }
-        auto [contained, contained_status] = arena_allocate<sz_u1x8_t>(work, divide_round_up(candidates.count, 8));
+        auto [contained, contained_status] = util::arena_allocate<sz_u1x8_t>(
+            work, util::divide_round_up(candidates.count, 8));
         if (contained_status.failed()) return contained_status;
         sz_strings_view_t strings {};
         sz_strings_from_string_views(views.data(), candidates.count, &strings);
@@ -144,14 +143,15 @@ struct compiled_match<vendored_residency_t::host_k> {
         else if (sz_subdocuments_engine_t* const* const paths = std::get_if<sz_subdocuments_engine_t*>(&matcher))
             status = sz_subdocuments_contains(*paths, &strings, contained.data(), &malformed_index, nullptr);
         if (status != sz_success_k)
-            return stringzilla_refusal(status, status_code_t::invalid_argument_k, "Failed to match the values");
+            return util::stringzilla_refusal(status, util::status_code_t::invalid_argument_k,
+                                             "The matcher rejected the values");
         return narrow(views, contained.data(), candidates);
     }
 
     /** Keeps among @p candidates those @p contained marks, compacting the @p views of their values beside them, and
      *  scores the kept when the match scores. */
-    status_t narrow(std::span<sz_string_view_t> views, sz_u1x8_t const* contained,
-                    candidates_t& candidates) const noexcept {
+    util::status_t narrow(std::span<sz_string_view_t> views, sz_u1x8_t const* contained,
+                          candidates_t& candidates) const noexcept {
         std::size_t kept = 0;
         for (std::size_t index = 0; index != candidates.count; ++index) {
             if (!((contained[index / 8] >> (index % 8)) & 1u)) continue;
@@ -170,7 +170,8 @@ struct compiled_match<vendored_residency_t::host_k> {
         sz_status_t const scoring = sz_substrings_bm25_scores(scorer, &scored, nullptr, &parameters, weights,
                                                               candidates.scores.data(), 1, nullptr);
         if (scoring != sz_success_k)
-            return stringzilla_refusal(scoring, status_code_t::invalid_argument_k, "Failed to score the values");
+            return util::stringzilla_refusal(scoring, util::status_code_t::invalid_argument_k,
+                                             "The scorer rejected the values");
         return {};
     }
 };
@@ -221,7 +222,7 @@ bool reads_values(arguments_type_ const& arguments) noexcept {
 
 /** The strings @p view holds, @p count of them, as StringZilla reads them, viewing @p view's own memory. */
 inline sz_strings_view_t stringzilla_strings(ustore_strings_view_t const& view, std::size_t count, ustore_arena_t work,
-                                             status_t& status) noexcept {
+                                             util::status_t& status) noexcept {
     sz_strings_view_t strings {};
     strings.count = count;
     if (view.layout == ustore_strings_u32_tape_k) {
@@ -236,7 +237,7 @@ inline sz_strings_view_t stringzilla_strings(ustore_strings_view_t const& view, 
         strings.data.u64_tape.offsets = view.data.u64_tape.offsets;
         return strings;
     }
-    auto [views, views_status] = arena_allocate<sz_string_view_t>(work, count);
+    auto [views, views_status] = util::arena_allocate<sz_string_view_t>(work, count);
     status = views_status;
     if (views_status.failed()) return strings;
     std::array<ustore_size_t, 64> indices;
@@ -256,73 +257,76 @@ inline sz_strings_view_t stringzilla_strings(ustore_strings_view_t const& view, 
 
 /** Compiles @p patterns, which the scans of blobs and strings take, into @p matcher: an engine for the kernels
  *  @p capabilities allow, whose handle is laid out in @p into and whose state @p engine_memory holds. */
-inline status_t compile_patterns(ustore_patterns_t const& patterns, ustore_arena_t into, sz_capability_t capabilities,
-                                 sz_allocator_t engine_memory, value_matcher_t& matcher) noexcept {
+inline util::status_t compile_patterns(ustore_patterns_t const& patterns, ustore_arena_t into,
+                                       sz_capability_t capabilities, sz_allocator_t engine_memory,
+                                       value_matcher_t& matcher) noexcept {
     matcher = match_everything_t {};
     if (matches_everything(patterns)) return {};
     if (patterns.kind != ustore_pattern_regex_k && patterns.kind != ustore_pattern_substrings_k)
-        return {status_code_t::invalid_argument_k, "Unknown pattern kind"};
+        return {util::status_code_t::invalid_argument_k, "Unknown pattern kind"};
     if (patterns.sensitivity != ustore_cased_k && patterns.sensitivity != ustore_uncased_k)
-        return {status_code_t::invalid_argument_k, "Unknown case sensitivity"};
+        return {util::status_code_t::invalid_argument_k, "Unknown case sensitivity"};
     if (patterns.weights && patterns.kind == ustore_pattern_regex_k)
-        return {status_code_t::invalid_argument_k, "Weights score substrings, never regexes"};
-    if (!patterns.count) return {status_code_t::invalid_argument_k, "Patterns need their count"};
-    status_t gathered;
+        return {util::status_code_t::invalid_argument_k, "Weights score substrings, never regexes"};
+    if (!patterns.count) return {util::status_code_t::invalid_argument_k, "Patterns need their count"};
+    util::status_t gathered;
     sz_strings_view_t const strings = stringzilla_strings(patterns.patterns, patterns.count, into, gathered);
     if (gathered.failed()) return gathered;
     sz_case_sensitivity_t const sensitivity = patterns.sensitivity == ustore_uncased_k ? sz_uncased_k : sz_cased_k;
     if (patterns.kind == ustore_pattern_regex_k) {
-        auto [compiled, compiled_status] = arena_allocate<sz_regex_engine_t>(into, 1);
+        auto [compiled, compiled_status] = util::arena_allocate<sz_regex_engine_t>(into, 1);
         if (compiled_status.failed()) return compiled_status;
         sz_size_t malformed_index = 0;
         sz_status_t const status = sz_regex_engine_init(compiled.data(), &strings, sensitivity, &malformed_index,
                                                         capabilities, &engine_memory, nullptr);
         if (status != sz_success_k)
-            return stringzilla_refusal(status, status_code_t::invalid_argument_k,
-                                       "Failed to compile the regular expression");
+            return util::stringzilla_refusal(status, util::status_code_t::invalid_argument_k,
+                                             "The regex engine rejected the pattern");
         matcher = compiled.data();
         return {};
     }
-    auto [compiled, compiled_status] = arena_allocate<sz_substrings_engine_t>(into, 1);
+    auto [compiled, compiled_status] = util::arena_allocate<sz_substrings_engine_t>(into, 1);
     if (compiled_status.failed()) return compiled_status;
     sz_status_t const status = sz_substrings_engine_init(
         compiled.data(), &strings, sensitivity, sz_substrings_leftmost_longest_k,
         STRINGZILLA_SUBSTRINGS_HOT_STATES_AUTO, 0, 0, capabilities, &engine_memory, nullptr);
     if (status != sz_success_k)
-        return stringzilla_refusal(status, status_code_t::invalid_argument_k, "Failed to compile the patterns");
+        return util::stringzilla_refusal(status, util::status_code_t::invalid_argument_k,
+                                         "The matcher rejected the patterns");
     matcher = compiled.data();
     return {};
 }
 
 /** Compiles @p filter, a JSONPath or root filter of documents or an XPath of pages as @p format names, into
  *  @p matcher, as @c compile_patterns compiles patterns. */
-inline status_t compile_filter(ustore_bytes_view_t filter, sz_subdocuments_format_t format, ustore_arena_t into,
-                               sz_capability_t capabilities, sz_allocator_t engine_memory,
-                               value_matcher_t& matcher) noexcept {
+inline util::status_t compile_filter(ustore_bytes_view_t filter, sz_subdocuments_format_t format, ustore_arena_t into,
+                                     sz_capability_t capabilities, sz_allocator_t engine_memory,
+                                     value_matcher_t& matcher) noexcept {
     matcher = match_everything_t {};
     if (!filter.length) return {};
-    if (!filter.data) return {status_code_t::invalid_argument_k, "A filter of some length needs its bytes"};
+    if (!filter.data) return {util::status_code_t::invalid_argument_k, "A filter of some length needs its bytes"};
     sz_string_view_t path;
     path.start = reinterpret_cast<sz_cptr_t>(filter.data);
     path.length = static_cast<sz_size_t>(filter.length);
     sz_strings_view_t paths {};
     sz_strings_from_string_views(&path, 1, &paths);
-    auto [compiled, compiled_status] = arena_allocate<sz_subdocuments_engine_t>(into, 1);
+    auto [compiled, compiled_status] = util::arena_allocate<sz_subdocuments_engine_t>(into, 1);
     if (compiled_status.failed()) return compiled_status;
     sz_size_t malformed_index = 0;
     sz_status_t const status = sz_subdocuments_engine_init(compiled.data(), &paths, format,
                                                            sz_subdocuments_options_none_k, &malformed_index,
                                                            capabilities, &engine_memory, nullptr);
     if (status != sz_success_k)
-        return stringzilla_refusal(status, status_code_t::invalid_argument_k, "Failed to compile the filter");
+        return util::stringzilla_refusal(status, util::status_code_t::invalid_argument_k,
+                                         "The matcher rejected the filter");
     matcher = compiled.data();
     return {};
 }
 
 /** Compiles the patterns or the filter of @p arguments into @p matcher, as @c compile_patterns does. */
 template <typename arguments_type_>
-status_t compile_values(arguments_type_ const& arguments, ustore_arena_t into, sz_capability_t capabilities,
-                        sz_allocator_t engine_memory, value_matcher_t& matcher) noexcept {
+util::status_t compile_values(arguments_type_ const& arguments, ustore_arena_t into, sz_capability_t capabilities,
+                              sz_allocator_t engine_memory, value_matcher_t& matcher) noexcept {
     if constexpr (matches_patterns_concept<arguments_type_>)
         return compile_patterns(arguments.patterns, into, capabilities, engine_memory, matcher);
     else if constexpr (std::is_same_v<arguments_type_, ustore_docs_scan_t> ||
@@ -336,20 +340,20 @@ status_t compile_values(arguments_type_ const& arguments, ustore_arena_t into, s
 /** Compiles what @p arguments match on the host, laying the engine handles and their state out in @p into, which must
  *  outlive the match, for the kernels @p capabilities allow. */
 template <typename arguments_type_>
-expected<compiled_match<vendored_residency_t::host_k>> compile_match(arguments_type_ const& arguments,
-                                                                     ustore_arena_t into,
-                                                                     sz_capability_t capabilities) noexcept {
+util::expected<compiled_match<vendored_residency_t::host_k>> compile_match(arguments_type_ const& arguments,
+                                                                           ustore_arena_t into,
+                                                                           sz_capability_t capabilities) noexcept {
     compiled_match<vendored_residency_t::host_k> match;
-    if (status_t const status = compile_values(arguments, into, capabilities, stringzilla_allocator(into),
-                                               match.matcher);
+    if (util::status_t const status = compile_values(arguments, into, capabilities, util::stringzilla_allocator(into),
+                                                     match.matcher);
         status.failed())
         return status;
     if constexpr (matches_patterns_concept<arguments_type_>)
         if (arguments.patterns.weights)
             match.scorer = std::get<sz_substrings_engine_t*>(match.matcher), match.weights = arguments.patterns.weights;
-    if (arguments.predicate.cost != ustore_predicate_cheap_k &&
-        arguments.predicate.cost != ustore_predicate_expensive_k)
-        return status_t {status_code_t::invalid_argument_k, "Unknown predicate cost"};
+    if (arguments.predicate.cost != ustore_predicate_cost_cheap_k &&
+        arguments.predicate.cost != ustore_predicate_cost_expensive_k)
+        return util::status_t {util::status_code_t::invalid_argument_k, "Unknown predicate cost"};
     match.predicate = arguments.predicate;
     return match;
 }
@@ -365,19 +369,20 @@ expected<compiled_match<vendored_residency_t::host_k>> compile_match(arguments_t
 template <typename plan_type_>
 concept plan_concept = requires(plan_type_& plan, typename plan_type_::step_t step, view_t const& view) {
     { plan.steps() } -> std::convertible_to<std::size_t>;
-    { plan.run(step, view) } -> std::same_as<status_t>;
+    { plan.run(step, view) } -> std::same_as<util::status_t>;
     plan.advance();
 };
 
 /** Runs every phase of @p plan on the thread @p view names, step after step, reporting one unit of @p progress per
  *  step and unwinding with @c progress_cancelled_k once it answers false. */
 template <plan_concept plan_type_>
-status_t run_steps(plan_type_& plan, view_t const& view, progress_t& progress) noexcept {
+util::status_t run_steps(plan_type_& plan, view_t const& view, util::progress_t& progress) noexcept {
     for (std::size_t steps = plan.steps(); steps != 0; plan.advance(), steps = plan.steps())
         for (std::size_t step = 0; step != steps; ++step) {
-            if (status_t const status = plan.run(static_cast<typename plan_type_::step_t>(step), view); status.failed())
+            if (util::status_t const status = plan.run(static_cast<typename plan_type_::step_t>(step), view);
+                status.failed())
                 return status;
-            if (!progress.advance(1)) return progress_cancelled_k;
+            if (!progress.advance(1)) return util::progress_cancelled_k;
         }
     return {};
 }
@@ -389,9 +394,10 @@ status_t run_steps(plan_type_& plan, view_t const& view, progress_t& progress) n
 /** Reads into @p values the values of @p keys of @p collection through the host verbs of @p engine, as the scan of
  *  @p scan_type_ matches them: blobs as stored, documents whole, pages rendered as XML. */
 template <typename scan_type_>
-status_t read_page_values(residency_tables<vendored_residency_t::host_k> const& engine, ustore_database_t database,
-                          ustore_collection_id_t const& collection, std::span<ustore_key_t const> keys,
-                          ustore_arena_t page, view_t const& view, strings_arg_t& values) noexcept {
+util::status_t read_page_values(residency_tables<vendored_residency_t::host_k> const& engine,
+                                ustore_database_t database, ustore_collection_id_t const& collection,
+                                std::span<ustore_key_t const> keys, ustore_arena_t page, view_t const& view,
+                                strings_arg_t& values) noexcept {
     values = {};
     if constexpr (std::is_same_v<scan_type_, ustore_blobs_scan_t>) {
         ustore_blobs_read_t const read {.database = database,
@@ -403,7 +409,7 @@ status_t read_page_values(residency_tables<vendored_residency_t::host_k> const& 
         return engine.blobs->read(read, view);
     }
     else if constexpr (std::is_same_v<scan_type_, ustore_docs_scan_t>) {
-        if (!engine.docs->read) return {status_code_t::unsupported_k, "The engine does not read documents"};
+        if (!engine.docs->read) return {util::status_code_t::unsupported_k, "The engine does not read documents"};
         ustore_docs_read_t const read {.database = database,
                                        .count = keys.size(),
                                        .collections = {&collection, 0},
@@ -413,7 +419,7 @@ status_t read_page_values(residency_tables<vendored_residency_t::host_k> const& 
         return engine.docs->read(read, strings_arg_t {}, view);
     }
     else if constexpr (std::is_same_v<scan_type_, ustore_pages_scan_t>) {
-        if (!engine.pages->read) return {status_code_t::unsupported_k, "The engine does not render pages"};
+        if (!engine.pages->read) return {util::status_code_t::unsupported_k, "The engine does not render pages"};
         ustore_pages_read_t const read {.database = database,
                                         .count = keys.size(),
                                         .collections = {&collection, 0},
@@ -423,14 +429,14 @@ status_t read_page_values(residency_tables<vendored_residency_t::host_k> const& 
                                         .outputs_encoding = ustore_page_encoding_xml_k};
         return engine.pages->read(read, view);
     }
-    else return {status_code_t::invalid_argument_k, "The modality matches no values"};
+    else return {util::status_code_t::invalid_argument_k, "The modality matches no values"};
 }
 
 /** The scores of the keys or strings a listing kept, grown in scratch beside them. */
-using scores_sink_t = st::vector<float, arena_allocator<float>>;
+using scores_sink_t = st::vector<float, util::arena_allocator<float>>;
 
 /** The keys a keyed listing kept, grown in scratch until they reach the call's arena. */
-using keyed_survivors_t = st::vector<ustore_key_t, arena_allocator<ustore_key_t>>;
+using keyed_survivors_t = st::vector<ustore_key_t, util::arena_allocator<ustore_key_t>>;
 
 /**
  *  @brief Appends to @p survivors up to @p wanted keys of @p collection from @p start on in
@@ -441,11 +447,12 @@ using keyed_survivors_t = st::vector<ustore_key_t, arena_allocator<ustore_key_t>
  *  key the next listing resumes at, or nothing once the range ends.
  */
 template <typename scan_type_, typename match_type_>
-status_t list_matched_keys(residency_tables<vendored_residency_t::host_k> const& engine, ustore_database_t database,
-                           ustore_collection_id_t const& collection, ustore_key_t start, ustore_key_t const* end,
-                           ustore_scan_direction_t direction, std::size_t wanted, match_type_ const& match,
-                           ustore_arena_t page, view_t const& view, keyed_survivors_t& survivors,
-                           std::variant<ustore_key_t, exhausted_t>& resume, scores_sink_t* scores = nullptr) noexcept {
+util::status_t list_matched_keys(residency_tables<vendored_residency_t::host_k> const& engine,
+                                 ustore_database_t database, ustore_collection_id_t const& collection,
+                                 ustore_key_t start, ustore_key_t const* end, ustore_scan_direction_t direction,
+                                 std::size_t wanted, match_type_ const& match, ustore_arena_t page, view_t const& view,
+                                 keyed_survivors_t& survivors, std::variant<ustore_key_t, exhausted_t>& resume,
+                                 scores_sink_t* scores = nullptr) noexcept {
     auto const* const verbs = engine.*verb_slot<scan_type_>::template table<vendored_residency_t::host_k>;
     auto const scan_verb = verbs->*verb_slot<scan_type_>::template verb<vendored_residency_t::host_k>;
     view_t page_view = view;
@@ -466,50 +473,54 @@ status_t list_matched_keys(residency_tables<vendored_residency_t::host_k> const&
                                .keys = &listed,
                                .arena = page,
                                .wanted = wanted};
-        if (status_t const status = scan_verb(scan, page_view); status.failed()) return status;
+        if (util::status_t const status = scan_verb(scan, page_view); status.failed()) return status;
         std::size_t const listed_count = offsets ? offsets[1] : 0;
         std::span<ustore_key_t const> const keys {listed, listed_count};
 
-        auto [indices, indices_status] = arena_allocate<std::uint32_t>(page, listed_count);
+        auto [indices, indices_status] = util::arena_allocate<std::uint32_t>(page, listed_count);
         if (indices_status.failed()) return indices_status;
         candidates_t candidates {indices, {}, listed_count};
         if (scores && match.scores()) {
-            auto [scored, scored_status] = arena_allocate<float>(page, listed_count);
+            auto [scored, scored_status] = util::arena_allocate<float>(page, listed_count);
             if (scored_status.failed()) return scored_status;
             candidates.scores = scored;
         }
         for (std::size_t index = 0; index != listed_count; ++index) indices[index] = static_cast<std::uint32_t>(index);
-        if (status_t const status = match.ask(ustore_predicate_cheap_k, keys, candidates, page); status.failed())
+        if (util::status_t const status = match.ask(ustore_predicate_cost_cheap_k, keys, candidates, page);
+            status.failed())
             return status;
         if (match.reads_values() && candidates.count) {
-            auto [asked, asked_status] = arena_allocate<ustore_key_t>(page, candidates.count);
+            auto [asked, asked_status] = util::arena_allocate<ustore_key_t>(page, candidates.count);
             if (asked_status.failed()) return asked_status;
             for (std::size_t index = 0; index != candidates.count; ++index) asked[index] = keys[indices[index]];
             strings_arg_t values;
-            if (status_t const status = read_page_values<scan_type_>(engine, database, collection, asked, page,
-                                                                     page_view, values);
+            if (util::status_t const status = read_page_values<scan_type_>(engine, database, collection, asked, page,
+                                                                           page_view, values);
                 status.failed())
                 return status;
-            if (status_t const status = match.select(values, candidates, page); status.failed()) return status;
+            if (util::status_t const status = match.select(values, candidates, page); status.failed()) return status;
         }
-        if (status_t const status = match.ask(ustore_predicate_expensive_k, keys, candidates, page); status.failed())
+        if (util::status_t const status = match.ask(ustore_predicate_cost_expensive_k, keys, candidates, page);
+            status.failed())
             return status;
 
         std::size_t const room = wanted - (survivors.size() - first);
         std::size_t const taken = candidates.count < room ? candidates.count : room;
         for (std::size_t index = 0; index != taken; ++index) {
-            if (status_t const status = growth_status(survivors.push_back(ustore_key_t {keys[indices[index]]}));
+            if (util::status_t const status = util::growth_status(
+                    survivors.push_back(ustore_key_t {keys[indices[index]]}));
                 status.failed())
                 return status;
             if (!candidates.scores.empty())
-                if (status_t const status = growth_status(scores->push_back(float {candidates.scores[index]}));
+                if (util::status_t const status = util::growth_status(
+                        scores->push_back(float {candidates.scores[index]}));
                     status.failed())
                     return status;
         }
 
         // A page short of what it wanted reached the range's end, as did one ending at the last key
         bool const descending = direction == ustore_scan_descending_k;
-        ustore_key_t const& edge = descending ? smallest_key_k : largest_key_k;
+        ustore_key_t const& edge = descending ? util::smallest_key_k : util::largest_key_k;
         ustore_key_t const* const last = listed_count ? listed + listed_count - 1 : nullptr;
         if (listed_count < wanted || (last && *last == edge)) {
             resume = exhausted_t {};
@@ -517,7 +528,7 @@ status_t list_matched_keys(residency_tables<vendored_residency_t::host_k> const&
         }
         // A page cut short by the room left resumes past the last key it handed out, not the page
         ustore_key_t const& consumed = taken < candidates.count ? keys[indices[taken - 1]] : *last;
-        start = descending ? key_before(consumed) : key_after(consumed);
+        start = descending ? util::key_before(consumed) : util::key_after(consumed);
         resume = start;
     }
     return {};
@@ -540,14 +551,16 @@ struct keyed_scan_plan {
     std::size_t steps() const noexcept { return phases_left ? arguments.count : 0; }
     void advance() noexcept { phases_left = 0; }
 
-    status_t run(step_t task, view_t const& view) noexcept {
+    util::status_t run(step_t task, view_t const& view) noexcept {
         offsets[task] = static_cast<ustore_length_t>(survivors.size());
         auto const signed_task = static_cast<std::ptrdiff_t>(task);
-        strided_iterator<ustore_key_t const> const start_keys = strided(arguments.start_keys);
-        strided_iterator<ustore_key_t const> const end_keys = strided(arguments.end_keys);
-        strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
+        util::strided_iterator<ustore_key_t const> const start_keys = util::strided(arguments.start_keys);
+        util::strided_iterator<ustore_key_t const> const end_keys = util::strided(arguments.end_keys);
+        util::strided_iterator<ustore_collection_id_t const> const collections = util::strided(arguments.collections);
         bool const descending = arguments.direction == ustore_scan_descending_k;
-        ustore_key_t const start = start_keys ? start_keys[signed_task] : descending ? largest_key_k : smallest_key_k;
+        ustore_key_t const start = start_keys   ? start_keys[signed_task]
+                                   : descending ? util::largest_key_k
+                                                : util::smallest_key_k;
         ustore_key_t const* const end = end_keys ? &end_keys[signed_task] : nullptr;
         std::variant<ustore_key_t, exhausted_t> resume;
         return list_matched_keys<scan_type_>(engine, arguments.database, collections[signed_task], start, end,
@@ -559,31 +572,32 @@ struct keyed_scan_plan {
 /** Serves the scan @p arguments with @p match through the host verbs of @p engine as a plan of one step per task, the
  *  call's arena holding one page at a time until the survivors are copied into it. */
 template <typename scan_type_, typename match_type_>
-status_t scan_matched(residency_tables<vendored_residency_t::host_k> const& engine, match_type_ const& match,
-                      scan_type_ const& arguments, view_t const& view) noexcept {
-    if (status_t const status = validate_scan(arguments); status.failed() || !arguments.count) return status;
-    auto [offsets, offsets_status] = arena_allocate<ustore_length_t>(view.scratch, arguments.count + 1);
+util::status_t scan_matched(residency_tables<vendored_residency_t::host_k> const& engine, match_type_ const& match,
+                            scan_type_ const& arguments, view_t const& view) noexcept {
+    if (util::status_t const status = util::validate_scan(arguments); status.failed() || !arguments.count)
+        return status;
+    auto [offsets, offsets_status] = util::arena_allocate<ustore_length_t>(view.scratch, arguments.count + 1);
     if (offsets_status.failed()) return offsets_status;
-    keyed_survivors_t survivors {arena_allocator<ustore_key_t> {view.scratch}};
-    scores_sink_t scores {arena_allocator<float> {view.scratch}};
+    keyed_survivors_t survivors {util::arena_allocator<ustore_key_t> {view.scratch}};
+    scores_sink_t scores {util::arena_allocator<float> {view.scratch}};
     bool const scored = [&]() noexcept {
         if constexpr (answers_scores_concept<scan_type_>) return arguments.scores && match.scores();
         else return false;
     }();
-    progress_t progress {arguments.progress, arguments.progress_state, arguments.count};
+    util::progress_t progress {arguments.progress, arguments.progress_state, arguments.count};
     scores_sink_t* const kept_scores = scored ? &scores : nullptr;
     keyed_scan_plan<scan_type_, match_type_> plan {engine, match, arguments, offsets, survivors, kept_scores};
-    if (status_t const status = run_steps(plan, view, progress); status.failed()) return status;
+    if (util::status_t const status = run_steps(plan, view, progress); status.failed()) return status;
     offsets[arguments.count] = static_cast<ustore_length_t>(survivors.size());
 
     match.rewind_page(arguments.arena);
-    auto [copied_offsets, copied_offsets_status] = arena_copy<ustore_length_t>(arguments.arena, offsets);
+    auto [copied_offsets, copied_offsets_status] = util::arena_copy<ustore_length_t>(arguments.arena, offsets);
     if (copied_offsets_status.failed()) return copied_offsets_status;
-    auto [keys, keys_status] = arena_copy<ustore_key_t>(arguments.arena, survivors);
+    auto [keys, keys_status] = util::arena_copy<ustore_key_t>(arguments.arena, survivors);
     if (keys_status.failed()) return keys_status;
     if constexpr (answers_scores_concept<scan_type_>)
         if (scored) {
-            auto [copied_scores, scores_status] = arena_copy<float>(arguments.arena, scores);
+            auto [copied_scores, scores_status] = util::arena_copy<float>(arguments.arena, scores);
             if (scores_status.failed()) return scores_status;
             *arguments.scores = copied_scores.data();
         }
@@ -619,13 +633,14 @@ constexpr start_bound_t resume_bound_of(ustore_scan_direction_t direction) noexc
  *  once the range ends; the next listing starts there as @c resume_bound_of says.
  */
 template <typename match_type_, typename survivors_type_, typename resume_bytes_type_>
-status_t list_matched_strings(residency_tables<vendored_residency_t::host_k> const& engine, ustore_database_t database,
-                              ustore_collection_id_t const& collection, ustore_bytes_view_t prefix,
-                              ustore_bytes_view_t start, start_bound_t start_bound, ustore_bytes_view_t end,
-                              ustore_scan_direction_t direction, std::size_t wanted, match_type_ const& match,
-                              ustore_arena_t page, view_t const& view, survivors_type_& survivors,
-                              resume_bytes_type_& resume_bytes, std::variant<ustore_bytes_view_t, exhausted_t>& resume,
-                              scores_sink_t* scores = nullptr) noexcept {
+util::status_t list_matched_strings(residency_tables<vendored_residency_t::host_k> const& engine,
+                                    ustore_database_t database, ustore_collection_id_t const& collection,
+                                    ustore_bytes_view_t prefix, ustore_bytes_view_t start, start_bound_t start_bound,
+                                    ustore_bytes_view_t end, ustore_scan_direction_t direction, std::size_t wanted,
+                                    match_type_ const& match, ustore_arena_t page, view_t const& view,
+                                    survivors_type_& survivors, resume_bytes_type_& resume_bytes,
+                                    std::variant<ustore_bytes_view_t, exhausted_t>& resume,
+                                    scores_sink_t* scores = nullptr) noexcept {
     strings_verbs<vendored_residency_t::host_k> const& verbs = *engine.strings;
     view_t page_view = view;
     page_view.scratch = page;
@@ -644,15 +659,15 @@ status_t list_matched_strings(residency_tables<vendored_residency_t::host_k> con
                                           .strings = &listed_view,
                                           .arena = page,
                                           .wanted = page_wanted};
-        if (status_t const status = verbs.scan(scan, strings_arg_t::from_views(&prefix),
-                                               strings_arg_t::from_views(&start), strings_arg_t::from_views(&end),
-                                               page_view);
+        if (util::status_t const status = verbs.scan(scan, strings_arg_t::from_views(&prefix),
+                                                     strings_arg_t::from_views(&start), strings_arg_t::from_views(&end),
+                                                     page_view);
             status.failed())
             return status;
         std::size_t const listed_count = offsets ? offsets[1] : 0;
         strings_arg_t const listed {listed_view};
         std::size_t const skipped = start_bound == start_bound_t::exclusive_k && listed_count &&
-                                    chars_of(listed[0]) == chars_of(start);
+                                    util::chars_of(listed[0]) == util::chars_of(start);
 
         ustore_key_t const* keys = nullptr;
         if (match.asks() && listed_count) {
@@ -661,40 +676,43 @@ status_t list_matched_strings(residency_tables<vendored_residency_t::host_k> con
                                               .collections = {&collection, 0},
                                               .values = &keys,
                                               .arena = page};
-            if (status_t const status = verbs.read(read, listed, page_view); status.failed()) return status;
+            if (util::status_t const status = verbs.read(read, listed, page_view); status.failed()) return status;
         }
         std::span<ustore_key_t const> const listed_keys {keys, keys ? listed_count : 0};
 
-        auto [indices, indices_status] = arena_allocate<std::uint32_t>(page, listed_count - skipped);
+        auto [indices, indices_status] = util::arena_allocate<std::uint32_t>(page, listed_count - skipped);
         if (indices_status.failed()) return indices_status;
         candidates_t candidates {indices, {}, listed_count - skipped};
         if (scores && match.scores()) {
-            auto [scored, scored_status] = arena_allocate<float>(page, listed_count - skipped);
+            auto [scored, scored_status] = util::arena_allocate<float>(page, listed_count - skipped);
             if (scored_status.failed()) return scored_status;
             candidates.scores = scored;
         }
         for (std::size_t index = skipped; index != listed_count; ++index)
             indices[index - skipped] = static_cast<std::uint32_t>(index);
-        if (status_t const status = match.ask(ustore_predicate_cheap_k, listed_keys, candidates, page); status.failed())
+        if (util::status_t const status = match.ask(ustore_predicate_cost_cheap_k, listed_keys, candidates, page);
+            status.failed())
             return status;
         if (match.reads_values() && candidates.count) {
-            auto [views, views_status] = arena_allocate<ustore_bytes_view_t>(page, candidates.count);
+            auto [views, views_status] = util::arena_allocate<ustore_bytes_view_t>(page, candidates.count);
             if (views_status.failed()) return views_status;
             for (std::size_t index = 0; index != candidates.count; ++index) views[index] = listed[indices[index]];
-            if (status_t const status = match.select(strings_arg_t::from_views(views.data()), candidates, page);
+            if (util::status_t const status = match.select(strings_arg_t::from_views(views.data()), candidates, page);
                 status.failed())
                 return status;
         }
-        if (status_t const status = match.ask(ustore_predicate_expensive_k, listed_keys, candidates, page);
+        if (util::status_t const status = match.ask(ustore_predicate_cost_expensive_k, listed_keys, candidates, page);
             status.failed())
             return status;
 
         std::size_t const room = wanted - (survivors.size() - first);
         std::size_t const taken = candidates.count < room ? candidates.count : room;
         for (std::size_t index = 0; index != taken; ++index) {
-            if (status_t const status = survivors.push_back(listed[indices[index]]); status.failed()) return status;
+            if (util::status_t const status = survivors.push_back(listed[indices[index]]); status.failed())
+                return status;
             if (!candidates.scores.empty())
-                if (status_t const status = growth_status(scores->push_back(float {candidates.scores[index]}));
+                if (util::status_t const status = util::growth_status(
+                        scores->push_back(float {candidates.scores[index]}));
                     status.failed())
                     return status;
         }
@@ -707,9 +725,10 @@ status_t list_matched_strings(residency_tables<vendored_residency_t::host_k> con
                                                                   : listed[listed_count - 1];
         start_bound = resume_bound_of(direction);
         std::size_t const resume_length = last.length + (start_bound == start_bound_t::inclusive_k);
-        if (status_t const status = growth_status(resume_bytes.resize(resume_length)); status.failed()) return status;
+        if (util::status_t const status = util::growth_status(resume_bytes.resize(resume_length)); status.failed())
+            return status;
         if (last.length) std::memcpy(resume_bytes.data(), last.data, last.length);
-        if (start_bound == start_bound_t::inclusive_k) resume_bytes[last.length] = byte_t {0};
+        if (start_bound == start_bound_t::inclusive_k) resume_bytes[last.length] = util::byte_t {0};
         start = {reinterpret_cast<ustore_byte_t const*>(resume_bytes.data()), resume_length};
         resume = start;
     }
@@ -719,46 +738,48 @@ status_t list_matched_strings(residency_tables<vendored_residency_t::host_k> con
 /** Serves the strings scan @p arguments with @p match through the host verbs of @p engine, one filtered listing per
  *  task, as @c scan_matched serves the keyed scans. */
 template <typename match_type_>
-status_t scan_matched(residency_tables<vendored_residency_t::host_k> const& engine, match_type_ const& match,
-                      ustore_strings_scan_t const& arguments, strings_arg_t const& prefixes,
-                      strings_arg_t const& starts, strings_arg_t const& ends, view_t const& view) noexcept {
+util::status_t scan_matched(residency_tables<vendored_residency_t::host_k> const& engine, match_type_ const& match,
+                            ustore_strings_scan_t const& arguments, strings_arg_t const& prefixes,
+                            strings_arg_t const& starts, strings_arg_t const& ends, view_t const& view) noexcept {
     if (arguments.mode != ustore_scan_ordered_k && arguments.mode != ustore_scan_unordered_k)
-        return {status_code_t::invalid_argument_k, "Unknown scan mode"};
-    if (status_t const status = validate_direction(arguments.direction); status.failed()) return status;
+        return {util::status_code_t::invalid_argument_k, "Unknown scan mode"};
+    if (util::status_t const status = util::validate_direction(arguments.direction); status.failed()) return status;
     if (!arguments.offsets || !arguments.strings)
-        return {status_code_t::invalid_argument_k, "Need outputs for the offsets and the strings"};
+        return {util::status_code_t::invalid_argument_k, "Need outputs for the offsets and the strings"};
     if (!arguments.count) return {};
-    auto [offsets, offsets_status] = arena_allocate<ustore_length_t>(view.scratch, arguments.count + 1);
+    auto [offsets, offsets_status] = util::arena_allocate<ustore_length_t>(view.scratch, arguments.count + 1);
     if (offsets_status.failed()) return offsets_status;
-    growing_strings<arena_allocator<byte_t>> survivors {arena_allocator<byte_t> {view.scratch}};
-    st::vector<byte_t, arena_allocator<byte_t>> resume_bytes {arena_allocator<byte_t> {view.scratch}};
-    scores_sink_t scores {arena_allocator<float> {view.scratch}};
+    util::growing_strings<util::arena_allocator<util::byte_t>> survivors {
+        util::arena_allocator<util::byte_t> {view.scratch}};
+    st::vector<util::byte_t, util::arena_allocator<util::byte_t>> resume_bytes {
+        util::arena_allocator<util::byte_t> {view.scratch}};
+    scores_sink_t scores {util::arena_allocator<float> {view.scratch}};
     bool const scored = arguments.scores && match.scores();
-    progress_t progress {arguments.progress, arguments.progress_state, arguments.count};
-    strided_iterator<ustore_collection_id_t const> const collections = strided(arguments.collections);
+    util::progress_t progress {arguments.progress, arguments.progress_state, arguments.count};
+    util::strided_iterator<ustore_collection_id_t const> const collections = util::strided(arguments.collections);
     for (std::size_t task = 0; task != arguments.count; ++task) {
         offsets[task] = static_cast<ustore_length_t>(survivors.size());
         ustore_bytes_view_t const prefix = prefixes ? prefixes[task] : ustore_bytes_view_t {};
         ustore_bytes_view_t const start = starts ? starts[task] : ustore_bytes_view_t {};
         ustore_bytes_view_t const end = ends ? ends[task] : ustore_bytes_view_t {};
         std::variant<ustore_bytes_view_t, exhausted_t> resume;
-        if (status_t const status = list_matched_strings(
+        if (util::status_t const status = list_matched_strings(
                 engine, arguments.database, collections[static_cast<std::ptrdiff_t>(task)], prefix, start,
                 start_bound_t::inclusive_k, end, arguments.direction, arguments.wanted, match, arguments.arena, view,
                 survivors, resume_bytes, resume, scored ? &scores : nullptr);
             status.failed())
             return status;
-        if (!progress.advance(1)) return progress_cancelled_k;
+        if (!progress.advance(1)) return util::progress_cancelled_k;
     }
     offsets[arguments.count] = static_cast<ustore_length_t>(survivors.size());
 
     match.rewind_page(arguments.arena);
-    auto [copied_offsets, copied_offsets_status] = arena_copy<ustore_length_t>(arguments.arena, offsets);
+    auto [copied_offsets, copied_offsets_status] = util::arena_copy<ustore_length_t>(arguments.arena, offsets);
     if (copied_offsets_status.failed()) return copied_offsets_status;
-    if (status_t const status = survivors.export_into(arguments.arena, *arguments.strings); status.failed())
+    if (util::status_t const status = survivors.export_into(arguments.arena, *arguments.strings); status.failed())
         return status;
     if (scored) {
-        auto [copied_scores, scores_status] = arena_copy<float>(arguments.arena, scores);
+        auto [copied_scores, scores_status] = util::arena_copy<float>(arguments.arena, scores);
         if (scores_status.failed()) return scores_status;
         *arguments.scores = copied_scores.data();
     }

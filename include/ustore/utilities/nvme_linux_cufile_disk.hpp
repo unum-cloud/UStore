@@ -294,13 +294,13 @@ class linux_cufile_files_disk {
     static expected<linux_cufile_files_disk> make(cufile_api_t const& api,
                                                   linux_cufile_disk_config_t const& config) noexcept {
         if (config.queue_pairs_limit == 0 || config.depth_limit == 0)
-            return status_t {status_code_t::invalid_argument_k, "A batch needs a queue pair and a request of depth"};
+            return status_t {status_code_t::invalid_argument_k, "A batch needs a queue pair and depth"};
         if (config.queue_pairs_limit == static_cast<std::uint16_t>(queue_pair_id_t::unallocated_k) ||
             config.registered_memory_limit == static_cast<std::uint16_t>(registered_memory_id_t::unregistered_k) ||
             config.media_limit == static_cast<std::uint16_t>(registered_medium_id_t::unregistered_k))
-            return status_t {status_code_t::invalid_argument_k, "A disk keeps one identifier for an empty handle"};
+            return status_t {status_code_t::invalid_argument_k, "A disk reserves one id for empty handles"};
         if (config.media_limit == 0 || config.registered_memory_limit == 0)
-            return status_t {status_code_t::invalid_argument_k, "A disk needs a medium and a range to move between"};
+            return status_t {status_code_t::invalid_argument_k, "A disk needs a medium and a range"};
         if (config.gds > ustore_gds_compatibility_k)
             return status_t {status_code_t::invalid_argument_k, "Unknown GPUDirect Storage mode"};
 
@@ -321,9 +321,9 @@ class linux_cufile_files_disk {
             return status_t {status_code_t::device_k, "The cuFile driver would not open"};
         disk.mode_ = mode_of_(properties);
         if (config.gds == ustore_gds_direct_k && disk.mode_ != linux_cufile_probe_t::direct_k)
-            return status_t {status_code_t::device_k, "GPUDirect Storage needs the nvidia_fs module, which is absent"};
+            return status_t {status_code_t::device_k, "GPUDirect Storage lacks the nvidia_fs module"};
         if (disk.mode_ == linux_cufile_probe_t::refused_k)
-            return status_t {status_code_t::device_k, "cuFile has no nvidia_fs and compat mode is disallowed"};
+            return status_t {status_code_t::device_k, "No nvidia_fs and compat mode is disallowed"};
         if (config.depth_limit > properties.max_batch_io_size)
             return status_t {status_code_t::invalid_argument_k, "A cuFile batch holds fewer requests than that"};
 
@@ -343,7 +343,7 @@ class linux_cufile_files_disk {
         if (status_t const sized = size_(disk.locals_, window); sized.failed()) return sized;
         for (std::size_t index = 0; index != disk.queue_pairs_.size(); ++index)
             if (api.batch_setup(&disk.queue_pairs_[index].batch, config.depth_limit).error != cufile_success_k)
-                return status_t {status_code_t::device_k, "cuFile would not set a batch up"};
+                return status_t {status_code_t::device_k, "The cuFile batch did not set up"};
         return disk;
     }
 
@@ -381,7 +381,7 @@ class linux_cufile_files_disk {
      */
     expected<queue_pair_t> acquire_queue_pair(queue_depth_t depth) noexcept {
         if (depth == 0 || depth > depth_limit_)
-            return status_t {status_code_t::invalid_argument_k, "A queue pair asks for more depth than the disk has"};
+            return status_t {status_code_t::invalid_argument_k, "The queue pair depth exceeds the disk's"};
         for (std::size_t index = 0; index != queue_pairs_.size(); ++index) {
             queue_pair_slot_t& slot = queue_pairs_[index];
             std::int32_t expected_free = 0;
@@ -398,7 +398,7 @@ class linux_cufile_files_disk {
             slot.locals_count = 0;
             return queue_pair_t {disk_handle_t {static_cast<std::uint16_t>(index), slot.generation}, depth};
         }
-        return status_t {status_code_t::capacity_exhausted_k, "Every queue pair of this disk is already held"};
+        return status_t {status_code_t::capacity_exhausted_k, "Every queue pair of the disk is held"};
     }
 
     /**
@@ -468,7 +468,7 @@ class linux_cufile_files_disk {
             return registered_memory_t {disk_handle_t {static_cast<std::uint16_t>(index), slot.generation}, memory,
                                         space};
         }
-        return status_t {status_code_t::capacity_exhausted_k, "Every registered memory slot of this disk is taken"};
+        return status_t {status_code_t::capacity_exhausted_k, "Every registered memory slot is taken"};
     }
 
     /**
@@ -479,7 +479,7 @@ class linux_cufile_files_disk {
         registered_memory_slot_t* const slot = slot_of_(registered_memory);
         if (!slot) return {status_code_t::invalid_argument_k, "The registered memory is not this disk's"};
         if (in_flight_(*slot).load(std::memory_order_acquire) != 0)
-            return {status_code_t::invalid_argument_k, "The range is still a medium of requests in flight"};
+            return {status_code_t::invalid_argument_k, "Requests in flight still use the range"};
         if (!registered_elsewhere_(slot->base, static_cast<std::size_t>(registered_memory.id()))) {
             [[maybe_unused]] cufile_error_t const deregistered = api_->buffer_deregister(slot->base);
         }
@@ -542,7 +542,7 @@ class linux_cufile_files_disk {
         registered_medium_slot_t* const slot = slot_of_(registered_medium);
         if (!slot) return {status_code_t::invalid_argument_k, "The medium is not this disk's"};
         if (in_flight_(*slot).load(std::memory_order_acquire) != 0)
-            return {status_code_t::invalid_argument_k, "The medium is still named by requests in flight"};
+            return {status_code_t::invalid_argument_k, "Requests in flight still use the medium"};
         api_->handle_deregister(slot->handle);
         [[maybe_unused]] status_t const closed = close_native_file(slot->file);
         ++slot->generation;

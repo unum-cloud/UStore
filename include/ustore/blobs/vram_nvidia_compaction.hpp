@@ -47,6 +47,8 @@ class cuda_compactor_t {
     static expected<cuda_compactor_t> make(utilities::cuda_executor_t& executor,
                                            device_sections_reader_t sections = {}) noexcept;
 
+    /** Holds nothing, as a moved-from compactor does. */
+    cuda_compactor_t() noexcept = default;
     cuda_compactor_t(cuda_compactor_t&& other) noexcept
         : executor_(other.executor_), sections_(other.sections_), blocks_(std::exchange(other.blocks_, {})),
           device_allocations_(std::exchange(other.device_allocations_, 0)), reads_(std::move(other.reads_)) {}

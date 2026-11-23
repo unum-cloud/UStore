@@ -146,6 +146,8 @@ class pool_view_t {
 /** The machine as ForkUnion harvests it, its cores, compute domains and memory domains, owned and deleted here. */
 class topology_t {
   public:
+    /** Holds nothing, as a moved-from topology does. */
+    constexpr topology_t() noexcept = default;
     topology_t(topology_t&& other) noexcept : topology_(std::exchange(other.topology_, nullptr)) {}
 
     topology_t& operator=(topology_t&& other) noexcept {
@@ -208,8 +210,6 @@ class topology_t {
     [[nodiscard]] fu_topology_t get() const noexcept { return topology_; }
 
   private:
-    constexpr topology_t() noexcept = default;
-
     /** The harvested topology, owned and deleted here. */
     fu_topology_t topology_ = nullptr;
 };
@@ -227,6 +227,8 @@ class executor_t {
     /** The label the pool's threads carry in the OS. */
     static constexpr char const pool_name_k[] = "ustore";
 
+    /** Holds nothing, as a moved-from executor does. */
+    constexpr executor_t() noexcept = default;
     executor_t(executor_t&& other) noexcept : pool_(std::exchange(other.pool_, nullptr)) {}
 
     executor_t& operator=(executor_t&& other) noexcept {
@@ -246,9 +248,9 @@ class executor_t {
      *  @param[in] exclusivity Whether the caller is one of the @p threads or only coordinates them.
      */
     [[nodiscard]] static st::expected<executor_t> make(std::size_t threads, caller_exclusivity_t exclusivity) noexcept {
-        st::expected<topology_t> topology = topology_t::make();
-        if (!topology) return topology.status();
-        return make(*topology, threads, exclusivity, fu_capabilities_all_k);
+        auto [topology, topology_status] = topology_t::make();
+        if (topology_status != st::status_t::success_k) return topology_status;
+        return make(topology, threads, exclusivity, fu_capabilities_all_k);
     }
 
     /** Spawns @p threads threads interleaved across every compute domain of @p topology, using only the ForkUnion
@@ -270,15 +272,15 @@ class executor_t {
      *  ForkUnion capabilities in @p allowed. */
     [[nodiscard]] static st::expected<executor_t> make_unpinned(std::size_t threads, caller_exclusivity_t exclusivity,
                                                                 fu_capabilities_t allowed) noexcept {
-        st::expected<topology_t> topology = topology_t::make();
-        if (!topology) return topology.status();
+        auto [topology, topology_status] = topology_t::make();
+        if (topology_status != st::status_t::success_k) return topology_status;
         executor_t executor;
         // Without memory placement ForkUnion spawns a flat pool of plain threads, which pins nothing
         fu_capabilities_t const unplaced = static_cast<fu_capabilities_t>(allowed &
                                                                           ~fu_capability_place_memory_on_domain_k);
         if (fu_status_t const status = fu_pool_new(pool_name_k, unplaced, &executor.pool_); status != fu_success_k)
             return status_from_(status);
-        if (fu_status_t const status = fu_pool_spawn(topology->get(), executor.pool_, threads, spawned_(exclusivity));
+        if (fu_status_t const status = fu_pool_spawn(topology.get(), executor.pool_, threads, spawned_(exclusivity));
             status != fu_success_k)
             return status_from_(status);
         return executor;
@@ -307,9 +309,9 @@ class executor_t {
 
     /** Counts the logical cores this process may run on, without spawning anything. */
     [[nodiscard]] static st::expected<std::size_t> logical_cores_count() noexcept {
-        st::expected<topology_t> topology = topology_t::make();
-        if (!topology) return topology.status();
-        return topology->logical_cores_count();
+        auto [topology, topology_status] = topology_t::make();
+        if (topology_status != st::status_t::success_k) return topology_status;
+        return topology.logical_cores_count();
     }
 
     /** The number of threads every dispatch runs on, the caller included when it is a worker. */
@@ -358,8 +360,6 @@ class executor_t {
     }
 
   private:
-    constexpr executor_t() noexcept = default;
-
     /** ForkUnion's spelling of @p exclusivity. */
     static constexpr fu_caller_exclusivity_t spawned_(caller_exclusivity_t exclusivity) noexcept {
         return exclusivity == caller_exclusivity_t::caller_inclusive_k ? fu_caller_inclusive_k : fu_caller_exclusive_k;

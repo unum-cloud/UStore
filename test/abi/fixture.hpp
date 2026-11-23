@@ -28,8 +28,6 @@
 
 namespace unum::ustore::test::abi {
 
-using namespace unum::ustore::utilities;
-
 #pragma region Write And Read Calls
 
 /** The value every deferred write stores under each of its keys, in static storage, since a
@@ -86,8 +84,30 @@ expected<ustore_executor_t> spawn_executor() noexcept {
         .threads = 2,
     };
     ustore_executor_for_ram(&spawn);
-    if (outcome.status != ustore_status_success_k) return status_t {outcome};
-    return executor;
+    if (outcome.status != ustore_status_success_k) return {{}, status_of<status_t, status_code_t>(outcome)};
+    return {executor};
+}
+
+/** The collection @p name names at the head of @p database, of any modality, refusing a missing
+ *  one. */
+inline expected<ustore_collection_id_t> collection_named(ustore_database_t database, std::string_view name) noexcept {
+    auto [arena, arena_status] = arena_t::make();
+    if (arena_status.failed()) return {{}, arena_status};
+    std::array<std::uint64_t, 2> const offsets {0, name.size()};
+    ustore_octet_t const* presences = nullptr;
+    ustore_collection_id_t const* collections = nullptr;
+    ustore_outcome_t outcome {};
+    ustore_collection_find_t find {.database = database,
+                                   .outcome = &outcome,
+                                   .count = 1,
+                                   .names = u64_tape(name.data(), offsets.data()),
+                                   .presences = &presences,
+                                   .collections = &collections,
+                                   .arena = arena.handle()};
+    ustore_collection_find(&find);
+    if (outcome.status != ustore_status_success_k) return {{}, status_of<status_t, status_code_t>(outcome)};
+    if (!(presences[0] & 1)) return {{}, status_t {status_code_t::not_found_k, "No such collection"}};
+    return {collections[0]};
 }
 
 /** Creates a collection named @p name, which holds @p modality. */
@@ -101,8 +121,8 @@ expected<ustore_collection_id_t> create_collection(ustore_database_t database, s
                                        .modality = modality,
                                        .collection = &created};
     ustore_collection_create(&create);
-    if (outcome.status != ustore_status_success_k) return status_t {outcome};
-    return created;
+    if (outcome.status != ustore_status_success_k) return {{}, status_of<status_t, status_code_t>(outcome)};
+    return {std::move(created)};
 }
 
 /** Whether a call wrote the output @p tape, whose offsets stay null until it does. */
@@ -117,7 +137,9 @@ struct read_columns_t {
     ustore_strings_view_t values {};
 
     /** The value of task @p index, empty for a missing key. */
-    std::string_view value(std::size_t index) const noexcept { return chars_of(tape_string(values, index)); }
+    std::string_view value(std::size_t index) const noexcept {
+        return util::chars_of(util::tape_string(values, index));
+    }
 };
 
 /** A blocking read of @p keys from @p collection into @p columns inside @p arena, finishing
@@ -143,9 +165,9 @@ inline ustore_blobs_read_t read_of(ustore_database_t database, ustore_collection
 
 /** Reports progress once and answers, standing in for a long scan whose progress callback a
  *  case holds open. */
-inline status_t scan_reporting_progress(ustore_blobs_scan_t const& arguments, view_t const&) noexcept {
+inline util::status_t scan_reporting_progress(ustore_blobs_scan_t const& arguments, view_t const&) noexcept {
     if (arguments.progress && arguments.progress(0, 1, arguments.progress_state) == ustore_cancel_k)
-        return {status_code_t::cancelled_k, "The progress callback stopped the scan"};
+        return {util::status_code_t::cancelled_k, "The progress callback stopped the scan"};
     return {};
 }
 
@@ -205,8 +227,8 @@ inline ustore_continuation_t hold_until_released(ustore_size_t, ustore_size_t, v
  *  holding the scan once submitted, so the executor, the arena and the view stay claimed. */
 inline bool arm_held(held_scan_t& held, ustore_executor_t executor, ustore_view_t view,
                      ustore_completion_t completion) noexcept {
-    auto [arena, arena_status] = arena_t::make(executor);
-    if (!expect_true(arena_status.succeeded())) return false;
+    auto [arena, arena_status] = arena_t::make({.executor = executor});
+    if (!expect_true(!arena_status.failed())) return false;
     held.arena = std::move(arena);
     held.executor = executor;
     held.scan = {
@@ -218,7 +240,7 @@ inline bool arm_held(held_scan_t& held, ustore_executor_t executor, ustore_view_
         .count = 1,
         .collections = {&held.collection, 0},
         .start_keys = {&held.start_key, 0},
-        .arena = held.arena,
+        .arena = held.arena.handle(),
         .progress = &hold_until_released,
         .progress_state = &held,
     };
@@ -259,7 +281,9 @@ struct pulled_keys_t {
     ustore_size_t written = 0;
 
     /** The value of key @p index. */
-    std::string_view value(std::size_t index) const noexcept { return chars_of(tape_string(values, index)); }
+    std::string_view value(std::size_t index) const noexcept {
+        return util::chars_of(util::tape_string(values, index));
+    }
 };
 
 /** A blocking pull of up to @p wanted keys and their values from @p cursor into @p pulled
@@ -288,8 +312,8 @@ expected<ustore_blobs_cursor_t> open_cursor(ustore_database_t database, ustore_c
                                      .view = view,
                                      .collection = collection};
     ustore_blobs_cursor_init(&init);
-    if (outcome.status != ustore_status_success_k) return status_t {outcome};
-    return cursor;
+    if (outcome.status != ustore_status_success_k) return {{}, status_of<status_t, status_code_t>(outcome)};
+    return {std::move(cursor)};
 }
 
 /** Fails a check for every key of the page @p pulled that is not @p wanted in order, or reads
@@ -306,6 +330,20 @@ inline void expect_page(pulled_keys_t const& pulled, std::span<ustore_key_t cons
 
 #pragma region Wrapper Round Trips
 
+/** Whether @p result holds a value equal to @p wanted, so a failure answers nothing. */
+template <typename value_type_, typename wanted_type_>
+bool answers(expected<value_type_> result, wanted_type_ const& wanted) noexcept {
+    auto [value, status] = std::move(result);
+    return !status.failed() && value == wanted;
+}
+
+/** Whether @p result holds a value of @p count elements, so a failure has no size. */
+template <typename value_type_>
+bool sized(expected<value_type_> result, std::size_t count) noexcept {
+    auto [value, status] = std::move(result);
+    return !status.failed() && value.size() == count;
+}
+
 /** Checks that every key @p reference names holds a value of @p expected_length, or is missing. */
 template <typename reference_type_>
 void check_length(reference_type_& reference, ustore_length_t expected_length) {
@@ -313,24 +351,23 @@ void check_length(reference_type_& reference, ustore_length_t expected_length) {
     using extractor_t = places_arg_extractor<typename reference_type_::locations_plain_t>;
     ustore_size_t const count = extractor_t {}.count(reference.locations());
 
-    auto maybe_retrieved = reference.value();
-    expect_true(maybe_retrieved.has_value());
-    if (!maybe_retrieved) return;
-    auto const& retrieved = *maybe_retrieved;
+    auto [retrieved, retrieve_status] = reference.value();
+    if (!expect_true(!retrieve_status.failed())) return;
     expect_equal(retrieved.size(), count);
 
     auto iterator = retrieved.begin();
     for (std::size_t index = 0; index != count; ++index, ++iterator)
         expect_equal((*iterator).size(), expects_missing ? 0 : expected_length);
 
-    auto maybe_lengths = reference.length();
-    expect_true(maybe_lengths.has_value());
-    for (std::size_t index = 0; index != count; ++index) expect_equal((*maybe_lengths)[index], expected_length);
+    auto [lengths, lengths_status] = reference.length();
+    expect_true(!lengths_status.failed());
+    for (std::size_t index = 0; !lengths_status.failed() && index != count; ++index)
+        expect_equal(lengths[index], expected_length);
 
-    auto maybe_indicators = reference.present();
-    expect_true(maybe_indicators.has_value());
-    for (std::size_t index = 0; index != count; ++index)
-        expect_true(static_cast<bool>(maybe_indicators->view().at(index)) == !expects_missing);
+    auto [indicators, indicators_status] = reference.present();
+    expect_true(!indicators_status.failed());
+    for (std::size_t index = 0; !indicators_status.failed() && index != count; ++index)
+        expect_true(static_cast<bool>(indicators.view().at(index)) == !expects_missing);
 }
 
 /** Checks that the keys @p reference names hold @p values, byte for byte. */
@@ -339,10 +376,8 @@ void check_equalities(reference_type_& reference, std::span<value_view_t const> 
     using extractor_t = places_arg_extractor<typename reference_type_::locations_plain_t>;
     ustore_size_t const count = extractor_t {}.count(reference.locations());
 
-    auto maybe_retrieved = reference.value();
-    expect_true(maybe_retrieved.has_value());
-    if (!maybe_retrieved) return;
-    auto const& retrieved = *maybe_retrieved;
+    auto [retrieved, retrieve_status] = reference.value();
+    if (!expect_true(!retrieve_status.failed())) return;
     expect_equal(retrieved.size(), count);
 
     auto iterator = retrieved.begin();
@@ -357,7 +392,7 @@ void check_equalities(reference_type_& reference, std::span<value_view_t const> 
 template <typename locations_type_, typename values_type_>
 void round_trip(blobs_ref<locations_type_>& reference, values_type_ const& values,
                 std::span<value_view_t const> expected) {
-    expect_true(reference.assign(values).succeeded());
+    expect_true(!reference.assign(values).failed());
     check_equalities(reference, expected);
 }
 
@@ -371,7 +406,7 @@ struct triplet_t {
     std::array<std::uint64_t, 4> wide_offsets {0, 1, 2, 3};
 
     /** The values as a tape of 32-bit offsets. */
-    ustore_strings_view_t u32_layout() const noexcept { return u32_tape(values.data(), narrow_offsets.data()); }
+    ustore_strings_view_t u32_layout() const noexcept { return util::u32_tape(values.data(), narrow_offsets.data()); }
 
     /** The values as a tape of 64-bit offsets. */
     ustore_strings_view_t u64_layout() const noexcept { return u64_tape(values.data(), wide_offsets.data()); }
@@ -438,12 +473,12 @@ constexpr edge_t edge_of(std::uint64_t source, std::uint64_t target, std::uint64
  *  writes: in a fresh directory beside the one @p config works in, or in memory when the suite
  *  runs without one. */
 template <typename database_type_>
-expected<database_type_> open_reference(config_t const& config) noexcept {
+util::expected<database_type_> open_reference(config_t const& config) noexcept {
     engine_options_t const ram;
     if (!config.directory()) return open_database<database_type_>(config_t {ram, nullptr});
     std::string const directory = fmt::format("{}/{}", config.directory(), "reference");
     if (!scratch_directory_t::recreate(directory.c_str()))
-        return status_t {status_code_t::io_k, "Cannot empty the directory of the reference database"};
+        return util::status_t {util::status_code_t::io_k, "Cannot empty the directory of the reference database"};
     return open_database<database_type_>(config_t {ram, directory.c_str()});
 }
 
@@ -460,21 +495,23 @@ struct compared_collections_t {
 inline expected<compared_collections_t> open_compared(config_t const& config, ustore_modality_t modality) noexcept {
     compared_collections_t compared;
     auto [tested, tested_status] = open_database<database_t>(config);
-    if (tested_status.failed()) return tested_status;
+    if (tested_status.failed())
+        return {{}, status_t {static_cast<status_code_t>(tested_status.code), tested_status.note}};
     auto [reference, reference_status] = open_reference<database_t>(config);
-    if (reference_status.failed()) return reference_status;
+    if (reference_status.failed())
+        return {{}, status_t {static_cast<status_code_t>(reference_status.code), reference_status.note}};
     compared.databases = {std::move(tested), std::move(reference)};
     for (std::size_t side = 0; side != 2; ++side) {
-        if (status_t const status = compared.databases[side].on().clear(ustore_drop_collection_k); status.failed())
-            return status;
-        auto [collection, collection_status] = create_collection(compared.databases[side], "ranges", modality);
-        if (collection_status.failed()) return collection_status;
+        if (status_t const status = compared.databases[side].clear(ustore_drop_collection_k); status.failed())
+            return {{}, status};
+        auto [collection, collection_status] = create_collection(compared.databases[side].handle(), "ranges", modality);
+        if (collection_status.failed()) return {{}, collection_status};
         auto [arena, arena_status] = arena_t::make();
-        if (arena_status.failed()) return arena_status;
+        if (arena_status.failed()) return {{}, arena_status};
         compared.collections[side] = collection;
         compared.arenas[side] = std::move(arena);
     }
-    return compared;
+    return {std::move(compared)};
 }
 
 /** A range a case lists or measures: from @c start, inclusive, or the first key in @c direction
@@ -494,7 +531,7 @@ expected<std::span<ustore_key_t const>> scan_bounds(void (*call)(arguments_type_
     ustore_key_t const* keys = nullptr;
     ustore_outcome_t outcome {};
     arguments_type_ scan {};
-    scan.database = compared.databases[side];
+    scan.database = compared.databases[side].handle();
     scan.outcome = &outcome;
     scan.count = 1;
     scan.collections = {&compared.collections[side], 0};
@@ -503,12 +540,12 @@ expected<std::span<ustore_key_t const>> scan_bounds(void (*call)(arguments_type_
     scan.direction = bounds.direction;
     scan.offsets = &offsets;
     scan.keys = &keys;
-    scan.arena = compared.arenas[side];
+    scan.arena = compared.arenas[side].handle();
     scan.wanted = bounds.wanted;
     call(&scan);
-    if (status_t const status {outcome}; status.failed()) return status;
-    if (!offsets) return status_t {status_code_t::internal_k, "The scan exported no offsets"};
-    return std::span<ustore_key_t const> {keys + offsets[0], keys + offsets[1]};
+    if (status_t const status = status_of<status_t, status_code_t>(outcome); status.failed()) return {{}, status};
+    if (!offsets) return {{}, status_t {status_code_t::internal_k, "The scan exported no offsets"}};
+    return {std::span<ustore_key_t const> {keys + offsets[0], keys + offsets[1]}};
 }
 
 /** Counts a failure for every key the engine under test lists over @p bounds through @p call apart
@@ -518,7 +555,7 @@ void expect_same_scan(void (*call)(arguments_type_*), compared_collections_t& co
                       std::span<ustore_key_t const> pinned) {
     auto [tested, tested_status] = scan_bounds(call, compared, 0, bounds);
     auto [reference, reference_status] = scan_bounds(call, compared, 1, bounds);
-    if (!expect_true(tested_status.succeeded()) || !expect_true(reference_status.succeeded())) return;
+    if (!expect_true(!tested_status.failed()) || !expect_true(!reference_status.failed())) return;
     expect_equal(tested.size(), reference.size());
     for (std::size_t index = 0; index != tested.size() && index != reference.size(); ++index)
         expect_equal(tested[index], reference[index]);
@@ -535,7 +572,7 @@ void remove_ranges(void (*call)(arguments_type_*), compared_collections_t& compa
     for (std::size_t side = 0; side != 2; ++side) {
         ustore_outcome_t outcome {};
         arguments_type_ remove {};
-        remove.database = compared.databases[side];
+        remove.database = compared.databases[side].handle();
         remove.outcome = &outcome;
         remove.count = starts.size();
         remove.collections = {&compared.collections[side], 0};
@@ -562,7 +599,7 @@ expected<measured_bounds_t> measure_bounds(void (*call)(arguments_type_*), compa
     ustore_size_t const *min_value_bytes = nullptr, *max_value_bytes = nullptr;
     ustore_outcome_t outcome {};
     arguments_type_ measure {};
-    measure.database = compared.databases[side];
+    measure.database = compared.databases[side].handle();
     measure.outcome = &outcome;
     measure.count = 1;
     measure.collections = {&compared.collections[side], 0};
@@ -573,12 +610,12 @@ expected<measured_bounds_t> measure_bounds(void (*call)(arguments_type_*), compa
     measure.max_cardinalities = &max_cardinalities;
     measure.min_value_bytes = &min_value_bytes;
     measure.max_value_bytes = &max_value_bytes;
-    measure.arena = compared.arenas[side];
+    measure.arena = compared.arenas[side].handle();
     call(&measure);
-    if (status_t const status {outcome}; status.failed()) return status;
+    if (status_t const status = status_of<status_t, status_code_t>(outcome); status.failed()) return {{}, status};
     if (!min_cardinalities || !max_cardinalities || !min_value_bytes || !max_value_bytes)
-        return status_t {status_code_t::internal_k, "The measure exported no bounds"};
-    return measured_bounds_t {min_cardinalities[0], max_cardinalities[0], min_value_bytes[0], max_value_bytes[0]};
+        return {{}, status_t {status_code_t::internal_k, "The measure exported no bounds"}};
+    return {measured_bounds_t {min_cardinalities[0], max_cardinalities[0], min_value_bytes[0], max_value_bytes[0]}};
 }
 
 /** Counts a failure unless the reference measures exactly @p cardinality entries in @p bounds
@@ -588,7 +625,7 @@ void expect_measure_holds(void (*call)(arguments_type_*), compared_collections_t
                           ustore_size_t cardinality) {
     auto [tested, tested_status] = measure_bounds(call, compared, 0, bounds);
     auto [reference, reference_status] = measure_bounds(call, compared, 1, bounds);
-    if (!expect_true(tested_status.succeeded()) || !expect_true(reference_status.succeeded())) return;
+    if (!expect_true(!tested_status.failed()) || !expect_true(!reference_status.failed())) return;
     expect_equal(reference.min_cardinality, cardinality);
     expect_equal(reference.max_cardinality, cardinality);
     expect_true(tested.min_cardinality <= cardinality && cardinality <= tested.max_cardinality);
@@ -604,13 +641,13 @@ void expect_samples_of(void (*call)(arguments_type_*), compared_collections_t& c
         ustore_key_t const* keys = nullptr;
         ustore_outcome_t outcome {};
         arguments_type_ sample {};
-        sample.database = compared.databases[side];
+        sample.database = compared.databases[side].handle();
         sample.outcome = &outcome;
         sample.count = 1;
         sample.collections = {&compared.collections[side], 0};
         sample.offsets = &offsets;
         sample.keys = &keys;
-        sample.arena = compared.arenas[side];
+        sample.arena = compared.arenas[side].handle();
         sample.wanted = wanted;
         call(&sample);
         expect_success(outcome);

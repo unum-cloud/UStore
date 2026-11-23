@@ -37,6 +37,8 @@
 
 namespace unum::ustore::blobs {
 
+using utilities::bytes_of;
+
 /**
  *  @brief The device compactor a database's merges run on an Apple device, made once at open over
  *      a Metal executor the database owns.
@@ -58,6 +60,8 @@ class metal_compactor_t {
     static expected<metal_compactor_t> make(utilities::metal_executor_t& executor,
                                             device_sections_reader_t sections = {}) noexcept;
 
+    /** Holds nothing, as a moved-from compactor does. */
+    metal_compactor_t() noexcept = default;
     metal_compactor_t(metal_compactor_t&& other) noexcept
         : executor_(other.executor_), sections_(other.sections_), blocks_(std::exchange(other.blocks_, {})),
           device_allocations_(std::exchange(other.device_allocations_, 0)), reads_(std::move(other.reads_)) {}
@@ -163,10 +167,10 @@ class metal_compactor_t {
 template <typename element_type_>
 element_type_* metal_compactor_t::carve_(std::size_t count) noexcept {
     std::uint32_t const held = blocks_.count;
-    expected<std::span<element_type_>> const carved = utilities::carve_runs<element_type_>(
+    auto const [carved, status] = utilities::carve_runs<element_type_>(
         blocks_, *executor_, count, [&](std::size_t bytes) noexcept { return executor_->allocate_async(bytes); });
     device_allocations_ += blocks_.count - held;
-    return carved ? carved->data() : nullptr;
+    return status.failed() ? nullptr : carved.data();
 }
 
 template <typename record_type_>

@@ -13,21 +13,22 @@
 #include "vram/classes.hpp" // `kernel_tables`, `pick_gpu_class`
 
 using namespace unum::ustore;
-using namespace unum::ustore::utilities;
 
-kernel_table<cuda_module_t> const* suite_kernels(gpu_drivers_t& drivers,
-                                                 kernel_tables<cuda_module_t>& tables) noexcept {
-    gpu_device_t device;
-    if (!list_nvidia_gpu_devices(drivers.cuda, {&device, 1})) return nullptr;
+util::kernel_table<util::cuda_module_t> const* suite_kernels(util::gpu_drivers_t& drivers,
+                                                             kernel_tables<util::cuda_module_t>& tables) noexcept {
+    util::gpu_device_t device;
+    if (!util::list_nvidia_gpu_devices(drivers.cuda, {&device, 1})) return nullptr;
     gpu_class_t const gpu_class = pick_gpu_class(drivers, device, gpu_class_t::unknown_k);
-    if (tables.load(drivers.cuda, drivers.cuda_contexts[0], 0, gpu_class, vram_kernel_names_k).failed()) return nullptr;
+    if (tables.load(drivers.cuda, drivers.cuda_contexts[0], 0, gpu_class, util::vram_kernel_names_k).failed())
+        return nullptr;
     return tables.table_of(0, gpu_class);
 }
 
-kernel_table<hip_module_t> const* suite_kernels(gpu_drivers_t& drivers, kernel_tables<hip_module_t>& tables) noexcept {
-    gpu_device_t device;
-    if (!list_amd_gpu_devices(drivers.hip, {&device, 1})) return nullptr;
+util::kernel_table<util::hip_module_t> const* suite_kernels(util::gpu_drivers_t& drivers,
+                                                            kernel_tables<util::hip_module_t>& tables) noexcept {
+    util::gpu_device_t device;
+    if (!util::list_amd_gpu_devices(drivers.hip, {&device, 1})) return nullptr;
     gpu_class_t const gpu_class = pick_gpu_class(drivers, device, gpu_class_t::unknown_k);
-    if (tables.load(drivers.hip, 0, 0, gpu_class, vram_kernel_names_k).failed()) return nullptr;
+    if (tables.load(drivers.hip, 0, 0, gpu_class, util::vram_kernel_names_k).failed()) return nullptr;
     return tables.table_of(0, gpu_class);
 }

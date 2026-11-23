@@ -21,15 +21,17 @@
 
 namespace unum::ustore::blobs {
 
+using utilities::bytes_of;
+
 #pragma region Merge
 
 template <typename element_type_>
 element_type_* hip_compactor_t::carve_(std::size_t count) noexcept {
     std::uint32_t const held = blocks_.count;
-    expected<std::span<element_type_>> const carved = utilities::carve_runs<element_type_>(
+    auto const [carved, status] = utilities::carve_runs<element_type_>(
         blocks_, *executor_, count, [&](std::size_t bytes) noexcept { return executor_->allocate_async(bytes); });
     device_allocations_ += blocks_.count - held;
-    return carved ? carved->data() : nullptr;
+    return status.failed() ? nullptr : carved.data();
 }
 
 template <typename record_type_>

@@ -13,7 +13,7 @@
 #include <type_traits> // `std::is_same_v`
 
 #include "ustore/blobs.h"
-#include "ustore/ranges.hpp" // `place_batch_t`, `strided`
+#include "ustore/utilities/ranges.hpp" // `place_batch_t`
 
 #include "database.hpp"          // `database_state`, `read_values`, `remove_keys`, `scan_keys`, `measure_keys`
 #include "utilities/batches.hpp" // `strings_arg_t`, `places_of`
@@ -33,7 +33,7 @@ status_t serve(database_state<cpu_class_, isolation_>& state, ustore_blobs_read_
  *  names first. */
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 store_status_t write_one(database_state<cpu_class_, isolation_>& state,
-                         strided_iterator<ustore_collection_id_t const> collections, ustore_key_t const& key,
+                         util::strided_iterator<ustore_collection_id_t const> collections, ustore_key_t const& key,
                          value_view_t content, status_t& outcome) noexcept {
     claim_t claim;
     reader_source<cpu_class_, isolation_> source {state, state.order.take_snapshot(claim)};
@@ -50,7 +50,7 @@ store_status_t write_one(database_state<cpu_class_, isolation_>& state,
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 status_t serve(database_state<cpu_class_, isolation_>& state, ustore_blobs_write_t const& arguments,
                strings_arg_t const& values, view_t const& view) noexcept {
-    place_batch_t const places = places_of(arguments);
+    util::place_batch_t const places = util::places_of(arguments);
     if (status_t const status = validate_write(view.transaction, places, values, arguments.durability, view.watch);
         status.failed() || !arguments.count)
         return status;

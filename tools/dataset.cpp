@@ -24,10 +24,10 @@
 #include <smashtable/basic_vector.hpp> // `st::vector`
 #include <stringzilla/stringzilla.hpp> // `sz::string_t`, `sz::string_view_t`, `sz::split`
 
-#include "ustore/docs.h"     // `ustore_docs_write_t`, `ustore_docs_read_t`, `ustore_docs_scan_t`
-#include "ustore/graph.h"    // `ustore_graph_write_edges_t`, `ustore_graph_scan_vertices_t`
-#include "ustore/ranges.hpp" // `bits_view_t`, `tape_string`, `u64_tape`
-#include "ustore/types.hpp"  // `sz`, `st`
+#include "ustore/docs.h"               // `ustore_docs_write_t`, `ustore_docs_read_t`, `ustore_docs_scan_t`
+#include "ustore/graph.h"              // `ustore_graph_write_edges_t`, `ustore_graph_scan_vertices_t`
+#include "ustore/utilities/ranges.hpp" // `bits_view_t`, `tape_string`, `u64_tape`
+#include "ustore/utilities/types.hpp"  // `sz`, `st`
 
 #include "ustore/utilities/blocking_files.hpp" // `mapped_file_t`, `open_native_file`, `write_native_file`
 
@@ -35,8 +35,6 @@
 #include "dataset.hpp" // `format_of`, `failed`, `copy_path`, `place`, `task_arena_t`, `staged_output_t`
 
 namespace unum::ustore::tools {
-
-using namespace unum::ustore::utilities;
 
 #pragma region Files
 
@@ -67,8 +65,8 @@ using namespace unum::ustore::utilities;
  *  leaves a file already at the target as it was. */
 class output_file_t {
     staged_output_t staged_;
-    native_file_t file_ = invalid_native_file_k;
-    native_file_event_t event_;
+    util::native_file_t file_ = util::invalid_native_file_k;
+    util::native_file_event_t event_;
     std::uint64_t offset_ = 0;
     std::size_t threshold_ = 0;
     sz::string_t buffer_;
@@ -78,8 +76,8 @@ class output_file_t {
     output_file_t(output_file_t const&) = delete;
     output_file_t& operator=(output_file_t const&) = delete;
     ~output_file_t() noexcept {
-        if (file_ == invalid_native_file_k) return;
-        [[maybe_unused]] status_t const closed = close_native_file(file_);
+        if (file_ == util::invalid_native_file_k) return;
+        [[maybe_unused]] util::status_t const closed = util::close_native_file(file_);
         ustore_outcome_t abandoned {ustore_status_cancelled_k, "The export ended before it finished"};
         staged_.land(&abandoned);
     }
@@ -89,14 +87,14 @@ class output_file_t {
         threshold_ = threshold;
         staged_.stage(path, outcome);
         if (failed(outcome)) return;
-        auto [event, event_status] = native_file_event_t::make();
+        auto [event, event_status] = util::native_file_event_t::make();
         if (event_status.failed()) {
-            *outcome = event_status;
+            *outcome = outcome_of(event_status);
             return;
         }
         event_ = std::move(event);
-        auto [file, open_status] = open_native_file(staged_.temporary(), file_access_t::truncate_read_write_k,
-                                                    file_buffering_t::buffered_k);
+        auto [file, open_status] = util::open_native_file(
+            staged_.temporary(), util::file_access_t::truncate_read_write_k, util::file_buffering_t::buffered_k);
         if (open_status.failed()) *outcome = {ustore_status_io_k, "Failed to create the output file"};
         else file_ = file;
     }
@@ -113,23 +111,24 @@ class output_file_t {
 
     /** Buffers @p key as the decimal digits of the integer it spells, or as quoted UUID text when it spells none. */
     void append_key(ustore_key_t key, ustore_outcome_t* outcome) noexcept {
-        if (auto [integer, integer_status] = uuid_to_integer(key.uuid); integer_status.succeeded()) {
+        if (auto [integer, integer_status] = util::uuid_to_integer(key.uuid); integer_status.succeeded()) {
             char digits[24];
             std::to_chars_result const printed = std::to_chars(digits, digits + sizeof(digits), integer);
             append({digits, static_cast<std::size_t>(printed.ptr - digits)}, outcome);
             return;
         }
-        char quoted[uuid_text_length_k + 2];
+        char quoted[util::uuid_text_length_k + 2];
         quoted[0] = '"';
-        uuid_to_text(key.uuid, std::span(quoted).subspan<1, uuid_text_length_k>());
-        quoted[uuid_text_length_k + 1] = '"';
+        util::uuid_to_text(key.uuid, std::span(quoted).subspan<1, util::uuid_text_length_k>());
+        quoted[util::uuid_text_length_k + 1] = '"';
         append({quoted, sizeof(quoted)}, outcome);
     }
 
     /** Writes the whole buffer out and empties it, reporting a short or failed write into @p outcome. */
     void flush(ustore_outcome_t* outcome) noexcept {
-        std::span<byte_t const> const pending {reinterpret_cast<byte_t const*>(buffer_.data()), buffer_.size()};
-        auto [landed, write_status] = write_native_file(file_, offset_, pending, event_);
+        std::span<util::byte_t const> const pending {reinterpret_cast<util::byte_t const*>(buffer_.data()),
+                                                     buffer_.size()};
+        auto [landed, write_status] = util::write_native_file(file_, offset_, pending, event_);
         if (write_status.failed() || landed != pending.size()) {
             *outcome = {ustore_status_io_k, "Failed to write the output file"};
             return;
@@ -143,8 +142,9 @@ class output_file_t {
     void finish(ustore_outcome_t* outcome) noexcept {
         if (!failed(outcome)) flush(outcome);
         if (!failed(outcome))
-            if (status_t const flushed = flush_native_file(file_); flushed.failed()) *outcome = flushed;
-        status_t const closed = close_native_file(std::exchange(file_, invalid_native_file_k));
+            if (util::status_t const flushed = util::flush_native_file(file_); flushed.failed())
+                *outcome = outcome_of(flushed);
+        util::status_t const closed = util::close_native_file(std::exchange(file_, util::invalid_native_file_k));
         if (closed.failed() && !failed(outcome)) *outcome = {ustore_status_io_k, "Failed to close the output file"};
         staged_.land(outcome);
     }
@@ -167,7 +167,7 @@ void copy_path(ustore_bytes_view_t path, sz::string_t& copy, ustore_outcome_t* o
         *outcome = {ustore_status_invalid_argument_k, "Empty path specified"};
         return;
     }
-    if (copy.assign(sz::string_view_t {chars_of(path)}) != sz::status_t::success_k)
+    if (copy.assign(sz::string_view_t {util::chars_of(path)}) != sz::status_t::success_k)
         *outcome = {ustore_status_out_of_memory_k, "Failed to copy the path"};
 }
 
@@ -218,11 +218,11 @@ using field_list_t = std::span<std::string_view const>;
 [[nodiscard]] bool read_key(yyjson_val* object, std::string_view field, ustore_key_t& key) noexcept {
     yyjson_val* const value = lookup(object, field);
     if (yyjson_is_uint(value)) {
-        key = key_from_integer(yyjson_get_uint(value));
+        key = util::key_from_integer(yyjson_get_uint(value));
         return true;
     }
     if (!yyjson_is_str(value)) return false;
-    auto [uuid, uuid_status] = uuid_from_text({yyjson_get_str(value), yyjson_get_len(value)});
+    auto [uuid, uuid_status] = util::uuid_from_text({yyjson_get_str(value), yyjson_get_len(value)});
     key.uuid = uuid;
     return uuid_status.succeeded();
 }
@@ -415,7 +415,7 @@ void read_header(csv_reader_t& reader, field_list_t fields, sz::string_t& names,
 
 /** Parses a CSV field holding a non-negative integer or UUID text into @p key, answering whether it held one. */
 [[nodiscard]] bool csv_key(std::string_view field, ustore_key_t& key) noexcept {
-    auto [uuid, uuid_status] = uuid_from_text(field);
+    auto [uuid, uuid_status] = util::uuid_from_text(field);
     key.uuid = uuid;
     return uuid_status.succeeded();
 }
@@ -477,12 +477,12 @@ void resolve_fields(ustore_strings_view_t const& strings, ustore_size_t count, s
         ustore_bytes_view_t name {};
         if (strings.layout == ustore_strings_accessor_k)
             strings.data.accessor.get(strings.data.accessor.handle, &index, 1, &name);
-        else name = tape_string(strings, index);
+        else name = util::tape_string(strings, index);
         if (!name.length) {
             *outcome = {ustore_status_invalid_argument_k, "Fields must not be empty"};
             return;
         }
-        fields[index] = chars_of(name);
+        fields[index] = util::chars_of(name);
     }
 }
 
@@ -534,7 +534,7 @@ class document_batch_t {
         write.type = ustore_docs_field_type_json_k;
         write.modification = ustore_docs_modify_upsert_k;
         write.collections = {&task.collection, 0};
-        write.values = u64_tape(text_.data(), offsets_.data());
+        write.values = util::u64_tape(text_.data(), offsets_.data());
         write.id_field = task.id_field;
         ustore_docs_write(&write);
 
@@ -635,7 +635,7 @@ template <typename scan_type_, void (*scan_)(scan_type_*), typename task_type_, 
 void scan_keys(task_type_ const& task, ustore_size_t batch_size, consumer_type_&& consume) noexcept {
     task_arena_t const keys_arena {nullptr, task.outcome};
     if (failed(task.outcome)) return;
-    ustore_key_t start = smallest_key_k;
+    ustore_key_t start = util::smallest_key_k;
     ustore_size_t scanned = 0;
     while (true) {
         ustore_length_t const* offsets = nullptr;
@@ -659,9 +659,9 @@ void scan_keys(task_type_ const& task, ustore_size_t batch_size, consumer_type_&
         ustore_key_t const last = keys[count - 1];
         consume(std::span<ustore_key_t const>(keys, count));
         scanned += count;
-        if (failed(task.outcome) || count < batch_size || last == largest_key_k) return;
+        if (failed(task.outcome) || count < batch_size || last == util::largest_key_k) return;
         if (!advance(task, scanned, 0)) return;
-        start = key_after(last);
+        start = util::key_after(last);
     }
 }
 
@@ -725,9 +725,9 @@ void import_ndjson_edges(ustore_graph_import_t const& task, sz::string_view_t te
         json_document_t const document {yyjson_read(row.data(), row.size(), 0)};
         yyjson_val* const root = yyjson_doc_get_root(document.handle);
         edge_row_t edge {{}, {}, ustore_edge_id_default_k};
-        if (!yyjson_is_obj(root) || !read_key(root, chars_of(task.source_id_field), edge.source) ||
-            !read_key(root, chars_of(task.target_id_field), edge.target) ||
-            (task.edge_id_field.length && !read_key(root, chars_of(task.edge_id_field), edge.edge))) {
+        if (!yyjson_is_obj(root) || !read_key(root, util::chars_of(task.source_id_field), edge.source) ||
+            !read_key(root, util::chars_of(task.target_id_field), edge.target) ||
+            (task.edge_id_field.length && !read_key(root, util::chars_of(task.edge_id_field), edge.edge))) {
             *task.outcome = {ustore_status_malformed_k,
                              "The input file holds a line without integer or UUID vertex or edge fields"};
             return;
@@ -746,10 +746,10 @@ void import_csv_edges(ustore_graph_import_t const& task, sz::string_view_t text)
     read_header(reader, field_list_t {}, names, columns, task.outcome);
     if (failed(task.outcome)) return;
 
-    std::size_t const source_column = column_index(names, columns, chars_of(task.source_id_field));
-    std::size_t const target_column = column_index(names, columns, chars_of(task.target_id_field));
+    std::size_t const source_column = column_index(names, columns, util::chars_of(task.source_id_field));
+    std::size_t const target_column = column_index(names, columns, util::chars_of(task.target_id_field));
     std::size_t const edge_column = task.edge_id_field.length
-                                        ? column_index(names, columns, chars_of(task.edge_id_field))
+                                        ? column_index(names, columns, util::chars_of(task.edge_id_field))
                                         : (std::numeric_limits<std::size_t>::max)();
     if (source_column == columns.size() || target_column == columns.size() || edge_column == columns.size()) {
         *task.outcome = {ustore_status_malformed_k, "The CSV header lacks a vertex or edge column"};
@@ -801,7 +801,7 @@ void ustore_docs_import(ustore_docs_import_t* task_pointer) {
     st::vector<std::string_view> fields;
     resolve_fields(task.fields, task.fields_count, fields, task.outcome);
     if (failed(task.outcome)) return;
-    std::string_view const id_field = chars_of(task.id_field);
+    std::string_view const id_field = util::chars_of(task.id_field);
     if (id_field.empty()) {
         *task.outcome = {ustore_status_invalid_argument_k, "Id field must be initialized"};
         return;
@@ -820,9 +820,9 @@ void ustore_docs_import(ustore_docs_import_t* task_pointer) {
     ustore_dataset_format_t const format = text_format_of(path.view(), task.outcome);
     if (failed(task.outcome)) return;
 
-    auto [file, map_status] = utilities::mapped_file_t::map(path.c_str());
+    auto [file, map_status] = util::mapped_file_t::map(path.c_str());
     if (map_status.failed()) {
-        *task.outcome = map_status;
+        *task.outcome = outcome_of(map_status);
         return;
     }
     if (format == ustore_dataset_format_ndjson_k) import_ndjson_documents(task, fields, file.view());
@@ -876,10 +876,10 @@ void ustore_docs_export(ustore_docs_export_t* task_pointer) {
         ustore_docs_read(&read);
         if (failed(task.outcome)) return;
 
-        bits_view_t const present {presences};
+        util::bits_view_t const present {presences};
         for (std::size_t index = 0; index != keys.size() && !failed(task.outcome); ++index) {
             if (!present[index]) continue;
-            sz::string_view_t document {chars_of(tape_string(values, index))};
+            sz::string_view_t document {util::chars_of(util::tape_string(values, index))};
             while (document.size() != 0 && document[document.size() - 1] == '\n')
                 document = sz::string_view_t(document.data(), document.size() - 1);
             if (fields.size() != 0) {
@@ -930,9 +930,9 @@ void ustore_graph_import(ustore_graph_import_t* task_pointer) {
     ustore_dataset_format_t const format = text_format_of(path.view(), task.outcome);
     if (failed(task.outcome)) return;
 
-    auto [file, map_status] = utilities::mapped_file_t::map(path.c_str());
+    auto [file, map_status] = util::mapped_file_t::map(path.c_str());
     if (map_status.failed()) {
-        *task.outcome = map_status;
+        *task.outcome = outcome_of(map_status);
         return;
     }
     if (format == ustore_dataset_format_ndjson_k) import_ndjson_edges(task, file.view());
@@ -948,9 +948,9 @@ void ustore_graph_export(ustore_graph_export_t* task_pointer) {
         *task.outcome = {ustore_status_uninitialized_k, "Database is uninitialized"};
         return;
     }
-    std::string_view const source_id_field = chars_of(task.source_id_field);
-    std::string_view const target_id_field = chars_of(task.target_id_field);
-    std::string_view const edge_id_field = chars_of(task.edge_id_field);
+    std::string_view const source_id_field = util::chars_of(task.source_id_field);
+    std::string_view const target_id_field = util::chars_of(task.target_id_field);
+    std::string_view const edge_id_field = util::chars_of(task.edge_id_field);
     if (source_id_field.empty() || target_id_field.empty()) {
         *task.outcome = {ustore_status_invalid_argument_k, "Source and target id fields must be initialized"};
         return;
@@ -1048,7 +1048,7 @@ void ustore_graph_export(ustore_graph_export_t* task_pointer) {
 ustore_dataset_format_t ustore_dataset_format_of(ustore_bytes_view_t path, ustore_dataset_format_t asked) {
     using namespace unum::ustore;
     using namespace unum::ustore::tools;
-    return format_of(chars_of(path), asked);
+    return format_of(util::chars_of(path), asked);
 }
 
 #pragma endregion C Interface

@@ -27,7 +27,6 @@
 
 using namespace unum::ustore;
 using namespace unum::ustore::test;
-using namespace unum::ustore::utilities;
 using namespace unum;
 
 /** Workload of the suite, each field set by the setting of the same name. */
@@ -127,9 +126,9 @@ struct batches_t {
 
 /** Begins the transaction a slot resets before every attempt. */
 bool begin_transaction(database_t& database, transaction_t& transaction) {
-    auto maybe_transaction = database.on().transaction();
-    if (!expect_true(maybe_transaction.has_value())) return false;
-    transaction = *std::move(maybe_transaction);
+    auto [begun, begin_status] = database.transaction();
+    if (!expect_true(!begin_status.failed())) return false;
+    transaction = std::move(begun);
     return true;
 }
 
@@ -138,11 +137,11 @@ bool begin_transaction(database_t& database, transaction_t& transaction) {
 bool prepare_run(atomicity_run_t& run, atomicity_options_t const& options) {
     auto [arena, arena_status] = arena_t::make();
     run.arena = std::move(arena);
-    if (!expect_true(arena_status.succeeded()) || !expect_true(st::succeeded(run.keys.resize(options.keys.value))) ||
+    if (!expect_true(!arena_status.failed()) || !expect_true(st::succeeded(run.keys.resize(options.keys.value))) ||
         !expect_true(st::succeeded(run.slots.resize((std::ranges::max)(options.thread_counts.view())))))
         return false;
     for (std::size_t index = 0; index != run.keys.size(); ++index) run.keys[index] = key_from_integer(index);
-    if (!run.database.on().supports_transactions()) return true;
+    if (!probed(run.database.supports_transactions())) return true;
     for (writer_slot_t& slot : run.slots)
         if (!begin_transaction(run.database, slot.transaction)) return false;
     return true;
@@ -157,12 +156,12 @@ bool prepare_run(atomicity_run_t& run, atomicity_options_t const& options) {
 bool commit_batch(transaction_t& transaction, ustore_collection_id_t target, keys_view_t keys, value_view_t value,
                   batch_operation_t operation) {
     while (true) {
-        if (!expect_true(transaction.on().reset().has_value())) return false;
+        if (!expect_true(!transaction.reset().status.failed())) return false;
         blobs_collection_t collection {transaction.receiver(), target};
-        bool const staged = operation == batch_operation_t::erase_k ? collection[keys].remove().succeeded()
-                                                                    : collection[keys].assign(value).succeeded();
+        bool const staged = operation == batch_operation_t::erase_k ? !collection[keys].remove().failed()
+                                                                    : !collection[keys].assign(value).failed();
         if (!staged) continue;
-        if (transaction.on().commit()) return true;
+        if (!transaction.commit().status.failed()) return true;
     }
 }
 
@@ -170,7 +169,7 @@ bool commit_batch(transaction_t& transaction, ustore_collection_id_t target, key
 void write_round(writer_slot_t& slot, ustore_collection_id_t collection, batches_t const& batches, std::size_t thread) {
     for (std::size_t batch = 0; batch != batches.count(); ++batch) {
         std::uint64_t const number = batch * batches.threads_count + thread;
-        value_view_t const value(reinterpret_cast<byte_t const*>(&number), sizeof(number));
+        value_view_t const value(reinterpret_cast<util::byte_t const*>(&number), sizeof(number));
         bool const erases = batches.deletes == round_deletes_t::with_deletes_k &&
                             slot.random_generator.below(batches.deletes_periodicity) == 0;
         batch_operation_t const operation = erases ? batch_operation_t::erase_k : batch_operation_t::overwrite_k;
@@ -180,21 +179,22 @@ void write_round(writer_slot_t& slot, ustore_collection_id_t collection, batches
 
 /** Checks that one batch holds one value in all its keys, reading them into @p arena. */
 void verify_batch(blobs_collection_t& collection, arena_t& arena, keys_view_t keys) {
-    auto maybe_retrieved = collection[keys].value(arena);
-    if (!expect_true(maybe_retrieved.has_value())) return;
-    auto const& retrieved = *maybe_retrieved;
+    auto const [retrieved, retrieve_status] = collection[keys].value(arena);
+    if (!expect_true(!retrieve_status.failed())) return;
     for (std::size_t offset = 1; offset != keys.size(); ++offset) expect_true(retrieved[0] == retrieved[offset]);
 }
 
 /** Runs one round: every thread writes every batch, then the main thread checks what they left
  *  and clears it. */
-void run_round(atomicity_run_t& run, executor_t& executor, batches_t const& batches) {
+void run_round(atomicity_run_t& run, util::executor_t& executor, batches_t const& batches) {
     std::span<writer_slot_t> const slots {run.slots.data(), batches.threads_count};
-    auto writer = [&](std::size_t thread) noexcept { write_round(slots[thread], run.collection, batches, thread); };
+    auto writer = [&](std::size_t thread) noexcept {
+        write_round(slots[thread], run.collection.handle(), batches, thread);
+    };
     expect_true(st::succeeded(executor.for_threads(writer)));
     for (std::size_t batch = 0; batch != batches.count(); ++batch)
         verify_batch(run.collection, run.arena, batches[batch]);
-    expect_true(run.database.on().clear(ustore_drop_pairs_k).succeeded());
+    expect_true(!run.database.clear(ustore_drop_pairs_k).failed());
 }
 
 #pragma endregion Round
@@ -215,7 +215,7 @@ void run_round(atomicity_run_t& run, executor_t& executor, batches_t const& batc
  *  @param[in] checkpoints Most rounds to run.
  *  @param[in] slice Time after which no further round starts; the first round always runs.
  */
-void insert_atomic_isolated(atomicity_run_t& run, executor_t& executor, batches_t const& batches,
+void insert_atomic_isolated(atomicity_run_t& run, util::executor_t& executor, batches_t const& batches,
                             std::size_t checkpoints, std::chrono::nanoseconds slice) {
     auto const deadline = std::chrono::steady_clock::now() + slice;
     std::size_t const failed_before = test_run.failed_checks.load();
@@ -229,19 +229,19 @@ void insert_atomic_isolated(atomicity_run_t& run, executor_t& executor, batches_
 /** Runs every batch size on one pool of @p threads threads. */
 void inserts_on_threads(atomicity_run_t& run, atomicity_options_t const& options, std::size_t threads,
                         round_deletes_t deletes, std::chrono::nanoseconds slice) {
-    auto maybe_executor = executor_t::make(threads, caller_exclusivity_t::caller_inclusive_k);
-    if (!expect_true(maybe_executor.has_value())) return;
+    auto [executor, executor_status] = util::executor_t::make(threads, util::caller_exclusivity_t::caller_inclusive_k);
+    if (!expect_true(!st::failed(executor_status))) return;
     for (std::size_t const batch_size : options.batch_sizes.view()) {
         std::span<ustore_key_t const> const keys {run.keys.data(), run.keys.size() / batch_size * batch_size};
         batches_t const batches {keys, batch_size, threads, deletes, options.deletes_periodicity.value};
-        insert_atomic_isolated(run, *maybe_executor, batches, options.checkpoints.value, slice);
+        insert_atomic_isolated(run, executor, batches, options.checkpoints.value, slice);
     }
 }
 
 /** Runs every thread count against every batch size, erasing batches when @p deletes
  *  asks for it. */
 case_result_t test_database_inserts(atomicity_run_t& run, atomicity_options_t const& options, round_deletes_t deletes) {
-    if (!run.database.on().supports_transactions()) return case_result_t::skipped(needs_transactions_k);
+    if (!probed(run.database.supports_transactions())) return case_result_t::skipped(needs_transactions_k);
     for (std::size_t index = 0; index != run.slots.size(); ++index)
         run.slots[index].random_generator = split_mix_generator_t {case_stream_key(index)};
     std::size_t const configurations_count = 2 * options.thread_counts.size * options.batch_sizes.size;
@@ -280,19 +280,19 @@ int main(int argc, char** argv) {
     read_bounded_setting(argc, argv, "USTORE_DELETES_PERIODICITY", "--deletes-periodicity",
                          options.deletes_periodicity);
 
-    auto const maybe_directory = scratch_directory_t::make(test_run.settings.directory);
-    if (!maybe_directory) {
+    auto [directory, directory_status] = scratch_directory_t::make(test_run.settings.directory);
+    if (st::failed(directory_status)) {
         fmt::println(stderr, "Cannot create a unique directory under {}", test_run.settings.directory);
         return 1;
     }
-    config_t const config {test_run.settings.engine, maybe_directory->path()};
+    config_t const config {test_run.settings.engine, directory.path()};
     auto [database, open_status] = open_database<database_t>(config);
     if (open_status.failed()) {
         fmt::println(stderr, "Cannot open the database");
         return 1;
     }
 
-    auto [collection, create_status] = database.on().find_or_create("atomicity");
+    auto [collection, create_status] = database.find_or_create("atomicity");
     if (create_status.failed()) {
         fmt::println(stderr, "Cannot create the collection");
         return 1;

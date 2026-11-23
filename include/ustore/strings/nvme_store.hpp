@@ -402,7 +402,7 @@ class nvme_store {
         st::vector<cursor_t, utilities::arena_allocator<cursor_t>>& cursors = page.cursors;
         cursors.clear();
         if (cursors.reserve(runs) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A walk could not hold a cursor per run"};
+            return {status_code_t::out_of_memory_k, "No room for a cursor per run"};
         for (memory_run_t const* run : view.memory_runs.runs()) {
             cursor_t cursor;
             cursor.memory = run;
@@ -479,7 +479,7 @@ class nvme_store {
         cursors.clear();
         if (cursors.reserve(runs) != st::status_t::success_k ||
             starts.resize(st::assume_uninitialized, runs) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A walk could not hold a cursor per run"};
+            return {status_code_t::out_of_memory_k, "No room for a cursor per run"};
         for (memory_run_t const* run : view.memory_runs.runs()) {
             cursor_t cursor;
             cursor.memory = run;
@@ -564,7 +564,7 @@ class nvme_store {
             if (each.delta.kind == delta_kind_t::change_k)
                 return status_t {status_code_t::invalid_argument_k, "A string takes whole values and removals"};
             if (each.delta.kind == delta_kind_t::write_k && !admits(each.delta.bytes.size()))
-                return status_t {status_code_t::malformed_k, "A string maps onto one 16-byte key"};
+                return status_t {status_code_t::malformed_k, "A string is one 16-byte write"};
         }
         sealed_commit_t sealed;
         if (deltas.empty() && ranges.empty()) return sealed;
@@ -580,11 +580,11 @@ class nvme_store {
     expected<sealed_commit_t> seal_writes(std::span<std::string_view const> texts, std::span<byte_t const> values,
                                           std::span<stored_value_size_t const> sizes) const noexcept {
         if (sizes.size() != texts.size())
-            return status_t {status_code_t::invalid_argument_k, "A batched insert names the size of every value"};
+            return status_t {status_code_t::invalid_argument_k, "A batched insert needs every value size"};
         std::uint64_t total = 0;
         for (stored_value_size_t const size : sizes) total += size;
         if (total != values.size())
-            return status_t {status_code_t::invalid_argument_k, "The named sizes do not add up to the values"};
+            return status_t {status_code_t::invalid_argument_k, "The sizes miss the value bytes"};
         auto [deltas, deltas_status] = deltas_of_(texts.size());
         if (deltas_status.failed()) return deltas_status;
         std::size_t offset = 0;
@@ -634,13 +634,15 @@ class nvme_store {
         else runs_.prepare(std::move(claimed));
     }
 
-    /** Stamps @p sealed's run with @p stamp, publishes the view @c prepare laid out, and takes the run over, which the
-     *  leader does before it publishes @p stamp itself, so a reader at the stamp finds the run. */
-    void publish(sealed_commit_t& sealed, transaction_stamp_t stamp) noexcept {
-        if (sealed.empty()) return;
-        expected<memory_run_t> stamped = memory_run_t::stamped(std::move(sealed.deltas), stamp,
-                                                               allocator_t {runs_.constraint()});
-        runs_.publish(stamped ? std::move(*stamped) : memory_run_t {}, stamp);
+    /** Stamps @p sealed's run with @p stamp, publishes the view @c prepare laid out, and takes the
+     *  run over, which the leader does before it publishes @p stamp itself, so a reader at the
+     *  stamp finds the run, an empty one when stamping it fails. */
+    status_t publish(sealed_commit_t& sealed, transaction_stamp_t stamp) noexcept {
+        if (sealed.empty()) return {};
+        auto [stamped, status] = memory_run_t::stamped(std::move(sealed.deltas), stamp,
+                                                       allocator_t {runs_.constraint()});
+        runs_.publish(std::move(stamped), stamp);
+        return status;
     }
 
     /** Drops the view @c prepare laid out, which the leader does for a commit it then refuses. */
@@ -796,7 +798,7 @@ class nvme_store {
                 return {status_code_t::invalid_argument_k, "An ingest takes its strings strictly ascending"};
             delta_view_t const& delta = rows[index].delta;
             if (delta.kind != delta_kind_t::write_k || !admits(delta.bytes.size()))
-                return {status_code_t::malformed_k, "A string maps onto one 16-byte key"};
+                return {status_code_t::malformed_k, "A string is one 16-byte write"};
             tails += tail_of(text).size();
         }
         // The strings laid out before take a run of their own when these overflow it.
@@ -1204,10 +1206,10 @@ class nvme_store {
         listed.offset = page.texts.size();
         listed.length = text.size();
         if (page.texts.resize(listed.offset + listed.length) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A walk could not hold its page"};
+            return {status_code_t::out_of_memory_k, "No room for a page of texts"};
         if (!text.empty()) std::memcpy(page.texts.data() + listed.offset, text.data(), text.size());
         if (page.listed.push_back(std::move(listed)) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A walk could not hold its page"};
+            return {status_code_t::out_of_memory_k, "A walk could not list a page entry"};
         return {};
     }
 
@@ -1234,7 +1236,7 @@ class nvme_store {
         std::uint64_t tails_bytes = 0;
         for (stamped_delta_t const& version : versions) tails_bytes += tail_of(version.stored_key).size();
         if (tails_bytes > (std::numeric_limits<std::uint32_t>::max)())
-            return {status_code_t::capacity_exhausted_k, "A flush's key tails outgrow what their offsets reach"};
+            return {status_code_t::capacity_exhausted_k, "Key tails outgrow their offsets"};
         if (drained.key_slots.resize(versions.size()) != st::status_t::success_k ||
             drained.stamps.resize(versions.size()) != st::status_t::success_k ||
             drained.kinds.resize(versions.size()) != st::status_t::success_k ||
@@ -1411,10 +1413,9 @@ class nvme_transaction {
     status_t write(collection_id_t collection, std::string_view text, delta_view_t delta,
                    transaction_stamp_t watch_stamp) noexcept {
         std::size_t const carried = delta.kind == delta_kind_t::remove_k ? 0 : sizeof(ustore_key_t);
-        if (delta.bytes.size() != carried)
-            return {status_code_t::invalid_argument_k, "A string maps onto one 16-byte key"};
+        if (delta.bytes.size() != carried) return {status_code_t::invalid_argument_k, "A string is one 16-byte write"};
         if (writes_.reserve_more(1) == writes_t::reserve_result_t::failed_k)
-            return {status_code_t::out_of_memory_k, "No room for another string"};
+            return {status_code_t::out_of_memory_k, "No room to list another written string"};
         write_t written {ustore_key_t {}, delta.kind, watch_stamp};
         if (carried != 0) std::memcpy(&written.value, delta.bytes.data(), carried);
         bool updated = false;
@@ -1645,7 +1646,7 @@ class nvme_transaction {
     expected<place_t> append_(std::string_view bytes) noexcept {
         std::size_t const offset = tape_.size();
         if (tape_.resize(offset + bytes.size()) != st::status_t::success_k)
-            return status_t {status_code_t::out_of_memory_k, "No room for another string"};
+            return status_t {status_code_t::out_of_memory_k, "No room on the string tape"};
         if (!bytes.empty()) std::memcpy(tape_.data() + offset, bytes.data(), bytes.size());
         place_t place;
         place.offset = offset;
@@ -1669,7 +1670,7 @@ class nvme_transaction {
         status_t const visited = database_->visit_store(
             collection, [&]<typename held_type_>(held_type_& store) noexcept -> status_t {
                 if constexpr (std::is_same_v<held_type_, store_t>) return visitor(store);
-                else return {status_code_t::write_conflict_k, "A strings collection the transaction wrote is gone"};
+                else return {status_code_t::write_conflict_k, "The collection is not a strings collection"};
             });
         if (visited == status_code_t::not_found_k)
             return {status_code_t::write_conflict_k, "A strings collection the transaction wrote is gone"};
@@ -1799,8 +1800,7 @@ class nvme_transaction {
         nvme_transaction& owner = *static_cast<nvme_transaction*>(context);
         for (sealed_collection_t& sealed : owner.sealed_) [[maybe_unused]]
             status_t const published = owner.with_store_(sealed.collection, [&](store_t& store) noexcept -> status_t {
-                store.publish(sealed.commit, stamp);
-                return {};
+                return store.publish(sealed.commit, stamp);
             });
     }
 

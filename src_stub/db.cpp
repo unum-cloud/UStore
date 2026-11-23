@@ -410,7 +410,6 @@ status_t write_image(ustore_database_handle_t& database, stamp_t stamp, std::str
 } // namespace unum::ustore::stub
 
 void ustore_database_init_ram(ustore_database_init_ram_t* arguments) {
-    if (submitted<&ustore_database_init_ram>(arguments)) return;
     call_t call(arguments->outcome);
     if (arguments->database) *arguments->database = nullptr;
     if (!arguments->database)
@@ -422,7 +421,6 @@ void ustore_database_init_ram(ustore_database_init_ram_t* arguments) {
 }
 
 void ustore_database_open_ram(ustore_database_open_ram_t* arguments) {
-    if (submitted<&ustore_database_open_ram>(arguments)) return;
     call_t call(arguments->outcome);
     if (arguments->database) *arguments->database = nullptr;
     if (!arguments->database)
@@ -448,27 +446,22 @@ void ustore_database_open_ram(ustore_database_open_ram_t* arguments) {
 }
 
 void ustore_database_open_rocksdb(ustore_database_open_rocksdb_t* arguments) {
-    if (submitted<&ustore_database_open_rocksdb>(arguments)) return;
     refuse_engine(arguments, "The library was built without RocksDB");
 }
 
 void ustore_database_view_rocksdb(ustore_database_view_rocksdb_t* arguments) {
-    if (submitted<&ustore_database_view_rocksdb>(arguments)) return;
     refuse_engine(arguments, "The library was built without RocksDB");
 }
 
 void ustore_database_open_leveldb(ustore_database_open_leveldb_t* arguments) {
-    if (submitted<&ustore_database_open_leveldb>(arguments)) return;
     refuse_engine(arguments, "The library was built without LevelDB");
 }
 
 void ustore_database_open_nvme(ustore_database_open_nvme_t* arguments) {
-    if (submitted<&ustore_database_open_nvme>(arguments)) return;
     refuse_engine(arguments, "The library was built without the NVMe engine");
 }
 
 void ustore_database_describe(ustore_database_describe_t* arguments) {
-    if (submitted<&ustore_database_describe>(arguments)) return;
     call_t call(arguments->outcome);
     if (arguments->description) *arguments->description = {};
     if (refuse_database(call, arguments->database)) return;
@@ -493,7 +486,6 @@ void ustore_database_describe(ustore_database_describe_t* arguments) {
 }
 
 void ustore_database_flush(ustore_database_flush_t* arguments) {
-    if (submitted<&ustore_database_flush>(arguments)) return;
     call_t call(arguments->outcome);
     if (refuse_database(call, arguments->database) || refuse_read_only(call, arguments->database)) return;
     if (!call.hold_executor(arguments->executor)) return;
@@ -515,7 +507,6 @@ void ustore_database_free(ustore_database_t database) {
 }
 
 void ustore_database_clear(ustore_database_clear_t* arguments) {
-    if (submitted<&ustore_database_clear>(arguments)) return;
     call_t call(arguments->outcome);
     if (refuse_database(call, arguments->database)) return;
     if (refuse_drop_mode(call, arguments->mode) || refuse_read_only(call, arguments->database)) return;
@@ -544,7 +535,6 @@ void ustore_database_clear(ustore_database_clear_t* arguments) {
 }
 
 void ustore_database_compact(ustore_database_compact_t* arguments) {
-    if (submitted<&ustore_database_compact>(arguments)) return;
     call_t call(arguments->outcome);
     if (arguments->phase) *arguments->phase = {};
     if (refuse_database(call, arguments->database)) return;
@@ -597,7 +587,6 @@ void ustore_database_compact(ustore_database_compact_t* arguments) {
 }
 
 void ustore_database_compact_plan_finish(ustore_database_compact_plan_finish_t* arguments) {
-    if (submitted<&ustore_database_compact_plan_finish>(arguments)) return;
     call_t call(arguments->outcome);
     ustore_database_compact_plan_handle_t* const plan = arguments->plan;
     // The plan goes whatever the call answers, once no call naming it is in flight
@@ -619,7 +608,6 @@ void ustore_database_compact_plan_finish(ustore_database_compact_plan_finish_t* 
 }
 
 void ustore_snapshot_init(ustore_snapshot_init_t* arguments) {
-    if (submitted<&ustore_snapshot_init>(arguments)) return;
     call_t call(arguments->outcome);
     if (arguments->snapshot) *arguments->snapshot = nullptr;
     if (arguments->read_stamp) *arguments->read_stamp = 0;
@@ -643,7 +631,6 @@ void ustore_snapshot_init(ustore_snapshot_init_t* arguments) {
 }
 
 void ustore_snapshot_save(ustore_snapshot_save_t* arguments) {
-    if (submitted<&ustore_snapshot_save>(arguments)) return;
     call_t call(arguments->outcome);
     ustore_snapshot_handle_t* const snapshot = arguments->snapshot;
     if (!snapshot) return call.refuse(ustore_status_uninitialized_k, "The snapshot is not open");
@@ -676,7 +663,6 @@ void ustore_snapshot_free(ustore_snapshot_t snapshot) {
 }
 
 void ustore_collection_list(ustore_collection_list_t* arguments) {
-    if (submitted<&ustore_collection_list>(arguments)) return;
     call_t call(arguments->outcome);
     if (arguments->collections) *arguments->collections = nullptr;
     if (arguments->modalities) *arguments->modalities = nullptr;
@@ -722,7 +708,6 @@ void ustore_collection_list(ustore_collection_list_t* arguments) {
 }
 
 void ustore_collection_create(ustore_collection_create_t* arguments) {
-    if (submitted<&ustore_collection_create>(arguments)) return;
     call_t call(arguments->outcome);
     if (arguments->collection) *arguments->collection = {};
     if (refuse_database(call, arguments->database) || refuse_unbacked(call, arguments->name)) return;
@@ -762,7 +747,6 @@ void ustore_collection_create(ustore_collection_create_t* arguments) {
 }
 
 void ustore_collection_find(ustore_collection_find_t* arguments) {
-    if (submitted<&ustore_collection_find>(arguments)) return;
     call_t call(arguments->outcome);
     if (arguments->presences) *arguments->presences = nullptr;
     if (arguments->collections) *arguments->collections = nullptr;
@@ -815,7 +799,6 @@ void ustore_collection_find(ustore_collection_find_t* arguments) {
 }
 
 void ustore_collection_drop(ustore_collection_drop_t* arguments) {
-    if (submitted<&ustore_collection_drop>(arguments)) return;
     call_t call(arguments->outcome);
     if (refuse_database(call, arguments->database)) return;
     if (refuse_drop_mode(call, arguments->mode) || refuse_read_only(call, arguments->database)) return;
@@ -847,7 +830,6 @@ void ustore_collection_drop(ustore_collection_drop_t* arguments) {
 }
 
 void ustore_transaction_init(ustore_transaction_init_t* arguments) {
-    if (submitted<&ustore_transaction_init>(arguments)) return;
     call_t call(arguments->outcome);
     ustore_transaction_handle_t* const reused = arguments->transaction ? *arguments->transaction : nullptr;
     if (refuse_database(call, arguments->database)) return;
@@ -886,7 +868,6 @@ ustore_view_t ustore_transaction_view(ustore_transaction_t transaction, ustore_w
 }
 
 void ustore_transaction_stage(ustore_transaction_stage_t* arguments) {
-    if (submitted<&ustore_transaction_stage>(arguments)) return;
     call_t call(arguments->outcome);
     if (arguments->read_stamp) *arguments->read_stamp = 0;
     if (!open_transaction_call(call, *arguments)) return;
@@ -898,7 +879,6 @@ void ustore_transaction_stage(ustore_transaction_stage_t* arguments) {
 }
 
 void ustore_transaction_commit(ustore_transaction_commit_t* arguments) {
-    if (submitted<&ustore_transaction_commit>(arguments)) return;
     call_t call(arguments->outcome);
     if (arguments->commit_stamp) *arguments->commit_stamp = 0;
     if (!open_transaction_call(call, *arguments)) return;
@@ -925,7 +905,6 @@ void ustore_transaction_commit(ustore_transaction_commit_t* arguments) {
 }
 
 void ustore_transaction_rollback(ustore_transaction_rollback_t* arguments) {
-    if (submitted<&ustore_transaction_rollback>(arguments)) return;
     call_t call(arguments->outcome);
     if (!open_transaction_call(call, *arguments)) return;
     arguments->transaction->staged = false;
@@ -953,7 +932,6 @@ struct ustore_changes_cursor_handle_t {
 };
 
 void ustore_changes_cursor_init(ustore_changes_cursor_init_t* arguments) {
-    if (submitted<&ustore_changes_cursor_init>(arguments)) return;
     call_t call(arguments->outcome);
     if (arguments->cursor) *arguments->cursor = nullptr;
     if (refuse_database(call, arguments->database)) return;
@@ -987,7 +965,6 @@ void ustore_changes_cursor_init(ustore_changes_cursor_init_t* arguments) {
 }
 
 void ustore_changes_cursor_next(ustore_changes_cursor_next_t* arguments) {
-    if (submitted<&ustore_changes_cursor_next>(arguments)) return;
     call_t call(arguments->outcome);
     if (arguments->count) *arguments->count = 0;
     if (arguments->keys) *arguments->keys = nullptr;

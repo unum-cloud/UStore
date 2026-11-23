@@ -139,7 +139,7 @@ class sealed_deltas {
     static expected<sealed_deltas> seal(std::span<keyed_delta_t> deltas, std::span<range_t const> ranges = {},
                                         allocator_t allocator = {}, std::span<byte_t const> lent = {}) noexcept {
         if (deltas.empty() && ranges.empty())
-            return status_t {status_code_t::invalid_argument_k, "A seal takes at least one delta or range"};
+            return status_t {status_code_t::invalid_argument_k, "A seal needs a delta or range"};
         utilities::sort_by_stored_key(deltas);
         std::uint64_t total_bytes = 0;
         std::uint8_t least_kind = deltas.empty() ? 0 : static_cast<std::uint8_t>(deltas[0].delta.kind);
@@ -155,7 +155,7 @@ class sealed_deltas {
             if (!lent.empty() && !delta.bytes.empty() &&
                 (delta.bytes.data() < lent.data() ||
                  delta.bytes.data() + delta.bytes.size() > lent.data() + lent.size()))
-                return status_t {status_code_t::invalid_argument_k, "A lent buffer holds the bytes of every delta"};
+                return status_t {status_code_t::invalid_argument_k, "A lent buffer holds every delta"};
             total_bytes += delta.bytes.size();
             least_kind = fu::min_of(least_kind, static_cast<std::uint8_t>(delta.kind));
             greatest_kind = fu::max_of(greatest_kind, static_cast<std::uint8_t>(delta.kind));
@@ -167,13 +167,17 @@ class sealed_deltas {
         // Empty values view nothing, so a buffer of overwritten values alone stays with its owner.
         bool const lends = !lent.empty() && total_bytes != 0;
         buffer_t copied {typename buffer_t::allocator_t(allocator)};
-        if (sealed.locations_.resize(st::assume_uninitialized, deltas.size()) != st::status_t::success_k ||
-            sealed.sizes_.resize(st::assume_uninitialized, deltas.size()) != st::status_t::success_k ||
-            sealed.bases_.reserve(1) != st::status_t::success_k ||
-            sealed.buffers_.reserve(1) != st::status_t::success_k ||
-            (!lends &&
-             copied.resize(st::assume_uninitialized, static_cast<std::size_t>(total_bytes)) != st::status_t::success_k))
-            return status_t {status_code_t::out_of_memory_k, "No room to seal the deltas"};
+        if (sealed.locations_.resize(st::assume_uninitialized, deltas.size()) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "No room for the sealed run's locations"};
+        if (sealed.sizes_.resize(st::assume_uninitialized, deltas.size()) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "No room for the sealed run's sizes"};
+        if (sealed.bases_.reserve(1) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "No room for the sealed run's base"};
+        if (sealed.buffers_.reserve(1) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "No room for the sealed run's buffer slot"};
+        if (!lends &&
+            copied.resize(st::assume_uninitialized, static_cast<std::size_t>(total_bytes)) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "No room for the sealed run's copied bytes"};
         stored_value_offset_t copied_offset = 0;
         for (std::size_t index = 0; index != deltas.size(); ++index) {
             std::span<byte_t const> const bytes = deltas[index].delta.bytes;
@@ -252,7 +256,7 @@ class sealed_deltas {
         }
         buffer_t folded {typename buffer_t::allocator_t(allocator)};
         if (folded.resize(st::assume_uninitialized, static_cast<std::size_t>(folded_bytes)) != st::status_t::success_k)
-            return status_t {status_code_t::out_of_memory_k, "No room for the folded values of a merge"};
+            return status_t {status_code_t::out_of_memory_k, "No room for the merged values"};
         value_location_t folding {static_cast<std::uint32_t>(inherited), 0};
         for (std::size_t index = 0; index != versions.size(); ++index) {
             stamped_delta<stored_key_t> const& version = versions[index];
@@ -335,9 +339,8 @@ class sealed_deltas {
 
   private:
     using key_allocator_t = typename std::allocator_traits<allocator_t>::template rebind_alloc<stored_key_t>;
-    using stored_keys_t =
-        st::immutable_splus_tree<stored_key_t, st::keys_per_row<stored_key_t>(st::default_row_bytes_k), row_kit_type_,
-                                 key_allocator_t>;
+    using stored_keys_t = st::immutable_splus_tree<stored_key_t, st::keys_per_row<stored_key_t>(sorted_run_row_bytes_k),
+                                                   row_kit_type_, key_allocator_t>;
 
     template <typename value_type_>
     using column =
@@ -358,10 +361,10 @@ class sealed_deltas {
         if (keys.resize(st::assume_uninitialized, deltas.size()) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room to seal the deltas"};
         for (std::size_t index = 0; index != deltas.size(); ++index) keys[index] = deltas[index].stored_key;
-        st::expected<stored_keys_t> tree = stored_keys_t::make(std::span<stored_key_t const> {keys},
-                                                               key_allocator_t(allocator));
-        if (!tree) return {status_code_t::out_of_memory_k, "No room for the tree of the sealed keys"};
-        stored_keys_ = std::move(*tree);
+        auto [tree, build_status] = stored_keys_t::make(std::span<stored_key_t const> {keys},
+                                                        key_allocator_t(allocator));
+        if (st::failed(build_status)) return {status_code_t::out_of_memory_k, "No room for the sealed key tree"};
+        stored_keys_ = std::move(tree);
 
         std::uint8_t pulled = 0;
         auto fill = [&](std::size_t position) noexcept {
@@ -369,10 +372,10 @@ class sealed_deltas {
             return st::expected<std::span<std::uint8_t const>>(std::span<std::uint8_t const>(&pulled, 1),
                                                                st::status_t::success_k);
         };
-        st::expected<kinds_t> kinds = kinds_t::make(deltas.size(), least_kind, greatest_kind, fill,
-                                                    typename kinds_t::allocator_t(allocator));
-        if (!kinds) return {status_code_t::out_of_memory_k, "No room to pack the kinds of sealed deltas"};
-        kinds_ = std::move(*kinds);
+        auto [kinds, pack_status] = kinds_t::make(deltas.size(), least_kind, greatest_kind, fill,
+                                                  typename kinds_t::allocator_t(allocator));
+        if (st::failed(pack_status)) return {status_code_t::out_of_memory_k, "No room to pack the delta kinds"};
+        kinds_ = std::move(kinds);
         return {};
     }
 
@@ -438,12 +441,12 @@ class memory_run {
                                         allocator_t allocator = {}) noexcept {
         if (stamp == unwritten_stamp_k)
             return status_t {status_code_t::invalid_argument_k, "No commit carries the unwritten stamp"};
-        st::expected<stamps_t> stamps = stamps_t::make(deltas.size(), stamp, typename stamps_t::allocator_t(allocator));
-        if (!stamps) return status_t {status_code_t::out_of_memory_k, "No room to stamp the sealed deltas"};
+        auto [stamps, status] = stamps_t::make(deltas.size(), stamp, typename stamps_t::allocator_t(allocator));
+        if (st::failed(status)) return status_t {status_code_t::out_of_memory_k, "No room to stamp the sealed deltas"};
         memory_run run;
         deltas.stamp_range_tombstones(stamp);
         run.deltas_ = std::move(deltas);
-        run.stamps_ = std::move(*stamps);
+        run.stamps_ = std::move(stamps);
         run.newest_stamp_ = stamp;
         return run;
     }
@@ -475,12 +478,12 @@ class memory_run {
             return st::expected<std::span<transaction_stamp_t const>>(std::span<transaction_stamp_t const>(&pulled, 1),
                                                                       st::status_t::success_k);
         };
-        st::expected<stamps_t> stamps = stamps_t::make(versions.size(), oldest_stamp, newest_stamp, fill,
-                                                       typename stamps_t::allocator_t(allocator));
-        if (!stamps) return status_t {status_code_t::out_of_memory_k, "No room to stamp a merged run"};
+        auto [stamps, stamp_status] = stamps_t::make(versions.size(), oldest_stamp, newest_stamp, fill,
+                                                     typename stamps_t::allocator_t(allocator));
+        if (st::failed(stamp_status)) return status_t {status_code_t::out_of_memory_k, "No room to stamp a merged run"};
         memory_run run;
         run.deltas_ = std::move(deltas);
-        run.stamps_ = std::move(*stamps);
+        run.stamps_ = std::move(stamps);
         run.newest_stamp_ = newest_stamp;
         run.tier_ = tier + 1;
         return run;

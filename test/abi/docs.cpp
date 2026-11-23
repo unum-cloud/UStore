@@ -27,7 +27,6 @@
 using namespace unum::ustore;
 using namespace unum::ustore::test;
 using namespace unum::ustore::test::abi;
-using namespace unum::ustore::utilities;
 using namespace unum;
 
 #pragma region JSON
@@ -41,6 +40,13 @@ struct written_json_t {
     written_json_t& operator=(written_json_t const&) = delete;
     ~written_json_t() noexcept { std::free(text); }
 };
+
+/** Whether the document or field @p reference names reads back as JSON equal to @p expected. */
+template <typename reference_type_>
+bool reads_json(reference_type_&& reference, std::string_view expected) noexcept {
+    auto [value, value_status] = reference.value();
+    return !value_status.failed() && json_equal(as_text(value), expected);
+}
 
 #pragma endregion JSON
 
@@ -92,31 +98,31 @@ struct documents_tape_t {
 /** Maps integers to flat JSON documents and reads them whole, by field and as a binary string. */
 void test_database_docs_flat(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return;
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
+    if (!expect_true(!open_status.failed())) return;
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
 
-    auto [collection, collection_status] = database.on().create<docs_collection_t>("docs");
-    if (!expect_true(collection_status.succeeded())) return;
-    expect_true(collection[key_from_integer(1)].assign(flat_documents_k[0]).succeeded());
-    expect_true(collection[key_from_integer(2)].assign(flat_documents_k[1]).succeeded());
-    expect_true(collection[key_from_integer(3)].assign(flat_documents_k[2]).succeeded());
-    expect_true(json_equal(as_text(*collection[key_from_integer(1)].value()), flat_documents_k[0]));
-    expect_true(
-        json_equal(as_text(*collection[collection_key_field_t {key_from_integer(2), "person"}].value()), R"("Bob")"));
-    expect_true(json_equal(as_text(*collection[collection_key_field_t {key_from_integer(3), "age"}].value()), "26"));
+    auto [collection, collection_status] = database.create<docs_collection_t>("docs");
+    if (!expect_true(!collection_status.failed())) return;
+    expect_true(!collection[key_from_integer(1)].assign(flat_documents_k[0]).failed());
+    expect_true(!collection[key_from_integer(2)].assign(flat_documents_k[1]).failed());
+    expect_true(!collection[key_from_integer(3)].assign(flat_documents_k[2]).failed());
+    expect_true(reads_json(collection[key_from_integer(1)], flat_documents_k[0]));
+    expect_true(reads_json(collection[collection_key_field_t {key_from_integer(2), "person"}], R"("Bob")"));
+    expect_true(reads_json(collection[collection_key_field_t {key_from_integer(3), "age"}], "26"));
 
-    auto maybe_person = collection[collection_key_field_t {key_from_integer(1), "person"}].value(
+    auto [person, person_status] = collection[collection_key_field_t {key_from_integer(1), "person"}].value(
         ustore_docs_field_type_string_k);
-    expect_equal(std::string_view(maybe_person->view().c_str(), maybe_person->size()), std::string_view("Alice"));
+    expect_true(!person_status.failed());
+    expect_equal(std::string_view(person.view()), std::string_view("Alice"));
 }
 
 /** Writes nested documents in one batch and reads them back by key and by JSON pointer. */
 void test_database_docs_nested_batch(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return;
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
-    auto [collection, collection_status] = database.on().create<docs_collection_t>("docs");
-    if (!expect_true(collection_status.succeeded())) return;
+    if (!expect_true(!open_status.failed())) return;
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
+    auto [collection, collection_status] = database.create<docs_collection_t>("docs");
+    if (!expect_true(!collection_status.failed())) return;
 
     documents_tape_t tape;
     ustore_strings_view_t const values = tape.values();
@@ -124,18 +130,17 @@ void test_database_docs_nested_batch(config_t const& config) {
 
     std::array<ustore_key_t, 3> keys {key_from_integer(1), key_from_integer(2), key_from_integer(3)};
     auto reference = collection[keys];
-    expect_true(reference.assign(values).succeeded());
+    expect_true(!reference.assign(values).failed());
 
-    expect_true(json_equal(as_text(*collection[key_from_integer(1)].value()), nested_documents_k[0]));
-    expect_true(json_equal(as_text(*collection[key_from_integer(2)].value()), nested_documents_k[1]));
-    expect_true(json_equal(as_text(*collection[key_from_integer(3)].value()), nested_documents_k[2]));
+    expect_true(reads_json(collection[key_from_integer(1)], nested_documents_k[0]));
+    expect_true(reads_json(collection[key_from_integer(2)], nested_documents_k[1]));
+    expect_true(reads_json(collection[key_from_integer(3)], nested_documents_k[2]));
 
-    expect_true(json_equal(as_text(*collection[collection_key_field_t {key_from_integer(1), "person"}].value()),
-                           R"({"name":"Alice","age":24})"));
-    expect_true(json_equal(as_text(*collection[collection_key_field_t {key_from_integer(2), "person"}].value()),
-                           R"([{"name":"Bob","age":25}])"));
-    expect_true(json_equal(as_text(*collection[collection_key_field_t {key_from_integer(2), "/person/0/name"}].value()),
-                           R"("Bob")"));
+    expect_true(
+        reads_json(collection[collection_key_field_t {key_from_integer(1), "person"}], R"({"name":"Alice","age":24})"));
+    expect_true(
+        reads_json(collection[collection_key_field_t {key_from_integer(2), "person"}], R"([{"name":"Bob","age":25}])"));
+    expect_true(reads_json(collection[collection_key_field_t {key_from_integer(2), "/person/0/name"}], R"("Bob")"));
 
     check_equalities(reference, tape.views());
 
@@ -165,40 +170,38 @@ void test_database_docs_nested_batch(config_t const& config) {
 /** Updates, inserts and upserts whole documents and fields addressed by JSON pointers. */
 void test_database_docs_modify(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return;
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
-    auto [collection, collection_status] = database.on().create<docs_collection_t>("docs");
-    if (!expect_true(collection_status.succeeded())) return;
-    expect_true(collection[key_from_integer(1)].assign(nested_documents_k[0].data()).succeeded());
-    expect_true(json_equal(as_text(*collection[key_from_integer(1)].value()), nested_documents_k[0]));
+    if (!expect_true(!open_status.failed())) return;
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
+    auto [collection, collection_status] = database.create<docs_collection_t>("docs");
+    if (!expect_true(!collection_status.failed())) return;
+    expect_true(!collection[key_from_integer(1)].assign(nested_documents_k[0].data()).failed());
+    expect_true(reads_json(collection[key_from_integer(1)], nested_documents_k[0]));
 
     char const* modifier = R"({"person":{"name":"Charles","age":28}})";
-    expect_true(collection[key_from_integer(1)].update(modifier).succeeded());
-    expect_true(json_equal(as_text(*collection[key_from_integer(1)].value()), modifier));
+    expect_true(!collection[key_from_integer(1)].update(modifier).failed());
+    expect_true(reads_json(collection[key_from_integer(1)], modifier));
 
-    expect_true(collection[collection_key_field_t {key_from_integer(1), "/person"}]
-                    .update(R"({"name":"Alice","age":24})")
-                    .succeeded());
-    expect_true(json_equal(as_text(*collection[key_from_integer(1)].value()), nested_documents_k[0]));
+    expect_true(!collection[collection_key_field_t {key_from_integer(1), "/person"}]
+                     .update(R"({"name":"Alice","age":24})")
+                     .failed());
+    expect_true(reads_json(collection[key_from_integer(1)], nested_documents_k[0]));
 
     expect_true(collection[key_from_integer(1)].insert(nested_documents_k[1].data()).failed());
-    expect_true(collection[key_from_integer(2)].insert(nested_documents_k[1].data()).succeeded());
-    expect_true(json_equal(as_text(*collection[key_from_integer(2)].value()), nested_documents_k[1]));
+    expect_true(!collection[key_from_integer(2)].insert(nested_documents_k[1].data()).failed());
+    expect_true(reads_json(collection[key_from_integer(2)], nested_documents_k[1]));
 
     expect_true(
-        collection[collection_key_field_t {key_from_integer(2), "/person/0/surname"}].insert(R"("Doe")").succeeded());
-    expect_true(json_equal(as_text(*collection[key_from_integer(2)].value()),
-                           R"({"person":[{"name":"Bob","age":25,"surname":"Doe"}]})"));
+        !collection[collection_key_field_t {key_from_integer(2), "/person/0/surname"}].insert(R"("Doe")").failed());
+    expect_true(reads_json(collection[key_from_integer(2)], R"({"person":[{"name":"Bob","age":25,"surname":"Doe"}]})"));
 
-    expect_true(collection[key_from_integer(1)].upsert(nested_documents_k[2].data()).succeeded());
-    expect_true(json_equal(as_text(*collection[key_from_integer(1)].value()), nested_documents_k[2]));
+    expect_true(!collection[key_from_integer(1)].upsert(nested_documents_k[2].data()).failed());
+    expect_true(reads_json(collection[key_from_integer(1)], nested_documents_k[2]));
 
-    expect_true(collection[collection_key_field_t {key_from_integer(1), "/person"}].upsert(R"("Charles")").succeeded());
-    expect_true(json_equal(as_text(*collection[key_from_integer(1)].value()), R"({"person":"Charles","age":26})"));
+    expect_true(!collection[collection_key_field_t {key_from_integer(1), "/person"}].upsert(R"("Charles")").failed());
+    expect_true(reads_json(collection[key_from_integer(1)], R"({"person":"Charles","age":26})"));
 
-    expect_true(collection[collection_key_field_t {key_from_integer(1), "/weight"}].upsert("70").succeeded());
-    expect_true(
-        json_equal(as_text(*collection[key_from_integer(1)].value()), R"({"person":"Charles","age":26,"weight":70})"));
+    expect_true(!collection[collection_key_field_t {key_from_integer(1), "/weight"}].upsert("70").failed());
+    expect_true(reads_json(collection[key_from_integer(1)], R"({"person":"Charles","age":26,"weight":70})"));
 }
 
 /** Writes @p values into @p fields of the documents keyed @p keys in one call with
@@ -227,30 +230,30 @@ ustore_status_t write_documents_once(ustore_database_t database, ustore_collecti
  *  second insertion of a key the first one created finds it taken, leaving the key untouched. */
 void test_database_docs_repeated_document(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return;
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
-    auto [collection, collection_status] = database.on().create<docs_collection_t>("docs");
-    if (!expect_true(collection_status.succeeded())) return;
-    expect_true(collection[key_from_integer(1)].assign(R"({"a":1,"b":1})").succeeded());
+    if (!expect_true(!open_status.failed())) return;
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
+    auto [collection, collection_status] = database.create<docs_collection_t>("docs");
+    if (!expect_true(!collection_status.failed())) return;
+    expect_true(!collection[key_from_integer(1)].assign(R"({"a":1,"b":1})").failed());
 
     std::array<ustore_key_t, 2> const repeated_keys {key_from_integer(1), key_from_integer(1)};
     std::array<std::string_view, 2> const fields {"/a", "/b"};
     std::array<std::string_view, 2> const numbers {"2", "3"};
-    expect_true(write_documents_once(database, collection, repeated_keys, fields, numbers,
+    expect_true(write_documents_once(database.handle(), collection.handle(), repeated_keys, fields, numbers,
                                      ustore_docs_modify_upsert_k) == ustore_status_success_k);
-    expect_true(json_equal(as_text(*collection[key_from_integer(1)].value()), R"({"a":2,"b":3})"));
+    expect_true(reads_json(collection[key_from_integer(1)], R"({"a":2,"b":3})"));
 
     std::array<std::string_view, 2> const merges {R"({"a":4})", R"({"b":5})"};
-    expect_true(write_documents_once(database, collection, repeated_keys, {}, merges, ustore_docs_modify_merge_k) ==
-                ustore_status_success_k);
-    expect_true(json_equal(as_text(*collection[key_from_integer(1)].value()), R"({"a":4,"b":5})"));
+    expect_true(write_documents_once(database.handle(), collection.handle(), repeated_keys, {}, merges,
+                                     ustore_docs_modify_merge_k) == ustore_status_success_k);
+    expect_true(reads_json(collection[key_from_integer(1)], R"({"a":4,"b":5})"));
 
     std::array<ustore_key_t, 2> const fresh_keys {key_from_integer(2), key_from_integer(2)};
     std::array<std::string_view, 2> const documents {R"({"x":1})", R"({"x":2})"};
-    expect_true(write_documents_once(database, collection, fresh_keys, {}, documents, ustore_docs_modify_insert_k) ==
-                ustore_status_already_exists_k);
-    expect_true(collection[key_from_integer(2)].insert(R"({"x":3})").succeeded());
-    expect_true(json_equal(as_text(*collection[key_from_integer(2)].value()), R"({"x":3})"));
+    expect_true(write_documents_once(database.handle(), collection.handle(), fresh_keys, {}, documents,
+                                     ustore_docs_modify_insert_k) == ustore_status_already_exists_k);
+    expect_true(!collection[key_from_integer(2)].insert(R"({"x":3})").failed());
+    expect_true(reads_json(collection[key_from_integer(2)], R"({"x":3})"));
 }
 
 /** Whether a modification case applies a JSON Patch or a JSON Merge Patch. */
@@ -361,14 +364,14 @@ void check_modification_cases(docs_collection_t& collection, document_modificati
         written_json_t const expected {yyjson_obj_get(entry, "expected")};
         if (!document.text || !modifier.text || !expected.text) continue;
 
-        expect_true(collection[key_from_integer(1)].assign(static_cast<char const*>(document.text)).succeeded());
+        expect_true(!collection[key_from_integer(1)].assign(static_cast<char const*>(document.text)).failed());
         char const* const modifier_text = static_cast<char const*>(modifier.text);
-        expect_true(patching ? collection[key_from_integer(1)].patch(modifier_text).succeeded()
-                             : collection[key_from_integer(1)].merge(modifier_text).succeeded());
-        auto maybe_value = collection[key_from_integer(1)].value();
-        if (!expect_true(maybe_value.has_value())) continue;
-        expect_true(json_equal(as_text(*maybe_value), expected.text), "{} with {} gave {}",
-                    static_cast<char const*>(document.text), modifier_text, as_text(*maybe_value));
+        expect_true(patching ? !collection[key_from_integer(1)].patch(modifier_text).failed()
+                             : !collection[key_from_integer(1)].merge(modifier_text).failed());
+        auto [value, value_status] = collection[key_from_integer(1)].value();
+        if (!expect_true(!value_status.failed())) continue;
+        expect_true(json_equal(as_text(value), expected.text), "{} with {} gave {}",
+                    static_cast<char const*>(document.text), modifier_text, as_text(value));
     }
     yyjson_doc_free(cases);
 }
@@ -377,10 +380,10 @@ void check_modification_cases(docs_collection_t& collection, document_modificati
  *  its expected document. */
 void test_database_docs_merge_and_patch(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return;
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
-    auto [collection, collection_status] = database.on().create<docs_collection_t>("docs");
-    if (!expect_true(collection_status.succeeded())) return;
+    if (!expect_true(!open_status.failed())) return;
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
+    auto [collection, collection_status] = database.create<docs_collection_t>("docs");
+    if (!expect_true(!collection_status.failed())) return;
 
     check_modification_cases(collection, document_modification_t::patch_k);
     check_modification_cases(collection, document_modification_t::merge_k);
@@ -390,28 +393,28 @@ void test_database_docs_merge_and_patch(config_t const& config) {
  *  type-punned exports. */
 void test_database_docs_table(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    if (!expect_true(open_status.succeeded())) return;
-    expect_true(database.on().clear(ustore_drop_collection_k).succeeded());
+    if (!expect_true(!open_status.failed())) return;
+    expect_true(!database.clear(ustore_drop_collection_k).failed());
 
-    auto [collection, collection_status] = database.on().create<docs_collection_t>("docs");
-    if (!expect_true(collection_status.succeeded())) return;
+    auto [collection, collection_status] = database.create<docs_collection_t>("docs");
+    if (!expect_true(!collection_status.failed())) return;
     char const* const alice = R"({"person":"Alice","age":27,"height":1})";
     char const* const bob = R"({"person":"Bob","age":"27","weight":2})";
     char const* const carl = R"({"person":"Carl","age":24})";
-    expect_true(collection[key_from_integer(1)].assign(alice).succeeded());
-    expect_true(collection[key_from_integer(2)].assign(bob).succeeded());
-    expect_true(collection[key_from_integer(3)].assign(carl).succeeded());
-    expect_true(json_equal(as_text(*collection[key_from_integer(1)].value()), alice));
-    expect_true(json_equal(as_text(*collection[key_from_integer(2)].value()), bob));
+    expect_true(!collection[key_from_integer(1)].assign(alice).failed());
+    expect_true(!collection[key_from_integer(2)].assign(bob).failed());
+    expect_true(!collection[key_from_integer(3)].assign(carl).failed());
+    expect_true(reads_json(collection[key_from_integer(1)], alice));
+    expect_true(reads_json(collection[key_from_integer(2)], bob));
 
     // Every table below lands in one arena, which each gather rewinds for the next
     auto [arena, arena_status] = arena_t::make();
-    if (!expect_true(arena_status.succeeded())) return;
+    if (!expect_true(!arena_status.failed())) return;
 
     // Column names
     {
-        auto maybe_fields = collection[key_from_integer(1)].gist(arena);
-        auto fields = *maybe_fields;
+        auto const [fields, gist_status] = collection[key_from_integer(1)].gist(arena);
+        expect_true(!gist_status.failed());
         bool has_person = false;
         bool has_height = false;
         bool has_age = false;
@@ -431,8 +434,8 @@ void test_database_docs_table(config_t const& config) {
     // Single cell
     {
         auto header = make_table_header().with<std::uint32_t>("age");
-        auto maybe_table = collection[key_from_integer(1)].gather(header, arena);
-        auto const& table = *maybe_table;
+        auto const [table, gather_status] = collection[key_from_integer(1)].gather(header, arena);
+        expect_true(!gather_status.failed());
         auto ages = table.column<0>();
 
         expect_equal(ages[0].value, 27u);
@@ -446,8 +449,8 @@ void test_database_docs_table(config_t const& config) {
                           .with<std::int32_t>("age")
                           .with<std::string_view>("age");
 
-        auto maybe_table = collection[key_from_integer(1)].gather(header, arena);
-        auto const& table = *maybe_table;
+        auto const [table, gather_status] = collection[key_from_integer(1)].gather(header, arena);
+        expect_true(!gather_status.failed());
         auto unsigned_ages = table.column<0>();
         auto signed_ages = table.column<1>();
         auto age_texts = table.column<2>();
@@ -463,10 +466,10 @@ void test_database_docs_table(config_t const& config) {
     // Single column
     {
         auto header = make_table_header().with<std::int32_t>("age");
-        auto maybe_table =
+        auto const [table, gather_status] =
             collection[{key_from_integer(1), key_from_integer(2), key_from_integer(3), key_from_integer(123456)}]
                 .gather(header, arena);
-        auto const& table = *maybe_table;
+        expect_true(!gather_status.failed());
         auto ages = table.column<0>();
 
         expect_equal(ages[0].value, 27);
@@ -478,10 +481,10 @@ void test_database_docs_table(config_t const& config) {
     // Single strings column
     {
         auto header = make_table_header().with<std::string_view>("age");
-        auto maybe_table =
+        auto const [table, gather_status] =
             collection[{key_from_integer(1), key_from_integer(2), key_from_integer(3), key_from_integer(123456)}]
                 .gather(header, arena);
-        auto const& table = *maybe_table;
+        expect_true(!gather_status.failed());
         auto age_texts = table.column<0>();
 
         expect_equal(std::string_view(age_texts[0].value.data()), std::string_view("27"));
@@ -500,10 +503,10 @@ void test_database_docs_table(config_t const& config) {
                           .with<std::int32_t>("height")
                           .with<std::uint64_t>("weight");
 
-        auto maybe_table = collection[{key_from_integer(1), key_from_integer(2), key_from_integer(3),
-                                       key_from_integer(123456), key_from_integer(654321)}]
-                               .gather(header, arena);
-        auto const& table = *maybe_table;
+        auto const [table, gather_status] = collection[{key_from_integer(1), key_from_integer(2), key_from_integer(3),
+                                                        key_from_integer(123456), key_from_integer(654321)}]
+                                                .gather(header, arena);
+        expect_true(!gather_status.failed());
         auto ages = table.column<0>();
         auto age_texts = table.column<1>();
         [[maybe_unused]] auto persons = table.column<2>();
@@ -531,10 +534,10 @@ void test_database_docs_table(config_t const& config) {
         };
         table_header_view_t const header = make_table_header(fields, types);
 
-        auto maybe_table = collection[{key_from_integer(1), key_from_integer(2), key_from_integer(3),
-                                       key_from_integer(123456), key_from_integer(654321)}]
-                               .gather(header, arena);
-        auto const& table = *maybe_table;
+        auto const [table, gather_status] = collection[{key_from_integer(1), key_from_integer(2), key_from_integer(3),
+                                                        key_from_integer(123456), key_from_integer(654321)}]
+                                                .gather(header, arena);
+        expect_true(!gather_status.failed());
         auto ages = table.column(0).as<std::int32_t>();
         auto age_texts = table.column(1).as<value_view_t>();
         [[maybe_unused]] auto persons = table.column(2).as<value_view_t>();
@@ -547,10 +550,10 @@ void test_database_docs_table(config_t const& config) {
         expect_true(ages[1].converted);
         expect_equal(ages[2].value, 24);
 
-        expect_equal(std::string_view(age_texts[0].value.c_str()), std::string_view("27"));
+        expect_equal(std::string_view(age_texts[0].value), std::string_view("27"));
         expect_true(age_texts[0].converted);
-        expect_equal(std::string_view(age_texts[1].value.c_str()), std::string_view("27"));
-        expect_equal(std::string_view(age_texts[2].value.c_str()), std::string_view("24"));
+        expect_equal(std::string_view(age_texts[1].value), std::string_view("27"));
+        expect_equal(std::string_view(age_texts[2].value), std::string_view("24"));
     }
 }
 
@@ -566,7 +569,7 @@ void write_range_documents(compared_collections_t& compared) {
     for (std::size_t side = 0; side != 2; ++side) {
         ustore_outcome_t outcome {};
         ustore_docs_write_t write {};
-        write.database = compared.databases[side];
+        write.database = compared.databases[side].handle();
         write.outcome = &outcome;
         write.count = keys.size();
         write.collections = {&compared.collections[side], 0};
@@ -580,7 +583,7 @@ void write_range_documents(compared_collections_t& compared) {
 /** A documents scan stops before its end key. */
 void test_docs_range_end_bound(config_t const& config) {
     auto [compared, compared_status] = open_compared(config, ustore_modality_docs_k);
-    if (!expect_true(compared_status.succeeded())) return;
+    if (!expect_true(!compared_status.failed())) return;
     write_range_documents(compared);
     ustore_key_t const start = key_from_integer(5), end = key_from_integer(9);
     expect_same_scan(ustore_docs_scan, compared, {&start, &end, ustore_scan_ascending_k, 10}, keys_of_integers<4>(5));
@@ -589,7 +592,7 @@ void test_docs_range_end_bound(config_t const& config) {
 /** A descending documents scan lists its range largest first. */
 void test_docs_range_descending(config_t const& config) {
     auto [compared, compared_status] = open_compared(config, ustore_modality_docs_k);
-    if (!expect_true(compared_status.succeeded())) return;
+    if (!expect_true(!compared_status.failed())) return;
     write_range_documents(compared);
     ustore_key_t const start = key_from_integer(14), end = key_from_integer(4);
     expect_same_scan(ustore_docs_scan, compared, {&start, &end, ustore_scan_descending_k, 3},
@@ -599,7 +602,7 @@ void test_docs_range_descending(config_t const& config) {
 /** A documents range removal removes every document from the start key up to the end key. */
 void test_docs_range_remove(config_t const& config) {
     auto [compared, compared_status] = open_compared(config, ustore_modality_docs_k);
-    if (!expect_true(compared_status.succeeded())) return;
+    if (!expect_true(!compared_status.failed())) return;
     write_range_documents(compared);
     ustore_key_t const start = key_from_integer(2), end = key_from_integer(18);
     remove_ranges(ustore_docs_remove, compared, {&start, 1}, {&end, 1});
@@ -611,7 +614,7 @@ void test_docs_range_remove(config_t const& config) {
 /** A documents measure counts the documents of its range with the end excluded. */
 void test_docs_range_measure(config_t const& config) {
     auto [compared, compared_status] = open_compared(config, ustore_modality_docs_k);
-    if (!expect_true(compared_status.succeeded())) return;
+    if (!expect_true(!compared_status.failed())) return;
     write_range_documents(compared);
     ustore_key_t const lower = key_from_integer(5), upper = key_from_integer(9);
     expect_measure_holds(ustore_docs_measure, compared, {&lower, &upper, ustore_scan_ascending_k}, 4);
@@ -623,12 +626,12 @@ void test_docs_range_measure(config_t const& config) {
 int main(int argc, char** argv) {
     start_test_run(argc, argv);
 
-    auto const maybe_directory = scratch_directory_t::make(test_run.settings.directory);
-    if (!maybe_directory) {
+    auto [directory, directory_status] = scratch_directory_t::make(test_run.settings.directory);
+    if (st::failed(directory_status)) {
         fmt::println(stderr, "Cannot create a unique directory under {}", test_run.settings.directory);
         return 1;
     }
-    config_t const config {test_run.settings.engine, maybe_directory->path()};
+    config_t const config {test_run.settings.engine, directory.path()};
 
     run_test_case(engine_label_t {"test_database_docs_flat"}.c_str(), test_database_docs_flat, config);
     run_test_case(engine_label_t {"test_database_docs_nested_batch"}.c_str(), test_database_docs_nested_batch, config);

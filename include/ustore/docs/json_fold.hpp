@@ -51,6 +51,7 @@
 namespace unum::ustore::docs {
 
 using utilities::arena_allocator;
+using utilities::bytes_of;
 using utilities::chars_of;
 using utilities::delta_kind_t;
 using utilities::delta_view_t;
@@ -136,7 +137,8 @@ inline expected<std::span<byte_t const>> encode_deltas(std::span<json_delta_t co
 
 /** Decodes the delta that starts @p bytes into @p delta, viewing its field and value in place, answering its size. */
 inline expected<std::size_t> decode_delta(std::span<byte_t const> bytes, json_delta_t& delta) noexcept {
-    if (bytes.size() < delta_header_bytes_k) return status_t {status_code_t::malformed_k, "A delta is truncated"};
+    if (bytes.size() < delta_header_bytes_k)
+        return status_t {status_code_t::malformed_k, "A delta's header is truncated"};
     std::uint8_t modification = 0;
     std::uint32_t field_length = 0, value_length = 0;
     byte_t const* input = bytes.data();
@@ -147,7 +149,7 @@ inline expected<std::size_t> decode_delta(std::span<byte_t const> bytes, json_de
     if (modification > static_cast<std::uint8_t>(delta_modification_t::remove_k))
         return status_t {status_code_t::malformed_k, "A delta has an unknown modification"};
     std::size_t const size = delta_header_bytes_k + std::size_t(field_length) + std::size_t(value_length);
-    if (bytes.size() < size) return status_t {status_code_t::malformed_k, "A delta is truncated"};
+    if (bytes.size() < size) return status_t {status_code_t::malformed_k, "A delta's field or value is truncated"};
     delta.modification = static_cast<delta_modification_t>(modification);
     delta.field = chars_of(bytes_of(input, field_length));
     delta.value = chars_of(bytes_of(input + field_length, value_length));
@@ -396,7 +398,7 @@ inline bool repeats_keys(yyjson_mut_val* object) noexcept {
  */
 inline expected<yyjson_mut_val*> compose_merges(yyjson_mut_doc* document, yyjson_mut_val* older,
                                                 yyjson_mut_val* newer) noexcept {
-    status_t const out_of_memory {status_code_t::out_of_memory_k, "Failed to compose merges"};
+    status_t const out_of_memory {status_code_t::out_of_memory_k, "No room to compose a merge patch"};
     if (!yyjson_mut_is_obj(newer)) {
         yyjson_mut_val* const copy = yyjson_mut_val_mut_copy(document, newer);
         if (!copy) return out_of_memory;
@@ -453,7 +455,7 @@ template <typename deltas_type_, typename keep_type_>
 status_t merge_open_chain(deltas_type_& deltas, keep_type_& keep, ustore_arena_t arena) noexcept {
     yyjson_alc const allocator = json_allocator(arena);
     yyjson_mut_doc* const document = yyjson_mut_doc_new(&allocator);
-    if (!document) return {status_code_t::out_of_memory_k, "Failed to compose deltas"};
+    if (!document) return {status_code_t::out_of_memory_k, "No room to compose the deltas"};
     std::size_t const count = deltas.size();
     auto const sets_field = [](delta_modification_t modification) noexcept {
         return modification == delta_modification_t::upsert_k || modification == delta_modification_t::merge_k;

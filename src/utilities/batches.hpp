@@ -14,10 +14,9 @@
 #include <limits>      // `std::numeric_limits`
 #include <string_view> // `std::string_view`
 
-#include "ustore/db.h"       // `ustore_ingest_append_t`, `ustore_collection_create_t`, `ustore_drop_mode_t`
-#include "ustore/ranges.hpp" // `strided_iterator`, `strided`, `place_batch_t`, `edges_view_t`, `tape_string`
-#include "ustore/status.hpp" // `status_t`, `expected`
-#include "ustore/types.hpp"  // `smallest_key_k`, `chars_of`
+#include "ustore/db.h"                 // `ustore_ingest_append_t`, `ustore_collection_create_t`, `ustore_drop_mode_t`
+#include "ustore/utilities/ranges.hpp" // `strided_iterator`, `strided`, `place_batch_t`, `edges_view_t`, `tape_string`
+#include "ustore/utilities/types.hpp"  // `status_t`, `expected`, `smallest_key_k`, `chars_of`
 
 #include "utilities/outputs.hpp" // `collection_find_outputs_t`
 
@@ -49,7 +48,7 @@ struct strings_arg_t {
 
     ustore_bytes_view_t operator[](std::size_t index) const noexcept {
         if (view.layout == ustore_strings_accessor_k) return gathered[index];
-        return ustore::tape_string(view, index);
+        return tape_string(view, index);
     }
 };
 
@@ -283,7 +282,7 @@ inline status_t validate_choices(ustore_transaction_t const transaction, ustore_
     if (watch != ustore_watch_keys_k && watch != ustore_watch_none_k)
         return {status_code_t::invalid_argument_k, "Unknown watch"};
     if (transaction && durability == ustore_durability_flushed_k)
-        return {status_code_t::invalid_argument_k, "A transaction flushes at commit, not at a write"};
+        return {status_code_t::invalid_argument_k, "A transaction flushes at commit only"};
     return {};
 }
 
@@ -339,7 +338,7 @@ inline expected<std::string_view> validate_collection_create(ustore_collection_c
 inline expected<collection_find_outputs_t> validate_collection_find(ustore_collection_find_t const& arguments,
                                                                     strings_arg_t const& names) noexcept {
     if (!names || !arguments.collections)
-        return status_t {status_code_t::invalid_argument_k, "Need the names and an output for the identifiers"};
+        return status_t {status_code_t::invalid_argument_k, "Needs the names and an identifiers output"};
     return collection_find_outputs_t::make(arguments);
 }
 

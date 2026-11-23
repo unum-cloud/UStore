@@ -38,11 +38,11 @@
 #include <smashtable/shared.hpp>       // `st::assume_uninitialized`
 #include <stringzilla/stringzilla.hpp> // `sz::string_t`
 
-#include "ustore/arrow.h"    // `ustore_keys_view_from_arrow`, `ustore_strings_view_to_arrow`
-#include "ustore/docs.h"     // `ustore_docs_write_t`
-#include "ustore/graph.h"    // `ustore_graph_write_edges_t`
-#include "ustore/ranges.hpp" // `u64_tape`
-#include "ustore/types.hpp"  // `sz`, `st`
+#include "ustore/arrow.h"              // `ustore_keys_view_from_arrow`, `ustore_strings_view_to_arrow`
+#include "ustore/docs.h"               // `ustore_docs_write_t`
+#include "ustore/graph.h"              // `ustore_graph_write_edges_t`
+#include "ustore/utilities/ranges.hpp" // `u64_tape`
+#include "ustore/utilities/types.hpp"  // `sz`, `st`
 
 #include "ustore/utilities/blocking_files.hpp" // `mapped_file_t`
 
@@ -51,8 +51,6 @@
 #include "dataset.hpp"   // `format_of`, `failed`, `copy_path`, `task_arena_t`, `staged_output_t`
 
 namespace unum::ustore::tools {
-
-using namespace unum::ustore::utilities;
 
 #pragma region Arrow
 
@@ -173,9 +171,7 @@ struct output_piece_t {
     // A link at the temporary's name is refused, not followed, as the library's temporaries are
     return ::open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW | O_CLOEXEC, 0644);
 }
-[[nodiscard]] bool flush_descriptor(int descriptor) noexcept {
-    return utilities::flush_native_file(descriptor).succeeded();
-}
+[[nodiscard]] bool flush_descriptor(int descriptor) noexcept { return util::flush_native_file(descriptor).succeeded(); }
 [[nodiscard]] bool close_descriptor(int descriptor) noexcept { return ::close(descriptor) == 0; }
 
 #endif
@@ -208,7 +204,7 @@ class owned_descriptor_t {
  *  exactly the counts the codec names, which is how standard input, pipes and anything that does
  *  not map are read. */
 class input_bytes_t {
-    utilities::mapped_file_t mapped_;
+    util::mapped_file_t mapped_;
     std::span<std::byte const> whole_;
     std::size_t cursor_ = 0;
 
@@ -257,7 +253,7 @@ class input_bytes_t {
             return;
         }
         // A pipe or a FIFO maps empty or not at all, so it is read in order instead
-        auto [file, map_status] = utilities::mapped_file_t::map(path);
+        auto [file, map_status] = util::mapped_file_t::map(path);
         if (map_status.succeeded() && !file.view().empty()) {
             mapped_ = std::move(file);
             std::string_view const bytes = mapped_.view();
@@ -474,7 +470,7 @@ void input_release(ArrowArrayStream* stream) noexcept { stream->release = nullpt
 [[nodiscard]] ustore_modality_t modality_of(ipc_schema_t const& schema) noexcept {
     if (std::string_view const named = metadata_value(schema.metadata, modality_key_k); !named.empty()) {
         ustore_modality_t modality {};
-        ustore_modality_from_name(bytes_of(named), &modality);
+        ustore_modality_from_name(util::bytes_of(named), &modality);
         return modality;
     }
     if (field_named(schema, "source") && field_named(schema, "target")) return ustore_modality_graph_k;
@@ -500,7 +496,7 @@ void input_release(ArrowArrayStream* stream) noexcept { stream->release = nullpt
     find.database = database;
     find.outcome = outcome;
     find.count = 1;
-    find.names = u64_tape(name.data(), offsets);
+    find.names = util::u64_tape(name.data(), offsets);
     find.presences = &presences;
     find.collections = &ids;
     find.modalities = &modalities;
@@ -753,7 +749,7 @@ struct batch_views_t {
                                                 &rows.strings, &count);
         if (status == ustore_status_success_k && count < static_cast<ustore_size_t>(batch.offset + batch.length))
             status = ustore_status_malformed_k;
-        rows.strings = tape_slice(rows.strings, static_cast<std::size_t>(batch.offset));
+        rows.strings = util::tape_slice(rows.strings, static_cast<std::size_t>(batch.offset));
     }
     if (status != ustore_status_success_k) *outcome = column_outcome(status);
     return status == ustore_status_success_k;
@@ -772,7 +768,7 @@ void write_chunk(ustore_database_t database, ustore_collection_id_t collection, 
     auto const slice = [&](ustore_keys_view_t keys) noexcept {
         return ustore_keys_view_t {keys.data ? keys.data + first : nullptr, keys.stride};
     };
-    ustore_strings_view_t const strings = tape_slice(rows.strings, first);
+    ustore_strings_view_t const strings = util::tape_slice(rows.strings, first);
     switch (modality) {
     case ustore_modality_docs_k: {
         ustore_docs_write_t write {.database = database,
@@ -1176,7 +1172,7 @@ void ustore_dataset_import(ustore_dataset_import_t* task_pointer) {
         return;
     }
 
-    std::string_view const name = task.collection_name.length ? chars_of(task.collection_name)
+    std::string_view const name = task.collection_name.length ? util::chars_of(task.collection_name)
                                                               : metadata_value(state.schema.metadata, collection_key_k);
     if (name.empty()) {
         *task.outcome = {ustore_status_invalid_argument_k,
@@ -1200,7 +1196,7 @@ void ustore_dataset_import(ustore_dataset_import_t* task_pointer) {
         ustore_collection_create_t create {};
         create.database = task.database;
         create.outcome = task.outcome;
-        create.name = bytes_of(name);
+        create.name = util::bytes_of(name);
         create.modality = wanted;
         create.collection = &collection;
         ustore_collection_create(&create);
@@ -1318,7 +1314,7 @@ void ustore_dataset_export(ustore_dataset_export_t* task_pointer) {
                                            : listed_modality(task.database, snapshot, task.collection, task.outcome);
     std::array<ipc_key_value_t, 2> metadata {
         {{modality_key_k, failed(task.outcome) ? "" : ustore_modality_name(modality)},
-         {collection_key_k, chars_of(task.collection_name)}}};
+         {collection_key_k, util::chars_of(task.collection_name)}}};
     ipc_schema_t const schema {export_fields(modality), std::span(metadata).first(task.collection_name.length ? 2 : 1)};
 
     output_descriptor_t output;

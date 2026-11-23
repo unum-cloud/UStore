@@ -76,7 +76,7 @@ Pin a commit, not a version, when building on them.
 ## Building
 
 Every template that owns a shared word or waits on one takes the atomic reference and the waiter as template parameters, wrapping the waiter in SmashTable's parking policy itself, and names no CPU class, instruction or ForkUnion `preferred_*` alias; `src/` picks both per CPU class.
-CMake exports the headers as the `ustore::header` interface target, which carries the include paths of `c/` and `include/` and links the header targets of ForkUnion, SmashTable and StringZilla, plus the include paths of yyjson and fmt, in the build tree.
+CMake exports the headers as the `ustore::templates` interface target, which carries the include paths of `c/` and `include/` and links the header targets of ForkUnion, SmashTable and StringZilla, plus the include paths of yyjson and fmt, in the build tree.
 An install copies `include/ustore/` beside `c/ustore/` and `cpp/ustore/`, but none of the siblings' headers, so a consumer of the installed package brings each sibling's own package, as the C++ SDK already asks.
 Headers that call ForkUnion's C ABI, such as `ram_buffers.hpp` and `ram_device.hpp`, also need `forkunion::static` or `ustore::static` at link time.
 `docs/json_paths.hpp` calls StringZilla's dispatched kernels, which its header-only build answers with `sz_missing_library_k`, so it resolves nothing without `stringzilla::static` or `ustore::static`, and its callers fall back to yyjson.

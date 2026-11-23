@@ -57,9 +57,9 @@ struct document_text_t {
 
     /** A copy owning bytes of its own, or why they could not be allocated. */
     st::expected<document_text_t> copy() const noexcept {
-        st::expected<blob_t> copied = text.copy();
-        if (!copied) return copied.status();
-        return document_text_t {std::move(*copied)};
+        auto [copied, status] = text.copy();
+        if (st::failed(status)) return status;
+        return document_text_t {std::move(copied)};
     }
 };
 
@@ -71,9 +71,9 @@ struct page_tree_bytes_t {
 
     /** A copy owning bytes of its own, or why they could not be allocated. */
     st::expected<page_tree_bytes_t> copy() const noexcept {
-        st::expected<blob_t> copied = tree.copy();
-        if (!copied) return copied.status();
-        return page_tree_bytes_t {std::move(*copied)};
+        auto [copied, status] = tree.copy();
+        if (st::failed(status)) return status;
+        return page_tree_bytes_t {std::move(copied)};
     }
 };
 
@@ -119,22 +119,20 @@ constexpr status_t translate(store_status_t status) noexcept {
     case store_status_t::success_k: return {};
     case store_status_t::unknown_k: return {status_code_t::internal_k, "SmashTable failed for an unknown reason"};
     case store_status_t::consistency_k: return {status_code_t::internal_k, "SmashTable found a staged version missing"};
-    case store_status_t::write_conflict_k:
-        return {status_code_t::write_conflict_k, "Write conflict: a written key was committed over"};
-    case store_status_t::read_conflict_k:
-        return {status_code_t::read_conflict_k, "Read conflict: a read key was committed over"};
+    case store_status_t::write_conflict_k: return {status_code_t::write_conflict_k, "Write conflict on a written key"};
+    case store_status_t::read_conflict_k: return {status_code_t::read_conflict_k, "Read conflict on a read key"};
     case store_status_t::phantom_conflict_k:
-        return {status_code_t::phantom_conflict_k, "Phantom conflict: a walked range gained or lost a key"};
-    case store_status_t::out_of_memory_heap_k: return {status_code_t::out_of_memory_k, "Out of memory"};
-    case store_status_t::invalid_argument_k: return {status_code_t::invalid_argument_k, "Invalid argument"};
+        return {status_code_t::phantom_conflict_k, "Phantom conflict on a walked range"};
+    case store_status_t::out_of_memory_heap_k: return {status_code_t::out_of_memory_k, "A store ran out of heap"};
+    case store_status_t::invalid_argument_k: return status_code_t::invalid_argument_k;
     case store_status_t::operation_not_permitted_k:
         return {status_code_t::invalid_argument_k, "Operation not permitted in the transaction's state"};
     case store_status_t::operation_would_block_k:
         return {status_code_t::write_conflict_k, "Gave up after every retry met a conflict"};
-    case store_status_t::capacity_exhausted_k: return {status_code_t::capacity_exhausted_k, "Capacity exhausted"};
-    case store_status_t::input_output_k: return {status_code_t::io_k, "Input or output failed"};
-    case store_status_t::key_already_exists_k: return {status_code_t::already_exists_k, "Key already exists"};
-    case store_status_t::key_not_found_k: return {status_code_t::not_found_k, "Key not found"};
+    case store_status_t::capacity_exhausted_k: return status_code_t::capacity_exhausted_k;
+    case store_status_t::input_output_k: return status_code_t::io_k;
+    case store_status_t::key_already_exists_k: return status_code_t::already_exists_k;
+    case store_status_t::key_not_found_k: return status_code_t::not_found_k;
     }
     return {status_code_t::internal_k, "SmashTable answered an unrecognized status"};
 }

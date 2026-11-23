@@ -38,7 +38,7 @@
 #include "ustore/pages.h"   // `ustore_pages_import_t`, `ustore_pages_read_t` and the other page calls
 #include "ustore/strings.h" // `ustore_strings_write_t`, `ustore_strings_remove_t` and the other strings calls
 
-#include "ustore/status.hpp" // `expected`, `status_t`
+#include "ustore/utilities/types.hpp" // `expected`, `status_t`
 
 #include "ustore/utilities/ram_buffers.hpp" // `host_blocks_t`, `cuda_blocks_t`, `hip_blocks_t`, `metal_blocks_t`
 #include "ustore/utilities/ram_device.hpp"  // `claim_t`
@@ -50,16 +50,15 @@
 
 namespace unum::ustore {
 
-using utilities::cuda_blocks_t;
-using utilities::cuda_executor_t;
-using utilities::executor_t;
-using utilities::hip_blocks_t;
-using utilities::hip_executor_t;
-using utilities::host_blocks_t;
-using utilities::lent_pool_t;
-using utilities::metal_blocks_t;
-using utilities::metal_executor_t;
-using utilities::strings_arg_t;
+using util::cuda_blocks_t;
+using util::cuda_executor_t;
+using util::hip_blocks_t;
+using util::hip_executor_t;
+using util::host_blocks_t;
+using util::lent_pool_t;
+using util::metal_blocks_t;
+using util::metal_executor_t;
+using util::strings_arg_t;
 
 /** What a call reads through, decoded once by the router from its view, or from the transaction a write carries, and
  *  the scratch and the executor thread it works on. */
@@ -186,54 +185,55 @@ namespace utilities {
 struct progress_ticks_t;
 } // namespace utilities
 
-using utilities::progress_ticks_t;
+using util::progress_ticks_t;
 
 /** The entries an engine's table gives every plan of one operation, over its engine plan behind a
  *  @c void*. */
 struct plan_verbs {
 
     /** Runs the plan's phases until it ends or @p ticks cancels at a barrier. */
-    status_t (*run)(void* plan, view_t const& runner, progress_ticks_t& ticks) noexcept;
+    util::status_t (*run)(void* plan, view_t const& runner, progress_ticks_t& ticks) noexcept;
     ustore_phase_progress_t (*phase)(void const* plan) noexcept;
 
     /** Stops the plan where it stands, keeping what its phases did, and answers the first failure
      *  it met. */
-    status_t (*finish)(void* plan) noexcept;
+    util::status_t (*finish)(void* plan) noexcept;
     void (*free)(void* plan) noexcept;
 };
 
 /** The database, snapshot, collection and transaction verbs every engine serves, on host threads alone. */
 struct database_verbs_t {
-    status_t (*describe)(ustore_database_describe_t const&, view_t const&) noexcept;
-    status_t (*clear)(ustore_database_clear_t const&, view_t const&) noexcept;
+    util::status_t (*describe)(ustore_database_describe_t const&, view_t const&) noexcept;
+    util::status_t (*clear)(ustore_database_clear_t const&, view_t const&) noexcept;
 
     /** Opens the engine's compaction plan, reserving everything it keeps, the only allocation a
      *  compaction makes. */
-    expected<void*> (*compact_plan_open)(ustore_database_compact_t const&, view_t const&) noexcept;
+    util::expected<void*> (*compact_plan_open)(ustore_database_compact_t const&, view_t const&) noexcept;
 
     /** The entries every compaction plan of the engine runs through. */
     plan_verbs compact_plan;
-    status_t (*flush)(ustore_database_flush_t const&, view_t const&) noexcept;
-    status_t (*snapshot_init)(ustore_snapshot_init_t const&, view_t const&) noexcept;
-    status_t (*snapshot_save)(ustore_snapshot_save_t const&, view_t const&) noexcept;
-    status_t (*collection_list)(ustore_collection_list_t const&, view_t const&) noexcept;
-    status_t (*collection_create)(ustore_collection_create_t const&, view_t const&) noexcept;
-    status_t (*collection_find)(ustore_collection_find_t const&, strings_arg_t const& names, view_t const&) noexcept;
-    status_t (*collection_drop)(ustore_collection_drop_t const&, view_t const&) noexcept;
-    status_t (*ingest_init)(ustore_ingest_init_t const&, view_t const&) noexcept;
-    status_t (*ingest_append)(ustore_ingest_append_t const&, strings_arg_t const& values, view_t const&) noexcept;
-    status_t (*ingest_finish)(ustore_ingest_finish_t const&, view_t const&) noexcept;
+    util::status_t (*flush)(ustore_database_flush_t const&, view_t const&) noexcept;
+    util::status_t (*snapshot_init)(ustore_snapshot_init_t const&, view_t const&) noexcept;
+    util::status_t (*snapshot_save)(ustore_snapshot_save_t const&, view_t const&) noexcept;
+    util::status_t (*collection_list)(ustore_collection_list_t const&, view_t const&) noexcept;
+    util::status_t (*collection_create)(ustore_collection_create_t const&, view_t const&) noexcept;
+    util::status_t (*collection_find)(ustore_collection_find_t const&, strings_arg_t const& names,
+                                      view_t const&) noexcept;
+    util::status_t (*collection_drop)(ustore_collection_drop_t const&, view_t const&) noexcept;
+    util::status_t (*ingest_init)(ustore_ingest_init_t const&, view_t const&) noexcept;
+    util::status_t (*ingest_append)(ustore_ingest_append_t const&, strings_arg_t const& values, view_t const&) noexcept;
+    util::status_t (*ingest_finish)(ustore_ingest_finish_t const&, view_t const&) noexcept;
     void (*ingest_free)(ustore_ingest_t) noexcept;
-    status_t (*transaction_init)(ustore_transaction_init_t const&, view_t const&) noexcept;
-    status_t (*transaction_stage)(ustore_transaction_stage_t const&, view_t const&) noexcept;
-    status_t (*transaction_commit)(ustore_transaction_commit_t const&, view_t const&) noexcept;
-    status_t (*transaction_rollback)(ustore_transaction_rollback_t const&, view_t const&) noexcept;
+    util::status_t (*transaction_init)(ustore_transaction_init_t const&, view_t const&) noexcept;
+    util::status_t (*transaction_stage)(ustore_transaction_stage_t const&, view_t const&) noexcept;
+    util::status_t (*transaction_commit)(ustore_transaction_commit_t const&, view_t const&) noexcept;
+    util::status_t (*transaction_rollback)(ustore_transaction_rollback_t const&, view_t const&) noexcept;
     void (*transaction_free)(ustore_transaction_t) noexcept;
     void (*snapshot_free)(ustore_snapshot_t) noexcept;
     void (*database_free)(ustore_database_t) noexcept;
-    status_t (*changes_cursor_init)(ustore_changes_cursor_init_t const&, ustore_changes_cursor_t,
-                                    view_t const&) noexcept;
-    status_t (*changes_cursor_next)(ustore_changes_cursor_next_t const&, view_t const&) noexcept;
+    util::status_t (*changes_cursor_init)(ustore_changes_cursor_init_t const&, ustore_changes_cursor_t,
+                                          view_t const&) noexcept;
+    util::status_t (*changes_cursor_next)(ustore_changes_cursor_next_t const&, view_t const&) noexcept;
     void (*changes_cursor_free)(ustore_changes_cursor_t) noexcept;
 
     /** Pins the newest stamp into @p pin for one call's verbs, or takes a reading of the one
@@ -249,21 +249,21 @@ struct blobs_verbs;
 /** The verbs of blobs collections on host threads. */
 template <>
 struct blobs_verbs<vendored_residency_t::host_k> {
-    status_t (*write)(ustore_blobs_write_t const&, strings_arg_t const& values, view_t const&) noexcept;
-    status_t (*remove)(ustore_blobs_remove_t const&, view_t const&) noexcept;
-    status_t (*read)(ustore_blobs_read_t const&, view_t const&) noexcept;
-    status_t (*scan)(ustore_blobs_scan_t const&, view_t const&) noexcept;
-    status_t (*sample)(ustore_blobs_sample_t const&, view_t const&) noexcept;
-    status_t (*measure)(ustore_blobs_measure_t const&, view_t const&) noexcept;
+    util::status_t (*write)(ustore_blobs_write_t const&, strings_arg_t const& values, view_t const&) noexcept;
+    util::status_t (*remove)(ustore_blobs_remove_t const&, view_t const&) noexcept;
+    util::status_t (*read)(ustore_blobs_read_t const&, view_t const&) noexcept;
+    util::status_t (*scan)(ustore_blobs_scan_t const&, view_t const&) noexcept;
+    util::status_t (*sample)(ustore_blobs_sample_t const&, view_t const&) noexcept;
+    util::status_t (*measure)(ustore_blobs_measure_t const&, view_t const&) noexcept;
 };
 
 /** The verbs of blobs collections on a device, which has no slot for a change. */
 template <vendored_residency_t residency_>
     requires(residency_ != vendored_residency_t::host_k)
 struct blobs_verbs<residency_> {
-    status_t (*read)(ustore_blobs_read_t const&, view_t const&, residency_executor<residency_>&) noexcept;
-    status_t (*scan)(ustore_blobs_scan_t const&, view_t const&, residency_executor<residency_>&) noexcept;
-    status_t (*sample)(ustore_blobs_sample_t const&, view_t const&, residency_executor<residency_>&) noexcept;
+    util::status_t (*read)(ustore_blobs_read_t const&, view_t const&, residency_executor<residency_>&) noexcept;
+    util::status_t (*scan)(ustore_blobs_scan_t const&, view_t const&, residency_executor<residency_>&) noexcept;
+    util::status_t (*sample)(ustore_blobs_sample_t const&, view_t const&, residency_executor<residency_>&) noexcept;
 };
 
 /** The verbs of strings collections served at one residency. */
@@ -273,25 +273,27 @@ struct strings_verbs;
 /** The verbs of strings collections on host threads. */
 template <>
 struct strings_verbs<vendored_residency_t::host_k> {
-    status_t (*write)(ustore_strings_write_t const&, strings_arg_t const& strings, view_t const&) noexcept;
-    status_t (*remove)(ustore_strings_remove_t const&, strings_arg_t const& strings, strings_arg_t const& end_strings,
-                       view_t const&) noexcept;
-    status_t (*read)(ustore_strings_read_t const&, strings_arg_t const& strings, view_t const&) noexcept;
-    status_t (*scan)(ustore_strings_scan_t const&, strings_arg_t const& prefixes, strings_arg_t const& start_strings,
-                     strings_arg_t const& end_strings, view_t const&) noexcept;
-    status_t (*sample)(ustore_strings_sample_t const&, view_t const&) noexcept;
-    status_t (*measure)(ustore_strings_measure_t const&, strings_arg_t const& start_strings,
-                        strings_arg_t const& end_strings, view_t const&) noexcept;
+    util::status_t (*write)(ustore_strings_write_t const&, strings_arg_t const& strings, view_t const&) noexcept;
+    util::status_t (*remove)(ustore_strings_remove_t const&, strings_arg_t const& strings,
+                             strings_arg_t const& end_strings, view_t const&) noexcept;
+    util::status_t (*read)(ustore_strings_read_t const&, strings_arg_t const& strings, view_t const&) noexcept;
+    util::status_t (*scan)(ustore_strings_scan_t const&, strings_arg_t const& prefixes,
+                           strings_arg_t const& start_strings, strings_arg_t const& end_strings,
+                           view_t const&) noexcept;
+    util::status_t (*sample)(ustore_strings_sample_t const&, view_t const&) noexcept;
+    util::status_t (*measure)(ustore_strings_measure_t const&, strings_arg_t const& start_strings,
+                              strings_arg_t const& end_strings, view_t const&) noexcept;
 };
 
 /** The verbs of strings collections on a device, whose strings a host index resolves. */
 template <vendored_residency_t residency_>
     requires(residency_ != vendored_residency_t::host_k)
 struct strings_verbs<residency_> {
-    status_t (*read)(ustore_strings_read_t const&, strings_arg_t const& strings, view_t const&,
-                     residency_executor<residency_>&) noexcept;
-    status_t (*scan)(ustore_strings_scan_t const&, strings_arg_t const& prefixes, strings_arg_t const& start_strings,
-                     strings_arg_t const& end_strings, view_t const&, residency_executor<residency_>&) noexcept;
+    util::status_t (*read)(ustore_strings_read_t const&, strings_arg_t const& strings, view_t const&,
+                           residency_executor<residency_>&) noexcept;
+    util::status_t (*scan)(ustore_strings_scan_t const&, strings_arg_t const& prefixes,
+                           strings_arg_t const& start_strings, strings_arg_t const& end_strings, view_t const&,
+                           residency_executor<residency_>&) noexcept;
 };
 
 /** The verbs of documents collections served at one residency. */
@@ -301,27 +303,27 @@ struct docs_verbs;
 /** The verbs of documents collections on host threads. */
 template <>
 struct docs_verbs<vendored_residency_t::host_k> {
-    status_t (*write)(ustore_docs_write_t const&, strings_arg_t const& fields, strings_arg_t const& values,
-                      view_t const&) noexcept;
-    status_t (*read)(ustore_docs_read_t const&, strings_arg_t const& fields, view_t const&) noexcept;
-    status_t (*gist)(ustore_docs_gist_t const&, view_t const&) noexcept;
-    status_t (*gather)(ustore_docs_gather_t const&, strings_arg_t const& fields, view_t const&) noexcept;
-    status_t (*remove)(ustore_docs_remove_t const&, view_t const&) noexcept;
-    status_t (*scan)(ustore_docs_scan_t const&, view_t const&) noexcept;
-    status_t (*sample)(ustore_docs_sample_t const&, view_t const&) noexcept;
-    status_t (*measure)(ustore_docs_measure_t const&, view_t const&) noexcept;
+    util::status_t (*write)(ustore_docs_write_t const&, strings_arg_t const& fields, strings_arg_t const& values,
+                            view_t const&) noexcept;
+    util::status_t (*read)(ustore_docs_read_t const&, strings_arg_t const& fields, view_t const&) noexcept;
+    util::status_t (*gist)(ustore_docs_gist_t const&, view_t const&) noexcept;
+    util::status_t (*gather)(ustore_docs_gather_t const&, strings_arg_t const& fields, view_t const&) noexcept;
+    util::status_t (*remove)(ustore_docs_remove_t const&, view_t const&) noexcept;
+    util::status_t (*scan)(ustore_docs_scan_t const&, view_t const&) noexcept;
+    util::status_t (*sample)(ustore_docs_sample_t const&, view_t const&) noexcept;
+    util::status_t (*measure)(ustore_docs_measure_t const&, view_t const&) noexcept;
 };
 
 /** The verbs of documents collections on a device, whose field paths the host compiles. */
 template <vendored_residency_t residency_>
     requires(residency_ != vendored_residency_t::host_k)
 struct docs_verbs<residency_> {
-    status_t (*read)(ustore_docs_read_t const&, strings_arg_t const& fields, view_t const&,
-                     residency_executor<residency_>&) noexcept;
-    status_t (*gather)(ustore_docs_gather_t const&, strings_arg_t const& fields, view_t const&,
-                       residency_executor<residency_>&) noexcept;
-    status_t (*scan)(ustore_docs_scan_t const&, view_t const&, residency_executor<residency_>&) noexcept;
-    status_t (*sample)(ustore_docs_sample_t const&, view_t const&, residency_executor<residency_>&) noexcept;
+    util::status_t (*read)(ustore_docs_read_t const&, strings_arg_t const& fields, view_t const&,
+                           residency_executor<residency_>&) noexcept;
+    util::status_t (*gather)(ustore_docs_gather_t const&, strings_arg_t const& fields, view_t const&,
+                             residency_executor<residency_>&) noexcept;
+    util::status_t (*scan)(ustore_docs_scan_t const&, view_t const&, residency_executor<residency_>&) noexcept;
+    util::status_t (*sample)(ustore_docs_sample_t const&, view_t const&, residency_executor<residency_>&) noexcept;
 };
 
 /** The verbs of graph collections served at one residency. */
@@ -331,23 +333,24 @@ struct graph_verbs;
 /** The verbs of graph collections on host threads. */
 template <>
 struct graph_verbs<vendored_residency_t::host_k> {
-    status_t (*read_edges)(ustore_graph_read_edges_t const&, view_t const&) noexcept;
-    status_t (*write_edges)(ustore_graph_write_edges_t const&, view_t const&) noexcept;
-    status_t (*remove_edges)(ustore_graph_remove_edges_t const&, view_t const&) noexcept;
-    status_t (*write_vertices)(ustore_graph_write_vertices_t const&, view_t const&) noexcept;
-    status_t (*remove_vertices)(ustore_graph_remove_vertices_t const&, view_t const&) noexcept;
-    status_t (*scan_vertices)(ustore_graph_scan_vertices_t const&, view_t const&) noexcept;
-    status_t (*sample_vertices)(ustore_graph_sample_vertices_t const&, view_t const&) noexcept;
-    status_t (*measure_vertices)(ustore_graph_measure_vertices_t const&, view_t const&) noexcept;
+    util::status_t (*read_edges)(ustore_graph_read_edges_t const&, view_t const&) noexcept;
+    util::status_t (*write_edges)(ustore_graph_write_edges_t const&, view_t const&) noexcept;
+    util::status_t (*remove_edges)(ustore_graph_remove_edges_t const&, view_t const&) noexcept;
+    util::status_t (*write_vertices)(ustore_graph_write_vertices_t const&, view_t const&) noexcept;
+    util::status_t (*remove_vertices)(ustore_graph_remove_vertices_t const&, view_t const&) noexcept;
+    util::status_t (*scan_vertices)(ustore_graph_scan_vertices_t const&, view_t const&) noexcept;
+    util::status_t (*sample_vertices)(ustore_graph_sample_vertices_t const&, view_t const&) noexcept;
+    util::status_t (*measure_vertices)(ustore_graph_measure_vertices_t const&, view_t const&) noexcept;
 };
 
 /** The verbs of graph collections on a device. */
 template <vendored_residency_t residency_>
     requires(residency_ != vendored_residency_t::host_k)
 struct graph_verbs<residency_> {
-    status_t (*read_edges)(ustore_graph_read_edges_t const&, view_t const&, residency_executor<residency_>&) noexcept;
-    status_t (*scan_vertices)(ustore_graph_scan_vertices_t const&, view_t const&,
-                              residency_executor<residency_>&) noexcept;
+    util::status_t (*read_edges)(ustore_graph_read_edges_t const&, view_t const&,
+                                 residency_executor<residency_>&) noexcept;
+    util::status_t (*scan_vertices)(ustore_graph_scan_vertices_t const&, view_t const&,
+                                    residency_executor<residency_>&) noexcept;
 };
 
 /** The verbs of pages collections served at one residency. */
@@ -357,27 +360,27 @@ struct pages_verbs;
 /** The verbs of pages collections on host threads. */
 template <>
 struct pages_verbs<vendored_residency_t::host_k> {
-    status_t (*import)(ustore_pages_import_t const&, strings_arg_t const& values, view_t const&) noexcept;
-    status_t (*insert)(ustore_pages_insert_t const&, strings_arg_t const& values, view_t const&) noexcept;
-    status_t (*remove)(ustore_pages_remove_t const&, view_t const&) noexcept;
-    status_t (*move)(ustore_pages_move_t const&, view_t const&) noexcept;
-    status_t (*splice)(ustore_pages_splice_t const&, strings_arg_t const& values, view_t const&) noexcept;
-    status_t (*set_attributes)(ustore_pages_set_attributes_t const&, strings_arg_t const& fields,
-                               strings_arg_t const& values, view_t const&) noexcept;
-    status_t (*remove_attributes)(ustore_pages_remove_attributes_t const&, strings_arg_t const& fields,
-                                  view_t const&) noexcept;
-    status_t (*read)(ustore_pages_read_t const&, view_t const&) noexcept;
-    status_t (*scan)(ustore_pages_scan_t const&, view_t const&) noexcept;
-    status_t (*sample)(ustore_pages_sample_t const&, view_t const&) noexcept;
-    status_t (*measure)(ustore_pages_measure_t const&, view_t const&) noexcept;
+    util::status_t (*import)(ustore_pages_import_t const&, strings_arg_t const& values, view_t const&) noexcept;
+    util::status_t (*insert)(ustore_pages_insert_t const&, strings_arg_t const& values, view_t const&) noexcept;
+    util::status_t (*remove)(ustore_pages_remove_t const&, view_t const&) noexcept;
+    util::status_t (*move)(ustore_pages_move_t const&, view_t const&) noexcept;
+    util::status_t (*splice)(ustore_pages_splice_t const&, strings_arg_t const& values, view_t const&) noexcept;
+    util::status_t (*set_attributes)(ustore_pages_set_attributes_t const&, strings_arg_t const& fields,
+                                     strings_arg_t const& values, view_t const&) noexcept;
+    util::status_t (*remove_attributes)(ustore_pages_remove_attributes_t const&, strings_arg_t const& fields,
+                                        view_t const&) noexcept;
+    util::status_t (*read)(ustore_pages_read_t const&, view_t const&) noexcept;
+    util::status_t (*scan)(ustore_pages_scan_t const&, view_t const&) noexcept;
+    util::status_t (*sample)(ustore_pages_sample_t const&, view_t const&) noexcept;
+    util::status_t (*measure)(ustore_pages_measure_t const&, view_t const&) noexcept;
 };
 
 /** The verbs of pages collections on a device. */
 template <vendored_residency_t residency_>
     requires(residency_ != vendored_residency_t::host_k)
 struct pages_verbs<residency_> {
-    status_t (*read)(ustore_pages_read_t const&, view_t const&, residency_executor<residency_>&) noexcept;
-    status_t (*scan)(ustore_pages_scan_t const&, view_t const&, residency_executor<residency_>&) noexcept;
+    util::status_t (*read)(ustore_pages_read_t const&, view_t const&, residency_executor<residency_>&) noexcept;
+    util::status_t (*scan)(ustore_pages_scan_t const&, view_t const&, residency_executor<residency_>&) noexcept;
 };
 
 /** The verbs of every modality an engine serves at one residency; a null host table or verb answers
@@ -393,8 +396,8 @@ struct residency_tables {
 
 /** Answers a device verb whose stage has not landed yet, which fills every entry of the device tables. */
 template <typename... parameters_types_>
-status_t unsupported_on_vram(parameters_types_...) noexcept {
-    return {status_code_t::unsupported_k, "No engine serves this call on devices yet"};
+util::status_t unsupported_on_vram(parameters_types_...) noexcept {
+    return {util::status_code_t::unsupported_k, "No engine serves this call on devices yet"};
 }
 
 template <vendored_residency_t residency_>
@@ -506,8 +509,8 @@ engine_t const& engine_of(handle_type_* handle) noexcept {
 /** The transaction state of @p state_type_ behind @p transaction, or @c uninitialized_k for a
  *  call naming none. */
 template <typename state_type_>
-expected<state_type_*> transaction_state_of(ustore_transaction_t transaction) noexcept {
-    if (!transaction) return status_t {status_code_t::uninitialized_k, "Transaction is uninitialized"};
+util::expected<state_type_*> transaction_state_of(ustore_transaction_t transaction) noexcept {
+    if (!transaction) return util::status_t {util::status_code_t::uninitialized_k, "Transaction is uninitialized"};
     return state_of<state_type_>(transaction);
 }
 
@@ -533,12 +536,12 @@ struct made_handle {
 /** A handle of @p handle_type_ stamped with @p engine over a state of @p state_type_ made from
  *  @p arguments, or @c out_of_memory_k. */
 template <typename handle_type_, typename state_type_, typename... arguments_types_>
-expected<made_handle<handle_type_, state_type_>> make_handle(engine_t const& engine,
-                                                             arguments_types_&&... arguments) noexcept {
+util::expected<made_handle<handle_type_, state_type_>> make_handle(engine_t const& engine,
+                                                                   arguments_types_&&... arguments) noexcept {
     made_handle<handle_type_, state_type_> made;
     made.handle.reset(new (std::nothrow) handle_type_ {});
     if (made.handle) made.state.reset(new (std::nothrow) state_type_(std::forward<arguments_types_>(arguments)...));
-    if (!made.state) return status_t {status_code_t::out_of_memory_k, "Failed to allocate the handle and its state"};
+    if (!made.state) return util::status_t {util::status_code_t::out_of_memory_k, "No room for the handle and state"};
     made.handle->engine = &engine;
     return made;
 }
@@ -555,12 +558,12 @@ ustore_database_t database_of(arguments_type_ const& arguments) noexcept {
 }
 
 /** The status every verb answers for a collection holding another modality than the verb serves. */
-inline status_t collection_holds_another_modality() noexcept {
-    return {status_code_t::invalid_argument_k, "The collection holds another modality"};
+inline util::status_t collection_holds_another_modality() noexcept {
+    return {util::status_code_t::invalid_argument_k, "The collection holds another modality"};
 }
 
 /** Admits a collection holding @p held to the verbs of @p served only when both name one modality. */
-inline status_t admit_modality(ustore_modality_t held, ustore_modality_t served) noexcept {
+inline util::status_t admit_modality(ustore_modality_t held, ustore_modality_t served) noexcept {
     if (held == served) return {};
     return collection_holds_another_modality();
 }
@@ -573,15 +576,17 @@ inline status_t admit_modality(ustore_modality_t held, ustore_modality_t served)
  *  collection it does not list, as @p view sees it, and one @c admit_modality refuses.
  */
 template <ustore_modality_t modality_, auto resolve_, auto serve_, typename arguments_type_>
-status_t guarded_by(arguments_type_ const& arguments, view_t const& view) noexcept {
-    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count, modality_, view);
+util::status_t guarded_by(arguments_type_ const& arguments, view_t const& view) noexcept {
+    util::status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count, modality_,
+                                             view);
     return resolved.failed() ? resolved : serve_(arguments, view);
 }
 
 /** Serves @p serve_, taking one ragged input, after @p resolve_ refuses every collection holding no @p modality_. */
 template <ustore_modality_t modality_, auto resolve_, auto serve_, typename arguments_type_>
-status_t guarded_by(arguments_type_ const& arguments, strings_arg_t const& values, view_t const& view) noexcept {
-    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count, modality_, view);
+util::status_t guarded_by(arguments_type_ const& arguments, strings_arg_t const& values, view_t const& view) noexcept {
+    util::status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count, modality_,
+                                             view);
     return resolved.failed() ? resolved : serve_(arguments, values, view);
 }
 
@@ -589,8 +594,9 @@ status_t guarded_by(arguments_type_ const& arguments, strings_arg_t const& value
  *  @p resolve_ refuses every collection holding another modality: the documents of @c ustore_docs_remove. */
 template <blobs_verbs<vendored_residency_t::host_k> const& values_verbs_, auto resolve_, ustore_modality_t modality_,
           typename arguments_type_>
-status_t remove_over_blobs(arguments_type_ const& arguments, view_t const& view) noexcept {
-    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count, modality_, view);
+util::status_t remove_over_blobs(arguments_type_ const& arguments, view_t const& view) noexcept {
+    util::status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count, modality_,
+                                             view);
     if (resolved.failed()) return resolved;
     ustore_blobs_remove_t const remove {
         .database = arguments.database,
@@ -612,8 +618,9 @@ status_t remove_over_blobs(arguments_type_ const& arguments, view_t const& view)
  *  collection holding another modality: the documents, vertices and pages of the scans of those modalities. */
 template <blobs_verbs<vendored_residency_t::host_k> const& values_verbs_, auto resolve_, ustore_modality_t modality_,
           typename arguments_type_>
-status_t scan_over_blobs(arguments_type_ const& arguments, view_t const& view) noexcept {
-    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count, modality_, view);
+util::status_t scan_over_blobs(arguments_type_ const& arguments, view_t const& view) noexcept {
+    util::status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count, modality_,
+                                             view);
     if (resolved.failed()) return resolved;
     ustore_blobs_scan_t const scan {
         .database = arguments.database,
@@ -642,8 +649,9 @@ status_t scan_over_blobs(arguments_type_ const& arguments, view_t const& view) n
  *  samples of those modalities. */
 template <blobs_verbs<vendored_residency_t::host_k> const& values_verbs_, auto resolve_, ustore_modality_t modality_,
           typename arguments_type_>
-status_t sample_over_blobs(arguments_type_ const& arguments, view_t const& view) noexcept {
-    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count, modality_, view);
+util::status_t sample_over_blobs(arguments_type_ const& arguments, view_t const& view) noexcept {
+    util::status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count, modality_,
+                                             view);
     if (resolved.failed()) return resolved;
     ustore_blobs_sample_t const sample {
         .database = arguments.database,
@@ -666,8 +674,9 @@ status_t sample_over_blobs(arguments_type_ const& arguments, view_t const& view)
  *  of the measures of those modalities. */
 template <blobs_verbs<vendored_residency_t::host_k> const& values_verbs_, auto resolve_, ustore_modality_t modality_,
           typename arguments_type_>
-status_t measure_over_blobs(arguments_type_ const& arguments, view_t const& view) noexcept {
-    status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count, modality_, view);
+util::status_t measure_over_blobs(arguments_type_ const& arguments, view_t const& view) noexcept {
+    util::status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count, modality_,
+                                             view);
     if (resolved.failed()) return resolved;
     ustore_blobs_measure_t const measure {
         .database = arguments.database,
@@ -692,7 +701,7 @@ status_t measure_over_blobs(arguments_type_ const& arguments, view_t const& view
 }
 
 /** Mints a UUIDv7 for a new collection, refusing when the system gives no entropy. */
-expected<ustore_collection_id_t> mint_collection_id() noexcept;
+util::expected<ustore_collection_id_t> mint_collection_id() noexcept;
 
 /** What an executor tells the NVMe databases it opens: how they move bytes, and on which threads. */
 struct nvme_placement_t {
@@ -715,15 +724,15 @@ nvme_placement_t nvme_placement_of(ustore_executor_t executor) noexcept;
 /** Serves @p serve_ of an oracle, whose library may throw, turning whatever it throws into a
  *  status; each argument binds as the verb takes it, so a plan the verb fills stays writable. */
 template <auto serve_, typename... arguments_types_>
-status_t guarded(arguments_types_&... arguments) noexcept {
+util::status_t guarded(arguments_types_&... arguments) noexcept {
     try {
         return serve_(arguments...);
     }
     catch (std::bad_alloc const&) {
-        return {status_code_t::out_of_memory_k, "Out of memory"};
+        return {util::status_code_t::out_of_memory_k, "An oracle library ran out of heap"};
     }
     catch (...) {
-        return {status_code_t::internal_k, "Unexpected engine failure"};
+        return {util::status_code_t::internal_k, "Unexpected engine failure"};
     }
 }
 
@@ -780,7 +789,7 @@ struct holding_call_t {
     ustore_outcome_t* outcome = nullptr;
 
     /** What the engine answered, which @c end_call publishes. */
-    status_t recorded;
+    util::status_t recorded;
 
     /** The counts of the database, the transaction, snapshot or cursor, and the arena the call
      *  names, raised at its claim and lowered at its end, each null when absent. */
@@ -795,8 +804,7 @@ struct holding_call_t {
 };
 
 /** The right to dispatch on @p pool, owned or lent. */
-inline utilities::pool_view_t view_of(
-    std::variant<utilities::executor_t, utilities::lent_pool_t> const& pool) noexcept {
+inline util::pool_view_t view_of(std::variant<util::executor_t, util::lent_pool_t> const& pool) noexcept {
     return std::visit([](auto const& alternative) noexcept { return alternative.view(); }, pool);
 }
 
@@ -1116,7 +1124,7 @@ constexpr sz_capability_t stringzilla_capabilities_of(cpu_class_t cpu_class) noe
 
 /** The StringZilla kernels the stores and calls of @p cpu_class_ run their string work through. */
 template <cpu_class_t cpu_class_>
-using strings_kit_of = typename utilities::strings_ladder<stringzilla_capabilities_of(cpu_class_)>::strings_kit_t;
+using strings_kit_of = typename util::strings_ladder<stringzilla_capabilities_of(cpu_class_)>::strings_kit_t;
 
 /** The SmashTable row kit one CPU class searches its trees and hash tables with; the Arm classes
  *  stay on NEON, as none of them requires SVE. */
@@ -1214,9 +1222,9 @@ static_assert(compiled_rungs(cpu_ladder_t {}) <= 1);
  *  than refusing it. Refuses a value no class takes, or an intersection the build compiled no class
  *  under, as a monoversioned build on an older CPU or under a ceiling below its one class. The one
  *  caller of StringZilla's and ForkUnion's detection. */
-inline expected<cpu_ceiling_t> pick_cpu_ceiling(ustore_cpu_class_t cpu_class_ceiling) noexcept {
+inline util::expected<cpu_ceiling_t> pick_cpu_ceiling(ustore_cpu_class_t cpu_class_ceiling) noexcept {
     if (std::string_view {ustore_cpu_class_name(cpu_class_ceiling)} == "unrecognized")
-        return status_t {status_code_t::invalid_argument_k, "Unknown CPU class ceiling"};
+        return util::status_t {util::status_code_t::invalid_argument_k, "Unknown CPU class ceiling"};
     cpu_ceiling_t ceiling;
     if (sz_capabilities_detected_cpu(&ceiling.strings) != sz_success_k) ceiling.strings = sz_cap_serial_k;
     ceiling.sync = fu::cpu_capabilities();
@@ -1228,7 +1236,8 @@ inline expected<cpu_ceiling_t> pick_cpu_ceiling(ustore_cpu_class_t cpu_class_cei
     bool const compiled = []<cpu_class_t... classes_>(cpu_ladder<classes_...>, cpu_ceiling_t under) noexcept {
         return ((cpu_class_compiled(classes_) && cpu_rung_fits(classes_, under)) || ...);
     }(cpu_ladder_t {}, ceiling);
-    if (!compiled) return status_t {status_code_t::unsupported_k, "The build compiled no class under the ceiling"};
+    if (!compiled)
+        return util::status_t {util::status_code_t::unsupported_k, "The build compiled no class under the ceiling"};
     return ceiling;
 }
 
@@ -1236,8 +1245,8 @@ inline expected<cpu_ceiling_t> pick_cpu_ceiling(ustore_cpu_class_t cpu_class_cei
  *  the serial floor last, calling it as <tt>open.template operator()<class>()</tt>; a class picking its
  *  parent's waiter and atomics is skipped without instantiating its variant. */
 template <cpu_class_t... classes_, typename open_type_>
-status_t open_fitting_rung(cpu_ladder<classes_...>, cpu_ceiling_t ceiling, open_type_&& open) noexcept {
-    status_t opened;
+util::status_t open_fitting_rung(cpu_ladder<classes_...>, cpu_ceiling_t ceiling, open_type_&& open) noexcept {
+    util::status_t opened;
     bool picked = false;
     auto rung = [&]<cpu_class_t class_>() noexcept {
         constexpr bool floor_k = class_ == cpu_class_t::serial_k || class_ == cpu_class_t::monoversioned_k;
@@ -1307,11 +1316,11 @@ class_verbs_t class_verbs_of() noexcept {
 /** The row of the newest compiled class this machine admits, picked once by the ladder walk. */
 inline class_verbs_t const& host_verbs() noexcept {
     static class_verbs_t const picked = []<cpu_class_t... classes_>(cpu_ladder<classes_...>) noexcept {
-        expected<cpu_ceiling_t> const ceiling = pick_cpu_ceiling(ustore_cpu_class_unknown_k);
+        auto const [ceiling, pick_status] = pick_cpu_ceiling(ustore_cpu_class_unknown_k);
         class_verbs_t row = class_verbs_of<cpu_ladder_floor_k>();
         bool found = false;
         auto rung = [&]<cpu_class_t class_>() noexcept {
-            if (!found && ceiling && cpu_class_compiled(class_) && cpu_rung_fits(class_, *ceiling))
+            if (!found && pick_status.succeeded() && cpu_class_compiled(class_) && cpu_rung_fits(class_, ceiling))
                 row = class_verbs_of<class_>(), found = true;
         };
         (rung.template operator()<classes_>(), ...);
@@ -1440,7 +1449,7 @@ struct ustore_snapshot_handle_t {
 struct ustore_executor_handle_t {
 
     /** The pool every call forks on, owned or lent; an exclusive one also runs delegated calls. */
-    std::variant<executor_t, lent_pool_t> pool;
+    std::variant<util::executor_t, lent_pool_t> pool;
 
     /** One scratch per pool thread and one for the call at index @c threads, each kept local. */
     st::vector<ustore_arena_handle_t> scratches;

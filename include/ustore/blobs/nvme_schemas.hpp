@@ -307,9 +307,9 @@ status_t load_binary_schema(schema_type_& schema, bytes_view_t source) noexcept 
     if (status_t const status = load(header, source); status.failed()) return status;
     binary_schema_header_t const current;
     if (std::memcmp(header.signature, current.signature, sizeof(current.signature)) != 0)
-        return status_t {status_code_t::malformed_k, "Invalid signature"};
+        return status_t {status_code_t::malformed_k, "Schema signature mismatch"};
     if (header.schema_kind != schema_type_::schema_kind_k || header.database_kind != schema_type_::database_kind_k)
-        return status_t {status_code_t::malformed_k, "Invalid schema"};
+        return status_t {status_code_t::malformed_k, "Schema kind differs from the loader's"};
     if (header.major_version != current.major_version || header.minor_version != current.minor_version)
         return status_t {status_code_t::unsupported_k, "Version not supported"};
     return schema.load(source.subspan(sizeof(header)));
@@ -493,7 +493,7 @@ inline status_t read_schema_header(yyjson_val* root, schema_header_t& header) no
     std::uint8_t database_kind = 0;
     if (!read_json(yyjson_obj_get(root, "schema_kind"), schema_kind) ||
         !read_json(yyjson_obj_get(root, "database_kind"), database_kind))
-        return status_t {status_code_t::malformed_k, "Invalid schema"};
+        return status_t {status_code_t::malformed_k, "Schema header lacks its kinds"};
     header.schema_kind = static_cast<schema_kind_t>(schema_kind);
     header.database_kind = static_cast<database_kind_t>(database_kind);
     return status_t {};
@@ -504,8 +504,8 @@ inline status_t load_schema_header(char const* file_path, schema_header_t& heade
     yyjson_read_err error;
     yyjson_doc* const document = yyjson_read_file(file_path, YYJSON_READ_NOFLAG, nullptr, &error);
     if (!document && error.code == YYJSON_READ_ERROR_FILE_OPEN)
-        return status_t {status_code_t::not_found_k, "File not exists"};
-    if (!document) return status_t {status_code_t::malformed_k, "Invalid schema"};
+        return status_t {status_code_t::not_found_k, "The file is absent"};
+    if (!document) return status_t {status_code_t::malformed_k, "The schema file did not parse"};
     status_t const status = read_schema_header(yyjson_doc_get_root(document), header);
     yyjson_doc_free(document);
     return status;
@@ -517,17 +517,17 @@ status_t load_schema(char const* file_path, schema_type_& schema) noexcept {
     yyjson_read_err error;
     yyjson_doc* const document = yyjson_read_file(file_path, YYJSON_READ_NOFLAG, nullptr, &error);
     if (!document && error.code == YYJSON_READ_ERROR_FILE_OPEN)
-        return status_t {status_code_t::not_found_k, "File not exists"};
-    if (!document) return status_t {status_code_t::malformed_k, "Invalid schema"};
+        return status_t {status_code_t::not_found_k, "The file is absent"};
+    if (!document) return status_t {status_code_t::malformed_k, "The schema file did not parse"};
 
     yyjson_val* const root = yyjson_doc_get_root(document);
     schema_header_t header;
     status_t status = read_schema_header(root, header);
     if (status &&
         (header.schema_kind != schema_type_::schema_kind_k || header.database_kind != schema_type_::database_kind_k))
-        status = status_t {status_code_t::malformed_k, "Invalid schema"};
+        status = status_t {status_code_t::malformed_k, "Schema kind differs from the loader's"};
     if (status && !read_json(yyjson_obj_get(root, "schema"), schema))
-        status = status_t {status_code_t::malformed_k, "Invalid schema"};
+        status = status_t {status_code_t::malformed_k, "Schema body does not read"};
     yyjson_doc_free(document);
     return status;
 }
@@ -707,7 +707,7 @@ template <typename element_type_, template <typename> typename allocator_>
 template <database_schema_concept schema_type_>
 status_t save_schema(char const* file_path, schema_type_ const& schema) noexcept {
     yyjson_mut_doc* const document = yyjson_mut_doc_new(nullptr);
-    if (!document) return status_t {status_code_t::out_of_memory_k, "Failed to allocate memory"};
+    if (!document) return status_t {status_code_t::out_of_memory_k, "No room for the schema document"};
 
     yyjson_mut_val* const root = yyjson_mut_obj(document);
     bool const written =
@@ -721,8 +721,8 @@ status_t save_schema(char const* file_path, schema_type_ const& schema) noexcept
     bool const saved = written && yyjson_mut_write_file(file_path, document, YYJSON_WRITE_PRETTY, nullptr, nullptr);
     yyjson_mut_doc_free(document);
 
-    if (!written) return status_t {status_code_t::out_of_memory_k, "Failed to allocate memory"};
-    if (!saved) return status_t {status_code_t::io_k, "Failed to submit file request"};
+    if (!written) return status_t {status_code_t::out_of_memory_k, "No room for the schema's members"};
+    if (!saved) return status_t {status_code_t::io_k, "The schema file did not write"};
     return status_t {};
 }
 
@@ -767,8 +767,7 @@ template <issue_sink_concept sink_type_>
     if (config.channels.request_buffer_bytes == 0 || config.channels.stream_buffer_bytes == 0)
         return report_issue(sink, issue_kind_t::error_k, "I/O blocks leave a channel nothing to transfer through");
     if (config.shared_io_channels == 0)
-        return report_issue(sink, issue_kind_t::error_k,
-                            "A mount keeps a channel for the threads outside its executor");
+        return report_issue(sink, issue_kind_t::error_k, "A mount keeps a channel per outside thread");
 
     for (std::size_t index = 0; index < config.data_directories.size(); ++index)
         for (std::size_t later = index + 1; later < config.data_directories.size(); ++later)

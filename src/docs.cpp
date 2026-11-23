@@ -40,15 +40,16 @@ constexpr enumerator_spelling<ustore_docs_modification_t> docs_modification_name
 /** Pulls the next page of @p cursor as @c pull does, narrowing through @p match, the walk's own
  *  match or the face a device pull shows it. */
 template <typename match_type_>
-status_t pull_through(engine_t const& engine, ustore_docs_cursor_next_t const& arguments,
-                      ustore_docs_cursor_handle_t& cursor, match_type_ const& match, view_t const& view) noexcept {
+util::status_t pull_through(engine_t const& engine, ustore_docs_cursor_next_t const& arguments,
+                            ustore_docs_cursor_handle_t& cursor, match_type_ const& match,
+                            view_t const& view) noexcept {
     if (!arguments.keys || !arguments.written)
-        return {status_code_t::invalid_argument_k, "Need outputs for the keys and the count written"};
+        return {util::status_code_t::invalid_argument_k, "Needs outputs for the keys and count"};
     if (arguments.values && !engine.host.docs->read)
-        return {status_code_t::unsupported_k, "The engine does not implement this call"};
-    keyed_survivors_t survivors {arena_allocator<ustore_key_t> {view.scratch}};
+        return {util::status_code_t::unsupported_k, "The engine does not implement this call"};
+    keyed_survivors_t survivors {util::arena_allocator<ustore_key_t> {view.scratch}};
     std::variant<ustore_key_t, exhausted_t> resume;
-    if (status_t const status = list_cursor_keys<ustore_docs_scan_t>(
+    if (util::status_t const status = list_cursor_keys<ustore_docs_scan_t>(
             engine, arguments.database, cursor, match, arguments.wanted, arguments.arena, view, survivors, resume);
         status.failed())
         return status;
@@ -61,22 +62,23 @@ status_t pull_through(engine_t const& engine, ustore_docs_cursor_next_t const& a
                                        .keys = {survivors.data(), sizeof(ustore_key_t)},
                                        .values = arguments.values,
                                        .arena = arguments.arena};
-        if (status_t const status = engine.host.docs->read(read, strings_arg_t {}, view); status.failed())
+        if (util::status_t const status = engine.host.docs->read(read, strings_arg_t {}, view); status.failed())
             return status;
     }
     auto [keys, keys_status] = arena_copy<ustore_key_t>(arguments.arena, survivors);
     if (keys_status.failed()) return keys_status;
-    if (!progress_t {arguments.progress, arguments.progress_state, 1}.advance(1)) return progress_cancelled_k;
+    if (!util::progress_t {arguments.progress, arguments.progress_state, 1}.advance(1))
+        return util::progress_cancelled_k;
     cursor.position = resume;
     *arguments.keys = keys.data();
     *arguments.written = written;
     return {};
 }
 
-status_t pull(engine_t const& engine, ustore_docs_cursor_next_t const& arguments, ustore_docs_cursor_handle_t& cursor,
-              view_t const& view) noexcept {
+util::status_t pull(engine_t const& engine, ustore_docs_cursor_next_t const& arguments,
+                    ustore_docs_cursor_handle_t& cursor, view_t const& view) noexcept {
     auto const* const walker = host_engine_of(cursor);
-    if (!walker) return {status_code_t::device_k, "The cursor walks on another kind of executor"};
+    if (!walker) return {util::status_code_t::device_k, "The cursor walks on another kind of executor"};
     return pull_through(engine, arguments, cursor, walker->match, view);
 }
 

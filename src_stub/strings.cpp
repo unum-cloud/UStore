@@ -116,7 +116,6 @@ struct ustore_strings_cursor_handle_t {
 };
 
 void ustore_strings_write(ustore_strings_write_t* arguments) {
-    if (submitted<&ustore_strings_write>(arguments)) return;
     call_t call(arguments->outcome);
     if (refuse_database(call, arguments->database)) return;
     std::size_t const count = arguments->count;
@@ -146,7 +145,6 @@ void ustore_strings_write(ustore_strings_write_t* arguments) {
 }
 
 void ustore_strings_remove(ustore_strings_remove_t* arguments) {
-    if (submitted<&ustore_strings_remove>(arguments)) return;
     call_t call(arguments->outcome);
     if (refuse_database(call, arguments->database)) return;
     std::size_t const count = arguments->count;
@@ -187,7 +185,6 @@ void ustore_strings_remove(ustore_strings_remove_t* arguments) {
 }
 
 void ustore_strings_read(ustore_strings_read_t* arguments) {
-    if (submitted<&ustore_strings_read>(arguments)) return;
     call_t call(arguments->outcome);
     if (arguments->presences) *arguments->presences = nullptr;
     if (arguments->values) *arguments->values = nullptr;
@@ -230,7 +227,6 @@ void ustore_strings_read(ustore_strings_read_t* arguments) {
 }
 
 void ustore_strings_scan(ustore_strings_scan_t* arguments) {
-    if (submitted<&ustore_strings_scan>(arguments)) return;
     call_t call(arguments->outcome);
     if (arguments->offsets) *arguments->offsets = nullptr;
     if (arguments->strings) *arguments->strings = {};
@@ -325,7 +321,6 @@ void ustore_strings_cursor_init(ustore_strings_cursor_init_t* arguments) {
 }
 
 void ustore_strings_cursor_next(ustore_strings_cursor_next_t* arguments) {
-    if (submitted<&ustore_strings_cursor_next>(arguments)) return;
     call_t call(arguments->outcome);
     if (arguments->strings) *arguments->strings = {};
     if (arguments->values) *arguments->values = nullptr;
@@ -395,7 +390,6 @@ void ustore_strings_cursor_free(ustore_strings_cursor_t cursor) {
 }
 
 void ustore_strings_sample(ustore_strings_sample_t* arguments) {
-    if (submitted<&ustore_strings_sample>(arguments)) return;
     call_t call(arguments->outcome);
     if (arguments->offsets) *arguments->offsets = nullptr;
     if (arguments->strings) *arguments->strings = {};
@@ -441,7 +435,6 @@ void ustore_strings_sample(ustore_strings_sample_t* arguments) {
 }
 
 void ustore_strings_measure(ustore_strings_measure_t* arguments) {
-    if (submitted<&ustore_strings_measure>(arguments)) return;
     call_t call(arguments->outcome);
     ustore_size_t const** const outputs[] = {arguments->min_cardinalities, arguments->max_cardinalities,
                                              arguments->min_value_bytes,   arguments->max_value_bytes,

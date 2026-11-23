@@ -23,6 +23,7 @@
 #include <atomic>           // `std::atomic`
 #include <charconv>         // `std::from_chars`
 #include <chrono>           // `std::chrono::steady_clock`
+#include <concepts>         // `std::convertible_to`
 #include <filesystem>       // `std::filesystem::create_directories`, `std::filesystem::remove_all`
 #include <functional>       // `std::invoke`
 #include <initializer_list> // `std::initializer_list`
@@ -41,8 +42,7 @@
 #include <stringzilla/stringzilla.hpp> // `sz::status_t`, `sz::strings_view_t`
 
 #include "ustore/db.h"
-#include "ustore/status.hpp" // `status_t`, `status_code_t`, `expected`
-#include "ustore/types.hpp"
+#include "ustore/utilities/types.hpp" // `status_t`, `expected`, `uuid_to_integer`, `uuid_to_text`
 
 #include "arguments.hpp"
 
@@ -58,10 +58,10 @@ template <>
 struct fmt::formatter<ustore_uuid_t> : fmt::formatter<std::string_view> {
     auto format(ustore_uuid_t const& uuid, fmt::format_context& context) const {
         using namespace unum::ustore;
-        if (auto [integer, integer_status] = uuid_to_integer(uuid); integer_status.succeeded())
+        if (auto [integer, integer_status] = util::uuid_to_integer(uuid); !integer_status.failed())
             return fmt::format_to(context.out(), "{}", integer);
-        char text[uuid_text_length_k];
-        uuid_to_text(uuid, text);
+        char text[util::uuid_text_length_k];
+        util::uuid_to_text(uuid, text);
         return fmt::formatter<std::string_view>::format(std::string_view(text, sizeof(text)), context);
     }
 };
@@ -446,14 +446,14 @@ struct regex_escaped_t {
 } // namespace unum::ustore::test
 
 /** The short spelling the foreign specializations below reach the project's types through. */
-namespace ustore = unum::ustore;
+namespace us = unum::ustore;
 
 /** Writes a @ref regex_escaped_t straight to the output, a backslash before each metacharacter. */
 template <>
-struct fmt::formatter<ustore::test::regex_escaped_t> {
+struct fmt::formatter<us::test::regex_escaped_t> {
     constexpr auto parse(fmt::format_parse_context& context) { return context.begin(); }
     template <typename context_type_>
-    auto format(ustore::test::regex_escaped_t const& escaped, context_type_& context) const {
+    auto format(us::test::regex_escaped_t const& escaped, context_type_& context) const {
         auto output = context.out();
         for (char const character : escaped.label) {
             if (std::string_view {"\\^$.|?*+()[]{}"}.find(character) != std::string_view::npos) *output++ = '\\';
@@ -680,63 +680,104 @@ inline bool expect_near(double actual, double wanted, double tolerance,
 
 /** The library's own spelling of @p code , as @c ustore_status_name answers it, for suites that
  *  link no library. */
-[[nodiscard]] constexpr char const* status_name(status_code_t code) noexcept {
-    switch (code) {
-    case status_code_t::success_k: return "success";
-    case status_code_t::deferred_k: return "deferred";
-    case status_code_t::out_of_memory_k: return "out-of-memory";
-    case status_code_t::read_only_k: return "read-only";
-    case status_code_t::io_k: return "io";
-    case status_code_t::device_k: return "device";
-    case status_code_t::malformed_k: return "malformed";
-    case status_code_t::internal_k: return "internal";
-    case status_code_t::uninitialized_k: return "uninitialized";
-    case status_code_t::contended_k: return "contended";
-    case status_code_t::cancelled_k: return "cancelled";
-    case status_code_t::unsupported_k: return "unsupported";
-    case status_code_t::invalid_argument_k: return "invalid-argument";
-    case status_code_t::not_found_k: return "not-found";
-    case status_code_t::already_exists_k: return "already-exists";
-    case status_code_t::write_conflict_k: return "write-conflict";
-    case status_code_t::read_conflict_k: return "read-conflict";
-    case status_code_t::phantom_conflict_k: return "phantom-conflict";
-    case status_code_t::capacity_exhausted_k: return "capacity-exhausted";
+template <typename code_type_>
+    requires std::is_enum_v<code_type_>
+[[nodiscard]] constexpr char const* status_name(code_type_ code) noexcept {
+    switch (static_cast<ustore_status_t>(code)) {
+    case ustore_status_success_k: return "success";
+    case ustore_status_deferred_k: return "deferred";
+    case ustore_status_out_of_memory_k: return "out-of-memory";
+    case ustore_status_read_only_k: return "read-only";
+    case ustore_status_io_k: return "io";
+    case ustore_status_device_k: return "device";
+    case ustore_status_malformed_k: return "malformed";
+    case ustore_status_internal_k: return "internal";
+    case ustore_status_uninitialized_k: return "uninitialized";
+    case ustore_status_contended_k: return "contended";
+    case ustore_status_cancelled_k: return "cancelled";
+    case ustore_status_unsupported_k: return "unsupported";
+    case ustore_status_invalid_argument_k: return "invalid-argument";
+    case ustore_status_not_found_k: return "not-found";
+    case ustore_status_already_exists_k: return "already-exists";
+    case ustore_status_write_conflict_k: return "write-conflict";
+    case ustore_status_read_conflict_k: return "read-conflict";
+    case ustore_status_phantom_conflict_k: return "phantom-conflict";
+    case ustore_status_capacity_exhausted_k: return "capacity-exhausted";
     }
     return "unrecognized";
 }
 
 /** Holds when @p status carries @p wanted ; otherwise counts a failed check and prints both by
  *  name. */
-inline bool expect_status(status_t status, status_code_t wanted,
-                          std::source_location where = std::source_location::current()) noexcept {
-    if (status.code == wanted) return true;
+template <typename status_type_, typename code_type_>
+    requires std::is_enum_v<code_type_> && requires(status_type_ const& status) {
+        { static_cast<ustore_status_t>(status.code) };
+        { status.note } -> std::convertible_to<char const*>;
+    }
+bool expect_status(status_type_ const& status, code_type_ wanted,
+                   std::source_location where = std::source_location::current()) noexcept {
+    // The engine and the SDK spell the codes as two enums over the same C statuses
+    if (static_cast<ustore_status_t>(status.code) == static_cast<ustore_status_t>(wanted)) return true;
     record_failed_check(where);
     fmt::println(stderr, "    expected {}, got {}{}{}", status_name(wanted), status_name(status.code),
-                 status.message ? ": " : "", status.message ? status.message : "");
+                 status.note ? ": " : "", status.note ? status.note : "");
+    return false;
+}
+
+/** The same check on a bare status code, which a container's refusal answers. */
+template <typename code_type_>
+    requires std::is_enum_v<code_type_>
+bool expect_status(code_type_ code, code_type_ wanted,
+                   std::source_location where = std::source_location::current()) noexcept {
+    if (code == wanted) return true;
+    record_failed_check(where);
+    fmt::println(stderr, "    expected {}, got {}", status_name(wanted), status_name(code));
     return false;
 }
 
 /** The same check on the status an @c expected carries, so a refusal is checked without unpacking
  *  it. */
-template <typename value_type_>
-bool expect_status(expected<value_type_> const& actual, status_code_t wanted,
+template <typename expected_type_, typename code_type_>
+    requires requires(expected_type_ const& actual) { actual.status().code; }
+bool expect_status(expected_type_ const& actual, code_type_ wanted,
                    std::source_location where = std::source_location::current()) noexcept {
     return expect_status(actual.status(), wanted, where);
 }
 
+/** The same check on the status the SDK's aggregate @c expected carries beside its value. */
+template <typename expected_type_, typename code_type_>
+    requires requires(expected_type_ const& actual) { actual.status.code; }
+bool expect_status(expected_type_ const& actual, code_type_ wanted,
+                   std::source_location where = std::source_location::current()) noexcept {
+    return expect_status(actual.status, wanted, where);
+}
+
+/** The status a C call's outcome carries, in the engine's types or in the two the SDK passes. */
+template <typename status_type_ = util::status_t, typename code_type_ = util::status_code_t>
+status_type_ status_of(ustore_outcome_t const& outcome) noexcept {
+    return {static_cast<code_type_>(outcome.status), outcome.message};
+}
+
 /** The same check on the outcome of a C call, which it clears either way, so the next call starts
  *  on a blank one. */
-inline bool expect_status(ustore_outcome_t& outcome, status_code_t wanted,
-                          std::source_location where = std::source_location::current()) noexcept {
-    bool const held = expect_status(status_t {outcome}, wanted, where);
+template <typename code_type_>
+bool expect_status(ustore_outcome_t& outcome, code_type_ wanted,
+                   std::source_location where = std::source_location::current()) noexcept {
+    bool const held = expect_status(status_of(outcome), wanted, where);
     outcome = {};
     return held;
+}
+
+/** Whether a capability probe answered yes, where a probe that failed reads as no. */
+template <typename probe_type_>
+bool probed(probe_type_ const& probe) noexcept {
+    return !probe.status.failed() && probe.value;
 }
 
 /** The @c success_k shorthand of @c expect_status on the outcome of a C call. */
 inline bool expect_success(ustore_outcome_t& outcome,
                            std::source_location where = std::source_location::current()) noexcept {
-    return expect_status(outcome, status_code_t::success_k, where);
+    return expect_status(outcome, util::status_code_t::success_k, where);
 }
 
 /**
@@ -750,13 +791,13 @@ void under_bisected_budget(std::size_t ceiling, body_type_&& body) {
     std::size_t admitted = ceiling;
     while (refused < admitted) {
         std::size_t const budget = refused + (admitted - refused) / 2;
-        status_t const status = body(budget);
-        if (status.succeeded()) {
+        util::status_t const status = body(budget);
+        if (!status.failed()) {
             admitted = budget;
             continue;
         }
-        expect_true(status.code == status_code_t::out_of_memory_k, "a budget of {} bytes failed with {}{}{}", budget,
-                    status_name(status.code), status.message ? ": " : "", status.message ? status.message : "");
+        expect_true(status.code == util::status_code_t::out_of_memory_k, "a budget of {} bytes failed with {}{}{}",
+                    budget, status_name(status.code), status.note ? ": " : "", status.note ? status.note : "");
         refused = budget + 1;
     }
 }
@@ -847,18 +888,18 @@ inline std::string save_target(config_t const& config, std::string const& path) 
 }
 
 /** Opens the engine @p config names through the C ABI. */
-inline expected<ustore_database_t> open_raw(config_t const& config) noexcept {
+inline util::expected<ustore_database_t> open_raw(config_t const& config) noexcept {
     ustore_database_t database = nullptr;
     ustore_outcome_t outcome {};
     open_engine(config.options(), &database, &outcome);
-    if (status_t const status {outcome}; status.failed()) return status;
+    if (util::status_t const status = status_of(outcome); status.failed()) return status;
     return database;
 }
 
 /** Opens the engine @p config names as a C++ @p database_type_, which adopts the handle. A template, so this header
  *  needs no @c ustore/db.hpp, whose names would clash with the storage suites' own. */
 template <typename database_type_>
-expected<database_type_> open_database(config_t const& config) noexcept {
+util::expected<database_type_> open_database(config_t const& config) noexcept {
     auto [database, open_status] = open_raw(config);
     if (open_status.failed()) return open_status;
     return database_type_ {database};
@@ -879,6 +920,9 @@ expected<database_type_> open_database(config_t const& config) noexcept {
  */
 class scratch_directory_t {
   public:
+    /** Names no directory, as a moved-from one does. */
+    scratch_directory_t() noexcept = default;
+
     scratch_directory_t(scratch_directory_t&& other) noexcept {
         std::memcpy(path_, other.path_, sizeof(path_));
         other.path_[0] = '\0';
@@ -937,8 +981,6 @@ class scratch_directory_t {
     [[nodiscard]] char const* path() const noexcept { return path_[0] != '\0' ? path_ : nullptr; }
 
   private:
-    scratch_directory_t() noexcept = default;
-
     /** Longest path the unique directory takes. */
     static constexpr std::size_t path_capacity_k = 4096;
 

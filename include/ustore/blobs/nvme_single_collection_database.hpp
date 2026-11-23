@@ -344,7 +344,7 @@ class single_collection_database_transaction {
         st::vector<std::size_t> deferred_requests;
         if (deferred_keys.reserve(stored_keys.size()) != st::status_t::success_k ||
             deferred_requests.reserve(stored_keys.size()) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A transaction could not track the keys of a batch"};
+            return {status_code_t::out_of_memory_k, "No room to track the batch keys"};
 
         for (std::size_t request = 0; request != stored_keys.size(); ++request) {
             lookup_result_t const own_lookup = visit_uncommitted_(
@@ -359,7 +359,7 @@ class single_collection_database_transaction {
 
         st::vector<lookup_result_t> deferred_results;
         if (deferred_results.resize(deferred_keys.size()) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A transaction could not track the keys of a batch"};
+            return {status_code_t::out_of_memory_k, "A transaction could not hold deferred results"};
 
         std::span<stored_key_t const> const watched {deferred_keys};
         if (status_t const prepared = core_.template watch_now_or_prepare<watch_schedule_>(single_collection_id_k,
@@ -741,8 +741,7 @@ class basic_single_collection_database {
     expected<transaction_unique_ptr_t> create_transaction(transaction_config_t const& config) noexcept {
         if (config.max_bytes > config_.collection.memory_runs_max_bytes ||
             config.max_deltas > config_.collection.memory_runs_max_deltas)
-            return status_t {status_code_t::invalid_argument_k,
-                             "A transaction may not outgrow the memory runs it commits into"};
+            return status_t {status_code_t::invalid_argument_k, "The transaction outgrows the memory runs"};
         return registry_.template create_transaction<transaction_t>(config);
     }
 
@@ -1079,7 +1078,7 @@ class basic_single_collection_database {
         manifest_collection_t const& carried = loaded.collections[0];
         if (carried.store != static_cast<std::uint16_t>(value_layout_k) ||
             carried.value_max_size != collection_.value_max_size())
-            return {status_code_t::invalid_argument_k, "The volume holds a collection of another value layout"};
+            return {status_code_t::invalid_argument_k, "The volume holds another value layout"};
 
         st::vector<lsm_tree_run_record_t> runs;
         if (runs.reserve(loaded.files.size()) != st::status_t::success_k)
@@ -1129,7 +1128,7 @@ class basic_single_collection_database {
         manifest_collection_t record;
         std::memcpy(record.id.bytes, single_collection_id_k.uuid.bytes, sizeof(record.id.bytes));
         if (sz::failed(record.name.assign(string_view_t {single_collection_name_k})))
-            return {status_code_t::out_of_memory_k, "No room to lay the manifest out"};
+            return {status_code_t::out_of_memory_k, "No room for the manifest collection name"};
         record.store = static_cast<std::uint16_t>(value_layout_k);
         record.value_size = is_fixed(value_layout_k) ? collection_.value_max_size() : 0;
         record.value_max_size = collection_.value_max_size();
@@ -1138,12 +1137,12 @@ class basic_single_collection_database {
         record.memory_runs_max_bytes = config_.collection.memory_runs_max_bytes;
         record.memory_runs_max_deltas = config_.collection.memory_runs_max_deltas;
         if (manifest.collections.push_back(std::move(record)) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "No room to lay the manifest out"};
+            return {status_code_t::out_of_memory_k, "No room for the manifest collection"};
 
         st::vector<lsm_tree_run_record_t> runs;
         if (status_t const named = record_lsm_tree_runs(collection_.tree(), runs); named.failed()) return named;
         if (manifest.files.reserve(runs.size() + 1) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "No room to lay the manifest out"};
+            return {status_code_t::out_of_memory_k, "No room for the manifest files"};
         for (lsm_tree_run_record_t const& run : runs) [[maybe_unused]]
             st::status_t const placed = manifest.files.push_back(
                 st::assume_reserved,

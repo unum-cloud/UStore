@@ -53,12 +53,12 @@ The `metal` preset builds them on macOS, and off Apple platforms the same switch
 
 `CMakeLists.txt` builds two libraries from the same sources, every engine adding its own:
 
-- __`ustore_static`__, aliased `ustore::static` and `ustore::ustore`, takes the objects of ForkUnion, StringZilla, yyjson and fmt, and links the engines' own archives, RocksDB, LevelDB and liburing, which install beside it in the same CMake package, so a change to UStore never rewrites them. The suites, benchmarks and tools inside the tree link it as `ustore::static` and reach the siblings through it.
+- __`ustore_static`__, aliased `ustore::static`, takes the objects of ForkUnion, StringZilla, yyjson and fmt, and links the engines' own archives, RocksDB, LevelDB and liburing, which install beside it in the same CMake package, so a change to UStore never rewrites them. The suites, benchmarks and tools inside the tree link it as `ustore::static` and reach the siblings through it.
 - __`ustore_shared`__, aliased `ustore::shared`, links the same libraries privately, compiles with `USTORE_EXPORTING`, hands its consumers `USTORE_SHARED`, and exports only the functions `USTORE_EXPORT` marks, as hidden visibility, a `ustore_*` version script on Linux, Android and FreeBSD and `-exported_symbol,_ustore_*` on macOS keep every other symbol inside.
 
 `c/test.c` builds against both, as `ustore_test_c` and `ustore_test_c_shared`, and CTest runs both.
-`USTORE_INSTALL` installs the two libraries, the headers, a `.pc` file and a CMake package under `lib/cmake/ustore`, which `find_package(ustore)` reads as `ustore::static` and `ustore::shared`.
-The install splits into components: `sdk` holds the shared library, `c/ustore/`, `cpp/ustore/`, the package and the license, `static` the archive with the engines' archives, and `core` the header-only `include/ustore/`.
+`USTORE_INSTALL` installs the two libraries, the headers, a `.pc` file and a CMake package under `lib/cmake/ustore`, which `find_package(ustore)` reads as `ustore::abi`, `ustore::templates`, `ustore::static`, `ustore::shared` and `ustore::cpp`, the C++ SDK linking the C headers and the archive.
+The install splits into components: `sdk` holds both libraries with the engines' archives, `c/ustore/`, `cpp/ustore/`, the package and the license, and `templates` the header-only `include/ustore/`.
 `cpack --config build_release/CPackConfig.cmake` archives the `sdk` component alone, stripped, as the preview SDK `ustore-<version>-<platform>-sdk.tar.gz`, a ZIP on Windows.
 A function the headers declare without `USTORE_EXPORT` links against the archive but is missing from the shared library, so every new declaration carries it.
 
@@ -235,6 +235,16 @@ A library leaves out the ones it cannot answer but never renumbers the rest, and
 Every enum the C interface names, statuses included, has a `ustore_*_name` answering "unrecognized" for a value it does not know and a `ustore_*_from_name(view, &out)` answering `invalid_argument` for a name it does not know, leaving `out` as it was.
 CPU and GPU class values are ABI: each class keeps the number USearch gives the same hardware, written explicitly, with unused numbers reserved rather than reused.
 `ustore_version_name` answers the full version, pre-release suffix included, in the engine and in the stub alike.
+
+### Notes
+
+A failure is `status_t {code, note}`, two words: recovery branches on the code, and the note, a literal or other static text, names the broken invariant, step or resource for logs and regression analysis.
+Codes use the C interface's spellings and numbers, and the SDK in `cpp/` keeps an identical copy of `status_t`, so a status reads the same on both sides of the C layer.
+A note is 2 to 8 words in sentence case with no closing period, never restates the code, and never carries a value that differs per call, such as a path, an error number, a size or an identifier.
+A failure forwards whole, as `if (x.failed()) return x;`, a site that returns its own code writes its own note, and no site hides a callee's more specific failure behind a code of its own.
+A call made once per candidate, neighbor, match or key may answer `expected<value_type_, status_code_t>`, the bare code, and the note is attached once where the loop's failure leaves it.
+An atomic status word holds the code alone, and only the thread whose compare-exchange wins writes the note.
+The C outcome's message is the note, else the rule of the call that was broken, else the status's own `ustore_status_name`.
 
 ### Compile-Time Choices
 
@@ -628,7 +638,7 @@ Nothing in a binding takes a lock, sends a notification or adds synchronization 
 The object that submitted a deferred call is the only one that polls its outcome, so no other thread ever waits on it, and whatever a second caller asks, the library answers.
 A blocking `wait` calls `ustore_outcome_wait`.
 An asynchronous bridge never parks a thread: it reads `ustore_outcome_status` and, while the call is deferred, yields to its runtime.
-A runtime with a timer pauses between reads with a backoff growing from about 1 µs to 1 ms, like Python's `asyncio.sleep`, Swift's `Task.sleep`, JavaScript's `setTimeout` and C#'s `Task.Delay`.
+A runtime that can reschedule a task reads again on its next turn with no sleep, like Python's `loop.call_soon`, a C++ scheduler's `post(poll, state)` and Mojo's runtime, while one that resumes only on a timer pauses with a backoff growing from about 1 µs to 1 ms, like Swift's `Task.sleep`, JavaScript's `setTimeout` and C#'s `Task.Delay`.
 A Rust future yields only: `poll` reads the status and, while it is deferred, calls `wake_by_ref` and returns `Poll::Pending`, with no sleep and no timer thread.
 
 A callback never raises into the library.
@@ -644,7 +654,7 @@ Where a binding's own types carry two lengths, like a slice of keys beside a mat
 
 Each verb has one body, which fills the C struct and calls the library with no layers in between.
 What it returns is read from the struct's output slot, a trampoline receives the handler itself as its state with no hub around it, and whether a call blocks or defers follows from the type of the receiver it is called on, never from a flag.
-Verbs are never shared through a base class; a trait whose default methods hold the one body per verb is fine, like Rust's and Mojo's, since each receiver supplies only its handle.
+Verbs are never shared through a base class; a trait whose default methods hold the one body per verb is fine, like Rust's and Mojo's, since each receiver supplies only its handle, and C++ writes each handle and its receivers as one class template over what the receiver holds, so the handle carries the verbs as Rust's `&Handle` does.
 
 A typed binding takes the scalar as a type parameter of each call, like *Example (USearch): `search::<f32>`*, rather than letting a handle's type fix one.
 A deferred Rust call owns what it lends the library until the call is final, since the borrow checker cannot see the library holding it.

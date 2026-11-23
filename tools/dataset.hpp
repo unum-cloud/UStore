@@ -31,6 +31,13 @@ namespace unum::ustore::tools {
 /** Whether @p outcome already holds a failure, which every later step of a task skips past. */
 [[nodiscard]] bool failed(ustore_outcome_t const* outcome) noexcept;
 
+/** The C outcome of @p status: its note as the message, else the code's name, none on success. */
+[[nodiscard]] inline ustore_outcome_t outcome_of(util::status_t status) noexcept {
+    ustore_status_t const code = static_cast<ustore_status_t>(status.code);
+    if (status.succeeded()) return {code, nullptr};
+    return {code, status.note ? status.note : ustore_status_name(code)};
+}
+
 /** Reports @p completed of @p total to the progress callback @p task carries, answering whether the
  *  task goes on; a cancel writes @c ustore_status_cancelled_k into the task's outcome. */
 template <typename task_type_>
@@ -57,9 +64,9 @@ void place(yyjson_mut_doc* builder, yyjson_mut_val* root, std::string_view field
  *  following a link on POSIX systems, so two exports to one target must not run at once.
  */
 class staged_output_t {
-    char target_[utilities::path_max_bytes_k] {};
-    char temporary_[utilities::path_max_bytes_k] {};
-    char directory_[utilities::path_max_bytes_k] {};
+    char target_[util::path_max_bytes_k] {};
+    char temporary_[util::path_max_bytes_k] {};
+    char directory_[util::path_max_bytes_k] {};
     bool staged_ = false;
 
   public:
@@ -68,13 +75,12 @@ class staged_output_t {
      *  @p outcome. */
     void stage(char const* target, ustore_outcome_t* outcome) noexcept {
         std::size_t const length = std::strlen(target);
-        utilities::status_t status;
-        if (length >= sizeof(target_))
-            status = {utilities::status_code_t::invalid_argument_k, "A path outgrew the limit"};
-        if (status.succeeded()) status = utilities::temporary_path_of(target, temporary_);
-        if (status.succeeded()) status = utilities::parent_directory_of(target, directory_);
+        util::status_t status;
+        if (length >= sizeof(target_)) status = {util::status_code_t::invalid_argument_k, "A path outgrew the limit"};
+        if (status.succeeded()) status = util::temporary_path_of(target, temporary_);
+        if (status.succeeded()) status = util::parent_directory_of(target, directory_);
         if (status.failed()) {
-            *outcome = status;
+            *outcome = outcome_of(status);
             return;
         }
         std::memcpy(target_, target, length + 1);
@@ -89,15 +95,15 @@ class staged_output_t {
     void land(ustore_outcome_t* outcome) noexcept {
         if (!staged_) return;
         staged_ = false;
-        utilities::status_t landed;
-        if (outcome->status == ustore_status_success_k) landed = utilities::rename_file(temporary_, target_);
+        util::status_t landed;
+        if (outcome->status == ustore_status_success_k) landed = util::rename_file(temporary_, target_);
         if (outcome->status != ustore_status_success_k || landed.failed()) {
-            [[maybe_unused]] utilities::status_t const removed = utilities::remove_file(temporary_);
-            if (landed.failed()) *outcome = landed;
+            [[maybe_unused]] util::status_t const removed = util::remove_file(temporary_);
+            if (landed.failed()) *outcome = outcome_of(landed);
             return;
         }
-        if (utilities::status_t const synced = utilities::sync_directory(directory_); synced.failed())
-            *outcome = synced;
+        if (util::status_t const synced = util::sync_directory(directory_); synced.failed())
+            *outcome = outcome_of(synced);
     }
 };
 

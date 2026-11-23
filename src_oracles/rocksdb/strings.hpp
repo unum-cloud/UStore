@@ -20,7 +20,7 @@
 
 #include <rocksdb/db.h>
 
-#include "ustore/ranges.hpp" // `strided`, `strided_iterator`
+#include "ustore/utilities/ranges.hpp" // `strided`, `strided_iterator`
 
 #include "database.hpp"           // `database_t`, `transaction_t`, `refuse_collections`, `buffer_write`, `step_towards`
 #include "utilities/batches.hpp"  // `validate_choices`, `validate_direction`, `samples_of`, `sample_generator_t`

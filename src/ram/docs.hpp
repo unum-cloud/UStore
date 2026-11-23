@@ -17,8 +17,8 @@
 
 #include <cstddef> // `std::size_t`
 
-#include "ustore/docs.h"     // `ustore_docs_write_t`, `ustore_docs_read_t`
-#include "ustore/ranges.hpp" // `place_batch_t`
+#include "ustore/docs.h"               // `ustore_docs_write_t`, `ustore_docs_read_t`
+#include "ustore/utilities/ranges.hpp" // `place_batch_t`
 
 #include "ustore/docs/ram_store.hpp" // `document_pair_t`
 
@@ -37,14 +37,14 @@ struct documents_in_store {
     store_status_t& failure;
 
     /** Reads the documents at @p places, appending their text to the scratch of @p view. */
-    expected<json_documents_t> read(place_batch_t const& places, view_t const& view) const noexcept {
+    expected<json_documents_t> read(util::place_batch_t const& places, view_t const& view) const noexcept {
         auto const [documents, read_status] = read_into_scratch<docs::document_pair_t>(source, places, view, failure);
         if (read_status.failed()) return read_status;
         return json_documents_t {documents.tape(), documents.presences().get(), places.count};
     }
 
     /** Stages @p values as the whole text of the documents at @p places. */
-    status_t write(place_batch_t const& places, strings_arg_t const& values, ustore_durability_t durability,
+    status_t write(util::place_batch_t const& places, strings_arg_t const& values, ustore_durability_t durability,
                    view_t const& view) const noexcept {
         if (status_t const status = validate_write(view.transaction, places, values, durability, view.watch);
             status.failed())

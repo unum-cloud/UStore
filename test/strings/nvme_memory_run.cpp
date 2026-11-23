@@ -83,21 +83,21 @@ static bool agrees(bool found, delta_view_t const& delta, model_version_t const*
  *  model's, removals included. */
 static bool cursor_agrees(view_t const& view, model_t const& model, std::string const& prefix, std::string const& start,
                           transaction_stamp_t at, std::size_t wanted) {
-    expected<cursor_t> cursor = cursor_t::over(view, prefix, start, at);
-    if (!expect_true(cursor.has_value())) return false;
+    auto [cursor, status] = cursor_t::over(view, prefix, start, at);
+    if (!expect_true(status.succeeded())) return false;
     std::size_t listed = 0;
     for (model_t::const_iterator entry = model.lower_bound(fu::max_of(prefix, start));
          entry != model.end() && entry->first.starts_with(prefix) && listed != wanted; ++entry) {
         model_version_t const* const version = model_find(model, entry->first, at);
         if (!version) continue;
         string_version_t found;
-        if (!expect_true(cursor->next(found))) return false;
+        if (!expect_true(cursor.next(found))) return false;
         if (!expect_true(found.string == entry->first && found.stamp == version->stamp)) return false;
         if (!agrees(true, found.delta, version)) return false;
         ++listed;
     }
     string_version_t past;
-    return listed == wanted || expect_true(!cursor->next(past));
+    return listed == wanted || expect_true(!cursor.next(past));
 }
 
 /** The strings every case draws from: ten thousand sharing a 15-byte prefix that holds zero and 0xFF bytes, the
@@ -185,11 +185,11 @@ static void draw_commit(std::vector<std::string> const& pool, split_mix_generato
  *  a failed check. */
 static run_t const* commit(std::vector<keyed_delta_t>& deltas, transaction_stamp_t stamp,
                            std::vector<std::unique_ptr<run_t>>& runs) {
-    expected<sealed_t> sealed = sealed_t::seal(deltas, &sz_sort_order_serial);
-    if (!expect_true(sealed.has_value())) return nullptr;
-    expected<run_t> stamped = run_t::stamped(std::move(*sealed), stamp);
-    if (!expect_true(stamped.has_value())) return nullptr;
-    runs.push_back(std::make_unique<run_t>(std::move(*stamped)));
+    auto [sealed, seal_status] = sealed_t::seal(deltas, &sz_sort_order_serial);
+    if (!expect_true(seal_status.succeeded())) return nullptr;
+    auto [stamped, stamp_status] = run_t::stamped(std::move(sealed), stamp);
+    if (!expect_true(stamp_status.succeeded())) return nullptr;
+    runs.push_back(std::make_unique<run_t>(std::move(stamped)));
     return runs.back().get();
 }
 
@@ -250,10 +250,10 @@ static void test_refusals() {
                                       {"", {delta_kind_t::remove_k, {}}},
                                       {"ab", {delta_kind_t::write_k, payload}},
                                       {"b", {delta_kind_t::remove_k, {}}}};
-    expected<std::size_t> const kept = strings::sort_unique_strings(std::span<keyed_delta_t> {batch},
-                                                                    &sz_sort_order_serial, strings::keep_t::last_k,
-                                                                    st::default_allocator<byte_t> {});
-    expect_true(kept.has_value() && *kept == 3);
+    auto const [kept, sort_status] = strings::sort_unique_strings(std::span<keyed_delta_t> {batch},
+                                                                  &sz_sort_order_serial, strings::keep_t::last_k,
+                                                                  st::default_allocator<byte_t> {});
+    expect_true(sort_status.succeeded() && kept == 3);
     expect_true(batch[0].stored_key.empty() && batch[1].stored_key == "ab" && batch[2].stored_key == "b");
     expect_true(batch[2].delta.kind == delta_kind_t::remove_k);
 
@@ -267,36 +267,36 @@ static void test_refusals() {
     expect_true(sealed_t::seal(empty_write, &sz_sort_order_serial).code() == status_code_t::invalid_argument_k);
 
     std::vector<keyed_delta_t> one {{"key", {delta_kind_t::write_k, payload}}};
-    expected<sealed_t> sealed = sealed_t::seal(one, &sz_sort_order_serial);
-    if (!expect_true(sealed.has_value())) return;
-    expect_true(run_t::stamped(std::move(*sealed), unwritten_stamp_k).code() == status_code_t::invalid_argument_k);
+    auto [sealed, seal_status] = sealed_t::seal(one, &sz_sort_order_serial);
+    if (!expect_true(seal_status.succeeded())) return;
+    expect_true(run_t::stamped(std::move(sealed), unwritten_stamp_k).code() == status_code_t::invalid_argument_k);
 
     std::string const empty_string;
     bytes_t const other_payload(sizeof(ustore_key_t), byte_t {9});
     std::vector<keyed_delta_t> deltas {{"gone", {delta_kind_t::remove_k, {}}},
                                        {"blank", {delta_kind_t::write_k, other_payload}},
                                        {empty_string, {delta_kind_t::write_k, payload}}};
-    expected<run_t> stamped = run_t::stamped(*sealed_t::seal(deltas, &sz_sort_order_serial), 5);
-    if (!expect_true(stamped.has_value())) return;
+    auto [stamped, stamp_status] = run_t::stamped(*sealed_t::seal(deltas, &sz_sort_order_serial), 5);
+    if (!expect_true(stamp_status.succeeded())) return;
     view_t const empty;
-    expected<view_t> view = view_t::extended(empty, *stamped);
-    if (!expect_true(view.has_value())) return;
+    auto [view, extend_status] = view_t::extended(empty, stamped);
+    if (!expect_true(extend_status.succeeded())) return;
     delta_view_t found;
-    expect_true(view->find("blank", 5, found) && found.kind == delta_kind_t::write_k &&
+    expect_true(view.find("blank", 5, found) && found.kind == delta_kind_t::write_k &&
                 found.bytes.size() == other_payload.size() &&
                 std::memcmp(found.bytes.data(), other_payload.data(), other_payload.size()) == 0);
-    expect_true(view->find("gone", 5, found) && found.kind == delta_kind_t::remove_k && found.bytes.empty());
-    expect_true(view->find(empty_string, 5, found) && found.bytes.size() == payload.size());
-    expect_true(stamped->values_bytes() == deltas.size() * sizeof(ustore_key_t));
-    expect_true(!view->find("blank", 4, found) && !view->find(std::string_view("blank\0", 6), 5, found));
-    expect_true(view->written_since("gone", 4) && !view->written_since("gone", 5));
-    expect_true(view->range_written_since("a", "blank", 4) && !view->range_written_since("c", "f", 4));
-    expect_true(view->range_written_since(empty_string, empty_string, 4) && !view->range_written_since("b", "a", 4));
+    expect_true(view.find("gone", 5, found) && found.kind == delta_kind_t::remove_k && found.bytes.empty());
+    expect_true(view.find(empty_string, 5, found) && found.bytes.size() == payload.size());
+    expect_true(stamped.values_bytes() == deltas.size() * sizeof(ustore_key_t));
+    expect_true(!view.find("blank", 4, found) && !view.find(std::string_view("blank\0", 6), 5, found));
+    expect_true(view.written_since("gone", 4) && !view.written_since("gone", 5));
+    expect_true(view.range_written_since("a", "blank", 4) && !view.range_written_since("c", "f", 4));
+    expect_true(view.range_written_since(empty_string, empty_string, 4) && !view.range_written_since("b", "a", 4));
 
     std::vector<keyed_delta_t> older {{"older", {delta_kind_t::write_k, payload}}};
-    expected<run_t> older_run = run_t::stamped(*sealed_t::seal(older, &sz_sort_order_serial), 5);
-    if (!expect_true(older_run.has_value())) return;
-    expect_true(view_t::extended(*view, *older_run).code() == status_code_t::invalid_argument_k);
+    auto [older_run, stamp_older_status] = run_t::stamped(*sealed_t::seal(older, &sz_sort_order_serial), 5);
+    if (!expect_true(stamp_older_status.succeeded())) return;
+    expect_true(view_t::extended(view, older_run).code() == status_code_t::invalid_argument_k);
 }
 
 /** A range of strings removed, with an empty end reaching past the last string, hides the older
@@ -311,27 +311,27 @@ static void test_range_tombstones_hide_older_runs() {
                                          keyed_delta_t {"plum", {delta_kind_t::write_k, payload}}};
     std::array<keyed_delta_t, 1> ranged {keyed_delta_t {"mango", {delta_kind_t::write_k, payload}}};
     std::array<range_t, 2> const ranges {range_t {"m", "n"}, range_t {"pear", {}}};
-    expected<run_t> first = run_t::stamped(*sealed_t::seal(oldest, &sz_sort_order_serial), 5);
-    expected<run_t> second = run_t::stamped(
+    auto [first, first_status] = run_t::stamped(*sealed_t::seal(oldest, &sz_sort_order_serial), 5);
+    auto [second, second_status] = run_t::stamped(
         *sealed_t::seal(ranged, &sz_sort_order_serial, std::span<range_t const> {ranges}), 7);
-    if (!expect_true(first.has_value() && second.has_value())) return;
-    expect_true(second->range_tombstones().size() == 2 && second->newest_stamp() == 7);
+    if (!expect_true(first_status.succeeded() && second_status.succeeded())) return;
+    expect_true(second.range_tombstones().size() == 2 && second.newest_stamp() == 7);
 
     view_t const empty;
-    expected<view_t> one = view_t::extended(empty, *first);
-    if (!expect_true(one.has_value())) return;
-    expected<view_t> view = view_t::extended(*one, *second);
-    if (!expect_true(view.has_value())) return;
-    expect_true(view->covering_stamp("melon", 9) == 7 && view->covering_stamp("melon", 6) == 0);
-    expect_true(view->covering_stamp("zebra", 9) == 7 && view->covering_stamp("apple", 9) == 0);
-    expect_true(view->written_since("plum", 6) && !view->written_since("apple", 6));
-    expect_true(view->range_written_since("q", "z", 6) && !view->range_written_since("b", "c", 6));
+    auto [one, extend_one_status] = view_t::extended(empty, first);
+    if (!expect_true(extend_one_status.succeeded())) return;
+    auto [view, extend_status] = view_t::extended(one, second);
+    if (!expect_true(extend_status.succeeded())) return;
+    expect_true(view.covering_stamp("melon", 9) == 7 && view.covering_stamp("melon", 6) == 0);
+    expect_true(view.covering_stamp("zebra", 9) == 7 && view.covering_stamp("apple", 9) == 0);
+    expect_true(view.written_since("plum", 6) && !view.written_since("apple", 6));
+    expect_true(view.range_written_since("q", "z", 6) && !view.range_written_since("b", "c", 6));
 
-    run_t const* const runs[2] {std::addressof(*second), std::addressof(*first)};
+    run_t const* const runs[2] {std::addressof(second), std::addressof(first)};
     auto const kept_strings = [&](compaction_stamps_t const& survival, std::span<std::string_view const> wanted) {
         st::vector<stamped_delta_t> versions;
-        utilities::arena_allocator<byte_t> folded_bytes;
-        if (!expect_true(kept_versions(std::span<run_t const* const> {runs}, survival, utilities::last_write_fold_t {},
+        util::arena_allocator<byte_t> folded_bytes;
+        if (!expect_true(kept_versions(std::span<run_t const* const> {runs}, survival, util::last_write_fold_t {},
                                        versions, folded_bytes)
                              .succeeded()))
             return;
@@ -369,9 +369,9 @@ static void test_random_streams_match_model() {
             draw_commit(pool, generator, stamp, model, deltas, payloads);
             run_t const* const committed = commit(deltas, stamp, runs);
             if (!committed || !run_is_ordered(*committed)) return;
-            expected<view_t> extended = view_t::extended(views.back(), *committed);
-            if (!expect_true(extended.has_value())) return;
-            views.push_back(std::move(*extended));
+            auto [extended, extend_status] = view_t::extended(views.back(), *committed);
+            if (!expect_true(extend_status.succeeded())) return;
+            views.push_back(std::move(extended));
             view_t const& view = views.back();
 
             for (std::size_t probe = 0; probe != probes_per_commit_k; ++probe) {
@@ -433,9 +433,9 @@ static void test_merges_keep_visible_versions() {
         draw_commit(pool, generator, stamp, model, deltas, payloads);
         run_t const* const committed = commit(deltas, stamp, runs);
         if (!committed) return;
-        expected<view_t> extended = view_t::extended(*view, *committed);
-        if (!expect_true(extended.has_value())) return;
-        view = std::make_unique<view_t>(std::move(*extended));
+        auto [extended, extend_status] = view_t::extended(*view, *committed);
+        if (!expect_true(extend_status.succeeded())) return;
+        view = std::make_unique<view_t>(std::move(extended));
         if (stamp % pin_stride_k == 0) pinned.push_back(stamp);
 
         std::span<run_t const* const> const listed = view->runs();
@@ -453,21 +453,21 @@ static void test_merges_keep_visible_versions() {
             survival.pinned_count = pinned.size();
             survival.horizon = stamp;
             st::vector<stamped_delta_t> versions;
-            utilities::local_arena_t folded;
-            utilities::arena_allocator<byte_t> folded_bytes = folded.allocator();
-            expect_true(
-                kept_versions(group, survival, utilities::last_write_fold_t {}, versions, folded_bytes).succeeded());
-            expected<run_t> merged = run_t::merged(group, std::span<stamped_delta_t const> {versions},
-                                                   *gathered_range_tombstones(group, st::default_allocator<byte_t> {}),
-                                                   group.back()->oldest_stamp(), group.back()->tier());
-            if (!expect_true(merged.has_value())) return;
+            util::local_arena_t folded;
+            util::arena_allocator<byte_t> folded_bytes = folded.allocator();
+            expect_true(kept_versions(group, survival, util::last_write_fold_t {}, versions, folded_bytes).succeeded());
+            auto [merged, merge_status] = run_t::merged(
+                group, std::span<stamped_delta_t const> {versions},
+                *gathered_range_tombstones(group, st::default_allocator<byte_t> {}), group.back()->oldest_stamp(),
+                group.back()->tier());
+            if (!expect_true(merge_status.succeeded())) return;
             std::size_t replaced = 0;
             for (run_t const* run : group) replaced += run->size();
-            expect_true(merged->tier() == group.back()->tier() + 1 &&
-                        merged->oldest_stamp() == group.back()->oldest_stamp() &&
-                        merged->newest_stamp() == group.front()->newest_stamp() && merged->size() <= replaced);
-            if (!run_is_ordered(*merged)) return;
-            runs.push_back(std::make_unique<run_t>(std::move(*merged)));
+            expect_true(merged.tier() == group.back()->tier() + 1 &&
+                        merged.oldest_stamp() == group.back()->oldest_stamp() &&
+                        merged.newest_stamp() == group.front()->newest_stamp() && merged.size() <= replaced);
+            if (!run_is_ordered(merged)) return;
+            runs.push_back(std::make_unique<run_t>(std::move(merged)));
 
             typename view_t::runs_t laid_out;
             if (!expect_true(laid_out.reserve(listed.size() - fan_in_k + 1) == st::status_t::success_k)) return;

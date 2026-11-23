@@ -28,6 +28,8 @@ namespace unum::ustore::strings {
 
 using utilities::blob_t;
 using utilities::byte_t;
+using utilities::bytes_of;
+using utilities::chars_of;
 
 /** A string of a strings collection, or the name of a collection, owning its bytes. */
 struct string_key_t {
@@ -41,9 +43,9 @@ struct string_key_t {
     /** A copy owning bytes of its own, or why they could not be allocated, which the store asks of a key it
      *  records. */
     st::expected<string_key_t> copy() const noexcept {
-        st::expected<blob_t> copied = text.copy();
-        if (!copied) return copied.status();
-        return string_key_t {std::move(*copied)};
+        auto [copied, status] = text.copy();
+        if (st::failed(status)) return status;
+        return string_key_t {std::move(copied)};
     }
 };
 

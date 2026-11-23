@@ -52,7 +52,6 @@
 namespace unum::ustore::bench {
 
 using namespace tools;
-using namespace utilities;
 
 using steady_clock_t = std::chrono::steady_clock;
 using time_point_t = steady_clock_t::time_point;
@@ -423,7 +422,7 @@ class loop_t {
  *  @param[in] body Called as `body(loop, thread)` on each thread; setup above its loop stays untimed.
  */
 template <typename body_type_>
-[[nodiscard]] row_t run_threads(executor_t& executor, bench_settings_t const& settings, std::string_view name,
+[[nodiscard]] row_t run_threads(util::executor_t& executor, bench_settings_t const& settings, std::string_view name,
                                 body_type_&& body) noexcept {
     st::vector<loop_t> loops;
     if (st::failed(loops.resize(executor.threads_count()))) return {.name = name, .skipped = "no memory for loops"};
@@ -441,7 +440,7 @@ template <typename body_type_>
  *  @param[in] body Called as `body(loop, thread)` on each thread; setup above its loop stays untimed.
  */
 template <typename body_type_>
-[[nodiscard]] row_t run_pass(executor_t& executor, std::string_view name, std::size_t count,
+[[nodiscard]] row_t run_pass(util::executor_t& executor, std::string_view name, std::size_t count,
                              body_type_&& body) noexcept {
     st::vector<loop_t> loops;
     std::size_t const threads = executor.threads_count();

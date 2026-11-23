@@ -44,15 +44,15 @@
 namespace unum::ustore {
 
 /** Serves @p bytes off the managed runs of the executor @p handle points to, as a StringZilla allocator does. */
-template <gpu_executor_concept executor_type_>
+template <util::gpu_executor_concept executor_type_>
 void* allocate_managed(sz_size_t bytes, void* handle, sz_stream_t) noexcept {
     executor_type_& executor = *static_cast<executor_type_*>(handle);
-    auto [block, status] = utilities::carve<byte_t>(executor.managed(), executor, bytes);
+    auto [block, status] = util::carve<byte_t>(executor.managed(), executor, bytes);
     return status.failed() ? nullptr : block.data();
 }
 
 /** Grows the managed block at @p pointer into a new one, as a StringZilla allocator does. */
-template <gpu_executor_concept executor_type_>
+template <util::gpu_executor_concept executor_type_>
 void* reallocate_managed(void* pointer, sz_size_t old_bytes, sz_size_t new_bytes, void* handle,
                          sz_stream_t stream) noexcept {
     if (new_bytes <= old_bytes) return pointer;
@@ -64,21 +64,20 @@ void* reallocate_managed(void* pointer, sz_size_t old_bytes, sz_size_t new_bytes
 
 /** The memory a device match lays its engine state out in: the managed runs of @p executor, which the host writes and
  *  the device reads, released all at once when the next call on the executor rewinds them. */
-template <gpu_executor_concept executor_type_>
+template <util::gpu_executor_concept executor_type_>
 sz_allocator_t match_memory(executor_type_& executor) noexcept {
-    return {allocate_managed<executor_type_>, reallocate_managed<executor_type_>, utilities::stringzilla_free,
-            &executor};
+    return {allocate_managed<executor_type_>, reallocate_managed<executor_type_>, util::stringzilla_free, &executor};
 }
 
 /** Copies the @p bytes at @p memory into a block of @p executor's managed runs, which the host
  *  never touches again, so the device keeps it where its kernels read it until the next call
  *  rewinds the runs. */
-template <gpu_executor_concept executor_type_>
-expected<byte_t*> copy_for_device(void const* memory, std::size_t bytes, executor_type_& executor) noexcept {
-    auto [block, block_status] = utilities::carve<byte_t>(executor.managed(), executor, bytes);
+template <util::gpu_executor_concept executor_type_>
+util::expected<byte_t*> copy_for_device(void const* memory, std::size_t bytes, executor_type_& executor) noexcept {
+    auto [block, block_status] = util::carve<byte_t>(executor.managed(), executor, bytes);
     if (block_status.failed()) return block_status;
-    if (status_t const copied = executor.upload_async(reinterpret_cast<std::uintptr_t>(block.data()),
-                                                      {static_cast<byte_t const*>(memory), bytes});
+    if (util::status_t const copied = executor.upload_async(reinterpret_cast<std::uintptr_t>(block.data()),
+                                                            {static_cast<byte_t const*>(memory), bytes});
         copied.failed())
         return copied;
     return block.data();
@@ -89,7 +88,7 @@ expected<byte_t*> copy_for_device(void const* memory, std::size_t bytes, executo
  *  kernels walk: byte-exact substrings, byte-exact regex with a start automaton and no lookarounds,
  *  and subdocuments paths without filters. */
 template <vendored_residency_t residency_>
-status_t rebase_on_device(compiled_match<residency_>& match, residency_executor<residency_>& executor) noexcept {
+util::status_t rebase_on_device(compiled_match<residency_>& match, residency_executor<residency_>& executor) noexcept {
     if (sz_substrings_engine_t* const* const substrings = std::get_if<sz_substrings_engine_t*>(&match.matcher)) {
         if ((*substrings)->case_sensitivity != sz_cased_k) return {};
         auto [tables, tables_status] = copy_for_device((*substrings)->memory, (*substrings)->memory_bytes, executor);
@@ -101,7 +100,7 @@ status_t rebase_on_device(compiled_match<residency_>& match, residency_executor<
         if (engine.case_sensitivity != sz_cased_k || !engine.reverse_rows || engine.lookarounds_count) return {};
         // The host fills the images before any copy is queued, as a device may forbid touching
         // managed runs meanwhile
-        auto [images, images_status] = utilities::carve<std::uint32_t>(
+        auto [images, images_status] = util::carve<std::uint32_t>(
             executor.managed(), executor, sz_regex_images_bytes_simt_(&engine) / sizeof(std::uint32_t));
         if (images_status.failed()) return images_status;
         for (std::size_t column = 0; column != sz_regex_stride_(engine.classes_count, engine.lookarounds_count);
@@ -133,32 +132,32 @@ status_t rebase_on_device(compiled_match<residency_>& match, residency_executor<
  *  managed runs, which the host walks for the shapes no kernel takes, rebased onto a copy
  *  the library's kernels walk, and the host half, the predicate and the BM25 scorer, all
  *  for @p host_capabilities, laid out in @p into, which must outlive the match. */
-template <typename arguments_type_, gpu_executor_concept executor_type_>
-expected<compiled_match<vendored_residency_of<executor_type_>>> compile_match(arguments_type_ const& arguments,
-                                                                              ustore_arena_t into,
-                                                                              sz_capability_t host_capabilities,
-                                                                              executor_type_& executor) noexcept {
+template <typename arguments_type_, util::gpu_executor_concept executor_type_>
+util::expected<compiled_match<vendored_residency_of<executor_type_>>> compile_match(arguments_type_ const& arguments,
+                                                                                    ustore_arena_t into,
+                                                                                    sz_capability_t host_capabilities,
+                                                                                    executor_type_& executor) noexcept {
     if (reads_values(arguments) && !executor.kernels())
-        return status_t {status_code_t::unsupported_k, "The device loaded no bundle of the library's kernels"};
+        return util::status_t {util::status_code_t::unsupported_k, "The device loaded no kernel bundle"};
     compiled_match<vendored_residency_of<executor_type_>> match;
-    if (status_t const status = compile_values(arguments, into, host_capabilities, match_memory(executor),
-                                               match.matcher);
+    if (util::status_t const status = compile_values(arguments, into, host_capabilities, match_memory(executor),
+                                                     match.matcher);
         status.failed())
         return status;
-    if (status_t const status = rebase_on_device(match, executor); status.failed()) return status;
+    if (util::status_t const status = rebase_on_device(match, executor); status.failed()) return status;
     if constexpr (matches_patterns_concept<arguments_type_>)
         if (arguments.patterns.weights) {
             value_matcher_t scorer;
-            if (status_t const status = compile_patterns(arguments.patterns, into, host_capabilities,
-                                                         utilities::stringzilla_allocator(into), scorer);
+            if (util::status_t const status = compile_patterns(arguments.patterns, into, host_capabilities,
+                                                               util::stringzilla_allocator(into), scorer);
                 status.failed())
                 return status;
             match.host.scorer = std::get<sz_substrings_engine_t*>(scorer);
             match.host.weights = arguments.patterns.weights;
         }
-    if (arguments.predicate.cost != ustore_predicate_cheap_k &&
-        arguments.predicate.cost != ustore_predicate_expensive_k)
-        return status_t {status_code_t::invalid_argument_k, "Unknown predicate cost"};
+    if (arguments.predicate.cost != ustore_predicate_cost_cheap_k &&
+        arguments.predicate.cost != ustore_predicate_cost_expensive_k)
+        return util::status_t {util::status_code_t::invalid_argument_k, "Unknown predicate cost"};
     match.host.predicate = arguments.predicate;
     return match;
 }
@@ -193,9 +192,9 @@ enum class walk_split_t : bool { by_length_k, per_thread_k };
 /** Sorts the @p count values at @p offsets into @p work by length, or every value to a lane when
  *  @p split says so. */
 template <typename offset_type_>
-expected<matching_shape_t> shape_of(offset_type_ const* offsets, std::size_t count, walk_split_t split,
-                                    ustore_arena_t work) noexcept {
-    auto [indices, indices_status] = arena_allocate<std::uint32_t>(work, 3 * count);
+util::expected<matching_shape_t> shape_of(offset_type_ const* offsets, std::size_t count, walk_split_t split,
+                                          ustore_arena_t work) noexcept {
+    auto [indices, indices_status] = util::arena_allocate<std::uint32_t>(work, 3 * count);
     if (indices_status.failed()) return indices_status;
     std::size_t threads = 0, groups = 0, chunks = 0;
     for (std::size_t value = 0; value != count; ++value) {
@@ -211,27 +210,28 @@ expected<matching_shape_t> shape_of(offset_type_ const* offsets, std::size_t cou
 
 /** The page of @p bytes and @p offsets on the device, walking the values @p picked lists and
  *  marking @p contained. */
-inline matching_page_t page_of(char const* bytes, std::uint64_t const* offsets, std::span<std::uint32_t const> picked,
-                               std::uint32_t* contained) noexcept {
+inline util::matching_page_t page_of(char const* bytes, std::uint64_t const* offsets,
+                                     std::span<std::uint32_t const> picked, std::uint32_t* contained) noexcept {
     return {bytes, offsets, picked.data(), static_cast<std::uint32_t>(picked.size()), contained};
 }
 
 /** Cuts the long values @p picked lists into chunks of @p chunk_bytes, written into @p work. */
 template <typename offset_type_>
-expected<std::span<matching_chunk_t>> chunks_of(offset_type_ const* offsets, std::span<std::uint32_t const> picked,
-                                                std::uint64_t chunk_bytes, ustore_arena_t work) noexcept {
+util::expected<std::span<util::matching_chunk_t>> chunks_of(offset_type_ const* offsets,
+                                                            std::span<std::uint32_t const> picked,
+                                                            std::uint64_t chunk_bytes, ustore_arena_t work) noexcept {
     std::size_t count = 0;
     for (std::uint32_t const value : picked)
         count += static_cast<std::size_t>(
-            divide_round_up<std::uint64_t>(offsets[value + 1] - offsets[value], chunk_bytes));
-    auto [chunks, chunks_status] = arena_allocate<matching_chunk_t>(work, count);
+            util::divide_round_up<std::uint64_t>(offsets[value + 1] - offsets[value], chunk_bytes));
+    auto [chunks, chunks_status] = util::arena_allocate<util::matching_chunk_t>(work, count);
     if (chunks_status.failed()) return chunks_status;
     std::size_t written = 0;
     for (std::uint32_t const value : picked) {
-        std::uint64_t const chunks_count = divide_round_up<std::uint64_t>(offsets[value + 1] - offsets[value],
-                                                                          chunk_bytes);
+        std::uint64_t const chunks_count = util::divide_round_up<std::uint64_t>(offsets[value + 1] - offsets[value],
+                                                                                chunk_bytes);
         for (std::uint64_t index = 0; index != chunks_count; ++index)
-            chunks[written++] = matching_chunk_t {value, static_cast<std::uint32_t>(index)};
+            chunks[written++] = util::matching_chunk_t {value, static_cast<std::uint32_t>(index)};
     }
     return chunks;
 }
@@ -247,40 +247,40 @@ template <vendored_residency_t residency_>
 class device_match {
   public:
     device_match(compiled_match<residency_> const& match, residency_executor<residency_>& executor,
-                 utilities::device_blocks_t& blocks) noexcept
+                 util::device_blocks_t& blocks) noexcept
         : match_(match), executor_(executor), blocks_(blocks) {}
 
     bool reads_values() const noexcept { return match_.reads_values(); }
     bool scores() const noexcept { return match_.host.scores(); }
     bool asks() const noexcept { return match_.host.asks(); }
 
-    status_t ask(ustore_predicate_cost_t phase, std::span<ustore_key_t const> keys, candidates_t& candidates,
-                 ustore_arena_t work) const noexcept {
+    util::status_t ask(ustore_predicate_cost_t phase, std::span<ustore_key_t const> keys, candidates_t& candidates,
+                       ustore_arena_t work) const noexcept {
         return match_.host.ask(phase, keys, candidates, work);
     }
 
     /** Rewinds the bounce, which is the page, and the call's device arena. */
     void rewind_page(ustore_arena_t) const noexcept {
         executor_.rewind_bounce();
-        utilities::rewind(blocks_, executor_);
+        util::rewind(blocks_, executor_);
     }
 
     /** Keeps among @p candidates those whose @p values, one per candidate in their order, the device engine contains a
      *  match in, laying the host side out in @p work, the bounce. */
-    status_t select(strings_arg_t const& values, candidates_t& candidates, ustore_arena_t work) const noexcept {
+    util::status_t select(strings_arg_t const& values, candidates_t& candidates, ustore_arena_t work) const noexcept {
         if (!reads_values() || !candidates.count) return {};
         std::size_t const count = candidates.count;
-        auto [views, views_status] = arena_allocate<sz_string_view_t>(work, count);
+        auto [views, views_status] = util::arena_allocate<sz_string_view_t>(work, count);
         if (views_status.failed()) return views_status;
         for (std::size_t index = 0; index != count; ++index) {
             ustore_bytes_view_t const value = values[index];
             views[index].start = reinterpret_cast<sz_cptr_t>(value.data);
             views[index].length = static_cast<sz_size_t>(value.length);
         }
-        auto [contained, contained_status] = arena_allocate<sz_u1x8_t>(work, divide_round_up(count, 8));
+        auto [contained, contained_status] = util::arena_allocate<sz_u1x8_t>(work, util::divide_round_up(count, 8));
         if (contained_status.failed()) return contained_status;
         ustore_strings_view_t const& tape = values.view;
-        status_t matched;
+        util::status_t matched;
         if (tape.layout == ustore_strings_u32_tape_k)
             matched = contains(tape.data.u32_tape.data, tape.data.u32_tape.offsets, count, contained);
         else if (tape.layout == ustore_strings_u64_tape_k)
@@ -291,17 +291,18 @@ class device_match {
     }
 
   private:
-    using kits_t = utilities::vram_matching_kits<typename residency_executor<residency_>::function_t>;
+    using kits_t = util::vram_matching_kits<typename residency_executor<residency_>::function_t>;
 
     /** Packs the strings @p views name into one tape in @p work, then matches it as @c contains does. */
-    status_t contains_packed(std::span<sz_string_view_t const> views, ustore_arena_t work,
-                             std::span<sz_u1x8_t> contained) const noexcept {
-        auto [offsets, offsets_status] = arena_allocate<std::uint64_t>(work, views.size() + 1);
+    util::status_t contains_packed(std::span<sz_string_view_t const> views, ustore_arena_t work,
+                                   std::span<sz_u1x8_t> contained) const noexcept {
+        auto [offsets, offsets_status] = util::arena_allocate<std::uint64_t>(work, views.size() + 1);
         if (offsets_status.failed()) return offsets_status;
         offsets[0] = 0;
         for (std::size_t index = 0; index != views.size(); ++index)
             offsets[index + 1] = offsets[index] + views[index].length;
-        auto [bytes, bytes_status] = arena_allocate<byte_t>(work, static_cast<std::size_t>(offsets[views.size()]));
+        auto [bytes, bytes_status] = util::arena_allocate<byte_t>(work,
+                                                                  static_cast<std::size_t>(offsets[views.size()]));
         if (bytes_status.failed()) return bytes_status;
         for (std::size_t index = 0; index != views.size(); ++index)
             if (views[index].length) std::memcpy(&bytes[offsets[index]], views[index].start, views[index].length);
@@ -312,8 +313,8 @@ class device_match {
      *  both in the bounce, the engine contains a match in, on the host, for the shapes no kernel
      *  walks and the pages a walk refused. */
     template <typename data_type_, typename offset_type_>
-    status_t contains_on_host(data_type_ const* data, offset_type_ const* offsets, std::size_t count,
-                              std::span<sz_u1x8_t> contained) const noexcept {
+    util::status_t contains_on_host(data_type_ const* data, offset_type_ const* offsets, std::size_t count,
+                                    std::span<sz_u1x8_t> contained) const noexcept {
         sz_strings_view_t strings {};
         strings.count = count;
         if constexpr (sizeof(offset_type_) == sizeof(sz_u32_t)) {
@@ -336,7 +337,8 @@ class device_match {
         else if (sz_subdocuments_engine_t* const* const paths = std::get_if<sz_subdocuments_engine_t*>(&match_.matcher))
             status = sz_subdocuments_contains(*paths, &strings, contained.data(), &malformed_index, nullptr);
         if (status != sz_success_k)
-            return stringzilla_refusal(status, status_code_t::invalid_argument_k, "Failed to match the values");
+            return stringzilla_refusal(status, util::status_code_t::invalid_argument_k,
+                                       "The matcher rejected the values");
         return {};
     }
 
@@ -351,12 +353,12 @@ class device_match {
      *  down, and the page one wait.
      */
     template <typename data_type_, typename offset_type_>
-    status_t contains(data_type_ const* data, offset_type_ const* offsets, std::size_t count,
-                      std::span<sz_u1x8_t> contained) const noexcept {
+    util::status_t contains(data_type_ const* data, offset_type_ const* offsets, std::size_t count,
+                            std::span<sz_u1x8_t> contained) const noexcept {
         if (std::holds_alternative<match_everything_t>(match_.on_device))
             return contains_on_host(data, offsets, count, contained);
         ustore_arena_t const work = executor_.bounce();
-        kits_t const kits = utilities::matching_kits_of(executor_.kernels());
+        kits_t const kits = util::matching_kits_of(executor_.kernels());
         sz_regex_engine_t* const* const regex = std::get_if<sz_regex_engine_t*>(&match_.matcher);
         sz_substrings_engine_t* const* const substrings = std::get_if<sz_substrings_engine_t*>(&match_.matcher);
         sz_subdocuments_engine_t* const* const paths = std::get_if<sz_subdocuments_engine_t*>(&match_.matcher);
@@ -369,9 +371,10 @@ class device_match {
                                                                           sz_substrings_chunk_bytes_simt_(*substrings))
                                               : matching_chunk_bytes_k;
         auto [chunks, chunks_status] = !paths ? chunks_of(offsets, shape.per_chunk, chunk_bytes, work)
-                                              : expected<std::span<matching_chunk_t>> {std::span<matching_chunk_t> {}};
+                                              : util::expected<std::span<util::matching_chunk_t>> {
+                                                    std::span<util::matching_chunk_t> {}};
         if (chunks_status.failed()) return chunks_status;
-        auto [wide, wide_status] = arena_allocate<std::uint64_t>(work, count + 1);
+        auto [wide, wide_status] = util::arena_allocate<std::uint64_t>(work, count + 1);
         if (wide_status.failed()) return wide_status;
         for (std::size_t index = 0; index <= count; ++index) wide[index] = offsets[index];
 
@@ -379,28 +382,29 @@ class device_match {
         std::uint64_t frame_words = 0, key_bytes = 0;
         if (paths) {
             frame_words = sz_subdocuments_frame_words_simt_(*paths);
-            key_bytes = round_up_to_multiple<std::uint64_t>(sz_subdocuments_key_bytes_(*paths), arena_alignment_k);
+            key_bytes = util::round_up_to_multiple<std::uint64_t>(sz_subdocuments_key_bytes_(*paths),
+                                                                  util::arena_alignment_k);
         }
 
         std::size_t const walkers = paths ? count : 0;
         std::size_t const data_bytes = static_cast<std::size_t>(offsets[count]);
-        std::size_t const words = divide_round_up<std::size_t>(count, 32);
-        auto [wide_on_device, wide_on_device_status] = utilities::carve<std::uint64_t>(blocks_, executor_, count + 1);
-        auto [bytes_on_device, bytes_on_device_status] = utilities::carve<char>(blocks_, executor_, data_bytes);
-        auto [bits, bits_status] = utilities::carve<std::uint32_t>(blocks_, executor_, words + 1);
-        auto [lists, lists_status] = utilities::carve<std::uint32_t>(blocks_, executor_, 3 * count);
-        auto [chunk_list, chunk_list_status] = utilities::carve<matching_chunk_t>(blocks_, executor_, chunks.size());
-        auto [stacks, stacks_status] = utilities::carve<std::uint64_t>(blocks_, executor_,
-                                                                       walkers * matching_frames_k * frame_words);
-        auto [keys, keys_status] = utilities::carve<unsigned char>(blocks_, executor_, walkers * key_bytes);
-        auto [refused_on_host, refused_status] = arena_allocate<std::uint32_t>(work, 1);
-        for (status_t const carved : {wide_on_device_status, bytes_on_device_status, bits_status, lists_status,
-                                      chunk_list_status, stacks_status, keys_status, refused_status})
+        std::size_t const words = util::divide_round_up<std::size_t>(count, 32);
+        auto [wide_on_device, wide_on_device_status] = util::carve<std::uint64_t>(blocks_, executor_, count + 1);
+        auto [bytes_on_device, bytes_on_device_status] = util::carve<char>(blocks_, executor_, data_bytes);
+        auto [bits, bits_status] = util::carve<std::uint32_t>(blocks_, executor_, words + 1);
+        auto [lists, lists_status] = util::carve<std::uint32_t>(blocks_, executor_, 3 * count);
+        auto [chunk_list, chunk_list_status] = util::carve<util::matching_chunk_t>(blocks_, executor_, chunks.size());
+        auto [stacks, stacks_status] = util::carve<std::uint64_t>(blocks_, executor_,
+                                                                  walkers * matching_frames_k * frame_words);
+        auto [keys, keys_status] = util::carve<unsigned char>(blocks_, executor_, walkers * key_bytes);
+        auto [refused_on_host, refused_status] = util::arena_allocate<std::uint32_t>(work, 1);
+        for (util::status_t const carved : {wide_on_device_status, bytes_on_device_status, bits_status, lists_status,
+                                            chunk_list_status, stacks_status, keys_status, refused_status})
             if (carved.failed()) return carved;
-        if (status_t const status = executor_.pin_bounce(); status.failed()) return status;
+        if (util::status_t const status = executor_.pin_bounce(); status.failed()) return status;
         std::span<data_type_ const> const tape {data, data_bytes};
         std::span<std::uint32_t const> const listed {shape.per_thread.data(), 3 * count};
-        for (status_t const copied :
+        for (util::status_t const copied :
              {executor_.upload_async(reinterpret_cast<std::uintptr_t>(wide_on_device.data()), std::as_bytes(wide)),
               executor_.upload_async(reinterpret_cast<std::uintptr_t>(bytes_on_device.data()), std::as_bytes(tape)),
               executor_.upload_async(reinterpret_cast<std::uintptr_t>(lists.data()), std::as_bytes(listed)),
@@ -414,15 +418,15 @@ class device_match {
             std::uint32_t const* const on_device = lists.data() + (picked.data() - shape.per_thread.data());
             return page_of(bytes_on_device.data(), wide_on_device.data(), {on_device, picked.size()}, bits.data());
         };
-        unsigned const threads = utilities::matching_block_threads_k;
+        unsigned const threads = util::matching_block_threads_k;
         auto const blocks_for = [](std::size_t lanes) noexcept {
-            return static_cast<unsigned>(divide_round_up<std::size_t>(lanes, threads));
+            return static_cast<unsigned>(util::divide_round_up<std::size_t>(lanes, threads));
         };
-        std::size_t const group_k = utilities::matching_group_lanes_k;
-        matching_chunks_t const chunking {page(shape.per_chunk), chunk_list.data(),
-                                          static_cast<std::uint32_t>(chunks.size()), chunk_bytes};
+        std::size_t const group_k = util::matching_group_lanes_k;
+        util::matching_chunks_t const chunking {page(shape.per_chunk), chunk_list.data(),
+                                                static_cast<std::uint32_t>(chunks.size()), chunk_bytes};
         std::uint32_t const* const primed = match_.images;
-        status_t launched;
+        util::status_t launched;
         if (substrings) {
             sz_substrings_engine_t const& engine = std::get<sz_substrings_engine_t>(match_.on_device);
             std::size_t const head = sz_substrings_staged_bytes_simt_(&engine, 0);
@@ -431,15 +435,15 @@ class device_match {
                 (matching_shared_bytes_k - head) / (sz_substrings_staged_bytes_simt_(&engine, 1) - head)));
             unsigned const shared = static_cast<unsigned>(sz_substrings_staged_bytes_simt_(&engine, staged));
             if (!shape.per_thread.empty())
-                launched = utilities::launch(executor_, kits.substrings.per_thread, blocks_for(shape.per_thread.size()),
-                                             threads, shared, engine, page(shape.per_thread), staged);
+                launched = util::launch(executor_, kits.substrings.per_thread, blocks_for(shape.per_thread.size()),
+                                        threads, shared, engine, page(shape.per_thread), staged);
             if (launched.succeeded() && !shape.per_group.empty())
-                launched = utilities::launch(executor_, kits.substrings.per_group,
-                                             blocks_for(shape.per_group.size() * group_k), threads, shared, engine,
-                                             page(shape.per_group), staged);
+                launched = util::launch(executor_, kits.substrings.per_group,
+                                        blocks_for(shape.per_group.size() * group_k), threads, shared, engine,
+                                        page(shape.per_group), staged);
             if (launched.succeeded() && !chunks.empty())
-                launched = utilities::launch(executor_, kits.substrings.per_chunk, blocks_for(chunks.size()), threads,
-                                             shared, engine, chunking, staged);
+                launched = util::launch(executor_, kits.substrings.per_chunk, blocks_for(chunks.size()), threads,
+                                        shared, engine, chunking, staged);
         }
         else if (regex) {
             sz_regex_engine_t const& engine = std::get<sz_regex_engine_t>(match_.on_device);
@@ -449,43 +453,41 @@ class device_match {
                 (matching_shared_bytes_k - head) / (sz_regex_staged_bytes_simt_(&engine, 1) - head)));
             unsigned const shared = static_cast<unsigned>(sz_regex_staged_bytes_simt_(&engine, cells));
             if (!shape.per_thread.empty())
-                launched = utilities::launch(executor_, kits.regex.per_thread, blocks_for(shape.per_thread.size()),
-                                             threads, shared, engine, page(shape.per_thread), cells);
+                launched = util::launch(executor_, kits.regex.per_thread, blocks_for(shape.per_thread.size()), threads,
+                                        shared, engine, page(shape.per_thread), cells);
             if (launched.succeeded() && !shape.per_group.empty())
-                launched = utilities::launch(executor_, kits.regex.per_group,
-                                             blocks_for(shape.per_group.size() * group_k), threads, shared, engine,
-                                             page(shape.per_group), primed, cells);
+                launched = util::launch(executor_, kits.regex.per_group, blocks_for(shape.per_group.size() * group_k),
+                                        threads, shared, engine, page(shape.per_group), primed, cells);
             if (launched.succeeded() && !chunks.empty())
-                launched = utilities::launch(executor_, kits.regex.per_chunk, blocks_for(chunks.size()), threads,
-                                             shared, engine, chunking, primed, cells, refused);
+                launched = util::launch(executor_, kits.regex.per_chunk, blocks_for(chunks.size()), threads, shared,
+                                        engine, chunking, primed, cells, refused);
         }
         else {
             sz_subdocuments_engine_t const& engine = std::get<sz_subdocuments_engine_t>(match_.on_device);
             // The launches run in stream order, so each reuses the walkers' memory of
             // the one before
-            matching_walkers_t const walkers_memory {
+            util::matching_walkers_t const walkers_memory {
                 stacks.data(), matching_frames_k * frame_words, frame_words, keys.data(), key_bytes, refused};
             if (markup && !shape.per_thread.empty())
-                launched = utilities::launch(executor_, kits.subdocuments.per_thread,
-                                             blocks_for(shape.per_thread.size()), threads, 0u, engine,
-                                             page(shape.per_thread), walkers_memory);
+                launched = util::launch(executor_, kits.subdocuments.per_thread, blocks_for(shape.per_thread.size()),
+                                        threads, 0u, engine, page(shape.per_thread), walkers_memory);
             // JSON walks as a group however short the value, as its walks classify a window
             // across the lanes
             if (!markup && !shape.per_thread.empty())
-                launched = utilities::launch(executor_, kits.subdocuments.per_group,
-                                             blocks_for(shape.per_thread.size() * group_k), threads, 0u, engine,
-                                             page(shape.per_thread), walkers_memory);
+                launched = util::launch(executor_, kits.subdocuments.per_group,
+                                        blocks_for(shape.per_thread.size() * group_k), threads, 0u, engine,
+                                        page(shape.per_thread), walkers_memory);
             if (launched.succeeded() && !shape.per_group.empty())
-                launched = utilities::launch(executor_, kits.subdocuments.per_group,
-                                             blocks_for(shape.per_group.size() * group_k), threads, 0u, engine,
-                                             page(shape.per_group), walkers_memory);
+                launched = util::launch(executor_, kits.subdocuments.per_group,
+                                        blocks_for(shape.per_group.size() * group_k), threads, 0u, engine,
+                                        page(shape.per_group), walkers_memory);
             if (launched.succeeded() && !shape.per_chunk.empty())
-                launched = utilities::launch(executor_, kits.subdocuments.per_chunk,
-                                             blocks_for(shape.per_chunk.size() * group_k), threads, 0u, engine,
-                                             page(shape.per_chunk), walkers_memory, chunk_bytes);
+                launched = util::launch(executor_, kits.subdocuments.per_chunk,
+                                        blocks_for(shape.per_chunk.size() * group_k), threads, 0u, engine,
+                                        page(shape.per_chunk), walkers_memory, chunk_bytes);
         }
         // Copies already queued read the bounce, which the next page rewinds, so a refusal still waits for them
-        status_t downloaded;
+        util::status_t downloaded;
         if (launched.succeeded()) {
             downloaded = executor_.download_async(std::as_writable_bytes(contained),
                                                   reinterpret_cast<std::uintptr_t>(bits.data()));
@@ -493,7 +495,7 @@ class device_match {
                 downloaded = executor_.download_async(std::as_writable_bytes(refused_on_host),
                                                       reinterpret_cast<std::uintptr_t>(refused));
         }
-        status_t const waited = executor_.wait();
+        util::status_t const waited = executor_.wait();
         if (launched.failed()) return launched;
         if (downloaded.failed()) return downloaded;
         if (waited.failed()) return waited;
@@ -505,20 +507,20 @@ class device_match {
 
     compiled_match<residency_> const& match_;
     residency_executor<residency_>& executor_;
-    utilities::device_blocks_t& blocks_;
+    util::device_blocks_t& blocks_;
 };
 
 /** Copies the @p count elements of the strided @p column, its stride apart or one repeated for
  *  zero, into @p scratch and repoints it there, as every page of a device listing rewinds the
  *  bounce, where staging may have put them. */
 template <typename element_type_, typename strided_type_>
-status_t settle(strided_type_& column, std::size_t count, ustore_arena_t scratch) noexcept {
+util::status_t settle(strided_type_& column, std::size_t count, ustore_arena_t scratch) noexcept {
     if (!column.data || !count) return {};
     std::size_t const copied = column.stride ? count : 1;
-    auto [copy, copy_status] = arena_allocate<element_type_>(scratch, copied);
+    auto [copy, copy_status] = util::arena_allocate<element_type_>(scratch, copied);
     if (copy_status.failed()) return copy_status;
     for (std::size_t index = 0; index != copied; ++index)
-        std::memcpy(&copy[index], bytes_of(column.data, 1).data() + index * column.stride, sizeof(element_type_));
+        std::memcpy(&copy[index], util::bytes_of(column.data, 1).data() + index * column.stride, sizeof(element_type_));
     column.data = copy.data();
     if (column.stride) column.stride = sizeof(element_type_);
     return {};
@@ -527,12 +529,12 @@ status_t settle(strided_type_& column, std::size_t count, ustore_arena_t scratch
 /** Copies @p tape, of @p count strings, into @p scratch and repoints it there, as @c settle
  *  copies a column. */
 template <typename tape_type_>
-status_t settle_tape(tape_type_& tape, std::size_t count, ustore_arena_t scratch) noexcept {
+util::status_t settle_tape(tape_type_& tape, std::size_t count, ustore_arena_t scratch) noexcept {
     if (!tape.offsets || !count) return {};
-    auto [copied_offsets, offsets_status] = arena_copy(scratch, std::span {tape.offsets, count + 1});
+    auto [copied_offsets, offsets_status] = util::arena_copy(scratch, std::span {tape.offsets, count + 1});
     if (offsets_status.failed()) return offsets_status;
-    auto [copied_data, data_status] = arena_copy(scratch,
-                                                 std::span {tape.data, static_cast<std::size_t>(tape.offsets[count])});
+    auto [copied_data, data_status] = util::arena_copy(
+        scratch, std::span {tape.data, static_cast<std::size_t>(tape.offsets[count])});
     if (data_status.failed()) return data_status;
     tape.data = copied_data.data(), tape.offsets = copied_offsets.data();
     return {};
@@ -540,7 +542,7 @@ status_t settle_tape(tape_type_& tape, std::size_t count, ustore_arena_t scratch
 
 /** Copies the tape @p strings, of @p count strings, into @p scratch as @c settle does, leaving accessors, which write
  *  host memory by contract, in place. */
-inline status_t settle(ustore_strings_view_t& strings, std::size_t count, ustore_arena_t scratch) noexcept {
+inline util::status_t settle(ustore_strings_view_t& strings, std::size_t count, ustore_arena_t scratch) noexcept {
     if (strings.layout == ustore_strings_u32_tape_k) return settle_tape(strings.data.u32_tape, count, scratch);
     if (strings.layout == ustore_strings_u64_tape_k) return settle_tape(strings.data.u64_tape, count, scratch);
     return {};
@@ -555,30 +557,30 @@ inline status_t settle(ustore_strings_view_t& strings, std::size_t count, ustore
  *  takes them.
  */
 template <vendored_residency_t residency_, typename arguments_type_, typename... rest_types_>
-status_t scan_matched_on_device(residency_tables<vendored_residency_t::host_k> const& engine,
-                                compiled_match<residency_> const& match, arguments_type_ const& arguments,
-                                rest_types_&... rest) noexcept {
+util::status_t scan_matched_on_device(residency_tables<vendored_residency_t::host_k> const& engine,
+                                      compiled_match<residency_> const& match, arguments_type_ const& arguments,
+                                      rest_types_&... rest) noexcept {
     constexpr std::size_t ragged_count = sizeof...(rest_types_) - 2;
     std::tuple<rest_types_&...> const tail {rest...};
     view_t const& view = std::get<ragged_count>(tail);
     residency_executor<residency_>& executor = std::get<ragged_count + 1>(tail);
-    utilities::device_blocks_t* const blocks = utilities::device_blocks_of(arguments.arena, executor);
-    if (!blocks) return {status_code_t::device_k, "The arena lives where another executor computes"};
+    util::device_blocks_t* const blocks = util::device_blocks_of(arguments.arena, executor);
+    if (!blocks) return {util::status_code_t::device_k, "The arena lives where another executor computes"};
 
     device_match<residency_> const matching {match, executor, *blocks};
     arguments_type_ hosted = arguments;
     hosted.arena = executor.bounce();
     std::size_t const count = static_cast<std::size_t>(arguments.count);
-    if (status_t const status = settle<ustore_collection_id_t>(hosted.collections, count, view.scratch);
+    if (util::status_t const status = settle<ustore_collection_id_t>(hosted.collections, count, view.scratch);
         status.failed())
         return status;
     if constexpr (takes_start_keys_concept<arguments_type_>)
-        if (status_t const status = settle<ustore_key_t>(hosted.start_keys, count, view.scratch); status.failed())
+        if (util::status_t const status = settle<ustore_key_t>(hosted.start_keys, count, view.scratch); status.failed())
             return status;
-    status_t const served = [&]<std::size_t... index_>(std::index_sequence<index_...>) noexcept {
+    util::status_t const served = [&]<std::size_t... index_>(std::index_sequence<index_...>) noexcept {
         std::array<strings_arg_t, ragged_count> settled {std::get<index_>(tail)...};
         for (strings_arg_t& strings : settled)
-            if (status_t const status = settle(strings.view, count, view.scratch); status.failed()) return status;
+            if (util::status_t const status = settle(strings.view, count, view.scratch); status.failed()) return status;
         return scan_matched(engine, matching, hosted, settled[index_]..., view);
     }(std::make_index_sequence<ragged_count> {});
     if (served.failed()) return served;

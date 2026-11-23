@@ -15,7 +15,6 @@ struct ustore_blobs_cursor_handle_t {
 };
 
 void ustore_blobs_write(ustore_blobs_write_t* arguments) {
-    if (submitted<&ustore_blobs_write>(arguments)) return;
     call_t call(arguments->outcome);
     if (refuse_database(call, arguments->database)) return;
     std::size_t const count = arguments->count;
@@ -45,7 +44,6 @@ void ustore_blobs_write(ustore_blobs_write_t* arguments) {
 }
 
 void ustore_blobs_remove(ustore_blobs_remove_t* arguments) {
-    if (submitted<&ustore_blobs_remove>(arguments)) return;
     call_t call(arguments->outcome);
     if (refuse_database(call, arguments->database)) return;
     std::size_t const count = arguments->count;
@@ -66,7 +64,6 @@ void ustore_blobs_remove(ustore_blobs_remove_t* arguments) {
 }
 
 void ustore_blobs_read(ustore_blobs_read_t* arguments) {
-    if (submitted<&ustore_blobs_read>(arguments)) return;
     call_t call(arguments->outcome);
     if (arguments->presences) *arguments->presences = nullptr;
     if (arguments->lengths) *arguments->lengths = nullptr;
@@ -114,7 +111,6 @@ void ustore_blobs_read(ustore_blobs_read_t* arguments) {
 }
 
 void ustore_blobs_scan(ustore_blobs_scan_t* arguments) {
-    if (submitted<&ustore_blobs_scan>(arguments)) return;
     call_t call(arguments->outcome);
     if (!check_scan(call, arguments)) return;
     matcher_t matcher;
@@ -138,7 +134,6 @@ void ustore_blobs_cursor_init(ustore_blobs_cursor_init_t* arguments) {
 }
 
 void ustore_blobs_cursor_next(ustore_blobs_cursor_next_t* arguments) {
-    if (submitted<&ustore_blobs_cursor_next>(arguments)) return;
     call_t call(arguments->outcome);
     keyed_cursor_t* const cursor = arguments->cursor ? &arguments->cursor->cursor : nullptr;
     ustore_arena_handle_t* const arena = open_pull(call, arguments, cursor);
@@ -161,12 +156,6 @@ void ustore_blobs_cursor_free(ustore_blobs_cursor_t cursor) {
     delete cursor;
 }
 
-void ustore_blobs_sample(ustore_blobs_sample_t* arguments) {
-    if (submitted<&ustore_blobs_sample>(arguments)) return;
-    sample_keyed(arguments, ustore_modality_blobs_k);
-}
+void ustore_blobs_sample(ustore_blobs_sample_t* arguments) { sample_keyed(arguments, ustore_modality_blobs_k); }
 
-void ustore_blobs_measure(ustore_blobs_measure_t* arguments) {
-    if (submitted<&ustore_blobs_measure>(arguments)) return;
-    measure_keyed(arguments, ustore_modality_blobs_k);
-}
+void ustore_blobs_measure(ustore_blobs_measure_t* arguments) { measure_keyed(arguments, ustore_modality_blobs_k); }

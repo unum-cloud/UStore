@@ -16,17 +16,15 @@
 #include <cstdint> // `std::uint32_t`
 #include <cstring> // `std::memset`
 
-#include <atomic>             // `std::atomic`
-#include <condition_variable> // `std::condition_variable` - a worker waiting for its next deferred call
-#include <map>                // `std::map`
-#include <mutex>              // `std::mutex`
-#include <new>                // `std::align_val_t`, `std::nothrow`
-#include <set>                // `std::multiset`, `std::set`
-#include <shared_mutex>       // `std::shared_mutex`
-#include <string>             // `std::string`
-#include <thread>             // `std::thread::id`
-#include <utility>            // `std::pair`
-#include <vector>             // `std::vector`
+#include <atomic>       // `std::atomic`
+#include <map>          // `std::map`
+#include <new>          // `std::align_val_t`, `std::nothrow`
+#include <set>          // `std::multiset`, `std::set`
+#include <shared_mutex> // `std::shared_mutex`
+#include <string>       // `std::string`
+#include <thread>       // `std::thread::id`
+#include <utility>      // `std::pair`
+#include <vector>       // `std::vector`
 
 #include "ustore/ustore.h"
 
@@ -61,8 +59,7 @@ struct claim_t {
     /** The outcome of the call holding the claim, or null while free. */
     std::atomic<void const*> holder {nullptr};
 
-    /** Takes the claim for @p owner, or answers true when @p owner, a deferred call submitted
-     *  with it, holds it. */
+    /** Takes the claim for @p owner, or answers true when @p owner already holds it. */
     bool take(void const* owner) noexcept {
         void const* expected = nullptr;
         if (holder.compare_exchange_strong(expected, owner, std::memory_order_acquire, std::memory_order_relaxed))
@@ -70,20 +67,7 @@ struct claim_t {
         return expected == owner;
     }
     void release() noexcept { holder.store(nullptr, std::memory_order_release); }
-
-    /** Lets go of the claim only when @p owner holds it. */
-    void release(void const* owner) noexcept {
-        void const* expected = owner;
-        holder.compare_exchange_strong(expected, nullptr, std::memory_order_release, std::memory_order_relaxed);
-    }
     bool held() const noexcept { return holder.load(std::memory_order_acquire) != nullptr; }
-};
-
-/** A deferred call handed to the worker of its executor: the routine running it and what
- *  it runs over. */
-struct deferred_job_t {
-    void (*run)(void* state) = nullptr;
-    void* state = nullptr;
 };
 
 /** The calls naming a handle, which its free waits out. */
@@ -160,17 +144,6 @@ struct ustore_executor_handle_t {
     bool for_nvme = false;
     ustore_nvme_options_t nvme {};
     ustore_size_t threads = 1;
-
-    /** The thread running the deferred calls of an executor owning its threads, absent for a
-     *  lent pool, whose deferred calls run at submission. */
-    std::thread worker;
-
-    /** The deferred call the worker runs next, null while it waits, or the stop job once the
-     *  executor frees, handed over under @c job_mutex, as atomic waits would tie the archive to
-     *  one C++ runtime. */
-    deferred_job_t* job = nullptr;
-    std::mutex job_mutex;
-    std::condition_variable job_changed;
 };
 
 /** What @c ustore_arena_t names: host blocks every call rewinds, each 64-byte aligned as

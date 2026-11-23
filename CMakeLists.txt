@@ -104,9 +104,6 @@ include(GNUInstallDirs)
 
 # Install 3rd Party Packages
 include(FetchContent)
-include_directories(c cpp include)
-include_directories(tools)
-include_directories(src)
 
 if (CMAKE_BUILD_TYPE MATCHES "Debug")
     set(FETCHCONTENT_QUIET OFF)
@@ -137,31 +134,41 @@ include(cmake/ustore_platform.cmake)
 # Modalities:
 include(cmake/fmt.cmake)
 include(cmake/yyjson.cmake)
-# A system {fmt} has no source tree, so the headers' include path comes from the target itself.
-get_target_property(ustore_fmt_include_dir_ fmt::fmt INTERFACE_INCLUDE_DIRECTORIES)
+
+# The C ABI of `c/ustore/`, which every other layer starts from.
+add_library(ustore_abi INTERFACE)
+add_library(ustore::abi ALIAS ustore_abi)
+set_target_properties(ustore_abi PROPERTIES EXPORT_NAME abi)
+target_include_directories(
+    ustore_abi INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/c>
+                         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+)
+
+# The C++ SDK of `cpp/ustore/`, over the C ABI and the archive.
+add_subdirectory(cpp)
 
 # The reusable templates of `include/ustore/`, header-only, with the include paths of the siblings and the third-party
 # headers they reach into. The package installs UStore's own headers alone, so a consumer brings each sibling's.
-add_library(ustore_header INTERFACE)
-add_library(ustore::header ALIAS ustore_header)
-set_target_properties(ustore_header PROPERTIES EXPORT_NAME header)
+add_library(ustore_templates INTERFACE)
+add_library(ustore::templates ALIAS ustore_templates)
+set_target_properties(ustore_templates PROPERTIES EXPORT_NAME templates)
 # MSVC reads BOM-less UTF-8 in the system code page, so consumers of these Unicode-commented headers need `/utf-8`.
 target_compile_options(
-    ustore_header INTERFACE "$<$<OR:$<COMPILE_LANG_AND_ID:C,MSVC>,$<COMPILE_LANG_AND_ID:CXX,MSVC>>:/utf-8>"
+    ustore_templates INTERFACE "$<$<OR:$<COMPILE_LANG_AND_ID:C,MSVC>,$<COMPILE_LANG_AND_ID:CXX,MSVC>>:/utf-8>"
 )
-target_compile_features(ustore_header INTERFACE cxx_std_20)
+target_compile_features(ustore_templates INTERFACE cxx_std_20)
 target_include_directories(
-    ustore_header
+    ustore_templates
     INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/c> $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
               $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 target_include_directories(
-    ustore_header SYSTEM INTERFACE $<BUILD_INTERFACE:${yyjson_SOURCE_DIR}/src>
-                                   "$<BUILD_INTERFACE:${ustore_fmt_include_dir_}>"
+    ustore_templates SYSTEM INTERFACE $<BUILD_INTERFACE:${yyjson_SOURCE_DIR}/src>
+                                      $<BUILD_INTERFACE:${fmt_SOURCE_DIR}/include>
 )
 target_link_libraries(
-    ustore_header INTERFACE $<BUILD_INTERFACE:forkunion::header> $<BUILD_INTERFACE:smashtable::header>
-                            $<BUILD_INTERFACE:stringzilla::header> $<BUILD_INTERFACE:ustore_sanitizers>
+    ustore_templates INTERFACE $<BUILD_INTERFACE:forkunion::header> $<BUILD_INTERFACE:smashtable::header>
+                               $<BUILD_INTERFACE:stringzilla::header> $<BUILD_INTERFACE:ustore_sanitizers>
 )
 
 include(cmake/ustore_gpu.cmake)
@@ -363,7 +370,7 @@ if (${USTORE_WITH_NVME})
     target_link_libraries(
         ustore_nvme_compaction
         PUBLIC $<BUILD_INTERFACE:smashtable::header> $<BUILD_INTERFACE:forkunion::header>
-        PRIVATE $<BUILD_INTERFACE:ustore_header>
+        PRIVATE $<BUILD_INTERFACE:ustore_templates>
     )
     set_target_properties(ustore_nvme_compaction PROPERTIES POSITION_INDEPENDENT_CODE ON)
     if (ustore_cuda_codes_ OR ustore_rocm_codes_)
@@ -420,7 +427,9 @@ foreach (class_ IN LISTS ustore_nvidia_classes_ ustore_amd_classes_ ustore_apple
     if (ustore_class_${class_}_vendor_ STREQUAL "apple")
         add_library(ustore_vram_${class_} OBJECT src/vram/${ustore_class_${class_}_source_})
         target_compile_features(ustore_vram_${class_} PRIVATE cxx_std_20)
-        target_include_directories(ustore_vram_${class_} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+        target_include_directories(
+            ustore_vram_${class_} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/c ${CMAKE_CURRENT_SOURCE_DIR}/include
+        )
         target_compile_definitions(ustore_vram_${class_} PRIVATE ${ustore_class_${class_}_gates_})
         target_compile_options(
             ustore_vram_${class_}
@@ -431,6 +440,9 @@ foreach (class_ IN LISTS ustore_nvidia_classes_ ustore_amd_classes_ ustore_apple
         continue()
     endif ()
     add_library(ustore_vram_${class_} OBJECT ${ustore_library_exclusion_})
+    target_include_directories(
+        ustore_vram_${class_} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/c ${CMAKE_CURRENT_SOURCE_DIR}/include
+    )
     target_include_directories(
         ustore_vram_${class_} SYSTEM
         PRIVATE $<TARGET_PROPERTY:smashtable::header,INTERFACE_INCLUDE_DIRECTORIES>
@@ -452,7 +464,6 @@ add_library(
                          ${ustore_dependency_objects_}
 )
 add_library(ustore::static ALIAS ustore_static)
-add_library(ustore::ustore ALIAS ustore_static)
 add_library(ustore_shared SHARED ${ustore_library_exclusion_} ${ustore_sources_} ${ustore_vram_objects_})
 add_library(ustore::shared ALIAS ustore_shared)
 target_compile_options(
@@ -518,12 +529,11 @@ foreach (library_ IN ITEMS ustore_static ustore_shared ${ustore_compiled_objects
                             $<BUILD_INTERFACE:stringzilla::cpu_capabilities_compiled>
     )
     target_link_libraries(${library_} PUBLIC $<BUILD_INTERFACE:ustore_sanitizers>)
-    # The `include_directories` above reach this project's targets only, so a consumer linking a library inherits the
-    # public headers from the target instead.
+    # The engine sees the C ABI and its templates; a consumer of the C++ SDK links `ustore::cpp`, which carries it.
     target_include_directories(
         ${library_}
-        PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/c> $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/cpp>
-               $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include> $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+        PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/c> $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+               $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
 endforeach ()
@@ -550,22 +560,23 @@ if (${USTORE_BUILD_PYTHON})
     add_subdirectory(python)
 endif ()
 
-# `find_package(ustore)` names the libraries `ustore::shared` and `ustore::static`. The `sdk` takes the shared library,
-# which links every engine inside, with the C headers and the C++ wrappers; `static` takes the archive and the engine
-# archives it links, `ustore::rocksdb`, `ustore::leveldb` and `ustore::uring`. The archive holds the device merger,
-# whose consumers also link the static CUDA runtime it calls where it has one.
-set(ustore_install_sdk_targets_ ustore_header ustore_shared)
-set(ustore_install_static_targets_ ustore_static ${ustore_engine_archives_})
+# `find_package(ustore)` names the C headers `ustore::abi`, the C++ SDK carrying them and the archive `ustore::cpp`, the
+# header-only templates `ustore::templates`, and the libraries `ustore::shared`, which links every engine inside, and
+# `ustore::static`, beside the engine archives it links, `ustore::rocksdb`, `ustore::leveldb` and `ustore::uring`. The
+# archive holds the device merger, whose consumers also link the static CUDA runtime it calls where it has one.
+set(ustore_install_sdk_targets_ ustore_abi ustore_cpp ustore_templates ustore_static ustore_shared
+                                ${ustore_engine_archives_}
+)
 set(ustore_static_dependencies_)
 if (ustore_device_compaction_ AND ustore_cuda_codes_)
     set(ustore_static_dependencies_ "find_dependency(CUDAToolkit)")
 endif ()
 include(cmake/ustore_install.cmake)
-# The header-only templates install as their own `core` component.
+# The header-only templates install as their own `templates` component.
 if (USTORE_INSTALL)
     install(
         DIRECTORY include/ustore
         DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-        COMPONENT core
+        COMPONENT templates
     )
 endif ()

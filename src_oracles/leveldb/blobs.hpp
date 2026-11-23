@@ -14,9 +14,8 @@
 #include <leveldb/db.h>
 #include <leveldb/write_batch.h>
 
-#include "ustore/ranges.hpp" // `place_batch_t`, `strided`
-
 #include "ustore/utilities/algorithm.hpp" // `reservoir_sample_iterator`
+#include "ustore/utilities/ranges.hpp"    // `place_batch_t`, `strided`
 
 #include "database.hpp"          // `database_t`, `resolve_collections`, `seek_towards`, `step_towards`, `get_each`
 #include "utilities/batches.hpp" // `validate_write`, `places_of`, `scans_of`, `measures_of`

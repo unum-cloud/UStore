@@ -92,7 +92,7 @@ constexpr enumerator_spelling<ustore_modality_t> modality_names_k[] {
     {ustore_modality_strings_k, "strings"}, {ustore_modality_pages_k, "pages"},
 };
 
-expected<ustore_collection_id_t> mint_collection_id() noexcept {
+util::expected<ustore_collection_id_t> mint_collection_id() noexcept {
     ustore_collection_id_t id {};
     std::uint8_t* const bytes = id.uuid.bytes;
 #if USTORE_OS_WINDOWS_
@@ -101,7 +101,7 @@ expected<ustore_collection_id_t> mint_collection_id() noexcept {
 #else
     bool const drawn = getentropy(bytes, sizeof(id.uuid.bytes)) == 0;
 #endif
-    if (!drawn) return status_t {status_code_t::internal_k, "The system gave no entropy for a collection identifier"};
+    if (!drawn) return util::status_t {util::status_code_t::internal_k, "No entropy for a collection identifier"};
     // Version 7: Unix milliseconds big-endian in bytes [0, 6), then the version nibble and the RFC variant over the
     // random bits, so identifiers minted later order after earlier ones
     auto const now = std::chrono::system_clock::now().time_since_epoch();
@@ -114,15 +114,15 @@ expected<ustore_collection_id_t> mint_collection_id() noexcept {
     return id;
 }
 
-status_t open_changes_cursor(engine_t const& engine, ustore_changes_cursor_init_t const& arguments,
-                             view_t const& view) noexcept {
+util::status_t open_changes_cursor(engine_t const& engine, ustore_changes_cursor_init_t const& arguments,
+                                   view_t const& view) noexcept {
     if (!engine.database->changes_cursor_init)
-        return {status_code_t::unsupported_k, "The engine keeps no stamps to read changes by"};
+        return {util::status_code_t::unsupported_k, "The engine keeps no stamps for changes"};
     auto* const cursor = new (std::nothrow) ustore_changes_cursor_handle_t {};
-    if (!cursor) return {status_code_t::out_of_memory_k, "Failed to allocate the change feed"};
+    if (!cursor) return {util::status_code_t::out_of_memory_k, "No room for the change feed"};
     cursor->cursor.database = arguments.database;
     cursor->cursor.collection = arguments.collection;
-    if (status_t const opened = engine.database->changes_cursor_init(arguments, cursor, view); opened.failed()) {
+    if (util::status_t const opened = engine.database->changes_cursor_init(arguments, cursor, view); opened.failed()) {
         delete cursor;
         return opened;
     }
@@ -131,33 +131,33 @@ status_t open_changes_cursor(engine_t const& engine, ustore_changes_cursor_init_
     return {};
 }
 
-status_t pull(engine_t const& engine, ustore_changes_cursor_next_t const& arguments, ustore_changes_cursor_handle_t&,
-              view_t const& view) noexcept {
+util::status_t pull(engine_t const& engine, ustore_changes_cursor_next_t const& arguments,
+                    ustore_changes_cursor_handle_t&, view_t const& view) noexcept {
     if (!arguments.count || !arguments.keys || !arguments.stamps || !arguments.kinds)
-        return {status_code_t::invalid_argument_k, "Need outputs for the count, the keys, the stamps and the kinds"};
+        return {util::status_code_t::invalid_argument_k, "Needs outputs for count, keys, stamps, kinds"};
     return engine.database->changes_cursor_next(arguments, view);
 }
 
 } // namespace unum::ustore
 
-status_t open_ingest(ustore_ingest_init_t const& arguments) noexcept {
-    if (!arguments.ingest) return {status_code_t::invalid_argument_k, "Need an output for the ingest"};
+util::status_t open_ingest(ustore_ingest_init_t const& arguments) noexcept {
+    if (!arguments.ingest) return {util::status_code_t::invalid_argument_k, "Need an output for the ingest"};
     *arguments.ingest = nullptr;
     ustore_database_t const database = arguments.database;
-    if (!database) return {status_code_t::uninitialized_k, "The database is uninitialized"};
+    if (!database) return {util::status_code_t::uninitialized_k, "The database is uninitialized"};
     if (arguments.order != ustore_ingest_sorted_k && arguments.order != ustore_ingest_unsorted_k)
-        return {status_code_t::invalid_argument_k, "Unknown ingest order"};
+        return {util::status_code_t::invalid_argument_k, "Unknown ingest order"};
     if (database->access == access_t::read_only_k)
-        return {status_code_t::read_only_k, "The database was opened read-only"};
+        return {util::status_code_t::read_only_k, "The database was opened read-only"};
     engine_t const& engine = engine_of(database);
-    if (!engine.database->ingest_init) return {status_code_t::unsupported_k, "The engine ingests nothing"};
+    if (!engine.database->ingest_init) return {util::status_code_t::unsupported_k, "The engine ingests nothing"};
     auto* const ingest = new (std::nothrow) ustore_ingest_handle_t {.engine = &engine, .database = database};
-    if (!ingest) return {status_code_t::out_of_memory_k, "Failed to allocate the ingest"};
+    if (!ingest) return {util::status_code_t::out_of_memory_k, "No room for the ingest"};
     *arguments.ingest = ingest;
-    if (status_t const opened = engine.database->ingest_init(arguments, view_t {.scratch = &ingest->scratch});
+    if (util::status_t const opened = engine.database->ingest_init(arguments, view_t {.scratch = &ingest->scratch});
         opened.failed()) {
         *arguments.ingest = nullptr;
-        arena_free_blocks(ingest->scratch);
+        util::arena_free_blocks(ingest->scratch);
         delete ingest;
         return opened;
     }
@@ -174,23 +174,25 @@ void close_ingest(ustore_ingest_t ingest) noexcept {
     floor_atomic_ref<std::uint32_t> {ingest->database->open_ingests}.fetch_sub(1, std::memory_order_acq_rel);
 }
 
-status_t append_ingest(ustore_ingest_append_t const& arguments) noexcept {
+util::status_t append_ingest(ustore_ingest_append_t const& arguments) noexcept {
     ustore_ingest_t const ingest = arguments.ingest;
-    if (!ingest || !ingest->state) return {status_code_t::invalid_argument_k, "The ingest is missing or finished"};
-    arena_rewind(&ingest->scratch);
+    if (!ingest || !ingest->state)
+        return {util::status_code_t::invalid_argument_k, "The ingest is missing or finished"};
+    util::arena_rewind(&ingest->scratch);
     strings_arg_t values;
-    if (status_t const gathered = gather_strings({arguments.values, arguments.count}, &ingest->scratch, values);
+    if (util::status_t const gathered = gather_strings({arguments.values, arguments.count}, &ingest->scratch, values);
         gathered.failed())
         return gathered;
     return ingest->engine->database->ingest_append(arguments, values, view_t {.scratch = &ingest->scratch});
 }
 
-status_t finish_ingest(ustore_ingest_finish_t const& arguments) noexcept {
+util::status_t finish_ingest(ustore_ingest_finish_t const& arguments) noexcept {
     if (arguments.commit_stamp) *arguments.commit_stamp = 0;
     ustore_ingest_t const ingest = arguments.ingest;
-    if (!ingest || !ingest->state) return {status_code_t::invalid_argument_k, "The ingest is missing or finished"};
-    status_t landed {status_code_t::invalid_argument_k, "Unknown durability"};
-    arena_rewind(&ingest->scratch);
+    if (!ingest || !ingest->state)
+        return {util::status_code_t::invalid_argument_k, "The ingest is missing or finished"};
+    util::status_t landed {util::status_code_t::invalid_argument_k, "Unknown durability"};
+    util::arena_rewind(&ingest->scratch);
     if (arguments.durability == ustore_durability_buffered_k || arguments.durability == ustore_durability_flushed_k)
         landed = ingest->engine->database->ingest_finish(arguments, view_t {.scratch = &ingest->scratch});
     close_ingest(ingest);
@@ -200,11 +202,11 @@ status_t finish_ingest(ustore_ingest_finish_t const& arguments) noexcept {
 /** Serves @p arguments holding the ingest's claim and counting the call, so a second call is
  *  contended and a free waits. */
 template <auto serve_, typename arguments_type_>
-status_t on_ingest(arguments_type_ const& arguments) noexcept {
-    if (!arguments.ingest) return {status_code_t::invalid_argument_k, "The ingest is missing"};
-    if (!take(arguments.ingest->claim)) return {status_code_t::contended_k, "The ingest serves another call"};
+util::status_t on_ingest(arguments_type_ const& arguments) noexcept {
+    if (!arguments.ingest) return {util::status_code_t::invalid_argument_k, "The ingest is missing"};
+    if (!take(arguments.ingest->claim)) return {util::status_code_t::contended_k, "The ingest serves another call"};
     std::array<std::uint32_t*, 3> const named_calls = raise_named_calls(arguments);
-    status_t const status = serve_(arguments);
+    util::status_t const status = serve_(arguments);
     release(arguments.ingest->claim);
     lower_named_calls(named_calls);
     return status;
@@ -298,7 +300,7 @@ void ustore_ingest_free(ustore_ingest_t ingest) {
     wait_named_calls(ingest->named_calls);
     if (ingest->state) close_ingest(ingest);
     ustore_database_t const database = ingest->database;
-    arena_free_blocks(ingest->scratch);
+    util::arena_free_blocks(ingest->scratch);
     delete ingest;
     release_hold(database);
 }
@@ -329,22 +331,22 @@ void ustore_database_free(ustore_database_t database) {
 
 #if !USTORE_WITH_ROCKSDB
 void ustore_database_open_rocksdb(ustore_database_open_rocksdb_t* arguments) {
-    finish(*arguments->outcome, {status_code_t::unsupported_k, "This build carries no RocksDB engine"});
+    finish(*arguments->outcome, {util::status_code_t::unsupported_k, "This build carries no RocksDB engine"});
 }
 
 void ustore_database_view_rocksdb(ustore_database_view_rocksdb_t* arguments) {
-    finish(*arguments->outcome, {status_code_t::unsupported_k, "This build carries no RocksDB engine"});
+    finish(*arguments->outcome, {util::status_code_t::unsupported_k, "This build carries no RocksDB engine"});
 }
 #endif
 
 #if !USTORE_WITH_LEVELDB
 void ustore_database_open_leveldb(ustore_database_open_leveldb_t* arguments) {
-    finish(*arguments->outcome, {status_code_t::unsupported_k, "This build carries no LevelDB engine"});
+    finish(*arguments->outcome, {util::status_code_t::unsupported_k, "This build carries no LevelDB engine"});
 }
 #endif
 
 #if !USTORE_WITH_NVME
 void ustore_database_open_nvme(ustore_database_open_nvme_t* arguments) {
-    finish(*arguments->outcome, {status_code_t::unsupported_k, "This build carries no NVMe engine"});
+    finish(*arguments->outcome, {util::status_code_t::unsupported_k, "This build carries no NVMe engine"});
 }
 #endif

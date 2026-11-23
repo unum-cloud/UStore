@@ -417,8 +417,10 @@ typedef enum ustore_status_t {
 
 } ustore_status_t;
 
-/** Outcome of one call: a status to branch on, and a static message that is never freed and is @c NULL exactly
- *  when the status is @c ustore_status_success_k. */
+/** Outcome of one call: the status word a deferred call completes through and every binding
+ *  branches on, and a static message naming what broke, a library invariant or a rule of this
+ *  call, else the status's own @ref ustore_status_name. Messages are never freed, and are
+ *  @c NULL exactly when the status is @c ustore_status_success_k. */
 typedef struct ustore_outcome_t {
 
     /** What went wrong, @c ustore_status_success_k, or @c ustore_status_deferred_k until a deferred call finishes. */
@@ -1149,7 +1151,7 @@ USTORE_EXPORT void ustore_executor_drain(ustore_executor_drain_t* arguments);
  *      borrowed pool and frees it; @c NULL is safe, and it cannot fail, so takes no outcome.
  *  @param[in,out] executor The executor to be freed; invalid afterwards.
  *
- *  Arenas it made stay valid, each keeping its memory until freed.
+ *  Every arena it made must be freed first.
  */
 USTORE_EXPORT void ustore_executor_free(ustore_executor_t executor);
 
@@ -1195,8 +1197,9 @@ typedef struct ustore_arena_init_t {
  *      its outputs on the device without asking.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
- *  Nothing is allocated until a call writes into it. An arena may outlive the executor that made it: it keeps its own
- *  memory, and the device that memory lives on, until it is freed.
+ *  Nothing is allocated until a call writes into it. An arena must not outlive the executor that
+ *  made it: free every arena before its executor. An arena made with a @c NULL executor has none,
+ *  and lives until it is freed.
  *
  *  @par Statuses:
  *  - @c ustore_status_invalid_argument_k The @c arena output is @c NULL.

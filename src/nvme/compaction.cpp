@@ -21,12 +21,13 @@
 
 namespace unum::ustore::blobs {
 
+using util::bytes_of;
+
 #pragma region NVIDIA
 
-expected<cuda_compactor_t> cuda_compactor_t::make(utilities::cuda_executor_t& executor,
+expected<cuda_compactor_t> cuda_compactor_t::make(util::cuda_executor_t& executor,
                                                   device_sections_reader_t sections) noexcept {
-    if (!executor.kernels())
-        return status_t {status_code_t::unsupported_k, "The device loaded no bundle of the library's kernels"};
+    if (!executor.kernels()) return status_t {status_code_t::unsupported_k, "The device loaded no kernel bundle"};
     return cuda_compactor_t(executor, sections);
 }
 
@@ -54,7 +55,7 @@ st::status_t cuda_compactor_t::merge_strings(compaction_kind_t kind, std::span<s
     if (executor_->bind().failed()) return status_t::unknown_k;
     executor_->rewind_bounce();
     if (blocks_.count > 1) sections_.release();
-    utilities::rewind(blocks_, *executor_);
+    util::rewind(blocks_, *executor_);
 
     strings_merge_run* const runs = carve_<strings_merge_run>(runs_count);
     st::key128_t* const heads = carve_<st::key128_t>(records);
@@ -161,7 +162,7 @@ st::status_t cuda_compactor_t::merge_strings(compaction_kind_t kind, std::span<s
         executor_->fill_async(reinterpret_cast<std::uintptr_t>(chain), byte_t {0}, sizeof(std::uint64_t)));
     if (status != status_t::success_k) return status;
     std::uint64_t const tickets = fu::min_of(
-        divide_round_up(std::uint64_t {records}, std::uint64_t {merge_block_threads_k}), utilities::chain_blocks_max_k);
+        divide_round_up(std::uint64_t {records}, std::uint64_t {merge_block_threads_k}), util::chain_blocks_max_k);
     status = launch_over(*executor_, merge_strings_pack_name_k, tickets * merge_block_threads_k, tickets,
                          static_cast<strings_version_t const*>(merged), static_cast<std::uint8_t const*>(flags),
                          std::uint64_t {records}, tickets, packed, chain);
@@ -181,7 +182,7 @@ cuda_compactor_t::~cuda_compactor_t() noexcept {
     if (!blocks_.count) return;
     sections_.release();
     if (executor_->bind().failed()) return;
-    utilities::rewind(blocks_, *executor_);
+    util::rewind(blocks_, *executor_);
     executor_->free_async(blocks_.blocks[0].address);
 }
 
@@ -189,10 +190,9 @@ cuda_compactor_t::~cuda_compactor_t() noexcept {
 
 #pragma region AMD
 
-expected<hip_compactor_t> hip_compactor_t::make(utilities::hip_executor_t& executor,
+expected<hip_compactor_t> hip_compactor_t::make(util::hip_executor_t& executor,
                                                 device_sections_reader_t sections) noexcept {
-    if (!executor.kernels())
-        return status_t {status_code_t::unsupported_k, "The device loaded no bundle of the library's kernels"};
+    if (!executor.kernels()) return status_t {status_code_t::unsupported_k, "The device loaded no kernel bundle"};
     return hip_compactor_t(executor, sections);
 }
 
@@ -220,7 +220,7 @@ st::status_t hip_compactor_t::merge_strings(compaction_kind_t kind, std::span<st
     if (executor_->bind().failed()) return status_t::unknown_k;
     executor_->rewind_bounce();
     if (blocks_.count > 1) sections_.release();
-    utilities::rewind(blocks_, *executor_);
+    util::rewind(blocks_, *executor_);
 
     strings_merge_run* const runs = carve_<strings_merge_run>(runs_count);
     st::key128_t* const heads = carve_<st::key128_t>(records);
@@ -327,7 +327,7 @@ st::status_t hip_compactor_t::merge_strings(compaction_kind_t kind, std::span<st
         executor_->fill_async(reinterpret_cast<std::uintptr_t>(chain), byte_t {0}, sizeof(std::uint64_t)));
     if (status != status_t::success_k) return status;
     std::uint64_t const tickets = fu::min_of(
-        divide_round_up(std::uint64_t {records}, std::uint64_t {merge_block_threads_k}), utilities::chain_blocks_max_k);
+        divide_round_up(std::uint64_t {records}, std::uint64_t {merge_block_threads_k}), util::chain_blocks_max_k);
     status = launch_over(*executor_, merge_strings_pack_name_k, tickets * merge_block_threads_k, tickets,
                          static_cast<strings_version_t const*>(merged), static_cast<std::uint8_t const*>(flags),
                          std::uint64_t {records}, tickets, packed, chain);
@@ -347,7 +347,7 @@ hip_compactor_t::~hip_compactor_t() noexcept {
     if (!blocks_.count) return;
     sections_.release();
     if (executor_->bind().failed()) return;
-    utilities::rewind(blocks_, *executor_);
+    util::rewind(blocks_, *executor_);
     executor_->free_async(blocks_.blocks[0].address);
 }
 
@@ -355,10 +355,9 @@ hip_compactor_t::~hip_compactor_t() noexcept {
 
 #pragma region Apple
 
-expected<metal_compactor_t> metal_compactor_t::make(utilities::metal_executor_t& executor,
+expected<metal_compactor_t> metal_compactor_t::make(util::metal_executor_t& executor,
                                                     device_sections_reader_t sections) noexcept {
-    if (!executor.kernels())
-        return status_t {status_code_t::unsupported_k, "The device loaded no bundle of the library's kernels"};
+    if (!executor.kernels()) return status_t {status_code_t::unsupported_k, "The device loaded no kernel bundle"};
     return metal_compactor_t(executor, sections);
 }
 
@@ -389,7 +388,7 @@ st::status_t metal_compactor_t::merge_strings(compaction_kind_t kind, std::span<
     if (executor_->bind().failed()) return status_t::unknown_k;
     executor_->rewind_bounce();
     if (blocks_.count > 1) sections_.release();
-    utilities::rewind(blocks_, *executor_);
+    util::rewind(blocks_, *executor_);
 
     strings_merge_run* const runs = carve_<strings_merge_run>(runs_count);
     st::key128_t* const heads = carve_<st::key128_t>(records);
@@ -495,13 +494,13 @@ st::status_t metal_compactor_t::merge_strings(compaction_kind_t kind, std::span<
                          static_cast<strings_merge_run const*>(runs), static_cast<std::uint32_t>(runs_count),
                          upper_runs, std::uint64_t {records}, kind, device_stamps, merged, flags);
     if (status != status_t::success_k) return status;
-    std::uint64_t const tile = round_up_to_multiple(
-        divide_round_up(std::uint64_t {records}, utilities::chain_blocks_max_k), std::uint64_t {256});
+    std::uint64_t const tile = round_up_to_multiple(divide_round_up(std::uint64_t {records}, util::chain_blocks_max_k),
+                                                    std::uint64_t {256});
     std::uint32_t const tiles = static_cast<std::uint32_t>(divide_round_up(std::uint64_t {records}, tile));
     std::uint64_t* const counts = carve_<std::uint64_t>(std::size_t {tiles} + 1);
     if (!counts) return status_t::out_of_memory_heap_k;
-    status = executor_status(utilities::select_flagged(*executor_, flags, static_cast<std::uint32_t>(records),
-                                                       static_cast<std::uint32_t>(tile), tiles, counts, selected));
+    status = executor_status(util::select_flagged(*executor_, flags, static_cast<std::uint32_t>(records),
+                                                  static_cast<std::uint32_t>(tile), tiles, counts, selected));
     if (status != status_t::success_k) return status;
     if ((status = download(*executor_, host_count, counts + tiles, 1)) != status_t::success_k ||
         (status = download(*executor_, host_merged, merged, records)) != status_t::success_k)
@@ -522,7 +521,7 @@ metal_compactor_t::~metal_compactor_t() noexcept {
     if (!blocks_.count) return;
     sections_.release();
     if (executor_->bind().failed()) return;
-    utilities::rewind(blocks_, *executor_);
+    util::rewind(blocks_, *executor_);
     executor_->free_async(blocks_.blocks[0].address);
 }
 

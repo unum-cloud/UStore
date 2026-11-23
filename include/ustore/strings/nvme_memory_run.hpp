@@ -66,6 +66,9 @@ using blobs::unwritten_stamp_k;
 using utilities::byte_t;
 using utilities::delta_kind_t;
 using utilities::delta_view_t;
+using utilities::expected;
+using utilities::status_code_t;
+using utilities::status_t;
 
 /** Orders the string under @p first_head against the one under @p second_head, reading the tails only when two
  *  heads of longer strings tie, which unsigned byte order of the whole strings agrees with. */
@@ -201,7 +204,7 @@ class sealed_deltas {
     static expected<sealed_deltas> seal(std::span<keyed_delta_t> deltas, sz_kernel_sort_order_t sort_order,
                                         std::span<range_t const> ranges = {}, allocator_t allocator = {}) noexcept {
         if (deltas.empty() && ranges.empty())
-            return status_t {status_code_t::invalid_argument_k, "A seal takes at least one delta or range"};
+            return status_t {status_code_t::invalid_argument_k, "A seal needs a delta or range"};
         if (!deltas.empty()) {
             auto [kept, sort_status] = sort_unique_strings(deltas, sort_order, keep_t::first_k, allocator);
             if (sort_status.failed()) return sort_status;
@@ -211,7 +214,7 @@ class sealed_deltas {
         for (std::size_t index = 0; index != deltas.size(); ++index) {
             std::size_t const carried = deltas[index].delta.kind == delta_kind_t::remove_k ? 0 : value_bytes_k;
             if (deltas[index].delta.bytes.size() != carried)
-                return status_t {status_code_t::invalid_argument_k, "A write carries one key and a removal none"};
+                return status_t {status_code_t::invalid_argument_k, "A write holds a key, a removal none"};
         }
         auto [sealed, sealed_status] = columns_of_<keyed_delta_t>(deltas, allocator);
         if (sealed_status.failed()) return sealed_status;
@@ -371,10 +374,11 @@ class sealed_deltas {
             return st::expected<std::span<std::uint8_t const>>(std::span<std::uint8_t const>(&pulled, 1),
                                                                st::status_t::success_k);
         };
-        st::expected<kinds_t> kinds = kinds_t::make(deltas.size(), least_kind, greatest_kind, fill,
-                                                    typename kinds_t::allocator_t(allocator));
-        if (!kinds) return status_t {status_code_t::out_of_memory_k, "No room to pack the kinds of strings deltas"};
-        sealed.kinds_ = std::move(*kinds);
+        auto [kinds, pack_status] = kinds_t::make(deltas.size(), least_kind, greatest_kind, fill,
+                                                  typename kinds_t::allocator_t(allocator));
+        if (st::failed(pack_status))
+            return status_t {status_code_t::out_of_memory_k, "No room to pack the delta kinds"};
+        sealed.kinds_ = std::move(kinds);
         return sealed;
     }
 
@@ -431,12 +435,13 @@ class memory_run {
                                         allocator_t allocator = {}) noexcept {
         if (stamp == unwritten_stamp_k)
             return status_t {status_code_t::invalid_argument_k, "No commit carries the unwritten stamp"};
-        st::expected<stamps_t> stamps = stamps_t::make(deltas.size(), stamp, typename stamps_t::allocator_t(allocator));
-        if (!stamps) return status_t {status_code_t::out_of_memory_k, "No room to stamp the deltas of strings"};
+        auto [stamps, status] = stamps_t::make(deltas.size(), stamp, typename stamps_t::allocator_t(allocator));
+        if (st::failed(status))
+            return status_t {status_code_t::out_of_memory_k, "No room to stamp the deltas of strings"};
         memory_run run;
         deltas.stamp_range_tombstones(stamp);
         run.deltas_ = std::move(deltas);
-        run.stamps_ = std::move(*stamps);
+        run.stamps_ = std::move(stamps);
         run.newest_stamp_ = stamp;
         return run;
     }
@@ -467,12 +472,13 @@ class memory_run {
             return st::expected<std::span<transaction_stamp_t const>>(std::span<transaction_stamp_t const>(&pulled, 1),
                                                                       st::status_t::success_k);
         };
-        st::expected<stamps_t> stamps = stamps_t::make(versions.size(), oldest_stamp, newest_stamp, fill,
-                                                       typename stamps_t::allocator_t(allocator));
-        if (!stamps) return status_t {status_code_t::out_of_memory_k, "No room to stamp a merged strings run"};
+        auto [stamps, stamp_status] = stamps_t::make(versions.size(), oldest_stamp, newest_stamp, fill,
+                                                     typename stamps_t::allocator_t(allocator));
+        if (st::failed(stamp_status))
+            return status_t {status_code_t::out_of_memory_k, "No room to stamp a merged strings run"};
         memory_run run;
         run.deltas_ = std::move(deltas);
-        run.stamps_ = std::move(*stamps);
+        run.stamps_ = std::move(stamps);
         run.newest_stamp_ = newest_stamp;
         run.tier_ = tier + 1;
         return run;
@@ -588,7 +594,7 @@ class memory_run_cursor {
         std::span<run_t const* const> const runs = view.runs();
         if (cursor.positions_.resize(runs.size()) != st::status_t::success_k ||
             cursor.ends_.resize(runs.size()) != st::status_t::success_k)
-            return status_t {status_code_t::out_of_memory_k, "A cursor could not hold a position per run"};
+            return status_t {status_code_t::out_of_memory_k, "No room for a position per run"};
         std::string_view const from = fu::max_of(start, prefix);
         for (std::size_t index = 0; index != runs.size(); ++index) {
             cursor.ends_[index] = runs[index]->prefix_end(prefix);

@@ -359,7 +359,7 @@ class half_edge_deltas_view_t {
     /** The records @p bytes holds, refusing a ragged length; @ref check_composed and @ref check_base judge them. */
     static expected<half_edge_deltas_view_t> make(std::span<byte_t const> bytes) noexcept {
         if (bytes.size() % half_edge_delta_bytes_k)
-            return status_t {status_code_t::malformed_k, "A chain of half-edge deltas has a ragged length"};
+            return status_t {status_code_t::malformed_k, "The half-edge delta chain is ragged"};
         half_edge_deltas_view_t view;
         view.bytes_ = bytes;
         return view;
@@ -399,7 +399,7 @@ inline status_t check_composed(half_edge_deltas_view_t chain) noexcept {
     for (std::size_t index = 0; index != chain.size(); ++index) {
         if (status_t const status = check_delta(chain.record(index)); status.failed()) return status;
         if (chain.operation(index) == half_edge_operation_t::remove_vertex_k) {
-            if (index) return {status_code_t::malformed_k, "A removal of the vertex follows other half-edge deltas"};
+            if (index) return {status_code_t::malformed_k, "A vertex removal follows half-edge deltas"};
             continue;
         }
         if (index && chain.operation(index - 1) != half_edge_operation_t::remove_vertex_k &&
@@ -413,7 +413,7 @@ inline status_t check_composed(half_edge_deltas_view_t chain) noexcept {
 inline status_t check_base(half_edge_deltas_view_t base) noexcept {
     for (std::size_t index = 0; index != base.size(); ++index)
         if (base.operation(index) != half_edge_operation_t::insert_k)
-            return {status_code_t::malformed_k, "A vertex value holds a record other than an insert"};
+            return {status_code_t::malformed_k, "A vertex value holds a non-insert record"};
     return check_composed(base);
 }
 
@@ -609,21 +609,21 @@ struct adjacency_fold_t {
             base = deltas[index].kind == delta_kind_t::write_k ? deltas[index].bytes : std::span<byte_t const> {};
             first_change = index + 1;
         }
-        auto base_view = half_edge_deltas_view_t::make(base);
-        if (!base_view) return base_view.status();
-        if (status_t const status = check_base(*base_view); status.failed()) return status;
+        auto [base_view, base_status] = half_edge_deltas_view_t::make(base);
+        if (base_status.failed()) return base_status;
+        if (status_t const status = check_base(base_view); status.failed()) return status;
         std::span<delta_view_t const> const changes = deltas.subspan(first_change);
         if (changes.empty()) return base;
 
-        auto chain_bytes = compose(changes, allocator);
-        if (!chain_bytes) return chain_bytes.status();
+        auto [chain_bytes, chain_status] = compose(changes, allocator);
+        if (chain_status.failed()) return chain_status;
         // The value keeps at most every half-edge of the base and every record of the chain
-        std::size_t const capacity = base.size() + chain_bytes->size();
+        std::size_t const capacity = base.size() + chain_bytes.size();
         if (!capacity) return std::span<byte_t const> {};
         byte_t* const block = allocator.allocate(capacity);
         if (!block) return status_t {status_code_t::out_of_memory_k, "No room for a folded vertex value"};
         std::size_t written = 0;
-        for (half_edge_cursor_t cursor(*base_view, *half_edge_deltas_view_t::make(*chain_bytes)); cursor.valid();
+        for (half_edge_cursor_t cursor(base_view, *half_edge_deltas_view_t::make(chain_bytes)); cursor.valid();
              cursor.next(), written += half_edge_delta_bytes_k)
             std::memcpy(block + written, cursor.record(), half_edge_delta_bytes_k);
         return std::span<byte_t const>(block, written);
@@ -645,12 +645,12 @@ struct adjacency_fold_t {
         std::size_t total = 0;
         for (delta_view_t const& delta : deltas) {
             if (delta.kind != delta_kind_t::change_k)
-                return status_t {status_code_t::invalid_argument_k, "A value write or removal is a base to apply"};
-            auto chain = half_edge_deltas_view_t::make(delta.bytes);
-            if (!chain) return chain.status();
-            for (std::size_t index = 0; index != chain->size(); ++index)
-                if (status_t const status = check_delta(chain->record(index)); status.failed()) return status;
-            total += chain->size();
+                return status_t {status_code_t::invalid_argument_k, "A write or removal is the base"};
+            auto [chain, chain_status] = half_edge_deltas_view_t::make(delta.bytes);
+            if (chain_status.failed()) return chain_status;
+            for (std::size_t index = 0; index != chain.size(); ++index)
+                if (status_t const status = check_delta(chain.record(index)); status.failed()) return status;
+            total += chain.size();
         }
         if (!total) return std::span<byte_t const> {};
         // Every record carries its place in the chain as a 32-bit sequence
@@ -735,13 +735,16 @@ class vertex_adjacency_t {
      *  read. */
     static expected<vertex_adjacency_t> make(id_entity_t const& vertex, std::span<byte_t const> base,
                                              std::span<byte_t const> pending) noexcept {
-        auto base_view = half_edge_deltas_view_t::make(base);
-        if (!base_view) return base_view.status();
-        auto chain = half_edge_deltas_view_t::make(pending);
-        if (!chain) return chain.status();
-        if (status_t const status = check_composed(*chain); status.failed()) return status;
-        return vertex_adjacency_t(vertex, *base_view, *chain);
+        auto [base_view, base_status] = half_edge_deltas_view_t::make(base);
+        if (base_status.failed()) return base_status;
+        auto [chain, chain_status] = half_edge_deltas_view_t::make(pending);
+        if (chain_status.failed()) return chain_status;
+        if (status_t const status = check_composed(chain); status.failed()) return status;
+        return vertex_adjacency_t(vertex, base_view, chain);
     }
+
+    /** Holds nothing: the adjacency of no vertex, with no half-edges. */
+    vertex_adjacency_t() noexcept = default;
 
     /** A walk over every live half-edge. */
     half_edge_cursor_t half_edges() const noexcept { return half_edge_cursor_t(base_, pending_); }

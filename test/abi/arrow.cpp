@@ -25,7 +25,7 @@
 
 #include <fmt/format.h>
 
-#include "ustore/ranges.hpp" // `tape_string`
+#include "ustore/utilities/ranges.hpp" // `tape_string`, `strided_strings`
 #include "ustore/ustore.h"
 
 #include "harness.hpp" // `run_test_case`, `expect_true`, `expect_equal`, `open_raw`
@@ -58,7 +58,7 @@ struct fixture_t {
 
     explicit fixture_t(config_t const& config) noexcept {
         auto [opened, open_status] = open_raw(config);
-        if (!expect_status(open_status, status_code_t::success_k)) return;
+        if (!expect_status(open_status, util::status_code_t::success_k)) return;
         database = opened;
         ustore_outcome_t outcome {};
         ustore_database_clear_t clear {.database = database, .outcome = &outcome, .mode = ustore_drop_collection_k};
@@ -74,7 +74,7 @@ struct fixture_t {
         ustore_outcome_t outcome {};
         ustore_collection_create_t create {.database = database,
                                            .outcome = &outcome,
-                                           .name = bytes_of(name),
+                                           .name = util::bytes_of(name),
                                            .modality = modality,
                                            .collection = &collection};
         ustore_collection_create(&create);
@@ -93,7 +93,7 @@ struct tape_t {
         offsets.push_back(static_cast<std::uint32_t>(bytes.size()));
     }
 
-    ustore_strings_view_t view() const noexcept { return utilities::u32_tape(bytes.data(), offsets.data()); }
+    ustore_strings_view_t view() const noexcept { return util::u32_tape(bytes.data(), offsets.data()); }
 };
 
 /** The bytes of @p key. */
@@ -101,7 +101,7 @@ std::string cell_of(ustore_key_t const& key) { return std::string(reinterpret_ca
 
 /** The bytes of string @p index of @p tape. */
 std::string cell_of(ustore_strings_view_t const& tape, std::size_t index) {
-    ustore_bytes_view_t const bytes = tape_string(tape, index);
+    ustore_bytes_view_t const bytes = util::tape_string(tape, index);
     return std::string(reinterpret_cast<char const*>(bytes.data), bytes.length);
 }
 
@@ -245,7 +245,7 @@ bool fill_blobs(ustore_database_t database, ustore_collection_id_t collection, s
     std::vector<ustore_key_t> keys;
     tape_t values;
     for (std::size_t index = 1; index <= count; ++index) {
-        keys.push_back(key_from_integer(index));
+        keys.push_back(util::key_from_integer(index));
         values.push(fmt::format("value-{}", index));
     }
     ustore_outcome_t outcome {};
@@ -266,8 +266,8 @@ struct modality_rows_t {
 
     modality_rows_t(ustore_modality_t modality, std::size_t count) {
         for (std::size_t index = 1; index <= count; ++index) {
-            keys.push_back(key_from_integer(index));
-            targets.push_back(key_from_integer(index + 1));
+            keys.push_back(util::key_from_integer(index));
+            targets.push_back(util::key_from_integer(index + 1));
             if (modality == ustore_modality_docs_k) texts.push(fmt::format("{{\"index\":{}}}", index));
             else if (modality == ustore_modality_pages_k) texts.push(fmt::format("<p>{}</p>", index));
             else texts.push(fmt::format("text-{:03}", index));
@@ -354,7 +354,7 @@ std::optional<std::string> stored_value(ustore_database_t database, ustore_colle
     ustore_blobs_read(&read);
     std::optional<std::string> value;
     if (outcome.status == ustore_status_success_k && presences && (presences[0] & 1)) {
-        ustore_bytes_view_t const bytes = tape_string(values, 0);
+        ustore_bytes_view_t const bytes = util::tape_string(values, 0);
         value.emplace(reinterpret_cast<char const*>(bytes.data), bytes.length);
     }
     ustore_arena_free(arena);
@@ -379,7 +379,8 @@ struct column_t {
 /** Converters read keys and tapes in place at the column's offset, and refuse nulls, dictionaries, views, other
  *  formats, released inputs and missing buffers. */
 void test_arrow_converters(config_t const&) {
-    std::array<ustore_key_t, 3> const keys {key_from_integer(1), key_from_integer(2), key_from_integer(3)};
+    std::array<ustore_key_t, 3> const keys {util::key_from_integer(1), util::key_from_integer(2),
+                                            util::key_from_integer(3)};
     column_t keyed {"w:16", 2, 2};
     keyed.buffers[1] = keys.data();
     keyed.array.offset = 1;
@@ -442,13 +443,13 @@ void test_arrow_docs_columns_export(config_t const& config) {
     std::array<char[64], 10> texts {};
     std::array<std::string_view, 10> documents {};
     for (std::size_t row = 0; row != keys.size(); ++row) {
-        keys[row] = key_from_integer(row + 1);
+        keys[row] = util::key_from_integer(row + 1);
         char* const end = row == 4 ? fmt::format_to(texts[row], R"({{"born": "unknown"}})")
                                    : fmt::format_to(texts[row], R"({{"alive": {}, "born": {}, "name": "n{}"}})",
                                                     row % 3 == 0, 1900 + row, row);
         documents[row] = {texts[row], end};
     }
-    strided_strings<std::string_view> const values {strided(std::as_const(documents)).begin()};
+    util::strided_strings<std::string_view> const values {util::strided(std::as_const(documents)).begin()};
     ustore_outcome_t outcome {};
     ustore_docs_write_t write {.database = fixture.database,
                                .outcome = &outcome,
@@ -460,7 +461,7 @@ void test_arrow_docs_columns_export(config_t const& config) {
     if (!expect_success(outcome)) return;
 
     std::array<std::string_view, 4> const fields {"alive", "born", "name", "name"};
-    strided_strings<std::string_view> const fields_strings {strided(fields).begin()};
+    util::strided_strings<std::string_view> const fields_strings {util::strided(fields).begin()};
     std::array<ustore_docs_field_type_t, 4> const types {ustore_docs_field_type_bool_k, ustore_docs_field_type_u32_k,
                                                          ustore_docs_field_type_string_k,
                                                          ustore_docs_field_type_binary_k};
@@ -523,7 +524,7 @@ void test_arrow_export_refuses_an_entry_without_terminator(config_t const& confi
     ustore_collection_id_t const collection = fixture.create("unterminated", ustore_modality_blobs_k);
     tape_t empty;
     empty.push("");
-    ustore_key_t const key = key_from_integer(1);
+    ustore_key_t const key = util::key_from_integer(1);
     ustore_outcome_t outcome {};
     ustore_blobs_write_t write {.database = fixture.database,
                                 .outcome = &outcome,
@@ -622,7 +623,7 @@ void test_arrow_exports_read_in_place(config_t const& config) {
     expect_equal(key_array.device_type, ARROW_DEVICE_CPU);
 
     // A key outside the arena is refused, while a strided run is carved dense behind the outputs
-    ustore_key_t const outside = key_from_integer(7);
+    ustore_key_t const outside = util::key_from_integer(7);
     ArrowSchema refused_schema {};
     ArrowDeviceArray refused_array {};
     expect_equal(ustore_keys_view_to_arrow({&outside, sizeof(ustore_key_t)}, 1, arena, &refused_schema, &refused_array),
@@ -669,9 +670,9 @@ void test_arrow_exports_read_in_place(config_t const& config) {
     // The far offsets are gathered as a column of their own arena, as an export reads only offsets
     // an arena holds
     ustore_collection_id_t const far_collection = fixture.create("far", ustore_modality_docs_k);
-    std::array<ustore_key_t, 2> const far_keys {key_from_integer(1), key_from_integer(2)};
+    std::array<ustore_key_t, 2> const far_keys {util::key_from_integer(1), util::key_from_integer(2)};
     std::array<std::string_view, 2> const far_documents {R"({"offset": 5368709120})", R"({"offset": 9663676416})"};
-    strided_strings<std::string_view> const far_values {strided(far_documents).begin()};
+    util::strided_strings<std::string_view> const far_values {util::strided(far_documents).begin()};
     ustore_docs_write_t far_write {.database = fixture.database,
                                    .outcome = &outcome,
                                    .count = far_keys.size(),
@@ -681,7 +682,7 @@ void test_arrow_exports_read_in_place(config_t const& config) {
     ustore_docs_write(&far_write);
     expect_success(outcome);
     std::array<std::string_view, 1> const far_fields {"offset"};
-    strided_strings<std::string_view> const far_fields_strings {strided(far_fields).begin()};
+    util::strided_strings<std::string_view> const far_fields_strings {util::strided(far_fields).begin()};
     ustore_docs_field_type_t const far_type = ustore_docs_field_type_u64_k;
     arena_t const far_arena;
     ustore_docs_column_view_t const* far_columns = nullptr;
@@ -722,7 +723,7 @@ void test_arrow_exports_read_in_place(config_t const& config) {
     expect_true(read_keys.data == pulled_keys && key_count == pulled && value_count == pulled);
 
     expect_true(cell_of(read_values, 0) == first_value);
-    expect_true(cell_of(read_keys.data[39]) == cell_of(key_from_integer(40)));
+    expect_true(cell_of(read_keys.data[39]) == cell_of(util::key_from_integer(40)));
     key_array.array.release(&key_array.array);
     expect_true(cell_of(read_values, 39) == "value-40");
     value_array.array.release(&value_array.array);
@@ -735,15 +736,15 @@ void test_arrow_exports_read_in_place(config_t const& config) {
 /** What an ingest of two rows answers on one engine. */
 struct ingest_expectation_t {
     std::string_view engine;
-    status_code_t status;
+    util::status_code_t status;
 };
 
 /** Every engine's answer to an ingest, one row each, so an engine gaining ingests flips its own row alone. */
 constexpr ingest_expectation_t ingest_expectations_k[] {
-    {"ram", status_code_t::success_k},
-    {"rocksdb", status_code_t::unsupported_k},
-    {"leveldb", status_code_t::unsupported_k},
-    {"nvme", status_code_t::success_k},
+    {"ram", util::status_code_t::success_k},
+    {"rocksdb", util::status_code_t::unsupported_k},
+    {"leveldb", util::status_code_t::unsupported_k},
+    {"nvme", util::status_code_t::success_k},
 };
 
 /** An ingest the case frees on destruction. */
@@ -771,7 +772,7 @@ struct ingest_t {
         ustore_ingest_append_t append {.ingest = ingest, .outcome = &appended, .count = count};
         if (modality == ustore_modality_graph_k)
             append.sources = keys, append.targets = {rows.targets.data() + first, sizeof(ustore_key_t)};
-        else append.keys = keys, append.values = tape_slice(rows.texts.view(), first);
+        else append.keys = keys, append.values = util::tape_slice(rows.texts.view(), first);
         ustore_ingest_append(&append);
         return appended;
     }
@@ -794,7 +795,7 @@ bool expect_succeeded(ustore_outcome_t outcome, std::source_location where = std
 /** Whether the engine @p config ingests, as its row of @c ingest_expectations_k says. */
 bool ingests(config_t const& config) noexcept {
     for (ingest_expectation_t const& row : ingest_expectations_k)
-        if (row.engine == config.engine()) return row.status == status_code_t::success_k;
+        if (row.engine == config.engine()) return row.status == util::status_code_t::success_k;
     return false;
 }
 
@@ -811,14 +812,15 @@ case_result_t test_arrow_ingest_per_engine(config_t const& config) {
     if (!fixture.database) return {};
     ustore_collection_id_t const collection = fixture.create("ingested", ustore_modality_blobs_k);
     ingest_t ingest {fixture.database, collection, ustore_ingest_sorted_k};
-    expect_status(status_t {ingest.outcome}, expectation->status);
-    expect_equal(ingest.ingest != nullptr, expectation->status == status_code_t::success_k);
+    expect_status(status_of(ingest.outcome), expectation->status);
+    expect_equal(ingest.ingest != nullptr, expectation->status == util::status_code_t::success_k);
     if (!ingest.ingest) return {};
     modality_rows_t const rows {ustore_modality_blobs_k, 2};
     expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 0, 2));
     expect_succeeded(ingest.finish());
     // A finished ingest takes no more rows
-    expect_status(status_t {ingest.append(ustore_modality_blobs_k, rows, 0, 2)}, status_code_t::invalid_argument_k);
+    expect_status(status_of(ingest.append(ustore_modality_blobs_k, rows, 0, 2)),
+                  util::status_code_t::invalid_argument_k);
     return {};
 }
 
@@ -871,12 +873,12 @@ case_result_t test_arrow_ingest_last_repeat_wins(config_t const& config) {
     if (!fixture.database) return {};
     ustore_collection_id_t const collection = fixture.create("repeated", ustore_modality_blobs_k);
     modality_rows_t rows {ustore_modality_blobs_k, 3};
-    rows.keys = {key_from_integer(7), key_from_integer(7), key_from_integer(7)};
+    rows.keys = {util::key_from_integer(7), util::key_from_integer(7), util::key_from_integer(7)};
     ingest_t ingest {fixture.database, collection, ustore_ingest_unsorted_k};
     expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 0, 2));
     expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 2, 1));
     expect_succeeded(ingest.finish());
-    expect_true(stored_value(fixture.database, collection, key_from_integer(7)) ==
+    expect_true(stored_value(fixture.database, collection, util::key_from_integer(7)) ==
                 std::optional<std::string> {"text-003"});
     return {};
 }
@@ -892,12 +894,14 @@ case_result_t test_arrow_ingest_refuses_a_descending_key(config_t const& config)
     std::reverse(rows.keys.begin() + 2, rows.keys.end());
     ingest_t ingest {fixture.database, collection, ustore_ingest_sorted_k};
     expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 0, 2));
-    expect_status(status_t {ingest.append(ustore_modality_blobs_k, rows, 2, 2)}, status_code_t::invalid_argument_k);
-    expect_status(status_t {ingest.append(ustore_modality_blobs_k, rows, 0, 1)}, status_code_t::invalid_argument_k);
+    expect_status(status_of(ingest.append(ustore_modality_blobs_k, rows, 2, 2)),
+                  util::status_code_t::invalid_argument_k);
+    expect_status(status_of(ingest.append(ustore_modality_blobs_k, rows, 0, 1)),
+                  util::status_code_t::invalid_argument_k);
     expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 3, 1));
     expect_succeeded(ingest.finish());
-    expect_true(!stored_value(fixture.database, collection, key_from_integer(4)).has_value());
-    expect_true(stored_value(fixture.database, collection, key_from_integer(3)) ==
+    expect_true(!stored_value(fixture.database, collection, util::key_from_integer(4)).has_value());
+    expect_true(stored_value(fixture.database, collection, util::key_from_integer(3)) ==
                 std::optional<std::string> {"text-004"});
     return {};
 }
@@ -930,14 +934,14 @@ case_result_t test_arrow_ingest_contends_a_second_append(config_t const& config)
     ingest_t ingest {fixture.database, collection, ustore_ingest_sorted_k};
     ustore_outcome_t nested {};
     reentering_values_t const values {.ingest = ingest.ingest, .value = "outer", .nested = &nested};
-    ustore_key_t const key = key_from_integer(1);
+    ustore_key_t const key = util::key_from_integer(1);
     ustore_outcome_t appended {};
     ustore_ingest_append_t append {.ingest = ingest.ingest, .outcome = &appended, .count = 1, .keys = {&key, 0}};
     append.values.layout = ustore_strings_accessor_k;
     append.values.data.accessor = {.get = &append_from_accessor, .handle = &values};
     ustore_ingest_append(&append);
     expect_succeeded(appended);
-    expect_status(status_t {nested}, status_code_t::contended_k);
+    expect_status(status_of(nested), util::status_code_t::contended_k);
     expect_succeeded(ingest.finish());
     expect_true(stored_value(fixture.database, collection, key) == std::optional<std::string> {"outer"});
     return {};
@@ -953,7 +957,7 @@ case_result_t test_arrow_ingest_contends_a_clear(config_t const& config) {
     ustore_collection_id_t const collection = fixture.create("cleared", ustore_modality_blobs_k);
     modality_rows_t const rows {ustore_modality_blobs_k, 2};
     fill(fixture.database, collection, ustore_modality_blobs_k, rows);
-    std::optional<std::string> const before = stored_value(fixture.database, collection, key_from_integer(1));
+    std::optional<std::string> const before = stored_value(fixture.database, collection, util::key_from_integer(1));
     ingest_t ingest {fixture.database, collection, ustore_ingest_unsorted_k};
     expect_succeeded(ingest.outcome);
     expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 0, 2));
@@ -961,7 +965,7 @@ case_result_t test_arrow_ingest_contends_a_clear(config_t const& config) {
         ustore_outcome_t cleared {};
         ustore_database_clear_t clear {.database = fixture.database, .outcome = &cleared, .mode = mode};
         ustore_database_clear(&clear);
-        expect_status(status_t {cleared}, status_code_t::contended_k);
+        expect_status(status_of(cleared), util::status_code_t::contended_k);
     }
     ustore_outcome_t created {};
     ustore_collection_id_t made {};
@@ -971,23 +975,23 @@ case_result_t test_arrow_ingest_contends_a_clear(config_t const& config) {
                                        .modality = ustore_modality_blobs_k,
                                        .collection = &made};
     ustore_collection_create(&create);
-    expect_status(status_t {created}, status_code_t::contended_k);
+    expect_status(status_of(created), util::status_code_t::contended_k);
     ustore_outcome_t dropped {};
     ustore_collection_drop_t drop {.database = fixture.database,
                                    .outcome = &dropped,
                                    .collection = collection,
                                    .mode = ustore_drop_pairs_k};
     ustore_collection_drop(&drop);
-    expect_status(status_t {dropped}, status_code_t::contended_k);
+    expect_status(status_of(dropped), util::status_code_t::contended_k);
     ustore_outcome_t flushed {};
     ustore_database_flush_t flush {.database = fixture.database, .outcome = &flushed};
     ustore_database_flush(&flush);
-    expect_status(status_t {flushed}, status_code_t::contended_k);
+    expect_status(status_of(flushed), util::status_code_t::contended_k);
     ustore_outcome_t compacted {};
     ustore_database_compact_t compact {.database = fixture.database, .outcome = &compacted};
     ustore_database_compact(&compact);
-    expect_status(status_t {compacted}, status_code_t::contended_k);
-    expect_true(stored_value(fixture.database, collection, key_from_integer(1)) == before);
+    expect_status(status_of(compacted), util::status_code_t::contended_k);
+    expect_true(stored_value(fixture.database, collection, util::key_from_integer(1)) == before);
     expect_succeeded(ingest.finish());
     ustore_database_flush(&flush);
     expect_succeeded(flushed);
@@ -1009,7 +1013,7 @@ case_result_t test_arrow_ingest_freed_lands_nothing(config_t const& config) {
         ingest_t ingest {fixture.database, collection, ustore_ingest_sorted_k};
         expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 0, 2));
     }
-    expect_true(!stored_value(fixture.database, collection, key_from_integer(1)).has_value());
+    expect_true(!stored_value(fixture.database, collection, util::key_from_integer(1)).has_value());
     return {};
 }
 
@@ -1032,10 +1036,10 @@ case_result_t test_arrow_ingest_spares_older_snapshots(config_t const& config) {
         expect_succeeded(ingest.append(ustore_modality_blobs_k, rows, 0, 2));
         expect_succeeded(ingest.finish());
     }
-    std::optional<std::string> const before = stored_value(fixture.database, collection, key_from_integer(1),
+    std::optional<std::string> const before = stored_value(fixture.database, collection, util::key_from_integer(1),
                                                            ustore_snapshot_view(snapshot));
     expect_true(before == std::optional<std::string> {"value-1"});
-    expect_true(stored_value(fixture.database, collection, key_from_integer(1)) ==
+    expect_true(stored_value(fixture.database, collection, util::key_from_integer(1)) ==
                 std::optional<std::string> {"text-001"});
     ustore_snapshot_free(snapshot);
     return {};
@@ -1052,7 +1056,7 @@ case_result_t test_arrow_ingest_conflicts_older_transactions(config_t const& con
     ustore_transaction_init_t init {.transaction = &transaction, .database = fixture.database, .outcome = &outcome};
     ustore_transaction_init(&init);
     if (!expect_success(outcome)) return {};
-    ustore_key_t const key = key_from_integer(1);
+    ustore_key_t const key = util::key_from_integer(1);
     tape_t values;
     values.push("staged");
     ustore_blobs_write_t write {.database = fixture.database,
@@ -1073,7 +1077,7 @@ case_result_t test_arrow_ingest_conflicts_older_transactions(config_t const& con
     }
     ustore_transaction_commit_t commit {.database = fixture.database, .outcome = &outcome, .transaction = transaction};
     ustore_transaction_commit(&commit);
-    expect_status(status_t {outcome}, status_code_t::write_conflict_k);
+    expect_status(status_of(outcome), util::status_code_t::write_conflict_k);
     ustore_transaction_free(transaction);
     return {};
 }
@@ -1083,12 +1087,12 @@ case_result_t test_arrow_ingest_conflicts_older_transactions(config_t const& con
 int main(int argc, char** argv) {
     start_test_run(argc, argv);
 
-    auto const maybe_test_directory = scratch_directory_t::make(test_run.settings.directory);
-    if (!maybe_test_directory) {
+    auto [scratch, scratch_status] = scratch_directory_t::make(test_run.settings.directory);
+    if (st::failed(scratch_status)) {
         fmt::println(stderr, "Cannot create a unique directory under {}", test_run.settings.directory);
         return 1;
     }
-    char const* const directory = maybe_test_directory->path();
+    char const* const directory = scratch.path();
     if (directory) fmt::println("Will work in directory: {}", directory);
     else fmt::println("Will work with default configuration");
     config_t const config {test_run.settings.engine, directory};

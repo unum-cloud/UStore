@@ -23,8 +23,8 @@
 
 namespace unum::ustore {
 
-using utilities::gpu_drivers_t;
-using utilities::gpu_executor_concept;
+using util::gpu_drivers_t;
+using util::gpu_executor_concept;
 
 /** Where one input of a device call lives. */
 enum class residence_t : std::uint8_t {
@@ -48,8 +48,8 @@ residence_t residence_of(gpu_drivers_t const& drivers, executor_type_ const& exe
     if (device >= 0)
         return device == static_cast<int>(executor.device().vendor_ordinal) ? residence_t::executor_device_k
                                                                             : residence_t::other_device_k;
-    return utilities::on_another_vendor<executor_type_>(drivers, pointer) ? residence_t::other_device_k
-                                                                          : residence_t::host_k;
+    return util::on_another_vendor<executor_type_>(drivers, pointer) ? residence_t::other_device_k
+                                                                     : residence_t::host_k;
 }
 
 /** Moves the inputs of one call on @p executor_type_ to the host: each is classified once, and one on the executor's
@@ -68,10 +68,10 @@ class input_stager {
         residence_t const residence = residence_of(drivers_, executor_, data);
         if (residence == residence_t::host_k) return data;
         if (residence == residence_t::other_device_k) {
-            status_ = {status_code_t::device_k, "An input lives on a device the executor does not compute on"};
+            status_ = {util::status_code_t::device_k, "An input lives off the executor's device"};
             return data;
         }
-        auto [copy, copy_status] = utilities::arena_allocate<byte_t>(executor_.bounce(), bytes);
+        auto [copy, copy_status] = util::arena_allocate<byte_t>(executor_.bounce(), bytes);
         if (copy_status.failed()) {
             status_ = copy_status;
             return data;
@@ -79,7 +79,7 @@ class input_stager {
         if ((status_ = executor_.pin_bounce()).failed()) return data;
         status_ = executor_.download_async(copy, reinterpret_cast<std::uintptr_t>(data));
         ++pending_;
-        return elements_of<element_type_>(copy).data();
+        return util::elements_of<element_type_>(copy).data();
     }
 
     /** Repoints the strided @p column at a host copy of its @p count elements, its stride apart or
@@ -99,7 +99,7 @@ class input_stager {
     }
 
     /** Waits for every download still queued, answering the first failure of the staging. */
-    status_t finish() noexcept {
+    util::status_t finish() noexcept {
         if (status_.failed() || !pending_) return status_;
         pending_ = 0;
         return executor_.wait();
@@ -117,7 +117,7 @@ class input_stager {
 
     gpu_drivers_t const& drivers_;
     executor_type_& executor_;
-    status_t status_;
+    util::status_t status_;
 
     /** Downloads queued since the last wait. */
     std::size_t pending_ = 0;
@@ -126,7 +126,8 @@ class input_stager {
 /** Moves every input of @p arguments, a call on @p executor, to the host as @c input_stager does, finding them by the
  *  names the argument structures give them, and waits once for what it downloaded. */
 template <gpu_executor_concept executor_type_, typename arguments_type_>
-status_t stage_inputs(gpu_drivers_t const& drivers, executor_type_& executor, arguments_type_& arguments) noexcept {
+util::status_t stage_inputs(gpu_drivers_t const& drivers, executor_type_& executor,
+                            arguments_type_& arguments) noexcept {
     input_stager<executor_type_> stager {drivers, executor};
     std::size_t const count = static_cast<std::size_t>(arguments.count);
     stager.stage(arguments.collections, count);

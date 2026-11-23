@@ -337,14 +337,14 @@ status_t assemble_tape(executor_type_& executor, std::span<tape_source_t const> 
     static_assert(std::is_same_v<offset_type_, std::uint32_t> || std::is_same_v<offset_type_, std::uint64_t>,
                   "A tape's offsets take 32 or 64 bits");
     if (offsets.size() != sources.size() + 1)
-        return {status_code_t::invalid_argument_k, "A tape takes one offset per string and one more"};
+        return {status_code_t::invalid_argument_k, "A tape needs offsets, one past strings"};
     if (!executor.kernels()) return {status_code_t::device_k, "The device holds no kernels of the library"};
     std::size_t const segments_count = divide_round_up(sources.size(), std::size_t {tape_sources_per_segment_k});
     tape_segment_t* segments = nullptr;
     if (segments_count) {
-        expected<std::uintptr_t> allocated = executor.allocate_async(segments_count * sizeof(tape_segment_t));
-        if (!allocated) return allocated.status();
-        segments = reinterpret_cast<tape_segment_t*>(*allocated);
+        auto const [allocated, allocate_status] = executor.allocate_async(segments_count * sizeof(tape_segment_t));
+        if (allocate_status.failed()) return allocate_status;
+        segments = reinterpret_cast<tape_segment_t*>(allocated);
     }
     char const* const offsets_kernel = std::is_same_v<offset_type_, std::uint32_t> ? "ustore_tape_offsets_u32"
                                                                                    : "ustore_tape_offsets_u64";
@@ -375,7 +375,7 @@ expected<std::span<element_type_>> carve_runs(device_blocks_t& blocks, executor_
     std::uintptr_t address = bump(blocks, padded);
     if (!address) {
         if (blocks.count == blocks.blocks.size())
-            return status_t {status_code_t::out_of_memory_k, "The device arena lists as many runs as it holds"};
+            return status_t {status_code_t::out_of_memory_k, "The device arena lists every run it holds"};
         std::size_t capacity = grown_capacity(blocks, padded);
         if (std::size_t const limit = executor.scratch_limit(); limit) {
             std::size_t held = 0;
@@ -385,9 +385,9 @@ expected<std::span<element_type_>> carve_runs(device_blocks_t& blocks, executor_
                 return status_t {status_code_t::out_of_memory_k, "The carve passes the executor's scratch limit"};
             capacity = fu::min_of(capacity, left);
         }
-        expected<std::uintptr_t> opened = allocate(capacity);
-        if (!opened) return opened.status();
-        blocks.blocks[blocks.count++] = {*opened, capacity};
+        auto const [opened, allocate_status] = allocate(capacity);
+        if (allocate_status.failed()) return allocate_status;
+        blocks.blocks[blocks.count++] = {opened, capacity};
         blocks.used = 0;
         address = bump(blocks, padded);
     }

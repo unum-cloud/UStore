@@ -196,7 +196,7 @@ expected<std::span<element_type_>> carve(host_blocks_t& blocks, std::size_t coun
                                                           arena_page_bytes_k);
         void* memory = nullptr;
         if (fu_allocate_on_domain_id(blocks.memory_domain, capacity, &memory) != fu_success_k || !memory)
-            return status_t {status_code_t::out_of_memory_k, "Failed to allocate arena memory"};
+            return status_t {status_code_t::out_of_memory_k, "No room for the arena pages"};
         blocks.newest = new (memory) arena_block_t {newest, capacity, sizeof(arena_block_t)};
         bytes = arena_bump(*blocks.newest, length, alignment);
     }
@@ -776,7 +776,7 @@ class local_arena_t {
 /** The status of growing a SmashTable container, which fails only when its allocator runs out of memory. */
 inline status_t growth_status(st::status_t status) noexcept {
     if (st::succeeded(status)) return {};
-    return {status_code_t::out_of_memory_k, "Failed to grow a container"};
+    return {status_code_t::out_of_memory_k, "No room to grow the container"};
 }
 
 /**

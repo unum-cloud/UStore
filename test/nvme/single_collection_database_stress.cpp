@@ -34,7 +34,6 @@ namespace unum::ustore::test {
 using namespace unum::ustore::test::nvme;
 
 using namespace unum::ustore::blobs;
-using namespace unum::ustore::utilities;
 
 #pragma region Shape
 
@@ -76,7 +75,7 @@ struct stress_stack {
     std::unique_ptr<volume_t> volume;
 
     /** The channel of the calling thread, which every read of this stack takes. */
-    [[nodiscard]] io_channel_t& channel() noexcept { return reading.channel(); }
+    [[nodiscard]] util::io_channel_t& channel() noexcept { return reading.channel(); }
 };
 
 /**
@@ -105,11 +104,12 @@ struct stress_stack {
 
 /** Mounts a fixture through @p mount, takes the three channels a case needs and formats one volume over them. */
 template <typename mount_type_>
-expected<std::unique_ptr<stress_stack<typename mount_type_::fixture_t>>> make_stack(mount_type_ const& mount) noexcept {
+util::expected<std::unique_ptr<stress_stack<typename mount_type_::fixture_t>>> make_stack(
+    mount_type_ const& mount) noexcept {
     using stack_t = stress_stack<typename mount_type_::fixture_t>;
     using volume_t = typename stack_t::volume_t;
     auto stack = std::unique_ptr<stack_t> {new (std::nothrow) stack_t {}};
-    if (!stack) return status_t {status_code_t::out_of_memory_k, "The stack did not fit"};
+    if (!stack) return util::status_t {util::status_code_t::out_of_memory_k, "The stack did not fit"};
 
     auto [fixture, mount_status] = mount();
     if (mount_status.failed()) return mount_status;
@@ -125,10 +125,10 @@ expected<std::unique_ptr<stress_stack<typename mount_type_::fixture_t>>> make_st
     if (acquire_reading_status.failed()) return acquire_reading_status;
     stack->reading = std::move(reading);
 
-    expected<volume_t> volume = stack->fixture->mount_volume(stack->writing.channel());
-    if (!volume) return volume.status();
-    stack->volume = std::unique_ptr<volume_t> {new (std::nothrow) volume_t {std::move(*volume)}};
-    if (!stack->volume) return status_t {status_code_t::out_of_memory_k, "The volume did not fit"};
+    auto [volume, mount_volume_status] = stack->fixture->mount_volume(stack->writing.channel());
+    if (mount_volume_status.failed()) return mount_volume_status;
+    stack->volume = std::unique_ptr<volume_t> {new (std::nothrow) volume_t {std::move(volume)}};
+    if (!stack->volume) return util::status_t {util::status_code_t::out_of_memory_k, "The volume did not fit"};
     return stack;
 }
 
@@ -138,7 +138,7 @@ expected<std::unique_ptr<stress_stack<typename mount_type_::fixture_t>>> make_st
 
 /** Reads every key of @p wanted through one batched select and counts what the model disagrees with. */
 template <typename database_type_>
-void check_model(database_type_ const& store, io_channel_t& channel, std::span<expectation_t const> wanted) {
+void check_model(database_type_ const& store, util::io_channel_t& channel, std::span<expectation_t const> wanted) {
     std::size_t const count = wanted.size();
     st::vector<stored_key_t> keys;
     st::vector<lookup_result_t> results;
@@ -153,7 +153,7 @@ void check_model(database_type_ const& store, io_channel_t& channel, std::span<e
     }
 
     std::size_t mismatches = 0;
-    auto sink = [&](std::size_t request, std::uint64_t offset, std::span<byte_t const> bytes) noexcept {
+    auto sink = [&](std::size_t request, std::uint64_t offset, std::span<util::byte_t const> bytes) noexcept {
         seen[request] += bytes.size();
         for (std::size_t index = 0; index != bytes.size(); ++index)
             if (bytes[index] != painted(wanted[request].seed, offset + index)) ++mismatches;
@@ -189,18 +189,17 @@ void concurrent_operations_keep_their_values(mount_type_ const& mount, stored_va
     using volume_t = typename stack_t::volume_t;
     using database_t = basic_single_collection_database<
         typename key_slot_type_::stored_key_t, volume_t, atomic_reference, waiter_t,
-        nvme_store<key_slot_type_, volume_t, atomic_reference, waiter_t, last_write_fold_t, no_device_fold_t>>;
+        nvme_store<key_slot_type_, volume_t, atomic_reference, waiter_t, util::last_write_fold_t, no_device_fold_t>>;
 
-    expected<std::unique_ptr<stack_t>> stack = make_stack(mount);
-    expect_status(stack, status_code_t::success_k);
-    if (!stack) return;
+    auto [stack, make_status] = make_stack(mount);
+    expect_status(make_status, util::status_code_t::success_k);
+    if (make_status.failed()) return;
 
-    expected<typename database_t::database_unique_ptr_t> store = database_t::open(
-        *(*stack)->volume, (*stack)->writing.channel(), (*stack)->merging.channel(),
-        stress_config(value_size, value_max_size), (*stack)->fixture->resources);
-    expect_true(store.has_value());
-    if (!store) return;
-    stored_value_size_t const widest = (*store)->value_max_size();
+    auto [store, open_status] = database_t::open(*stack->volume, stack->writing.channel(), stack->merging.channel(),
+                                                 stress_config(value_size, value_max_size), stack->fixture->resources);
+    expect_true(open_status.succeeded());
+    if (open_status.failed()) return;
+    stored_value_size_t const widest = store->value_max_size();
 
     std::array<st::vector<expectation_t>, worker_threads_k> models;
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker) {
@@ -210,30 +209,30 @@ void concurrent_operations_keep_their_values(mount_type_ const& mount, stored_va
     }
 
     // Every key starts written and flushed, so the reads below reach the runs as well as the memory runs.
-    st::vector<byte_t> first;
+    st::vector<util::byte_t> first;
     if (!expect_true(first.resize(widest) == st::status_t::success_k)) return;
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker)
         for (expectation_t& entry : models[worker]) {
             entry.state = lookup_result_t::written_k;
             entry.bytes = value_size != 0 ? value_size : 1 + entry.stored_key % widest;
             entry.seed = entry.stored_key + widest;
-            std::span<byte_t> const painted_value {first.data(), static_cast<std::size_t>(entry.bytes)};
+            std::span<util::byte_t> const painted_value {first.data(), static_cast<std::size_t>(entry.bytes)};
             paint_into(entry, painted_value);
-            expect_status((*store)->insert(entry.stored_key, std::span<byte_t const> {painted_value}),
-                          status_code_t::success_k);
+            expect_status(store->insert(entry.stored_key, std::span<util::byte_t const> {painted_value}),
+                          util::status_code_t::success_k);
         }
-    if (!expect_true((*store)->flush().succeeded())) return;
+    if (!expect_true(store->flush().succeeded())) return;
 
     std::array<std::thread, worker_threads_k> workers;
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker)
         workers[worker] = std::thread {[&, worker]() noexcept {
-            expected<guard_t> guard = (*stack)->fixture->channels.acquire();
-            expect_true(guard.has_value());
-            if (!guard) return;
+            auto [guard, acquire_status] = stack->fixture->channels.acquire();
+            expect_true(acquire_status.succeeded());
+            if (acquire_status.failed()) return;
 
             split_mix_generator_t random {case_stream_key(worker)};
             st::vector<expectation_t>& model = models[worker];
-            st::vector<byte_t> value;
+            st::vector<util::byte_t> value;
             if (!expect_true(value.resize(widest) == st::status_t::success_k)) return;
 
             for (std::size_t operation = 0; operation != operations_per_worker_k; ++operation) {
@@ -247,7 +246,8 @@ void concurrent_operations_keep_their_values(mount_type_ const& mount, stored_va
                     bool const owned = anywhere / keys_per_worker_k == worker;
                     stored_key_t const key = owned ? entry.stored_key : anywhere;
                     stored_value_size_t size = 0;
-                    status_t const read = (*store)->select(guard->channel(), key, std::span<byte_t> {value}, size);
+                    util::status_t const read = store->select(guard.channel(), key, std::span<util::byte_t> {value},
+                                                              size);
                     if (read.succeeded()) {
                         if (owned) {
                             expect_true(entry.state == lookup_result_t::written_k);
@@ -257,7 +257,7 @@ void concurrent_operations_keep_their_values(mount_type_ const& mount, stored_va
                         }
                     }
                     else {
-                        expect_true(read == status_code_t::not_found_k);
+                        expect_true(read == util::status_code_t::not_found_k);
                         if (owned) expect_true(entry.state != lookup_result_t::written_k);
                     }
                 }
@@ -265,15 +265,15 @@ void concurrent_operations_keep_their_values(mount_type_ const& mount, stored_va
                     entry.state = lookup_result_t::written_k;
                     entry.bytes = value_size != 0 ? value_size : 1 + random.below(widest);
                     entry.seed = random();
-                    std::span<byte_t> const painted_value {value.data(), static_cast<std::size_t>(entry.bytes)};
+                    std::span<util::byte_t> const painted_value {value.data(), static_cast<std::size_t>(entry.bytes)};
                     paint_into(entry, painted_value);
-                    expect_status((*store)->insert(entry.stored_key, std::span<byte_t const> {painted_value}),
-                                  status_code_t::success_k);
+                    expect_status(store->insert(entry.stored_key, std::span<util::byte_t const> {painted_value}),
+                                  util::status_code_t::success_k);
                 }
                 else {
                     entry.state = lookup_result_t::removed_k;
                     entry.bytes = 0;
-                    expect_status((*store)->remove(entry.stored_key), status_code_t::success_k);
+                    expect_status(store->remove(entry.stored_key), util::status_code_t::success_k);
                 }
             }
         }};
@@ -281,10 +281,10 @@ void concurrent_operations_keep_their_values(mount_type_ const& mount, stored_va
 
     // Once with the last writes still in memory runs, and once more out of the runs alone.
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker)
-        check_model(**store, (*stack)->channel(), std::span<expectation_t const> {models[worker]});
-    expect_true((*store)->flush().succeeded());
+        check_model(*store, stack->channel(), std::span<expectation_t const> {models[worker]});
+    expect_true(store->flush().succeeded());
     for (std::size_t worker = 0; worker != worker_threads_k; ++worker)
-        check_model(**store, (*stack)->channel(), std::span<expectation_t const> {models[worker]});
+        check_model(*store, stack->channel(), std::span<expectation_t const> {models[worker]});
 }
 
 /** Values of up to 12 bytes kept inside the key slots. */
@@ -318,8 +318,8 @@ int main(int argc, char** argv) {
 
     start_test_run(argc, argv);
 
-    st::expected<scratch_directory_t> const directory = scratch_directory_t::make(test_run.settings.directory);
-    if (!directory) {
+    auto [directory, directory_status] = scratch_directory_t::make(test_run.settings.directory);
+    if (st::failed(directory_status)) {
         fmt::println(stderr, "  the working directory would not open");
         return 1;
     }
@@ -330,7 +330,7 @@ int main(int argc, char** argv) {
         report_on_mount(mount, "test_variable_width_keeps_its_values", test_variable_width_keeps_its_values);
     };
     for (transport_t const transport : every_transport_k)
-        run_on_transport(transport, directory->path(), stress_config_k, 1, "single_collection_database_stress", cases);
+        run_on_transport(transport, directory.path(), stress_config_k, 1, "single_collection_database_stress", cases);
 
     return finish_test_run();
 }

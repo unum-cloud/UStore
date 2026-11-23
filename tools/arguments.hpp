@@ -560,13 +560,13 @@ struct spelling_t {
 } // namespace unum::ustore::tools
 
 /** The short spelling the foreign specialization below reaches the project's types through. */
-namespace ustore = unum::ustore;
+namespace us = unum::ustore;
 
-/** Spells a @ref ustore::tools::bytes_t as a user types it, in the largest binary suffix dividing
+/** Spells a @ref us::tools::bytes_t as a user types it, in the largest binary suffix dividing
  *  it, like "256M". */
 template <>
-struct fmt::formatter<ustore::tools::bytes_t> : fmt::formatter<std::string_view> {
-    auto format(ustore::tools::bytes_t size, fmt::format_context& context) const {
+struct fmt::formatter<us::tools::bytes_t> : fmt::formatter<std::string_view> {
+    auto format(us::tools::bytes_t size, fmt::format_context& context) const {
         constexpr std::array<char const*, 5> suffixes {"", "K", "M", "G", "T"};
         std::size_t bytes = size.value, power = 0;
         while (power + 1 != suffixes.size() && bytes && bytes % 1024 == 0) bytes /= 1024, ++power;
@@ -631,12 +631,12 @@ inline constexpr std::size_t nvme_manifest_capacity_k = 4096;
  *  @c <directory>/ustore.ustore.json for a plain directory, and @p directory itself for a raw
  *  address or a path to a manifest. */
 inline std::string_view nvme_manifest_in(std::string_view directory, std::span<char> into) noexcept {
-    auto const [address, address_status] = utilities::parse_data_address(directory);
-    bool const named = address_status.failed() || address.kind != utilities::data_address_kind_t::directory_k ||
-                       directory.ends_with(utilities::manifest_suffix_k);
+    auto const [address, address_status] = util::parse_data_address(directory);
+    bool const named = address_status.failed() || address.kind != util::data_address_kind_t::directory_k ||
+                       directory.ends_with(util::manifest_suffix_k);
     auto const written = named ? fmt::format_to_n(into.data(), into.size() - 1, "{}", directory)
                                : fmt::format_to_n(into.data(), into.size() - 1, "{}/{}{}", directory,
-                                                  nvme_database_name_k, utilities::manifest_suffix_k);
+                                                  nvme_database_name_k, util::manifest_suffix_k);
     *written.out = '\0';
     return std::string_view {into.data(), static_cast<std::size_t>(written.out - into.data())};
 }

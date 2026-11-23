@@ -175,7 +175,7 @@ template <typename database_type_>
 status_t settle(database_type_& database) noexcept {
     if (status_t const flushed = database.flush(); flushed.failed()) return flushed;
     while (database.needs_compaction())
-        if (expected<compaction_outcome_t> const merged = database.compact(); !merged) return merged.status();
+        if (auto const [outcome, status] = database.compact(); status.failed()) return status;
     return {};
 }
 
@@ -186,9 +186,9 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources,
                   nvme_single_collection_database_settings_t const& settings, workload_t const& workload) noexcept {
     using volume_t = typename mount_type_::volume_t;
     using slot_t = key_slot<stored_key_t, layout_>;
-    using store_t = nvme_store<slot_t, volume_t, atomic_reference, waiter_t, last_write_fold_t, no_device_fold_t>;
+    using store_t = nvme_store<slot_t, volume_t, atomic_reference, waiter_t, util::last_write_fold_t, no_device_fold_t>;
     using cursor_t =
-        nvme_store_cursor<slot_t, volume_t, atomic_reference, waiter_t, last_write_fold_t, no_device_fold_t>;
+        nvme_store_cursor<slot_t, volume_t, atomic_reference, waiter_t, util::last_write_fold_t, no_device_fold_t>;
     using database_t = basic_single_collection_database<stored_key_t, volume_t, atomic_reference, waiter_t, store_t>;
 
     auto [writing, writing_status] = mount.channels().acquire();
@@ -199,9 +199,9 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources,
     auto [database, open_status] = database_t::open(volume, writing.channel(), merging.channel(),
                                                     database_config(workload), resources);
     if (open_status.failed()) return open_status;
-    auto maybe_executor = executor_t::make(workload.threads, caller_exclusivity_t::caller_inclusive_k);
-    if (!maybe_executor) return {status_code_t::out_of_memory_k, "The executor did not start"};
-    executor_t& executor = *maybe_executor;
+    auto [executor, executor_status] = util::executor_t::make(workload.threads,
+                                                              util::caller_exclusivity_t::caller_inclusive_k);
+    if (st::failed(executor_status)) return {status_code_t::out_of_memory_k, "The executor did not start"};
 
     // Inline and fixed layouts write values of their whole width, and the variable one draws a
     // width per key
@@ -286,7 +286,7 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources,
             st::vector<byte_t> value;
             if (reading_status.failed() || st::failed(value.resize(value_max_size)))
                 return loop.skip("no channel or no memory for a value");
-            utilities::local_arena_t walk;
+            util::local_arena_t walk;
             expected<cursor_t> cursor = cursor_t::over(database->records(), walk.allocator().arena);
             if (!cursor) return loop.skip("the cursor did not open");
             for ([[maybe_unused]] std::size_t call : loop) {
@@ -325,8 +325,8 @@ status_t run_workload(nvme_single_collection_database_settings_t const& settings
     resources_config_t config;
     config.threads = workload.threads;
     config.shared_io_channels = 3;
-    config.io_transport = static_cast<io_transport_t>(settings.transport.selected);
-    data_directory_config_t data;
+    config.io_transport = static_cast<util::io_transport_t>(settings.transport.selected);
+    util::data_directory_config_t data;
     data.max_size = settings.volume_size.value;
     if (sz::failed(config.manifest.assign(string_view_t {manifest})) ||
         sz::failed(data.path.assign(string_view_t {directory})) ||
@@ -335,9 +335,8 @@ status_t run_workload(nvme_single_collection_database_settings_t const& settings
 
     status_t ran;
     {
-        expected<resources_ptr_t> opened = open_resources<atomic_reference, waiter_t>(config);
-        if (!opened) return opened.status();
-        resources_ptr_t const resources = std::move(*opened);
+        auto const [resources, open_status] = open_resources<atomic_reference, waiter_t>(config);
+        if (open_status.failed()) return open_status;
         fmt::println("- {}: {} transport, {} threads, {} keys", workload.name,
                      storage_transport_names_k[static_cast<std::size_t>(resources->storage.report().transport)],
                      workload.threads, workload.population_count);
@@ -398,7 +397,7 @@ int main(int argc, char** argv) {
         default: break;
         }
         if (ran.failed()) {
-            fmt::println(stderr, "{}: {}", workload.name, ran.message);
+            fmt::println(stderr, "{}: {}", workload.name, ran.note);
             exit_code = 1;
         }
     }

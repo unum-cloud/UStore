@@ -295,16 +295,16 @@ class page_view_t {
                 record.attributes_count > view.attributes_count_ - record.first_attribute)
                 return status_t {status_code_t::malformed_k, "A page record's attributes overrun the page"};
             if (record.kind != element_kind_t::element_k && (record.attributes_count || record.subtree_size != 1))
-                return status_t {status_code_t::malformed_k, "A text or comment record holds attributes or children"};
+                return status_t {status_code_t::malformed_k, "A text or comment holds attributes or children"};
             std::uint32_t const directed = load_u32(view.directory_ + std::size_t(position) * page_directory_bytes_k +
                                                     16);
             if (directed >= view.count_ || !(view.record(directed).key == view.directory_key(position)))
                 return status_t {status_code_t::malformed_k, "A directory entry disagrees with its record"};
             if (position && !(view.directory_key(position - 1) < view.directory_key(position)))
-                return status_t {status_code_t::malformed_k, "A page directory is unsorted or repeats a key"};
+                return status_t {status_code_t::malformed_k, "A page directory is unsorted or repeating"};
         }
         if (view.record(0).subtree_size != view.count_ || view.record(0).kind != element_kind_t::element_k)
-            return status_t {status_code_t::malformed_k, "A page root must be an element spanning the page"};
+            return status_t {status_code_t::malformed_k, "A page root must be an element"};
         for (std::uint32_t index = 0; index != view.attributes_count_; ++index) {
             page_attribute_t const attribute = view.attribute(index);
             if (!spans_inside(attribute.name, view.strings_length_) ||
@@ -695,13 +695,13 @@ class element_tree {
                                                                           ? after
                                                                           : copies[source.previous_sibling])
                                                                    : elements_[holder].last_child;
-            auto copy = link(holder, previous, source.key, source.kind, fragment.string(source.name),
-                             fragment.string(source.text), placement);
-            if (!copy) return copy.status();
-            copies[at] = *copy;
+            auto [copy, copy_status] = link(holder, previous, source.key, source.kind, fragment.string(source.name),
+                                            fragment.string(source.text), placement);
+            if (copy_status.failed()) return copy_status;
+            copies[at] = copy;
             for (element_index_t attribute = source.first_attribute; attribute != no_element_k;
                  attribute = fragment.attribute(attribute).next)
-                if (status_t status = set_attribute(*copy, fragment.string(fragment.attribute(attribute).name),
+                if (status_t status = set_attribute(copy, fragment.string(fragment.attribute(attribute).name),
                                                     fragment.string(fragment.attribute(attribute).value));
                     status.failed())
                     return status;
@@ -820,7 +820,7 @@ class element_tree {
     expected<std::span<byte_t const>> encode(output_allocator_type_& allocator) noexcept {
         std::uint64_t const size = encoded_size();
         byte_t* const block = allocator.allocate(std::size_t(size));
-        if (!block) return status_t {status_code_t::out_of_memory_k, "Failed to allocate a page"};
+        if (!block) return status_t {status_code_t::out_of_memory_k, "No room for the encoded page"};
         if (status_t status = encode_into({block, std::size_t(size)}); status.failed()) {
             allocator.deallocate(block, std::size_t(size));
             return status;
@@ -830,12 +830,12 @@ class element_tree {
 
     /** Replaces the tree with the dense form in @p bytes, refusing malformed bytes with the tree left empty. */
     status_t decode(std::span<byte_t const> bytes) noexcept {
-        auto view = page_view_t::make(bytes);
-        if (!view) {
+        auto [view, view_status] = page_view_t::make(bytes);
+        if (view_status.failed()) {
             elements_.clear();
-            return view.status();
+            return view_status;
         }
-        return decode(*view);
+        return decode(view);
     }
 
     /** Replaces the tree with what @p view holds. */
@@ -873,18 +873,18 @@ class element_tree {
                 elements_.clear();
                 return {status_code_t::malformed_k, "A page subtree overruns its parent"};
             }
-            auto added = append(open.back().index, record.key, record.kind, view.string(record.name),
-                                view.string(record.text), record.placement);
-            if (!added) {
+            auto [added, added_status] = append(open.back().index, record.key, record.kind, view.string(record.name),
+                                                view.string(record.text), record.placement);
+            if (added_status.failed()) {
                 elements_.clear();
-                return added.code() == status_code_t::out_of_memory_k
-                           ? added.status()
+                return added_status.code == status_code_t::out_of_memory_k
+                           ? added_status
                            : status_t {status_code_t::malformed_k, "A page repeats or nils a key"};
             }
-            if (status_t status = copy_attributes(*added, record); status.failed()) return elements_.clear(), status;
+            if (status_t status = copy_attributes(added, record); status.failed()) return elements_.clear(), status;
             if (record.subtree_size > 1) [[maybe_unused]]
                 auto const pushed_child = open.push_back(st::assume_reserved,
-                                                         open_t {*added, position + record.subtree_size});
+                                                         open_t {added, position + record.subtree_size});
         }
         return {};
     }

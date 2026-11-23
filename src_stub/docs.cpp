@@ -1455,7 +1455,6 @@ struct ustore_docs_cursor_handle_t {
 };
 
 void ustore_docs_write(ustore_docs_write_t* arguments) {
-    if (submitted<&ustore_docs_write>(arguments)) return;
     call_t call(arguments->outcome);
     if (refuse_database(call, arguments->database)) return;
     std::size_t const count = arguments->count;
@@ -1529,7 +1528,6 @@ void ustore_docs_write(ustore_docs_write_t* arguments) {
 }
 
 void ustore_docs_read(ustore_docs_read_t* arguments) {
-    if (submitted<&ustore_docs_read>(arguments)) return;
     call_t call(arguments->outcome);
     if (arguments->presences) *arguments->presences = nullptr;
     if (arguments->lengths) *arguments->lengths = nullptr;
@@ -1593,7 +1591,6 @@ void ustore_docs_read(ustore_docs_read_t* arguments) {
 }
 
 void ustore_docs_gist(ustore_docs_gist_t* arguments) {
-    if (submitted<&ustore_docs_gist>(arguments)) return;
     call_t call(arguments->outcome);
     if (arguments->fields) *arguments->fields = {};
     if (arguments->written) *arguments->written = 0;
@@ -1637,7 +1634,6 @@ void ustore_docs_gist(ustore_docs_gist_t* arguments) {
 }
 
 void ustore_docs_gather(ustore_docs_gather_t* arguments) {
-    if (submitted<&ustore_docs_gather>(arguments)) return;
     call_t call(arguments->outcome);
     if (arguments->columns) *arguments->columns = nullptr;
     if (refuse_database(call, arguments->database)) return;
@@ -1717,7 +1713,6 @@ void ustore_docs_gather(ustore_docs_gather_t* arguments) {
 }
 
 void ustore_docs_remove(ustore_docs_remove_t* arguments) {
-    if (submitted<&ustore_docs_remove>(arguments)) return;
     call_t call(arguments->outcome);
     if (refuse_database(call, arguments->database)) return;
     std::size_t const count = arguments->count;
@@ -1738,7 +1733,6 @@ void ustore_docs_remove(ustore_docs_remove_t* arguments) {
 }
 
 void ustore_docs_scan(ustore_docs_scan_t* arguments) {
-    if (submitted<&ustore_docs_scan>(arguments)) return;
     call_t call(arguments->outcome);
     if (!check_scan(call, arguments)) return;
     verdict_t verdict;
@@ -1762,7 +1756,6 @@ void ustore_docs_cursor_init(ustore_docs_cursor_init_t* arguments) {
 }
 
 void ustore_docs_cursor_next(ustore_docs_cursor_next_t* arguments) {
-    if (submitted<&ustore_docs_cursor_next>(arguments)) return;
     call_t call(arguments->outcome);
     keyed_cursor_t* const cursor = arguments->cursor ? &arguments->cursor->cursor : nullptr;
     ustore_arena_handle_t* const arena = open_pull(call, arguments, cursor);
@@ -1785,12 +1778,6 @@ void ustore_docs_cursor_free(ustore_docs_cursor_t cursor) {
     delete cursor;
 }
 
-void ustore_docs_sample(ustore_docs_sample_t* arguments) {
-    if (submitted<&ustore_docs_sample>(arguments)) return;
-    sample_keyed(arguments, ustore_modality_docs_k);
-}
+void ustore_docs_sample(ustore_docs_sample_t* arguments) { sample_keyed(arguments, ustore_modality_docs_k); }
 
-void ustore_docs_measure(ustore_docs_measure_t* arguments) {
-    if (submitted<&ustore_docs_measure>(arguments)) return;
-    measure_keyed(arguments, ustore_modality_docs_k);
-}
+void ustore_docs_measure(ustore_docs_measure_t* arguments) { measure_keyed(arguments, ustore_modality_docs_k); }

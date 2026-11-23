@@ -220,9 +220,9 @@ class nvme_store_cursor {
     status_t position_(stored_key_t from) noexcept {
         std::span<memory_run_t const* const> const memory_runs = view_->memory_runs.runs();
         if (memory_positions_.resize(memory_runs.size()) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A scan could not hold a cursor per memory run"};
+            return {status_code_t::out_of_memory_k, "No room for a cursor per memory run"};
         if (memory_ends_.resize(memory_runs.size()) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A scan could not hold a cursor per memory run"};
+            return {status_code_t::out_of_memory_k, "A scan could not hold memory run ends"};
         for (std::size_t index = 0; index != memory_runs.size(); ++index) {
             memory_run_t const& run = *memory_runs[index];
             memory_positions_[index] = run.lower_bound(from);
@@ -237,7 +237,7 @@ class nvme_store_cursor {
         for (std::size_t number = 0; number != levels.size(); ++number) runs += levels.level(number).size();
         cursors_.clear();
         if (cursors_.reserve(runs) != st::status_t::success_k)
-            return {status_code_t::out_of_memory_k, "A scan could not hold a cursor per run"};
+            return {status_code_t::out_of_memory_k, "No room for a cursor per run"};
         for (std::size_t number = 0; number != levels.size(); ++number) {
             auto const& level = levels.level(number);
             for (std::size_t index = 0; index != level.size(); ++index) {

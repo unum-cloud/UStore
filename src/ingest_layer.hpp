@@ -53,19 +53,19 @@ class ingest_value_parser {
     ingest_value_parser(ingest_value_parser const&) = delete;
     ingest_value_parser& operator=(ingest_value_parser const&) = delete;
     ~ingest_value_parser() noexcept {
-        arena_free_blocks(parsing_);
-        arena_free_blocks(trees_);
+        util::arena_free_blocks(parsing_);
+        util::arena_free_blocks(trees_);
     }
 
     /** Forgets every page tree laid out so far, whose rows the engine has copied or written. */
-    void rewind() noexcept { arena_rewind(&trees_); }
+    void rewind() noexcept { util::arena_rewind(&trees_); }
 
     /** The value of row @p row of @p rows as the engine files it, readable until @c rewind. */
-    expected<std::span<byte_t const>> operator()(keyed_rows_t const& rows, std::size_t row) noexcept {
+    expected<std::span<byte_t const>> operator()(util::keyed_rows_t const& rows, std::size_t row) noexcept {
         ustore_bytes_view_t const given = rows.values[row];
         std::span<byte_t const> const bytes = bytes_of(given.data, static_cast<std::size_t>(given.length));
         if (values_ == ingest_values_t::bytes_k) return bytes;
-        arena_rewind(&parsing_);
+        util::arena_rewind(&parsing_);
         if (values_ == ingest_values_t::documents_k) {
             status_t const parsed = docs::json_parse(value_view_t {bytes}, &parsing_).status();
             if (parsed.failed()) return parsed;
@@ -76,7 +76,7 @@ class ingest_value_parser {
                                                                        page_allocator_t {&parsing_});
         if (tree_status.failed()) return tree_status;
         ++placement_.sequence;
-        auto [kept, kept_status] = arena_copy<byte_t>(&trees_, tree);
+        auto [kept, kept_status] = util::arena_copy<byte_t>(&trees_, tree);
         if (kept_status.failed()) return kept_status;
         return std::span<byte_t const> {kept};
     }
