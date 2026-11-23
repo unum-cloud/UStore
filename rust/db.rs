@@ -17,20 +17,22 @@
 //! Date: September 16, 2026
 
 use std::borrow::BorrowMut;
+use std::cell::UnsafeCell;
 use std::ffi::{CStr, c_char, c_void};
 use std::fmt;
-use std::future::{Future, IntoFuture};
+use std::future::Future;
 use std::iter::FusedIterator;
-use std::marker::PhantomData;
-use std::mem::ManuallyDrop;
+use std::marker::{PhantomData, PhantomPinned};
+use std::mem::{ManuallyDrop, MaybeUninit};
 use std::ops::{ControlFlow, Range};
-use std::pin::Pin;
-use std::ptr::{self, NonNull};
+use std::pin::{Pin, pin};
+use std::ptr;
 use std::str::FromStr;
 use std::task::{Context, Poll};
 
 use stringtape::{BytesTape, BytesTapeViewU32, BytesTapeViewU64, CharsTape};
 
+use self::sealed::Handles;
 use crate::docs::{Column, KeyedBy};
 use crate::graph::{Edge, Roles};
 
@@ -824,7 +826,7 @@ pub(crate) mod ffi {
 
 /// What went wrong, in the vocabulary of `ustore_status_t`, whose success is left to `Result`.
 ///
-/// An [`Error`] never carries [`Status::Deferred`], which only [`Deferred::status`] reports.
+/// An [`Error`] never carries [`Status::Deferred`], which only a call still in flight reports.
 #[repr(i32)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[non_exhaustive]
@@ -1558,35 +1560,50 @@ pub struct PhaseProgress {
 
 /// Memory the library writes every output whose length scales with a call into, reused across calls.
 ///
-/// An executor places it where it computes, decided once, and nothing is allocated until a call writes into it. Every
-/// call rewinds and refills it, invalidating the previous call's outputs, so a steady loop allocates once. Every verb,
-/// blocking or deferred, borrows it as `&mut Arena` and answers outputs that borrow it in turn, so the borrow checker
-/// both keeps a result from outliving its arena and stops the call that would overwrite it.
+/// An executor places it where it computes, decided once, and nothing is allocated until a call
+/// writes into it. Every call rewinds and refills it, invalidating the previous call's outputs, so
+/// a steady loop allocates once. Every verb, blocking or deferred, borrows it as `&mut Arena<'_>`
+/// and answers outputs that borrow it in turn, so the borrow checker both keeps a result from
+/// outliving its arena and stops the call that would overwrite it. An arena never outlives the
+/// executor that made it, which `'executor` borrows:
+///
+/// ```compile_fail,E0505
+/// use ustore::{Arena, Executor};
+///
+/// let executor = Executor::for_ram(&[], 2)?;
+/// let arena = Arena::new_in(&executor)?;
+/// drop(executor);
+/// let placed = arena.describe()?;
+/// # Ok::<(), ustore::Error>(())
+/// ```
 ///
 /// Mirrors `ustore_arena_t`; dropping it calls `ustore_arena_free`, which waits for the calls still writing into it.
 #[derive(Debug)]
-pub struct Arena {
+pub struct Arena<'executor> {
     pub(crate) handle: ffi::ustore_arena_t,
+    executor: PhantomData<&'executor ()>,
 }
 
-impl Arena {
+impl Arena<'static> {
     /// Makes an arena of host pages for calls on the calling thread.
     ///
     /// Calls `ustore_arena_init`.
     pub fn new() -> Result<Self> {
         Arena::made_by(ptr::null_mut())
     }
+}
 
+impl<'executor> Arena<'executor> {
     /// Makes an arena where `executor` computes, serving the calls of its residency.
     ///
     /// Calls `ustore_arena_init`.
-    pub fn new_in(executor: &Executor) -> Result<Self> {
+    pub fn new_in(executor: &'executor Executor) -> Result<Self> {
         Arena::made_by(executor.handle)
     }
 
     /// The arena `executor` places, where null places it for the calling thread.
     fn made_by(executor: ffi::ustore_executor_t) -> Result<Self> {
-        let mut arena = Arena { handle: ptr::null_mut() };
+        let mut arena = Arena { handle: ptr::null_mut(), executor: PhantomData };
         let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_arena_init_t { arena: &mut arena.handle, executor, outcome: &mut outcome };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
@@ -1682,16 +1699,17 @@ impl<Value> fmt::Debug for Address<Value> {
 unsafe impl<Value> Send for Address<Value> {}
 unsafe impl<Value> Sync for Address<Value> {}
 
-impl Drop for Arena {
+impl Drop for Arena<'_> {
     fn drop(&mut self) {
         // SAFETY: the handle came from the library and is freed once, after the calls still writing into it.
         unsafe { ffi::ustore_arena_free(self.handle) };
     }
 }
 
-// SAFETY: an arena serves one call at a time, which the `&mut` every verb takes already enforces, and the library
-// ties it to no thread.
-unsafe impl Send for Arena {}
+// SAFETY: an arena serves one call at a time, which the `&mut` every verb takes already enforces,
+// the library ties it to no thread, and a shared borrow only asks the library where it lives.
+unsafe impl Send for Arena<'_> {}
+unsafe impl Sync for Arena<'_> {}
 
 /// The rows of a batch result in order, from either end, each read through the result's own `get`.
 #[derive(Clone, Debug)]
@@ -2754,15 +2772,14 @@ impl Database {
 
     /// The head of the database, where writes land and reads see the latest committed state.
     pub fn head(&self) -> On<'_> {
-        On {
+        On::of(Handles {
             database: self.handle,
             view: ptr::null_mut(),
             transaction: ptr::null_mut(),
             snapshot: ptr::null_mut(),
             executor: ptr::null_mut(),
             watch: Watch::Keys,
-            marker: PhantomData,
-        }
+        })
     }
 
     /// Begins a transaction over this database, which conflicts rather than blocks.
@@ -2868,12 +2885,7 @@ pub(crate) unsafe fn exported_slice<'arena, Value>(first: *const Value, count: u
 /// [`On::deferred`] makes, returns once its call is submitted and answers a [`Deferred`].
 #[derive(Debug)]
 pub struct On<'view, Parent = Database, Completion = Blocking> {
-    database: ffi::ustore_database_t,
-    view: ffi::ustore_view_t,
-    transaction: ffi::ustore_transaction_t,
-    snapshot: ffi::ustore_snapshot_t,
-    executor: ffi::ustore_executor_t,
-    watch: Watch,
+    handles: Handles,
     marker: PhantomData<(&'view Parent, Completion)>,
 }
 
@@ -2885,82 +2897,134 @@ impl<Parent, Completion> Clone for On<'_, Parent, Completion> {
 
 impl<Parent, Completion> Copy for On<'_, Parent, Completion> {}
 
-/// A view whose verbs defer their calls on an executor, each answering a [`Deferred`] once submitted.
+/// A view whose verbs defer their calls on an executor, each answering a [`Deferred`].
 pub type DeferredOn<'view, Parent = Database> = On<'view, Parent, Deferring>;
 
 impl<'view, Parent, Completion> On<'view, Parent, Completion> {
+    /// The view of `handles`, which the parent's borrow keeps open for `'view`.
+    fn of(handles: Handles) -> Self {
+        On { handles, marker: PhantomData }
+    }
+
     /// This view with every call through it running on `executor`.
     pub fn on<'with>(self, executor: &'with Executor) -> On<'with, Parent, Completion>
     where
         'view: 'with,
     {
-        On { executor: executor.handle, ..self }
+        On::of(Handles { executor: executor.handle, ..self.handles })
     }
 
-    /// This view with every verb through it deferred on `executor`, answering a [`Deferred`] once submitted.
+    /// This view with every verb through it deferred on `executor`, answering a [`Deferred`].
     pub fn deferred<'with>(self, executor: &'with Executor) -> DeferredOn<'with, Parent>
     where
         'view: 'with,
     {
-        On {
-            database: self.database,
-            view: self.view,
-            transaction: self.transaction,
-            snapshot: self.snapshot,
-            executor: executor.handle,
-            watch: self.watch,
-            marker: PhantomData,
-        }
+        On::of(Handles { executor: executor.handle, ..self.handles })
     }
 
     /// The database every call through this view reaches.
     pub(crate) fn database(&self) -> ffi::ustore_database_t {
-        self.database
+        self.handles.database
     }
 
     /// The executor every call through this view runs on, null for the calling thread.
     pub(crate) fn executor(&self) -> ffi::ustore_executor_t {
-        self.executor
+        self.handles.executor
     }
 
     /// What every read through this view sees, null at the head.
     pub(crate) fn view(&self) -> ffi::ustore_view_t {
-        self.view
+        self.handles.view
     }
 
     /// The transaction every write through this view joins, null at the head.
     pub(crate) fn transaction(&self) -> ffi::ustore_transaction_t {
-        self.transaction
+        self.handles.transaction
     }
 
     /// Whether the transaction records what the writes through this view touch.
     pub(crate) fn watch(&self) -> Watch {
-        self.watch
-    }
-
-    /// The snapshot a listing through this view reads, null at the head and inside a transaction, whose listings
-    /// read the head as well.
-    pub(crate) fn snapshot(&self) -> ffi::ustore_snapshot_t {
-        self.snapshot
+        self.handles.watch
     }
 }
 
-impl<Parent, Completion: sealed::Completion> On<'_, Parent, Completion> {
+/// What a verb answers through `Receiver`: what the call produced, or a [`Deferred`].
+pub(crate) type Deferrable<'view, Receiver, Verb> =
+    <<Receiver as ViewVerbs<'view>>::Completion as sealed::Completion>::Deferrable<'view, Verb>;
+
+/// The verbs every view serves, written once for every receiver: `&Database` blocks on the calling
+/// thread at the head, `&Transaction` inside the transaction, watching the keys it touches,
+/// `&Snapshot` at the snapshot, and an [`On`] on its executor, blocking or deferred. Each modality
+/// extends it with its own verbs, as [`BlobsVerbs`] does.
+///
+/// [`BlobsVerbs`]: crate::BlobsVerbs
+///
+/// Rust-only.
+pub trait ViewVerbs<'view>: Copy {
+    /// The handle the view reads through: a [`Database`], a [`Transaction`] or a [`Snapshot`].
+    type Parent: 'view;
+    /// [`Blocking`] or [`Deferring`].
+    type Completion: sealed::Completion + 'view;
+
+    /// The view every verb of this receiver goes through.
+    #[doc(hidden)]
+    fn receiver(self) -> On<'view, Self::Parent, Self::Completion>;
+
     /// Every collection the database holds at this view's snapshot or at the head, exported into the arena.
     ///
     /// Calls `ustore_collection_list`.
-    pub fn collection_list<'arena>(&self, arena: &'arena mut Arena) -> Completion::Answer<CollectionList<'arena>> {
+    fn collection_list<'arena>(self, arena: &'arena mut Arena<'_>) -> Deferrable<'view, Self, CollectionList<'arena>> {
         let verb = CollectionList { arena, written: 0, collections: Address::default() };
-        Completion::answer(self, verb)
+        <Self::Completion as sealed::Completion>::answer(&self.receiver(), verb)
     }
 }
 
-impl<Completion: sealed::Completion> On<'_, Database, Completion> {
+impl<'view> ViewVerbs<'view> for &'view Database {
+    type Parent = Database;
+    type Completion = Blocking;
+
+    fn receiver(self) -> On<'view> {
+        self.head()
+    }
+}
+
+impl<'view, 'db> ViewVerbs<'view> for &'view Transaction<'db> {
+    type Parent = Transaction<'db>;
+    type Completion = Blocking;
+
+    fn receiver(self) -> On<'view, Transaction<'db>> {
+        self.view(Watch::Keys)
+    }
+}
+
+impl<'view, 'db> ViewVerbs<'view> for &'view Snapshot<'db> {
+    type Parent = Snapshot<'db>;
+    type Completion = Blocking;
+
+    fn receiver(self) -> On<'view, Snapshot<'db>> {
+        self.view()
+    }
+}
+
+impl<'view, Parent, Completion: sealed::Completion + 'view> ViewVerbs<'view> for On<'view, Parent, Completion> {
+    type Parent = Parent;
+    type Completion = Completion;
+
+    fn receiver(self) -> Self {
+        self
+    }
+}
+
+impl<'view, Completion: sealed::Completion> On<'view, Database, Completion> {
     /// Removes the contents of a collection, or the collection itself together with its name, which only the head
     /// does, since collections are created and dropped nowhere else.
     ///
     /// Calls `ustore_collection_drop`.
-    pub fn collection_drop(&self, collection: CollectionID, mode: DropMode) -> Completion::Answer<CollectionDrop> {
+    pub fn collection_drop(
+        &self,
+        collection: CollectionID,
+        mode: DropMode,
+    ) -> Completion::Deferrable<'view, CollectionDrop> {
         Completion::answer(self, CollectionDrop { collection, mode })
     }
 
@@ -2972,7 +3036,7 @@ impl<Completion: sealed::Completion> On<'_, Database, Completion> {
     /// [`Status::InvalidArgument`], since the snapshot belongs to its holder.
     ///
     /// Calls `ustore_database_clear`.
-    pub fn clear(&self, mode: DropMode) -> Completion::Answer<Clear> {
+    pub fn clear(&self, mode: DropMode) -> Completion::Deferrable<'view, Clear> {
         Completion::answer(self, Clear { mode })
     }
 
@@ -2993,7 +3057,7 @@ impl<Completion: sealed::Completion> On<'_, Database, Completion> {
     pub fn compact<'config, Plan: BorrowMut<CompactPlan>, Phase: BorrowMut<PhaseProgress>>(
         &self,
         config: impl Into<CompactConfig<'config, Plan, Phase>>,
-    ) -> Completion::Answer<Compact<'config, Plan, Phase>>
+    ) -> Completion::Deferrable<'view, Compact<'config, Plan, Phase>>
     where
         Completion: sealed::Accepts<CompactConfig<'config, Plan, Phase>>,
     {
@@ -3006,7 +3070,7 @@ impl<Completion: sealed::Completion> On<'_, Database, Completion> {
     /// or executor.
     ///
     /// Calls `ustore_database_compact_plan_finish`.
-    pub fn compact_plan_finish(&self, plan: CompactPlan) -> Completion::Answer<CompactPlanFinish> {
+    pub fn compact_plan_finish(&self, plan: CompactPlan) -> Completion::Deferrable<'view, CompactPlanFinish> {
         Completion::answer(self, CompactPlanFinish { plan })
     }
 
@@ -3015,15 +3079,15 @@ impl<Completion: sealed::Completion> On<'_, Database, Completion> {
     /// rotated stays unsynced until its compaction lands.
     ///
     /// Calls `ustore_database_flush`.
-    pub fn flush(&self) -> Completion::Answer<Flush> {
+    pub fn flush(&self) -> Completion::Deferrable<'view, Flush> {
         Completion::answer(self, Flush)
     }
 }
 
-/// A listing of the collections a view sees; see [`On::collection_list`].
+/// A listing of the collections a view sees; see [`ViewVerbs::collection_list`].
 #[derive(Debug)]
 pub struct CollectionList<'arena> {
-    arena: &'arena mut Arena,
+    arena: &'arena Arena<'arena>,
     written: ffi::ustore_size_t,
     collections: Address<CollectionID>,
 }
@@ -3032,9 +3096,9 @@ impl<'arena> sealed::Calling for CollectionList<'arena> {
     type Arguments = ffi::ustore_collection_list_t;
     type Output = &'arena [CollectionID];
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ffi::ustore_outcome_t,
         completion: ffi::ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -3076,9 +3140,9 @@ impl sealed::Calling for CollectionDrop {
     type Arguments = ffi::ustore_collection_drop_t;
     type Output = ();
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ffi::ustore_outcome_t,
         completion: ffi::ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -3111,9 +3175,9 @@ impl sealed::Calling for Clear {
     type Arguments = ffi::ustore_database_clear_t;
     type Output = ();
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ffi::ustore_outcome_t,
         completion: ffi::ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -3141,7 +3205,7 @@ impl sealed::Calling for Clear {
 /// [`Deferred::wait_with_inputs`] hands them back.
 pub struct CompactConfig<'config, Plan = &'config mut CompactPlan, Phase = &'config mut PhaseProgress> {
     /// Reports the units done and stops between units wherever it says to.
-    pub progress: Option<Box<ProgressCallback<'config>>>,
+    pub progress: Option<Progress<'config>>,
     /// A plan a cancel leaves live and the next call continues, opened when fresh; `None` runs to
     /// the end.
     pub plan: Option<Plan>,
@@ -3155,8 +3219,8 @@ impl Default for CompactConfig<'_> {
     }
 }
 
-impl<'config> From<Option<Box<ProgressCallback<'config>>>> for CompactConfig<'config> {
-    fn from(progress: Option<Box<ProgressCallback<'config>>>) -> Self {
+impl<'config> From<Option<Progress<'config>>> for CompactConfig<'config> {
+    fn from(progress: Option<Progress<'config>>) -> Self {
         CompactConfig { progress, ..CompactConfig::default() }
     }
 }
@@ -3218,14 +3282,14 @@ impl<Plan: BorrowMut<CompactPlan>, Phase: BorrowMut<PhaseProgress>> sealed::Call
     type Arguments = ffi::ustore_database_compact_t;
     type Output = ();
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ffi::ustore_outcome_t,
         completion: ffi::ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         let config = &mut self.config;
-        let (progress, progress_state) = lowered_progress(&mut config.progress);
+        let (progress, progress_state) = lowered_progress(&config.progress);
         Ok(Some(ffi::ustore_database_compact_t {
             database: view.database(),
             executor: view.executor(),
@@ -3267,9 +3331,9 @@ impl sealed::Calling for CompactPlanFinish {
     type Arguments = ffi::ustore_database_compact_plan_finish_t;
     type Output = ();
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ffi::ustore_outcome_t,
         completion: ffi::ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -3299,9 +3363,9 @@ impl sealed::Calling for Flush {
     type Arguments = ffi::ustore_database_flush_t;
     type Output = ();
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ffi::ustore_outcome_t,
         completion: ffi::ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -3448,24 +3512,110 @@ impl FromStr for PredicateCost {
     }
 }
 
-/// A caller's verdict on one page of listed keys, writing one [`Admission`] per key, every one starting as
-/// [`Admission::Reject`].
+/// What a scan or a cursor asks of the keys it lists, lowered to the `ustore_predicate_t` its
+/// handler shape calls: [`Predicate::each`] answers one key at a time and is cheap, while
+/// [`Predicate::batch`] fills a page of [`Admission`]s, each starting as [`Admission::Reject`],
+/// and is expensive unless told [`Predicate::cheap`].
 ///
-/// It runs on whichever thread runs the call, never on two at once within one call, so it owes
-/// `Send` and may be `FnMut`. It must not panic: unwinding out of the library's `extern "C"` frame
-/// aborts the process.
+/// It borrows its handler, which runs on whichever thread runs the call, so it owes `Sync`.
+/// It must not panic: unwinding out of the library's `extern "C"` frame aborts the process.
+/// A deferred call needs a `'static` handler, since the library asks it after the verb returns.
 ///
-/// Mirrors `ustore_predicate_callback_t`.
-pub type PredicateCallback<'handler> = dyn FnMut(&[Key], &mut [Admission]) + Send + 'handler;
+/// Mirrors `ustore_predicate_t`.
+#[derive(Clone, Copy, Debug)]
+pub struct Predicate<'handler> {
+    raw: ffi::ustore_predicate_t,
+    handler: PhantomData<&'handler ()>,
+}
+
+// SAFETY: the state addresses a `Sync` handler, which any thread may call through a shared borrow.
+unsafe impl Send for Predicate<'_> {}
+unsafe impl Sync for Predicate<'_> {}
+
+impl<'handler> Predicate<'handler> {
+    /// Answers one key at a time, asked as the keys are listed.
+    pub fn each<Handler: Fn(Key) -> bool + Sync>(handler: &'handler Handler) -> Self {
+        Predicate::lowered(each_trampoline::<Handler>, handler, PredicateCost::Cheap)
+    }
+
+    /// Answers a page at a time, asked once per page unless told it is cheap.
+    pub fn batch<Handler: Fn(&[Key], &mut [Admission]) + Sync>(handler: &'handler Handler) -> Self {
+        Predicate::lowered(batch_trampoline::<Handler>, handler, PredicateCost::Expensive)
+    }
+
+    /// This predicate, asked wherever the engine finds it cheapest.
+    pub fn cheap(mut self) -> Self {
+        self.raw.cost = PredicateCost::Cheap as ffi::ustore_enum_t;
+        self
+    }
+
+    fn lowered<Handler>(
+        callback: unsafe extern "C" fn(
+            *const ffi::ustore_key_t,
+            *mut ffi::ustore_enum_t,
+            ffi::ustore_size_t,
+            *mut c_void,
+        ),
+        handler: &'handler Handler,
+        cost: PredicateCost,
+    ) -> Self {
+        let raw = ffi::ustore_predicate_t {
+            callback: Some(callback),
+            state: ptr::from_ref(handler).cast_mut().cast(),
+            cost: cost as ffi::ustore_enum_t,
+        };
+        Predicate { raw, handler: PhantomData }
+    }
+}
+
+/// Admits every key of a page that the handler at `state` approves.
+///
+/// # Safety
+/// `state` addresses the `Handler` a [`Predicate`] borrows, and `keys` and `admissions` hold
+/// `count` entries each.
+unsafe extern "C" fn each_trampoline<Handler: Fn(Key) -> bool + Sync>(
+    keys: *const ffi::ustore_key_t,
+    admissions: *mut ffi::ustore_enum_t,
+    count: ffi::ustore_size_t,
+    state: *mut c_void,
+) {
+    unsafe {
+        let handler = &*state.cast::<Handler>();
+        let count = count as usize;
+        let keys = std::slice::from_raw_parts(keys, count);
+        // SAFETY: an `Admission` is an `ustore_enum_t` wide, and every slot is overwritten.
+        let admissions = std::slice::from_raw_parts_mut(admissions.cast::<Admission>(), count);
+        for (key, admission) in keys.iter().zip(admissions) {
+            *admission = if handler(*key) { Admission::Admit } else { Admission::Reject };
+        }
+    }
+}
+
+/// Runs the handler at `state` over one page.
+///
+/// # Safety
+/// `state` addresses the `Handler` a [`Predicate`] borrows, and `keys` and `admissions` hold
+/// `count` entries each.
+unsafe extern "C" fn batch_trampoline<Handler: Fn(&[Key], &mut [Admission]) + Sync>(
+    keys: *const ffi::ustore_key_t,
+    admissions: *mut ffi::ustore_enum_t,
+    count: ffi::ustore_size_t,
+    state: *mut c_void,
+) {
+    unsafe {
+        let handler = &*state.cast::<Handler>();
+        let count = count as usize;
+        // SAFETY: the library wrote a rejection, a valid `Admission` of that width, into each slot.
+        let admissions = std::slice::from_raw_parts_mut(admissions.cast::<Admission>(), count);
+        handler(std::slice::from_raw_parts(keys, count), admissions);
+    }
+}
 
 /// What a scan or a cursor narrows its keys by, every part left empty to keep every key: patterns over the values of
 /// blobs, a JSONPath or XPath filter over documents and pages, and a predicate over the keys.
 ///
-/// The predicate is boxed, so a deferred call owns it outright, while a blocking one may box a
-/// borrow.
-///
 /// Mirrors the `patterns`, `filter` and `predicate` fields of `ustore_blobs_scan_t` and its kin.
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Matching<'matching> {
     /// The patterns every listed value matches one of, compiled once per call or once per cursor.
     pub patterns: &'matching [&'matching str],
@@ -3478,24 +3628,7 @@ pub struct Matching<'matching> {
     /// The JSONPath, root filter or XPath every listed document or page matches.
     pub filter: Option<&'matching str>,
     /// The caller's verdict on the keys of every page.
-    pub predicate: Option<Box<PredicateCallback<'matching>>>,
-    /// Where the predicate is asked.
-    pub predicate_cost: PredicateCost,
-}
-
-impl fmt::Debug for Matching<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .debug_struct("Matching")
-            .field("patterns", &self.patterns)
-            .field("pattern_kind", &self.pattern_kind)
-            .field("sensitivity", &self.sensitivity)
-            .field("weights", &self.weights)
-            .field("filter", &self.filter)
-            .field("predicate", &self.predicate.is_some())
-            .field("predicate_cost", &self.predicate_cost)
-            .finish()
-    }
+    pub predicate: Option<Predicate<'matching>>,
 }
 
 impl Matching<'_> {
@@ -3524,17 +3657,9 @@ impl Matching<'_> {
         self.weights.is_some()
     }
 
-    /// The predicate as the ABI takes it, addressing the box in `self`, which stays in place until
-    /// the call or the cursor ends.
-    pub(crate) fn lowered_predicate(&mut self) -> ffi::ustore_predicate_t {
-        match &mut self.predicate {
-            Some(handler) => ffi::ustore_predicate_t {
-                callback: Some(predicate_trampoline),
-                state: ptr::from_mut(handler).cast(),
-                cost: self.predicate_cost as ffi::ustore_enum_t,
-            },
-            None => ffi::ustore_predicate_t::default(),
-        }
+    /// The predicate as the ABI takes it, addressing the handler it borrows.
+    pub(crate) fn lowered_predicate(&self) -> ffi::ustore_predicate_t {
+        self.predicate.map_or_else(ffi::ustore_predicate_t::default, |predicate| predicate.raw)
     }
 }
 
@@ -3554,85 +3679,62 @@ pub(crate) unsafe extern "C" fn string_views(
     }
 }
 
-/// Runs the boxed predicate at `state` over one page.
-///
-/// # Safety
-/// `state` addresses the predicate box of the call or cursor it was passed to, which nothing else
-/// reaches until the callback returns, and `keys` and `admissions` hold `count` entries each.
-unsafe extern "C" fn predicate_trampoline(
-    keys: *const ffi::ustore_key_t,
-    admissions: *mut ffi::ustore_enum_t,
-    count: ffi::ustore_size_t,
-    state: *mut c_void,
-) {
-    unsafe {
-        let handler = &mut *state.cast::<Box<PredicateCallback<'_>>>();
-        let count = count as usize;
-        // SAFETY: the library wrote a rejection, a valid `Admission` of that width, into each slot.
-        let admissions = std::slice::from_raw_parts_mut(admissions.cast::<Admission>(), count);
-        handler(std::slice::from_raw_parts(keys, count), admissions);
-    }
-}
-
 // endregion: Matching
 
 // region: Progress
 
 /// A periodic report of the units a call finished and the units it finishes if it runs to the end,
-/// where `ControlFlow::Break` cancels the call, which then fails with [`Status::Cancelled`].
+/// lent as the callback and state every reporting verb takes; `ControlFlow::Break` cancels the
+/// call, which then fails with [`Status::Cancelled`].
 ///
-/// It runs on whichever thread advanced the work, never on two at once and never after the call is
-/// final, so it owes `Send` and may be `FnMut`. It must not panic: unwinding out of the library's
-/// `extern "C"` frame aborts the process. A config holds it boxed, so a deferred call owns it
-/// outright, while a blocking one may box a borrow.
+/// The handler runs on whichever thread advanced the work, never on two at once and never after the
+/// call is final, so it owes `Send` and may be `FnMut`. It must not panic: unwinding out of the
+/// library's `extern "C"` frame aborts the process. A deferred call needs a `'static` handler,
+/// since the library calls it after the call is submitted.
 ///
-/// Mirrors `ustore_progress_callback_t`.
-pub type ProgressCallback<'handler> = dyn FnMut(usize, usize) -> ControlFlow<()> + Send + 'handler;
+/// Mirrors the `progress` and `progress_state` fields of `ustore_database_compact_t` and its kin.
+#[derive(Debug)]
+pub struct Progress<'handler> {
+    callback: ffi::ustore_progress_callback_t,
+    state: *mut c_void,
+    handler: PhantomData<&'handler mut ()>,
+}
 
-/// The progress handler one call lends the library.
-pub(crate) struct Progress<'handler>(pub(crate) Option<Box<ProgressCallback<'handler>>>);
+// SAFETY: it points at a `Send` handler it borrows exclusively.
+unsafe impl Send for Progress<'_> {}
 
-impl Progress<'_> {
-    /// The callback and state the verb passes, addressing the handler's box, which stays in place
-    /// until the call is final.
-    pub(crate) fn lowered(&mut self) -> (ffi::ustore_progress_callback_t, *mut c_void) {
-        lowered_progress(&mut self.0)
+impl<'handler> Progress<'handler> {
+    /// Lends `handler`, called with the units finished so far and the units the call finishes.
+    pub fn new<Handler: FnMut(usize, usize) -> ControlFlow<()> + Send>(handler: &'handler mut Handler) -> Self {
+        Progress {
+            callback: Some(progress_trampoline::<Handler>),
+            state: ptr::from_mut(handler).cast(),
+            handler: PhantomData,
+        }
     }
 }
 
-impl fmt::Debug for Progress<'_> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.debug_struct("Progress").field("reporting", &self.0.is_some()).finish()
-    }
-}
-
-/// The callback and state a reporting verb passes for `handler`, addressing its box, which stays in
-/// place until the call is final, or nulls without one.
-pub(crate) fn lowered_progress(
-    handler: &mut Option<Box<ProgressCallback<'_>>>,
-) -> (ffi::ustore_progress_callback_t, *mut c_void) {
-    match handler {
-        Some(handler) => (Some(progress_trampoline), ptr::from_mut(handler).cast()),
-        None => (None, ptr::null_mut()),
-    }
-}
-
-/// Runs the boxed handler at `state`, cancelling the call on a `Break`.
-///
 /// # Safety
-/// `state` addresses the handler box of the call it was passed to, which nothing else reaches until
-/// the callback returns, since the library never runs one callback concurrently with itself.
-unsafe extern "C" fn progress_trampoline(
+/// `state` must address the `Handler` a [`Progress`] lent to the call.
+unsafe extern "C" fn progress_trampoline<Handler: FnMut(usize, usize) -> ControlFlow<()>>(
     finished: ffi::ustore_size_t,
     total: ffi::ustore_size_t,
     state: *mut c_void,
 ) -> ffi::ustore_enum_t {
     unsafe {
-        let handler = &mut *state.cast::<Box<ProgressCallback<'_>>>();
+        let handler = &mut *state.cast::<Handler>();
         match handler(finished as usize, total as usize) {
             ControlFlow::Continue(()) => ffi::USTORE_CONTINUE_K,
             ControlFlow::Break(()) => ffi::USTORE_CANCEL_K,
         }
+    }
+}
+
+/// Lends an optional progress as the callback and state a reporting verb takes; `None` lends nulls.
+pub(crate) fn lowered_progress(progress: &Option<Progress<'_>>) -> (ffi::ustore_progress_callback_t, *mut c_void) {
+    match progress {
+        Some(progress) => (progress.callback, progress.state),
+        None => (None, ptr::null_mut()),
     }
 }
 
@@ -3643,6 +3745,54 @@ unsafe extern "C" fn progress_trampoline(
 /// The traits only this crate implements.
 pub(crate) mod sealed {
     use super::{On, Result, ffi};
+
+    /// The handles every call through a view names, which a deferred call keeps until it submits.
+    #[derive(Clone, Copy, Debug)]
+    pub struct Handles {
+        pub(crate) database: ffi::ustore_database_t,
+        pub(crate) view: ffi::ustore_view_t,
+        pub(crate) transaction: ffi::ustore_transaction_t,
+        pub(crate) snapshot: ffi::ustore_snapshot_t,
+        pub(crate) executor: ffi::ustore_executor_t,
+        pub(crate) watch: super::Watch,
+    }
+
+    // SAFETY: `db.h` shares a database across threads, and a transaction or snapshot goes with the
+    // calls naming it.
+    unsafe impl Send for Handles {}
+
+    impl Handles {
+        /// The database every call through this view reaches.
+        pub fn database(&self) -> ffi::ustore_database_t {
+            self.database
+        }
+
+        /// The executor every call through this view runs on, null for the calling thread.
+        pub fn executor(&self) -> ffi::ustore_executor_t {
+            self.executor
+        }
+
+        /// What every read through this view sees, null at the head.
+        pub fn view(&self) -> ffi::ustore_view_t {
+            self.view
+        }
+
+        /// The transaction every write through this view joins, null at the head.
+        pub fn transaction(&self) -> ffi::ustore_transaction_t {
+            self.transaction
+        }
+
+        /// Whether the transaction records what the writes through this view touch.
+        pub fn watch(&self) -> super::Watch {
+            self.watch
+        }
+
+        /// The snapshot a listing through this view reads, null at the head and inside a
+        /// transaction, whose listings read the head as well.
+        pub fn snapshot(&self) -> ffi::ustore_snapshot_t {
+            self.snapshot
+        }
+    }
 
     /// One verb over one `#[repr(C)]` argument struct: where the arguments point, which C entry point takes them,
     /// and what a successful call hands back.
@@ -3655,9 +3805,9 @@ pub(crate) mod sealed {
         /// The arguments over the inputs and outputs this verb holds, or `None` for a batch that reaches no engine.
         ///
         /// The arguments point into `self`, so the verb stays in place until the call they feed is final.
-        fn arguments<Parent, Completion>(
+        fn arguments(
             &mut self,
-            view: &On<'_, Parent, Completion>,
+            view: &Handles,
             outcome: *mut ffi::ustore_outcome_t,
             completion: ffi::ustore_completion_t,
         ) -> Result<Option<Self::Arguments>>;
@@ -3684,11 +3834,14 @@ pub(crate) mod sealed {
 
     /// How the verbs of a view complete, which decides what each of them answers.
     pub trait Completion: Sized {
-        /// What a verb answers: `Result<Output>` when blocking, `Result<Deferred<Verb>>` when deferring.
-        type Answer<Verb: Calling>;
+        /// A verb's answer: `Result<Output>` blocking, `Result<Deferred<'view, Verb>>` deferred.
+        type Deferrable<'view, Verb: Calling>;
 
-        /// Runs `verb` through `view`, or submits it there.
-        fn answer<Parent, Verb: Calling>(view: &On<'_, Parent, Self>, verb: Verb) -> Self::Answer<Verb>;
+        /// Runs `verb` through `view`, or readies it there.
+        fn answer<'view, Parent, Verb: Calling>(
+            view: &On<'view, Parent, Self>,
+            verb: Verb,
+        ) -> Self::Deferrable<'view, Verb>;
     }
 
     /// The inputs a completion takes: a blocking view takes borrows and owned values alike, while a deferring one
@@ -3699,7 +3852,7 @@ pub(crate) mod sealed {
         label = "the library would still read this borrow after the verb returns",
         note = "pass keys or edges in an array or a `Vec`, keys beside a `BytesTape` or a `CharsTape`, paths in a \
                 `CharsTape`, columns in a `Vec<Column<'static>>`, names as a `String`, and `'static` collections, \
-                roles, fields and names, and boxed handlers that borrow nothing"
+                roles, fields, names, predicates and progress handlers"
     )]
     pub trait Accepts<Input> {}
 
@@ -3718,17 +3871,20 @@ pub(crate) mod sealed {
 #[derive(Clone, Copy, Debug)]
 pub struct Blocking;
 
-/// The completion of a [`DeferredOn`], whose verbs return once their call is submitted and answer a
-/// [`Deferred`].
+/// The completion of a [`DeferredOn`], whose verbs answer a [`Deferred`] that submits its call when
+/// first awaited or waited on.
 #[derive(Clone, Copy, Debug)]
 pub struct Deferring;
 
 impl sealed::Completion for Blocking {
-    type Answer<Verb: sealed::Calling> = Result<Verb::Output>;
+    type Deferrable<'view, Verb: sealed::Calling> = Result<Verb::Output>;
 
-    fn answer<Parent, Verb: sealed::Calling>(view: &On<'_, Parent, Blocking>, mut verb: Verb) -> Result<Verb::Output> {
+    fn answer<'view, Parent, Verb: sealed::Calling>(
+        view: &On<'view, Parent, Blocking>,
+        mut verb: Verb,
+    ) -> Result<Verb::Output> {
         let mut outcome = ffi::ustore_outcome_t::default();
-        if let Some(mut arguments) = verb.arguments(view, &mut outcome, ffi::ustore_completion_t::Blocking)? {
+        if let Some(mut arguments) = verb.arguments(&view.handles, &mut outcome, ffi::ustore_completion_t::Blocking)? {
             // SAFETY: the arguments point into `verb` and `outcome`, which stay in place until the call returns, and
             // a blocking call is final on return.
             unsafe { Verb::call(&mut arguments) };
@@ -3739,25 +3895,27 @@ impl sealed::Completion for Blocking {
 }
 
 impl sealed::Completion for Deferring {
-    type Answer<Verb: sealed::Calling> = Result<Deferred<Verb>>;
+    type Deferrable<'view, Verb: sealed::Calling> = Result<Deferred<'view, Verb>>;
 
-    fn answer<Parent, Verb: sealed::Calling>(view: &On<'_, Parent, Deferring>, verb: Verb) -> Result<Deferred<Verb>> {
-        let lent = Box::into_raw(Box::new(Lent { outcome: ffi::ustore_outcome_t::default(), verb }));
-        // SAFETY: the box is fresh and reached through `lent` alone, and the arguments point into its fields, where
-        // they stay until the box is freed, while submission copies the arguments themselves. A verb that reaches no
-        // engine leaves the outcome a final success.
-        unsafe {
-            let outcome = ptr::addr_of_mut!((*lent).outcome);
-            match (*lent).verb.arguments(view, outcome, ffi::ustore_completion_t::Deferred) {
-                Ok(Some(mut arguments)) => Verb::call(&mut arguments),
-                Ok(None) => {}
-                Err(refusal) => {
-                    drop(Box::from_raw(lent));
-                    return Err(refusal);
-                }
-            }
-            Ok(Deferred { lent: NonNull::new_unchecked(lent) })
-        }
+    fn answer<'view, Parent, Verb: sealed::Calling>(
+        view: &On<'view, Parent, Deferring>,
+        mut verb: Verb,
+    ) -> Result<Deferred<'view, Verb>> {
+        // The refusals the binding catches surface here, while the arguments taken at this address
+        // are dropped unused.
+        let mut outcome = ffi::ustore_outcome_t::default();
+        verb.arguments(&view.handles, &mut outcome, ffi::ustore_completion_t::Deferred)?;
+        Ok(Deferred {
+            call: UnsafeCell::new(Call {
+                outcome,
+                arguments: MaybeUninit::uninit(),
+                view: view.handles,
+                verb: ManuallyDrop::new(verb),
+            }),
+            stage: CallStage::Unsubmitted,
+            borrows: PhantomData,
+            pinned: PhantomPinned,
+        })
     }
 }
 
@@ -3800,123 +3958,171 @@ impl sealed::Accepts<Range<&'static str>> for Deferring {}
 impl sealed::Writable for Database {}
 impl sealed::Writable for Transaction<'_> {}
 
-/// A submitted call, which owns its outcome, inputs and output slots in one box the library reads until the call is
-/// final, and borrows its arena as a blocking call does.
-///
-/// [`Deferred::status`] polls without blocking, and [`Deferred::wait`] blocks until the call is
-/// final and hands back what it produced, while `.await` polls it from async code. Dropping an
-/// unfinished one waits for it, then frees the box.
-///
-/// Rust-only; polling calls `ustore_outcome_status`, and waiting and dropping call `ustore_outcome_wait`.
-#[must_use = "a deferred call's outcome is seen only through `status`, `wait` or `.await`"]
-pub struct Deferred<Verb: sealed::Calling> {
-    lent: NonNull<Lent<Verb>>,
+/// How far a [`Deferred`] got.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CallStage {
+    Unsubmitted,
+    Submitted,
+    Answered,
 }
 
-impl<Verb: sealed::Calling> Deferred<Verb> {
-    /// `Err(Status::Deferred)` until the call is final, then its final status, read without blocking.
-    ///
-    /// Calls `ustore_outcome_status`.
-    pub fn status(&self) -> std::result::Result<(), Status> {
-        // SAFETY: the outcome lives in the box this `Deferred` owns until it is final.
-        Status::from_raw(unsafe { ffi::ustore_outcome_status(ptr::addr_of_mut!((*self.lent.as_ptr()).outcome)) })
+/// What the library reads and writes while a call is in flight, reached only through raw pointers.
+struct Call<Verb: sealed::Calling> {
+    outcome: ffi::ustore_outcome_t,
+    /// Written at submission, `None` for a batch that reaches no engine.
+    arguments: MaybeUninit<Option<Verb::Arguments>>,
+    view: Handles,
+    /// The owned inputs, the output slots and the arena borrow.
+    verb: ManuallyDrop<Verb>,
+}
+
+/// A call submitted on its first poll or on [`Deferred::wait`], at the address it is pinned at, so
+/// its outcome, arguments, inputs and output slots live inline and need no allocation.
+///
+/// It is the `Future` of its call: `.await` submits it and polls `ustore_outcome_status` until the
+/// call is final, asking to be polled again in between, while [`Deferred::wait`] submits it and
+/// blocks in `ustore_outcome_wait`.
+/// Dropping a submitted one waits for it, and dropping one never awaited submits nothing. `'view`
+/// is the borrow of the [`DeferredOn`] that made it.
+///
+/// An arena serves one call at a time, so a second call into the arena of a pending one fails to
+/// compile:
+///
+/// ```compile_fail,E0499
+/// use ustore::{Arena, BlobsVerbs, Database, Executor, Key, Modality, RAMOptions};
+///
+/// let database = Database::init_ram(&RAMOptions::default())?;
+/// let executor = Executor::for_ram(&[], 2)?;
+/// let mut arena = Arena::new_in(&executor)?;
+/// let people = database.collection_create("people", Modality::Blobs)?;
+/// let first = database.head().deferred(&executor).read(people, vec![Key::from(1u64)], &mut arena)?;
+/// let second = database.head().deferred(&executor).read(people, vec![Key::from(2u64)], &mut arena)?;
+/// first.wait()?;
+/// second.wait()?;
+/// # Ok::<(), ustore::Error>(())
+/// ```
+///
+/// Rust-only; polling calls `ustore_outcome_status`, and waiting and dropping call `ustore_outcome_wait`.
+#[must_use = "a deferred call runs only once awaited or waited on"]
+pub struct Deferred<'view, Verb: sealed::Calling> {
+    /// The library writes here while `stage` is `Submitted`.
+    call: UnsafeCell<Call<Verb>>,
+    stage: CallStage,
+    borrows: PhantomData<&'view ()>,
+    #[allow(dead_code, reason = "a marker, which makes the call `!Unpin`")]
+    pinned: PhantomPinned,
+}
+
+// SAFETY: until submission it is plain data, and once submitted it is pinned and only the
+// library reaches it.
+unsafe impl<Verb: sealed::Calling + Send> Send for Deferred<'_, Verb> {}
+
+impl<Verb: sealed::Calling> Deferred<'_, Verb> {
+    /// The outcome the library finishes, reached without a reference to the call.
+    fn outcome(&self) -> *mut ffi::ustore_outcome_t {
+        // SAFETY: the call lives as long as `self`, and only a raw pointer to it is taken.
+        unsafe { ptr::addr_of_mut!((*self.call.get()).outcome) }
     }
 
-    /// Blocks until the call is final, then hands back what it produced.
+    /// Hands the call to the library at the address it is pinned at.
+    fn submit(self: Pin<&mut Self>) {
+        // SAFETY: nothing is moved out, and the pointers taken here live while the call is pinned.
+        let this = unsafe { self.get_unchecked_mut() };
+        let call = this.call.get();
+        this.stage = CallStage::Submitted;
+        unsafe {
+            let outcome = ptr::addr_of_mut!((*call).outcome);
+            let view = (*call).view;
+            match (*call).verb.arguments(&view, outcome, ffi::ustore_completion_t::Deferred) {
+                Ok(arguments) => {
+                    if let Some(arguments) = (*call).arguments.write(arguments) {
+                        Verb::call(arguments);
+                    }
+                }
+                // The same arguments were taken once already, when the call was made.
+                Err(_) => (*outcome).status = ffi::ustore_status_t(Status::Internal as _),
+            }
+        }
+    }
+
+    /// Takes the verb, with the call's status, out of a final call the library touches no more.
+    fn finished(self: Pin<&mut Self>) -> (Result<()>, Verb) {
+        // SAFETY: the call is final, and the verb is taken once, as `Answered` records.
+        let this = unsafe { self.get_unchecked_mut() };
+        this.stage = CallStage::Answered;
+        let call = this.call.get();
+        unsafe { (check(ptr::read(ptr::addr_of!((*call).outcome))), ManuallyDrop::take(&mut (*call).verb)) }
+    }
+
+    /// Submits the call, then blocks until it is final, then hands back what it produced.
     ///
     /// Calls `ustore_outcome_wait`.
     pub fn wait(self) -> Result<Verb::Output> {
-        let (outcome, verb) = self.waited();
-        check(outcome)?;
-        verb.finish()
-    }
-
-    /// Blocks until the call is final, then frees the box, handing back its outcome and the verb.
-    fn waited(self) -> (ffi::ustore_outcome_t, Verb) {
-        let lent = ManuallyDrop::new(self).lent.as_ptr();
-        // SAFETY: once the outcome is final the library touches the box no more, so it is freed here.
-        let Lent { outcome, verb } = unsafe {
-            ffi::ustore_outcome_wait(ptr::addr_of_mut!((*lent).outcome));
-            *Box::from_raw(lent)
-        };
-        (outcome, verb)
+        let mut this = pin!(self);
+        this.as_mut().submit();
+        // SAFETY: the outcome lives in the pinned call.
+        unsafe { ffi::ustore_outcome_wait(this.outcome()) };
+        let (status, verb) = this.finished();
+        status.and_then(|()| verb.finish())
     }
 }
 
-impl<Verb: sealed::Lending> Deferred<Verb> {
-    /// Blocks until the call is final, then hands back what it produced beside the inputs it owned,
-    /// like a plan a stop left live.
+impl<Verb: sealed::Lending> Deferred<'_, Verb> {
+    /// Submits the call and blocks until it is final, then hands back what it produced beside the
+    /// inputs it owned, like a plan a stop left live.
     ///
     /// Calls `ustore_outcome_wait`.
     pub fn wait_with_inputs(self) -> (Result<Verb::Output>, Verb::Inputs) {
-        let (outcome, verb) = self.waited();
+        let mut this = pin!(self);
+        this.as_mut().submit();
+        // SAFETY: the outcome lives in the pinned call.
+        unsafe { ffi::ustore_outcome_wait(this.outcome()) };
+        let (status, verb) = this.finished();
         let (output, inputs) = verb.finish_with_inputs();
-        (check(outcome).and(output), inputs)
+        (status.and(output), inputs)
     }
 }
 
-impl<Verb: sealed::Calling> Drop for Deferred<Verb> {
-    fn drop(&mut self) {
-        let lent = self.lent.as_ptr();
-        // SAFETY: once the outcome is final the library touches the box no more, and this `Deferred` owned it.
-        unsafe {
-            ffi::ustore_outcome_wait(ptr::addr_of_mut!((*lent).outcome));
-            drop(Box::from_raw(lent));
-        }
-    }
-}
-
-impl<Verb: sealed::Calling> fmt::Debug for Deferred<Verb> {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(formatter, "Deferred({:?})", self.status())
-    }
-}
-
-// SAFETY: the box moves with the `Deferred`, and until its call is final only the library reaches it.
-unsafe impl<Verb: sealed::Calling + Send> Send for Deferred<Verb> {}
-
-impl<Verb: sealed::Calling> IntoFuture for Deferred<Verb> {
-    type Output = Result<Verb::Output>;
-    type IntoFuture = Wait<Verb>;
-
-    fn into_future(self) -> Wait<Verb> {
-        Wait(Some(self))
-    }
-}
-
-/// A [`Deferred`] being awaited: every poll reads its status, and one not yet final asks to be
-/// polled again and returns, so the runtime decides when, and no thread sleeps or parks in
-/// `ustore_outcome_wait` on the awaiting task's behalf; [`Deferred::wait`] blocks there instead.
-///
-/// Rust-only; every poll calls `ustore_outcome_status`, and the final one `ustore_outcome_wait`, which returns at once.
-#[must_use = "an awaited call does nothing unless polled"]
-pub struct Wait<Verb: sealed::Calling>(Option<Deferred<Verb>>);
-
-impl<Verb: sealed::Calling> Future for Wait<Verb> {
+impl<Verb: sealed::Calling> Future for Deferred<'_, Verb> {
     type Output = Result<Verb::Output>;
 
-    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        let awaited = &mut self.get_mut().0;
-        match awaited.take() {
-            None => Poll::Ready(Err(fail(Status::InvalidArgument, "the call was already awaited"))),
-            Some(call) if call.status() == Err(Status::Deferred) => {
-                *awaited = Some(call);
-                context.waker().wake_by_ref();
-                Poll::Pending
+    fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        match self.stage {
+            CallStage::Answered => {
+                return Poll::Ready(Err(fail(Status::InvalidArgument, "the call was already awaited")));
             }
-            Some(call) => Poll::Ready(call.wait()),
+            CallStage::Unsubmitted => self.as_mut().submit(),
+            CallStage::Submitted => {}
         }
+        // SAFETY: the outcome lives in the pinned call.
+        if unsafe { ffi::ustore_outcome_status(self.outcome()) } == ffi::ustore_status_t::DEFERRED {
+            context.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        let (status, verb) = self.finished();
+        Poll::Ready(status.and_then(|()| verb.finish()))
     }
 }
 
-/// One deferred call and everything it lends the library, at one heap address until its status is final.
-///
-/// The argument struct is not among them, since submission copies it.
-struct Lent<Verb: sealed::Calling> {
-    /// The outcome the library finishes.
-    outcome: ffi::ustore_outcome_t,
-    /// The inputs, the output slots and the arena borrow.
-    verb: Verb,
+impl<Verb: sealed::Calling> Drop for Deferred<'_, Verb> {
+    fn drop(&mut self) {
+        match self.stage {
+            CallStage::Answered => return,
+            // SAFETY: a submitted call is pinned, so its outcome is where the library writes it.
+            CallStage::Submitted => unsafe {
+                ffi::ustore_outcome_wait(self.outcome());
+            },
+            CallStage::Unsubmitted => {}
+        }
+        // SAFETY: the call is final or was never submitted, and the verb was not taken.
+        unsafe { ManuallyDrop::drop(&mut (*self.call.get()).verb) };
+    }
+}
+
+impl<Verb: sealed::Calling> fmt::Debug for Deferred<'_, Verb> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Deferred({:?})", self.stage)
+    }
 }
 
 // endregion: Calls
@@ -4085,7 +4291,7 @@ pub struct Transaction<'db> {
 impl<'db> Transaction<'db> {
     /// The view every call inside this transaction addresses, watching the keys it touches or not.
     pub fn view(&self, watch: Watch) -> On<'_, Transaction<'db>> {
-        On {
+        On::of(Handles {
             database: self.database.handle(),
             // SAFETY: the transaction is open, and its view tags the handle without allocating.
             view: unsafe { ffi::ustore_transaction_view(self.handle, watch) },
@@ -4093,8 +4299,7 @@ impl<'db> Transaction<'db> {
             snapshot: ptr::null_mut(),
             executor: ptr::null_mut(),
             watch,
-            marker: PhantomData,
-        }
+        })
     }
 
     /// The view of this transaction watching the keys it touches, with every call through it running on `executor`.
@@ -4143,29 +4348,29 @@ impl Drop for Transaction<'_> {
 // refuses a second call while one is unfinished, which is all the C interface asks of it.
 unsafe impl Send for Transaction<'_> {}
 
-impl<Completion: sealed::Completion> On<'_, Transaction<'_>, Completion> {
+impl<'view, Completion: sealed::Completion> On<'view, Transaction<'_>, Completion> {
     /// Stages the writes of this view's transaction as the first phase of a two-phase commit, reporting the stamp the
     /// transaction reads at.
-    pub fn stage(&self) -> Completion::Answer<Stage> {
+    pub fn stage(&self) -> Completion::Deferrable<'view, Stage> {
         let verb = Stage { stamp: ReadStamp::default() };
         Completion::answer(self, verb)
     }
 
     /// Commits the writes of this view's transaction, reporting the commit's position in commit order.
-    pub fn commit(&self, durability: Durability) -> Completion::Answer<Commit> {
+    pub fn commit(&self, durability: Durability) -> Completion::Deferrable<'view, Commit> {
         let verb = Commit { durability, stamp: CommitStamp::default() };
         Completion::answer(self, verb)
     }
 
     /// Withdraws a stage of this view's transaction, releasing whatever it claimed, while keeping the reads and
     /// writes to stage again.
-    pub fn rollback(&self) -> Completion::Answer<Rollback> {
+    pub fn rollback(&self) -> Completion::Deferrable<'view, Rollback> {
         Completion::answer(self, Rollback)
     }
 
     /// Discards the reads and writes of this view's transaction and reopens it on the newest state, keeping its
     /// handle.
-    pub fn reset(&self) -> Completion::Answer<Reset> {
+    pub fn reset(&self) -> Completion::Deferrable<'view, Reset> {
         let verb = Reset { transaction: Address::default() };
         Completion::answer(self, verb)
     }
@@ -4181,9 +4386,9 @@ impl sealed::Calling for Stage {
     type Arguments = ffi::ustore_transaction_stage_t;
     type Output = ReadStamp;
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ffi::ustore_outcome_t,
         completion: ffi::ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -4217,9 +4422,9 @@ impl sealed::Calling for Commit {
     type Arguments = ffi::ustore_transaction_commit_t;
     type Output = CommitStamp;
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ffi::ustore_outcome_t,
         completion: ffi::ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -4251,9 +4456,9 @@ impl sealed::Calling for Rollback {
     type Arguments = ffi::ustore_transaction_rollback_t;
     type Output = ();
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ffi::ustore_outcome_t,
         completion: ffi::ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -4286,9 +4491,9 @@ impl sealed::Calling for Reset {
     type Arguments = ffi::ustore_transaction_init_t;
     type Output = ();
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ffi::ustore_outcome_t,
         completion: ffi::ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -4330,7 +4535,7 @@ pub struct Snapshot<'db> {
 impl<'db> Snapshot<'db> {
     /// The view every call at this snapshot addresses, which no write may go through.
     pub fn view(&self) -> On<'_, Snapshot<'db>> {
-        On {
+        On::of(Handles {
             database: self.database.handle(),
             // SAFETY: the snapshot is pinned, and its view tags the handle without allocating.
             view: unsafe { ffi::ustore_snapshot_view(self.handle) },
@@ -4338,8 +4543,7 @@ impl<'db> Snapshot<'db> {
             snapshot: self.handle,
             executor: ptr::null_mut(),
             watch: Watch::None,
-            marker: PhantomData,
-        }
+        })
     }
 
     /// The view of this snapshot with every call through it running on `executor`.
@@ -4375,7 +4579,7 @@ impl Drop for Snapshot<'_> {
 // interface promises concurrent calls only through a database.
 unsafe impl Send for Snapshot<'_> {}
 
-impl<Completion: sealed::Completion> On<'_, Snapshot<'_>, Completion> {
+impl<'view, Completion: sealed::Completion> On<'view, Snapshot<'_>, Completion> {
     /// Writes the snapshot this view reads out as a new database of the same engine, which that engine's open then
     /// serves, holding exactly the collections and names the snapshot records, whatever changed since.
     ///
@@ -4387,13 +4591,12 @@ impl<Completion: sealed::Completion> On<'_, Snapshot<'_>, Completion> {
     pub fn save<'config, Path: AsRef<str>>(
         &self,
         config: impl Into<SaveConfig<'config, Path>>,
-    ) -> Completion::Answer<Save<'config, Path>>
+    ) -> Completion::Deferrable<'view, Save<'config, Path>>
     where
         Completion: sealed::Accepts<SaveConfig<'config, Path>>,
     {
         let SaveConfig { path, progress } = config.into();
-        let verb = Save { path, progress: Progress(progress) };
-        Completion::answer(self, verb)
+        Completion::answer(self, Save { path, progress })
     }
 }
 
@@ -4402,7 +4605,7 @@ pub struct SaveConfig<'config, Path> {
     /// The directory of the new database.
     pub path: Path,
     /// Reports the bytes saved and stops wherever it says to, removing what the save wrote.
-    pub progress: Option<Box<ProgressCallback<'config>>>,
+    pub progress: Option<Progress<'config>>,
 }
 
 impl<Path: AsRef<str>> From<Path> for SaveConfig<'_, Path> {
@@ -4412,23 +4615,22 @@ impl<Path: AsRef<str>> From<Path> for SaveConfig<'_, Path> {
 }
 
 /// A save of a snapshot as a database of its own; see [`On::save`].
-#[derive(Debug)]
 pub struct Save<'progress, Path> {
     path: Path,
-    progress: Progress<'progress>,
+    progress: Option<Progress<'progress>>,
 }
 
 impl<Path: AsRef<str>> sealed::Calling for Save<'_, Path> {
     type Arguments = ffi::ustore_snapshot_save_t;
     type Output = ();
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ffi::ustore_outcome_t,
         completion: ffi::ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
-        let (progress, progress_state) = self.progress.lowered();
+        let (progress, progress_state) = lowered_progress(&self.progress);
         Ok(Some(ffi::ustore_snapshot_save_t {
             snapshot: view.snapshot(),
             executor: view.executor(),
@@ -4534,6 +4736,25 @@ impl From<CommitStamp> for ChangesCursorConfig {
     }
 }
 
+/// A cursor whose pulls block on an executor, which every pull names again, since a cursor keeps
+/// none; a cursor's own pulls run on the calling thread.
+///
+/// Rust-only.
+#[derive(Debug)]
+pub struct CursorOn<'cursor, Cursor> {
+    pub(crate) cursor: &'cursor mut Cursor,
+    pub(crate) executor: ffi::ustore_executor_t,
+    marker: PhantomData<&'cursor Executor>,
+}
+
+impl<'cursor, Cursor> CursorOn<'cursor, Cursor> {
+    /// The receiver whose pulls through `cursor` block on `executor`, or on the calling thread for
+    /// none.
+    pub(crate) fn new(cursor: &'cursor mut Cursor, executor: Option<&'cursor Executor>) -> Self {
+        CursorOn { cursor, executor: executor.map_or(ptr::null_mut(), |executor| executor.handle), marker: PhantomData }
+    }
+}
+
 /// A feed of the changes committed to one collection after a stamp, oldest first, which every pull
 /// resumes past the last change the pull before it handed out; see [`Database::changes_cursor`].
 ///
@@ -4546,25 +4767,45 @@ pub struct ChangesCursor<'database> {
 }
 
 impl ChangesCursor<'_> {
-    /// Pulls up to `wanted` next changes into `arena`, none once the feed is at its newest commit.
-    pub fn next<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena) -> Result<Changes<'arena>> {
+    /// The receiver whose pulls block on `executor`.
+    pub fn on<'cursor>(&'cursor mut self, executor: &'cursor Executor) -> CursorOn<'cursor, Self> {
+        CursorOn::new(self, Some(executor))
+    }
+
+    /// Pulls up to `wanted` next changes into `arena` on the calling thread, none once the feed is
+    /// at its newest commit.
+    pub fn next<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena<'_>) -> Result<Changes<'arena>> {
+        CursorOn::new(self, None).next(wanted, arena)
+    }
+
+    /// Pulls up to `wanted` next changes with the bytes every one carries into `arena` in one call
+    /// on the calling thread.
+    pub fn next_pairs<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena<'_>) -> Result<Changes<'arena>> {
+        CursorOn::new(self, None).next_pairs(wanted, arena)
+    }
+}
+
+impl CursorOn<'_, ChangesCursor<'_>> {
+    /// Pulls up to `wanted` next changes into `arena` on this receiver's executor.
+    pub fn next<'arena>(self, wanted: usize, arena: &'arena mut Arena<'_>) -> Result<Changes<'arena>> {
         self.pull(wanted, arena, ptr::null_mut())
     }
 
-    /// Pulls up to `wanted` next changes with the bytes every one carries into `arena` in one call.
-    pub fn next_pairs<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena) -> Result<Changes<'arena>> {
+    /// Pulls up to `wanted` next changes with the bytes every one carries into `arena` in one call
+    /// on this receiver's executor.
+    pub fn next_pairs<'arena>(self, wanted: usize, arena: &'arena mut Arena<'_>) -> Result<Changes<'arena>> {
         let mut values = ffi::ustore_strings_view_t::default();
         let mut changes = self.pull(wanted, arena, &mut values)?;
-        // SAFETY: the pull succeeded, writing each change's value as a tape into the `'arena` one.
+        // SAFETY: the pull succeeded, writing each value onto a tape in the result's arena.
         changes.values = unsafe { Strings::exported(values, changes.keys.len())? };
         Ok(changes)
     }
 
     /// Pulls a page of changes into `arena`, with their values into `values` unless it is null.
     fn pull<'arena>(
-        &mut self,
+        self,
         wanted: usize,
-        arena: &'arena mut Arena,
+        arena: &'arena mut Arena<'_>,
         values: *mut ffi::ustore_strings_view_t,
     ) -> Result<Changes<'arena>> {
         let mut count: ffi::ustore_size_t = 0;
@@ -4573,8 +4814,8 @@ impl ChangesCursor<'_> {
         let mut kinds: *const ffi::ustore_enum_t = ptr::null();
         let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_changes_cursor_next_t {
-            cursor: self.handle,
-            executor: ptr::null_mut(),
+            cursor: self.cursor.handle,
+            executor: self.executor,
             outcome: &mut outcome,
             completion: ffi::ustore_completion_t::Blocking,
             wanted: wanted as ffi::ustore_size_t,
@@ -4590,7 +4831,8 @@ impl ChangesCursor<'_> {
         check(outcome)?;
         arena.host()?;
         let count = count as usize;
-        // SAFETY: a successful pull wrote `count` of each output to the arena borrowed for `'arena`
+        // SAFETY: a successful pull wrote `count` of each output to the arena borrowed for the
+        // result
         let raw_kinds = unsafe { exported_slice(kinds, count) };
         if raw_kinds.iter().any(|&kind| ChangeKind::from_raw(kind).is_none()) {
             return Err(fail(Status::Malformed, "the library wrote an unknown change kind"));
@@ -4664,7 +4906,8 @@ impl<'arena> Changes<'arena> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::testing::{ScratchDirectory, block_on, created, key, keys, skipped};
+    use crate::testing::{self, ScratchDirectory, block_on, created, key, keys, skipped};
+    use crate::{BlobsVerbs, DocsVerbs, StringsVerbs};
 
     #[test]
     fn change_feeds_hand_out_writes_and_removals_oldest_first() {
@@ -4880,21 +5123,21 @@ mod tests {
             database.head().write(collection, &entries, Durability::Buffered).unwrap();
         }
         let mut reports = Vec::new();
-        let counting = |finished: usize, total: usize| {
+        let mut counting = |finished: usize, total: usize| {
             reports.push((finished, total));
             ControlFlow::Continue(())
         };
-        database.compact(Some(Box::new(counting) as Box<ProgressCallback>)).unwrap();
+        database.compact(Some(Progress::new(&mut counting))).unwrap();
         assert!(!reports.is_empty() && reports.iter().all(|(finished, total)| finished <= total));
 
-        let stopping = |_: usize, _: usize| -> ControlFlow<()> { ControlFlow::Break(()) };
-        let cancelled = database.compact(Some(Box::new(stopping) as Box<ProgressCallback>)).unwrap_err();
+        let mut stopping = |_: usize, _: usize| -> ControlFlow<()> { ControlFlow::Break(()) };
+        let cancelled = database.compact(Some(Progress::new(&mut stopping))).unwrap_err();
         assert_eq!(cancelled.status, Status::Cancelled);
 
-        // A deferred call owns its handler outright, so nothing it captures is borrowed or leaked.
+        // A deferred call lends a `'static` handler, as the library calls it after submission.
         let executor = Executor::for_ram(&[], 1).unwrap();
-        let owned = Box::new(|_: usize, _: usize| -> ControlFlow<()> { ControlFlow::Break(()) });
-        let compaction = database.head().deferred(&executor).compact(Some(owned as Box<ProgressCallback>)).unwrap();
+        let leaked = Box::leak(Box::new(|_: usize, _: usize| -> ControlFlow<()> { ControlFlow::Break(()) }));
+        let compaction = database.head().deferred(&executor).compact(Some(Progress::new(leaked))).unwrap();
         assert_eq!(compaction.wait().unwrap_err().status, Status::Cancelled);
     }
 
@@ -4908,9 +5151,9 @@ mod tests {
         }
         let executor = Executor::for_ram(&[], 1).unwrap();
         let (mut plan, mut phase) = (CompactPlan::default(), PhaseProgress::default());
-        let stopping = |_: usize, _: usize| -> ControlFlow<()> { ControlFlow::Break(()) };
+        let mut stopping = |_: usize, _: usize| -> ControlFlow<()> { ControlFlow::Break(()) };
         let stopped = database.head().on(&executor).compact(CompactConfig {
-            progress: Some(Box::new(stopping)),
+            progress: Some(Progress::new(&mut stopping)),
             plan: Some(&mut plan),
             phase: Some(&mut phase),
         });
@@ -5416,15 +5659,15 @@ mod tests {
         let executor = Executor::for_ram(&[], 1).unwrap();
         let mut arena = Arena::new_in(&executor).unwrap();
         let (database, blobs) = crowded(100_000);
-        let scan = database.head().deferred(&executor).scan(blobs, key(0), 100_000, &mut arena).unwrap();
-        let lent = scan.lent;
+        let mut scan = Box::pin(database.head().deferred(&executor).scan(blobs, key(0), 100_000, &mut arena).unwrap());
+        let _ = testing::poll_once(scan.as_mut());
         std::mem::forget(scan);
 
-        // The free waits in the library for the call naming the database, which the forgotten box still holds.
+        // The free waits in the library for the call naming the database, which the leaked call
+        // still holds, so the arena it wrote into serves the next call at once.
         drop(database);
-        let scan = Deferred { lent };
-        assert_eq!(scan.status(), Ok(()));
-        assert_eq!(scan.wait().unwrap().keys.len(), 100_000);
+        let (database, blobs) = crowded(1);
+        assert_eq!(database.head().scan(blobs, key(0), 1, &mut arena).unwrap().keys, &keys([0]));
     }
 
     #[test]
@@ -5432,8 +5675,10 @@ mod tests {
         let executor = Executor::for_ram(&[], 1).unwrap();
         let mut arena = Arena::new_in(&executor).unwrap();
         let (database, blobs) = crowded(100_000);
-        let scan = database.head().deferred(&executor).scan(blobs, key(0), 100_000, &mut arena).unwrap();
-        drop(scan);
+        {
+            let mut scan = pin!(database.head().deferred(&executor).scan(blobs, key(0), 100_000, &mut arena).unwrap());
+            let _ = testing::poll_once(scan.as_mut());
+        }
 
         // The drop waited for the scan to release the arena, so the next call through it is not contended.
         assert_eq!(database.head().scan(blobs, key(0), 1, &mut arena).unwrap().keys, &keys([0]));
@@ -5447,11 +5692,13 @@ mod tests {
         let mut measured = Arena::new_in(&executor).unwrap();
         let head = database.head().deferred(&executor);
 
-        let scan = head.scan(blobs, key(0), 100_000, &mut scanned).unwrap();
+        let mut scan = pin!(head.scan(blobs, key(0), 100_000, &mut scanned).unwrap());
+        if testing::poll_once(scan.as_mut()).is_ready() {
+            return skipped("the executor finished the call within the poll that submitted it");
+        }
         let refused = head.measure(blobs, key(0)..key(9), &mut measured).unwrap();
-        assert_eq!(refused.status(), Err(Status::Contended), "a refused call is final at once");
         assert_eq!(refused.wait().unwrap_err().status, Status::Contended);
-        assert_eq!(scan.wait().unwrap().keys.len(), 100_000);
+        assert_eq!(block_on(scan).unwrap().keys.len(), 100_000);
         head.measure(blobs, key(0)..key(9), &mut measured).unwrap().wait().unwrap();
     }
 
@@ -5464,11 +5711,14 @@ mod tests {
         let mut deferred_arena = Arena::new_in(&executor).unwrap();
 
         let every: Vec<Key> = (0..100_000u64).map(Key::from).collect();
-        let read = transaction.deferred(&executor).read(blobs, every, &mut deferred_arena).unwrap();
+        let mut read = pin!(transaction.deferred(&executor).read(blobs, every, &mut deferred_arena).unwrap());
+        if testing::poll_once(read.as_mut()).is_ready() {
+            return skipped("the executor finished the call within the poll that submitted it");
+        }
         let refused = transaction.view(Watch::Keys).read(blobs, &keys([1]), &mut arena).unwrap_err();
         assert_eq!(refused.status, Status::Contended);
 
-        assert_eq!(read.wait().unwrap().len(), 100_000);
+        assert_eq!(block_on(read).unwrap().len(), 100_000);
         let after = transaction.view(Watch::Keys).read(blobs, &keys([1]), &mut arena).unwrap();
         assert_eq!(after.get(0), Some(b"value".as_slice()));
     }
@@ -5481,10 +5731,17 @@ mod tests {
         let head = database.head().deferred(&executor);
         for (index, mood) in [Mood::Spinning, Mood::Parked, Mood::Spinning].into_iter().enumerate() {
             let value: stringtape::BytesTape<u64> = [b"value".as_slice()].into_iter().collect();
-            let write = head.write(blobs, ([key(index as u64)], value), Durability::Buffered).unwrap();
+            let mut write = pin!(head.write(blobs, ([key(index as u64)], value), Durability::Buffered).unwrap());
+            let submitted = testing::poll_once(write.as_mut());
             executor.drain(mood).unwrap();
-            assert_eq!(write.status(), Ok(()));
-            write.wait().unwrap();
+            let finished = match submitted {
+                Poll::Ready(written) => written,
+                Poll::Pending => match testing::poll_once(write.as_mut()) {
+                    Poll::Ready(written) => written,
+                    Poll::Pending => panic!("the drain left the call deferred"),
+                },
+            };
+            finished.unwrap();
         }
     }
 
@@ -5496,8 +5753,6 @@ mod tests {
         };
         let failure = check(written).unwrap_err();
         assert_eq!(failure.status, Status::NotFound);
-        assert_eq!(failure.message, "No such collection");
-        assert_eq!(failure.to_string(), "No such collection");
         assert_eq!(failure.status.to_string(), "not-found");
 
         let contended = ffi::ustore_outcome_t {

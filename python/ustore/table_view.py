@@ -25,7 +25,7 @@ import numpy as np
 import pandas
 
 from ustore.keys import PAGE_KEYS, KeyLike, as_key, scan_keys
-from ustore.lib import Arena, Columns, Database, FieldType, Modality, Modification, Transaction, On
+from ustore.lib import Arena, Columns, Database, FieldType, Modality, Modification, On, Transaction
 
 type Receiver = Database | Transaction | On
 

@@ -61,9 +61,9 @@ type DataDirectory = PathLikeOrStr | tuple[PathLikeOrStr, int]
 type Progress = Callable[[int, int], bool | None]
 """Called with the units a call finished and the units it finishes in all, from whichever thread runs it but never two
 at once; None or a truthy answer carries on, any other falsy one cancels, and a raise cancels and re-raises."""
-type Predicate = Callable[[tuple[UUID, ...]], Sequence[object]]
-"""Called with the keys one page of a scan or a pull listed, from whichever thread runs it, answering one truthy item
-per key kept; a raise rejects the rest and re-raises once the call is final."""
+type Predicate = Callable[[UUID], bool] | Batch
+"""Called with each key a scan or a pull listed, from whichever thread runs it, keeping it when truthy, or a `Batch`
+asked once per page; a raise reports through `sys.unraisablehook` and rejects the rest of the page."""
 
 __version__: str
 edge_id_default: UUID
@@ -103,13 +103,11 @@ class Status(IntEnum):
     PHANTOM_CONFLICT = 22
     CAPACITY_EXHAUSTED = 23
 
-
 class Mood(IntEnum):
     """What an executor's threads do once it next goes idle, valued as `ustore_mood_t`."""
 
     PARKED = 0
     SPINNING = 1
-
 
 class Watch(IntEnum):
     """Whether a transaction records the keys a call touches, valued as `ustore_watch_t`."""
@@ -117,13 +115,11 @@ class Watch(IntEnum):
     KEYS = 0
     NONE = 1
 
-
 class Durability(IntEnum):
     """How durable the writes a call publishes are once it finishes, valued as `ustore_durability_t`."""
 
     BUFFERED = 0
     FLUSHED = 1
-
 
 class DropMode(IntEnum):
     """What dropping a collection removes, valued as `ustore_drop_mode_t`."""
@@ -132,20 +128,17 @@ class DropMode(IntEnum):
     PAIRS = 1
     VALUES = 2
 
-
 class ScanMode(IntEnum):
     """In what order a scan hands its keys over, valued as `ustore_scan_mode_t`."""
 
     ORDERED = 0
     UNORDERED = 1
 
-
 class ScanDirection(IntEnum):
     """Which way a scan, a cursor or a measurement walks its range from the start key."""
 
     ASCENDING = 0
     DESCENDING = 1
-
 
 class Modality(IntEnum):
     """What a collection holds, valued as `ustore_modality_t`."""
@@ -156,13 +149,11 @@ class Modality(IntEnum):
     STRINGS = 4
     PAGES = 5
 
-
 class Isolation(IntEnum):
     """How the transactions of the in-memory engine see each other's writes, valued as `ustore_isolation_t`."""
 
     STRICT_SERIALIZABLE = 0
     SNAPSHOT = 1
-
 
 class CPUClass(IntEnum):
     """The CPU generation a database confines its waits, atomics and string kernels to, valued as
@@ -181,7 +172,6 @@ class CPUClass(IntEnum):
     ALIBABA_C930 = 17
     IBM_POWER10 = 18
 
-
 class Transport(IntEnum):
     """How the NVMe engine moves bytes between its files and memory, valued as `ustore_transport_t`."""
 
@@ -191,13 +181,11 @@ class Transport(IntEnum):
     LINUX_AIO = 3
     LINUX_SPDK = 4
 
-
 class PatternKind(IntEnum):
     """What the patterns of a scan or a cursor are matched as, valued as `ustore_pattern_kind_t`."""
 
     REGEX = 0
     SUBSTRINGS = 1
-
 
 class CaseSensitivity(IntEnum):
     """Whether patterns compare bytes as they are or after Unicode case folding, valued as
@@ -206,14 +194,12 @@ class CaseSensitivity(IntEnum):
     CASED = 0
     UNCASED = 1
 
-
 class PredicateCost(IntEnum):
     """Where a scan asks its predicate: before patterns and filters read values, or last, valued as
     `ustore_predicate_cost_t`."""
 
     CHEAP = 0
     EXPENSIVE = 1
-
 
 class Gds(IntEnum):
     """How an executor of `Executor.for_vram` moves bytes between the drives and its device, valued as
@@ -223,14 +209,12 @@ class Gds(IntEnum):
     DIRECT = 1
     COMPATIBILITY = 2
 
-
 class GPUVendor(IntEnum):
     """The vendor whose runtime drives a GPU, valued as `ustore_gpu_vendor_t`."""
 
     NVIDIA = 1
     AMD = 2
     APPLE = 3
-
 
 class GPUClass(IntEnum):
     """The generation of a GPU, valued as `ustore_gpu_class_t`."""
@@ -247,7 +231,6 @@ class GPUClass(IntEnum):
     APPLE_METAL9 = 11
     APPLE_METAL10 = 12
 
-
 class Engine(IntEnum):
     """The engine serving a database, as `describe()` reports it, valued as `ustore_engine_t`."""
 
@@ -256,7 +239,6 @@ class Engine(IntEnum):
     LEVELDB = 2
     NVME = 3
 
-
 class Role(IntEnum):
     """The role a vertex plays in an edge, valued as `ustore_vertex_role_t`."""
 
@@ -264,7 +246,6 @@ class Role(IntEnum):
     SOURCE = 1
     TARGET = 2
     ANY = 3
-
 
 class FieldType(IntEnum):
     """How a document or a field is spelled, or what a gather converts it into, valued as `ustore_docs_field_type_t`."""
@@ -287,7 +268,6 @@ class FieldType(IntEnum):
     BINARY = 50
     STRING = 51
 
-
 class Modification(IntEnum):
     """What a document write applies, valued as `ustore_docs_modification_t`."""
 
@@ -296,7 +276,6 @@ class Modification(IntEnum):
     INSERT = 2
     PATCH = 3
     MERGE = 4
-
 
 class PageEncoding(IntEnum):
     """How a page or a fragment is spelled on import or rendered on read, valued as `ustore_page_encoding_t`."""
@@ -307,14 +286,12 @@ class PageEncoding(IntEnum):
     TEXT = 3
     JSON = 4
 
-
 class ChangeKind(IntEnum):
     """What one committed change did to its key."""
 
     WRITE = 0
     REMOVAL = 1
     CHANGE = 2
-
 
 class Phase(IntEnum):
     """The kind of work a plan is doing, named through `ustore_phase_name`."""
@@ -324,7 +301,6 @@ class Phase(IntEnum):
     MERGE = 2
     RECLAIM = 3
     DONE = 4
-
 
 # endregion: Statuses and Modes
 
@@ -575,7 +551,7 @@ class Neighborhoods:
 # region: Collections
 
 class Collection:
-    """A collection a receiver addresses by name, resolved on every call and created by its first write.
+    """A collection a receiver addresses by name, resolved on every call; a missing name raises `NotFoundError`.
 
     The mapping views and `sample` copy what they read out of a one-off arena each. Through a deferred view,
     `blobs[key]`, `docs[key]`, `docs_json[key]`, `scan`, `sample_keys` and the reads of `graph` that take one call
@@ -641,6 +617,28 @@ class DocsJSONView:
 # endregion: Collections
 
 # region: Executors and Deferred Calls
+
+@final
+class Batch:
+    """A `predicate=` answering a page of keys in one call, for handlers that pay per call, such as a lookup in an
+    external database.
+
+    `handler(keys, admissions)` reads a `(count, 16)` memoryview of key bytes and writes 1 into a `(count,)`
+    memoryview of admissions for every key it keeps; both are valid only for the call. An expensive batch is asked
+    about the keys patterns and filters kept, a cheap one before they read any value.
+    """
+
+    def __init__(
+        self,
+        handler: Callable[[memoryview, memoryview], object],
+        /,
+        *,
+        cost: PredicateCost = PredicateCost.EXPENSIVE,
+    ) -> None: ...
+    @property
+    def handler(self) -> Callable[[memoryview, memoryview], object]: ...
+    @property
+    def cost(self) -> PredicateCost: ...
 
 @final
 class Executor:
@@ -713,8 +711,8 @@ class Deferred[T]:
         """Blocks the thread until the call finishes, answering or raising what the blocking verb would."""
 
     def __await__(self) -> Generator[Any, None, T]:
-        """Polls `status` between sleeps growing from 1 µs to 1 ms on the running loop, parking no thread, then
-        answers `wait()`."""
+        """Polls `status`, re-polling once per turn of the running loop through `loop.call_soon` while it is
+        deferred, parking no thread, then answers `wait()`."""
 
 # endregion: Executors and Deferred Calls
 
@@ -934,7 +932,6 @@ class _Reads:
         pattern_kind: PatternKind = PatternKind.REGEX,
         sensitivity: CaseSensitivity = CaseSensitivity.CASED,
         predicate: Predicate | None = None,
-        predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Cursor:
         """A walk over the keys of one collection from `start`, reading nothing until its first pull, whose every pull
         blocks as this receiver's calls do. Calls `ustore_blobs_cursor_init`."""
@@ -949,7 +946,6 @@ class _Reads:
         direction: ScanDirection = ScanDirection.ASCENDING,
         filter: str | bytes | None = None,
         predicate: Predicate | None = None,
-        predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Cursor:
         """A walk over documents, keeping those `filter` matches. Calls `ustore_docs_cursor_init`."""
 
@@ -963,7 +959,6 @@ class _Reads:
         direction: ScanDirection = ScanDirection.ASCENDING,
         filter: str | bytes | None = None,
         predicate: Predicate | None = None,
-        predicate_cost: PredicateCost = PredicateCost.CHEAP,
         outputs_encoding: PageEncoding = PageEncoding.XML,
     ) -> Cursor:
         """A walk over pages, keeping those holding a node of the XPath `filter`, whose pulls render whole pages into
@@ -978,7 +973,6 @@ class _Reads:
         end: KeyLike | None = None,
         direction: ScanDirection = ScanDirection.ASCENDING,
         predicate: Predicate | None = None,
-        predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Cursor:
         """A walk over the vertices of one graph collection. Calls `ustore_graph_vertices_cursor_init`."""
 
@@ -999,7 +993,6 @@ class _Reads:
         sensitivity: CaseSensitivity = CaseSensitivity.CASED,
         weights: Sequence[float] | None = None,
         predicate: Predicate | None = None,
-        predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Keys:
         """Lists up to `wanted` keys from `start` towards `end`. Values are not exported, so a
         read follows the scan, or a `cursor()` walks a collection with its values instead.
@@ -1039,7 +1032,6 @@ class _Reads:
         sensitivity: CaseSensitivity = CaseSensitivity.CASED,
         weights: Sequence[float] | None = None,
         predicate: Predicate | None = None,
-        predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Keys:
         """One scan per start, reporting the scans finished to `progress`."""
     def sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Keys:
@@ -1157,7 +1149,6 @@ class _Reads:
         progress: Progress | None = None,
         filter: str | bytes | None = None,
         predicate: Predicate | None = None,
-        predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Keys:
         """Lists up to `wanted` document keys from `start` towards `end`, as `scan` lists the
         keys of blobs. Documents are not exported, so a `docs_read` follows the scan.
@@ -1247,7 +1238,6 @@ class _Reads:
         progress: Progress | None = None,
         filter: str | bytes | None = None,
         predicate: Predicate | None = None,
-        predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Keys:
         """Up to `wanted` page keys from `start`, keeping those holding a node of the XPath `filter`."""
     def pages_sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Keys:
@@ -1309,7 +1299,6 @@ class _Reads:
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
         predicate: Predicate | None = None,
-        predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Keys:
         """Lists up to `wanted` vertices from `start` towards `end`, those without edges included.
         Edges are not exported, so a `graph_read_edges` follows the scan.
@@ -1978,7 +1967,6 @@ class DeferredOn:
         sensitivity: CaseSensitivity = CaseSensitivity.CASED,
         weights: Sequence[float] | None = None,
         predicate: Predicate | None = None,
-        predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Deferred[Keys]:
         """scan(start, wanted, arena, *, collection, end=None, direction=ScanDirection.ASCENDING,
         mode=ScanMode.ORDERED, progress=None) answers a Keys tape.
@@ -2022,7 +2010,6 @@ class DeferredOn:
         sensitivity: CaseSensitivity = CaseSensitivity.CASED,
         weights: Sequence[float] | None = None,
         predicate: Predicate | None = None,
-        predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Deferred[Keys]:
         """The `Deferred` of one scan per start, whose `progress` runs on the executor's threads."""
     def sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Deferred[Keys]:
@@ -2171,7 +2158,6 @@ class DeferredOn:
         progress: Progress | None = None,
         filter: str | bytes | None = None,
         predicate: Predicate | None = None,
-        predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Deferred[Keys]:
         """docs_scan(start, wanted, arena, *, collection, end=None,
         direction=ScanDirection.ASCENDING, mode=ScanMode.ORDERED, progress=None)
@@ -2280,7 +2266,6 @@ class DeferredOn:
         progress: Progress | None = None,
         filter: str | bytes | None = None,
         predicate: Predicate | None = None,
-        predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Deferred[Keys]:
         """Up to `wanted` page keys from `start`, keeping those holding a node of the XPath `filter`."""
 
@@ -2362,7 +2347,6 @@ class DeferredOn:
         mode: ScanMode = ScanMode.ORDERED,
         progress: Progress | None = None,
         predicate: Predicate | None = None,
-        predicate_cost: PredicateCost = PredicateCost.CHEAP,
     ) -> Deferred[Keys]:
         """graph_scan_vertices(start, wanted, arena, *, collection, end=None,
         direction=ScanDirection.ASCENDING, mode=ScanMode.ORDERED, progress=None)

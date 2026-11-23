@@ -36,9 +36,9 @@ from ustore.lib import (
     Modality,
     Modification,
     Neighborhoods,
+    On,
     Role,
     Transaction,
-    On,
     edge_id_default,
 )
 
@@ -50,14 +50,12 @@ type Triple = tuple[UUID, UUID, UUID]
 type KeysLike = Sequence[KeyLike] | Buffer
 
 
-def resolve_collection(view: Receiver, collection: CollectionLike, modality: Modality) -> UUID:
-    """Answers the ID a collection argument addresses, creating a named one that is missing to hold `modality`."""
+def resolve_collection(view: Receiver, collection: CollectionLike) -> UUID:
+    """Answers the ID a collection argument addresses, finding a named one; a missing name raises `NotFoundError`."""
     if not isinstance(collection, str):
         return collection
     database = view if isinstance(view, Database) else view.database
-    if database.collection_contains(collection):
-        return database.collection_find(collection, Arena())
-    return database.collection_create(collection, modality=modality)
+    return database.collection_find(collection, Arena())
 
 
 def triples_of(neighborhoods: Neighborhoods, index: int) -> list[Triple]:
@@ -212,12 +210,12 @@ class Graph:
     ) -> None:
         """Opens a graph in the graph collection `graph`, with vertex attributes in `nodes` and edge attributes in `edges`.
 
-        Named collections that do not exist yet are created, at the head of the database, graph and documents.
+        Named collections are only found, never created, so `collection_create` makes them first.
         """
         self.view = view
-        self.graph_collection = resolve_collection(view, graph, Modality.GRAPH)
-        self.nodes_collection = None if nodes is None else resolve_collection(view, nodes, Modality.DOCS)
-        self.edges_collection = None if edges is None else resolve_collection(view, edges, Modality.DOCS)
+        self.graph_collection = resolve_collection(view, graph)
+        self.nodes_collection = None if nodes is None else resolve_collection(view, nodes)
+        self.edges_collection = None if edges is None else resolve_collection(view, edges)
         # A graph collection holds vertices rather than documents, so attributes live in collections of their own.
         if self.graph_collection in (self.nodes_collection, self.edges_collection):
             raise ValueError("Attributes live in a collection apart from the graph")

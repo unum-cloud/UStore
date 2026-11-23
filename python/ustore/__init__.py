@@ -22,12 +22,14 @@ __version__ = _extension.__version__
 async def _settled(deferred: Deferred) -> object:
     """Answers `deferred` once final, parking no thread, as `Deferred.__await__` drives it.
 
-    The status is polled between sleeps that grow from 1 µs to 1 ms.
+    While the status is deferred, it is re-polled on the next turn of the running loop through a
+    future `loop.call_soon` resolves.
     """
-    delay = 1e-6
+    loop = asyncio.get_running_loop()
     while deferred.status == Status.DEFERRED:
-        await asyncio.sleep(delay)
-        delay = min(delay * 2, 1e-3)
+        turn = loop.create_future()
+        loop.call_soon(turn.set_result, None)
+        await turn
     return deferred.wait()
 
 

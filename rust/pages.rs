@@ -23,11 +23,11 @@ use crate::db::ffi::{
     ustore_progress_callback_t, ustore_scan_direction_t, ustore_scan_mode_t, ustore_size_t, ustore_strided_view_t,
     ustore_strings_view_t, ustore_transaction_t, ustore_view_t, ustore_watch_t,
 };
-use crate::db::sealed::{Accepts, Calling, Writable};
+use crate::db::sealed::{Accepts, Calling, Completion, Handles, Writable};
 use crate::db::{
-    Address, Arena, CollectionID, Collections, Deferring, Durability, Error, Key, KeyRange, Matching, On, Progress,
-    ProgressCallback, Result, ScanMode, Status, Strings, check, exported_slice, fail, read_spelling, spelling,
-    string_views,
+    Address, Arena, CollectionID, Collections, CursorOn, Deferrable, Deferring, Durability, Error, Executor, Key,
+    KeyRange, Matching, On, Progress, Result, ScanMode, Status, Strings, ViewVerbs, check, exported_slice, fail,
+    lowered_progress, read_spelling, spelling, string_views,
 };
 
 /// The encoding pages render in, as `ustore_page_encoding_t` spells it.
@@ -352,12 +352,13 @@ pub(crate) mod ffi {
 
 // region: Inputs
 
-/// The markup imported pages arrive in and how the import reports; see [`On::pages_import`].
+/// The markup imported pages arrive in and how the import reports, as
+/// [`PagesVerbs::pages_import`] takes them.
 pub struct PagesImportConfig<'config> {
     /// The encoding of the markup.
     pub encoding: PageEncoding,
     /// Reports the pages imported and stops wherever it says to.
-    pub progress: Option<Box<ProgressCallback<'config>>>,
+    pub progress: Option<Progress<'config>>,
 }
 
 impl From<PageEncoding> for PagesImportConfig<'_> {
@@ -366,7 +367,7 @@ impl From<PageEncoding> for PagesImportConfig<'_> {
     }
 }
 
-/// Where inserted elements land and which keys they take; see [`On::pages_insert`].
+/// Where inserted elements land and which keys they take; see [`PagesVerbs::pages_insert`].
 #[derive(Clone, Copy, Debug)]
 pub struct PagesInsertConfig<'config> {
     /// The key of the first element of every fragment; minted in every task when empty.
@@ -385,7 +386,7 @@ impl From<PageEncoding> for PagesInsertConfig<'_> {
     }
 }
 
-/// What a page read returns and how; see [`On::pages_read`].
+/// What a page read returns and how; see [`PagesVerbs::pages_read`].
 #[derive(Clone, Copy, Debug)]
 pub struct PagesReadConfig<'config> {
     /// Only these elements of each page; every element when empty.
@@ -400,7 +401,7 @@ impl From<PageEncoding> for PagesReadConfig<'_> {
     }
 }
 
-/// The page keys a scan keeps, what admits them and how it reports; see [`On::pages_scan`].
+/// The page keys a scan keeps, what admits them and how it reports; see [`PagesVerbs::pages_scan`].
 pub struct PagesScanConfig<'config> {
     /// Page keys kept, at most.
     pub wanted: usize,
@@ -409,7 +410,7 @@ pub struct PagesScanConfig<'config> {
     /// In what order the page keys come.
     pub mode: ScanMode,
     /// Reports the scans finished and stops wherever it says to.
-    pub progress: Option<Box<ProgressCallback<'config>>>,
+    pub progress: Option<Progress<'config>>,
 }
 
 impl From<usize> for PagesScanConfig<'_> {
@@ -418,7 +419,7 @@ impl From<usize> for PagesScanConfig<'_> {
     }
 }
 
-/// The page keys a sample draws; see [`On::pages_sample`].
+/// The page keys a sample draws; see [`PagesVerbs::pages_sample`].
 #[derive(Clone, Copy, Debug)]
 pub struct PagesSampleConfig {
     /// Page keys drawn, at most.
@@ -475,32 +476,30 @@ fn texts(texts: &[&str], count: usize) -> Result<ustore_strings_view_t> {
 
 // region: Verbs
 
-impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent, Completion> {
+/// The verbs over pages, written once for every receiver of [`ViewVerbs`]: a handle blocks on the
+/// calling thread, and an [`On`] runs on its executor, blocking or deferred.
+///
+/// Rust-only.
+pub trait PagesVerbs<'view>: ViewVerbs<'view> {
     /// Replaces whole pages with parsed markup, one per key, minting a key for every element.
     ///
     /// Calls `ustore_pages_import`.
-    pub fn pages_import<'collections, 'config, 'texts, Keys: AsRef<[Key]>, Markups: AsRef<[&'texts str]>>(
-        &self,
+    fn pages_import<'collections, 'config, 'texts, Keys: AsRef<[Key]>, Markups: AsRef<[&'texts str]>>(
+        self,
         collections: impl Into<Collections<'collections>>,
         keys: Keys,
         markups: Markups,
         config: impl Into<PagesImportConfig<'config>>,
         durability: Durability,
-    ) -> Completion::Answer<PagesImport<'collections, 'config, Keys, Markups>>
+    ) -> Deferrable<'view, Self, PagesImport<'collections, 'config, Keys, Markups>>
     where
-        Completion:
+        Self::Parent: Writable,
+        Self::Completion:
             Accepts<Collections<'collections>> + Accepts<Keys> + Accepts<Markups> + Accepts<PagesImportConfig<'config>>,
     {
         let PagesImportConfig { encoding, progress } = config.into();
-        let verb = PagesImport {
-            collections: collections.into(),
-            keys,
-            markups,
-            encoding,
-            progress: Progress(progress),
-            durability,
-        };
-        Completion::answer(self, verb)
+        let verb = PagesImport { collections: collections.into(), keys, markups, encoding, progress, durability };
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
     /// Parses one fragment per task into elements under a parent after an anchor of the page `keys`
@@ -508,17 +507,18 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
     /// arena.
     ///
     /// Calls `ustore_pages_insert`.
-    pub fn pages_insert<'arena, 'collections, 'config, 'texts, Keys: AsRef<[Key]>, Fragments: AsRef<[&'texts str]>>(
-        &self,
+    fn pages_insert<'arena, 'collections, 'config, 'texts, Keys: AsRef<[Key]>, Fragments: AsRef<[&'texts str]>>(
+        self,
         collections: impl Into<Collections<'collections>>,
         keys: Keys,
         fragments: Fragments,
         config: impl Into<PagesInsertConfig<'config>>,
-        arena: &'arena mut Arena,
+        arena: &'arena mut Arena<'_>,
         durability: Durability,
-    ) -> Completion::Answer<PagesInsert<'arena, 'collections, 'config, Keys, Fragments>>
+    ) -> Deferrable<'view, Self, PagesInsert<'arena, 'collections, 'config, Keys, Fragments>>
     where
-        Completion: Accepts<Collections<'collections>>
+        Self::Parent: Writable,
+        Self::Completion: Accepts<Collections<'collections>>
             + Accepts<Keys>
             + Accepts<Fragments>
             + Accepts<PagesInsertConfig<'config>>,
@@ -532,61 +532,64 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
             durability,
             effective: Address::default(),
         };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
     /// Removes one element per task with its subtree, where the Nil element [`Key::default`]
     /// removes the whole page.
     ///
     /// Calls `ustore_pages_remove`.
-    pub fn pages_remove<'collections, Keys: AsRef<[Key]>, Elements: AsRef<[Key]>>(
-        &self,
+    fn pages_remove<'collections, Keys: AsRef<[Key]>, Elements: AsRef<[Key]>>(
+        self,
         collections: impl Into<Collections<'collections>>,
         keys: Keys,
         elements: Elements,
         durability: Durability,
-    ) -> Completion::Answer<PagesRemove<'collections, Keys, Elements>>
+    ) -> Deferrable<'view, Self, PagesRemove<'collections, Keys, Elements>>
     where
-        Completion: Accepts<Collections<'collections>> + Accepts<Keys> + Accepts<Elements>,
+        Self::Parent: Writable,
+        Self::Completion: Accepts<Collections<'collections>> + Accepts<Keys> + Accepts<Elements>,
     {
         let verb = PagesRemove { collections: collections.into(), keys, elements, durability };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
     /// Moves one element per task with its subtree under a parent after an anchor, keeping its key,
     /// where empty `parents` stand for the root and empty `anchors` for the front.
     ///
     /// Calls `ustore_pages_move`.
-    pub fn pages_move<'collections, Keys, Elements, Parents, Anchors>(
-        &self,
+    fn pages_move<'collections, Keys, Elements, Parents, Anchors>(
+        self,
         collections: impl Into<Collections<'collections>>,
         keys: Keys,
         elements: Elements,
         parents: Parents,
         anchors: Anchors,
         durability: Durability,
-    ) -> Completion::Answer<PagesMove<'collections, Keys, Elements, Parents, Anchors>>
+    ) -> Deferrable<'view, Self, PagesMove<'collections, Keys, Elements, Parents, Anchors>>
     where
+        Self::Parent: Writable,
         Keys: AsRef<[Key]>,
         Elements: AsRef<[Key]>,
         Parents: AsRef<[Key]>,
         Anchors: AsRef<[Key]>,
-        Completion: Accepts<Collections<'collections>>
+        Self::Completion: Accepts<Collections<'collections>>
             + Accepts<Keys>
             + Accepts<Elements>
             + Accepts<Parents>
             + Accepts<Anchors>,
     {
         let verb = PagesMove { collections: collections.into(), keys, elements, parents, anchors, durability };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
     /// Replaces `lengths` bytes of the text of one element per task from `starts` on with `texts`,
     /// where a zero length only inserts and an empty text only removes.
     ///
     /// Calls `ustore_pages_splice`.
-    pub fn pages_splice<'collections, 'texts, Keys, Elements, Starts, Lengths, Texts>(
-        &self,
+    #[allow(clippy::too_many_arguments)]
+    fn pages_splice<'collections, 'texts, Keys, Elements, Starts, Lengths, Texts>(
+        self,
         collections: impl Into<Collections<'collections>>,
         keys: Keys,
         elements: Elements,
@@ -594,14 +597,15 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
         lengths: Lengths,
         texts: Texts,
         durability: Durability,
-    ) -> Completion::Answer<PagesSplice<'collections, Keys, Elements, Starts, Lengths, Texts>>
+    ) -> Deferrable<'view, Self, PagesSplice<'collections, Keys, Elements, Starts, Lengths, Texts>>
     where
+        Self::Parent: Writable,
         Keys: AsRef<[Key]>,
         Elements: AsRef<[Key]>,
         Starts: AsRef<[ustore_length_t]>,
         Lengths: AsRef<[ustore_length_t]>,
         Texts: AsRef<[&'texts str]>,
-        Completion: Accepts<Collections<'collections>>
+        Self::Completion: Accepts<Collections<'collections>>
             + Accepts<Keys>
             + Accepts<Elements>
             + Accepts<Starts>
@@ -609,68 +613,68 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
             + Accepts<Texts>,
     {
         let verb = PagesSplice { collections: collections.into(), keys, elements, starts, lengths, texts, durability };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
     /// Sets one attribute of one element per task, adding the ones it lacks.
     ///
     /// Calls `ustore_pages_set_attributes`.
-    pub fn pages_set_attributes<'collections, 'texts, Keys, Elements, Fields, Texts>(
-        &self,
+    fn pages_set_attributes<'collections, 'texts, Keys, Elements, Fields, Texts>(
+        self,
         collections: impl Into<Collections<'collections>>,
         keys: Keys,
         elements: Elements,
         fields: Fields,
         values: Texts,
         durability: Durability,
-    ) -> Completion::Answer<PagesSetAttributes<'collections, Keys, Elements, Fields, Texts>>
+    ) -> Deferrable<'view, Self, PagesSetAttributes<'collections, Keys, Elements, Fields, Texts>>
     where
+        Self::Parent: Writable,
         Keys: AsRef<[Key]>,
         Elements: AsRef<[Key]>,
         Fields: AsRef<[&'texts str]>,
         Texts: AsRef<[&'texts str]>,
-        Completion:
+        Self::Completion:
             Accepts<Collections<'collections>> + Accepts<Keys> + Accepts<Elements> + Accepts<Fields> + Accepts<Texts>,
     {
         let verb = PagesSetAttributes { collections: collections.into(), keys, elements, fields, values, durability };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
     /// Removes one attribute of one element per task.
     ///
     /// Calls `ustore_pages_remove_attributes`.
-    pub fn pages_remove_attributes<'collections, 'texts, Keys, Elements, Fields>(
-        &self,
+    fn pages_remove_attributes<'collections, 'texts, Keys, Elements, Fields>(
+        self,
         collections: impl Into<Collections<'collections>>,
         keys: Keys,
         elements: Elements,
         fields: Fields,
         durability: Durability,
-    ) -> Completion::Answer<PagesRemoveAttributes<'collections, Keys, Elements, Fields>>
+    ) -> Deferrable<'view, Self, PagesRemoveAttributes<'collections, Keys, Elements, Fields>>
     where
+        Self::Parent: Writable,
         Keys: AsRef<[Key]>,
         Elements: AsRef<[Key]>,
         Fields: AsRef<[&'texts str]>,
-        Completion: Accepts<Collections<'collections>> + Accepts<Keys> + Accepts<Elements> + Accepts<Fields>,
+        Self::Completion: Accepts<Collections<'collections>> + Accepts<Keys> + Accepts<Elements> + Accepts<Fields>,
     {
         let verb = PagesRemoveAttributes { collections: collections.into(), keys, elements, fields, durability };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
-}
 
-impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completion> {
     /// Reads whole pages, or chosen elements of them, as markup into the arena.
     ///
     /// Calls `ustore_pages_read`.
-    pub fn pages_read<'arena, 'collections, 'config, Keys: AsRef<[Key]>>(
-        &self,
+    fn pages_read<'arena, 'collections, 'config, Keys: AsRef<[Key]>>(
+        self,
         collections: impl Into<Collections<'collections>>,
         keys: Keys,
         config: impl Into<PagesReadConfig<'config>>,
-        arena: &'arena mut Arena,
-    ) -> Completion::Answer<PagesRead<'arena, 'collections, 'config, Keys>>
+        arena: &'arena mut Arena<'_>,
+    ) -> Deferrable<'view, Self, PagesRead<'arena, 'collections, 'config, Keys>>
     where
-        Completion: Accepts<Collections<'collections>> + Accepts<Keys> + Accepts<PagesReadConfig<'config>>,
+        Self::Completion: Accepts<Collections<'collections>> + Accepts<Keys> + Accepts<PagesReadConfig<'config>>,
     {
         let verb = PagesRead {
             collections: collections.into(),
@@ -680,22 +684,22 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
             presences: Address::default(),
             values: ustore_strings_view_t::default(),
         };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
     /// Lists up to `wanted` page keys of one collection's `range` into the arena, keeping those its
-    /// `matching` admits, while [`On::pages_read`] renders them.
+    /// `matching` admits, while [`PagesVerbs::pages_read`] renders them.
     ///
     /// Calls `ustore_pages_scan`.
-    pub fn pages_scan<'config, 'arena>(
-        &self,
+    fn pages_scan<'config, 'arena>(
+        self,
         collection: CollectionID,
         range: impl Into<KeyRange>,
         config: impl Into<PagesScanConfig<'config>>,
-        arena: &'arena mut Arena,
-    ) -> Completion::Answer<PagesScan<'arena, 'config>>
+        arena: &'arena mut Arena<'_>,
+    ) -> Deferrable<'view, Self, PagesScan<'arena, 'config>>
     where
-        Completion: Accepts<PagesScanConfig<'config>>,
+        Self::Completion: Accepts<PagesScanConfig<'config>>,
     {
         let range = range.into();
         let PagesScanConfig { wanted, matching, mode, progress } = config.into();
@@ -707,49 +711,51 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
             wanted,
             matched: matching,
             mode,
-            progress: Progress(progress),
+            progress,
             found: Found::default(),
         };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
     /// Draws up to `wanted` page keys uniformly at random from one pages collection into the arena.
     ///
     /// Calls `ustore_pages_sample`.
-    pub fn pages_sample<'arena>(
-        &self,
+    fn pages_sample<'arena>(
+        self,
         collection: CollectionID,
         config: impl Into<PagesSampleConfig>,
-        arena: &'arena mut Arena,
-    ) -> Completion::Answer<PagesSample<'arena>> {
+        arena: &'arena mut Arena<'_>,
+    ) -> Deferrable<'view, Self, PagesSample<'arena>> {
         let verb = PagesSample { collection, arena, wanted: config.into().wanted, found: Found::default() };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
     /// Estimates the pages and the space a range of page keys takes in one collection, through the
     /// arena its bounds land in.
     ///
     /// Calls `ustore_pages_measure`.
-    pub fn pages_measure<'arena>(
-        &self,
+    fn pages_measure<'arena>(
+        self,
         collection: CollectionID,
         range: impl Into<KeyRange>,
-        arena: &'arena mut Arena,
-    ) -> Completion::Answer<PagesMeasure<'arena>> {
+        arena: &'arena mut Arena<'_>,
+    ) -> Deferrable<'view, Self, PagesMeasure<'arena>> {
         let range = range.into();
         let verb = PagesMeasure { collection, start: range.start_key(), range, arena, bounds: Bounds::default() };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 }
 
-/// A replacement of whole pages; see [`On::pages_import`].
+impl<'view, Receiver: ViewVerbs<'view>> PagesVerbs<'view> for Receiver {}
+
+/// A replacement of whole pages; see [`PagesVerbs::pages_import`].
 #[derive(Debug)]
 pub struct PagesImport<'collections, 'config, Keys, Markups> {
     collections: Collections<'collections>,
     keys: Keys,
     markups: Markups,
     encoding: PageEncoding,
-    progress: Progress<'config>,
+    progress: Option<Progress<'config>>,
     durability: Durability,
 }
 
@@ -757,9 +763,9 @@ impl<'texts, Keys: AsRef<[Key]>, Markups: AsRef<[&'texts str]>> Calling for Page
     type Arguments = ffi::ustore_pages_import_t;
     type Output = ();
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -767,7 +773,7 @@ impl<'texts, Keys: AsRef<[Key]>, Markups: AsRef<[&'texts str]>> Calling for Page
         if keys.is_empty() {
             return Ok(None);
         }
-        let (progress, progress_state) = self.progress.lowered();
+        let (progress, progress_state) = lowered_progress(&self.progress);
         Ok(Some(ffi::ustore_pages_import_t {
             database: view.database(),
             executor: view.executor(),
@@ -795,14 +801,14 @@ impl<'texts, Keys: AsRef<[Key]>, Markups: AsRef<[&'texts str]>> Calling for Page
     }
 }
 
-/// An insertion of parsed fragments; see [`On::pages_insert`].
+/// An insertion of parsed fragments; see [`PagesVerbs::pages_insert`].
 #[derive(Debug)]
 pub struct PagesInsert<'arena, 'collections, 'config, Keys, Fragments> {
     collections: Collections<'collections>,
     keys: Keys,
     fragments: Fragments,
     config: PagesInsertConfig<'config>,
-    arena: &'arena mut Arena,
+    arena: &'arena Arena<'arena>,
     durability: Durability,
     effective: Address<Key>,
 }
@@ -813,9 +819,9 @@ impl<'arena, 'texts, Keys: AsRef<[Key]>, Fragments: AsRef<[&'texts str]>> Callin
     type Arguments = ffi::ustore_pages_insert_t;
     type Output = &'arena [Key];
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -856,7 +862,7 @@ impl<'arena, 'texts, Keys: AsRef<[Key]>, Fragments: AsRef<[&'texts str]>> Callin
     }
 }
 
-/// A removal of elements with their subtrees; see [`On::pages_remove`].
+/// A removal of elements with their subtrees; see [`PagesVerbs::pages_remove`].
 #[derive(Debug)]
 pub struct PagesRemove<'collections, Keys, Elements> {
     collections: Collections<'collections>,
@@ -869,9 +875,9 @@ impl<Keys: AsRef<[Key]>, Elements: AsRef<[Key]>> Calling for PagesRemove<'_, Key
     type Arguments = ffi::ustore_pages_remove_t;
     type Output = ();
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -904,7 +910,7 @@ impl<Keys: AsRef<[Key]>, Elements: AsRef<[Key]>> Calling for PagesRemove<'_, Key
     }
 }
 
-/// A move of elements with their subtrees; see [`On::pages_move`].
+/// A move of elements with their subtrees; see [`PagesVerbs::pages_move`].
 #[derive(Debug)]
 pub struct PagesMove<'collections, Keys, Elements, Parents, Anchors> {
     collections: Collections<'collections>,
@@ -925,9 +931,9 @@ where
     type Arguments = ffi::ustore_pages_move_t;
     type Output = ();
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -961,7 +967,7 @@ where
     }
 }
 
-/// A replacement of runs of text inside elements; see [`On::pages_splice`].
+/// A replacement of runs of text inside elements; see [`PagesVerbs::pages_splice`].
 #[derive(Debug)]
 pub struct PagesSplice<'collections, Keys, Elements, Starts, Lengths, Texts> {
     collections: Collections<'collections>,
@@ -984,9 +990,9 @@ where
     type Arguments = ffi::ustore_pages_splice_t;
     type Output = ();
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1021,7 +1027,7 @@ where
     }
 }
 
-/// A setting of attributes of elements; see [`On::pages_set_attributes`].
+/// A setting of attributes of elements; see [`PagesVerbs::pages_set_attributes`].
 #[derive(Debug)]
 pub struct PagesSetAttributes<'collections, Keys, Elements, Fields, Texts> {
     collections: Collections<'collections>,
@@ -1042,9 +1048,9 @@ where
     type Arguments = ffi::ustore_pages_set_attributes_t;
     type Output = ();
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1078,7 +1084,7 @@ where
     }
 }
 
-/// A removal of attributes of elements; see [`On::pages_remove_attributes`].
+/// A removal of attributes of elements; see [`PagesVerbs::pages_remove_attributes`].
 #[derive(Debug)]
 pub struct PagesRemoveAttributes<'collections, Keys, Elements, Fields> {
     collections: Collections<'collections>,
@@ -1097,9 +1103,9 @@ where
     type Arguments = ffi::ustore_pages_remove_attributes_t;
     type Output = ();
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1132,13 +1138,13 @@ where
     }
 }
 
-/// A rendering of pages or subtrees; see [`On::pages_read`].
+/// A rendering of pages or subtrees; see [`PagesVerbs::pages_read`].
 #[derive(Debug)]
 pub struct PagesRead<'arena, 'collections, 'config, Keys> {
     collections: Collections<'collections>,
     keys: Keys,
     config: PagesReadConfig<'config>,
-    arena: &'arena mut Arena,
+    arena: &'arena Arena<'arena>,
     presences: Address<ustore_octet_t>,
     values: ustore_strings_view_t,
 }
@@ -1147,9 +1153,9 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for PagesRead<'arena, '_, '_, Keys> {
     type Arguments = ffi::ustore_pages_read_t;
     type Output = Values<'arena>;
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1186,17 +1192,17 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for PagesRead<'arena, '_, '_, Keys> {
     }
 }
 
-/// A walk over the keys of one pages collection; see [`On::pages_scan`].
+/// A walk over the keys of one pages collection; see [`PagesVerbs::pages_scan`].
 #[derive(Debug)]
 pub struct PagesScan<'arena, 'config> {
     collection: CollectionID,
     start: Key,
     range: KeyRange,
-    arena: &'arena mut Arena,
+    arena: &'arena Arena<'arena>,
     wanted: usize,
     matched: Matching<'config>,
     mode: ScanMode,
-    progress: Progress<'config>,
+    progress: Option<Progress<'config>>,
     found: Found,
 }
 
@@ -1204,13 +1210,13 @@ impl<'arena> Calling for PagesScan<'arena, '_> {
     type Arguments = ffi::ustore_pages_scan_t;
     type Output = &'arena [Key];
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
-        let (progress, progress_state) = self.progress.lowered();
+        let (progress, progress_state) = lowered_progress(&self.progress);
         Ok(Some(ffi::ustore_pages_scan_t {
             database: view.database(),
             executor: view.executor(),
@@ -1245,11 +1251,11 @@ impl<'arena> Calling for PagesScan<'arena, '_> {
     }
 }
 
-/// A random draw of page keys from one collection; see [`On::pages_sample`].
+/// A random draw of page keys from one collection; see [`PagesVerbs::pages_sample`].
 #[derive(Debug)]
 pub struct PagesSample<'arena> {
     collection: CollectionID,
-    arena: &'arena mut Arena,
+    arena: &'arena Arena<'arena>,
     wanted: usize,
     found: Found,
 }
@@ -1258,9 +1264,9 @@ impl<'arena> Calling for PagesSample<'arena> {
     type Arguments = ffi::ustore_pages_sample_t;
     type Output = &'arena [Key];
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1290,13 +1296,13 @@ impl<'arena> Calling for PagesSample<'arena> {
     }
 }
 
-/// An estimate of what a range of pages holds; see [`On::pages_measure`].
+/// An estimate of what a range of pages holds; see [`PagesVerbs::pages_measure`].
 #[derive(Debug)]
 pub struct PagesMeasure<'arena> {
     collection: CollectionID,
     start: Key,
     range: KeyRange,
-    arena: &'arena mut Arena,
+    arena: &'arena Arena<'arena>,
     bounds: Bounds,
 }
 
@@ -1304,9 +1310,9 @@ impl Calling for PagesMeasure<'_> {
     type Arguments = ffi::ustore_pages_measure_t;
     type Output = Measurement;
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1362,8 +1368,6 @@ impl Calling for PagesMeasure<'_> {
 pub struct PagesCursor<'view> {
     handle: ffi::ustore_pages_cursor_t,
     database: ustore_database_t,
-    executor: ustore_executor_t,
-    matched: Box<Matching<'view>>,
     marker: PhantomData<&'view ()>,
 }
 
@@ -1379,13 +1383,8 @@ impl<'view, Parent> On<'view, Parent> {
         config: impl Into<PagesCursorConfig<'view>>,
     ) -> Result<PagesCursor<'view>> {
         let range: KeyRange = range.into();
-        let mut cursor = PagesCursor {
-            handle: ptr::null_mut(),
-            database: self.database(),
-            executor: self.executor(),
-            matched: Box::new(config.into().matching),
-            marker: PhantomData,
-        };
+        let matching = config.into().matching;
+        let mut cursor = PagesCursor { handle: ptr::null_mut(), database: self.database(), marker: PhantomData };
         let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_pages_cursor_init_t {
             cursor: &mut cursor.handle,
@@ -1397,8 +1396,8 @@ impl<'view, Parent> On<'view, Parent> {
             start_key: range.start_key(),
             end_key: range.end.as_ref().map_or(ptr::null(), ptr::from_ref),
             direction: range.direction,
-            filter: cursor.matched.lowered_filter(),
-            predicate: cursor.matched.lowered_predicate(),
+            filter: matching.lowered_filter(),
+            predicate: matching.lowered_predicate(),
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_pages_cursor_init(&mut arguments) };
@@ -1407,10 +1406,41 @@ impl<'view, Parent> On<'view, Parent> {
 }
 
 impl PagesCursor<'_> {
+    /// The receiver whose pulls block on `executor`.
+    pub fn on<'cursor>(&'cursor mut self, executor: &'cursor Executor) -> CursorOn<'cursor, Self> {
+        CursorOn::new(self, Some(executor))
+    }
+
     /// Pulls up to `wanted` next keys into `arena`, fewer once the walk nears its end and none past it.
     ///
     /// Calls `ustore_pages_cursor_next`.
-    pub fn next<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena) -> Result<&'arena [Key]> {
+    ///
+    /// Runs on the calling thread; [`PagesCursor::on`] names an executor for one pull.
+    pub fn next<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena<'_>) -> Result<&'arena [Key]> {
+        CursorOn::new(self, None).next(wanted, arena)
+    }
+
+    /// Pulls up to `wanted` next keys with their pages rendered as `encoding` names into `arena` in
+    /// one call.
+    ///
+    /// Calls `ustore_pages_cursor_next`.
+    ///
+    /// Runs on the calling thread; [`PagesCursor::on`] names an executor for one pull.
+    pub fn next_pairs<'arena>(
+        &mut self,
+        wanted: usize,
+        arena: &'arena mut Arena<'_>,
+        encoding: PageEncoding,
+    ) -> Result<Page<'arena>> {
+        CursorOn::new(self, None).next_pairs(wanted, arena, encoding)
+    }
+}
+
+impl CursorOn<'_, PagesCursor<'_>> {
+    /// Pulls up to `wanted` next keys into `arena`, fewer near the walk's end and none past it.
+    ///
+    /// Calls `ustore_pages_cursor_next`.
+    pub fn next<'arena>(self, wanted: usize, arena: &'arena mut Arena<'_>) -> Result<&'arena [Key]> {
         self.pull(wanted, arena, ptr::null_mut(), PageEncoding::Xml)
     }
 
@@ -1419,23 +1449,23 @@ impl PagesCursor<'_> {
     ///
     /// Calls `ustore_pages_cursor_next`.
     pub fn next_pairs<'arena>(
-        &mut self,
+        self,
         wanted: usize,
-        arena: &'arena mut Arena,
+        arena: &'arena mut Arena<'_>,
         encoding: PageEncoding,
     ) -> Result<Page<'arena>> {
         let mut values = ustore_strings_view_t::default();
         let keys = self.pull(wanted, arena, &mut values, encoding)?;
-        // SAFETY: the pull succeeded, writing a value per key as a tape into the arena borrowed for `'arena`.
+        // SAFETY: the pull succeeded, writing a value per key as a tape into the result's arena.
         let values = unsafe { Strings::exported(values, keys.len())? };
         Ok(Page::new(keys, values))
     }
 
     /// Pulls a page of keys into `arena`, with their values into `values` unless it is null.
     fn pull<'arena>(
-        &mut self,
+        self,
         wanted: usize,
-        arena: &'arena mut Arena,
+        arena: &'arena mut Arena<'_>,
         values: *mut ustore_strings_view_t,
         encoding: PageEncoding,
     ) -> Result<&'arena [Key]> {
@@ -1443,11 +1473,11 @@ impl PagesCursor<'_> {
         let mut written: ustore_size_t = 0;
         let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_pages_cursor_next_t {
-            database: self.database,
+            database: self.cursor.database,
             executor: self.executor,
             outcome: &mut outcome,
             completion: ustore_completion_t::Blocking,
-            cursor: self.handle,
+            cursor: self.cursor.handle,
             keys: &mut keys,
             values,
             written: &mut written,
@@ -1461,7 +1491,7 @@ impl PagesCursor<'_> {
         unsafe { ffi::ustore_pages_cursor_next(&mut arguments) };
         check(outcome)?;
         arena.host()?;
-        // SAFETY: a successful pull wrote `written` keys into the arena, which stays borrowed for `'arena`.
+        // SAFETY: a successful pull wrote `written` keys into the arena the result borrows.
         Ok(unsafe { exported_slice(keys, written as usize) })
     }
 }
@@ -1486,7 +1516,7 @@ mod tests {
     const BUFFERED: Durability = Durability::Buffered;
 
     /// A database whose pages collection holds `markup` as the page keyed five hundred.
-    fn imported(markup: &str) -> (Database, CollectionID, Arena) {
+    fn imported(markup: &str) -> (Database, CollectionID, Arena<'static>) {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let pages = created(&database, Modality::Pages);
         database.head().pages_import(pages, [key(500)], [markup], PageEncoding::Xml, BUFFERED).unwrap();
@@ -1495,7 +1525,12 @@ mod tests {
 
     /// The rendering of `element` of the page keyed five hundred, or of the whole page, and `None`
     /// where it is missing.
-    fn rendered(database: &Database, pages: CollectionID, element: Option<Key>, arena: &mut Arena) -> Option<String> {
+    fn rendered(
+        database: &Database,
+        pages: CollectionID,
+        element: Option<Key>,
+        arena: &mut Arena<'_>,
+    ) -> Option<String> {
         let config = PagesReadConfig { elements: element.as_slice(), outputs_encoding: PageEncoding::Xml };
         let values = database.head().pages_read(pages, [key(500)], config, arena).unwrap();
         values.get(0).map(|bytes| String::from_utf8(bytes.to_vec()).unwrap())
@@ -1508,7 +1543,7 @@ mod tests {
         fragment: &str,
         element: Key,
         parent: Option<Key>,
-        arena: &mut Arena,
+        arena: &mut Arena<'_>,
     ) {
         let config = PagesInsertConfig {
             elements: &[element],

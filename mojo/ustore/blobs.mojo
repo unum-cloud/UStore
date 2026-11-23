@@ -31,7 +31,7 @@ from ustore.db import (
 from ustore.library import Library
 from ustore.types import (
     Address,
-    Answer,
+    Deferrable,
     Arena,
     Arguments,
     Completion,
@@ -77,7 +77,7 @@ struct ValuesWritten(Defaultable, ImplicitlyCopyable):
 
 
 @fieldwise_init
-struct Values[origin: MutOrigin](Answer, Sized):
+struct Values[origin: MutOrigin](Deferrable, Sized):
     """What a read wrote into the arena it borrows: an Apache Arrow binary array of one value per task,
     a missing key reading as an unset presence bit and an empty value.
 
@@ -86,7 +86,7 @@ struct Values[origin: MutOrigin](Answer, Sized):
     """
 
     comptime Written = ValuesWritten
-    var arena: Pointer[Arena, Self.origin]
+    var arena: Pointer[Arena[ImmUntrackedOrigin], Self.origin]
     """The arena holding the values."""
     var generation: Int
     """The arena's call the values came from."""
@@ -96,7 +96,7 @@ struct Values[origin: MutOrigin](Answer, Sized):
     """Tasks the read carried."""
 
     def __init__(out self, arena: Address, generation: Int, written: ValuesWritten, count: Int):
-        self.arena = Pointer[Arena, Self.origin](unsafe_from_address=arena)
+        self.arena = Pointer[Arena[ImmUntrackedOrigin], Self.origin](unsafe_from_address=arena)
         self.generation = generation
         self.written = written
         self.count = count
@@ -135,7 +135,7 @@ struct KeyRunsWritten(Defaultable, ImplicitlyCopyable):
 
 
 @fieldwise_init
-struct KeyRuns[origin: MutOrigin](Answer, Sized):
+struct KeyRuns[origin: MutOrigin](Deferrable, Sized):
     """The keys a scan or a sample listed into the arena it borrows, run after run, one run per task.
 
     Parameters:
@@ -143,7 +143,7 @@ struct KeyRuns[origin: MutOrigin](Answer, Sized):
     """
 
     comptime Written = KeyRunsWritten
-    var arena: Pointer[Arena, Self.origin]
+    var arena: Pointer[Arena[ImmUntrackedOrigin], Self.origin]
     """The arena holding the keys."""
     var generation: Int
     """The arena's call the keys came from."""
@@ -153,7 +153,7 @@ struct KeyRuns[origin: MutOrigin](Answer, Sized):
     """Runs, one per task."""
 
     def __init__(out self, arena: Address, generation: Int, written: KeyRunsWritten, count: Int):
-        self.arena = Pointer[Arena, Self.origin](unsafe_from_address=arena)
+        self.arena = Pointer[Arena[ImmUntrackedOrigin], Self.origin](unsafe_from_address=arena)
         self.generation = generation
         self.written = written
         self.count = count
@@ -201,7 +201,7 @@ struct MeasuresWritten(Defaultable, ImplicitlyCopyable):
 
 
 @fieldwise_init
-struct Measures[origin: MutOrigin](Answer, Sized):
+struct Measures[origin: MutOrigin](Deferrable, Sized):
     """The bounds a measure estimated into the arena it borrows, one per range.
 
     Parameters:
@@ -209,7 +209,7 @@ struct Measures[origin: MutOrigin](Answer, Sized):
     """
 
     comptime Written = MeasuresWritten
-    var arena: Pointer[Arena, Self.origin]
+    var arena: Pointer[Arena[ImmUntrackedOrigin], Self.origin]
     """The arena holding the bounds."""
     var generation: Int
     """The arena's call the bounds came from."""
@@ -219,7 +219,7 @@ struct Measures[origin: MutOrigin](Answer, Sized):
     """Ranges measured."""
 
     def __init__(out self, arena: Address, generation: Int, written: MeasuresWritten, count: Int):
-        self.arena = Pointer[Arena, Self.origin](unsafe_from_address=arena)
+        self.arena = Pointer[Arena[ImmUntrackedOrigin], Self.origin](unsafe_from_address=arena)
         self.generation = generation
         self.written = written
         self.count = count
@@ -272,7 +272,7 @@ struct PulledWritten(Defaultable, ImplicitlyCopyable):
 
 
 @fieldwise_init
-struct Pulled[origin: MutOrigin](Answer, Sized):
+struct Pulled[origin: MutOrigin](Deferrable, Sized):
     """One page of a cursor's walk, read in place from the arena the pull borrows.
 
     Parameters:
@@ -280,7 +280,7 @@ struct Pulled[origin: MutOrigin](Answer, Sized):
     """
 
     comptime Written = PulledWritten
-    var arena: Pointer[Arena, Self.origin]
+    var arena: Pointer[Arena[ImmUntrackedOrigin], Self.origin]
     """The arena holding the page."""
     var generation: Int
     """The arena's call the page came from."""
@@ -288,7 +288,7 @@ struct Pulled[origin: MutOrigin](Answer, Sized):
     """The views the engine wrote."""
 
     def __init__(out self, arena: Address, generation: Int, written: PulledWritten, count: Int):
-        self.arena = Pointer[Arena, Self.origin](unsafe_from_address=arena)
+        self.arena = Pointer[Arena[ImmUntrackedOrigin], Self.origin](unsafe_from_address=arena)
         self.generation = generation
         self.written = written
 
@@ -770,7 +770,7 @@ struct BlobsCursor(Movable):
                     NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, self.address, None, None, None, NULL_ADDRESS,
                     c_size_t(wanted), progress, values,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 0,
             ),
         )
@@ -862,7 +862,7 @@ trait BlobsVerbs:
                     keys.arguments(), config.offsets.arguments(), config.limits.arguments(), None, None, None, NULL_ADDRESS,
                     config.values,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         )
@@ -893,7 +893,7 @@ trait BlobsVerbs:
                     start_keys.arguments(), config.end_keys.arguments(), config.direction, config.patterns.arguments(),
                     config.predicate, None, None, None, NULL_ADDRESS, c_size_t(wanted), config.mode, config.progress, config.scores,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         )
@@ -940,7 +940,7 @@ trait BlobsVerbs:
                     NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS, c_size_t(count), collections.arguments(),
                     None, None, NULL_ADDRESS, c_size_t(wanted),
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         )
@@ -961,7 +961,7 @@ trait BlobsVerbs:
             self._scope(),
             _Crossing[MeasureArguments["ustore_blobs_measure"], Measures[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]()))](
                 _measure["ustore_blobs_measure"](count, collections.arguments(), start_keys.arguments(), end_keys.arguments(), direction),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         )
@@ -978,13 +978,14 @@ trait BlobsDeferredVerbs:
     def write[
         collections_origin: ImmOrigin, keys_origin: ImmOrigin, values_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         keys: KeysView[keys_origin],
         values: StringsView[values_origin],
         durability: Durability = Durability.BUFFERED,
     ) -> Deferred[
-        _Crossing[BlobsWriteArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[values_origin]()))]
+        _Crossing[BlobsWriteArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[values_origin]()))],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `BlobsVerbs.write`. Calls `ustore_blobs_write`."""
         return {
@@ -1003,13 +1004,14 @@ trait BlobsDeferredVerbs:
     def remove[
         collections_origin: ImmOrigin, keys_origin: ImmOrigin, end_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         keys: KeysView[keys_origin],
         end_keys: KeysView[end_origin] = KeysView(),
         durability: Durability = Durability.BUFFERED,
     ) -> Deferred[
-        _Crossing[BlobsRemoveArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[end_origin]()))]
+        _Crossing[BlobsRemoveArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[end_origin]()))],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `BlobsVerbs.remove`. Calls `ustore_blobs_remove`."""
         return {
@@ -1028,13 +1030,14 @@ trait BlobsDeferredVerbs:
     def read[
         collections_origin: ImmOrigin, keys_origin: ImmOrigin, offsets_origin: ImmOrigin, limits_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         keys: KeysView[keys_origin],
         mut arena: Arena,
         config: BlobsReadConfig[offsets_origin, limits_origin] = BlobsReadConfig(),
     ) -> Deferred[
-        _Crossing[BlobsReadArguments, Values[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[offsets_origin](), _anchor[limits_origin]()))]
+        _Crossing[BlobsReadArguments, Values[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[offsets_origin](), _anchor[limits_origin]()))],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `BlobsVerbs.read`. Calls `ustore_blobs_read`."""
         var count = _tasks(collections.tasks(), keys.tasks(), config.offsets.tasks(), config.limits.tasks())
@@ -1046,7 +1049,7 @@ trait BlobsDeferredVerbs:
                     keys.arguments(), config.offsets.arguments(), config.limits.arguments(), None, None, None, NULL_ADDRESS,
                     config.values,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         }
@@ -1054,14 +1057,15 @@ trait BlobsDeferredVerbs:
     def scan[
         collections_origin: ImmOrigin, start_origin: ImmOrigin, end_origin: ImmOrigin, patterns_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         start_keys: KeysView[start_origin],
         wanted: Int,
         mut arena: Arena,
         config: BlobsScanConfig[end_origin, patterns_origin] = BlobsScanConfig(),
     ) -> Deferred[
-        _Crossing[BlobsScanArguments, KeyRuns[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin](), _anchor[patterns_origin]()))]
+        _Crossing[BlobsScanArguments, KeyRuns[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin](), _anchor[patterns_origin]()))],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `BlobsVerbs.scan`. Calls `ustore_blobs_scan`."""
         var count = _tasks(collections.tasks(), start_keys.tasks(), config.end_keys.tasks())
@@ -1073,15 +1077,16 @@ trait BlobsDeferredVerbs:
                     start_keys.arguments(), config.end_keys.arguments(), config.direction, config.patterns.arguments(),
                     config.predicate, None, None, None, NULL_ADDRESS, c_size_t(wanted), config.mode, config.progress, config.scores,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         }
 
     def sample[
         collections_origin: ImmOrigin, //
-    ](self, collections: CollectionsView[collections_origin], wanted: Int, mut arena: Arena) -> Deferred[
-        _Crossing[SampleArguments["ustore_blobs_sample"], KeyRuns[origin_of(arena)], origin_of(arena), collections_origin]
+    ](ref self, collections: CollectionsView[collections_origin], wanted: Int, mut arena: Arena) -> Deferred[
+        _Crossing[SampleArguments["ustore_blobs_sample"], KeyRuns[origin_of(arena)], origin_of(arena), collections_origin],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `BlobsVerbs.sample`. Calls `ustore_blobs_sample`."""
         var count = len(collections)
@@ -1092,7 +1097,7 @@ trait BlobsDeferredVerbs:
                     NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS, c_size_t(count), collections.arguments(),
                     None, None, NULL_ADDRESS, c_size_t(wanted),
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         }
@@ -1100,14 +1105,15 @@ trait BlobsDeferredVerbs:
     def measure[
         collections_origin: ImmOrigin, start_origin: ImmOrigin, end_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         start_keys: KeysView[start_origin],
         end_keys: KeysView[end_origin],
         mut arena: Arena,
         direction: ScanDirection = ScanDirection.ASCENDING,
     ) -> Deferred[
-        _Crossing[MeasureArguments["ustore_blobs_measure"], Measures[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]()))]
+        _Crossing[MeasureArguments["ustore_blobs_measure"], Measures[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]()))],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `BlobsVerbs.measure`. Calls `ustore_blobs_measure`."""
         var count = _tasks(collections.tasks(), start_keys.tasks(), end_keys.tasks())
@@ -1115,7 +1121,7 @@ trait BlobsDeferredVerbs:
             self._scope(),
             _Crossing[MeasureArguments["ustore_blobs_measure"], Measures[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]()))](
                 _measure["ustore_blobs_measure"](count, collections.arguments(), start_keys.arguments(), end_keys.arguments(), direction),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         }

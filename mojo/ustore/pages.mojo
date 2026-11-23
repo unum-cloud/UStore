@@ -13,7 +13,17 @@ Date: November 8, 2026
 from std.ffi import c_int, c_size_t
 from std.memory import stack_allocation
 
-from ustore.blobs import KeyRuns, MeasureArguments, Measures, Pulled, PulledWritten, SampleArguments, Values, ValuesWritten, _measure
+from ustore.blobs import (
+    KeyRuns,
+    MeasureArguments,
+    Measures,
+    Pulled,
+    PulledWritten,
+    SampleArguments,
+    Values,
+    ValuesWritten,
+    _measure,
+)
 from ustore.db import (
     CollectionID,
     CollectionsView,
@@ -33,7 +43,7 @@ from ustore.docs import FilteredScanArguments, _filtered_cursor, _filtered_scan
 from ustore.library import Library
 from ustore.types import (
     Address,
-    Answer,
+    Deferrable,
     Arena,
     Arguments,
     BytesView,
@@ -89,7 +99,7 @@ struct EffectiveKeysWritten(Defaultable, ImplicitlyCopyable):
 
 
 @fieldwise_init
-struct EffectiveKeys[origin: MutOrigin](Answer, Sized):
+struct EffectiveKeys[origin: MutOrigin](Deferrable, Sized):
     """The key every inserted element ended up with, minted or given, read in place from the arena an
     insert borrows.
 
@@ -98,7 +108,7 @@ struct EffectiveKeys[origin: MutOrigin](Answer, Sized):
     """
 
     comptime Written = EffectiveKeysWritten
-    var arena: Pointer[Arena, Self.origin]
+    var arena: Pointer[Arena[ImmUntrackedOrigin], Self.origin]
     """The arena holding the keys."""
     var generation: Int
     """The arena's call the keys came from."""
@@ -108,7 +118,7 @@ struct EffectiveKeys[origin: MutOrigin](Answer, Sized):
     """Insertions the call carried."""
 
     def __init__(out self, arena: Address, generation: Int, written: EffectiveKeysWritten, count: Int):
-        self.arena = Pointer[Arena, Self.origin](unsafe_from_address=arena)
+        self.arena = Pointer[Arena[ImmUntrackedOrigin], Self.origin](unsafe_from_address=arena)
         self.generation = generation
         self.written = written
         self.count = count
@@ -129,7 +139,9 @@ struct EffectiveKeys[origin: MutOrigin](Answer, Sized):
 
 
 struct PagesInsertConfig[
-    elements_origin: ImmOrigin = ImmUntrackedOrigin, parents_origin: ImmOrigin = ImmUntrackedOrigin, anchors_origin: ImmOrigin = ImmUntrackedOrigin
+    elements_origin: ImmOrigin = ImmUntrackedOrigin,
+    parents_origin: ImmOrigin = ImmUntrackedOrigin,
+    anchors_origin: ImmOrigin = ImmUntrackedOrigin,
 ](ImplicitlyCopyable):
     """Where inserted fragments land, the keys they take, and how they read.
 
@@ -194,7 +206,9 @@ struct PagesReadConfig[elements_origin: ImmOrigin = ImmUntrackedOrigin](Implicit
         self.values = values
 
 
-struct PagesScanConfig[end_origin: ImmOrigin = ImmUntrackedOrigin, filter_origin: ImmOrigin = ImmUntrackedOrigin](ImplicitlyCopyable):
+struct PagesScanConfig[end_origin: ImmOrigin = ImmUntrackedOrigin, filter_origin: ImmOrigin = ImmUntrackedOrigin](
+    ImplicitlyCopyable
+):
     """The bounds, order and filter of a scan over page keys.
 
     Parameters:
@@ -290,7 +304,14 @@ struct PagesImportArguments(Arguments):
     var watch: c_int
     var progress: Progress
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[Unwritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[Unwritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self.database = scope.database
         self.executor = scope.executor
         self.outcome = outcome
@@ -327,7 +348,14 @@ struct PagesInsertArguments(Arguments):
     var durability: Durability
     var watch: c_int
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[EffectiveKeysWritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[EffectiveKeysWritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self.database = scope.database
         self.executor = scope.executor
         self.outcome = outcome
@@ -361,7 +389,14 @@ struct PagesRemoveArguments(Arguments):
     var durability: Durability
     var watch: c_int
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[Unwritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[Unwritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self.database = scope.database
         self.executor = scope.executor
         self.outcome = outcome
@@ -394,7 +429,14 @@ struct PagesMoveArguments(Arguments):
     var durability: Durability
     var watch: c_int
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[Unwritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[Unwritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self.database = scope.database
         self.executor = scope.executor
         self.outcome = outcome
@@ -428,7 +470,14 @@ struct PagesSpliceArguments(Arguments):
     var durability: Durability
     var watch: c_int
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[Unwritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[Unwritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self.database = scope.database
         self.executor = scope.executor
         self.outcome = outcome
@@ -461,7 +510,14 @@ struct PagesSetAttributesArguments(Arguments):
     var durability: Durability
     var watch: c_int
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[Unwritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[Unwritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self.database = scope.database
         self.executor = scope.executor
         self.outcome = outcome
@@ -493,7 +549,14 @@ struct PagesRemoveAttributesArguments(Arguments):
     var durability: Durability
     var watch: c_int
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[Unwritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[Unwritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self.database = scope.database
         self.executor = scope.executor
         self.outcome = outcome
@@ -528,7 +591,14 @@ struct PagesReadArguments(Arguments):
     var outputs_encoding: PageEncoding
     var with_values: Bool
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[ValuesWritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[ValuesWritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self.database = scope.database
         self.executor = scope.executor
         self.outcome = outcome
@@ -564,7 +634,14 @@ struct PagesCursorNextArguments(Arguments):
     var progress: Progress
     var with_values: Bool
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[PulledWritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[PulledWritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self.database = scope.database
         self.executor = scope.executor
         self.outcome = outcome
@@ -626,10 +703,21 @@ struct PagesCursor(Movable):
             Scope(self.library, self.database, executor.address, NULL_ADDRESS, NULL_ADDRESS, NULL_ADDRESS, Watch.KEYS),
             _Crossing[PagesCursorNextArguments, Pulled[origin_of(arena)], origin_of(arena), ImmUntrackedOrigin](
                 PagesCursorNextArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, self.address, None, None, None, NULL_ADDRESS,
-                    c_size_t(wanted), outputs_encoding, progress, values,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.BLOCKING,
+                    self.address,
+                    None,
+                    None,
+                    None,
+                    NULL_ADDRESS,
+                    c_size_t(wanted),
+                    outputs_encoding,
+                    progress,
+                    values,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 0,
             ),
         )
@@ -665,11 +753,26 @@ trait PagesVerbs:
         """
         _ = _block(
             self._scope(),
-            _Crossing[PagesImportArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[values_origin]()))](
+            _Crossing[
+                PagesImportArguments,
+                Unwritten,
+                MutUntrackedOrigin,
+                ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[values_origin]())),
+            ](
                 PagesImportArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS,
-                    c_size_t(_tasks(collections.tasks(), keys.tasks(), values.tasks())), collections.arguments(), keys.arguments(),
-                    values.arguments(), encoding, durability, 0, progress,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.BLOCKING,
+                    NULL_ADDRESS,
+                    c_size_t(_tasks(collections.tasks(), keys.tasks(), values.tasks())),
+                    collections.arguments(),
+                    keys.arguments(),
+                    values.arguments(),
+                    encoding,
+                    durability,
+                    0,
+                    progress,
                 ),
                 None,
                 0,
@@ -677,7 +780,13 @@ trait PagesVerbs:
         )
 
     def pages_insert[
-        collections_origin: ImmOrigin, keys_origin: ImmOrigin, values_origin: ImmOrigin, elements_origin: ImmOrigin, parents_origin: ImmOrigin, anchors_origin: ImmOrigin, //
+        collections_origin: ImmOrigin,
+        keys_origin: ImmOrigin,
+        values_origin: ImmOrigin,
+        elements_origin: ImmOrigin,
+        parents_origin: ImmOrigin,
+        anchors_origin: ImmOrigin,
+        //,
     ](
         self,
         collections: CollectionsView[collections_origin],
@@ -688,16 +797,51 @@ trait PagesVerbs:
     ) raises Error -> EffectiveKeys[origin_of(arena)]:
         """Parses fragments into elements under parents after anchors, answering the key every element ended
         up with. Calls `ustore_pages_insert`."""
-        var count = _tasks(collections.tasks(), keys.tasks(), values.tasks(), config.elements.tasks(), config.parents.tasks(), config.anchors.tasks())
+        var count = _tasks(
+            collections.tasks(),
+            keys.tasks(),
+            values.tasks(),
+            config.elements.tasks(),
+            config.parents.tasks(),
+            config.anchors.tasks(),
+        )
         return _block(
             self._scope(),
-            _Crossing[PagesInsertArguments, EffectiveKeys[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[values_origin](), _anchor[elements_origin](), _anchor[parents_origin](), _anchor[anchors_origin]()))](
-                PagesInsertArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS, c_size_t(count), collections.arguments(),
-                    keys.arguments(), config.elements.arguments(), config.parents.arguments(), config.anchors.arguments(),
-                    values.arguments(), config.encoding, None, NULL_ADDRESS, config.durability, 0,
+            _Crossing[
+                PagesInsertArguments,
+                EffectiveKeys[origin_of(arena)],
+                origin_of(arena),
+                ImmOrigin(
+                    origin_of(
+                        _anchor[collections_origin](),
+                        _anchor[keys_origin](),
+                        _anchor[values_origin](),
+                        _anchor[elements_origin](),
+                        _anchor[parents_origin](),
+                        _anchor[anchors_origin](),
+                    )
                 ),
-                Pointer(to=arena),
+            ](
+                PagesInsertArguments(
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.BLOCKING,
+                    NULL_ADDRESS,
+                    c_size_t(count),
+                    collections.arguments(),
+                    keys.arguments(),
+                    config.elements.arguments(),
+                    config.parents.arguments(),
+                    config.anchors.arguments(),
+                    values.arguments(),
+                    config.encoding,
+                    None,
+                    NULL_ADDRESS,
+                    config.durability,
+                    0,
+                ),
+                arena._pointer(),
                 count,
             ),
         )
@@ -716,11 +860,32 @@ trait PagesVerbs:
         Calls `ustore_pages_remove`."""
         _ = _block(
             self._scope(),
-            _Crossing[PagesRemoveArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[elements_origin](), _anchor[end_origin]()))](
+            _Crossing[
+                PagesRemoveArguments,
+                Unwritten,
+                MutUntrackedOrigin,
+                ImmOrigin(
+                    origin_of(
+                        _anchor[collections_origin](),
+                        _anchor[keys_origin](),
+                        _anchor[elements_origin](),
+                        _anchor[end_origin](),
+                    )
+                ),
+            ](
                 PagesRemoveArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS,
-                    c_size_t(_tasks(collections.tasks(), keys.tasks(), elements.tasks(), end_keys.tasks())), collections.arguments(),
-                    keys.arguments(), end_keys.arguments(), elements.arguments(), durability, 0,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.BLOCKING,
+                    NULL_ADDRESS,
+                    c_size_t(_tasks(collections.tasks(), keys.tasks(), elements.tasks(), end_keys.tasks())),
+                    collections.arguments(),
+                    keys.arguments(),
+                    end_keys.arguments(),
+                    elements.arguments(),
+                    durability,
+                    0,
                 ),
                 None,
                 0,
@@ -728,7 +893,12 @@ trait PagesVerbs:
         )
 
     def pages_move[
-        collections_origin: ImmOrigin, keys_origin: ImmOrigin, elements_origin: ImmOrigin, parents_origin: ImmOrigin, anchors_origin: ImmOrigin, //
+        collections_origin: ImmOrigin,
+        keys_origin: ImmOrigin,
+        elements_origin: ImmOrigin,
+        parents_origin: ImmOrigin,
+        anchors_origin: ImmOrigin,
+        //,
     ](
         self,
         collections: CollectionsView[collections_origin],
@@ -741,11 +911,36 @@ trait PagesVerbs:
         """Moves elements with their subtrees under parents after anchors. Calls `ustore_pages_move`."""
         _ = _block(
             self._scope(),
-            _Crossing[PagesMoveArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[elements_origin](), _anchor[parents_origin](), _anchor[anchors_origin]()))](
+            _Crossing[
+                PagesMoveArguments,
+                Unwritten,
+                MutUntrackedOrigin,
+                ImmOrigin(
+                    origin_of(
+                        _anchor[collections_origin](),
+                        _anchor[keys_origin](),
+                        _anchor[elements_origin](),
+                        _anchor[parents_origin](),
+                        _anchor[anchors_origin](),
+                    )
+                ),
+            ](
                 PagesMoveArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS,
-                    c_size_t(_tasks(collections.tasks(), keys.tasks(), elements.tasks(), parents.tasks(), anchors.tasks())), collections.arguments(),
-                    keys.arguments(), elements.arguments(), parents.arguments(), anchors.arguments(), durability, 0,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.BLOCKING,
+                    NULL_ADDRESS,
+                    c_size_t(
+                        _tasks(collections.tasks(), keys.tasks(), elements.tasks(), parents.tasks(), anchors.tasks())
+                    ),
+                    collections.arguments(),
+                    keys.arguments(),
+                    elements.arguments(),
+                    parents.arguments(),
+                    anchors.arguments(),
+                    durability,
+                    0,
                 ),
                 None,
                 0,
@@ -753,7 +948,13 @@ trait PagesVerbs:
         )
 
     def pages_splice[
-        collections_origin: ImmOrigin, keys_origin: ImmOrigin, elements_origin: ImmOrigin, starts_origin: ImmOrigin, lengths_origin: ImmOrigin, values_origin: ImmOrigin, //
+        collections_origin: ImmOrigin,
+        keys_origin: ImmOrigin,
+        elements_origin: ImmOrigin,
+        starts_origin: ImmOrigin,
+        lengths_origin: ImmOrigin,
+        values_origin: ImmOrigin,
+        //,
     ](
         self,
         collections: CollectionsView[collections_origin],
@@ -767,12 +968,45 @@ trait PagesVerbs:
         """Replaces runs of text inside elements with new bytes. Calls `ustore_pages_splice`."""
         _ = _block(
             self._scope(),
-            _Crossing[PagesSpliceArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[elements_origin](), _anchor[starts_origin](), _anchor[lengths_origin](), _anchor[values_origin]()))](
+            _Crossing[
+                PagesSpliceArguments,
+                Unwritten,
+                MutUntrackedOrigin,
+                ImmOrigin(
+                    origin_of(
+                        _anchor[collections_origin](),
+                        _anchor[keys_origin](),
+                        _anchor[elements_origin](),
+                        _anchor[starts_origin](),
+                        _anchor[lengths_origin](),
+                        _anchor[values_origin](),
+                    )
+                ),
+            ](
                 PagesSpliceArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS,
-                    c_size_t(_tasks(collections.tasks(), keys.tasks(), elements.tasks(), text_starts.tasks(), text_lengths.tasks(), values.tasks())), collections.arguments(),
-                    keys.arguments(), elements.arguments(), text_starts.arguments(), text_lengths.arguments(), values.arguments(),
-                    durability, 0,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.BLOCKING,
+                    NULL_ADDRESS,
+                    c_size_t(
+                        _tasks(
+                            collections.tasks(),
+                            keys.tasks(),
+                            elements.tasks(),
+                            text_starts.tasks(),
+                            text_lengths.tasks(),
+                            values.tasks(),
+                        )
+                    ),
+                    collections.arguments(),
+                    keys.arguments(),
+                    elements.arguments(),
+                    text_starts.arguments(),
+                    text_lengths.arguments(),
+                    values.arguments(),
+                    durability,
+                    0,
                 ),
                 None,
                 0,
@@ -780,7 +1014,12 @@ trait PagesVerbs:
         )
 
     def pages_set_attributes[
-        collections_origin: ImmOrigin, keys_origin: ImmOrigin, elements_origin: ImmOrigin, fields_origin: ImmOrigin, values_origin: ImmOrigin, //
+        collections_origin: ImmOrigin,
+        keys_origin: ImmOrigin,
+        elements_origin: ImmOrigin,
+        fields_origin: ImmOrigin,
+        values_origin: ImmOrigin,
+        //,
     ](
         self,
         collections: CollectionsView[collections_origin],
@@ -793,11 +1032,36 @@ trait PagesVerbs:
         """Sets one attribute of an element per task. Calls `ustore_pages_set_attributes`."""
         _ = _block(
             self._scope(),
-            _Crossing[PagesSetAttributesArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[elements_origin](), _anchor[fields_origin](), _anchor[values_origin]()))](
+            _Crossing[
+                PagesSetAttributesArguments,
+                Unwritten,
+                MutUntrackedOrigin,
+                ImmOrigin(
+                    origin_of(
+                        _anchor[collections_origin](),
+                        _anchor[keys_origin](),
+                        _anchor[elements_origin](),
+                        _anchor[fields_origin](),
+                        _anchor[values_origin](),
+                    )
+                ),
+            ](
                 PagesSetAttributesArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS,
-                    c_size_t(_tasks(collections.tasks(), keys.tasks(), elements.tasks(), fields.tasks(), values.tasks())), collections.arguments(),
-                    keys.arguments(), elements.arguments(), fields.arguments(), values.arguments(), durability, 0,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.BLOCKING,
+                    NULL_ADDRESS,
+                    c_size_t(
+                        _tasks(collections.tasks(), keys.tasks(), elements.tasks(), fields.tasks(), values.tasks())
+                    ),
+                    collections.arguments(),
+                    keys.arguments(),
+                    elements.arguments(),
+                    fields.arguments(),
+                    values.arguments(),
+                    durability,
+                    0,
                 ),
                 None,
                 0,
@@ -817,11 +1081,32 @@ trait PagesVerbs:
         """Removes one attribute of an element per task. Calls `ustore_pages_remove_attributes`."""
         _ = _block(
             self._scope(),
-            _Crossing[PagesRemoveAttributesArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[elements_origin](), _anchor[fields_origin]()))](
+            _Crossing[
+                PagesRemoveAttributesArguments,
+                Unwritten,
+                MutUntrackedOrigin,
+                ImmOrigin(
+                    origin_of(
+                        _anchor[collections_origin](),
+                        _anchor[keys_origin](),
+                        _anchor[elements_origin](),
+                        _anchor[fields_origin](),
+                    )
+                ),
+            ](
                 PagesRemoveAttributesArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS,
-                    c_size_t(_tasks(collections.tasks(), keys.tasks(), elements.tasks(), fields.tasks())), collections.arguments(),
-                    keys.arguments(), elements.arguments(), fields.arguments(), durability, 0,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.BLOCKING,
+                    NULL_ADDRESS,
+                    c_size_t(_tasks(collections.tasks(), keys.tasks(), elements.tasks(), fields.tasks())),
+                    collections.arguments(),
+                    keys.arguments(),
+                    elements.arguments(),
+                    fields.arguments(),
+                    durability,
+                    0,
                 ),
                 None,
                 0,
@@ -841,12 +1126,30 @@ trait PagesVerbs:
         var count = _tasks(collections.tasks(), keys.tasks(), config.elements.tasks())
         return _block(
             self._scope(),
-            _Crossing[PagesReadArguments, Values[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[elements_origin]()))](
+            _Crossing[
+                PagesReadArguments,
+                Values[origin_of(arena)],
+                origin_of(arena),
+                ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[elements_origin]())),
+            ](
                 PagesReadArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS, c_size_t(count), collections.arguments(),
-                    keys.arguments(), config.elements.arguments(), None, None, None, NULL_ADDRESS, config.outputs_encoding, config.values,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.BLOCKING,
+                    NULL_ADDRESS,
+                    c_size_t(count),
+                    collections.arguments(),
+                    keys.arguments(),
+                    config.elements.arguments(),
+                    None,
+                    None,
+                    None,
+                    NULL_ADDRESS,
+                    config.outputs_encoding,
+                    config.values,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         )
@@ -865,41 +1168,83 @@ trait PagesVerbs:
         var count = _tasks(collections.tasks(), start_keys.tasks(), config.end_keys.tasks())
         return _block(
             self._scope(),
-            _Crossing[FilteredScanArguments["ustore_pages_scan"], KeyRuns[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin](), _anchor[filter_origin]()))](
-                _filtered_scan["ustore_pages_scan"](
-                    count, collections.arguments(), start_keys.arguments(), config.end_keys.arguments(), config.direction,
-                    config.filter.arguments(), config.predicate, wanted, config.mode, config.progress,
+            _Crossing[
+                FilteredScanArguments["ustore_pages_scan"],
+                KeyRuns[origin_of(arena)],
+                origin_of(arena),
+                ImmOrigin(
+                    origin_of(
+                        _anchor[collections_origin](),
+                        _anchor[start_origin](),
+                        _anchor[end_origin](),
+                        _anchor[filter_origin](),
+                    )
                 ),
-                Pointer(to=arena),
+            ](
+                _filtered_scan["ustore_pages_scan"](
+                    count,
+                    collections.arguments(),
+                    start_keys.arguments(),
+                    config.end_keys.arguments(),
+                    config.direction,
+                    config.filter.arguments(),
+                    config.predicate,
+                    wanted,
+                    config.mode,
+                    config.progress,
+                ),
+                arena._pointer(),
                 count,
             ),
         )
 
     def pages_cursor[
         filter_origin: ImmOrigin, //
-    ](self, collection: CollectionID, start_key: Key, config: PagesCursorConfig[filter_origin] = PagesCursorConfig()) raises Error -> PagesCursor:
+    ](
+        self, collection: CollectionID, start_key: Key, config: PagesCursorConfig[filter_origin] = PagesCursorConfig()
+    ) raises Error -> PagesCursor:
         """Opens a walk over the page keys of one collection, compiling its filter once and reading nothing
         until its first pull. Calls `ustore_pages_cursor_init`."""
         var scope = self._scope()
         var address = _filtered_cursor(
-            scope, collection, start_key, config.end_key, config.direction, config.filter.arguments(), config.predicate,
-            scope.library.symbols().pages_cursor_init, "ustore_pages_cursor_init",
+            scope,
+            collection,
+            start_key,
+            config.end_key,
+            config.direction,
+            config.filter.arguments(),
+            config.predicate,
+            scope.library.symbols().pages_cursor_init,
+            "ustore_pages_cursor_init",
         )
         return PagesCursor(library=scope.library, database=scope.database, address=address)
 
     def pages_sample[
         collections_origin: ImmOrigin, //
-    ](self, collections: CollectionsView[collections_origin], wanted: Int, mut arena: Arena) raises Error -> KeyRuns[origin_of(arena)]:
+    ](self, collections: CollectionsView[collections_origin], wanted: Int, mut arena: Arena) raises Error -> KeyRuns[
+        origin_of(arena)
+    ]:
         """Draws up to `wanted` page keys uniformly at random from every collection. Calls `ustore_pages_sample`."""
         var count = len(collections)
         return _block(
             self._scope(),
-            _Crossing[SampleArguments["ustore_pages_sample"], KeyRuns[origin_of(arena)], origin_of(arena), collections_origin](
+            _Crossing[
+                SampleArguments["ustore_pages_sample"], KeyRuns[origin_of(arena)], origin_of(arena), collections_origin
+            ](
                 SampleArguments["ustore_pages_sample"](
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS, c_size_t(count), collections.arguments(),
-                    None, None, NULL_ADDRESS, c_size_t(wanted),
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.BLOCKING,
+                    NULL_ADDRESS,
+                    c_size_t(count),
+                    collections.arguments(),
+                    None,
+                    None,
+                    NULL_ADDRESS,
+                    c_size_t(wanted),
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         )
@@ -918,9 +1263,16 @@ trait PagesVerbs:
         var count = _tasks(collections.tasks(), start_keys.tasks(), end_keys.tasks())
         return _block(
             self._scope(),
-            _Crossing[MeasureArguments["ustore_pages_measure"], Measures[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]()))](
-                _measure["ustore_pages_measure"](count, collections.arguments(), start_keys.arguments(), end_keys.arguments(), direction),
-                Pointer(to=arena),
+            _Crossing[
+                MeasureArguments["ustore_pages_measure"],
+                Measures[origin_of(arena)],
+                origin_of(arena),
+                ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]())),
+            ](
+                _measure["ustore_pages_measure"](
+                    count, collections.arguments(), start_keys.arguments(), end_keys.arguments(), direction
+                ),
+                arena._pointer(),
                 count,
             ),
         )
@@ -937,7 +1289,7 @@ trait PagesDeferredVerbs:
     def pages_import[
         collections_origin: ImmOrigin, keys_origin: ImmOrigin, values_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         keys: KeysView[keys_origin],
         values: StringsView[values_origin],
@@ -945,16 +1297,37 @@ trait PagesDeferredVerbs:
         durability: Durability = Durability.BUFFERED,
         progress: Progress = Progress(),
     ) -> Deferred[
-        _Crossing[PagesImportArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[values_origin]()))]
+        _Crossing[
+            PagesImportArguments,
+            Unwritten,
+            MutUntrackedOrigin,
+            ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[values_origin]())),
+        ],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `PagesVerbs.pages_import`. Calls `ustore_pages_import`."""
         return {
             self._scope(),
-            _Crossing[PagesImportArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[values_origin]()))](
+            _Crossing[
+                PagesImportArguments,
+                Unwritten,
+                MutUntrackedOrigin,
+                ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[values_origin]())),
+            ](
                 PagesImportArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS,
-                    c_size_t(_tasks(collections.tasks(), keys.tasks(), values.tasks())), collections.arguments(), keys.arguments(),
-                    values.arguments(), encoding, durability, 0, progress,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.DEFERRED,
+                    NULL_ADDRESS,
+                    c_size_t(_tasks(collections.tasks(), keys.tasks(), values.tasks())),
+                    collections.arguments(),
+                    keys.arguments(),
+                    values.arguments(),
+                    encoding,
+                    durability,
+                    0,
+                    progress,
                 ),
                 None,
                 0,
@@ -962,28 +1335,84 @@ trait PagesDeferredVerbs:
         }
 
     def pages_insert[
-        collections_origin: ImmOrigin, keys_origin: ImmOrigin, values_origin: ImmOrigin, elements_origin: ImmOrigin, parents_origin: ImmOrigin, anchors_origin: ImmOrigin, //
+        collections_origin: ImmOrigin,
+        keys_origin: ImmOrigin,
+        values_origin: ImmOrigin,
+        elements_origin: ImmOrigin,
+        parents_origin: ImmOrigin,
+        anchors_origin: ImmOrigin,
+        //,
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         keys: KeysView[keys_origin],
         values: StringsView[values_origin],
         mut arena: Arena,
         config: PagesInsertConfig[elements_origin, parents_origin, anchors_origin] = PagesInsertConfig(),
     ) -> Deferred[
-        _Crossing[PagesInsertArguments, EffectiveKeys[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[values_origin](), _anchor[elements_origin](), _anchor[parents_origin](), _anchor[anchors_origin]()))]
+        _Crossing[
+            PagesInsertArguments,
+            EffectiveKeys[origin_of(arena)],
+            origin_of(arena),
+            ImmOrigin(
+                origin_of(
+                    _anchor[collections_origin](),
+                    _anchor[keys_origin](),
+                    _anchor[values_origin](),
+                    _anchor[elements_origin](),
+                    _anchor[parents_origin](),
+                    _anchor[anchors_origin](),
+                )
+            ),
+        ],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `PagesVerbs.pages_insert`. Calls `ustore_pages_insert`."""
-        var count = _tasks(collections.tasks(), keys.tasks(), values.tasks(), config.elements.tasks(), config.parents.tasks(), config.anchors.tasks())
+        var count = _tasks(
+            collections.tasks(),
+            keys.tasks(),
+            values.tasks(),
+            config.elements.tasks(),
+            config.parents.tasks(),
+            config.anchors.tasks(),
+        )
         return {
             self._scope(),
-            _Crossing[PagesInsertArguments, EffectiveKeys[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[values_origin](), _anchor[elements_origin](), _anchor[parents_origin](), _anchor[anchors_origin]()))](
-                PagesInsertArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS, c_size_t(count), collections.arguments(),
-                    keys.arguments(), config.elements.arguments(), config.parents.arguments(), config.anchors.arguments(),
-                    values.arguments(), config.encoding, None, NULL_ADDRESS, config.durability, 0,
+            _Crossing[
+                PagesInsertArguments,
+                EffectiveKeys[origin_of(arena)],
+                origin_of(arena),
+                ImmOrigin(
+                    origin_of(
+                        _anchor[collections_origin](),
+                        _anchor[keys_origin](),
+                        _anchor[values_origin](),
+                        _anchor[elements_origin](),
+                        _anchor[parents_origin](),
+                        _anchor[anchors_origin](),
+                    )
                 ),
-                Pointer(to=arena),
+            ](
+                PagesInsertArguments(
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.DEFERRED,
+                    NULL_ADDRESS,
+                    c_size_t(count),
+                    collections.arguments(),
+                    keys.arguments(),
+                    config.elements.arguments(),
+                    config.parents.arguments(),
+                    config.anchors.arguments(),
+                    values.arguments(),
+                    config.encoding,
+                    None,
+                    NULL_ADDRESS,
+                    config.durability,
+                    0,
+                ),
+                arena._pointer(),
                 count,
             ),
         }
@@ -991,23 +1420,57 @@ trait PagesDeferredVerbs:
     def pages_remove[
         collections_origin: ImmOrigin, keys_origin: ImmOrigin, elements_origin: ImmOrigin, end_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         keys: KeysView[keys_origin],
         elements: KeysView[elements_origin] = KeysView(),
         end_keys: KeysView[end_origin] = KeysView(),
         durability: Durability = Durability.BUFFERED,
     ) -> Deferred[
-        _Crossing[PagesRemoveArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[elements_origin](), _anchor[end_origin]()))]
+        _Crossing[
+            PagesRemoveArguments,
+            Unwritten,
+            MutUntrackedOrigin,
+            ImmOrigin(
+                origin_of(
+                    _anchor[collections_origin](),
+                    _anchor[keys_origin](),
+                    _anchor[elements_origin](),
+                    _anchor[end_origin](),
+                )
+            ),
+        ],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `PagesVerbs.pages_remove`. Calls `ustore_pages_remove`."""
         return {
             self._scope(),
-            _Crossing[PagesRemoveArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[elements_origin](), _anchor[end_origin]()))](
+            _Crossing[
+                PagesRemoveArguments,
+                Unwritten,
+                MutUntrackedOrigin,
+                ImmOrigin(
+                    origin_of(
+                        _anchor[collections_origin](),
+                        _anchor[keys_origin](),
+                        _anchor[elements_origin](),
+                        _anchor[end_origin](),
+                    )
+                ),
+            ](
                 PagesRemoveArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS,
-                    c_size_t(_tasks(collections.tasks(), keys.tasks(), elements.tasks(), end_keys.tasks())), collections.arguments(),
-                    keys.arguments(), end_keys.arguments(), elements.arguments(), durability, 0,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.DEFERRED,
+                    NULL_ADDRESS,
+                    c_size_t(_tasks(collections.tasks(), keys.tasks(), elements.tasks(), end_keys.tasks())),
+                    collections.arguments(),
+                    keys.arguments(),
+                    end_keys.arguments(),
+                    elements.arguments(),
+                    durability,
+                    0,
                 ),
                 None,
                 0,
@@ -1015,9 +1478,14 @@ trait PagesDeferredVerbs:
         }
 
     def pages_move[
-        collections_origin: ImmOrigin, keys_origin: ImmOrigin, elements_origin: ImmOrigin, parents_origin: ImmOrigin, anchors_origin: ImmOrigin, //
+        collections_origin: ImmOrigin,
+        keys_origin: ImmOrigin,
+        elements_origin: ImmOrigin,
+        parents_origin: ImmOrigin,
+        anchors_origin: ImmOrigin,
+        //,
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         keys: KeysView[keys_origin],
         elements: KeysView[elements_origin],
@@ -1025,16 +1493,55 @@ trait PagesDeferredVerbs:
         anchors: KeysView[anchors_origin],
         durability: Durability = Durability.BUFFERED,
     ) -> Deferred[
-        _Crossing[PagesMoveArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[elements_origin](), _anchor[parents_origin](), _anchor[anchors_origin]()))]
+        _Crossing[
+            PagesMoveArguments,
+            Unwritten,
+            MutUntrackedOrigin,
+            ImmOrigin(
+                origin_of(
+                    _anchor[collections_origin](),
+                    _anchor[keys_origin](),
+                    _anchor[elements_origin](),
+                    _anchor[parents_origin](),
+                    _anchor[anchors_origin](),
+                )
+            ),
+        ],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `PagesVerbs.pages_move`. Calls `ustore_pages_move`."""
         return {
             self._scope(),
-            _Crossing[PagesMoveArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[elements_origin](), _anchor[parents_origin](), _anchor[anchors_origin]()))](
+            _Crossing[
+                PagesMoveArguments,
+                Unwritten,
+                MutUntrackedOrigin,
+                ImmOrigin(
+                    origin_of(
+                        _anchor[collections_origin](),
+                        _anchor[keys_origin](),
+                        _anchor[elements_origin](),
+                        _anchor[parents_origin](),
+                        _anchor[anchors_origin](),
+                    )
+                ),
+            ](
                 PagesMoveArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS,
-                    c_size_t(_tasks(collections.tasks(), keys.tasks(), elements.tasks(), parents.tasks(), anchors.tasks())), collections.arguments(),
-                    keys.arguments(), elements.arguments(), parents.arguments(), anchors.arguments(), durability, 0,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.DEFERRED,
+                    NULL_ADDRESS,
+                    c_size_t(
+                        _tasks(collections.tasks(), keys.tasks(), elements.tasks(), parents.tasks(), anchors.tasks())
+                    ),
+                    collections.arguments(),
+                    keys.arguments(),
+                    elements.arguments(),
+                    parents.arguments(),
+                    anchors.arguments(),
+                    durability,
+                    0,
                 ),
                 None,
                 0,
@@ -1042,9 +1549,15 @@ trait PagesDeferredVerbs:
         }
 
     def pages_splice[
-        collections_origin: ImmOrigin, keys_origin: ImmOrigin, elements_origin: ImmOrigin, starts_origin: ImmOrigin, lengths_origin: ImmOrigin, values_origin: ImmOrigin, //
+        collections_origin: ImmOrigin,
+        keys_origin: ImmOrigin,
+        elements_origin: ImmOrigin,
+        starts_origin: ImmOrigin,
+        lengths_origin: ImmOrigin,
+        values_origin: ImmOrigin,
+        //,
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         keys: KeysView[keys_origin],
         elements: KeysView[elements_origin],
@@ -1053,17 +1566,65 @@ trait PagesDeferredVerbs:
         values: StringsView[values_origin],
         durability: Durability = Durability.BUFFERED,
     ) -> Deferred[
-        _Crossing[PagesSpliceArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[elements_origin](), _anchor[starts_origin](), _anchor[lengths_origin](), _anchor[values_origin]()))]
+        _Crossing[
+            PagesSpliceArguments,
+            Unwritten,
+            MutUntrackedOrigin,
+            ImmOrigin(
+                origin_of(
+                    _anchor[collections_origin](),
+                    _anchor[keys_origin](),
+                    _anchor[elements_origin](),
+                    _anchor[starts_origin](),
+                    _anchor[lengths_origin](),
+                    _anchor[values_origin](),
+                )
+            ),
+        ],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `PagesVerbs.pages_splice`. Calls `ustore_pages_splice`."""
         return {
             self._scope(),
-            _Crossing[PagesSpliceArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[elements_origin](), _anchor[starts_origin](), _anchor[lengths_origin](), _anchor[values_origin]()))](
+            _Crossing[
+                PagesSpliceArguments,
+                Unwritten,
+                MutUntrackedOrigin,
+                ImmOrigin(
+                    origin_of(
+                        _anchor[collections_origin](),
+                        _anchor[keys_origin](),
+                        _anchor[elements_origin](),
+                        _anchor[starts_origin](),
+                        _anchor[lengths_origin](),
+                        _anchor[values_origin](),
+                    )
+                ),
+            ](
                 PagesSpliceArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS,
-                    c_size_t(_tasks(collections.tasks(), keys.tasks(), elements.tasks(), text_starts.tasks(), text_lengths.tasks(), values.tasks())), collections.arguments(),
-                    keys.arguments(), elements.arguments(), text_starts.arguments(), text_lengths.arguments(), values.arguments(),
-                    durability, 0,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.DEFERRED,
+                    NULL_ADDRESS,
+                    c_size_t(
+                        _tasks(
+                            collections.tasks(),
+                            keys.tasks(),
+                            elements.tasks(),
+                            text_starts.tasks(),
+                            text_lengths.tasks(),
+                            values.tasks(),
+                        )
+                    ),
+                    collections.arguments(),
+                    keys.arguments(),
+                    elements.arguments(),
+                    text_starts.arguments(),
+                    text_lengths.arguments(),
+                    values.arguments(),
+                    durability,
+                    0,
                 ),
                 None,
                 0,
@@ -1071,9 +1632,14 @@ trait PagesDeferredVerbs:
         }
 
     def pages_set_attributes[
-        collections_origin: ImmOrigin, keys_origin: ImmOrigin, elements_origin: ImmOrigin, fields_origin: ImmOrigin, values_origin: ImmOrigin, //
+        collections_origin: ImmOrigin,
+        keys_origin: ImmOrigin,
+        elements_origin: ImmOrigin,
+        fields_origin: ImmOrigin,
+        values_origin: ImmOrigin,
+        //,
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         keys: KeysView[keys_origin],
         elements: KeysView[elements_origin],
@@ -1081,16 +1647,55 @@ trait PagesDeferredVerbs:
         values: StringsView[values_origin],
         durability: Durability = Durability.BUFFERED,
     ) -> Deferred[
-        _Crossing[PagesSetAttributesArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[elements_origin](), _anchor[fields_origin](), _anchor[values_origin]()))]
+        _Crossing[
+            PagesSetAttributesArguments,
+            Unwritten,
+            MutUntrackedOrigin,
+            ImmOrigin(
+                origin_of(
+                    _anchor[collections_origin](),
+                    _anchor[keys_origin](),
+                    _anchor[elements_origin](),
+                    _anchor[fields_origin](),
+                    _anchor[values_origin](),
+                )
+            ),
+        ],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `PagesVerbs.pages_set_attributes`. Calls `ustore_pages_set_attributes`."""
         return {
             self._scope(),
-            _Crossing[PagesSetAttributesArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[elements_origin](), _anchor[fields_origin](), _anchor[values_origin]()))](
+            _Crossing[
+                PagesSetAttributesArguments,
+                Unwritten,
+                MutUntrackedOrigin,
+                ImmOrigin(
+                    origin_of(
+                        _anchor[collections_origin](),
+                        _anchor[keys_origin](),
+                        _anchor[elements_origin](),
+                        _anchor[fields_origin](),
+                        _anchor[values_origin](),
+                    )
+                ),
+            ](
                 PagesSetAttributesArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS,
-                    c_size_t(_tasks(collections.tasks(), keys.tasks(), elements.tasks(), fields.tasks(), values.tasks())), collections.arguments(),
-                    keys.arguments(), elements.arguments(), fields.arguments(), values.arguments(), durability, 0,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.DEFERRED,
+                    NULL_ADDRESS,
+                    c_size_t(
+                        _tasks(collections.tasks(), keys.tasks(), elements.tasks(), fields.tasks(), values.tasks())
+                    ),
+                    collections.arguments(),
+                    keys.arguments(),
+                    elements.arguments(),
+                    fields.arguments(),
+                    values.arguments(),
+                    durability,
+                    0,
                 ),
                 None,
                 0,
@@ -1100,23 +1705,57 @@ trait PagesDeferredVerbs:
     def pages_remove_attributes[
         collections_origin: ImmOrigin, keys_origin: ImmOrigin, elements_origin: ImmOrigin, fields_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         keys: KeysView[keys_origin],
         elements: KeysView[elements_origin],
         fields: StringsView[fields_origin],
         durability: Durability = Durability.BUFFERED,
     ) -> Deferred[
-        _Crossing[PagesRemoveAttributesArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[elements_origin](), _anchor[fields_origin]()))]
+        _Crossing[
+            PagesRemoveAttributesArguments,
+            Unwritten,
+            MutUntrackedOrigin,
+            ImmOrigin(
+                origin_of(
+                    _anchor[collections_origin](),
+                    _anchor[keys_origin](),
+                    _anchor[elements_origin](),
+                    _anchor[fields_origin](),
+                )
+            ),
+        ],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `PagesVerbs.pages_remove_attributes`. Calls `ustore_pages_remove_attributes`."""
         return {
             self._scope(),
-            _Crossing[PagesRemoveAttributesArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[elements_origin](), _anchor[fields_origin]()))](
+            _Crossing[
+                PagesRemoveAttributesArguments,
+                Unwritten,
+                MutUntrackedOrigin,
+                ImmOrigin(
+                    origin_of(
+                        _anchor[collections_origin](),
+                        _anchor[keys_origin](),
+                        _anchor[elements_origin](),
+                        _anchor[fields_origin](),
+                    )
+                ),
+            ](
                 PagesRemoveAttributesArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS,
-                    c_size_t(_tasks(collections.tasks(), keys.tasks(), elements.tasks(), fields.tasks())), collections.arguments(),
-                    keys.arguments(), elements.arguments(), fields.arguments(), durability, 0,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.DEFERRED,
+                    NULL_ADDRESS,
+                    c_size_t(_tasks(collections.tasks(), keys.tasks(), elements.tasks(), fields.tasks())),
+                    collections.arguments(),
+                    keys.arguments(),
+                    elements.arguments(),
+                    fields.arguments(),
+                    durability,
+                    0,
                 ),
                 None,
                 0,
@@ -1126,24 +1765,48 @@ trait PagesDeferredVerbs:
     def pages_read[
         collections_origin: ImmOrigin, keys_origin: ImmOrigin, elements_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         keys: KeysView[keys_origin],
         mut arena: Arena,
         config: PagesReadConfig[elements_origin] = PagesReadConfig(),
     ) -> Deferred[
-        _Crossing[PagesReadArguments, Values[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[elements_origin]()))]
+        _Crossing[
+            PagesReadArguments,
+            Values[origin_of(arena)],
+            origin_of(arena),
+            ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[elements_origin]())),
+        ],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `PagesVerbs.pages_read`. Calls `ustore_pages_read`."""
         var count = _tasks(collections.tasks(), keys.tasks(), config.elements.tasks())
         return {
             self._scope(),
-            _Crossing[PagesReadArguments, Values[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[elements_origin]()))](
+            _Crossing[
+                PagesReadArguments,
+                Values[origin_of(arena)],
+                origin_of(arena),
+                ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[elements_origin]())),
+            ](
                 PagesReadArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS, c_size_t(count), collections.arguments(),
-                    keys.arguments(), config.elements.arguments(), None, None, None, NULL_ADDRESS, config.outputs_encoding, config.values,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.DEFERRED,
+                    NULL_ADDRESS,
+                    c_size_t(count),
+                    collections.arguments(),
+                    keys.arguments(),
+                    config.elements.arguments(),
+                    None,
+                    None,
+                    None,
+                    NULL_ADDRESS,
+                    config.outputs_encoding,
+                    config.values,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         }
@@ -1151,44 +1814,91 @@ trait PagesDeferredVerbs:
     def pages_scan[
         collections_origin: ImmOrigin, start_origin: ImmOrigin, end_origin: ImmOrigin, filter_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         start_keys: KeysView[start_origin],
         wanted: Int,
         mut arena: Arena,
         config: PagesScanConfig[end_origin, filter_origin] = PagesScanConfig(),
     ) -> Deferred[
-        _Crossing[FilteredScanArguments["ustore_pages_scan"], KeyRuns[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin](), _anchor[filter_origin]()))]
+        _Crossing[
+            FilteredScanArguments["ustore_pages_scan"],
+            KeyRuns[origin_of(arena)],
+            origin_of(arena),
+            ImmOrigin(
+                origin_of(
+                    _anchor[collections_origin](),
+                    _anchor[start_origin](),
+                    _anchor[end_origin](),
+                    _anchor[filter_origin](),
+                )
+            ),
+        ],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `PagesVerbs.pages_scan`. Calls `ustore_pages_scan`."""
         var count = _tasks(collections.tasks(), start_keys.tasks(), config.end_keys.tasks())
         return {
             self._scope(),
-            _Crossing[FilteredScanArguments["ustore_pages_scan"], KeyRuns[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin](), _anchor[filter_origin]()))](
-                _filtered_scan["ustore_pages_scan"](
-                    count, collections.arguments(), start_keys.arguments(), config.end_keys.arguments(), config.direction,
-                    config.filter.arguments(), config.predicate, wanted, config.mode, config.progress,
+            _Crossing[
+                FilteredScanArguments["ustore_pages_scan"],
+                KeyRuns[origin_of(arena)],
+                origin_of(arena),
+                ImmOrigin(
+                    origin_of(
+                        _anchor[collections_origin](),
+                        _anchor[start_origin](),
+                        _anchor[end_origin](),
+                        _anchor[filter_origin](),
+                    )
                 ),
-                Pointer(to=arena),
+            ](
+                _filtered_scan["ustore_pages_scan"](
+                    count,
+                    collections.arguments(),
+                    start_keys.arguments(),
+                    config.end_keys.arguments(),
+                    config.direction,
+                    config.filter.arguments(),
+                    config.predicate,
+                    wanted,
+                    config.mode,
+                    config.progress,
+                ),
+                arena._pointer(),
                 count,
             ),
         }
 
     def pages_sample[
         collections_origin: ImmOrigin, //
-    ](self, collections: CollectionsView[collections_origin], wanted: Int, mut arena: Arena) -> Deferred[
-        _Crossing[SampleArguments["ustore_pages_sample"], KeyRuns[origin_of(arena)], origin_of(arena), collections_origin]
+    ](ref self, collections: CollectionsView[collections_origin], wanted: Int, mut arena: Arena) -> Deferred[
+        _Crossing[
+            SampleArguments["ustore_pages_sample"], KeyRuns[origin_of(arena)], origin_of(arena), collections_origin
+        ],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `PagesVerbs.pages_sample`. Calls `ustore_pages_sample`."""
         var count = len(collections)
         return {
             self._scope(),
-            _Crossing[SampleArguments["ustore_pages_sample"], KeyRuns[origin_of(arena)], origin_of(arena), collections_origin](
+            _Crossing[
+                SampleArguments["ustore_pages_sample"], KeyRuns[origin_of(arena)], origin_of(arena), collections_origin
+            ](
                 SampleArguments["ustore_pages_sample"](
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS, c_size_t(count), collections.arguments(),
-                    None, None, NULL_ADDRESS, c_size_t(wanted),
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.DEFERRED,
+                    NULL_ADDRESS,
+                    c_size_t(count),
+                    collections.arguments(),
+                    None,
+                    None,
+                    NULL_ADDRESS,
+                    c_size_t(wanted),
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         }
@@ -1196,22 +1906,35 @@ trait PagesDeferredVerbs:
     def pages_measure[
         collections_origin: ImmOrigin, start_origin: ImmOrigin, end_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         start_keys: KeysView[start_origin],
         end_keys: KeysView[end_origin],
         mut arena: Arena,
         direction: ScanDirection = ScanDirection.ASCENDING,
     ) -> Deferred[
-        _Crossing[MeasureArguments["ustore_pages_measure"], Measures[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]()))]
+        _Crossing[
+            MeasureArguments["ustore_pages_measure"],
+            Measures[origin_of(arena)],
+            origin_of(arena),
+            ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]())),
+        ],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `PagesVerbs.pages_measure`. Calls `ustore_pages_measure`."""
         var count = _tasks(collections.tasks(), start_keys.tasks(), end_keys.tasks())
         return {
             self._scope(),
-            _Crossing[MeasureArguments["ustore_pages_measure"], Measures[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]()))](
-                _measure["ustore_pages_measure"](count, collections.arguments(), start_keys.arguments(), end_keys.arguments(), direction),
-                Pointer(to=arena),
+            _Crossing[
+                MeasureArguments["ustore_pages_measure"],
+                Measures[origin_of(arena)],
+                origin_of(arena),
+                ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]())),
+            ](
+                _measure["ustore_pages_measure"](
+                    count, collections.arguments(), start_keys.arguments(), end_keys.arguments(), direction
+                ),
+                arena._pointer(),
                 count,
             ),
         }

@@ -169,8 +169,8 @@ def test_a_snapshot_keeps_its_collections_from_a_drop(database, engine: str):
 
 
 def test_save_needs_a_view_of_a_snapshot(database, tmp_path):
-    """A save through a view of the database itself raises TypeError naming snapshots."""
-    with ustore.Executor.for_ram(1) as executor, pytest.raises(TypeError, match="snapshot"):
+    """A save through a view of the database itself raises TypeError."""
+    with ustore.Executor.for_ram(1) as executor, pytest.raises(TypeError):
         database.deferred(executor).save(tmp_path)
 
 

@@ -25,10 +25,10 @@ use crate::db::ffi::{
     self as db_ffi, ustore_completion_t, ustore_database_t, ustore_enum_t, ustore_length_t, ustore_octet_t,
     ustore_outcome_t, ustore_size_t, ustore_strided_view_t, ustore_strings_view_t,
 };
-use crate::db::sealed::{Accepts, Calling, TapeOffset, Writable};
+use crate::db::sealed::{Accepts, Calling, Completion, Handles, TapeOffset, Writable};
 use crate::db::{
-    Address, Arena, CollectionID, Collections, Deferring, Durability, Key, Matching, Modality, On, Progress,
-    ProgressCallback, Result, Rows, ScanDirection, ScanMode, Status, Strings, check, exported_slice, fail,
+    Address, Arena, CollectionID, Collections, Deferrable, Deferring, Durability, Key, Matching, Modality, Progress,
+    Result, Rows, ScanDirection, ScanMode, Status, Strings, ViewVerbs, check, exported_slice, fail, lowered_progress,
     string_views,
 };
 use crate::docs::Bitmap;
@@ -256,7 +256,8 @@ impl<'names, 'arena> IntoIterator for &'names Names<'arena> {
 
 // region: Strings
 
-/// The strings a scan keeps, what admits them and how it reports; see [`On::strings_scan`].
+/// The strings a scan keeps, what admits them and how it reports, as
+/// [`StringsVerbs::strings_scan`] takes them.
 pub struct StringsScanConfig<'config> {
     /// Strings kept, at most.
     pub wanted: usize,
@@ -265,7 +266,7 @@ pub struct StringsScanConfig<'config> {
     /// In what order the strings come.
     pub mode: ScanMode,
     /// Reports the scans finished and stops wherever it says to.
-    pub progress: Option<Box<ProgressCallback<'config>>>,
+    pub progress: Option<Progress<'config>>,
 }
 
 impl From<usize> for StringsScanConfig<'_> {
@@ -274,7 +275,7 @@ impl From<usize> for StringsScanConfig<'_> {
     }
 }
 
-/// The strings a sample draws; see [`On::strings_sample`].
+/// The strings a sample draws; see [`StringsVerbs::strings_sample`].
 #[derive(Clone, Copy, Debug)]
 pub struct StringsSampleConfig {
     /// Strings drawn, at most.
@@ -442,7 +443,11 @@ impl<'arena> Listing<'arena> {
     }
 }
 
-impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent, Completion> {
+/// The verbs over strings and collection names, written once for every receiver of [`ViewVerbs`]: a
+/// handle blocks on the calling thread, and an [`On`] runs on its executor, blocking or deferred.
+///
+/// Rust-only.
+pub trait StringsVerbs<'view>: ViewVerbs<'view> {
     /// Upserts a batch of strings and the keys they map onto, one key per string.
     ///
     /// The strings are a borrowed `&[&str]`, or an owned `stringtape::CharsTape`, which a deferred
@@ -450,51 +455,51 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
     /// every string the same collection.
     ///
     /// Calls `ustore_strings_write`.
-    pub fn strings_write<'collections, Strs: Texts, Keys: AsRef<[Key]>>(
-        &self,
+    fn strings_write<'collections, Strs: Texts, Keys: AsRef<[Key]>>(
+        self,
         collections: impl Into<Collections<'collections>>,
         strings: Strs,
         keys: Keys,
         durability: Durability,
-    ) -> Completion::Answer<StringsWrite<'collections, Strs, Keys>>
+    ) -> Deferrable<'view, Self, StringsWrite<'collections, Strs, Keys>>
     where
-        Completion: Accepts<Collections<'collections>> + Accepts<Strs> + Accepts<Keys>,
+        Self::Parent: Writable,
+        Self::Completion: Accepts<Collections<'collections>> + Accepts<Strs> + Accepts<Keys>,
     {
         let verb = StringsWrite { collections: collections.into(), strings, keys, durability };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
     /// Removes a batch of strings with their keys, whether or not the database holds them, and
     /// hands the strings back.
     ///
     /// Calls `ustore_strings_remove`.
-    pub fn strings_remove<'collections, Strs: Texts>(
-        &self,
+    fn strings_remove<'collections, Strs: Texts>(
+        self,
         collections: impl Into<Collections<'collections>>,
         strings: Strs,
         durability: Durability,
-    ) -> Completion::Answer<StringsRemove<'collections, Strs>>
+    ) -> Deferrable<'view, Self, StringsRemove<'collections, Strs>>
     where
-        Completion: Accepts<Collections<'collections>> + Accepts<Strs>,
+        Self::Parent: Writable,
+        Self::Completion: Accepts<Collections<'collections>> + Accepts<Strs>,
     {
         let verb = StringsRemove { collections: collections.into(), strings, durability };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
-}
 
-impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completion> {
     /// Reads the keys a batch of strings map onto into the arena, one collection per string or one
     /// for all of them.
     ///
     /// Calls `ustore_strings_read`.
-    pub fn strings_read<'arena, 'collections, Strs: Texts>(
-        &self,
+    fn strings_read<'arena, 'collections, Strs: Texts>(
+        self,
         collections: impl Into<Collections<'collections>>,
         strings: Strs,
-        arena: &'arena mut Arena,
-    ) -> Completion::Answer<StringsRead<'arena, 'collections, Strs>>
+        arena: &'arena mut Arena<'_>,
+    ) -> Deferrable<'view, Self, StringsRead<'arena, 'collections, Strs>>
     where
-        Completion: Accepts<Collections<'collections>> + Accepts<Strs>,
+        Self::Completion: Accepts<Collections<'collections>> + Accepts<Strs>,
     {
         let verb = StringsRead {
             collections: collections.into(),
@@ -504,22 +509,22 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
             presences: Address::default(),
             keys: Address::default(),
         };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
     /// Lists up to `wanted` strings of one collection's `range` into the arena, keeping those its
     /// `matching` admits. Weighted patterns write one BM25 score per string beside them.
     ///
     /// Calls `ustore_strings_scan`.
-    pub fn strings_scan<'config, 'arena, 'text>(
-        &self,
+    fn strings_scan<'config, 'arena, 'text>(
+        self,
         collection: CollectionID,
         range: impl Into<TextRange<'text>>,
         config: impl Into<StringsScanConfig<'config>>,
-        arena: &'arena mut Arena,
-    ) -> Completion::Answer<StringsScan<'arena, 'text, 'config>>
+        arena: &'arena mut Arena<'_>,
+    ) -> Deferrable<'view, Self, StringsScan<'arena, 'text, 'config>>
     where
-        Completion: Accepts<TextRange<'text>> + Accepts<StringsScanConfig<'config>>,
+        Self::Completion: Accepts<TextRange<'text>> + Accepts<StringsScanConfig<'config>>,
     {
         let StringsScanConfig { wanted, matching, mode, progress } = config.into();
         let verb = StringsScan {
@@ -529,23 +534,23 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
             wanted,
             matched: matching,
             mode,
-            progress: Progress(progress),
+            progress,
             offsets: Address::default(),
             strings: ustore_strings_view_t::default(),
             scores: Address::default(),
         };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
     /// Draws up to `wanted` strings uniformly at random from one collection into the arena.
     ///
     /// Calls `ustore_strings_sample`.
-    pub fn strings_sample<'arena>(
-        &self,
+    fn strings_sample<'arena>(
+        self,
         collection: CollectionID,
         config: impl Into<StringsSampleConfig>,
-        arena: &'arena mut Arena,
-    ) -> Completion::Answer<StringsSample<'arena>> {
+        arena: &'arena mut Arena<'_>,
+    ) -> Deferrable<'view, Self, StringsSample<'arena>> {
         let verb = StringsSample {
             collection,
             arena,
@@ -553,21 +558,21 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
             offsets: Address::default(),
             strings: ustore_strings_view_t::default(),
         };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
     /// Estimates the strings and the space between two strings of one collection, through the arena
     /// its bounds land in.
     ///
     /// Calls `ustore_strings_measure`.
-    pub fn strings_measure<'arena, 'text>(
-        &self,
+    fn strings_measure<'arena, 'text>(
+        self,
         collection: CollectionID,
         range: Range<&'text str>,
-        arena: &'arena mut Arena,
-    ) -> Completion::Answer<StringsMeasure<'arena, 'text>>
+        arena: &'arena mut Arena<'_>,
+    ) -> Deferrable<'view, Self, StringsMeasure<'arena, 'text>>
     where
-        Completion: Accepts<Range<&'text str>>,
+        Self::Completion: Accepts<Range<&'text str>>,
     {
         let verb = StringsMeasure {
             collection,
@@ -575,11 +580,63 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
             arena,
             bounds: Bounds::default(),
         };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
+    }
+
+    /// The collection `name` addresses and the modality it holds, which
+    /// [`crate::Database::collection_create`] bound, resolved through the arena.
+    ///
+    /// Collections are created and dropped only at the head, so names never join a transaction's
+    /// conflicts: they are read at the view's snapshot, or at the head for a transaction or the
+    /// head itself.
+    ///
+    /// Calls `ustore_collection_find`.
+    fn collection_find<'arena, Name: AsRef<str>>(
+        self,
+        name: Name,
+        arena: &'arena mut Arena<'_>,
+    ) -> Deferrable<'view, Self, CollectionFind<'arena, Name>>
+    where
+        Self::Completion: Accepts<Name>,
+    {
+        let verb = CollectionFind {
+            name,
+            arena,
+            offsets: [0; 2],
+            presences: Address::default(),
+            collections: Address::default(),
+            modalities: Address::default(),
+        };
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
+    }
+
+    /// Lists up to `wanted` collection names under `prefix` into the arena, in the order of their
+    /// text, from `start` on where one is given.
+    ///
+    /// An engine lists its collections in an order of its own, so the names are sorted here.
+    /// A listing describes the database rather than a transaction, so it reads the view's snapshot
+    /// or the head.
+    ///
+    /// Calls `ustore_collection_list`.
+    fn collection_names<'arena, Name: AsRef<str>>(
+        self,
+        prefix: Name,
+        start: Option<Name>,
+        wanted: usize,
+        arena: &'arena mut Arena<'_>,
+    ) -> Deferrable<'view, Self, CollectionNames<'arena, Name>>
+    where
+        Self::Completion: Accepts<Name>,
+    {
+        let verb =
+            CollectionNames { prefix, start, arena, wanted, written: 0, names: ustore_strings_view_t::default() };
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 }
 
-/// An upsert of a batch of strings; see [`On::strings_write`].
+impl<'view, Receiver: ViewVerbs<'view>> StringsVerbs<'view> for Receiver {}
+
+/// An upsert of a batch of strings; see [`StringsVerbs::strings_write`].
 #[derive(Debug)]
 pub struct StringsWrite<'collections, Strs, Keys> {
     collections: Collections<'collections>,
@@ -592,9 +649,9 @@ impl<Strs: Texts, Keys: AsRef<[Key]>> Calling for StringsWrite<'_, Strs, Keys> {
     type Arguments = ffi::ustore_strings_write_t;
     type Output = (Strs, Keys);
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -629,7 +686,7 @@ impl<Strs: Texts, Keys: AsRef<[Key]>> Calling for StringsWrite<'_, Strs, Keys> {
     }
 }
 
-/// A removal of a batch of strings; see [`On::strings_remove`].
+/// A removal of a batch of strings; see [`StringsVerbs::strings_remove`].
 #[derive(Debug)]
 pub struct StringsRemove<'collections, Strs> {
     collections: Collections<'collections>,
@@ -641,9 +698,9 @@ impl<Strs: Texts> Calling for StringsRemove<'_, Strs> {
     type Arguments = ffi::ustore_strings_remove_t;
     type Output = Strs;
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -674,12 +731,12 @@ impl<Strs: Texts> Calling for StringsRemove<'_, Strs> {
     }
 }
 
-/// A read of the keys of a batch of strings; see [`On::strings_read`].
+/// A read of the keys of a batch of strings; see [`StringsVerbs::strings_read`].
 #[derive(Debug)]
 pub struct StringsRead<'arena, 'collections, Strs> {
     collections: Collections<'collections>,
     strings: Strs,
-    arena: &'arena mut Arena,
+    arena: &'arena Arena<'arena>,
     count: usize,
     presences: Address<ustore_octet_t>,
     keys: Address<Key>,
@@ -689,9 +746,9 @@ impl<'arena, Strs: Texts> Calling for StringsRead<'arena, '_, Strs> {
     type Arguments = ffi::ustore_strings_read_t;
     type Output = Mapped<'arena>;
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -734,16 +791,16 @@ impl<'arena, Strs: Texts> Calling for StringsRead<'arena, '_, Strs> {
     }
 }
 
-/// A walk over the strings of one collection; see [`On::strings_scan`].
+/// A walk over the strings of one collection; see [`StringsVerbs::strings_scan`].
 #[derive(Debug)]
 pub struct StringsScan<'arena, 'text, 'matching> {
     collection: CollectionID,
     range: TextRange<'text>,
-    arena: &'arena mut Arena,
+    arena: &'arena Arena<'arena>,
     wanted: usize,
     matched: Matching<'matching>,
     mode: ScanMode,
-    progress: Progress<'matching>,
+    progress: Option<Progress<'matching>>,
     offsets: Address<ustore_length_t>,
     strings: ustore_strings_view_t,
     scores: Address<f32>,
@@ -753,13 +810,13 @@ impl<'arena> Calling for StringsScan<'arena, '_, '_> {
     type Arguments = ffi::ustore_strings_scan_t;
     type Output = Listing<'arena>;
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
-        let (progress, progress_state) = self.progress.lowered();
+        let (progress, progress_state) = lowered_progress(&self.progress);
         Ok(Some(ffi::ustore_strings_scan_t {
             database: view.database(),
             executor: view.executor(),
@@ -800,11 +857,11 @@ impl<'arena> Calling for StringsScan<'arena, '_, '_> {
     }
 }
 
-/// A random draw of strings from one collection; see [`On::strings_sample`].
+/// A random draw of strings from one collection; see [`StringsVerbs::strings_sample`].
 #[derive(Debug)]
 pub struct StringsSample<'arena> {
     collection: CollectionID,
-    arena: &'arena mut Arena,
+    arena: &'arena Arena<'arena>,
     wanted: usize,
     offsets: Address<ustore_length_t>,
     strings: ustore_strings_view_t,
@@ -814,9 +871,9 @@ impl<'arena> Calling for StringsSample<'arena> {
     type Arguments = ffi::ustore_strings_sample_t;
     type Output = Listing<'arena>;
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -846,12 +903,12 @@ impl<'arena> Calling for StringsSample<'arena> {
     }
 }
 
-/// An estimate of what a range of strings holds; see [`On::strings_measure`].
+/// An estimate of what a range of strings holds; see [`StringsVerbs::strings_measure`].
 #[derive(Debug)]
 pub struct StringsMeasure<'arena, 'text> {
     collection: CollectionID,
     range: (Option<&'text str>, Option<&'text str>),
-    arena: &'arena mut Arena,
+    arena: &'arena Arena<'arena>,
     bounds: Bounds,
 }
 
@@ -859,9 +916,9 @@ impl Calling for StringsMeasure<'_, '_> {
     type Arguments = ffi::ustore_strings_measure_t;
     type Output = Measurement;
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -928,61 +985,11 @@ pub(crate) fn create_named(database: ustore_database_t, name: &str, modality: Mo
     Ok(collection)
 }
 
-impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completion> {
-    /// The collection `name` addresses and the modality it holds, which [`crate::Database::collection_create`]
-    /// bound, resolved through the arena.
-    ///
-    /// Collections are created and dropped only at the head, so names are read at the view's snapshot, or at the
-    /// head for a transaction or the head itself, and never join a transaction's conflicts.
-    ///
-    /// Calls `ustore_collection_find`.
-    pub fn collection_find<'arena, Name: AsRef<str>>(
-        &self,
-        name: Name,
-        arena: &'arena mut Arena,
-    ) -> Completion::Answer<CollectionFind<'arena, Name>>
-    where
-        Completion: Accepts<Name>,
-    {
-        let verb = CollectionFind {
-            name,
-            arena,
-            offsets: [0; 2],
-            presences: Address::default(),
-            collections: Address::default(),
-            modalities: Address::default(),
-        };
-        Completion::answer(self, verb)
-    }
-
-    /// Lists up to `wanted` collection names under `prefix` into the arena, in the order of their text, from `start`
-    /// on where one is given.
-    ///
-    /// An engine lists its collections in an order of its own, so the names are sorted here. A listing
-    /// describes the database rather than a transaction, so it reads the view's snapshot or the head.
-    ///
-    /// Calls `ustore_collection_list`.
-    pub fn collection_names<'arena, Name: AsRef<str>>(
-        &self,
-        prefix: Name,
-        start: Option<Name>,
-        wanted: usize,
-        arena: &'arena mut Arena,
-    ) -> Completion::Answer<CollectionNames<'arena, Name>>
-    where
-        Completion: Accepts<Name>,
-    {
-        let verb =
-            CollectionNames { prefix, start, arena, wanted, written: 0, names: ustore_strings_view_t::default() };
-        Completion::answer(self, verb)
-    }
-}
-
-/// A lookup of a collection by its name; see [`On::collection_find`].
+/// A lookup of a collection by its name; see [`StringsVerbs::collection_find`].
 #[derive(Debug)]
 pub struct CollectionFind<'arena, Name> {
     name: Name,
-    arena: &'arena mut Arena,
+    arena: &'arena Arena<'arena>,
     /// The two offsets of the one-name tape the arguments point at.
     offsets: [u64; 2],
     presences: Address<ustore_octet_t>,
@@ -994,9 +1001,9 @@ impl<Name: AsRef<str>> Calling for CollectionFind<'_, Name> {
     type Arguments = db_ffi::ustore_collection_find_t;
     type Output = (CollectionID, Modality);
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1036,12 +1043,12 @@ impl<Name: AsRef<str>> Calling for CollectionFind<'_, Name> {
     }
 }
 
-/// A listing of collection names; see [`On::collection_names`].
+/// A listing of collection names; see [`StringsVerbs::collection_names`].
 #[derive(Debug)]
 pub struct CollectionNames<'arena, Name> {
     prefix: Name,
     start: Option<Name>,
-    arena: &'arena mut Arena,
+    arena: &'arena Arena<'arena>,
     wanted: usize,
     written: ustore_size_t,
     names: ustore_strings_view_t,
@@ -1079,9 +1086,9 @@ impl<'arena, Name: AsRef<str>> Calling for CollectionNames<'arena, Name> {
     type Arguments = db_ffi::ustore_collection_list_t;
     type Output = Names<'arena>;
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1121,7 +1128,7 @@ mod tests {
     use crate::testing::{created, key, keys};
 
     /// A database holding three named collections.
-    fn three_named() -> (Database, Arena) {
+    fn three_named() -> (Database, Arena<'static>) {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         for name in ["people", "places", "planets"] {
             database.collection_create(name, Modality::Blobs).unwrap();
@@ -1131,7 +1138,7 @@ mod tests {
 
     /// A strings collection mapping `apple`, `apricot` and `banana` onto the keys one, two and
     /// three.
-    fn populated() -> (Database, CollectionID, Arena) {
+    fn populated() -> (Database, CollectionID, Arena<'static>) {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let strings = created(&database, Modality::Strings);
         database
@@ -1192,7 +1199,7 @@ mod tests {
     }
 
     /// Drops the collection `name` addresses, together with its name.
-    fn drop_named(database: &Database, name: &str, arena: &mut Arena) {
+    fn drop_named(database: &Database, name: &str, arena: &mut Arena<'_>) {
         let (collection, _) = database.head().collection_find(name, arena).unwrap();
         database.collection_drop(collection, DropMode::Collection).unwrap();
     }

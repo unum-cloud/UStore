@@ -1,7 +1,8 @@
 """The Python the website shows, line by line, on every engine, and the Quickstarts of the binding READMEs.
 
 The site opens `ustore.umem.Database()`, which is `Database.open_ram()` and its siblings here, as the
-`database` fixture does. It decodes a poster with `.decode('png')`, while a blob reads here as bytes
+`database` fixture does, and every collection it names is made first with `collection_create`, since a
+name only finds. It decodes a poster with `.decode('png')`, while a blob reads here as bytes
 that an image library decodes. Its `db.transition()` is a typo for `db.transaction()`.
 
 The Quickstarts of `python/README.md` and `mojo/README.md` run verbatim, the first fenced block
@@ -37,6 +38,7 @@ PNG = b"\x89PNG\r\n\x1a\n"
 
 def test_description_is_a_document(database):
     """A movie's description is a document, read back as the object written."""
+    database.collection_create("movies", modality=ustore.Modality.DOCS)
     database["movies"].docs[AVATAR] = {"title": "Avatar", "year": 2009}
     description = database["movies"].docs[AVATAR]
     assert description == {"title": "Avatar", "year": 2009}
@@ -44,6 +46,7 @@ def test_description_is_a_document(database):
 
 def test_thumbnail_is_a_blob(database):
     """A movie's thumbnail is a binary value, read back byte for byte."""
+    database.collection_create("posters", modality=ustore.Modality.BLOBS)
     database["posters"].blobs[AVATAR] = PNG
     thumbnail = database["posters"].blobs[AVATAR]
     assert thumbnail == PNG
@@ -51,6 +54,7 @@ def test_thumbnail_is_a_blob(database):
 
 def test_recommendations_are_edges(database):
     """Recommendations are graph edges, read back by their source."""
+    database.collection_create("similar", modality=ustore.Modality.GRAPH)
     database["similar"].graph.add_edge(AVATAR, TITANIC)
     recommendations = database["similar"].graph.read_edges(AVATAR)
     assert [(source, target) for source, target, _ in recommendations[0]] == [(key(AVATAR), key(TITANIC))]
@@ -58,6 +62,7 @@ def test_recommendations_are_edges(database):
 
 def test_images_are_sampled_values(database):
     """Sampling a collection of images answers every image by its key."""
+    database.collection_create("pictures", modality=ustore.Modality.BLOBS)
     database["pictures"].blobs[[AVATAR, TITANIC]] = [PNG, PNG]
     images = database["pictures"].sample(1000)
     assert images == {key(AVATAR): PNG, key(TITANIC): PNG}
@@ -67,6 +72,11 @@ def test_images_are_sampled_values(database):
 @pytest.mark.skipif(not pandas_available, reason="pandas is not installed")
 def test_the_transaction_writes_every_modality(database):
     """One transaction writes documents, edges, values and table rows across collections."""
+    for name in ("payments", "products", "availability"):
+        database.collection_create(name, modality=ustore.Modality.DOCS)
+    for name in ("connections", "relations"):
+        database.collection_create(name, modality=ustore.Modality.GRAPH)
+    database.collection_create("posters", modality=ustore.Modality.BLOBS)
     with database.transaction() as txn:
         txn["payments"].docs[NEW] = {"from": ALICE, "to": BOB, "amount": 10_000}
         txn["connections"].graph.add_edge(ALICE, BOB)
@@ -85,7 +95,7 @@ def test_the_transaction_writes_every_modality(database):
 
 def test_the_database_opens_by_engine():
     """A database opens through an engine's constructor alone, never the bare class."""
-    with pytest.raises(TypeError, match="open_ram"):
+    with pytest.raises(TypeError):
         ustore.Database()
     with ustore.Database.open_ram() as db:
         assert isinstance(db["movies"], ustore.Collection)

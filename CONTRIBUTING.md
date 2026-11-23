@@ -664,6 +664,7 @@ A dynamic binding publishes every field of every report the library fills.
 A type the binding hands to C by cast, like a slice of parts lent as the C array, is a transparent wrapper over the C struct, like Rust's `#[repr(transparent)]` newtype, so the cast is sound by construction and nothing asserts its size or alignment.
 Tests never restate a struct's layout that the compiler already pins: no `offset_of!`, `size_of`, `MemoryLayout` or `Marshal.SizeOf` asserts against the C structs; `offsetof` tables that declare members are declarations, not tests.
 Tests of how names print and parse, and of an engine run again through the binding, stay.
+A binding test asserts a status, or the exception or error type mapped from it, and never the wording of a message or note, in any language: no pytest `match=`, no comparison of `error.message`, `err.Error()` or a note's text, and no substring search in them, since engines refine their notes over time.
 
 Bindings wrap the C ABI and never instantiate C++ templates themselves.
 A binding is usable once it covers opening and closing, binary reads and writes, named collections, transactions and scans; documents and graphs follow in any order.
@@ -676,6 +677,13 @@ A deferred call polls only through `ustore_outcome_status`, and releasing one ri
 A walk is a cursor whose every pull takes an arena, and a language's loop shorthand owns one arena for the loop's lifetime.
 A progress callback runs on the thread that runs the call, an executor's own for a deferred one, so a binding's callback enters its runtime there.
 The Design sections of [`rust/README.md`](rust/README.md) and [`python/README.md`](python/README.md) spell these rules out in each language.
+
+A verb called on the handle itself runs on the calling thread, `on(executor)` blocks on an executor, and `deferred(executor)` submits there, with the same arguments in every language.
+A deferred call allocates nothing in C++, Rust or Mojo: C++ and Mojo construct it immovable where the caller holds it and submit at once, while a Rust `Deferred` submits on its first poll or `wait`, once pinned in place.
+A callback crosses as the C struct it lowers to, built by one generic constructor per handler shape with a trampoline made per handler type, never a trait object, a box or an enum.
+A per-key predicate lowers as cheap, and a batch predicate as expensive unless the caller says it is cheap.
+An arena never outlives the executor that made it: Rust's `Arena<'executor>` and Mojo's arena origin enforce the order, and the other bindings document it.
+Brackets and name lookups only find, and creating or dropping a collection stays an explicit database verb.
 
 `.githooks/pre-commit` refuses locks in binding sources, throwing callback types, caught unwinds and kept exceptions.
 

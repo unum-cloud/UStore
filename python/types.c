@@ -2007,7 +2007,7 @@ void ustore_py_call_release(ustore_py_call_t* call) {
     call->arena = NULL;
     Py_CLEAR(call->progress);
     Py_CLEAR(call->result);
-    Py_CLEAR(call->predicate.callable);
+    Py_CLEAR(call->predicate.handler);
 }
 
 PyObject* ustore_py_call_answer_none(void* Py_UNUSED(call)) { Py_RETURN_NONE; }
@@ -2050,78 +2050,214 @@ ustore_progress_callback_t ustore_py_progress_callback(ustore_py_call_t const* c
     return call->progress ? progress_trampoline : NULL;
 }
 
-int ustore_py_predicate_from_object(PyObject* object, PyObject** callable) {
-    *callable = NULL;
+int ustore_py_predicate_from_object(PyObject* object, PyObject** handler) {
+    *handler = NULL;
     if (object == Py_None) return 0;
-    if (!PyCallable_Check(object)) {
-        PyErr_Format(PyExc_TypeError, "The 'predicate' option takes a callable or None, got %S", Py_TYPE(object));
+    if (!PyCallable_Check(object) && !Py_IS_TYPE(object, &BatchType)) {
+        PyErr_Format(PyExc_TypeError, "The 'predicate' option takes a callable, a ustore.Batch or None, got %S",
+                     Py_TYPE(object));
         return -1;
     }
-    *callable = object;
+    *handler = object;
     return 0;
 }
 
 /**
- *  @brief Re-enters Python for one page of the scan whose predicate is @p state, from whichever thread runs it.
+ *  @brief Re-enters Python for one page of the scan whose predicate is @p state, asking its
+ *      callable about each key in turn as a <tt>uuid.UUID</tt>, from whichever thread runs it.
  *
- *  The callable receives the keys as a tuple of <tt>uuid.UUID</tt> and answers one truthy or falsy
- *  item per key. One that raises, or answers the wrong number of items, reports through the
- *  unraisable hook and rejects the whole page.
+ *  A callable that raises reports through the unraisable hook, and its key and the rest of the
+ *  page are rejected.
  */
-static void predicate_trampoline(ustore_key_t const* keys, ustore_admission_t* admissions, ustore_size_t count,
-                                 void* state) {
-    ustore_py_predicate_t* const predicate = (ustore_py_predicate_t*)state;
-    for (ustore_size_t index = 0; index != count; ++index) admissions[index] = ustore_reject_k;
+static void predicate_each_trampoline(ustore_key_t const* keys, ustore_admission_t* admissions, ustore_size_t count,
+                                      void* state) {
+    PyObject* const callable = ((ustore_py_predicate_t const*)state)->handler;
     PyGILState_STATE const interpreter = PyGILState_Ensure();
-    PyObject* asked = PyTuple_New((Py_ssize_t)count);
-    for (ustore_size_t index = 0; asked && index != count; ++index) {
+    ustore_size_t index = 0;
+    for (; index != count; ++index) {
         PyObject* const key = ustore_py_uuid_to_object(&keys[index].uuid);
-        if (!key) Py_CLEAR(asked);
-        else PyTuple_SET_ITEM(asked, (Py_ssize_t)index, key);
+        PyObject* const verdict = key ? PyObject_CallOneArg(callable, key) : NULL;
+        Py_XDECREF(key);
+        int const truth = verdict ? PyObject_IsTrue(verdict) : -1;
+        Py_XDECREF(verdict);
+        if (truth < 0) break;
+        admissions[index] = truth ? ustore_admit_k : ustore_reject_k;
     }
-    PyObject* const verdicts = asked ? PyObject_CallOneArg(predicate->callable, asked) : NULL;
-    PyObject* const listed = verdicts ? PySequence_Fast(verdicts, "A predicate answers a sequence") : NULL;
-    if (listed && PySequence_Fast_GET_SIZE(listed) != (Py_ssize_t)count)
-        PyErr_Format(PyExc_ValueError, "A predicate answered %zd items for %llu keys", PySequence_Fast_GET_SIZE(listed),
-                     (unsigned long long)count);
-    for (ustore_size_t index = 0; listed && !PyErr_Occurred() && index != count; ++index) {
-        int const truth = PyObject_IsTrue(PySequence_Fast_GET_ITEM(listed, (Py_ssize_t)index));
-        if (truth > 0) admissions[index] = ustore_admit_k;
-    }
-    if (PyErr_Occurred()) {
-        PyErr_WriteUnraisable(predicate->callable);
-        for (ustore_size_t index = 0; index != count; ++index) admissions[index] = ustore_reject_k;
-    }
-    Py_XDECREF(listed);
-    Py_XDECREF(verdicts);
-    Py_XDECREF(asked);
+    if (index != count) PyErr_WriteUnraisable(callable);
+    for (; index != count; ++index) admissions[index] = ustore_reject_k;
     PyGILState_Release(interpreter);
 }
 
-ustore_predicate_t ustore_py_predicate_of(ustore_py_predicate_t* predicate, int cost) {
-    ustore_predicate_t const asked = {predicate_trampoline, predicate, (ustore_predicate_cost_t)cost};
-    ustore_predicate_t const none = {NULL, NULL, ustore_predicate_cheap_k};
-    return predicate->callable ? asked : none;
+/** A batch predicate: the handler answering a page of keys per call, and where a scan asks it. */
+typedef struct Batch {
+    PyObject ob_base;
+
+    /** The callable taking the keys and the admissions to write, held. */
+    PyObject* handler;
+
+    /** Where in a scan @c handler is asked, fixed at construction. */
+    ustore_predicate_cost_t cost;
+} Batch;
+
+_Static_assert(sizeof(ustore_admission_t) == sizeof(unsigned int), "admissions cross as an 'I' memoryview");
+
+/** Closes @p view, stolen, so a handler keeping it past its call reads nothing; one still
+ *  exporting it reports through the unraisable hook. @return 0 on success, -1 otherwise. */
+static int predicate_view_close(PyObject* view, PyObject* handler) {
+    if (!view) return 0;
+    PyObject* const closed = PyObject_CallMethod(view, "release", NULL);
+    Py_DECREF(view);
+    if (closed) {
+        Py_DECREF(closed);
+        return 0;
+    }
+    PyErr_WriteUnraisable(handler);
+    return -1;
 }
+
+/**
+ *  @brief Re-enters Python for one page of the scan whose predicate is @p state, handing its
+ *      @c Batch handler the keys and the admissions as memoryviews over the library's buffers.
+ *
+ *  The keys are a read-only "B" view of @p count rows of 16 bytes, and the admissions a writable
+ *  "I" view of @p count entries the library pre-filled with rejections. Both close when the handler
+ *  returns. A handler that raises, or keeps a view exported past its call, reports through the
+ *  unraisable hook, and the whole page is rejected.
+ */
+static void predicate_batch_trampoline(ustore_key_t const* keys, ustore_admission_t* admissions, ustore_size_t count,
+                                       void* state) {
+    PyObject* const handler = ((Batch const*)((ustore_py_predicate_t const*)state)->handler)->handler;
+    PyGILState_STATE const interpreter = PyGILState_Ensure();
+    Py_ssize_t keys_shape[2] = {(Py_ssize_t)count, (Py_ssize_t)sizeof(ustore_key_t)};
+    Py_ssize_t admissions_shape[1] = {(Py_ssize_t)count};
+    Py_buffer keys_buffer = {.buf = (void*)keys,
+                             .len = (Py_ssize_t)(count * sizeof(ustore_key_t)),
+                             .itemsize = 1,
+                             .readonly = 1,
+                             .ndim = 2,
+                             .format = "B",
+                             .shape = keys_shape};
+    Py_buffer admissions_buffer = {.buf = admissions,
+                                   .len = (Py_ssize_t)(count * sizeof(ustore_admission_t)),
+                                   .itemsize = sizeof(ustore_admission_t),
+                                   .ndim = 1,
+                                   .format = "I",
+                                   .shape = admissions_shape};
+    PyObject* const keys_view = PyMemoryView_FromBuffer(&keys_buffer);
+    PyObject* const admissions_view = keys_view ? PyMemoryView_FromBuffer(&admissions_buffer) : NULL;
+    PyObject* const arguments[2] = {keys_view, admissions_view};
+    PyObject* const answered = admissions_view ? PyObject_Vectorcall(handler, arguments, 2, NULL) : NULL;
+    if (!answered) PyErr_WriteUnraisable(handler);
+    Py_XDECREF(answered);
+    int const kept = predicate_view_close(keys_view, handler) | predicate_view_close(admissions_view, handler);
+    if (!answered || kept)
+        for (ustore_size_t index = 0; index != count; ++index) admissions[index] = ustore_reject_k;
+    PyGILState_Release(interpreter);
+}
+
+ustore_predicate_t ustore_py_predicate_of(ustore_py_predicate_t* predicate) {
+    PyObject* const handler = predicate->handler;
+    if (!handler) return (ustore_predicate_t) {0};
+    if (Py_IS_TYPE(handler, &BatchType))
+        return (ustore_predicate_t) {predicate_batch_trampoline, predicate, ((Batch const*)handler)->cost};
+    return (ustore_predicate_t) {predicate_each_trampoline, predicate, ustore_predicate_cost_cheap_k};
+}
+
+static char const doc_Batch[] =                                                                      //
+    "Batch(handler, /, *, cost=PredicateCost.EXPENSIVE)\n"                                           //
+    "\n"                                                                                             //
+    "A `predicate=` that answers a page of keys in one call, for handlers that pay per call, such\n" //
+    "as a lookup in an external database. `handler(keys, admissions)` reads a `(count, 16)`\n"       //
+    "memoryview of key bytes and writes 1 into a `(count,)` memoryview of admissions for every\n"    //
+    "key it keeps, the rest staying rejected. Both views are valid only for the call. An\n"          //
+    "expensive batch is asked about the keys patterns and filters kept, and a cheap one before\n"    //
+    "they read any value. Wraps `ustore_predicate_t`.\n"                                             //
+    "\n"                                                                                             //
+    "Example:\n"                                                                                     //
+    "  >>> def even(keys, admissions):\n"                                                            //
+    "  ...     for row in range(len(admissions)):\n"                                                 //
+    "  ...         admissions[row] = keys[row, 15] % 2 == 0\n"                                       //
+    "  >>> database.scan(None, 100, arena, collection='posters', predicate=ustore.Batch(even))";
+
+static PyObject* Batch_tp_new(PyTypeObject* type, PyObject* args, PyObject* keywords) {
+    PyObject* const cost_object = keywords ? PyDict_GetItemString(keywords, "cost") : NULL;
+    if (PyTuple_GET_SIZE(args) != 1 || (keywords && PyDict_GET_SIZE(keywords) != (cost_object != NULL))) {
+        PyErr_SetString(PyExc_TypeError, "Batch() takes one positional handler and an optional cost=");
+        return NULL;
+    }
+    PyObject* const handler = PyTuple_GET_ITEM(args, 0);
+    if (!PyCallable_Check(handler)) {
+        PyErr_Format(PyExc_TypeError, "Batch() takes a callable handler, got %S", Py_TYPE(handler));
+        return NULL;
+    }
+    int cost = ustore_predicate_cost_expensive_k;
+    if (cost_object && ustore_py_enum_from_object(cost_object, "cost", ustore_py_enum_predicate_cost_k, &cost) != 0)
+        return NULL;
+    Batch* const batch = (Batch*)type->tp_alloc(type, 0);
+    if (!batch) return NULL;
+    batch->handler = Py_NewRef(handler);
+    batch->cost = (ustore_predicate_cost_t)cost;
+    return (PyObject*)batch;
+}
+
+static int Batch_traverse(Batch* self, visitproc visit, void* arg) {
+    Py_VISIT(self->handler);
+    return 0;
+}
+
+static int Batch_clear(Batch* self) {
+    Py_CLEAR(self->handler);
+    return 0;
+}
+
+static void Batch_dealloc(Batch* self) {
+    PyObject_GC_UnTrack(self);
+    Batch_clear(self);
+    Py_TYPE(self)->tp_free((PyObject*)self);
+}
+
+static PyObject* Batch_get_handler(Batch* self, void* closure) { return Py_NewRef(self->handler); }
+
+static PyObject* Batch_get_cost(Batch* self, void* closure) {
+    return ustore_py_enum_to_object(ustore_py_enum_predicate_cost_k, (int)self->cost);
+}
+
+static PyGetSetDef Batch_getset[] = {
+    {"handler", (getter)Batch_get_handler, NULL, "The callable taking the keys and the admissions.", NULL},
+    {"cost", (getter)Batch_get_cost, NULL, "The `PredicateCost` placing the handler in a scan.", NULL},
+    {NULL, NULL, NULL, NULL, NULL},
+};
+
+PyTypeObject BatchType = {
+    PyVarObject_HEAD_INIT(NULL, 0) //
+        .tp_name = "ustore.Batch",
+    .tp_doc = doc_Batch,
+    .tp_basicsize = sizeof(Batch),
+    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_HAVE_GC,
+    .tp_new = Batch_tp_new,
+    .tp_dealloc = (destructor)Batch_dealloc,
+    .tp_traverse = (traverseproc)Batch_traverse,
+    .tp_clear = (inquiry)Batch_clear,
+    .tp_getset = Batch_getset,
+};
 
 #pragma endregion Calls
 
 #pragma region Deferred Calls
 
-static char const doc_Deferred[] =                                                                //
-    "A call a deferred view submitted, which answers once it finishes.\n"                         //
-    "\n"                                                                                          //
-    "Built by the verbs of a DeferredOn, never by name. `await` suspends the coroutine until\n"   //
-    "the call is final, polling `status` between sleeps growing from 1 us to 1 ms and parking\n"  //
-    "no thread, and `wait()` blocks the thread instead. Either answers what the blocking verb\n"  //
-    "would have answered, or raises what it would have raised, as many times as it is asked.\n"   //
-    "The object holds the outcome, the keys and buffers the call borrows, its output slots and\n" //
-    "its arena until the call finishes, so dropping it waits for that, and C refuses another\n"   //
-    "call naming the arena with ContendedError until it finishes.\n"                              //
-    "\n"                                                                                          //
-    "Example:\n"                                                                                  //
-    "  >>> async def read(database, executor, keys):\n"                                           //
-    "  ...     reading = database.deferred(executor).read(keys, ustore.Arena(executor))\n"        //
+static char const doc_Deferred[] =                                                                         //
+    "A call a deferred view submitted, which answers once it finishes.\n"                                  //
+    "\n"                                                                                                   //
+    "Built by the verbs of a DeferredOn, never by name. `await` suspends the coroutine until the call\n"   //
+    "is final, re-polling `status` once per turn of the running loop and parking no thread, and\n"         //
+    "`wait()` blocks the thread instead. Either answers what the blocking verb would have answered, or\n"  //
+    "raises what it would have raised, as many times as it is asked. The object holds the outcome, the\n"  //
+    "keys and buffers the call borrows, its output slots and its arena until the call finishes, so\n"      //
+    "dropping it waits for that; meanwhile C refuses another call naming the arena with ContendedError.\n" //
+    "\n"                                                                                                   //
+    "Example:\n"                                                                                           //
+    "  >>> async def read(database, executor, keys):\n"                                                    //
+    "  ...     reading = database.deferred(executor).read(keys, ustore.Arena(executor))\n"                 //
     "  ...     return await reading  # or: reading.wait()";
 
 /** The outcome of the call @p deferred holds. */
@@ -2190,8 +2326,8 @@ static PyObject* Deferred_wait(Deferred* self, PyObject* Py_UNUSED(ignored)) {
     return deferred_answer(self);
 }
 
-/** Answers the iterator of the <tt>ustore._settled</tt> coroutine, which polls the status on the
- *  running loop with a growing sleep and never parks a thread, then answers the wait. */
+/** Answers the iterator of the <tt>ustore._settled</tt> coroutine, which re-polls the status once per
+ *  turn of the running loop and never parks a thread, then answers the wait. */
 static PyObject* Deferred_await(Deferred* self) {
     PyObject* const package = PyImport_ImportModule("ustore");
     PyObject* const settled = package ? PyObject_GetAttrString(package, "_settled") : NULL;
@@ -2230,7 +2366,7 @@ static int Deferred_traverse(Deferred* self, visitproc visit, void* arg) {
     Py_VISIT(header->arena);
     Py_VISIT(header->progress);
     Py_VISIT(header->result);
-    Py_VISIT(header->predicate.callable);
+    Py_VISIT(header->predicate.handler);
     return 0;
 }
 

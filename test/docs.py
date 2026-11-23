@@ -481,7 +481,7 @@ def test_a_deferred_docs_gather_answers_once_waited(view, docs, later, arena):
     assert columns[1] == ("x", None)
 
 
-def test_deferred_document_subscripts_answer_once_waited(view, later):
+def test_deferred_document_subscripts_answer_once_waited(docs, view, later):
     """`docs[key]` parses what it read once waited for, and `docs_json[key]` answers a copy of the text."""
     view["docs"].docs[1] = NESTED
     collection = later["docs"]

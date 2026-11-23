@@ -29,6 +29,12 @@ include = [
 name = "ustore"
 path = "rust/lib.rs"
 
+# Its own binary, since it counts every allocation through a global allocator.
+[[test]]
+name = "deferred_allocations"
+path = "rust/tests/deferred_allocations.rs"
+harness = false
+
 # The `ram` engine always builds; each engine feature adds its engine to the one library, and without it the engine's
 # `Database::open_*` fails with `Status::Unsupported`.
 [features]

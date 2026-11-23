@@ -28,7 +28,7 @@ from ustore.pages import PagesDeferredVerbs, PagesVerbs
 from ustore.strings import StringsDeferredVerbs, StringsVerbs
 from ustore.types import (
     Address,
-    Answer,
+    Deferrable,
     Arena,
     Arguments,
     BytesView,
@@ -130,7 +130,7 @@ struct Key(Equatable, ImplicitlyCopyable, Writable):
 
 
 @fieldwise_init
-struct CollectionID(Answer, Defaultable, Equatable, ImplicitlyCopyable, Writable):
+struct CollectionID(Defaultable, Deferrable, Equatable, ImplicitlyCopyable, Writable):
     """The identifier of a collection, a UUIDv7 its create mints once, `ustore_collection_id_t`."""
 
     comptime Written = CollectionID
@@ -159,7 +159,7 @@ struct CollectionID(Answer, Defaultable, Equatable, ImplicitlyCopyable, Writable
 
 
 @fieldwise_init
-struct Stamp(Answer, Defaultable, Equatable, ImplicitlyCopyable):
+struct Stamp(Defaultable, Deferrable, Equatable, ImplicitlyCopyable):
     """A position in the order commits apply in, `ustore_stamp_t`: where a commit landed, or the newest
     commit a transaction or a snapshot reads."""
 
@@ -432,13 +432,32 @@ struct PredicateCost(Equatable, ImplicitlyCopyable, TrivialRegisterPassable):
 # region Predicates
 
 
-def _predicate[
-    T: AnyType, handler: def(Span[Key, MutAnyOrigin], Span[Admission, MutAnyOrigin], Pointer[T, MutAnyOrigin]) thin -> None
+def _each_predicate[
+    T: AnyType, judge: def(Key, Pointer[T, MutAnyOrigin]) thin -> Bool
 ](
-    keys: Pointer[Key, MutAnyOrigin], admissions: Pointer[Admission, MutAnyOrigin], count: c_size_t, state: Pointer[T, MutAnyOrigin]
+    keys: Pointer[Key, MutAnyOrigin],
+    admissions: Pointer[Admission, MutAnyOrigin],
+    count: c_size_t,
+    state: Pointer[T, MutAnyOrigin],
 ) abi("C"):
-    """The C callback of one handler, instantiated per handler since a capturing closure cannot cross."""
-    handler(
+    """The C callback of one per-key handler, asking it about every key of the page in turn."""
+    for position in range(Int(count)):
+        admissions[unsafe_offset=position] = Admission.ADMIT if judge(
+            keys[unsafe_offset=position], state
+        ) else Admission.REJECT
+
+
+def _batch_predicate[
+    T: AnyType,
+    judge: def(Span[Key, MutAnyOrigin], Span[Admission, MutAnyOrigin], Pointer[T, MutAnyOrigin]) thin -> None,
+](
+    keys: Pointer[Key, MutAnyOrigin],
+    admissions: Pointer[Admission, MutAnyOrigin],
+    count: c_size_t,
+    state: Pointer[T, MutAnyOrigin],
+) abi("C"):
+    """The C callback of one batch handler, instantiated per handler since a capturing closure cannot cross."""
+    judge(
         Span[Key, MutAnyOrigin](unsafe_ptr=keys, length=Int(count)),
         Span[Admission, MutAnyOrigin](unsafe_ptr=admissions, length=Int(count)),
         state,
@@ -462,24 +481,42 @@ struct Predicate(Defaultable, ImplicitlyCopyable):
         self = Self(NULL_ADDRESS, NULL_ADDRESS, PredicateCost.CHEAP)
 
     @staticmethod
-    def of[
-        T: AnyType,
-        origin: MutOrigin,
-        //,
-        handler: def(Span[Key, MutAnyOrigin], Span[Admission, MutAnyOrigin], Pointer[T, MutAnyOrigin]) thin -> None,
-    ](state: Pointer[T, origin], cost: PredicateCost = PredicateCost.CHEAP) -> Self:
-        """Asks `handler` about every page of listed keys, which writes one admission per key.
+    def each[
+        T: AnyType, origin: MutOrigin, //, judge: def(Key, Pointer[T, MutAnyOrigin]) thin -> Bool
+    ](state: Pointer[T, origin]) -> Self:
+        """Asks the cheap `judge` about every listed key, one at a time, before patterns or filters read any value.
 
         Parameters:
             T: What `state` points at, inferred from it.
             origin: The state's origin, inferred with it.
-            handler: Called with the page's keys, their admissions to write, and `state`.
+            judge: Whether one key is admitted, called with the key and `state`.
+
+        Args:
+            state: Forwarded into every call; it must outlive the scan.
+        """
+        var callback = _each_predicate[T, judge]
+        return Self(Pointer(to=callback).unsafe_bitcast[Int]()[], Int(state), PredicateCost.CHEAP)
+
+    @staticmethod
+    def batch[
+        T: AnyType,
+        origin: MutOrigin,
+        //,
+        judge: def(Span[Key, MutAnyOrigin], Span[Admission, MutAnyOrigin], Pointer[T, MutAnyOrigin]) thin -> None,
+    ](state: Pointer[T, origin], cost: PredicateCost = PredicateCost.EXPENSIVE) -> Self:
+        """Asks `judge` about every page of listed keys, which writes one admission per key; an expensive
+        one is asked about the keys patterns and filters kept, unless told it is cheap.
+
+        Parameters:
+            T: What `state` points at, inferred from it.
+            origin: The state's origin, inferred with it.
+            judge: Called with the page's keys, their admissions to write, and `state`.
 
         Args:
             state: Forwarded into every call; it must outlive the scan.
             cost: Where in a scan the handler is asked.
         """
-        var callback = _predicate[T, handler]
+        var callback = _batch_predicate[T, judge]
         return Self(Pointer(to=callback).unsafe_bitcast[Int]()[], Int(state), cost)
 
 
@@ -651,7 +688,7 @@ struct Capabilities(Equatable, ImplicitlyCopyable, TrivialRegisterPassable):
 
 
 @fieldwise_init
-struct DatabaseDescription(Answer, Defaultable, ImplicitlyCopyable):
+struct DatabaseDescription(Defaultable, Deferrable, ImplicitlyCopyable):
     """What an open database reports about itself in one call, `ustore_database_description_t`."""
 
     comptime Written = DatabaseDescription
@@ -695,7 +732,14 @@ struct DatabaseDescribeArguments(Arguments):
     var completion: Completion
     var description: Optional[Pointer[DatabaseDescription, MutUntrackedOrigin]]
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[DatabaseDescription, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[DatabaseDescription, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self = Self(scope.database, scope.executor, outcome, completion, written)
 
     @staticmethod
@@ -715,7 +759,14 @@ struct DatabaseClearArguments(Arguments):
     var completion: Completion
     var mode: DropMode
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[Unwritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[Unwritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self = Self(scope.database, scope.executor, outcome, completion, self.mode)
 
     @staticmethod
@@ -737,7 +788,14 @@ struct DatabaseCompactArguments(Arguments):
     var plan: Optional[Pointer[Address, MutUntrackedOrigin]]
     var phase: Optional[Pointer[PhaseProgress, MutUntrackedOrigin]]
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[Unwritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[Unwritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self = Self(scope.database, scope.executor, outcome, completion, self.progress, self.plan, self.phase)
 
     @staticmethod
@@ -791,7 +849,14 @@ struct DatabaseCompactPlanFinishArguments(Arguments):
     var completion: Completion
     var plan: Address
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[Unwritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[Unwritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self = Self(scope.database, scope.executor, outcome, completion, self.plan)
 
     @staticmethod
@@ -810,7 +875,14 @@ struct DatabaseFlushArguments(Arguments):
     var outcome: Optional[Pointer[Outcome, MutUntrackedOrigin]]
     var completion: Completion
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[Unwritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[Unwritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self = Self(scope.database, scope.executor, outcome, completion)
 
     @staticmethod
@@ -848,7 +920,14 @@ struct SnapshotSaveArguments(Arguments):
     var path: BytesViewArguments
     var progress: Progress
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[Unwritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[Unwritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self = Self(scope.snapshot, scope.executor, outcome, completion, self.path, self.progress)
 
     @staticmethod
@@ -892,11 +971,25 @@ struct CollectionListArguments(Arguments):
     var written: Optional[Pointer[c_size_t, MutUntrackedOrigin]]
     var arena: Address
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[CollectionListWritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[CollectionListWritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self = Self(
-            scope.database, scope.executor, outcome, completion, scope.snapshot,
-            Pointer(to=written[].collections), Pointer(to=written[].modalities), Pointer(to=written[].names),
-            Pointer(to=written[].written), arena,
+            scope.database,
+            scope.executor,
+            outcome,
+            completion,
+            scope.snapshot,
+            Pointer(to=written[].collections),
+            Pointer(to=written[].modalities),
+            Pointer(to=written[].names),
+            Pointer(to=written[].written),
+            arena,
         )
 
     @staticmethod
@@ -905,7 +998,7 @@ struct CollectionListArguments(Arguments):
 
 
 @fieldwise_init
-struct CollectionList[origin: MutOrigin](Answer, Sized):
+struct CollectionList[origin: MutOrigin](Deferrable, Sized):
     """The collections of a database, read in place from the arena a listing borrows.
 
     Parameters:
@@ -913,7 +1006,7 @@ struct CollectionList[origin: MutOrigin](Answer, Sized):
     """
 
     comptime Written = CollectionListWritten
-    var arena: Pointer[Arena, Self.origin]
+    var arena: Pointer[Arena[ImmUntrackedOrigin], Self.origin]
     """The arena holding the listing."""
     var generation: Int
     """The arena's call the listing came from."""
@@ -921,7 +1014,7 @@ struct CollectionList[origin: MutOrigin](Answer, Sized):
     """The views the engine wrote."""
 
     def __init__(out self, arena: Address, generation: Int, written: CollectionListWritten, count: Int):
-        self.arena = Pointer[Arena, Self.origin](unsafe_from_address=arena)
+        self.arena = Pointer[Arena[ImmUntrackedOrigin], Self.origin](unsafe_from_address=arena)
         self.generation = generation
         self.written = written
 
@@ -958,7 +1051,14 @@ struct CollectionCreateArguments(Arguments):
     var modality: Modality
     var collection: Optional[Pointer[CollectionID, MutUntrackedOrigin]]
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[CollectionID, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[CollectionID, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self = Self(scope.database, scope.executor, outcome, completion, self.name, self.modality, written)
 
     @staticmethod
@@ -997,10 +1097,26 @@ struct CollectionFindArguments(Arguments):
     var modalities: Optional[Pointer[Address, MutUntrackedOrigin]]
     var arena: Address
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[CollectionFindWritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[CollectionFindWritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self = Self(
-            scope.database, scope.executor, outcome, completion, scope.snapshot, self.count, self.names,
-            Pointer(to=written[].presences), Pointer(to=written[].collections), Pointer(to=written[].modalities), arena,
+            scope.database,
+            scope.executor,
+            outcome,
+            completion,
+            scope.snapshot,
+            self.count,
+            self.names,
+            Pointer(to=written[].presences),
+            Pointer(to=written[].collections),
+            Pointer(to=written[].modalities),
+            arena,
         )
 
     @staticmethod
@@ -1009,7 +1125,7 @@ struct CollectionFindArguments(Arguments):
 
 
 @fieldwise_init
-struct CollectionsFound[origin: MutOrigin](Answer, Sized):
+struct CollectionsFound[origin: MutOrigin](Deferrable, Sized):
     """The collections a batch of names address, read in place from the arena a find borrows.
 
     Parameters:
@@ -1017,7 +1133,7 @@ struct CollectionsFound[origin: MutOrigin](Answer, Sized):
     """
 
     comptime Written = CollectionFindWritten
-    var arena: Pointer[Arena, Self.origin]
+    var arena: Pointer[Arena[ImmUntrackedOrigin], Self.origin]
     """The arena holding the answers."""
     var generation: Int
     """The arena's call the answers came from."""
@@ -1027,7 +1143,7 @@ struct CollectionsFound[origin: MutOrigin](Answer, Sized):
     """Names the call resolved."""
 
     def __init__(out self, arena: Address, generation: Int, written: CollectionFindWritten, count: Int):
-        self.arena = Pointer[Arena, Self.origin](unsafe_from_address=arena)
+        self.arena = Pointer[Arena[ImmUntrackedOrigin], Self.origin](unsafe_from_address=arena)
         self.generation = generation
         self.written = written
         self.count = count
@@ -1065,7 +1181,14 @@ struct CollectionDropArguments(Arguments):
     var collection: CollectionID
     var mode: DropMode
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[Unwritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[Unwritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self = Self(scope.database, scope.executor, outcome, completion, self.collection, self.mode)
 
     @staticmethod
@@ -1079,7 +1202,7 @@ struct CollectionDropArguments(Arguments):
 
 
 @fieldwise_init
-struct Reset(Answer, Defaultable, ImplicitlyCopyable):
+struct Reset(Defaultable, Deferrable, ImplicitlyCopyable):
     """The handle a transaction reset reads and keeps, at one stable address; its result holds nothing."""
 
     comptime Written = Reset
@@ -1107,7 +1230,14 @@ struct TransactionInitArguments(Arguments):
     var outcome: Optional[Pointer[Outcome, MutUntrackedOrigin]]
     var completion: Completion
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[Reset, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[Reset, MutUntrackedOrigin],
+        arena: Address,
+    ):
         written[].transaction = scope.transaction
         self = Self(Pointer(to=written[].transaction), scope.database, scope.executor, outcome, completion)
 
@@ -1129,7 +1259,14 @@ struct TransactionStageArguments(Arguments):
     var transaction: Address
     var read_stamp: Optional[Pointer[Stamp, MutUntrackedOrigin]]
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[Stamp, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[Stamp, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self = Self(scope.database, scope.executor, outcome, completion, scope.transaction, written)
 
     @staticmethod
@@ -1151,7 +1288,14 @@ struct TransactionCommitArguments(Arguments):
     var commit_stamp: Optional[Pointer[Stamp, MutUntrackedOrigin]]
     var durability: Durability
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[Stamp, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[Stamp, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self = Self(scope.database, scope.executor, outcome, completion, scope.transaction, written, self.durability)
 
     @staticmethod
@@ -1171,7 +1315,14 @@ struct TransactionRollbackArguments(Arguments):
     var completion: Completion
     var transaction: Address
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[Unwritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[Unwritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self = Self(scope.database, scope.executor, outcome, completion, scope.transaction)
 
     @staticmethod
@@ -1231,11 +1382,27 @@ struct ChangesCursorNextArguments(Arguments):
     var arena: Address
     var with_values: Bool
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[ChangesWritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[ChangesWritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self = Self(
-            self.cursor, scope.executor, outcome, completion, self.wanted, Pointer(to=written[].count),
-            Pointer(to=written[].keys), Pointer(to=written[].stamps), Pointer(to=written[].kinds),
-            _slot(self.with_values, Pointer(to=written[].values)), arena, self.with_values,
+            self.cursor,
+            scope.executor,
+            outcome,
+            completion,
+            self.wanted,
+            Pointer(to=written[].count),
+            Pointer(to=written[].keys),
+            Pointer(to=written[].stamps),
+            Pointer(to=written[].kinds),
+            _slot(self.with_values, Pointer(to=written[].values)),
+            arena,
+            self.with_values,
         )
 
     @staticmethod
@@ -1244,7 +1411,7 @@ struct ChangesCursorNextArguments(Arguments):
 
 
 @fieldwise_init
-struct Changes[origin: MutOrigin](Answer, Sized):
+struct Changes[origin: MutOrigin](Deferrable, Sized):
     """The changes one pull of a feed yielded, oldest first, read in place from the arena it borrows.
 
     Parameters:
@@ -1252,7 +1419,7 @@ struct Changes[origin: MutOrigin](Answer, Sized):
     """
 
     comptime Written = ChangesWritten
-    var arena: Pointer[Arena, Self.origin]
+    var arena: Pointer[Arena[ImmUntrackedOrigin], Self.origin]
     """The arena holding the changes."""
     var generation: Int
     """The arena's call the changes came from."""
@@ -1260,7 +1427,7 @@ struct Changes[origin: MutOrigin](Answer, Sized):
     """The views the engine wrote."""
 
     def __init__(out self, arena: Address, generation: Int, written: ChangesWritten, count: Int):
-        self.arena = Pointer[Arena, Self.origin](unsafe_from_address=arena)
+        self.arena = Pointer[Arena[ImmUntrackedOrigin], Self.origin](unsafe_from_address=arena)
         self.generation = generation
         self.written = written
 
@@ -1307,7 +1474,9 @@ struct ChangesCursor(Movable):
         self.library.symbols().changes_cursor_free(self.address)
         _ = self.library^
 
-    def next(self, executor: Executor, mut arena: Arena, wanted: Int, values: Bool = True) raises Error -> Changes[origin_of(arena)]:
+    def next(
+        self, executor: Executor, mut arena: Arena, wanted: Int, values: Bool = True
+    ) raises Error -> Changes[origin_of(arena)]:
         """Pulls up to `wanted` next changes, with their values when asked. Calls `ustore_changes_cursor_next`.
 
         Args:
@@ -1323,10 +1492,20 @@ struct ChangesCursor(Movable):
             Scope(self.library, NULL_ADDRESS, executor.address, NULL_ADDRESS, NULL_ADDRESS, NULL_ADDRESS, Watch.KEYS),
             _Crossing[ChangesCursorNextArguments, Changes[origin_of(arena)], origin_of(arena), ImmUntrackedOrigin](
                 ChangesCursorNextArguments(
-                    self.address, NULL_ADDRESS, None, Completion.BLOCKING, c_size_t(wanted), None, None, None, None, None,
-                    NULL_ADDRESS, values,
+                    self.address,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.BLOCKING,
+                    c_size_t(wanted),
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    NULL_ADDRESS,
+                    values,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 0,
             ),
         )
@@ -1392,7 +1571,12 @@ struct Ingest(Movable):
         _ = self.library^
 
     def append[
-        keys_origin: ImmOrigin, values_origin: ImmOrigin, sources_origin: ImmOrigin, targets_origin: ImmOrigin, edges_origin: ImmOrigin, //
+        keys_origin: ImmOrigin,
+        values_origin: ImmOrigin,
+        sources_origin: ImmOrigin,
+        targets_origin: ImmOrigin,
+        edges_origin: ImmOrigin,
+        //,
     ](
         self,
         keys: KeysView[keys_origin] = KeysView(),
@@ -1414,8 +1598,14 @@ struct Ingest(Movable):
         var count = _tasks(keys.tasks(), values.tasks(), sources.tasks(), targets.tasks(), edges.tasks())
         _cross(
             IngestAppendArguments(
-                self.address, outcome, c_size_t(count), keys.arguments(), values.arguments(), sources.arguments(),
-                targets.arguments(), edges.arguments(),
+                self.address,
+                outcome,
+                c_size_t(count),
+                keys.arguments(),
+                values.arguments(),
+                sources.arguments(),
+                targets.arguments(),
+                edges.arguments(),
             ),
             self.library.symbols().ingest_append,
         )
@@ -1481,10 +1671,14 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         var outcome = stack_allocation[1, Outcome]().unsafe_origin_cast[MutUntrackedOrigin]()
         outcome[] = Outcome()
         _cross(
-            DatabaseInitRamArguments(created, executor.address, outcome, Completion.BLOCKING, isolation, cpu_class_ceiling),
+            DatabaseInitRamArguments(
+                created, executor.address, outcome, Completion.BLOCKING, isolation, cpu_class_ceiling
+            ),
             executor.library.symbols().database_init_ram,
         )
-        return Self(library=executor.library, address=_created(executor.library, outcome, created, "ustore_database_init_ram"))
+        return Self(
+            library=executor.library, address=_created(executor.library, outcome, created, "ustore_database_init_ram")
+        )
 
     @staticmethod
     def open_ram[
@@ -1507,12 +1701,19 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         outcome[] = Outcome()
         _cross(
             DatabaseOpenRamArguments(
-                created, executor.address, outcome, Completion.BLOCKING, BytesView.of(directory).arguments(), isolation,
+                created,
+                executor.address,
+                outcome,
+                Completion.BLOCKING,
+                BytesView.of(directory).arguments(),
+                isolation,
                 cpu_class_ceiling,
             ),
             executor.library.symbols().database_open_ram,
         )
-        return Self(library=executor.library, address=_created(executor.library, outcome, created, "ustore_database_open_ram"))
+        return Self(
+            library=executor.library, address=_created(executor.library, outcome, created, "ustore_database_open_ram")
+        )
 
     @staticmethod
     def open_rocksdb[
@@ -1520,7 +1721,9 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
     ](
         executor: Executor,
         directory: StringSlice[directory_origin],
-        data_directories: Span[DataDirectory[paths_origin], directories_origin] = Span[DataDirectory[paths_origin], directories_origin](),
+        data_directories: Span[DataDirectory[paths_origin], directories_origin] = Span[
+            DataDirectory[paths_origin], directories_origin
+        ](),
     ) raises Error -> Self:
         """Serves a directory through the RocksDB engine, creating the database when it holds none.
         Calls `ustore_database_open_rocksdb`.
@@ -1528,7 +1731,13 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         Raises:
             `Error` with `UNSUPPORTED` in a build without the engine.
         """
-        return Self._rocksdb(executor, BytesView.of(directory).arguments(), Int(data_directories.unsafe_ptr()), len(data_directories), False)
+        return Self._rocksdb(
+            executor,
+            BytesView.of(directory).arguments(),
+            Int(data_directories.unsafe_ptr()),
+            len(data_directories),
+            False,
+        )
 
     @staticmethod
     def view_rocksdb[
@@ -1536,33 +1745,57 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
     ](
         executor: Executor,
         directory: StringSlice[directory_origin],
-        data_directories: Span[DataDirectory[paths_origin], directories_origin] = Span[DataDirectory[paths_origin], directories_origin](),
+        data_directories: Span[DataDirectory[paths_origin], directories_origin] = Span[
+            DataDirectory[paths_origin], directories_origin
+        ](),
     ) raises Error -> Self:
         """Serves a directory through the RocksDB engine, read-only. Calls `ustore_database_view_rocksdb`.
 
         Raises:
             `Error` with `UNSUPPORTED` in a build without the engine.
         """
-        return Self._rocksdb(executor, BytesView.of(directory).arguments(), Int(data_directories.unsafe_ptr()), len(data_directories), True)
+        return Self._rocksdb(
+            executor,
+            BytesView.of(directory).arguments(),
+            Int(data_directories.unsafe_ptr()),
+            len(data_directories),
+            True,
+        )
 
     @staticmethod
-    def _rocksdb(executor: Executor, directory: BytesViewArguments, directories: Address, count: Int, read_only: Bool) raises Error -> Self:
+    def _rocksdb(
+        executor: Executor, directory: BytesViewArguments, directories: Address, count: Int, read_only: Bool
+    ) raises Error -> Self:
         """The open and the read-only view share one layout, differing only in the verb."""
         var created = stack_allocation[1, Address]().unsafe_origin_cast[MutUntrackedOrigin]()
         created[] = NULL_ADDRESS
         var outcome = stack_allocation[1, Outcome]().unsafe_origin_cast[MutUntrackedOrigin]()
         outcome[] = Outcome()
         var arguments = DatabaseOpenRocksdbArguments(
-            created, executor.address, outcome, Completion.BLOCKING, directory, directories if count else NULL_ADDRESS, c_size_t(count)
+            created,
+            executor.address,
+            outcome,
+            Completion.BLOCKING,
+            directory,
+            directories if count else NULL_ADDRESS,
+            c_size_t(count),
         )
         if read_only:
             _cross(arguments, executor.library.symbols().database_view_rocksdb)
-            return Self(library=executor.library, address=_created(executor.library, outcome, created, "ustore_database_view_rocksdb"))
+            return Self(
+                library=executor.library,
+                address=_created(executor.library, outcome, created, "ustore_database_view_rocksdb"),
+            )
         _cross(arguments, executor.library.symbols().database_open_rocksdb)
-        return Self(library=executor.library, address=_created(executor.library, outcome, created, "ustore_database_open_rocksdb"))
+        return Self(
+            library=executor.library,
+            address=_created(executor.library, outcome, created, "ustore_database_open_rocksdb"),
+        )
 
     @staticmethod
-    def open_leveldb[directory_origin: ImmOrigin, //](executor: Executor, directory: StringSlice[directory_origin]) raises Error -> Self:
+    def open_leveldb[
+        directory_origin: ImmOrigin, //
+    ](executor: Executor, directory: StringSlice[directory_origin]) raises Error -> Self:
         """Serves a directory through the LevelDB engine, creating the database when it holds none.
         Calls `ustore_database_open_leveldb`.
 
@@ -1574,10 +1807,15 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         var outcome = stack_allocation[1, Outcome]().unsafe_origin_cast[MutUntrackedOrigin]()
         outcome[] = Outcome()
         _cross(
-            DatabaseOpenLeveldbArguments(created, executor.address, outcome, Completion.BLOCKING, BytesView.of(directory).arguments()),
+            DatabaseOpenLeveldbArguments(
+                created, executor.address, outcome, Completion.BLOCKING, BytesView.of(directory).arguments()
+            ),
             executor.library.symbols().database_open_leveldb,
         )
-        return Self(library=executor.library, address=_created(executor.library, outcome, created, "ustore_database_open_leveldb"))
+        return Self(
+            library=executor.library,
+            address=_created(executor.library, outcome, created, "ustore_database_open_leveldb"),
+        )
 
     @staticmethod
     def open_nvme[
@@ -1586,7 +1824,9 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         executor: Executor,
         directory: StringSlice[directory_origin],
         options: DatabaseNvmeOptions = DatabaseNvmeOptions(),
-        data_directories: Span[DataDirectory[paths_origin], directories_origin] = Span[DataDirectory[paths_origin], directories_origin](),
+        data_directories: Span[DataDirectory[paths_origin], directories_origin] = Span[
+            DataDirectory[paths_origin], directories_origin
+        ](),
         compactions: Address = NULL_ADDRESS,
     ) raises Error -> Self:
         """Serves the database a manifest names through the NVMe engine, creating it when the manifest is
@@ -1609,17 +1849,31 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         var count = len(data_directories)
         _cross(
             DatabaseOpenNvmeArguments(
-                created, executor.address, outcome, Completion.BLOCKING, BytesView.of(directory).arguments(),
-                Int(data_directories.unsafe_ptr()) if count else NULL_ADDRESS, c_size_t(count), compactions,
-                options.memory_limit, options.transaction_max_bytes, options.transaction_max_deltas,
-                options.collection_concurrency_limit, options.collection_cache_limit,
-                options.collection_memory_runs_max_bytes, options.collection_memory_runs_max_deltas,
-                options.collection_level_enlarge_factor, options.collection_value_size,
-                options.collection_value_max_size, options.cpu_class_ceiling,
+                created,
+                executor.address,
+                outcome,
+                Completion.BLOCKING,
+                BytesView.of(directory).arguments(),
+                Int(data_directories.unsafe_ptr()) if count else NULL_ADDRESS,
+                c_size_t(count),
+                compactions,
+                options.memory_limit,
+                options.transaction_max_bytes,
+                options.transaction_max_deltas,
+                options.collection_concurrency_limit,
+                options.collection_cache_limit,
+                options.collection_memory_runs_max_bytes,
+                options.collection_memory_runs_max_deltas,
+                options.collection_level_enlarge_factor,
+                options.collection_value_size,
+                options.collection_value_max_size,
+                options.cpu_class_ceiling,
             ),
             executor.library.symbols().database_open_nvme,
         )
-        return Self(library=executor.library, address=_created(executor.library, outcome, created, "ustore_database_open_nvme"))
+        return Self(
+            library=executor.library, address=_created(executor.library, outcome, created, "ustore_database_open_nvme")
+        )
 
     def __deinit__(deinit self):
         """Closes the database once nothing holds it open. Calls `ustore_database_free`.
@@ -1663,7 +1917,12 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
             self.library.symbols().snapshot_init,
         )
         var address = _created(self.library, outcome, created, "ustore_snapshot_init")
-        return Snapshot(library=self.library, database=self.address, address=address, read_stamp=stamp.unsafe_origin_cast[MutAnyOrigin]()[])
+        return Snapshot(
+            library=self.library,
+            database=self.address,
+            address=address,
+            read_stamp=stamp.unsafe_origin_cast[MutAnyOrigin]()[],
+        )
 
     def transaction(self) raises Error -> Transaction:
         """Begins a transaction. Calls `ustore_transaction_init`.
@@ -1679,7 +1938,11 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
             TransactionInitArguments(created, self.address, NULL_ADDRESS, outcome, Completion.BLOCKING),
             self.library.symbols().transaction_init,
         )
-        return Transaction(library=self.library, database=self.address, address=_created(self.library, outcome, created, "ustore_transaction_init"))
+        return Transaction(
+            library=self.library,
+            database=self.address,
+            address=_created(self.library, outcome, created, "ustore_transaction_init"),
+        )
 
     def ingest(self, collection: CollectionID, order: IngestOrder = IngestOrder.SORTED) raises Error -> Ingest:
         """Opens an ingest into one collection. Calls `ustore_ingest_init`.
@@ -1691,7 +1954,9 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         created[] = NULL_ADDRESS
         var outcome = stack_allocation[1, Outcome]().unsafe_origin_cast[MutUntrackedOrigin]()
         outcome[] = Outcome()
-        _cross(IngestInitArguments(created, self.address, outcome, collection, order), self.library.symbols().ingest_init)
+        _cross(
+            IngestInitArguments(created, self.address, outcome, collection, order), self.library.symbols().ingest_init
+        )
         return Ingest(library=self.library, address=_created(self.library, outcome, created, "ustore_ingest_init"))
 
 
@@ -1739,7 +2004,9 @@ struct Transaction(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pa
         """The same verbs, blocking on `executor`. Binding-only."""
         return On[ImmOrigin(origin_of(self, executor))](self._watching(watch, executor.address))
 
-    def deferred(ref self, ref executor: Executor, watch: Watch = Watch.KEYS) -> DeferredOn[ImmOrigin(origin_of(self, executor))]:
+    def deferred(
+        ref self, ref executor: Executor, watch: Watch = Watch.KEYS
+    ) -> DeferredOn[ImmOrigin(origin_of(self, executor))]:
         """The same verbs, each submitted to `executor` and answering a `Deferred` at once. Binding-only."""
         return DeferredOn[ImmOrigin(origin_of(self, executor))](self._watching(watch, executor.address))
 
@@ -1792,7 +2059,9 @@ struct Snapshot(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
 
 
 @fieldwise_init
-struct On[origin: ImmOrigin](BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, ImplicitlyCopyable, PagesVerbs, StringsVerbs):
+struct On[origin: ImmOrigin](
+    BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, ImplicitlyCopyable, PagesVerbs, StringsVerbs
+):
     """A database, transaction or snapshot bound to the executor its verbs block on. Binding-only.
 
     Parameters:
@@ -1809,7 +2078,13 @@ struct On[origin: ImmOrigin](BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, I
 
 @fieldwise_init
 struct DeferredOn[origin: ImmOrigin](
-    BlobsDeferredVerbs, DatabaseDeferredVerbs, DocsDeferredVerbs, GraphDeferredVerbs, ImplicitlyCopyable, PagesDeferredVerbs, StringsDeferredVerbs
+    BlobsDeferredVerbs,
+    DatabaseDeferredVerbs,
+    DocsDeferredVerbs,
+    GraphDeferredVerbs,
+    ImplicitlyCopyable,
+    PagesDeferredVerbs,
+    StringsDeferredVerbs,
 ):
     """A database, transaction or snapshot bound to the executor its verbs are submitted to: every verb
     answers a `Deferred` at once, borrowing its arena and inputs until final. Binding-only.
@@ -1907,7 +2182,9 @@ trait DatabaseVerbs:
         _ = _block(
             self._scope(),
             _Crossing[DatabaseCompactPlanFinishArguments, Unwritten, MutUntrackedOrigin, ImmUntrackedOrigin](
-                DatabaseCompactPlanFinishArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, plan.address), None, 0
+                DatabaseCompactPlanFinishArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, plan.address),
+                None,
+                0,
             ),
         )
 
@@ -1920,7 +2197,9 @@ trait DatabaseVerbs:
             ),
         )
 
-    def save[path_origin: ImmOrigin, //](self, path: StringSlice[path_origin], progress: Progress = Progress()) raises Error:
+    def save[
+        path_origin: ImmOrigin, //
+    ](self, path: StringSlice[path_origin], progress: Progress = Progress()) raises Error:
         """Writes the receiver's snapshot out as a new database of the same engine. Calls `ustore_snapshot_save`.
 
         Raises:
@@ -1929,7 +2208,9 @@ trait DatabaseVerbs:
         _ = _block(
             self._scope(),
             _Crossing[SnapshotSaveArguments, Unwritten, MutUntrackedOrigin, path_origin](
-                SnapshotSaveArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, BytesView.of(path).arguments(), progress),
+                SnapshotSaveArguments(
+                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, BytesView.of(path).arguments(), progress
+                ),
                 None,
                 0,
             ),
@@ -1940,13 +2221,26 @@ trait DatabaseVerbs:
         return _block(
             self._scope(),
             _Crossing[CollectionListArguments, CollectionList[origin_of(arena)], origin_of(arena), ImmUntrackedOrigin](
-                CollectionListArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS, None, None, None, None, NULL_ADDRESS),
-                Pointer(to=arena),
+                CollectionListArguments(
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.BLOCKING,
+                    NULL_ADDRESS,
+                    None,
+                    None,
+                    None,
+                    None,
+                    NULL_ADDRESS,
+                ),
+                arena._pointer(),
                 0,
             ),
         )
 
-    def collection_create[name_origin: ImmOrigin, //](self, name: StringSlice[name_origin], modality: Modality) raises Error -> CollectionID:
+    def collection_create[
+        name_origin: ImmOrigin, //
+    ](self, name: StringSlice[name_origin], modality: Modality) raises Error -> CollectionID:
         """Creates an empty collection, unnamed for an empty `name`. Calls `ustore_collection_create`.
 
         Raises:
@@ -1956,20 +2250,33 @@ trait DatabaseVerbs:
         return _block(
             self._scope(),
             _Crossing[CollectionCreateArguments, CollectionID, MutUntrackedOrigin, name_origin](
-                CollectionCreateArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, view, modality, None), None, 0
+                CollectionCreateArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, view, modality, None),
+                None,
+                0,
             ),
         )
 
-    def collection_find[names_origin: ImmOrigin, //](self, names: StringsView[names_origin], mut arena: Arena) raises Error -> CollectionsFound[origin_of(arena)]:
+    def collection_find[
+        names_origin: ImmOrigin, //
+    ](self, names: StringsView[names_origin], mut arena: Arena) raises Error -> CollectionsFound[origin_of(arena)]:
         """Reads the collections a batch of names address. Calls `ustore_collection_find`."""
         return _block(
             self._scope(),
             _Crossing[CollectionFindArguments, CollectionsFound[origin_of(arena)], origin_of(arena), names_origin](
                 CollectionFindArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS, c_size_t(len(names)), names.arguments(),
-                    None, None, None, NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.BLOCKING,
+                    NULL_ADDRESS,
+                    c_size_t(len(names)),
+                    names.arguments(),
+                    None,
+                    None,
+                    None,
+                    NULL_ADDRESS,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 len(names),
             ),
         )
@@ -1983,7 +2290,9 @@ trait DatabaseVerbs:
         _ = _block(
             self._scope(),
             _Crossing[CollectionDropArguments, Unwritten, MutUntrackedOrigin, ImmUntrackedOrigin](
-                CollectionDropArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, collection, mode), None, 0
+                CollectionDropArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, collection, mode),
+                None,
+                0,
             ),
         )
 
@@ -2007,7 +2316,9 @@ trait DatabaseVerbs:
         return _block(
             self._scope(),
             _Crossing[TransactionStageArguments, Stamp, MutUntrackedOrigin, ImmUntrackedOrigin](
-                TransactionStageArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS, None), None, 0
+                TransactionStageArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS, None),
+                None,
+                0,
             ),
         )
 
@@ -2020,7 +2331,11 @@ trait DatabaseVerbs:
         return _block(
             self._scope(),
             _Crossing[TransactionCommitArguments, Stamp, MutUntrackedOrigin, ImmUntrackedOrigin](
-                TransactionCommitArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS, None, durability), None, 0
+                TransactionCommitArguments(
+                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS, None, durability
+                ),
+                None,
+                0,
             ),
         )
 
@@ -2029,7 +2344,9 @@ trait DatabaseVerbs:
         _ = _block(
             self._scope(),
             _Crossing[TransactionRollbackArguments, Unwritten, MutUntrackedOrigin, ImmUntrackedOrigin](
-                TransactionRollbackArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS), None, 0
+                TransactionRollbackArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS),
+                None,
+                0,
             ),
         )
 
@@ -2046,10 +2363,14 @@ trait DatabaseVerbs:
         var outcome = stack_allocation[1, Outcome]().unsafe_origin_cast[MutUntrackedOrigin]()
         outcome[] = Outcome()
         _cross(
-            ChangesCursorInitArguments(scope.database, scope.executor, outcome, Completion.BLOCKING, collection, since.value, created),
+            ChangesCursorInitArguments(
+                scope.database, scope.executor, outcome, Completion.BLOCKING, collection, since.value, created
+            ),
             scope.library.symbols().changes_cursor_init,
         )
-        return ChangesCursor(library=scope.library, address=_created(scope.library, outcome, created, "ustore_changes_cursor_init"))
+        return ChangesCursor(
+            library=scope.library, address=_created(scope.library, outcome, created, "ustore_changes_cursor_init")
+        )
 
 
 trait DatabaseDeferredVerbs:
@@ -2059,7 +2380,12 @@ trait DatabaseDeferredVerbs:
         """What the receiver addresses and the executor it submits to."""
         ...
 
-    def describe(self) -> Deferred[_Crossing[DatabaseDescribeArguments, DatabaseDescription, MutUntrackedOrigin, ImmUntrackedOrigin]]:
+    def describe(
+        ref self,
+    ) -> Deferred[
+        _Crossing[DatabaseDescribeArguments, DatabaseDescription, MutUntrackedOrigin, ImmUntrackedOrigin],
+        ImmOrigin(origin_of(self)),
+    ]:
         """Submits `DatabaseVerbs.describe`. Calls `ustore_database_describe`."""
         return {
             self._scope(),
@@ -2068,7 +2394,11 @@ trait DatabaseDeferredVerbs:
             ),
         }
 
-    def clear(self, mode: DropMode = DropMode.PAIRS) -> Deferred[_Crossing[DatabaseClearArguments, Unwritten, MutUntrackedOrigin, ImmUntrackedOrigin]]:
+    def clear(
+        ref self, mode: DropMode = DropMode.PAIRS
+    ) -> Deferred[
+        _Crossing[DatabaseClearArguments, Unwritten, MutUntrackedOrigin, ImmUntrackedOrigin], ImmOrigin(origin_of(self))
+    ]:
         """Submits `DatabaseVerbs.clear`. Calls `ustore_database_clear`."""
         return {
             self._scope(),
@@ -2080,7 +2410,7 @@ trait DatabaseDeferredVerbs:
     def compact[
         plan_origin: MutOrigin = MutUntrackedOrigin, phase_origin: MutOrigin = MutUntrackedOrigin, //
     ](
-        self,
+        ref self,
         progress: Progress = Progress(),
         plan: Optional[Pointer[DatabaseCompactPlan, plan_origin]] = None,
         phase: Optional[Pointer[PhaseProgress, phase_origin]] = None,
@@ -2090,7 +2420,8 @@ trait DatabaseDeferredVerbs:
             Unwritten,
             MutUntrackedOrigin,
             ImmOrigin(origin_of(_anchor[plan_origin](), _anchor[phase_origin]())),
-        ]
+        ],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `DatabaseVerbs.compact`; the plan and phase slots stay borrowed until final.
         Calls `ustore_database_compact`."""
@@ -2104,18 +2435,27 @@ trait DatabaseDeferredVerbs:
             ](DatabaseCompactArguments.of(Completion.DEFERRED, progress, plan, phase), None, 0),
         }
 
-    def compact_plan_finish(self, var plan: DatabaseCompactPlan) -> Deferred[
-        _Crossing[DatabaseCompactPlanFinishArguments, Unwritten, MutUntrackedOrigin, ImmUntrackedOrigin]
+    def compact_plan_finish(
+        ref self, var plan: DatabaseCompactPlan
+    ) -> Deferred[
+        _Crossing[DatabaseCompactPlanFinishArguments, Unwritten, MutUntrackedOrigin, ImmUntrackedOrigin],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `DatabaseVerbs.compact_plan_finish`. Calls `ustore_database_compact_plan_finish`."""
         return {
             self._scope(),
             _Crossing[DatabaseCompactPlanFinishArguments, Unwritten, MutUntrackedOrigin, ImmUntrackedOrigin](
-                DatabaseCompactPlanFinishArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, plan.address), None, 0
+                DatabaseCompactPlanFinishArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, plan.address),
+                None,
+                0,
             ),
         }
 
-    def flush(self) -> Deferred[_Crossing[DatabaseFlushArguments, Unwritten, MutUntrackedOrigin, ImmUntrackedOrigin]]:
+    def flush(
+        ref self,
+    ) -> Deferred[
+        _Crossing[DatabaseFlushArguments, Unwritten, MutUntrackedOrigin, ImmUntrackedOrigin], ImmOrigin(origin_of(self))
+    ]:
         """Submits `DatabaseVerbs.flush`. Calls `ustore_database_flush`."""
         return {
             self._scope(),
@@ -2124,72 +2464,117 @@ trait DatabaseDeferredVerbs:
             ),
         }
 
-    def save[path_origin: ImmOrigin, //](self, path: StringSlice[path_origin], progress: Progress = Progress()) -> Deferred[
-        _Crossing[SnapshotSaveArguments, Unwritten, MutUntrackedOrigin, path_origin]
+    def save[
+        path_origin: ImmOrigin, //
+    ](ref self, path: StringSlice[path_origin], progress: Progress = Progress()) -> Deferred[
+        _Crossing[SnapshotSaveArguments, Unwritten, MutUntrackedOrigin, path_origin],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `DatabaseVerbs.save`. Calls `ustore_snapshot_save`."""
         return {
             self._scope(),
             _Crossing[SnapshotSaveArguments, Unwritten, MutUntrackedOrigin, path_origin](
-                SnapshotSaveArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, BytesView.of(path).arguments(), progress),
+                SnapshotSaveArguments(
+                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, BytesView.of(path).arguments(), progress
+                ),
                 None,
                 0,
             ),
         }
 
-    def collection_list(self, mut arena: Arena) -> Deferred[
-        _Crossing[CollectionListArguments, CollectionList[origin_of(arena)], origin_of(arena), ImmUntrackedOrigin]
+    def collection_list(
+        ref self, mut arena: Arena
+    ) -> Deferred[
+        _Crossing[CollectionListArguments, CollectionList[origin_of(arena)], origin_of(arena), ImmUntrackedOrigin],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `DatabaseVerbs.collection_list`. Calls `ustore_collection_list`."""
         return {
             self._scope(),
             _Crossing[CollectionListArguments, CollectionList[origin_of(arena)], origin_of(arena), ImmUntrackedOrigin](
-                CollectionListArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS, None, None, None, None, NULL_ADDRESS),
-                Pointer(to=arena),
+                CollectionListArguments(
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.DEFERRED,
+                    NULL_ADDRESS,
+                    None,
+                    None,
+                    None,
+                    None,
+                    NULL_ADDRESS,
+                ),
+                arena._pointer(),
                 0,
             ),
         }
 
-    def collection_create[name_origin: ImmOrigin, //](self, name: StringSlice[name_origin], modality: Modality) -> Deferred[
-        _Crossing[CollectionCreateArguments, CollectionID, MutUntrackedOrigin, name_origin]
+    def collection_create[
+        name_origin: ImmOrigin, //
+    ](ref self, name: StringSlice[name_origin], modality: Modality) -> Deferred[
+        _Crossing[CollectionCreateArguments, CollectionID, MutUntrackedOrigin, name_origin],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `DatabaseVerbs.collection_create`. Calls `ustore_collection_create`."""
         var view = BytesView.of(name).arguments() if name.byte_length() else BytesViewArguments.empty()
         return {
             self._scope(),
             _Crossing[CollectionCreateArguments, CollectionID, MutUntrackedOrigin, name_origin](
-                CollectionCreateArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, view, modality, None), None, 0
+                CollectionCreateArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, view, modality, None),
+                None,
+                0,
             ),
         }
 
-    def collection_find[names_origin: ImmOrigin, //](self, names: StringsView[names_origin], mut arena: Arena) -> Deferred[
-        _Crossing[CollectionFindArguments, CollectionsFound[origin_of(arena)], origin_of(arena), names_origin]
+    def collection_find[
+        names_origin: ImmOrigin, //
+    ](ref self, names: StringsView[names_origin], mut arena: Arena) -> Deferred[
+        _Crossing[CollectionFindArguments, CollectionsFound[origin_of(arena)], origin_of(arena), names_origin],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `DatabaseVerbs.collection_find`. Calls `ustore_collection_find`."""
         return {
             self._scope(),
             _Crossing[CollectionFindArguments, CollectionsFound[origin_of(arena)], origin_of(arena), names_origin](
                 CollectionFindArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS, c_size_t(len(names)), names.arguments(),
-                    None, None, None, NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.DEFERRED,
+                    NULL_ADDRESS,
+                    c_size_t(len(names)),
+                    names.arguments(),
+                    None,
+                    None,
+                    None,
+                    NULL_ADDRESS,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 len(names),
             ),
         }
 
-    def collection_drop(self, collection: CollectionID, mode: DropMode = DropMode.COLLECTION) -> Deferred[
-        _Crossing[CollectionDropArguments, Unwritten, MutUntrackedOrigin, ImmUntrackedOrigin]
+    def collection_drop(
+        ref self, collection: CollectionID, mode: DropMode = DropMode.COLLECTION
+    ) -> Deferred[
+        _Crossing[CollectionDropArguments, Unwritten, MutUntrackedOrigin, ImmUntrackedOrigin],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `DatabaseVerbs.collection_drop`. Calls `ustore_collection_drop`."""
         return {
             self._scope(),
             _Crossing[CollectionDropArguments, Unwritten, MutUntrackedOrigin, ImmUntrackedOrigin](
-                CollectionDropArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, collection, mode), None, 0
+                CollectionDropArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, collection, mode),
+                None,
+                0,
             ),
         }
 
-    def reset(self) -> Deferred[_Crossing[TransactionInitArguments, Reset, MutUntrackedOrigin, ImmUntrackedOrigin]]:
+    def reset(
+        ref self,
+    ) -> Deferred[
+        _Crossing[TransactionInitArguments, Reset, MutUntrackedOrigin, ImmUntrackedOrigin], ImmOrigin(origin_of(self))
+    ]:
         """Submits `DatabaseVerbs.reset`. Calls `ustore_transaction_init`."""
         return {
             self._scope(),
@@ -2198,32 +2583,52 @@ trait DatabaseDeferredVerbs:
             ),
         }
 
-    def stage(self) -> Deferred[_Crossing[TransactionStageArguments, Stamp, MutUntrackedOrigin, ImmUntrackedOrigin]]:
+    def stage(
+        ref self,
+    ) -> Deferred[
+        _Crossing[TransactionStageArguments, Stamp, MutUntrackedOrigin, ImmUntrackedOrigin], ImmOrigin(origin_of(self))
+    ]:
         """Submits `DatabaseVerbs.stage`. Calls `ustore_transaction_stage`."""
         return {
             self._scope(),
             _Crossing[TransactionStageArguments, Stamp, MutUntrackedOrigin, ImmUntrackedOrigin](
-                TransactionStageArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS, None), None, 0
+                TransactionStageArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS, None),
+                None,
+                0,
             ),
         }
 
-    def commit(self, durability: Durability = Durability.BUFFERED) -> Deferred[
-        _Crossing[TransactionCommitArguments, Stamp, MutUntrackedOrigin, ImmUntrackedOrigin]
+    def commit(
+        ref self, durability: Durability = Durability.BUFFERED
+    ) -> Deferred[
+        _Crossing[TransactionCommitArguments, Stamp, MutUntrackedOrigin, ImmUntrackedOrigin],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `DatabaseVerbs.commit`. Calls `ustore_transaction_commit`."""
         return {
             self._scope(),
             _Crossing[TransactionCommitArguments, Stamp, MutUntrackedOrigin, ImmUntrackedOrigin](
-                TransactionCommitArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS, None, durability), None, 0
+                TransactionCommitArguments(
+                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS, None, durability
+                ),
+                None,
+                0,
             ),
         }
 
-    def rollback(self) -> Deferred[_Crossing[TransactionRollbackArguments, Unwritten, MutUntrackedOrigin, ImmUntrackedOrigin]]:
+    def rollback(
+        ref self,
+    ) -> Deferred[
+        _Crossing[TransactionRollbackArguments, Unwritten, MutUntrackedOrigin, ImmUntrackedOrigin],
+        ImmOrigin(origin_of(self)),
+    ]:
         """Submits `DatabaseVerbs.rollback`. Calls `ustore_transaction_rollback`."""
         return {
             self._scope(),
             _Crossing[TransactionRollbackArguments, Unwritten, MutUntrackedOrigin, ImmUntrackedOrigin](
-                TransactionRollbackArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS), None, 0
+                TransactionRollbackArguments(NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS),
+                None,
+                0,
             ),
         }
 

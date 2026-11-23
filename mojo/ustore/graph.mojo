@@ -31,7 +31,7 @@ from ustore.db import (
 from ustore.library import Library
 from ustore.types import (
     Address,
-    Answer,
+    Deferrable,
     Arena,
     Arguments,
     Completion,
@@ -99,7 +99,7 @@ struct EdgesWritten(Defaultable, ImplicitlyCopyable):
 
 
 @fieldwise_init
-struct Edges[origin: MutOrigin](Answer, Sized):
+struct Edges[origin: MutOrigin](Deferrable, Sized):
     """The edges of a batch of vertices, three keys per edge, read in place from the arena a read borrows.
 
     Parameters:
@@ -107,7 +107,7 @@ struct Edges[origin: MutOrigin](Answer, Sized):
     """
 
     comptime Written = EdgesWritten
-    var arena: Pointer[Arena, Self.origin]
+    var arena: Pointer[Arena[ImmUntrackedOrigin], Self.origin]
     """The arena holding the edges."""
     var generation: Int
     """The arena's call the edges came from."""
@@ -117,7 +117,7 @@ struct Edges[origin: MutOrigin](Answer, Sized):
     """Vertices the read carried."""
 
     def __init__(out self, arena: Address, generation: Int, written: EdgesWritten, count: Int):
-        self.arena = Pointer[Arena, Self.origin](unsafe_from_address=arena)
+        self.arena = Pointer[Arena[ImmUntrackedOrigin], Self.origin](unsafe_from_address=arena)
         self.generation = generation
         self.written = written
         self.count = count
@@ -466,7 +466,7 @@ struct GraphVerticesCursor(Movable):
                 GraphVerticesCursorNextArguments(
                     NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, self.address, None, None, NULL_ADDRESS, c_size_t(wanted), progress
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 0,
             ),
         )
@@ -503,7 +503,7 @@ trait GraphVerbs:
                     NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS, c_size_t(count), collections.arguments(),
                     vertices.arguments(), roles.arguments(), None, None, None, NULL_ADDRESS, edges,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         )
@@ -617,7 +617,7 @@ trait GraphVerbs:
                     start_keys.arguments(), config.end_keys.arguments(), config.direction, config.predicate, None, None,
                     NULL_ADDRESS, c_size_t(wanted), config.mode, config.progress,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         )
@@ -658,7 +658,7 @@ trait GraphVerbs:
                     NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS, c_size_t(count), collections.arguments(),
                     None, None, NULL_ADDRESS, c_size_t(wanted),
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         )
@@ -679,7 +679,7 @@ trait GraphVerbs:
             self._scope(),
             _Crossing[MeasureArguments["ustore_graph_measure_vertices"], Measures[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]()))](
                 _measure["ustore_graph_measure_vertices"](count, collections.arguments(), start_keys.arguments(), end_keys.arguments(), direction),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         )
@@ -696,14 +696,15 @@ trait GraphDeferredVerbs:
     def graph_read_edges[
         collections_origin: ImmOrigin, vertices_origin: ImmOrigin, roles_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         vertices: KeysView[vertices_origin],
         mut arena: Arena,
         roles: VertexRolesView[roles_origin] = VertexRolesView(),
         edges: Bool = True,
     ) -> Deferred[
-        _Crossing[GraphReadEdgesArguments, Edges[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[vertices_origin](), _anchor[roles_origin]()))]
+        _Crossing[GraphReadEdgesArguments, Edges[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[vertices_origin](), _anchor[roles_origin]()))],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `GraphVerbs.graph_read_edges`. Calls `ustore_graph_read_edges`."""
         var count = _tasks(collections.tasks(), vertices.tasks(), roles.tasks())
@@ -714,7 +715,7 @@ trait GraphDeferredVerbs:
                     NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS, c_size_t(count), collections.arguments(),
                     vertices.arguments(), roles.arguments(), None, None, None, NULL_ADDRESS, edges,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         }
@@ -722,14 +723,15 @@ trait GraphDeferredVerbs:
     def graph_write_edges[
         collections_origin: ImmOrigin, sources_origin: ImmOrigin, targets_origin: ImmOrigin, edges_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         sources: KeysView[sources_origin],
         targets: KeysView[targets_origin],
         edges: KeysView[edges_origin] = KeysView(),
         durability: Durability = Durability.BUFFERED,
     ) -> Deferred[
-        _Crossing[GraphEdgesArguments["ustore_graph_write_edges"], Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[sources_origin](), _anchor[targets_origin](), _anchor[edges_origin]()))]
+        _Crossing[GraphEdgesArguments["ustore_graph_write_edges"], Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[sources_origin](), _anchor[targets_origin](), _anchor[edges_origin]()))],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `GraphVerbs.graph_write_edges`. Calls `ustore_graph_write_edges`."""
         return {
@@ -748,14 +750,15 @@ trait GraphDeferredVerbs:
     def graph_remove_edges[
         collections_origin: ImmOrigin, sources_origin: ImmOrigin, targets_origin: ImmOrigin, edges_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         sources: KeysView[sources_origin],
         targets: KeysView[targets_origin],
         edges: KeysView[edges_origin] = KeysView(),
         durability: Durability = Durability.BUFFERED,
     ) -> Deferred[
-        _Crossing[GraphEdgesArguments["ustore_graph_remove_edges"], Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[sources_origin](), _anchor[targets_origin](), _anchor[edges_origin]()))]
+        _Crossing[GraphEdgesArguments["ustore_graph_remove_edges"], Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[sources_origin](), _anchor[targets_origin](), _anchor[edges_origin]()))],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `GraphVerbs.graph_remove_edges`. Calls `ustore_graph_remove_edges`."""
         return {
@@ -773,8 +776,9 @@ trait GraphDeferredVerbs:
 
     def graph_write_vertices[
         collections_origin: ImmOrigin, vertices_origin: ImmOrigin, //
-    ](self, collections: CollectionsView[collections_origin], vertices: KeysView[vertices_origin], durability: Durability = Durability.BUFFERED) -> Deferred[
-        _Crossing[GraphWriteVerticesArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[vertices_origin]()))]
+    ](ref self, collections: CollectionsView[collections_origin], vertices: KeysView[vertices_origin], durability: Durability = Durability.BUFFERED) -> Deferred[
+        _Crossing[GraphWriteVerticesArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[vertices_origin]()))],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `GraphVerbs.graph_write_vertices`. Calls `ustore_graph_write_vertices`."""
         return {
@@ -792,14 +796,15 @@ trait GraphDeferredVerbs:
     def graph_remove_vertices[
         collections_origin: ImmOrigin, vertices_origin: ImmOrigin, end_origin: ImmOrigin, roles_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         vertices: KeysView[vertices_origin],
         end_vertices: KeysView[end_origin] = KeysView(),
         roles: VertexRolesView[roles_origin] = VertexRolesView(),
         durability: Durability = Durability.BUFFERED,
     ) -> Deferred[
-        _Crossing[GraphRemoveVerticesArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[vertices_origin](), _anchor[end_origin](), _anchor[roles_origin]()))]
+        _Crossing[GraphRemoveVerticesArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[vertices_origin](), _anchor[end_origin](), _anchor[roles_origin]()))],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `GraphVerbs.graph_remove_vertices`. Calls `ustore_graph_remove_vertices`."""
         return {
@@ -818,14 +823,15 @@ trait GraphDeferredVerbs:
     def graph_scan_vertices[
         collections_origin: ImmOrigin, start_origin: ImmOrigin, end_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         start_keys: KeysView[start_origin],
         wanted: Int,
         mut arena: Arena,
         config: GraphScanConfig[end_origin] = GraphScanConfig(),
     ) -> Deferred[
-        _Crossing[GraphScanVerticesArguments, KeyRuns[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]()))]
+        _Crossing[GraphScanVerticesArguments, KeyRuns[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]()))],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `GraphVerbs.graph_scan_vertices`. Calls `ustore_graph_scan_vertices`."""
         var count = _tasks(collections.tasks(), start_keys.tasks(), config.end_keys.tasks())
@@ -837,15 +843,16 @@ trait GraphDeferredVerbs:
                     start_keys.arguments(), config.end_keys.arguments(), config.direction, config.predicate, None, None,
                     NULL_ADDRESS, c_size_t(wanted), config.mode, config.progress,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         }
 
     def graph_sample_vertices[
         collections_origin: ImmOrigin, //
-    ](self, collections: CollectionsView[collections_origin], wanted: Int, mut arena: Arena) -> Deferred[
-        _Crossing[SampleArguments["ustore_graph_sample_vertices"], KeyRuns[origin_of(arena)], origin_of(arena), collections_origin]
+    ](ref self, collections: CollectionsView[collections_origin], wanted: Int, mut arena: Arena) -> Deferred[
+        _Crossing[SampleArguments["ustore_graph_sample_vertices"], KeyRuns[origin_of(arena)], origin_of(arena), collections_origin],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `GraphVerbs.graph_sample_vertices`. Calls `ustore_graph_sample_vertices`."""
         var count = len(collections)
@@ -856,7 +863,7 @@ trait GraphDeferredVerbs:
                     NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS, c_size_t(count), collections.arguments(),
                     None, None, NULL_ADDRESS, c_size_t(wanted),
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         }
@@ -864,14 +871,15 @@ trait GraphDeferredVerbs:
     def graph_measure_vertices[
         collections_origin: ImmOrigin, start_origin: ImmOrigin, end_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         start_keys: KeysView[start_origin],
         end_keys: KeysView[end_origin],
         mut arena: Arena,
         direction: ScanDirection = ScanDirection.ASCENDING,
     ) -> Deferred[
-        _Crossing[MeasureArguments["ustore_graph_measure_vertices"], Measures[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]()))]
+        _Crossing[MeasureArguments["ustore_graph_measure_vertices"], Measures[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]()))],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `GraphVerbs.graph_measure_vertices`. Calls `ustore_graph_measure_vertices`."""
         var count = _tasks(collections.tasks(), start_keys.tasks(), end_keys.tasks())
@@ -879,7 +887,7 @@ trait GraphDeferredVerbs:
             self._scope(),
             _Crossing[MeasureArguments["ustore_graph_measure_vertices"], Measures[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]()))](
                 _measure["ustore_graph_measure_vertices"](count, collections.arguments(), start_keys.arguments(), end_keys.arguments(), direction),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         }

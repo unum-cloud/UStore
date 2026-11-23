@@ -42,7 +42,7 @@ from ustore.db import (
 from ustore.library import Library
 from ustore.types import (
     Address,
-    Answer,
+    Deferrable,
     Arena,
     Arguments,
     BytesView,
@@ -151,7 +151,7 @@ struct GistWritten(Defaultable, ImplicitlyCopyable):
 
 
 @fieldwise_init
-struct Gist[origin: MutOrigin](Answer, Sized):
+struct Gist[origin: MutOrigin](Deferrable, Sized):
     """The unique paths to the leaves of the requested documents, read in place from the arena a gist borrows.
 
     Parameters:
@@ -159,7 +159,7 @@ struct Gist[origin: MutOrigin](Answer, Sized):
     """
 
     comptime Written = GistWritten
-    var arena: Pointer[Arena, Self.origin]
+    var arena: Pointer[Arena[ImmUntrackedOrigin], Self.origin]
     """The arena holding the paths."""
     var generation: Int
     """The arena's call the paths came from."""
@@ -167,7 +167,7 @@ struct Gist[origin: MutOrigin](Answer, Sized):
     """The views the engine wrote."""
 
     def __init__(out self, arena: Address, generation: Int, written: GistWritten, count: Int):
-        self.arena = Pointer[Arena, Self.origin](unsafe_from_address=arena)
+        self.arena = Pointer[Arena[ImmUntrackedOrigin], Self.origin](unsafe_from_address=arena)
         self.generation = generation
         self.written = written
 
@@ -211,7 +211,7 @@ struct Column[origin: MutOrigin](ImplicitlyCopyable, Sized):
         origin: The arena the column lives in, which this result borrows.
     """
 
-    var arena: Pointer[Arena, Self.origin]
+    var arena: Pointer[Arena[ImmUntrackedOrigin], Self.origin]
     """The arena holding the column."""
     var generation: Int
     """The arena's call the column came from."""
@@ -250,7 +250,7 @@ struct Column[origin: MutOrigin](ImplicitlyCopyable, Sized):
 
 
 @fieldwise_init
-struct Columns[origin: MutOrigin](Answer, Sized):
+struct Columns[origin: MutOrigin](Deferrable, Sized):
     """Every gathered field of every document, one column per field, read in place from the arena a gather borrows.
 
     Parameters:
@@ -258,7 +258,7 @@ struct Columns[origin: MutOrigin](Answer, Sized):
     """
 
     comptime Written = ColumnsWritten
-    var arena: Pointer[Arena, Self.origin]
+    var arena: Pointer[Arena[ImmUntrackedOrigin], Self.origin]
     """The arena holding the columns."""
     var generation: Int
     """The arena's call the columns came from."""
@@ -268,7 +268,7 @@ struct Columns[origin: MutOrigin](Answer, Sized):
     """Rows, one per document."""
 
     def __init__(out self, arena: Address, generation: Int, written: ColumnsWritten, count: Int):
-        self.arena = Pointer[Arena, Self.origin](unsafe_from_address=arena)
+        self.arena = Pointer[Arena[ImmUntrackedOrigin], Self.origin](unsafe_from_address=arena)
         self.generation = generation
         self.written = written
         self.count = count
@@ -739,7 +739,7 @@ struct DocsCursor(Movable):
                     NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, self.address, None, None, None, NULL_ADDRESS,
                     c_size_t(wanted), progress, values,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 0,
             ),
         )
@@ -804,7 +804,7 @@ trait DocsVerbs:
                     NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS, c_size_t(count), collections.arguments(),
                     keys.arguments(), config.fields.arguments(), None, None, None, NULL_ADDRESS, config.outputs_type, config.values,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         )
@@ -821,7 +821,7 @@ trait DocsVerbs:
                     NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS, c_size_t(count), collections.arguments(),
                     keys.arguments(), None, None, NULL_ADDRESS,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         )
@@ -846,7 +846,7 @@ trait DocsVerbs:
                     NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS, c_size_t(count), collections.arguments(),
                     keys.arguments(), c_size_t(len(fields)), fields.arguments(), None, NULL_ADDRESS, Int(types.unsafe_ptr()),
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         )
@@ -898,7 +898,7 @@ trait DocsVerbs:
                     count, collections.arguments(), start_keys.arguments(), config.end_keys.arguments(), config.direction,
                     config.filter.arguments(), config.predicate, wanted, config.mode, config.progress,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         )
@@ -927,7 +927,7 @@ trait DocsVerbs:
                     NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS, c_size_t(count), collections.arguments(),
                     None, None, NULL_ADDRESS, c_size_t(wanted),
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         )
@@ -948,7 +948,7 @@ trait DocsVerbs:
             self._scope(),
             _Crossing[MeasureArguments["ustore_docs_measure"], Measures[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]()))](
                 _measure["ustore_docs_measure"](count, collections.arguments(), start_keys.arguments(), end_keys.arguments(), direction),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         )
@@ -965,13 +965,14 @@ trait DocsDeferredVerbs:
     def docs_write[
         collections_origin: ImmOrigin, keys_origin: ImmOrigin, values_origin: ImmOrigin, fields_origin: ImmOrigin, id_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         keys: KeysView[keys_origin],
         values: StringsView[values_origin],
         config: DocsWriteConfig[fields_origin, id_origin] = DocsWriteConfig(),
     ) -> Deferred[
-        _Crossing[DocsWriteArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[values_origin](), _anchor[fields_origin](), _anchor[id_origin]()))]
+        _Crossing[DocsWriteArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[values_origin](), _anchor[fields_origin](), _anchor[id_origin]()))],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `DocsVerbs.docs_write`. Calls `ustore_docs_write`."""
         return {
@@ -991,13 +992,14 @@ trait DocsDeferredVerbs:
     def docs_read[
         collections_origin: ImmOrigin, keys_origin: ImmOrigin, fields_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         keys: KeysView[keys_origin],
         mut arena: Arena,
         config: DocsReadConfig[fields_origin] = DocsReadConfig(),
     ) -> Deferred[
-        _Crossing[DocsReadArguments, Values[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[fields_origin]()))]
+        _Crossing[DocsReadArguments, Values[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[fields_origin]()))],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `DocsVerbs.docs_read`. Calls `ustore_docs_read`."""
         var count = _tasks(collections.tasks(), keys.tasks(), config.fields.tasks())
@@ -1008,15 +1010,16 @@ trait DocsDeferredVerbs:
                     NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS, c_size_t(count), collections.arguments(),
                     keys.arguments(), config.fields.arguments(), None, None, None, NULL_ADDRESS, config.outputs_type, config.values,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         }
 
     def docs_gist[
         collections_origin: ImmOrigin, keys_origin: ImmOrigin, //
-    ](self, collections: CollectionsView[collections_origin], keys: KeysView[keys_origin], mut arena: Arena) -> Deferred[
-        _Crossing[DocsGistArguments, Gist[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin]()))]
+    ](ref self, collections: CollectionsView[collections_origin], keys: KeysView[keys_origin], mut arena: Arena) -> Deferred[
+        _Crossing[DocsGistArguments, Gist[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin]()))],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `DocsVerbs.docs_gist`. Calls `ustore_docs_gist`."""
         var count = _tasks(collections.tasks(), keys.tasks())
@@ -1027,7 +1030,7 @@ trait DocsDeferredVerbs:
                     NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS, c_size_t(count), collections.arguments(),
                     keys.arguments(), None, None, NULL_ADDRESS,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         }
@@ -1035,14 +1038,15 @@ trait DocsDeferredVerbs:
     def docs_gather[
         collections_origin: ImmOrigin, keys_origin: ImmOrigin, fields_origin: ImmOrigin, types_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         keys: KeysView[keys_origin],
         fields: StringsView[fields_origin],
         types: Span[FieldType, types_origin],
         mut arena: Arena,
     ) -> Deferred[
-        _Crossing[DocsGatherArguments, Columns[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[fields_origin](), _anchor[types_origin]()))]
+        _Crossing[DocsGatherArguments, Columns[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[fields_origin](), _anchor[types_origin]()))],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `DocsVerbs.docs_gather`. Calls `ustore_docs_gather`."""
         var count = _tasks(collections.tasks(), keys.tasks())
@@ -1053,7 +1057,7 @@ trait DocsDeferredVerbs:
                     NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS, c_size_t(count), collections.arguments(),
                     keys.arguments(), c_size_t(len(fields)), fields.arguments(), None, NULL_ADDRESS, Int(types.unsafe_ptr()),
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         }
@@ -1061,13 +1065,14 @@ trait DocsDeferredVerbs:
     def docs_remove[
         collections_origin: ImmOrigin, keys_origin: ImmOrigin, end_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         keys: KeysView[keys_origin],
         end_keys: KeysView[end_origin] = KeysView(),
         durability: Durability = Durability.BUFFERED,
     ) -> Deferred[
-        _Crossing[DocsRemoveArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[end_origin]()))]
+        _Crossing[DocsRemoveArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[keys_origin](), _anchor[end_origin]()))],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `DocsVerbs.docs_remove`. Calls `ustore_docs_remove`."""
         return {
@@ -1086,14 +1091,15 @@ trait DocsDeferredVerbs:
     def docs_scan[
         collections_origin: ImmOrigin, start_origin: ImmOrigin, end_origin: ImmOrigin, filter_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         start_keys: KeysView[start_origin],
         wanted: Int,
         mut arena: Arena,
         config: DocsScanConfig[end_origin, filter_origin] = DocsScanConfig(),
     ) -> Deferred[
-        _Crossing[FilteredScanArguments["ustore_docs_scan"], KeyRuns[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin](), _anchor[filter_origin]()))]
+        _Crossing[FilteredScanArguments["ustore_docs_scan"], KeyRuns[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin](), _anchor[filter_origin]()))],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `DocsVerbs.docs_scan`. Calls `ustore_docs_scan`."""
         var count = _tasks(collections.tasks(), start_keys.tasks(), config.end_keys.tasks())
@@ -1104,15 +1110,16 @@ trait DocsDeferredVerbs:
                     count, collections.arguments(), start_keys.arguments(), config.end_keys.arguments(), config.direction,
                     config.filter.arguments(), config.predicate, wanted, config.mode, config.progress,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         }
 
     def docs_sample[
         collections_origin: ImmOrigin, //
-    ](self, collections: CollectionsView[collections_origin], wanted: Int, mut arena: Arena) -> Deferred[
-        _Crossing[SampleArguments["ustore_docs_sample"], KeyRuns[origin_of(arena)], origin_of(arena), collections_origin]
+    ](ref self, collections: CollectionsView[collections_origin], wanted: Int, mut arena: Arena) -> Deferred[
+        _Crossing[SampleArguments["ustore_docs_sample"], KeyRuns[origin_of(arena)], origin_of(arena), collections_origin],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `DocsVerbs.docs_sample`. Calls `ustore_docs_sample`."""
         var count = len(collections)
@@ -1123,7 +1130,7 @@ trait DocsDeferredVerbs:
                     NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS, c_size_t(count), collections.arguments(),
                     None, None, NULL_ADDRESS, c_size_t(wanted),
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         }
@@ -1131,14 +1138,15 @@ trait DocsDeferredVerbs:
     def docs_measure[
         collections_origin: ImmOrigin, start_origin: ImmOrigin, end_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         start_keys: KeysView[start_origin],
         end_keys: KeysView[end_origin],
         mut arena: Arena,
         direction: ScanDirection = ScanDirection.ASCENDING,
     ) -> Deferred[
-        _Crossing[MeasureArguments["ustore_docs_measure"], Measures[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]()))]
+        _Crossing[MeasureArguments["ustore_docs_measure"], Measures[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]()))],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `DocsVerbs.docs_measure`. Calls `ustore_docs_measure`."""
         var count = _tasks(collections.tasks(), start_keys.tasks(), end_keys.tasks())
@@ -1146,7 +1154,7 @@ trait DocsDeferredVerbs:
             self._scope(),
             _Crossing[MeasureArguments["ustore_docs_measure"], Measures[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]()))](
                 _measure["ustore_docs_measure"](count, collections.arguments(), start_keys.arguments(), end_keys.arguments(), direction),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         }

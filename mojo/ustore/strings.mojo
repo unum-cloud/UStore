@@ -30,7 +30,7 @@ from ustore.db import (
 from ustore.library import Library
 from ustore.types import (
     Address,
-    Answer,
+    Deferrable,
     Arena,
     Arguments,
     BytesView,
@@ -78,7 +78,7 @@ struct StringRunsWritten(Defaultable, ImplicitlyCopyable):
 
 
 @fieldwise_init
-struct StringRuns[origin: MutOrigin](Answer, Sized):
+struct StringRuns[origin: MutOrigin](Deferrable, Sized):
     """The strings a scan or a sample listed into the arena it borrows, run after run, one run per task.
 
     Parameters:
@@ -86,7 +86,7 @@ struct StringRuns[origin: MutOrigin](Answer, Sized):
     """
 
     comptime Written = StringRunsWritten
-    var arena: Pointer[Arena, Self.origin]
+    var arena: Pointer[Arena[ImmUntrackedOrigin], Self.origin]
     """The arena holding the strings."""
     var generation: Int
     """The arena's call the strings came from."""
@@ -96,7 +96,7 @@ struct StringRuns[origin: MutOrigin](Answer, Sized):
     """Runs, one per task."""
 
     def __init__(out self, arena: Address, generation: Int, written: StringRunsWritten, count: Int):
-        self.arena = Pointer[Arena, Self.origin](unsafe_from_address=arena)
+        self.arena = Pointer[Arena[ImmUntrackedOrigin], Self.origin](unsafe_from_address=arena)
         self.generation = generation
         self.written = written
         self.count = count
@@ -113,7 +113,9 @@ struct StringRuns[origin: MutOrigin](Answer, Sized):
     def strings(self) raises Error -> Tape[Self.origin]:
         """Every run's strings end to end; run `i` spans entries `offsets()[i]` up to `offsets()[i + 1]`."""
         var offsets = self.offsets()
-        return Tape[Self.origin](self.arena, self.generation, self.written.strings, Int(offsets[self.count]) if self.count else 0)
+        return Tape[Self.origin](
+            self.arena, self.generation, self.written.strings, Int(offsets[self.count]) if self.count else 0
+        )
 
     def scores(ref self) raises Error -> Span[Float32, origin_of(self)]:
         """One score per listed string, empty unless weighted patterns asked for them."""
@@ -134,7 +136,7 @@ struct StringKeysWritten(Defaultable, ImplicitlyCopyable):
 
 
 @fieldwise_init
-struct StringKeys[origin: MutOrigin](Answer, Sized):
+struct StringKeys[origin: MutOrigin](Deferrable, Sized):
     """The keys a batch of strings map onto, read in place from the arena a strings read borrows.
 
     Parameters:
@@ -142,7 +144,7 @@ struct StringKeys[origin: MutOrigin](Answer, Sized):
     """
 
     comptime Written = StringKeysWritten
-    var arena: Pointer[Arena, Self.origin]
+    var arena: Pointer[Arena[ImmUntrackedOrigin], Self.origin]
     """The arena holding the keys."""
     var generation: Int
     """The arena's call the keys came from."""
@@ -152,7 +154,7 @@ struct StringKeys[origin: MutOrigin](Answer, Sized):
     """Strings the read carried."""
 
     def __init__(out self, arena: Address, generation: Int, written: StringKeysWritten, count: Int):
-        self.arena = Pointer[Arena, Self.origin](unsafe_from_address=arena)
+        self.arena = Pointer[Arena[ImmUntrackedOrigin], Self.origin](unsafe_from_address=arena)
         self.generation = generation
         self.written = written
         self.count = count
@@ -187,7 +189,7 @@ struct StringsPulledWritten(Defaultable, ImplicitlyCopyable):
 
 
 @fieldwise_init
-struct StringsPulled[origin: MutOrigin](Answer, Sized):
+struct StringsPulled[origin: MutOrigin](Deferrable, Sized):
     """One page of a strings cursor's walk, read in place from the arena the pull borrows.
 
     Parameters:
@@ -195,7 +197,7 @@ struct StringsPulled[origin: MutOrigin](Answer, Sized):
     """
 
     comptime Written = StringsPulledWritten
-    var arena: Pointer[Arena, Self.origin]
+    var arena: Pointer[Arena[ImmUntrackedOrigin], Self.origin]
     """The arena holding the page."""
     var generation: Int
     """The arena's call the page came from."""
@@ -203,7 +205,7 @@ struct StringsPulled[origin: MutOrigin](Answer, Sized):
     """The views the engine wrote."""
 
     def __init__(out self, arena: Address, generation: Int, written: StringsPulledWritten, count: Int):
-        self.arena = Pointer[Arena, Self.origin](unsafe_from_address=arena)
+        self.arena = Pointer[Arena[ImmUntrackedOrigin], Self.origin](unsafe_from_address=arena)
         self.generation = generation
         self.written = written
 
@@ -227,7 +229,9 @@ struct StringsPulled[origin: MutOrigin](Answer, Sized):
 
 
 struct StringsScanConfig[
-    start_origin: ImmOrigin = ImmUntrackedOrigin, end_origin: ImmOrigin = ImmUntrackedOrigin, patterns_origin: ImmOrigin = ImmUntrackedOrigin
+    start_origin: ImmOrigin = ImmUntrackedOrigin,
+    end_origin: ImmOrigin = ImmUntrackedOrigin,
+    patterns_origin: ImmOrigin = ImmUntrackedOrigin,
 ](ImplicitlyCopyable):
     """The bounds, order and filters of a prefix scan.
 
@@ -278,7 +282,9 @@ struct StringsScanConfig[
 
 
 struct StringsCursorConfig[
-    start_origin: ImmOrigin = ImmUntrackedOrigin, end_origin: ImmOrigin = ImmUntrackedOrigin, patterns_origin: ImmOrigin = ImmUntrackedOrigin
+    start_origin: ImmOrigin = ImmUntrackedOrigin,
+    end_origin: ImmOrigin = ImmUntrackedOrigin,
+    patterns_origin: ImmOrigin = ImmUntrackedOrigin,
 ](ImplicitlyCopyable):
     """The bounds, order and filters of a walk over one prefix, every string copied when the walk opens.
 
@@ -339,7 +345,14 @@ struct StringsWriteArguments(Arguments):
     var durability: Durability
     var watch: c_int
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[Unwritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[Unwritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self.database = scope.database
         self.executor = scope.executor
         self.outcome = outcome
@@ -370,7 +383,14 @@ struct StringsRemoveArguments(Arguments):
     var durability: Durability
     var watch: c_int
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[Unwritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[Unwritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self.database = scope.database
         self.executor = scope.executor
         self.outcome = outcome
@@ -401,7 +421,14 @@ struct StringsReadArguments(Arguments):
     var values: Optional[Pointer[Address, MutUntrackedOrigin]]
     var arena: Address
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[StringKeysWritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[StringKeysWritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self.database = scope.database
         self.executor = scope.executor
         self.outcome = outcome
@@ -444,7 +471,14 @@ struct StringsScanArguments(Arguments):
     var progress: Progress
     var with_scores: Bool
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[StringRunsWritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[StringRunsWritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self.database = scope.database
         self.executor = scope.executor
         self.outcome = outcome
@@ -497,7 +531,14 @@ struct StringsCursorNextArguments(Arguments):
     var progress: Progress
     var with_values: Bool
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[StringsPulledWritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[StringsPulledWritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self.database = scope.database
         self.executor = scope.executor
         self.outcome = outcome
@@ -530,7 +571,14 @@ struct StringsSampleArguments(Arguments):
     var arena: Address
     var wanted: c_size_t
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[StringRunsWritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[StringRunsWritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self.database = scope.database
         self.executor = scope.executor
         self.outcome = outcome
@@ -569,7 +617,14 @@ struct StringsMeasureArguments(Arguments):
     var max_space_usages: Optional[Pointer[Address, MutUntrackedOrigin]]
     var arena: Address
 
-    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[MeasuresWritten, MutUntrackedOrigin], arena: Address):
+    def bind(
+        mut self,
+        scope: Scope,
+        completion: Completion,
+        outcome: Pointer[Outcome, MutUntrackedOrigin],
+        written: Pointer[MeasuresWritten, MutUntrackedOrigin],
+        arena: Address,
+    ):
         self.database = scope.database
         self.executor = scope.executor
         self.outcome = outcome
@@ -626,12 +681,24 @@ struct StringsCursor(Movable):
         """
         return _block(
             Scope(self.library, self.database, executor.address, NULL_ADDRESS, NULL_ADDRESS, NULL_ADDRESS, Watch.KEYS),
-            _Crossing[StringsCursorNextArguments, StringsPulled[origin_of(arena)], origin_of(arena), ImmUntrackedOrigin](
+            _Crossing[
+                StringsCursorNextArguments, StringsPulled[origin_of(arena)], origin_of(arena), ImmUntrackedOrigin
+            ](
                 StringsCursorNextArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, self.address, None, None, None, NULL_ADDRESS,
-                    c_size_t(wanted), progress, values,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.BLOCKING,
+                    self.address,
+                    None,
+                    None,
+                    None,
+                    NULL_ADDRESS,
+                    c_size_t(wanted),
+                    progress,
+                    values,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 0,
             ),
         )
@@ -665,11 +732,26 @@ trait StringsVerbs:
         """
         _ = _block(
             self._scope(),
-            _Crossing[StringsWriteArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[strings_origin](), _anchor[values_origin]()))](
+            _Crossing[
+                StringsWriteArguments,
+                Unwritten,
+                MutUntrackedOrigin,
+                ImmOrigin(
+                    origin_of(_anchor[collections_origin](), _anchor[strings_origin](), _anchor[values_origin]())
+                ),
+            ](
                 StringsWriteArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS,
-                    c_size_t(_tasks(collections.tasks(), strings.tasks(), values.tasks())), collections.arguments(), strings.arguments(),
-                    values.arguments(), durability, 0,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.BLOCKING,
+                    NULL_ADDRESS,
+                    c_size_t(_tasks(collections.tasks(), strings.tasks(), values.tasks())),
+                    collections.arguments(),
+                    strings.arguments(),
+                    values.arguments(),
+                    durability,
+                    0,
                 ),
                 None,
                 0,
@@ -689,11 +771,24 @@ trait StringsVerbs:
         are given. Calls `ustore_strings_remove`."""
         _ = _block(
             self._scope(),
-            _Crossing[StringsRemoveArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[strings_origin](), _anchor[end_origin]()))](
+            _Crossing[
+                StringsRemoveArguments,
+                Unwritten,
+                MutUntrackedOrigin,
+                ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[strings_origin](), _anchor[end_origin]())),
+            ](
                 StringsRemoveArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS,
-                    c_size_t(_tasks(collections.tasks(), strings.tasks(), end_strings.tasks())), collections.arguments(), strings.arguments(),
-                    end_strings.arguments(), durability, 0,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.BLOCKING,
+                    NULL_ADDRESS,
+                    c_size_t(_tasks(collections.tasks(), strings.tasks(), end_strings.tasks())),
+                    collections.arguments(),
+                    strings.arguments(),
+                    end_strings.arguments(),
+                    durability,
+                    0,
                 ),
                 None,
                 0,
@@ -702,25 +797,44 @@ trait StringsVerbs:
 
     def strings_read[
         collections_origin: ImmOrigin, strings_origin: ImmOrigin, //
-    ](self, collections: CollectionsView[collections_origin], strings: StringsView[strings_origin], mut arena: Arena) raises Error -> StringKeys[
-        origin_of(arena)
-    ]:
+    ](
+        self, collections: CollectionsView[collections_origin], strings: StringsView[strings_origin], mut arena: Arena
+    ) raises Error -> StringKeys[origin_of(arena)]:
         """Reads the keys a batch of strings map onto, and their presence. Calls `ustore_strings_read`."""
         var count = _tasks(collections.tasks(), strings.tasks())
         return _block(
             self._scope(),
-            _Crossing[StringsReadArguments, StringKeys[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[strings_origin]()))](
+            _Crossing[
+                StringsReadArguments,
+                StringKeys[origin_of(arena)],
+                origin_of(arena),
+                ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[strings_origin]())),
+            ](
                 StringsReadArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS, c_size_t(count), collections.arguments(),
-                    strings.arguments(), None, None, NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.BLOCKING,
+                    NULL_ADDRESS,
+                    c_size_t(count),
+                    collections.arguments(),
+                    strings.arguments(),
+                    None,
+                    None,
+                    NULL_ADDRESS,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         )
 
     def strings_scan[
-        collections_origin: ImmOrigin, prefixes_origin: ImmOrigin, start_origin: ImmOrigin, end_origin: ImmOrigin, patterns_origin: ImmOrigin, //
+        collections_origin: ImmOrigin,
+        prefixes_origin: ImmOrigin,
+        start_origin: ImmOrigin,
+        end_origin: ImmOrigin,
+        patterns_origin: ImmOrigin,
+        //,
     ](
         self,
         collections: CollectionsView[collections_origin],
@@ -734,17 +848,49 @@ trait StringsVerbs:
         Raises:
             `Error` with `CANCELLED` once `config.progress` stops it.
         """
-        var count = _tasks(collections.tasks(), prefixes.tasks(), config.start_strings.tasks(), config.end_strings.tasks())
+        var count = _tasks(
+            collections.tasks(), prefixes.tasks(), config.start_strings.tasks(), config.end_strings.tasks()
+        )
         return _block(
             self._scope(),
-            _Crossing[StringsScanArguments, StringRuns[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[prefixes_origin](), _anchor[start_origin](), _anchor[end_origin](), _anchor[patterns_origin]()))](
-                StringsScanArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS, c_size_t(count), collections.arguments(),
-                    prefixes.arguments(), config.start_strings.arguments(), config.end_strings.arguments(), config.direction,
-                    config.patterns.arguments(), config.predicate, None, None, None, NULL_ADDRESS, c_size_t(wanted), config.mode,
-                    config.progress, config.scores,
+            _Crossing[
+                StringsScanArguments,
+                StringRuns[origin_of(arena)],
+                origin_of(arena),
+                ImmOrigin(
+                    origin_of(
+                        _anchor[collections_origin](),
+                        _anchor[prefixes_origin](),
+                        _anchor[start_origin](),
+                        _anchor[end_origin](),
+                        _anchor[patterns_origin](),
+                    )
                 ),
-                Pointer(to=arena),
+            ](
+                StringsScanArguments(
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.BLOCKING,
+                    NULL_ADDRESS,
+                    c_size_t(count),
+                    collections.arguments(),
+                    prefixes.arguments(),
+                    config.start_strings.arguments(),
+                    config.end_strings.arguments(),
+                    config.direction,
+                    config.patterns.arguments(),
+                    config.predicate,
+                    None,
+                    None,
+                    None,
+                    NULL_ADDRESS,
+                    c_size_t(wanted),
+                    config.mode,
+                    config.progress,
+                    config.scores,
+                ),
+                arena._pointer(),
                 count,
             ),
         )
@@ -771,27 +917,51 @@ trait StringsVerbs:
         var prefixed = BytesView.of(prefix).arguments() if prefix.byte_length() else BytesViewArguments.empty()
         _cross(
             StringsCursorInitArguments(
-                created, scope.database, scope.executor, outcome, scope.view, collection, prefixed,
-                config.start_string.arguments(), config.end_string.arguments(), config.direction, config.patterns.arguments(),
+                created,
+                scope.database,
+                scope.executor,
+                outcome,
+                scope.view,
+                collection,
+                prefixed,
+                config.start_string.arguments(),
+                config.end_string.arguments(),
+                config.direction,
+                config.patterns.arguments(),
                 config.predicate,
             ),
             scope.library.symbols().strings_cursor_init,
         )
-        return StringsCursor(library=scope.library, database=scope.database, address=_created(scope.library, outcome, created, "ustore_strings_cursor_init"))
+        return StringsCursor(
+            library=scope.library,
+            database=scope.database,
+            address=_created(scope.library, outcome, created, "ustore_strings_cursor_init"),
+        )
 
     def strings_sample[
         collections_origin: ImmOrigin, //
-    ](self, collections: CollectionsView[collections_origin], wanted: Int, mut arena: Arena) raises Error -> StringRuns[origin_of(arena)]:
+    ](self, collections: CollectionsView[collections_origin], wanted: Int, mut arena: Arena) raises Error -> StringRuns[
+        origin_of(arena)
+    ]:
         """Draws up to `wanted` strings uniformly at random from every collection. Calls `ustore_strings_sample`."""
         var count = len(collections)
         return _block(
             self._scope(),
             _Crossing[StringsSampleArguments, StringRuns[origin_of(arena)], origin_of(arena), collections_origin](
                 StringsSampleArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS, c_size_t(count), collections.arguments(),
-                    None, None, NULL_ADDRESS, c_size_t(wanted),
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.BLOCKING,
+                    NULL_ADDRESS,
+                    c_size_t(count),
+                    collections.arguments(),
+                    None,
+                    None,
+                    NULL_ADDRESS,
+                    c_size_t(wanted),
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         )
@@ -810,12 +980,32 @@ trait StringsVerbs:
         var count = _tasks(collections.tasks(), start_strings.tasks(), end_strings.tasks())
         return _block(
             self._scope(),
-            _Crossing[StringsMeasureArguments, Measures[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]()))](
+            _Crossing[
+                StringsMeasureArguments,
+                Measures[origin_of(arena)],
+                origin_of(arena),
+                ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]())),
+            ](
                 StringsMeasureArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, NULL_ADDRESS, c_size_t(count), collections.arguments(),
-                    start_strings.arguments(), end_strings.arguments(), direction, None, None, None, None, None, None, NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.BLOCKING,
+                    NULL_ADDRESS,
+                    c_size_t(count),
+                    collections.arguments(),
+                    start_strings.arguments(),
+                    end_strings.arguments(),
+                    direction,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    NULL_ADDRESS,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         )
@@ -832,22 +1022,43 @@ trait StringsDeferredVerbs:
     def strings_write[
         collections_origin: ImmOrigin, strings_origin: ImmOrigin, values_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         strings: StringsView[strings_origin],
         values: KeysView[values_origin],
         durability: Durability = Durability.BUFFERED,
     ) -> Deferred[
-        _Crossing[StringsWriteArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[strings_origin](), _anchor[values_origin]()))]
+        _Crossing[
+            StringsWriteArguments,
+            Unwritten,
+            MutUntrackedOrigin,
+            ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[strings_origin](), _anchor[values_origin]())),
+        ],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `StringsVerbs.strings_write`. Calls `ustore_strings_write`."""
         return {
             self._scope(),
-            _Crossing[StringsWriteArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[strings_origin](), _anchor[values_origin]()))](
+            _Crossing[
+                StringsWriteArguments,
+                Unwritten,
+                MutUntrackedOrigin,
+                ImmOrigin(
+                    origin_of(_anchor[collections_origin](), _anchor[strings_origin](), _anchor[values_origin]())
+                ),
+            ](
                 StringsWriteArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS,
-                    c_size_t(_tasks(collections.tasks(), strings.tasks(), values.tasks())), collections.arguments(), strings.arguments(),
-                    values.arguments(), durability, 0,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.DEFERRED,
+                    NULL_ADDRESS,
+                    c_size_t(_tasks(collections.tasks(), strings.tasks(), values.tasks())),
+                    collections.arguments(),
+                    strings.arguments(),
+                    values.arguments(),
+                    durability,
+                    0,
                 ),
                 None,
                 0,
@@ -857,22 +1068,41 @@ trait StringsDeferredVerbs:
     def strings_remove[
         collections_origin: ImmOrigin, strings_origin: ImmOrigin, end_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         strings: StringsView[strings_origin],
         end_strings: StringsView[end_origin] = StringsView(),
         durability: Durability = Durability.BUFFERED,
     ) -> Deferred[
-        _Crossing[StringsRemoveArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[strings_origin](), _anchor[end_origin]()))]
+        _Crossing[
+            StringsRemoveArguments,
+            Unwritten,
+            MutUntrackedOrigin,
+            ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[strings_origin](), _anchor[end_origin]())),
+        ],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `StringsVerbs.strings_remove`. Calls `ustore_strings_remove`."""
         return {
             self._scope(),
-            _Crossing[StringsRemoveArguments, Unwritten, MutUntrackedOrigin, ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[strings_origin](), _anchor[end_origin]()))](
+            _Crossing[
+                StringsRemoveArguments,
+                Unwritten,
+                MutUntrackedOrigin,
+                ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[strings_origin](), _anchor[end_origin]())),
+            ](
                 StringsRemoveArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS,
-                    c_size_t(_tasks(collections.tasks(), strings.tasks(), end_strings.tasks())), collections.arguments(), strings.arguments(),
-                    end_strings.arguments(), durability, 0,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.DEFERRED,
+                    NULL_ADDRESS,
+                    c_size_t(_tasks(collections.tasks(), strings.tasks(), end_strings.tasks())),
+                    collections.arguments(),
+                    strings.arguments(),
+                    end_strings.arguments(),
+                    durability,
+                    0,
                 ),
                 None,
                 0,
@@ -881,55 +1111,132 @@ trait StringsDeferredVerbs:
 
     def strings_read[
         collections_origin: ImmOrigin, strings_origin: ImmOrigin, //
-    ](self, collections: CollectionsView[collections_origin], strings: StringsView[strings_origin], mut arena: Arena) -> Deferred[
-        _Crossing[StringsReadArguments, StringKeys[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[strings_origin]()))]
+    ](
+        ref self,
+        collections: CollectionsView[collections_origin],
+        strings: StringsView[strings_origin],
+        mut arena: Arena,
+    ) -> Deferred[
+        _Crossing[
+            StringsReadArguments,
+            StringKeys[origin_of(arena)],
+            origin_of(arena),
+            ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[strings_origin]())),
+        ],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `StringsVerbs.strings_read`. Calls `ustore_strings_read`."""
         var count = _tasks(collections.tasks(), strings.tasks())
         return {
             self._scope(),
-            _Crossing[StringsReadArguments, StringKeys[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[strings_origin]()))](
+            _Crossing[
+                StringsReadArguments,
+                StringKeys[origin_of(arena)],
+                origin_of(arena),
+                ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[strings_origin]())),
+            ](
                 StringsReadArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS, c_size_t(count), collections.arguments(),
-                    strings.arguments(), None, None, NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.DEFERRED,
+                    NULL_ADDRESS,
+                    c_size_t(count),
+                    collections.arguments(),
+                    strings.arguments(),
+                    None,
+                    None,
+                    NULL_ADDRESS,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         }
 
     def strings_scan[
-        collections_origin: ImmOrigin, prefixes_origin: ImmOrigin, start_origin: ImmOrigin, end_origin: ImmOrigin, patterns_origin: ImmOrigin, //
+        collections_origin: ImmOrigin,
+        prefixes_origin: ImmOrigin,
+        start_origin: ImmOrigin,
+        end_origin: ImmOrigin,
+        patterns_origin: ImmOrigin,
+        //,
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         prefixes: StringsView[prefixes_origin],
         wanted: Int,
         mut arena: Arena,
         config: StringsScanConfig[start_origin, end_origin, patterns_origin] = StringsScanConfig(),
     ) -> Deferred[
-        _Crossing[StringsScanArguments, StringRuns[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[prefixes_origin](), _anchor[start_origin](), _anchor[end_origin](), _anchor[patterns_origin]()))]
+        _Crossing[
+            StringsScanArguments,
+            StringRuns[origin_of(arena)],
+            origin_of(arena),
+            ImmOrigin(
+                origin_of(
+                    _anchor[collections_origin](),
+                    _anchor[prefixes_origin](),
+                    _anchor[start_origin](),
+                    _anchor[end_origin](),
+                    _anchor[patterns_origin](),
+                )
+            ),
+        ],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `StringsVerbs.strings_scan`. Calls `ustore_strings_scan`."""
-        var count = _tasks(collections.tasks(), prefixes.tasks(), config.start_strings.tasks(), config.end_strings.tasks())
+        var count = _tasks(
+            collections.tasks(), prefixes.tasks(), config.start_strings.tasks(), config.end_strings.tasks()
+        )
         return {
             self._scope(),
-            _Crossing[StringsScanArguments, StringRuns[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[prefixes_origin](), _anchor[start_origin](), _anchor[end_origin](), _anchor[patterns_origin]()))](
-                StringsScanArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS, c_size_t(count), collections.arguments(),
-                    prefixes.arguments(), config.start_strings.arguments(), config.end_strings.arguments(), config.direction,
-                    config.patterns.arguments(), config.predicate, None, None, None, NULL_ADDRESS, c_size_t(wanted), config.mode,
-                    config.progress, config.scores,
+            _Crossing[
+                StringsScanArguments,
+                StringRuns[origin_of(arena)],
+                origin_of(arena),
+                ImmOrigin(
+                    origin_of(
+                        _anchor[collections_origin](),
+                        _anchor[prefixes_origin](),
+                        _anchor[start_origin](),
+                        _anchor[end_origin](),
+                        _anchor[patterns_origin](),
+                    )
                 ),
-                Pointer(to=arena),
+            ](
+                StringsScanArguments(
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.DEFERRED,
+                    NULL_ADDRESS,
+                    c_size_t(count),
+                    collections.arguments(),
+                    prefixes.arguments(),
+                    config.start_strings.arguments(),
+                    config.end_strings.arguments(),
+                    config.direction,
+                    config.patterns.arguments(),
+                    config.predicate,
+                    None,
+                    None,
+                    None,
+                    NULL_ADDRESS,
+                    c_size_t(wanted),
+                    config.mode,
+                    config.progress,
+                    config.scores,
+                ),
+                arena._pointer(),
                 count,
             ),
         }
 
     def strings_sample[
         collections_origin: ImmOrigin, //
-    ](self, collections: CollectionsView[collections_origin], wanted: Int, mut arena: Arena) -> Deferred[
-        _Crossing[StringsSampleArguments, StringRuns[origin_of(arena)], origin_of(arena), collections_origin]
+    ](ref self, collections: CollectionsView[collections_origin], wanted: Int, mut arena: Arena) -> Deferred[
+        _Crossing[StringsSampleArguments, StringRuns[origin_of(arena)], origin_of(arena), collections_origin],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `StringsVerbs.strings_sample`. Calls `ustore_strings_sample`."""
         var count = len(collections)
@@ -937,10 +1244,19 @@ trait StringsDeferredVerbs:
             self._scope(),
             _Crossing[StringsSampleArguments, StringRuns[origin_of(arena)], origin_of(arena), collections_origin](
                 StringsSampleArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS, c_size_t(count), collections.arguments(),
-                    None, None, NULL_ADDRESS, c_size_t(wanted),
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.DEFERRED,
+                    NULL_ADDRESS,
+                    c_size_t(count),
+                    collections.arguments(),
+                    None,
+                    None,
+                    NULL_ADDRESS,
+                    c_size_t(wanted),
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         }
@@ -948,25 +1264,51 @@ trait StringsDeferredVerbs:
     def strings_measure[
         collections_origin: ImmOrigin, start_origin: ImmOrigin, end_origin: ImmOrigin, //
     ](
-        self,
+        ref self,
         collections: CollectionsView[collections_origin],
         start_strings: StringsView[start_origin],
         end_strings: StringsView[end_origin],
         mut arena: Arena,
         direction: ScanDirection = ScanDirection.ASCENDING,
     ) -> Deferred[
-        _Crossing[StringsMeasureArguments, Measures[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]()))]
+        _Crossing[
+            StringsMeasureArguments,
+            Measures[origin_of(arena)],
+            origin_of(arena),
+            ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]())),
+        ],
+        ImmOrigin(origin_of(self)),
     ]:
         """Submits `StringsVerbs.strings_measure`. Calls `ustore_strings_measure`."""
         var count = _tasks(collections.tasks(), start_strings.tasks(), end_strings.tasks())
         return {
             self._scope(),
-            _Crossing[StringsMeasureArguments, Measures[origin_of(arena)], origin_of(arena), ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]()))](
+            _Crossing[
+                StringsMeasureArguments,
+                Measures[origin_of(arena)],
+                origin_of(arena),
+                ImmOrigin(origin_of(_anchor[collections_origin](), _anchor[start_origin](), _anchor[end_origin]())),
+            ](
                 StringsMeasureArguments(
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.DEFERRED, NULL_ADDRESS, c_size_t(count), collections.arguments(),
-                    start_strings.arguments(), end_strings.arguments(), direction, None, None, None, None, None, None, NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    NULL_ADDRESS,
+                    None,
+                    Completion.DEFERRED,
+                    NULL_ADDRESS,
+                    c_size_t(count),
+                    collections.arguments(),
+                    start_strings.arguments(),
+                    end_strings.arguments(),
+                    direction,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    None,
+                    NULL_ADDRESS,
                 ),
-                Pointer(to=arena),
+                arena._pointer(),
                 count,
             ),
         }

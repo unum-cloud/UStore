@@ -33,6 +33,9 @@ The mapping views copy each answer out of a one-off arena, while the batch verbs
 import ustore
 
 with ustore.Database.open_ram() as database:
+    database.collection_create("posters", modality=ustore.Modality.BLOBS)  # brackets only find
+    database.collection_create("movies", modality=ustore.Modality.DOCS)
+    database.collection_create("similar", modality=ustore.Modality.GRAPH)
     with database.transaction() as transaction:  # a clean exit commits all three writes, or none
         transaction["posters"].blobs[1] = b"\x89PNG"
         transaction["movies"].docs[1] = {"title": "Avatar", "year": 2009}
@@ -50,9 +53,10 @@ with ustore.Database.open_ram() as database:
 
 ## Collections
 
-No collection exists until `collection_create(name, modality=...)` makes it to hold one modality, or a mapping view creates it on its first write.
+No collection exists until `collection_create(name, modality=...)` makes it to hold one modality.
 Every verb names its collection through `collection=`, as a `uuid.UUID` identifier or as a name resolved on the calling thread when the call is made.
-`database["movies"]` answers a `Collection`, whose `blobs`, `docs`, `graph` and `table` views each address one modality, and a view of another modality raises `InvalidArgumentError`.
+`database["movies"]` answers a `Collection`, whose `blobs`, `docs`, `graph` and `table` views each address one modality.
+Brackets only find, so every call through a missing name raises `NotFoundError`, and a view of another modality raises `InvalidArgumentError`.
 Names starting with `_` are reserved for the system collections, which no listing shows.
 
 ```python
@@ -71,7 +75,7 @@ database.collection_drop("posters", ustore.DropMode.PAIRS)  # empties it, keepin
 `write`, `set`, `read`, `get`, `contains` and `remove` address binary values by key.
 A write takes one bytes-like value per key, one value broadcast to every key, or a tape, and borrows every value for the length of the call rather than copying it.
 A tape is an Arrow `binary`, `large_binary`, `string` or `large_string` array, or a `(data, offsets)` tuple of buffers, and reaches the C ABI as the tape it already is.
-A read answers the tape the engine wrote, exported through the Arrow C data interface as `binary` or `large_binary`, with `None` for a missing key.
+A read answers the tape the engine wrote, with `None` for a missing key.
 `read(keys, arena, offset=16, limit=64)` reads a slice of every value, and `remove(keys, ends=ends)` removes ranges in one atomic call.
 
 ```python
@@ -105,6 +109,28 @@ with database.cursor(collection=posters) as cursor:     # reads nothing until it
 
 `changes_cursor(since, collection=...)` opens a feed of the changes committed after a commit stamp, oldest first, whose pulls answer `Changes` of keys, values, stamps and `ChangeKind` members.
 
+### Predicates
+
+Scans and cursors take `predicate=`, which keeps the listed keys it admits.
+A plain callable is asked about one `uuid.UUID` at a time and is cheap, so it runs before patterns or filters read any value.
+`ustore.Batch(handler)` is asked once per page about the keys patterns and filters kept, for handlers that pay per call, and `cost=PredicateCost.CHEAP` moves it ahead of them.
+
+```python
+database.scan(None, 100, arena, collection=posters, predicate=lambda key: key.int % 2 == 0)
+
+
+def even(keys, admissions):  # a (count, 16) view of key bytes, and a (count,) view to write 1 into
+    for row in range(len(admissions)):
+        admissions[row] = keys[row, 15] % 2 == 0
+
+
+database.scan(None, 100, arena, collection=posters, predicate=ustore.Batch(even))
+database.scan(None, 100, arena, collection=posters, predicate=ustore.Batch(even, cost=ustore.PredicateCost.CHEAP))
+```
+
+Both views are valid only for the call, and the admissions start as rejections.
+An exception inside a predicate goes to `sys.unraisablehook` and rejects the rest of its page.
+
 ### Progress and Cancellation
 
 `scan`, `scan_batch`, a cursor's `next`, `compact` and a snapshot's `save` take `progress=`, a callable of the units finished and the units in all.
@@ -129,7 +155,7 @@ A `Transaction` groups reads and writes across collections and modalities, and c
 Used as a context manager, it commits on a clean exit and drops the staged work on an exception.
 `database.transaction(Watch.KEYS)` records the keys it reads, so its commit raises a `ConflictError` if a concurrent writer touched them, and `transaction.unwatched()` answers a view whose reads record nothing.
 `stage()` runs the first phase of a two-phase commit and answers the read stamp, `commit()` answers the commit stamp, `rollback()` withdraws a stage, and `reset()` starts over on the same handle.
-Indexing a transaction by name answers a `Collection` whose writes stage there, while a missing collection is created at the head.
+Indexing a transaction by name answers a `Collection` whose writes stage there.
 
 ```python
 transaction = database.transaction(ustore.Watch.KEYS)
@@ -162,7 +188,7 @@ A snapshot holds its database open in C until it closes, so `database.close()` n
 `docs_write`, `docs_read`, `docs_gist` and `docs_gather` address JSON documents, whole or a field inside each, where a field is a top-level key or a JSON Pointer such as `/user/name`.
 A document is JSON text or bytes, a tape of them, or a dict, list or number the binding serializes, while `Collection.docs` takes and answers Python objects outright.
 A fixed-width `type` given a contiguous buffer writes a column of scalars, one per key, so a NumPy column reaches the store without being printed as JSON and parsed back.
-A gather answers `Columns`, each a buffer NumPy reads without a copy beside its validity, conversion and collision bitmaps, and the whole gather exports through `__arrow_c_array__` as one struct array of columns named by their fields.
+A gather answers `Columns`, each a buffer NumPy reads without a copy beside its validity, conversion and collision bitmaps.
 
 ```python
 people = database.collection_create("people", modality=ustore.Modality.DOCS)
@@ -173,7 +199,6 @@ database.docs_gist([10, 11], arena, collection=people)  # ("/name", "/tweets", "
 types = [ustore.FieldType.STRING, ustore.FieldType.I64]
 columns = database.docs_gather([10, 11], ["name", "tweets"], types, arena, collection=people)
 columns[1], columns.validities(1)                       # memoryview of "q", bitmap bytes
-pyarrow.array(columns).field("name")                   # ["Lex", "Joe"], exported in place
 ```
 
 `ustore.table_view.Table` reads document collections as a Pandas frame, converting `page` rows at a time.
@@ -194,6 +219,8 @@ neighborhoods = database.graph_read_edges([1, 2, 3], arena, role=ustore.Role.ANY
 np.asarray(neighborhoods)                               # (edges, 3, 16) bytes of source, target, edge
 database.graph_degrees([1, 2, 3], arena, role=ustore.Role.SOURCE, collection=follows)  # (1, 1, 0)
 
+for name, modality in [("graph", ustore.Modality.GRAPH), ("nodes", ustore.Modality.DOCS), ("edges", ustore.Modality.DOCS)]:
+    database.collection_create(name, modality=modality)   # a view only finds collections by name
 graph = DiGraph(database, "graph", nodes="nodes", edges="edges")
 graph.add_edge(1, 2, weight=3)
 list(graph.edges(data=True))                            # [(UUID(int=1), UUID(int=2), {"weight": 3})]
@@ -203,7 +230,7 @@ list(graph.edges(data=True))                            # [(UUID(int=1), UUID(in
 
 The receiver a verb is called on chooses where it runs and how it completes, while the verb and its arguments stay the same, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#receivers--deferred-calls) describe in full.
 A `Database`, `Transaction` or `Snapshot` runs its calls on the calling thread, `on(executor)` blocks on that executor, and `deferred(executor)` submits there and answers a `ustore.Deferred`.
-In a coroutine, `await` a deferred call, which polls its status with a sleep growing from 1 µs to 1 ms and parks no thread; anywhere else, `wait()` blocks the thread with its state detached.
+In a coroutine, `await` a deferred call, which polls its status and re-polls on the next turn of the running loop through `loop.call_soon`, never sleeping and parking no thread; anywhere else, `wait()` blocks the thread with its state detached.
 A `Deferred` holds its inputs, output slots and arena until the call finishes, and dropping an unfinished one waits for it.
 
 ```python
@@ -215,6 +242,15 @@ async def main(database, executor, keys, key):
     reading.status                                       # ustore.Status.DEFERRED until final
     values = await reading                               # or: reading.wait()
     poster = await later["movies"].blobs[key]            # a missing key raises KeyError
+```
+
+Calls on two executors run together, and `asyncio.gather` awaits both:
+
+```python
+async def fan_out(database, left, right, keys):
+    reading = database.deferred(left).read(keys, ustore.Arena(left), collection="movies")
+    scanning = database.deferred(right).scan(None, 100, ustore.Arena(right), collection="movies")
+    return await asyncio.gather(reading, scanning)       # both submitted before either is awaited
 ```
 
 Python's `in`, assignments, `del` and the table view take several calls or must answer at once, so through a deferred view they raise `TypeError` naming the verb to call instead.
@@ -276,6 +312,25 @@ finally:
 
 Every C enum is an `enum.IntEnum` built at import through the C `_name` functions, so "strict-serializable" is `Isolation.STRICT_SERIALIZABLE`.
 
+## Apache Arrow
+
+Outputs speak the Arrow PyCapsule protocol, exporting in place until their arena rewinds, and `import_arrow` and `ingest_arrow` read any object that speaks it back into a collection:
+
+```python
+values = database.read([1, 2, 3], arena, collection=posters)
+pyarrow.array(values)  # `binary`, null where a key is missing
+types = [ustore.FieldType.STRING, ustore.FieldType.I64]
+columns = database.docs_gather([10, 11], ["name", "tweets"], types, arena, collection=people)
+pyarrow.array(columns).field("name")  # ["Lex", "Joe"], one struct array of the columns
+
+table = pyarrow.table(database["posters"])  # the whole collection as a stream, keys as `arrow.uuid`
+database.import_arrow(table, collection="copies")  # every batch's columns read in place
+database.ingest_arrow(table, collection="copies", order="sorted")  # or landed as one commit
+```
+
+`Values.__arrow_c_array__` exports a read as `binary` or `large_binary`, `Columns.__arrow_c_array__` a gather through `ustore_docs_column_view_to_arrow`, and `Collection.__arrow_c_stream__` the collection through `ustore_keys_view_to_arrow` and `ustore_strings_view_to_arrow`.
+`import_arrow` and `ingest_arrow` read keys and strings through `ustore_keys_view_from_arrow` and `ustore_strings_view_from_arrow`, from an object answering `__arrow_c_stream__` or `__arrow_c_array__`.
+
 ## Platform Notes
 
 ### Engines
@@ -286,7 +341,7 @@ Every C enum is an `enum.IntEnum` built at import through the C `_name` function
 `describe()`, `clear(mode)` and `compact()` report on, empty and reclaim every collection at once, and `on(executor).compact(plan=ustore.CompactPlan())` leaves a stopped compaction open for the next call to continue.
 The extension declares `Py_MOD_GIL_NOT_USED`, so free-threaded builds run without the interpreter lock, and critical sections fence the few fields the binding mutates.
 
-### What This Binding Does Not Expose
+### Left Unbound
 
 - The strings cursor, which `export_arrow` drives.
 - Deferred constructors and cursors: an open takes `executor=` and blocks on it, and every pull blocks.

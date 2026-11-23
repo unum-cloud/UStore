@@ -849,7 +849,7 @@ PyObject* ustore_py_api_pages_read(PyObject* self, PyObject* const* arguments, P
 char const doc_pages_scan[] =                                                                  //
     "pages_scan(start, wanted, arena, *, collection, end=None,\n"                              //
     "           direction=ScanDirection.ASCENDING, mode=ScanMode.ORDERED, progress=None,\n"    //
-    "           filter=None, predicate=None, predicate_cost=PredicateCost.CHEAP)\n"            //
+    "           filter=None, predicate=None)\n"                                                //
     "answers a Keys tape.\n"                                                                   //
     "\n"                                                                                       //
     "Lists up to `wanted` page keys from `start` towards `end`, as `scan` lists the keys of\n" //

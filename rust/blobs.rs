@@ -23,10 +23,11 @@ use crate::db::ffi::{
     ustore_progress_callback_t, ustore_scan_direction_t, ustore_scan_mode_t, ustore_size_t, ustore_strided_view_t,
     ustore_strings_view_t, ustore_transaction_t, ustore_view_t, ustore_watch_t,
 };
-use crate::db::sealed::{Accepts, Calling, TapeOffset, Writable};
+use crate::db::sealed::{Accepts, Calling, Completion, Handles, TapeOffset, Writable};
 use crate::db::{
-    Address, Arena, CollectionID, Collections, Deferring, Durability, Key, KeyRange, Matching, On, Progress,
-    ProgressCallback, Result, Rows, ScanMode, Status, Strings, Tape, check, exported_slice, fail,
+    Address, Arena, CollectionID, Collections, CursorOn, Deferrable, Deferring, Durability, Executor, Key, KeyRange,
+    Matching, On, Progress, Result, Rows, ScanMode, Status, Strings, Tape, ViewVerbs, check, exported_slice, fail,
+    lowered_progress,
 };
 use crate::docs::Bitmap;
 
@@ -288,7 +289,7 @@ impl<Keys: AsRef<[Key]>, Offset: TapeOffset> Pairs for (Keys, BytesTape<Offset>)
     }
 }
 
-/// The keys a scan keeps, what admits them and how it reports; see [`On::scan`].
+/// The keys a scan keeps, what admits them and how it reports; see [`BlobsVerbs::scan`].
 pub struct BlobsScanConfig<'config> {
     /// Keys kept, at most.
     pub wanted: usize,
@@ -297,7 +298,7 @@ pub struct BlobsScanConfig<'config> {
     /// In what order the keys come.
     pub mode: ScanMode,
     /// Reports the scans finished and stops wherever it says to.
-    pub progress: Option<Box<ProgressCallback<'config>>>,
+    pub progress: Option<Progress<'config>>,
 }
 
 impl From<usize> for BlobsScanConfig<'_> {
@@ -306,7 +307,7 @@ impl From<usize> for BlobsScanConfig<'_> {
     }
 }
 
-/// The keys a sample draws; see [`On::sample`].
+/// The keys a sample draws; see [`BlobsVerbs::sample`].
 #[derive(Clone, Copy, Debug)]
 pub struct BlobsSampleConfig {
     /// Keys drawn, at most.
@@ -445,9 +446,13 @@ pub struct Measurement {
 
 // region: Verbs
 
-impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent, Completion> {
-    /// Upserts a batch of values, where an empty value is still a value and [`On::remove`] removes
-    /// keys.
+/// The verbs over binary values, written once for every receiver of [`ViewVerbs`]: a handle blocks
+/// on the calling thread, and an [`On`] runs on its executor, blocking or deferred.
+///
+/// Rust-only.
+pub trait BlobsVerbs<'view>: ViewVerbs<'view> {
+    /// Upserts a batch of values, where an empty value is still a value; [`BlobsVerbs::remove`]
+    /// is what removes keys.
     ///
     /// The entries are borrowed [`Entry`] values, or owned keys beside a `stringtape::BytesTape` of their values with
     /// 32-bit or 64-bit offsets, which a deferred write needs, and the call hands them back. The batch spans as many
@@ -455,61 +460,64 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
     /// flushes at its commit, so [`Durability::Flushed`] is refused inside one.
     ///
     /// Calls `ustore_blobs_write`.
-    pub fn write<'collections, Entries: Pairs>(
-        &self,
+    fn write<'collections, Entries: Pairs>(
+        self,
         collections: impl Into<Collections<'collections>>,
         entries: Entries,
         durability: Durability,
-    ) -> Completion::Answer<Write<'collections, Entries>>
+    ) -> Deferrable<'view, Self, Write<'collections, Entries>>
     where
-        Completion: Accepts<Collections<'collections>> + Accepts<Entries>,
+        Self::Parent: Writable,
+        Self::Completion: Accepts<Collections<'collections>> + Accepts<Entries>,
     {
         let verb = Write { collections: collections.into(), entries, durability };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
     /// Removes a batch of keys with their values, whether or not the database holds them, and hands the keys back.
     ///
     /// Calls `ustore_blobs_remove`.
-    pub fn remove<'collections, Keys: AsRef<[Key]>>(
-        &self,
+    fn remove<'collections, Keys: AsRef<[Key]>>(
+        self,
         collections: impl Into<Collections<'collections>>,
         keys: Keys,
         durability: Durability,
-    ) -> Completion::Answer<Remove<'collections, Keys>>
+    ) -> Deferrable<'view, Self, Remove<'collections, Keys>>
     where
-        Completion: Accepts<Collections<'collections>> + Accepts<Keys>,
+        Self::Parent: Writable,
+        Self::Completion: Accepts<Collections<'collections>> + Accepts<Keys>,
     {
         let verb = Remove { collections: collections.into(), keys, durability };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
     /// Removes every key of one collection from `range.start`, inclusive, to `range.end`,
     /// exclusive, with its value, in one atomic call.
-    pub fn remove_range(
-        &self,
+    fn remove_range(
+        self,
         collection: CollectionID,
         range: Range<Key>,
         durability: Durability,
-    ) -> Completion::Answer<RemoveRange> {
+    ) -> Deferrable<'view, Self, RemoveRange>
+    where
+        Self::Parent: Writable,
+    {
         let verb = RemoveRange { collection, range, durability };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
-}
 
-impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completion> {
     /// Reads a batch of keys into the arena, one collection per key or one for all of them, and hands back the
     /// [`Values`].
     ///
     /// Calls `ustore_blobs_read`.
-    pub fn read<'arena, 'collections, Keys: AsRef<[Key]>>(
-        &self,
+    fn read<'arena, 'collections, Keys: AsRef<[Key]>>(
+        self,
         collections: impl Into<Collections<'collections>>,
         keys: Keys,
-        arena: &'arena mut Arena,
-    ) -> Completion::Answer<Read<'arena, 'collections, Keys>>
+        arena: &'arena mut Arena<'_>,
+    ) -> Deferrable<'view, Self, Read<'arena, 'collections, Keys>>
     where
-        Completion: Accepts<Collections<'collections>> + Accepts<Keys>,
+        Self::Completion: Accepts<Collections<'collections>> + Accepts<Keys>,
     {
         let verb = Read {
             collections: collections.into(),
@@ -520,21 +528,21 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
             presences: Address::default(),
             values: ustore_strings_view_t::default(),
         };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
-    /// Reads the same byte range of every value of a batch into the arena, as [`On::read`] reads
-    /// whole values, where a range past the end of a value reads empty and one running past it
-    /// stops there.
-    pub fn read_slices<'arena, 'collections, Keys: AsRef<[Key]>>(
-        &self,
+    /// Reads the same byte range of every value of a batch into the arena, as [`BlobsVerbs::read`]
+    /// reads whole values, where a range past the end of a value reads empty and one running past
+    /// it stops there.
+    fn read_slices<'arena, 'collections, Keys: AsRef<[Key]>>(
+        self,
         collections: impl Into<Collections<'collections>>,
         keys: Keys,
         bytes: impl RangeBounds<u64>,
-        arena: &'arena mut Arena,
-    ) -> Completion::Answer<Read<'arena, 'collections, Keys>>
+        arena: &'arena mut Arena<'_>,
+    ) -> Deferrable<'view, Self, Read<'arena, 'collections, Keys>>
     where
-        Completion: Accepts<Collections<'collections>> + Accepts<Keys>,
+        Self::Completion: Accepts<Collections<'collections>> + Accepts<Keys>,
     {
         let offset = match bytes.start_bound() {
             Bound::Included(&start) => start,
@@ -555,7 +563,7 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
             presences: Address::default(),
             values: ustore_strings_view_t::default(),
         };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
     /// Lists up to `wanted` keys of one collection's `range` into the arena, keeping those its
@@ -563,15 +571,15 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
     /// BM25 score per key beside them.
     ///
     /// Calls `ustore_blobs_scan`.
-    pub fn scan<'config, 'arena>(
-        &self,
+    fn scan<'config, 'arena>(
+        self,
         collection: CollectionID,
         range: impl Into<KeyRange>,
         config: impl Into<BlobsScanConfig<'config>>,
-        arena: &'arena mut Arena,
-    ) -> Completion::Answer<Scan<'arena, 'config>>
+        arena: &'arena mut Arena<'_>,
+    ) -> Deferrable<'view, Self, Scan<'arena, 'config>>
     where
-        Completion: Accepts<BlobsScanConfig<'config>>,
+        Self::Completion: Accepts<BlobsScanConfig<'config>>,
     {
         let range = range.into();
         let BlobsScanConfig { wanted, matching, mode, progress } = config.into();
@@ -583,40 +591,42 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
             wanted,
             matched: matching,
             mode,
-            progress: Progress(progress),
+            progress,
             found: Found::default(),
             scores: Address::default(),
         };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
     /// Draws up to `wanted` keys uniformly at random from one collection into the arena.
     ///
     /// Calls `ustore_blobs_sample`.
-    pub fn sample<'arena>(
-        &self,
+    fn sample<'arena>(
+        self,
         collection: CollectionID,
         config: impl Into<BlobsSampleConfig>,
-        arena: &'arena mut Arena,
-    ) -> Completion::Answer<Sample<'arena>> {
+        arena: &'arena mut Arena<'_>,
+    ) -> Deferrable<'view, Self, Sample<'arena>> {
         let verb = Sample { collection, arena, wanted: config.into().wanted, found: Found::default() };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
     /// Estimates the keys and the space a range of keys takes in one collection, through the arena its bounds land in.
     ///
     /// Calls `ustore_blobs_measure`.
-    pub fn measure<'arena>(
-        &self,
+    fn measure<'arena>(
+        self,
         collection: CollectionID,
         range: impl Into<KeyRange>,
-        arena: &'arena mut Arena,
-    ) -> Completion::Answer<Measure<'arena>> {
+        arena: &'arena mut Arena<'_>,
+    ) -> Deferrable<'view, Self, Measure<'arena>> {
         let range = range.into();
         let verb = Measure { collection, start: range.start_key(), range, arena, bounds: Default::default() };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 }
+
+impl<'view, Receiver: ViewVerbs<'view>> BlobsVerbs<'view> for Receiver {}
 
 impl<'view, Parent> On<'view, Parent> {
     /// Opens a walk over the keys of one collection's `range`, reading nothing until its first
@@ -636,13 +646,8 @@ impl<'view, Parent> On<'view, Parent> {
         config: impl Into<BlobsCursorConfig<'view>>,
     ) -> Result<Cursor<'view>> {
         let range: KeyRange = range.into();
-        let mut cursor = Cursor {
-            handle: ptr::null_mut(),
-            database: self.database(),
-            executor: self.executor(),
-            matched: Box::new(config.into().matching),
-            marker: PhantomData,
-        };
+        let matching = config.into().matching;
+        let mut cursor = Cursor { handle: ptr::null_mut(), database: self.database(), marker: PhantomData };
         let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_blobs_cursor_init_t {
             cursor: &mut cursor.handle,
@@ -654,8 +659,8 @@ impl<'view, Parent> On<'view, Parent> {
             start_key: range.start_key(),
             end_key: range.end.as_ref().map_or(ptr::null(), ptr::from_ref),
             direction: range.direction,
-            patterns: cursor.matched.lowered_patterns(),
-            predicate: cursor.matched.lowered_predicate(),
+            patterns: matching.lowered_patterns(),
+            predicate: matching.lowered_predicate(),
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_blobs_cursor_init(&mut arguments) };
@@ -667,7 +672,7 @@ impl<'view, Parent> On<'view, Parent> {
         &self,
         collection: CollectionID,
         keys: &[Key],
-        arena: &'arena mut Arena,
+        arena: &'arena mut Arena<'_>,
     ) -> Result<Bitmap<'arena>> {
         let mut presences: *const ustore_octet_t = ptr::null();
         let mut outcome = ustore_outcome_t::default();
@@ -697,7 +702,7 @@ impl<'view, Parent> On<'view, Parent> {
     }
 }
 
-/// An upsert of a batch of values; see [`On::write`].
+/// An upsert of a batch of values; see [`BlobsVerbs::write`].
 #[derive(Debug)]
 pub struct Write<'collections, Entries> {
     collections: Collections<'collections>,
@@ -709,9 +714,9 @@ impl<Entries: Pairs> Calling for Write<'_, Entries> {
     type Arguments = ffi::ustore_blobs_write_t;
     type Output = Entries;
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -742,7 +747,7 @@ impl<Entries: Pairs> Calling for Write<'_, Entries> {
     }
 }
 
-/// A removal of a batch of keys; see [`On::remove`].
+/// A removal of a batch of keys; see [`BlobsVerbs::remove`].
 #[derive(Debug)]
 pub struct Remove<'collections, Keys> {
     collections: Collections<'collections>,
@@ -754,9 +759,9 @@ impl<Keys: AsRef<[Key]>> Calling for Remove<'_, Keys> {
     type Arguments = ffi::ustore_blobs_remove_t;
     type Output = Keys;
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -788,7 +793,7 @@ impl<Keys: AsRef<[Key]>> Calling for Remove<'_, Keys> {
     }
 }
 
-/// A removal of one range of keys; see [`On::remove_range`].
+/// A removal of one range of keys; see [`BlobsVerbs::remove_range`].
 #[derive(Debug)]
 pub struct RemoveRange {
     collection: CollectionID,
@@ -800,9 +805,9 @@ impl Calling for RemoveRange {
     type Arguments = ffi::ustore_blobs_remove_t;
     type Output = ();
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -830,12 +835,12 @@ impl Calling for RemoveRange {
     }
 }
 
-/// A read of a batch of keys; see [`On::read`].
+/// A read of a batch of keys; see [`BlobsVerbs::read`].
 #[derive(Debug)]
 pub struct Read<'arena, 'collections, Keys> {
     collections: Collections<'collections>,
     keys: Keys,
-    arena: &'arena mut Arena,
+    arena: &'arena Arena<'arena>,
     offset: ustore_length_t,
     limit: Option<ustore_length_t>,
     presences: Address<ustore_octet_t>,
@@ -846,9 +851,9 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for Read<'arena, '_, Keys> {
     type Arguments = ffi::ustore_blobs_read_t;
     type Output = Values<'arena>;
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -912,23 +917,23 @@ impl Found {
     }
 }
 
-/// A walk over the keys of one collection; see [`On::scan`].
+/// A walk over the keys of one collection; see [`BlobsVerbs::scan`].
 #[derive(Debug)]
 pub struct Scan<'arena, 'matching> {
     collection: CollectionID,
     start: Key,
     range: KeyRange,
-    arena: &'arena mut Arena,
+    arena: &'arena Arena<'arena>,
     wanted: usize,
     matched: Matching<'matching>,
     mode: ScanMode,
-    progress: Progress<'matching>,
+    progress: Option<Progress<'matching>>,
     found: Found,
     scores: Address<f32>,
 }
 
 /// The keys one scan listed, and their BM25 scores when its patterns carried weights; see
-/// [`On::scan`].
+/// [`BlobsVerbs::scan`].
 #[derive(Clone, Copy, Debug)]
 pub struct Scanned<'arena> {
     /// The keys, in the order of the scan's direction.
@@ -941,13 +946,13 @@ impl<'arena> Calling for Scan<'arena, '_> {
     type Arguments = ffi::ustore_blobs_scan_t;
     type Output = Scanned<'arena>;
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
-        let (progress, progress_state) = self.progress.lowered();
+        let (progress, progress_state) = lowered_progress(&self.progress);
         Ok(Some(ffi::ustore_blobs_scan_t {
             database: view.database(),
             executor: view.executor(),
@@ -989,11 +994,11 @@ impl<'arena> Calling for Scan<'arena, '_> {
     }
 }
 
-/// A random draw of keys from one collection; see [`On::sample`].
+/// A random draw of keys from one collection; see [`BlobsVerbs::sample`].
 #[derive(Debug)]
 pub struct Sample<'arena> {
     collection: CollectionID,
-    arena: &'arena mut Arena,
+    arena: &'arena Arena<'arena>,
     wanted: usize,
     found: Found,
 }
@@ -1002,9 +1007,9 @@ impl<'arena> Calling for Sample<'arena> {
     type Arguments = ffi::ustore_blobs_sample_t;
     type Output = &'arena [Key];
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1034,13 +1039,13 @@ impl<'arena> Calling for Sample<'arena> {
     }
 }
 
-/// An estimate of what a range of keys holds; see [`On::measure`].
+/// An estimate of what a range of keys holds; see [`BlobsVerbs::measure`].
 #[derive(Debug)]
 pub struct Measure<'arena> {
     collection: CollectionID,
     start: Key,
     range: KeyRange,
-    arena: &'arena mut Arena,
+    arena: &'arena Arena<'arena>,
     bounds: Bounds,
 }
 
@@ -1048,9 +1053,9 @@ impl Calling for Measure<'_> {
     type Arguments = ffi::ustore_blobs_measure_t;
     type Output = Measurement;
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1135,16 +1140,40 @@ impl Bounds {
 pub struct Cursor<'view> {
     handle: ffi::ustore_blobs_cursor_t,
     database: ustore_database_t,
-    executor: ustore_executor_t,
-    matched: Box<Matching<'view>>,
     marker: PhantomData<&'view ()>,
 }
 
 impl Cursor<'_> {
+    /// The receiver whose pulls block on `executor`.
+    pub fn on<'cursor>(&'cursor mut self, executor: &'cursor Executor) -> CursorOn<'cursor, Self> {
+        CursorOn::new(self, Some(executor))
+    }
+
+    /// Pulls up to `wanted` next keys into `arena`, fewer near the walk's end and none past it.
+    ///
+    /// Calls `ustore_blobs_cursor_next`.
+    ///
+    /// Runs on the calling thread; [`Cursor::on`] names an executor for one pull.
+    pub fn next<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena<'_>) -> Result<&'arena [Key]> {
+        CursorOn::new(self, None).next(wanted, arena)
+    }
+
+    /// Pulls up to `wanted` next keys with their values into `arena` in one call, where a key
+    /// removed at the head between the listing and the read of one pull reads as an empty value.
+    ///
+    /// Calls `ustore_blobs_cursor_next`.
+    ///
+    /// Runs on the calling thread; [`Cursor::on`] names an executor for one pull.
+    pub fn next_pairs<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena<'_>) -> Result<Page<'arena>> {
+        CursorOn::new(self, None).next_pairs(wanted, arena)
+    }
+}
+
+impl CursorOn<'_, Cursor<'_>> {
     /// Pulls up to `wanted` next keys into `arena`, fewer once the walk nears its end and none past it.
     ///
     /// Calls `ustore_blobs_cursor_next`.
-    pub fn next<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena) -> Result<&'arena [Key]> {
+    pub fn next<'arena>(self, wanted: usize, arena: &'arena mut Arena<'_>) -> Result<&'arena [Key]> {
         self.pull(wanted, arena, ptr::null_mut())
     }
 
@@ -1152,30 +1181,30 @@ impl Cursor<'_> {
     /// between the listing and the read of one pull reads as an empty value.
     ///
     /// Calls `ustore_blobs_cursor_next`.
-    pub fn next_pairs<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena) -> Result<Page<'arena>> {
+    pub fn next_pairs<'arena>(self, wanted: usize, arena: &'arena mut Arena<'_>) -> Result<Page<'arena>> {
         let mut values = ustore_strings_view_t::default();
         let keys = self.pull(wanted, arena, &mut values)?;
-        // SAFETY: the pull succeeded, writing a value per key as a tape into the arena borrowed for `'arena`.
+        // SAFETY: the pull succeeded, writing a value per key as a tape into the result's arena.
         let values = unsafe { Strings::exported(values, keys.len())? };
         Ok(Page { keys, values })
     }
 
     /// Pulls a page of keys into `arena`, with their values into `values` unless it is null.
     fn pull<'arena>(
-        &mut self,
+        self,
         wanted: usize,
-        arena: &'arena mut Arena,
+        arena: &'arena mut Arena<'_>,
         values: *mut ustore_strings_view_t,
     ) -> Result<&'arena [Key]> {
         let mut keys: *const ustore_key_t = ptr::null();
         let mut written: ustore_size_t = 0;
         let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_blobs_cursor_next_t {
-            database: self.database,
+            database: self.cursor.database,
             executor: self.executor,
             outcome: &mut outcome,
             completion: ustore_completion_t::Blocking,
-            cursor: self.handle,
+            cursor: self.cursor.handle,
             keys: &mut keys,
             values,
             written: &mut written,
@@ -1188,7 +1217,7 @@ impl Cursor<'_> {
         unsafe { ffi::ustore_blobs_cursor_next(&mut arguments) };
         check(outcome)?;
         arena.host()?;
-        // SAFETY: a successful pull wrote `written` keys into the arena, which stays borrowed for `'arena`.
+        // SAFETY: a successful pull wrote `written` keys into the arena the result borrows.
         Ok(unsafe { exported_slice(keys, written as usize) })
     }
 }
@@ -1237,15 +1266,17 @@ impl<'arena> Page<'arena> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use super::*;
     use crate::db::{
-        Admission, CollectionID, Collections, Database, DropMode, Executor, Modality, PatternKind, PredicateCost,
+        Admission, CollectionID, Collections, Database, DropMode, Executor, Modality, PatternKind, Predicate,
         RAMOptions, ScanDirection, Status, UUID,
     };
     use crate::testing::{created, key, keys};
 
     /// A database whose blobs collection holds `alpha`, `beta` and `gamma` under the keys one, two and three.
-    fn populated() -> (Database, CollectionID, Arena) {
+    fn populated() -> (Database, CollectionID, Arena<'static>) {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let blobs = created(&database, Modality::Blobs);
         let entries = [Entry::new(key(1), b"alpha"), Entry::new(key(2), b"beta"), Entry::new(key(3), b"gamma")];
@@ -1388,7 +1419,6 @@ mod tests {
 
         // An empty batch reaches no engine and is final at once.
         let empty = database.head().deferred(&executor).read(blobs, [], &mut arena).unwrap();
-        assert_eq!(empty.status(), Ok(()));
         assert!(empty.wait().unwrap().is_empty());
     }
 
@@ -1446,24 +1476,28 @@ mod tests {
         let expected = |count: f32| count * 2.2 / (count + 1.2);
         assert_eq!(scored.scores, Some([expected(2.0), expected(1.0), expected(2.0)].as_slice()));
 
-        let mut asked = 0;
-        let mut only_the_second = |listed: &[Key], admissions: &mut [Admission]| {
-            asked += 1;
+        let asked = AtomicUsize::new(0);
+        let only_the_second = |listed: &[Key], admissions: &mut [Admission]| {
+            asked.fetch_add(1, Ordering::Relaxed);
             for (admission, listed) in admissions.iter_mut().zip(listed) {
                 *admission = if *listed == key(2) { Admission::Admit } else { Admission::Reject };
             }
         };
-        let predicated = Matching {
-            predicate: Some(Box::new(&mut only_the_second)),
-            predicate_cost: PredicateCost::Expensive,
-            ..Matching::default()
-        };
+        let predicated = Matching { predicate: Some(Predicate::batch(&only_the_second)), ..Matching::default() };
         let admitted = database
             .head()
             .scan(blobs, key(0), BlobsScanConfig { matching: predicated, ..BlobsScanConfig::from(2) }, &mut arena)
             .unwrap();
         assert_eq!(admitted.keys, &keys([2]));
-        assert_eq!(asked, 2);
+        assert_eq!(asked.load(Ordering::Relaxed), 2, "an expensive predicate is asked once per page");
+
+        let second = |listed: Key| listed == key(2);
+        let each = Matching { predicate: Some(Predicate::each(&second)), ..Matching::default() };
+        let admitted = database
+            .head()
+            .scan(blobs, key(0), BlobsScanConfig { matching: each, ..BlobsScanConfig::from(2) }, &mut arena)
+            .unwrap();
+        assert_eq!(admitted.keys, &keys([2]));
 
         let unbalanced = Matching { patterns: &["("], ..Matching::default() };
         let refused = database
@@ -1540,7 +1574,7 @@ mod tests {
         let mut cursor = snapshot.on(&executor).cursor(blobs, key(0), Matching::default()).unwrap();
         database.head().remove(blobs, keys([2]), Durability::Buffered).unwrap();
 
-        let page = cursor.next_pairs(10, &mut arena).unwrap();
+        let page = cursor.on(&executor).next_pairs(10, &mut arena).unwrap();
         assert_eq!(page.keys(), &keys([1, 2, 3]));
         assert_eq!(page.get(1), Some(b"beta".as_slice()));
         assert!(matches!(page.tape(), Tape::U32(tape) if tape.len() == 3));

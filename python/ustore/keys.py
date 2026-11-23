@@ -9,7 +9,7 @@ from collections.abc import Iterable, Iterator
 from operator import index
 from uuid import UUID
 
-from ustore.lib import Arena, Database, Modality, Snapshot, Transaction, On
+from ustore.lib import Arena, Database, Modality, On, Snapshot, Transaction
 
 type KeyLike = UUID | int | str | bytes
 

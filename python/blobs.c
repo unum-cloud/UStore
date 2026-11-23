@@ -556,11 +556,8 @@ typedef struct scan_match_t {
     /** The JSONPath or XPath filter as `str` or bytes, or NULL. */
     PyObject* filter;
 
-    /** The predicate callable, or NULL. */
+    /** The predicate callable or @c Batch, or NULL. */
     PyObject* predicate;
-
-    /** The `PredicateCost` placing the predicate. */
-    int cost;
 } scan_match_t;
 
 /** Reads one match keyword into @p match, answering 1 when @p name is one, 0 when it is not, -1 failing. */
@@ -587,10 +584,6 @@ static int scan_match_from_keyword(PyObject* name, PyObject* value, scan_match_t
                    : -1;
     if (PyUnicode_CompareWithASCIIString(name, "predicate") == 0)
         return ustore_py_predicate_from_object(value, &match->predicate) == 0 ? 1 : -1;
-    if (PyUnicode_CompareWithASCIIString(name, "predicate_cost") == 0)
-        return ustore_py_enum_from_object(value, "predicate_cost", ustore_py_enum_predicate_cost_k, &match->cost) == 0
-                   ? 1
-                   : -1;
     return 0;
 }
 
@@ -721,7 +714,7 @@ static void keys_release(void* erased) {
  *  the call finishes, then writes the ABI's spelling of them into @p patterns and @p filter. */
 static int match_fill(keys_call_t* call, scan_match_t const* match, ustore_patterns_t* patterns,
                       ustore_bytes_view_t* filter) {
-    call->call.predicate.callable = Py_XNewRef(match->predicate);
+    call->call.predicate.handler = Py_XNewRef(match->predicate);
     if (match->patterns) {
         if (ustore_py_texts_from_object(match->patterns, "patterns", NULL, NULL, &call->patterns) != 0) return -1;
         Py_ssize_t const count = (Py_ssize_t)call->patterns.contents.count;
@@ -829,7 +822,7 @@ static PyObject* keys_scan(ustore_py_context_t const* context, ustore_py_verb_op
     ustore_bytes_view_t filter = {0};
     if (scan_match_admitted(match, modality) != 0 || match_fill(call, match, &patterns, &filter) != 0)
         return ustore_py_call_discard(context, &scan_verb, call);
-    ustore_predicate_t const predicate = ustore_py_predicate_of(&call->call.predicate, match->cost);
+    ustore_predicate_t const predicate = ustore_py_predicate_of(&call->call.predicate);
     if (modality == ustore_modality_docs_k) {
         ustore_docs_scan_t scan = {
             .database = context->database_handle,
@@ -1634,7 +1627,7 @@ static void Cursor_dealloc(Cursor* self) {
     // No pull can hold the handle, since every pull holds the cursor.
     cursor_close(self);
     Py_XDECREF((PyObject*)self->executor);
-    Py_XDECREF(self->predicate.callable);
+    Py_XDECREF(self->predicate.handler);
     PyObject_Free(self);
 }
 
@@ -1834,7 +1827,7 @@ PyTypeObject CursorType = {
 char const doc_cursor[] =                                                                        //
     "cursor(start=None, /, *, collection, end=None, direction=ScanDirection.ASCENDING,\n"        //
     "patterns=None, pattern_kind=PatternKind.REGEX, sensitivity=CaseSensitivity.CASED,\n"        //
-    "predicate=None, predicate_cost=PredicateCost.CHEAP) answers a Cursor.\n"                    //
+    "predicate=None) answers a Cursor.\n"                                                        //
     "\n"                                                                                         //
     "Opens a walk over the keys of one collection from `start` towards `end`, reading nothing\n" //
     "until its first pull, which `Cursor.next` makes into an arena of its own. Every pull\n"     //
@@ -1851,35 +1844,32 @@ char const doc_cursor[] =                                                       
     "    `start`, largest key first.\n"                                                          //
     "  patterns (Sequence[str | bytes], optional): Patterns every value the walk hands out\n"    //
     "    matches, compiled once here.\n"                                                         //
-    "  predicate (Callable[[tuple[UUID, ...]], Sequence], optional): Asked once per page\n"      //
-    "    about its keys, answering a truthy item for every key the walk keeps.\n"                //
+    "  predicate (Callable[[UUID], bool] | Batch, optional): Asked about each key the walk\n"    //
+    "    lists, keeping it when truthy, or a `Batch` asked once per page.\n"                     //
     "Returns:\n"                                                                                 //
     "  Cursor: The walk, pulled page by page.";
 
 char const doc_docs_cursor[] =                                                                    //
     "docs_cursor(start=None, /, *, collection, end=None, direction=ScanDirection.ASCENDING,\n"    //
-    "filter=None, predicate=None, predicate_cost=PredicateCost.CHEAP) answers a Cursor over\n"    //
-    "documents.\n"                                                                                //
+    "filter=None, predicate=None) answers a Cursor over documents.\n"                             //
     "\n"                                                                                          //
     "Walks as `cursor()` does, every page keeping the documents `filter`, a JSONPath or a bare\n" //
     "root filter such as `?@.age > 30`, matches, and its pulls reading whole documents when\n"    //
     "asked. Calls `ustore_docs_cursor_init`.";
 
-char const doc_pages_cursor[] =                                                                  //
-    "pages_cursor(start=None, /, *, collection, end=None, direction=ScanDirection.ASCENDING,\n"  //
-    "filter=None, predicate=None, predicate_cost=PredicateCost.CHEAP,\n"                         //
-    "outputs_encoding=PageEncoding.XML) answers a Cursor over pages.\n"                          //
-    "\n"                                                                                         //
-    "Walks as `cursor()` does, keeping the pages that hold a node of `filter`, a path in\n"      //
-    "StringZilla's XPath subset such as '/doc/b[2]', and its pulls rendering whole pages into\n" //
+char const doc_pages_cursor[] =                                                                      //
+    "pages_cursor(start=None, /, *, collection, end=None, direction=ScanDirection.ASCENDING,\n"      //
+    "filter=None, predicate=None, outputs_encoding=PageEncoding.XML) answers a Cursor over pages.\n" //
+    "\n"                                                                                             //
+    "Walks as `cursor()` does, keeping the pages that hold a node of `filter`, a path in\n"          //
+    "StringZilla's XPath subset such as '/doc/b[2]', and its pulls rendering whole pages into\n"     //
     "`outputs_encoding` when asked. Calls `ustore_pages_cursor_init`.";
 
-char const doc_graph_vertices_cursor[] =                                                         //
-    "graph_vertices_cursor(start=None, /, *, collection, end=None,\n"                            //
-    "direction=ScanDirection.ASCENDING, predicate=None, predicate_cost=PredicateCost.CHEAP)\n"   //
-    "answers a Cursor over vertices.\n"                                                          //
-    "\n"                                                                                         //
-    "Walks the vertices of one graph collection as `cursor()` walks keys, its pulls answering\n" //
+char const doc_graph_vertices_cursor[] =                                                                 //
+    "graph_vertices_cursor(start=None, /, *, collection, end=None, direction=ScanDirection.ASCENDING,\n" //
+    "predicate=None) answers a Cursor over vertices.\n"                                                  //
+    "\n"                                                                                                 //
+    "Walks the vertices of one graph collection as `cursor()` walks keys, its pulls answering\n"         //
     "keys alone. Calls `ustore_graph_vertices_cursor_init`.";
 
 /** Opens a walk of @p modality as the receiver @p self names, from the start and with the match its arguments give. */
@@ -1946,7 +1936,7 @@ static PyObject* cursor_open(PyObject* self, PyObject* const* arguments, Py_ssiz
     cursor->handle = NULL;
     cursor->modality = modality;
     cursor->outputs_encoding = (ustore_page_encoding_t)outputs_encoding;
-    cursor->predicate.callable = Py_XNewRef(match.predicate);
+    cursor->predicate.handler = Py_XNewRef(match.predicate);
     cursor->database = context.database_handle;
     cursor->executor = (Executor*)Py_XNewRef((PyObject*)context.executor);
     // The patterns and the filter are compiled at init, so they are borrowed only while it runs
@@ -1954,7 +1944,7 @@ static PyObject* cursor_open(PyObject* self, PyObject* const* arguments, Py_ssiz
     memset(&gathered, 0, sizeof(gathered));
     ustore_patterns_t patterns = {0};
     ustore_bytes_view_t filter = {0};
-    ustore_predicate_t const predicate = ustore_py_predicate_of(&cursor->predicate, match.cost);
+    ustore_predicate_t const predicate = ustore_py_predicate_of(&cursor->predicate);
     scan_match_t borrowed = match;
     borrowed.predicate = NULL;
     if (match_fill(&gathered, &borrowed, &patterns, &filter) != 0) {

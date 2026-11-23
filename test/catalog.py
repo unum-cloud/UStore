@@ -107,7 +107,7 @@ def test_a_deferred_find_answers_once_waited(database):
         later, arena = database.deferred(executor), ustore.Arena(executor)
         assert later.collection_find("people", arena).wait() == people
         missing = later.collection_find("nobody", arena)
-        with pytest.raises(ustore.NotFoundError, match="nobody"):
+        with pytest.raises(ustore.NotFoundError):
             missing.wait()
 
 

@@ -10,6 +10,7 @@ Date: November 8, 2026
 """
 
 from std.os import listdir, remove, rmdir
+from std.runtime._asyncrt import create_raising_task
 from std.tempfile import mkdtemp
 from std.sys.info import CompilationTarget
 from std.testing import TestSuite, assert_equal, assert_false, assert_raises, assert_true
@@ -38,6 +39,7 @@ from ustore import (
     Phase,
     PhaseProgress,
     Predicate,
+    PredicateCost,
     Progress,
     Residency,
     column_to_arrow,
@@ -71,6 +73,8 @@ def _stream_key(seed: UInt64, name: String, index: UInt64 = 0) -> UInt64:
     for byte in name.as_bytes():
         hashed = (hashed ^ UInt64(byte)) * 0x100000001B3
     return _split_mix_bits(_split_mix_bits(seed ^ hashed) + index)
+
+
 # endregion Shared Testing
 
 
@@ -211,7 +215,9 @@ def test_strings_map_onto_keys() raises:
     var names = db.collection_create("names", Modality.STRINGS)
     var strings = _Tape(["apple", "apricot", "banana"])
     var keys: List[Key] = [Key(10), Key(11), Key(12)]
-    db.strings_write(CollectionsView.repeating(names), StringsView.of(strings.bytes, strings.offsets), KeysView.of(keys))
+    db.strings_write(
+        CollectionsView.repeating(names), StringsView.of(strings.bytes, strings.offsets), KeysView.of(keys)
+    )
 
     var arena = Arena(library)
     var asked = _Tape(["apricot", "cherry"])
@@ -221,7 +227,9 @@ def test_strings_map_onto_keys() raises:
     assert_true(found.keys()[0] == Key(11))
 
     var prefix = _Tape(["ap"])
-    var listed = db.strings_scan(CollectionsView.repeating(names), StringsView.of(prefix.bytes, prefix.offsets), 10, arena)
+    var listed = db.strings_scan(
+        CollectionsView.repeating(names), StringsView.of(prefix.bytes, prefix.offsets), 10, arena
+    )
     var tape = listed.strings()
     assert_equal(len(tape), 2)
     assert_equal(_text(tape[0]), "apple")
@@ -238,7 +246,9 @@ def test_docs_write_and_read() raises:
     var movies = db.collection_create("movies", Modality.DOCS)
     var key = Key(1)
     var documents = _Tape(['{"title":"Alien","year":1979}'])
-    db.docs_write(CollectionsView.repeating(movies), KeysView.repeating(key), StringsView.of(documents.bytes, documents.offsets))
+    db.docs_write(
+        CollectionsView.repeating(movies), KeysView.repeating(key), StringsView.of(documents.bytes, documents.offsets)
+    )
 
     var arena = Arena(library)
     var whole = db.docs_read(CollectionsView.repeating(movies), KeysView.repeating(key), arena)
@@ -247,7 +257,10 @@ def test_docs_write_and_read() raises:
 
     var fields = _Tape(["/year"])
     var year = db.docs_read(
-        CollectionsView.repeating(movies), KeysView.repeating(key), arena, DocsReadConfig(fields=StringsView.of(fields.bytes, fields.offsets))
+        CollectionsView.repeating(movies),
+        KeysView.repeating(key),
+        arena,
+        DocsReadConfig(fields=StringsView.of(fields.bytes, fields.offsets)),
     )
     assert_equal(_text(year.values()[0]), "1979")
 
@@ -301,6 +314,98 @@ def test_deferred_calls_match_blocking_ones() raises:
     var arena = Arena(executor)
     var read = db.deferred(executor).read(CollectionsView.repeating(people), KeysView.repeating(key), arena)
     assert_equal(_text(read.wait().values()[0]), "deferred")
+
+
+async def _read_both(
+    east: Database,
+    west: Database,
+    east_executor: Executor,
+    west_executor: Executor,
+    east_people: CollectionID,
+    west_people: CollectionID,
+) raises -> String:
+    """Reads one key from two databases at once, each on its own executor and arena, and joins the values."""
+    var key = Key(5)
+    var east_arena = Arena(east_executor)
+    var west_arena = Arena(west_executor)
+    var east_call = east.deferred(east_executor).read(
+        CollectionsView.repeating(east_people), KeysView.repeating(key), east_arena
+    )
+    var west_call = west.deferred(west_executor).read(
+        CollectionsView.repeating(west_people), KeysView.repeating(key), west_arena
+    )
+    ref east_values = await east_call
+    ref west_values = await west_call
+    return _text(east_values.values()[0]) + _text(west_values.values()[0])
+
+
+def test_awaited_fan_out_answers_both_databases() raises:
+    """Two deferred reads submitted before either is awaited both answer inside one task."""
+    if not _library_is_present():
+        _skipped(library_missing_k)
+        return
+    var library = Library()
+    var east = Database.init_ram(Executor(library))
+    var west = Database.init_ram(Executor(library))
+    var east_people = east.collection_create("people", Modality.BLOBS)
+    var west_people = west.collection_create("people", Modality.BLOBS)
+    var key = Key(5)
+    var east_values = _Tape(["east"])
+    var west_values = _Tape(["west"])
+    east.write(
+        CollectionsView.repeating(east_people),
+        KeysView.repeating(key),
+        StringsView.of(east_values.bytes, east_values.offsets),
+    )
+    west.write(
+        CollectionsView.repeating(west_people),
+        KeysView.repeating(key),
+        StringsView.of(west_values.bytes, west_values.offsets),
+    )
+    var east_executor = Executor.for_ram(library, threads=2)
+    var west_executor = Executor.for_ram(library, threads=2)
+    var both = create_raising_task(_read_both(east, west, east_executor, west_executor, east_people, west_people))
+    assert_equal(both^.wait(), "eastwest")
+
+
+async def _finish_unopened(db: Database, executor: Executor) raises -> Int:
+    """Awaits the finish of a plan no compaction opened and answers the status code it failed with."""
+    var call = db.deferred(executor).compact_plan_finish(DatabaseCompactPlan())
+    try:
+        _ = await call
+    except error:
+        return Int(error.status.code)
+    return 0
+
+
+def test_awaited_failures_raise() raises:
+    """A deferred call the engine refuses raises its failure through `await` and the task's wait."""
+    if not _library_is_present():
+        _skipped(library_missing_k)
+        return
+    var library = Library()
+    var executor = Executor.for_ram(library, threads=2)
+    var db = Database.init_ram(Executor(library))
+    var failing = create_raising_task(_finish_unopened(db, executor))
+    assert_equal(failing^.wait(), Int(Status.INVALID_ARGUMENT.code), "the refusal reaches the awaiting task")
+
+
+def test_arenas_free_before_their_executor() raises:
+    """An arena borrows the executor that made it, so the executor outlives it past its own last use."""
+    if not _library_is_present():
+        _skipped(library_missing_k)
+        return
+    var library = Library()
+    var db = Database.init_ram(Executor(library))
+    var people = db.collection_create("people", Modality.BLOBS)
+    var key = Key(5)
+    var values = _Tape(["kept"])
+    db.write(CollectionsView.repeating(people), KeysView.repeating(key), StringsView.of(values.bytes, values.offsets))
+    var executor = Executor.for_ram(library, threads=2)
+    var arena = Arena(executor)
+    for _ in range(2):
+        var read = db.read(CollectionsView.repeating(people), KeysView.repeating(key), arena)
+        assert_equal(_text(read.values()[0]), "kept", "the arena serves calls after its executor's last use")
 
 
 @fieldwise_init
@@ -359,7 +464,7 @@ def test_a_held_executor_refuses_the_next_call() raises:
         KeysView.repeating(start),
         10,
         arena,
-        BlobsScanConfig(predicate=Predicate.of[_write_on_the_held_executor](Pointer(to=holder))),
+        BlobsScanConfig(predicate=Predicate.batch[_write_on_the_held_executor](Pointer(to=holder))),
     )
     assert_true(holder.refused == Status.CONTENDED, "a call on a held executor must finish contended")
     assert_equal(len(scanned.run(0)), 1)
@@ -470,15 +575,22 @@ def test_compact_plans_stay_live_until_finished() raises:
     _ = db^  # the database a plan names outlives its finish
 
 
-def _admit_even(keys: Span[Key, MutAnyOrigin], admissions: Span[Admission, MutAnyOrigin], asked: Pointer[Int, MutAnyOrigin]):
+def _is_even(key: Key, asked: Pointer[Int, MutAnyOrigin]) -> Bool:
+    """Whether the key's integer is even, counting the keys it was asked about."""
+    asked[] += 1
+    return key.uuid.bytes[15] % 2 == 0
+
+
+def _admit_even(
+    keys: Span[Key, MutAnyOrigin], admissions: Span[Admission, MutAnyOrigin], asked: Pointer[Int, MutAnyOrigin]
+):
     """A predicate admitting the keys whose integer is even, counting the keys it was asked about."""
     for index in range(len(keys)):
-        asked[] += 1
-        admissions[index] = Admission.ADMIT if keys[index].uuid.bytes[15] % 2 == 0 else Admission.REJECT
+        admissions[index] = Admission.ADMIT if _is_even(keys[index], asked) else Admission.REJECT
 
 
 def test_predicate_filters_a_scan() raises:
-    """A scan lists only the keys its predicate admits."""
+    """A scan lists only the keys its per-key or batch predicate admits."""
     if not _library_is_present():
         _skipped(library_missing_k)
         return
@@ -492,17 +604,22 @@ def test_predicate_filters_a_scan() raises:
     var arena = Arena(library)
     var asked = 0
     var start = Key(0)
-    var admitted = db.scan(
-        CollectionsView.repeating(people),
-        KeysView.repeating(start),
-        10,
-        arena,
-        BlobsScanConfig(predicate=Predicate.of[_admit_even](Pointer(to=asked))),
-    )
-    var run = admitted.run(0)
-    assert_equal(len(run), 3)
-    assert_true(run[0] == Key(2) and run[1] == Key(4) and run[2] == Key(6))
-    assert_true(asked >= 6)
+    var predicates = [Predicate.each[_is_even](Pointer(to=asked)), Predicate.batch[_admit_even](Pointer(to=asked))]
+    assert_true(predicates[0].cost == PredicateCost.CHEAP, "a per-key predicate is cheap")
+    assert_true(predicates[1].cost == PredicateCost.EXPENSIVE, "and a batch one expensive unless told otherwise")
+    for predicate in predicates:
+        asked = 0
+        var admitted = db.scan(
+            CollectionsView.repeating(people),
+            KeysView.repeating(start),
+            10,
+            arena,
+            BlobsScanConfig(predicate=predicate),
+        )
+        var run = admitted.run(0)
+        assert_equal(len(run), 3)
+        assert_true(run[0] == Key(2) and run[1] == Key(4) and run[2] == Key(6))
+        assert_true(asked >= 6)
 
 
 def test_transactions_commit_their_writes() raises:
@@ -517,7 +634,9 @@ def test_transactions_commit_their_writes() raises:
     var values = _Tape(["pending"])
     var arena = Arena(library)
     var transaction = db.transaction()
-    transaction.write(CollectionsView.repeating(people), KeysView.repeating(key), StringsView.of(values.bytes, values.offsets))
+    transaction.write(
+        CollectionsView.repeating(people), KeysView.repeating(key), StringsView.of(values.bytes, values.offsets)
+    )
     assert_false(db.read(CollectionsView.repeating(people), KeysView.repeating(key), arena).present(0))
     var stamp = transaction.commit()
     assert_true(stamp.value > 0)
@@ -535,7 +654,9 @@ def test_databases_open_at_a_directory_and_keep_what_they_held() raises:
     var values = _Tape(["kept"])
     var db = Database.open_ram(Executor(library), directory)
     var collection = db.collection_create("", Modality.BLOBS)
-    db.write(CollectionsView.repeating(collection), KeysView.repeating(key), StringsView.of(values.bytes, values.offsets))
+    db.write(
+        CollectionsView.repeating(collection), KeysView.repeating(key), StringsView.of(values.bytes, values.offsets)
+    )
     db.flush()
     _ = db^
     var reopened = Database.open_ram(Executor(library), directory)
@@ -577,11 +698,17 @@ def test_arrow_exports_read_in_place() raises:
     var movies = db.collection_create("movies", Modality.DOCS)
     var key = Key(1)
     var documents = _Tape(['{"year":1979}'])
-    db.docs_write(CollectionsView.repeating(movies), KeysView.repeating(key), StringsView.of(documents.bytes, documents.offsets))
+    db.docs_write(
+        CollectionsView.repeating(movies), KeysView.repeating(key), StringsView.of(documents.bytes, documents.offsets)
+    )
     var fields = _Tape(["year"])
     var types: List[FieldType] = [FieldType.I64]
     var gathered = db.docs_gather(
-        CollectionsView.repeating(movies), KeysView.repeating(key), StringsView.of(fields.bytes, fields.offsets), types, arena
+        CollectionsView.repeating(movies),
+        KeysView.repeating(key),
+        StringsView.of(fields.bytes, fields.offsets),
+        types,
+        arena,
     )
     assert_equal(len(column_to_arrow(gathered.column(0), FieldType.I64)), 1)
 
@@ -619,6 +746,9 @@ def main() raises:
     suite.test[test_docs_write_and_read]()
     suite.test[test_graph_edges_round_trip]()
     suite.test[test_deferred_calls_match_blocking_ones]()
+    suite.test[test_awaited_fan_out_answers_both_databases]()
+    suite.test[test_awaited_failures_raise]()
+    suite.test[test_arenas_free_before_their_executor]()
     suite.test[test_a_held_executor_refuses_the_next_call]()
     suite.test[test_a_drain_frees_the_executor_in_either_mood]()
     suite.test[test_progress_reports_and_cancels]()

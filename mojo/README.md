@@ -1,7 +1,7 @@
 # UStore for Mojo
 
 The Mojo package binds the C ABI in `c/ustore/`, opening the engine's shared library with `dlopen` rather than linking it, so a consumer builds with no linker flags of its own.
-It needs Mojo 1.2 through pixi, on Linux x86-64, Linux AArch64 or macOS on Apple silicon.
+It needs the Mojo nightly the workspace pins, through pixi, on Linux x86-64, Linux AArch64 or macOS on Apple silicon.
 It binds every exported verb, the Arrow exchange included:
 
 - `Library`: the engine, opened once and kept mapped by every handle made through it.
@@ -116,24 +116,24 @@ print(len(page.keys()))
 
 Handlers are compile-time parameters, since a capturing closure cannot cross into C, and their state crosses beside them as a pointer that must outlive the call.
 A progress handler answering `Continuation.CANCEL` stops the call, which raises `Status.CANCELLED`, and a predicate admits or rejects every key a scan meets.
+`Predicate.each` asks a cheap handler about one key at a time, before patterns or filters read any value, and `Predicate.batch` hands a handler a page of keys to write one `Admission` apiece, asked about the keys patterns and filters kept unless passed `PredicateCost.CHEAP`.
 
 ```mojo
 def stop_at_once(finished: Int, total: Int, seen: Pointer[Int, MutAnyOrigin]) -> Continuation:
     seen[] = finished
     return Continuation.CANCEL
 
-def admit_even(keys: Span[Key, MutAnyOrigin], admissions: Span[Admission, MutAnyOrigin], state: Pointer[Int, MutAnyOrigin]):
-    for index in range(len(keys)):
-        admissions[index] = Admission.ADMIT if keys[index].uuid.bytes[15] % 2 == 0 else Admission.REJECT
+def is_even(key: Key, state: Pointer[Int, MutAnyOrigin]) -> Bool:
+    return key.uuid.bytes[15] % 2 == 0
 
 var seen = 0
-var even = BlobsScanConfig(predicate=Predicate.of[admit_even](Pointer(to=seen)))
+var even = BlobsScanConfig(predicate=Predicate.each[is_even](Pointer(to=seen)))
 var evens = db.scan(CollectionsView.repeating(people), KeysView.repeating(start), 100, arena, even)
 var cancelling = BlobsScanConfig(progress=Progress.of[stop_at_once](Pointer(to=seen)))
 _ = db.scan(CollectionsView.repeating(people), KeysView.repeating(start), 100, arena, cancelling)  # raises
 ```
 
-Progress handlers return a value, which Mojo 1.2 is confirmed to pass back on Linux x86-64; Linux AArch64 and macOS rest on the CI matrix.
+Handlers that return a value run in the CI matrix on Linux x86-64, Linux AArch64 and macOS.
 
 ## Transactions
 
@@ -209,20 +209,45 @@ print(Int(leaving.degrees()[1]))  # 0, as vertex 2 leaves by no edge
 
 The receiver chooses where a verb runs, what it sees and how it completes, and the verb stays the same, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#receivers--deferred-calls) describe in full.
 A database, transaction or snapshot runs a verb on the calling thread, `handle.on(executor)` blocks on an executor, and `handle.deferred(executor)` submits there and answers a `Deferred`.
-A `Deferred` owns its outcome and outputs and borrows its arena and inputs, which Mojo's origins keep alive for as long as it is; `wait` blocks in `ustore_outcome_wait` and answers the result or raises, `status` polls, and destroying an unfinished one waits for it.
+A `Deferred` keeps its outcome and outputs inline and never moves: the receiver builds it in your variable and submits it there, so it allocates nothing.
+It borrows the receiver, and through it the handle and the executor, along with its arena and inputs, which Mojo's origins keep alive for as long as it is.
+`wait` blocks in `ustore_outcome_wait` and answers the result or raises, `status` polls, and destroying an unfinished one waits for it.
 
 ```mojo
-db.write(collections, keys, values)                       # the head, on the calling thread
-db.on(executor).write(collections, keys, values)          # blocking, on the executor
-var call = db.deferred(executor).read(collections, keys, arena)  # Deferred[...]
-print(call.wait().present(0))
+db.write(collections, keys, values)                              # the head, on the calling thread
+db.on(executor).write(collections, keys, values)                 # blocking, on the executor
+var call = db.deferred(executor).read(collections, keys, arena)  # running now
+other_work()
+ref values = call.wait()                                         # blocks until final
+print(values.present(0))
 ```
+
+Inside an `async def`, `await call` answers the same, re-polling the status and yielding to Mojo's runtime while the call is pending; a task re-raises a failure as Mojo's own `Error`, which keeps the message but not the `status`:
+
+```mojo
+from std.runtime._asyncrt import create_raising_task  # Mojo's runtime entry point today
+
+async def read_both(east: Database, west: Database, east_executor: Executor, west_executor: Executor,
+                    east_people: CollectionID, west_people: CollectionID, keys: KeysView) raises -> Bool:
+    var east_arena = Arena(east_executor)  # borrows east_executor until it is freed
+    var west_arena = Arena(west_executor)
+    var east_call = east.deferred(east_executor).read(CollectionsView.repeating(east_people), keys, east_arena)  # running now
+    var west_call = west.deferred(west_executor).read(CollectionsView.repeating(west_people), keys, west_arena)
+    ref east_values = await east_call  # raises the call's failure
+    ref west_values = await west_call
+    return east_values.present(0) and west_values.present(0)
+
+var both = create_raising_task(read_both(east, west, east_executor, west_executor, east_people, west_people, keys))
+print(both^.wait())  # drives the coroutine on the runtime
+```
+
+Mojo still calls async experimental and reaches its runtime through underscored modules, so `await` and this entry point move to a public runtime once Mojo stabilizes one.
 
 ## Executors
 
 An executor owns the threads or rings calls run on, and serves one call at a time, so a call on one serving another raises `Status.CONTENDED`.
 `Executor(library)` owns nothing and runs every verb on the calling thread, `Executor.for_ram` spawns host threads near the NUMA nodes its `RamOptions` name, `Executor.for_nvme` spawns the NVMe engine's rings, and `Executor.for_vram` drives one GPU.
-An executor is freed once it and every device arena it made go out of scope, and freeing it waits for the calls naming it, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#executors) describe.
+An executor is freed once it goes out of scope, after every arena it made, since each arena borrows it, and freeing it waits for the calls naming it, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#executors) describe.
 
 ```mojo
 var domains: List[Int32] = [0]
@@ -250,15 +275,6 @@ _ = first.present(0)  # raises: its arena served a later call
 
 Every view tracks the origin of what it borrows, so the data outlives the call that reads it, and every deferred call takes an arena of its own.
 
-Outputs export in place through the Arrow C data interface: `keys_to_arrow`, `tape_to_arrow` and `column_to_arrow` answer an `ArrowExport` whose schema and array addresses any Arrow consumer imports, and `keys_from_arrow` and `strings_from_arrow` read an Arrow column back as a call's input.
-
-```mojo
-var scanned = db.scan(CollectionsView.repeating(people), KeysView.repeating(Key(0)), 10, arena)
-var exported = keys_to_arrow(KeysView.of(scanned.keys()), arena)  # fixed_size_binary(16), arrow.uuid
-var keys = keys_from_arrow(arena, exported.schema_address(), exported.array_address())
-_ = exported^  # Mojo frees at last use, so the export outlives every view of its buffers
-```
-
 ## Errors
 
 Every fallible entry point raises `Error` and nothing else, since Mojo allows one error type per function, and an `Error` carries a `Status` shared with the C interface.
@@ -273,6 +289,23 @@ except error:
     print(error)  # UStore: not-found [ustore_collection_drop]: ...
 ```
 
+## Apache Arrow
+
+The converters of `c/ustore/arrow.h` view an Arrow column as a call's input in place, and export what a call wrote into an arena as an `ArrowExport` whose schema and array addresses any Arrow consumer imports:
+
+```mojo
+var scanned = db.scan(CollectionsView.repeating(people), KeysView.repeating(Key(0)), 10, arena)
+var exported = keys_to_arrow(KeysView.of(scanned.keys()), arena)  # fixed_size_binary(16), arrow.uuid
+var keys = keys_from_arrow(arena, exported.schema_address(), exported.array_address())  # the same keys, in place
+
+var columns = db.docs_gather(CollectionsView.repeating(movies), keys, StringsView.of(paths, path_offsets), types, other)
+var years = column_to_arrow(columns.column(0), FieldType.I64)  # the gathered column, with its validities
+_ = exported^  # Mojo frees at last use, so the export outlives every view of its buffers
+_ = years^
+```
+
+`keys_from_arrow` and `strings_from_arrow` read keys and strings, and `keys_to_arrow`, `tape_to_arrow` and `column_to_arrow` write keys, strings and gathered columns.
+
 ## Platform Notes
 
 ### Engines
@@ -282,7 +315,7 @@ The RAM and NVMe opens take a `cpu_class_ceiling`, the newest `CPUClass` the dat
 `describe`, `clear`, `compact` and `flush` act on the whole database through any receiver, and a `DatabaseCompactPlan` keeps a cancelled compaction open until `compact_plan_finish`.
 On Linux the engine builds against conda-forge's glibc 2.39 sysroot, whose kernel headers carry the `io_uring` flags the NVMe engine needs.
 
-### What This Binding Does Not Expose
+### Left Unbound
 
 On x86-64 `tape_to_arrow` raises `Status.UNSUPPORTED`, since that ABI passes the 24-byte strings view on the stack, where a Mojo call cannot place it.
 The accessor layout of a strings batch, which reads strings through a C callback, is not exposed: Mojo passes the two tape layouts.

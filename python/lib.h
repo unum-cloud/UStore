@@ -145,6 +145,7 @@ extern PyTypeObject ArenaType;
 extern PyTypeObject OnType;
 extern PyTypeObject DeferredOnType;
 extern PyTypeObject DeferredType;
+extern PyTypeObject BatchType;
 extern PyTypeObject ValuesType;
 extern PyTypeObject KeysType;
 extern PyTypeObject ColumnsType;
@@ -445,8 +446,8 @@ typedef struct ustore_py_context_t {
 /** A predicate the caller passed a scan or a cursor, re-entered from whichever thread runs the call. */
 typedef struct ustore_py_predicate_t {
 
-    /** The callable admitting keys, held, or NULL when the caller passed none. */
-    PyObject* callable;
+    /** The callable asked per key or the @c Batch asked per page, held, or NULL for none. */
+    PyObject* handler;
 } ustore_py_predicate_t;
 
 /** What every call keeps until it finishes, leading its verb's call: on the stack while it blocks, inside its
@@ -958,13 +959,16 @@ int ustore_py_progress_from_object(PyObject* object, PyObject** progress);
 ustore_progress_callback_t ustore_py_progress_callback(ustore_py_call_t const* call);
 
 /**
- *  @brief Reads @p object, a callable or None, as the predicate of a scan or a cursor.
+ *  @brief Reads @p object, a callable asked per key, a @c Batch or None, as the predicate of a
+ *      scan or a cursor.
+ *  @param[out] handler The object, borrowed, or NULL for None.
  *  @return 0 on success, -1 with a @c TypeError set otherwise.
  */
-int ustore_py_predicate_from_object(PyObject* object, PyObject** callable);
+int ustore_py_predicate_from_object(PyObject* object, PyObject** handler);
 
-/** The C predicate re-entering the callable @p predicate holds, asked at @p cost, zeroed when it holds none. */
-ustore_predicate_t ustore_py_predicate_of(ustore_py_predicate_t* predicate, int cost);
+/** The C predicate re-entering what @p predicate holds: cheap per key for a callable, at the cost
+ *  a @c Batch carries for one; zeroed when it holds none. */
+ustore_predicate_t ustore_py_predicate_of(ustore_py_predicate_t* predicate);
 
 /**
  *  @brief Reads one UUID from a `uuid.UUID`, 16 raw bytes, canonical UUID text or a non-negative integer.

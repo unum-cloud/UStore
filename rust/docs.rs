@@ -6,7 +6,7 @@
 //! whole document.
 //!
 //! ```no_run
-//! use ustore::{Arena, Column, RAMOptions, Database, DocumentEntry, Durability, FieldAddress, FieldEntry};
+//! use ustore::{Arena, Column, Database, DocsVerbs, DocumentEntry, Durability, FieldAddress, FieldEntry, RAMOptions};
 //! use ustore::{Json, Key, Modality, Modification, Text};
 //!
 //! let database = Database::init_ram(&RAMOptions::default())?;
@@ -59,7 +59,7 @@
 //! while they live:
 //!
 //! ```compile_fail,E0499
-//! use ustore::{Arena, Column, RAMOptions, Database, Key, Modality, Text};
+//! use ustore::{Arena, Column, RAMOptions, Database, Key, Modality, Text, DocsVerbs};
 //!
 //! let database = Database::init_ram(&RAMOptions::default())?;
 //! let mut arena = Arena::new()?;
@@ -95,11 +95,11 @@ use crate::db::ffi::{
     ustore_progress_callback_t, ustore_scan_direction_t, ustore_scan_mode_t, ustore_size_t, ustore_strided_view_t,
     ustore_strings_view_t, ustore_transaction_t, ustore_view_t, ustore_watch_t,
 };
-use crate::db::sealed::{Accepts, Calling, TapeOffset, Writable};
+use crate::db::sealed::{Accepts, Calling, Completion, Handles, TapeOffset, Writable};
 use crate::db::{
-    Address, Arena, CollectionID, Collections, Deferring, Durability, Error, Key, KeyRange, Matching, On, Progress,
-    ProgressCallback, Result, Rows, ScanMode, Status, Strings, UUID, check, exported_slice, fail, host_arena,
-    read_spelling, spelling,
+    Address, Arena, CollectionID, Collections, CursorOn, Deferrable, Deferring, Durability, Error, Executor, Key,
+    KeyRange, Matching, On, Progress, Result, Rows, ScanMode, Status, Strings, UUID, ViewVerbs, check, exported_slice,
+    fail, host_arena, lowered_progress, read_spelling, spelling,
 };
 
 // region: Raw Declarations
@@ -960,7 +960,8 @@ impl<Keys: AsRef<[Key]>, Offset: TapeOffset> Addresses for (Keys, CharsTape<Offs
     }
 }
 
-/// The document keys a scan keeps, what admits them and how it reports; see [`On::docs_scan`].
+/// The document keys a scan keeps, what admits them and how it reports, as
+/// [`DocsVerbs::docs_scan`] takes them.
 pub struct DocsScanConfig<'config> {
     /// Keys kept, at most.
     pub wanted: usize,
@@ -969,7 +970,7 @@ pub struct DocsScanConfig<'config> {
     /// In what order the keys come.
     pub mode: ScanMode,
     /// Reports the scans finished and stops wherever it says to.
-    pub progress: Option<Box<ProgressCallback<'config>>>,
+    pub progress: Option<Progress<'config>>,
 }
 
 impl From<usize> for DocsScanConfig<'_> {
@@ -978,7 +979,7 @@ impl From<usize> for DocsScanConfig<'_> {
     }
 }
 
-/// The document keys a sample draws; see [`On::docs_sample`].
+/// The document keys a sample draws; see [`DocsVerbs::docs_sample`].
 #[derive(Clone, Copy, Debug)]
 pub struct DocsSampleConfig {
     /// Keys drawn, at most.
@@ -991,7 +992,7 @@ impl From<usize> for DocsSampleConfig {
     }
 }
 
-/// The typed columns a gather reads; see [`On::docs_gather`].
+/// The typed columns a gather reads; see [`DocsVerbs::docs_gather`].
 #[derive(Clone, Copy, Debug)]
 pub struct DocsGatherConfig<Requested> {
     /// The fields and the format each lands in, borrowed or owned.
@@ -1236,7 +1237,7 @@ impl<'arena, 'field, Requested: AsRef<[Column<'field>]>> Columns<'arena, Request
     /// would rewind it does not compile while one lives:
     ///
     /// ```compile_fail,E0499
-    /// use ustore::{Arena, Column, RAMOptions, Database, Key, Modality, Text};
+    /// use ustore::{Arena, Column, RAMOptions, Database, Key, Modality, Text, DocsVerbs};
     ///
     /// let database = Database::init_ram(&RAMOptions::default())?;
     /// let mut arena = Arena::new()?;
@@ -1310,9 +1311,13 @@ impl<'arena, 'field, Requested: AsRef<[Column<'field>]>> Columns<'arena, Request
 
 // region: Verbs
 
-impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent, Completion> {
-    /// Writes whole documents or values into fields inside them, where [`On::docs_remove`] removes
-    /// documents and a merge with a JSON `null` removes a field, and hands what it wrote back.
+/// The verbs over documents, written once for every receiver of [`ViewVerbs`]: a handle blocks on
+/// the calling thread, and an [`On`] runs on its executor, blocking or deferred.
+///
+/// Rust-only.
+pub trait DocsVerbs<'view>: ViewVerbs<'view> {
+    /// Writes whole documents or values into fields inside them, and hands what it wrote back.
+    /// [`DocsVerbs::docs_remove`] removes documents, and merging a JSON `null` removes a field.
     ///
     /// The batch is one of:
     /// - borrowed [`DocumentEntry`] values of one format, which is [`Json`] for the text the engine parses and a
@@ -1325,63 +1330,66 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
     /// A transaction flushes at its commit, so [`Durability::Flushed`] is refused inside one.
     ///
     /// Calls `ustore_docs_write`.
-    pub fn docs_write<'collections, Documents: Writes>(
-        &self,
+    fn docs_write<'collections, Documents: Writes>(
+        self,
         collections: impl Into<Collections<'collections>>,
         documents: Documents,
         modification: Modification,
         durability: Durability,
-    ) -> Completion::Answer<DocsWrite<'collections, Documents>>
+    ) -> Deferrable<'view, Self, DocsWrite<'collections, Documents>>
     where
-        Completion: Accepts<Collections<'collections>> + Accepts<Documents>,
+        Self::Parent: Writable,
+        Self::Completion: Accepts<Collections<'collections>> + Accepts<Documents>,
     {
         let verb = DocsWrite { collections: collections.into(), documents, modification, durability };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
     /// Removes a batch of whole documents, whether or not the collections hold them, and hands the keys back.
     ///
     /// Calls `ustore_docs_remove`.
-    pub fn docs_remove<'collections, Keys: AsRef<[Key]>>(
-        &self,
+    fn docs_remove<'collections, Keys: AsRef<[Key]>>(
+        self,
         collections: impl Into<Collections<'collections>>,
         keys: Keys,
         durability: Durability,
-    ) -> Completion::Answer<DocsRemove<'collections, Keys>>
+    ) -> Deferrable<'view, Self, DocsRemove<'collections, Keys>>
     where
-        Completion: Accepts<Collections<'collections>> + Accepts<Keys>,
+        Self::Parent: Writable,
+        Self::Completion: Accepts<Collections<'collections>> + Accepts<Keys>,
     {
         let verb = DocsRemove { collections: collections.into(), keys, durability };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
     /// Removes every document of one collection from `range.start`, inclusive, to `range.end`,
     /// exclusive, in one atomic call.
-    pub fn docs_remove_range(
-        &self,
+    fn docs_remove_range(
+        self,
         collection: CollectionID,
         range: Range<Key>,
         durability: Durability,
-    ) -> Completion::Answer<DocsRemoveRange> {
+    ) -> Deferrable<'view, Self, DocsRemoveRange>
+    where
+        Self::Parent: Writable,
+    {
         let verb = DocsRemoveRange { collection, range, durability };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
-}
 
-impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completion> {
     /// Lists up to `wanted` document keys of one collection's `range` into the arena, keeping those
     /// whose document the filter of `matching` admits and the keys its predicate admits.
     ///
     /// Calls `ustore_docs_scan`.
-    pub fn docs_scan<'config, 'arena>(
-        &self,
+    fn docs_scan<'config, 'arena>(
+        self,
         collection: CollectionID,
         range: impl Into<KeyRange>,
         config: impl Into<DocsScanConfig<'config>>,
-        arena: &'arena mut Arena,
-    ) -> Completion::Answer<DocsScan<'arena, 'config>>
+        arena: &'arena mut Arena<'_>,
+    ) -> Deferrable<'view, Self, DocsScan<'arena, 'config>>
     where
-        Completion: Accepts<DocsScanConfig<'config>>,
+        Self::Completion: Accepts<DocsScanConfig<'config>>,
     {
         let range = range.into();
         let DocsScanConfig { wanted, matching, mode, progress } = config.into();
@@ -1393,34 +1401,34 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
             wanted,
             matched: matching,
             mode,
-            progress: Progress(progress),
+            progress,
             found: Found::default(),
         };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
     /// Draws up to `wanted` document keys uniformly at random from one collection into the arena.
-    pub fn docs_sample<'arena>(
-        &self,
+    fn docs_sample<'arena>(
+        self,
         collection: CollectionID,
         config: impl Into<DocsSampleConfig>,
-        arena: &'arena mut Arena,
-    ) -> Completion::Answer<DocsSample<'arena>> {
+        arena: &'arena mut Arena<'_>,
+    ) -> Deferrable<'view, Self, DocsSample<'arena>> {
         let verb = DocsSample { collection, arena, wanted: config.into().wanted, found: Found::default() };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
     /// Estimates the documents and the space a range of keys takes in one collection, through the
     /// arena its bounds land in.
-    pub fn docs_measure<'arena>(
-        &self,
+    fn docs_measure<'arena>(
+        self,
         collection: CollectionID,
         range: impl Into<KeyRange>,
-        arena: &'arena mut Arena,
-    ) -> Completion::Answer<DocsMeasure<'arena>> {
+        arena: &'arena mut Arena<'_>,
+    ) -> Deferrable<'view, Self, DocsMeasure<'arena>> {
         let range = range.into();
         let verb = DocsMeasure { collection, start: range.start_key(), range, arena, bounds: Bounds::default() };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
     /// Reads whole documents or fields inside them into the arena in `format`, [`Json`] or [`Text`], reporting a
@@ -1430,15 +1438,15 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
     /// `stringtape::CharsTape` of paths, a path per key, which a deferred read needs.
     ///
     /// Calls `ustore_docs_read`.
-    pub fn docs_read<'arena, 'collections, Targets: Addresses, Format: ReadFormat>(
-        &self,
+    fn docs_read<'arena, 'collections, Targets: Addresses, Format: ReadFormat>(
+        self,
         collections: impl Into<Collections<'collections>>,
         targets: Targets,
         format: Format,
-        arena: &'arena mut Arena,
-    ) -> Completion::Answer<DocsRead<'arena, 'collections, Targets>>
+        arena: &'arena mut Arena<'_>,
+    ) -> Deferrable<'view, Self, DocsRead<'arena, 'collections, Targets>>
     where
-        Completion: Accepts<Collections<'collections>> + Accepts<Targets>,
+        Self::Completion: Accepts<Collections<'collections>> + Accepts<Targets>,
     {
         let _ = format;
         let verb = DocsRead {
@@ -1450,20 +1458,20 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
             presences: Address::default(),
             values: ustore_strings_view_t::default(),
         };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
     /// Lists the unique paths to the leaves of the documents under `keys` into the arena.
     ///
     /// Calls `ustore_docs_gist`.
-    pub fn docs_gist<'arena, 'collections, Keys: AsRef<[Key]>>(
-        &self,
+    fn docs_gist<'arena, 'collections, Keys: AsRef<[Key]>>(
+        self,
         collections: impl Into<Collections<'collections>>,
         keys: Keys,
-        arena: &'arena mut Arena,
-    ) -> Completion::Answer<DocsGist<'arena, 'collections, Keys>>
+        arena: &'arena mut Arena<'_>,
+    ) -> Deferrable<'view, Self, DocsGist<'arena, 'collections, Keys>>
     where
-        Completion: Accepts<Collections<'collections>> + Accepts<Keys>,
+        Self::Completion: Accepts<Collections<'collections>> + Accepts<Keys>,
     {
         let verb = DocsGist {
             collections: collections.into(),
@@ -1472,7 +1480,7 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
             written: 0,
             fields: ustore_strings_view_t::default(),
         };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 
     /// Reads `columns` of the documents under `keys` into typed columns in the arena, a row per key.
@@ -1481,15 +1489,15 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
     /// keys and owned columns, whose paths are owned or `'static`.
     ///
     /// Calls `ustore_docs_gather`.
-    pub fn docs_gather<'arena, 'collections, Keys: AsRef<[Key]>, Requested>(
-        &self,
+    fn docs_gather<'arena, 'collections, Keys: AsRef<[Key]>, Requested>(
+        self,
         collections: impl Into<Collections<'collections>>,
         keys: Keys,
         config: impl Into<DocsGatherConfig<Requested>>,
-        arena: &'arena mut Arena,
-    ) -> Completion::Answer<DocsGather<'arena, 'collections, Keys, Requested>>
+        arena: &'arena mut Arena<'_>,
+    ) -> Deferrable<'view, Self, DocsGather<'arena, 'collections, Keys, Requested>>
     where
-        Completion: Accepts<Collections<'collections>> + Accepts<Keys> + Accepts<Requested>,
+        Self::Completion: Accepts<Collections<'collections>> + Accepts<Keys> + Accepts<Requested>,
         DocsGather<'arena, 'collections, Keys, Requested>: Calling,
     {
         let verb = DocsGather {
@@ -1500,11 +1508,13 @@ impl<Parent, Completion: crate::db::sealed::Completion> On<'_, Parent, Completio
             formats: Vec::new(),
             views: Address::default(),
         };
-        Completion::answer(self, verb)
+        <Self::Completion as Completion>::answer(&self.receiver(), verb)
     }
 }
 
-/// A write of whole documents or of fields inside them; see [`On::docs_write`].
+impl<'view, Receiver: ViewVerbs<'view>> DocsVerbs<'view> for Receiver {}
+
+/// A write of whole documents or of fields inside them; see [`DocsVerbs::docs_write`].
 #[derive(Debug)]
 pub struct DocsWrite<'collections, Documents> {
     collections: Collections<'collections>,
@@ -1517,9 +1527,9 @@ impl<Documents: Writes> Calling for DocsWrite<'_, Documents> {
     type Arguments = ffi::ustore_docs_write_t;
     type Output = Documents;
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1554,7 +1564,7 @@ impl<Documents: Writes> Calling for DocsWrite<'_, Documents> {
     }
 }
 
-/// A removal of a batch of whole documents; see [`On::docs_remove`].
+/// A removal of a batch of whole documents; see [`DocsVerbs::docs_remove`].
 #[derive(Debug)]
 pub struct DocsRemove<'collections, Keys> {
     collections: Collections<'collections>,
@@ -1566,9 +1576,9 @@ impl<Keys: AsRef<[Key]>> Calling for DocsRemove<'_, Keys> {
     type Arguments = ffi::ustore_docs_remove_t;
     type Output = Keys;
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1600,7 +1610,7 @@ impl<Keys: AsRef<[Key]>> Calling for DocsRemove<'_, Keys> {
     }
 }
 
-/// A removal of one range of documents; see [`On::docs_remove_range`].
+/// A removal of one range of documents; see [`DocsVerbs::docs_remove_range`].
 #[derive(Debug)]
 pub struct DocsRemoveRange {
     collection: CollectionID,
@@ -1612,9 +1622,9 @@ impl Calling for DocsRemoveRange {
     type Arguments = ffi::ustore_docs_remove_t;
     type Output = ();
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1642,17 +1652,17 @@ impl Calling for DocsRemoveRange {
     }
 }
 
-/// A walk over the document keys of one collection; see [`On::docs_scan`].
+/// A walk over the document keys of one collection; see [`DocsVerbs::docs_scan`].
 #[derive(Debug)]
 pub struct DocsScan<'arena, 'matching> {
     collection: CollectionID,
     start: Key,
     range: KeyRange,
-    arena: &'arena mut Arena,
+    arena: &'arena Arena<'arena>,
     wanted: usize,
     matched: Matching<'matching>,
     mode: ScanMode,
-    progress: Progress<'matching>,
+    progress: Option<Progress<'matching>>,
     found: Found,
 }
 
@@ -1660,13 +1670,13 @@ impl<'arena> Calling for DocsScan<'arena, '_> {
     type Arguments = ffi::ustore_docs_scan_t;
     type Output = &'arena [Key];
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
-        let (progress, progress_state) = self.progress.lowered();
+        let (progress, progress_state) = lowered_progress(&self.progress);
         Ok(Some(ffi::ustore_docs_scan_t {
             database: view.database(),
             executor: view.executor(),
@@ -1701,11 +1711,11 @@ impl<'arena> Calling for DocsScan<'arena, '_> {
     }
 }
 
-/// A random draw of document keys from one collection; see [`On::docs_sample`].
+/// A random draw of document keys from one collection; see [`DocsVerbs::docs_sample`].
 #[derive(Debug)]
 pub struct DocsSample<'arena> {
     collection: CollectionID,
-    arena: &'arena mut Arena,
+    arena: &'arena Arena<'arena>,
     wanted: usize,
     found: Found,
 }
@@ -1714,9 +1724,9 @@ impl<'arena> Calling for DocsSample<'arena> {
     type Arguments = ffi::ustore_docs_sample_t;
     type Output = &'arena [Key];
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1746,13 +1756,13 @@ impl<'arena> Calling for DocsSample<'arena> {
     }
 }
 
-/// An estimate of what a range of documents holds; see [`On::docs_measure`].
+/// An estimate of what a range of documents holds; see [`DocsVerbs::docs_measure`].
 #[derive(Debug)]
 pub struct DocsMeasure<'arena> {
     collection: CollectionID,
     start: Key,
     range: KeyRange,
-    arena: &'arena mut Arena,
+    arena: &'arena Arena<'arena>,
     bounds: Bounds,
 }
 
@@ -1760,9 +1770,9 @@ impl Calling for DocsMeasure<'_> {
     type Arguments = ffi::ustore_docs_measure_t;
     type Output = Measurement;
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1806,12 +1816,12 @@ impl Calling for DocsMeasure<'_> {
     }
 }
 
-/// A read of whole documents or of fields inside them; see [`On::docs_read`].
+/// A read of whole documents or of fields inside them; see [`DocsVerbs::docs_read`].
 #[derive(Debug)]
 pub struct DocsRead<'arena, 'collections, Targets> {
     collections: Collections<'collections>,
     targets: Targets,
-    arena: &'arena mut Arena,
+    arena: &'arena Arena<'arena>,
     format: c_int,
     /// How many documents or fields the read addressed, once its arguments are filled.
     count: usize,
@@ -1823,9 +1833,9 @@ impl<'arena, Targets: Addresses> Calling for DocsRead<'arena, '_, Targets> {
     type Arguments = ffi::ustore_docs_read_t;
     type Output = Values<'arena>;
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1864,12 +1874,12 @@ impl<'arena, Targets: Addresses> Calling for DocsRead<'arena, '_, Targets> {
     }
 }
 
-/// A listing of the paths to the leaves of documents; see [`On::docs_gist`].
+/// A listing of the paths to the leaves of documents; see [`DocsVerbs::docs_gist`].
 #[derive(Debug)]
 pub struct DocsGist<'arena, 'collections, Keys> {
     collections: Collections<'collections>,
     keys: Keys,
-    arena: &'arena mut Arena,
+    arena: &'arena Arena<'arena>,
     written: ustore_size_t,
     fields: ustore_strings_view_t,
 }
@@ -1878,9 +1888,9 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for DocsGist<'arena, '_, Keys> {
     type Arguments = ffi::ustore_docs_gist_t;
     type Output = Paths<'arena>;
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1911,13 +1921,13 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for DocsGist<'arena, '_, Keys> {
     }
 }
 
-/// A conversion of fields into typed columns; see [`On::docs_gather`].
+/// A conversion of fields into typed columns; see [`DocsVerbs::docs_gather`].
 #[derive(Debug)]
 pub struct DocsGather<'arena, 'collections, Keys, Requested> {
     collections: Collections<'collections>,
     keys: Keys,
     columns: Requested,
-    arena: &'arena mut Arena,
+    arena: &'arena Arena<'arena>,
     /// The type of every column, packed as the arguments read them until the call is final.
     formats: Vec<c_int>,
     views: Address<ffi::ustore_docs_column_view_t>,
@@ -1929,9 +1939,9 @@ impl<'arena, 'field, Keys: AsRef<[Key]>, Requested: AsRef<[Column<'field>]>> Cal
     type Arguments = ffi::ustore_docs_gather_t;
     type Output = Columns<'arena, Requested>;
 
-    fn arguments<Parent, Completion>(
+    fn arguments(
         &mut self,
-        view: &On<'_, Parent, Completion>,
+        view: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1984,12 +1994,12 @@ mod tests {
     use std::slice;
 
     use super::*;
-    use crate::blobs::Entry;
+    use crate::blobs::{BlobsVerbs, Entry};
     use crate::db::{CollectionID, Collections, Database, Executor, Modality, RAMOptions, Watch};
     use crate::testing::{created, key, keys};
 
     /// A database whose docs collection holds Ada under key one and Grace under key two.
-    fn populated() -> (Database, CollectionID, Arena) {
+    fn populated() -> (Database, CollectionID, Arena<'static>) {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let docs = created(&database, Modality::Docs);
         let documents = [
@@ -2634,8 +2644,6 @@ mod tests {
 pub struct DocsCursor<'view> {
     handle: ffi::ustore_docs_cursor_t,
     database: ustore_database_t,
-    executor: ustore_executor_t,
-    matched: Box<Matching<'view>>,
     marker: PhantomData<&'view ()>,
 }
 
@@ -2651,13 +2659,8 @@ impl<'view, Parent> On<'view, Parent> {
         config: impl Into<DocsCursorConfig<'view>>,
     ) -> Result<DocsCursor<'view>> {
         let range: KeyRange = range.into();
-        let mut cursor = DocsCursor {
-            handle: ptr::null_mut(),
-            database: self.database(),
-            executor: self.executor(),
-            matched: Box::new(config.into().matching),
-            marker: PhantomData,
-        };
+        let matching = config.into().matching;
+        let mut cursor = DocsCursor { handle: ptr::null_mut(), database: self.database(), marker: PhantomData };
         let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_docs_cursor_init_t {
             cursor: &mut cursor.handle,
@@ -2669,8 +2672,8 @@ impl<'view, Parent> On<'view, Parent> {
             start_key: range.start_key(),
             end_key: range.end.as_ref().map_or(ptr::null(), ptr::from_ref),
             direction: range.direction,
-            filter: cursor.matched.lowered_filter(),
-            predicate: cursor.matched.lowered_predicate(),
+            filter: matching.lowered_filter(),
+            predicate: matching.lowered_predicate(),
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_docs_cursor_init(&mut arguments) };
@@ -2679,40 +2682,65 @@ impl<'view, Parent> On<'view, Parent> {
 }
 
 impl DocsCursor<'_> {
+    /// The receiver whose pulls block on `executor`.
+    pub fn on<'cursor>(&'cursor mut self, executor: &'cursor Executor) -> CursorOn<'cursor, Self> {
+        CursorOn::new(self, Some(executor))
+    }
+
     /// Pulls up to `wanted` next keys into `arena`, fewer once the walk nears its end and none past it.
     ///
     /// Calls `ustore_docs_cursor_next`.
-    pub fn next<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena) -> Result<&'arena [Key]> {
+    ///
+    /// Runs on the calling thread; [`DocsCursor::on`] names an executor for one pull.
+    pub fn next<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena<'_>) -> Result<&'arena [Key]> {
+        CursorOn::new(self, None).next(wanted, arena)
+    }
+
+    /// Pulls up to `wanted` next keys with their whole documents into `arena` in one call.
+    ///
+    /// Calls `ustore_docs_cursor_next`.
+    ///
+    /// Runs on the calling thread; [`DocsCursor::on`] names an executor for one pull.
+    pub fn next_pairs<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena<'_>) -> Result<Page<'arena>> {
+        CursorOn::new(self, None).next_pairs(wanted, arena)
+    }
+}
+
+impl CursorOn<'_, DocsCursor<'_>> {
+    /// Pulls up to `wanted` next keys into `arena`, fewer near the walk's end and none past it.
+    ///
+    /// Calls `ustore_docs_cursor_next`.
+    pub fn next<'arena>(self, wanted: usize, arena: &'arena mut Arena<'_>) -> Result<&'arena [Key]> {
         self.pull(wanted, arena, ptr::null_mut())
     }
 
     /// Pulls up to `wanted` next keys with their whole documents into `arena` in one call.
     ///
     /// Calls `ustore_docs_cursor_next`.
-    pub fn next_pairs<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena) -> Result<Page<'arena>> {
+    pub fn next_pairs<'arena>(self, wanted: usize, arena: &'arena mut Arena<'_>) -> Result<Page<'arena>> {
         let mut values = ustore_strings_view_t::default();
         let keys = self.pull(wanted, arena, &mut values)?;
-        // SAFETY: the pull succeeded, writing a value per key as a tape into the arena borrowed for `'arena`.
+        // SAFETY: the pull succeeded, writing a value per key as a tape into the result's arena.
         let values = unsafe { Strings::exported(values, keys.len())? };
         Ok(Page::new(keys, values))
     }
 
     /// Pulls a page of keys into `arena`, with their values into `values` unless it is null.
     fn pull<'arena>(
-        &mut self,
+        self,
         wanted: usize,
-        arena: &'arena mut Arena,
+        arena: &'arena mut Arena<'_>,
         values: *mut ustore_strings_view_t,
     ) -> Result<&'arena [Key]> {
         let mut keys: *const ustore_key_t = ptr::null();
         let mut written: ustore_size_t = 0;
         let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_docs_cursor_next_t {
-            database: self.database,
+            database: self.cursor.database,
             executor: self.executor,
             outcome: &mut outcome,
             completion: ustore_completion_t::Blocking,
-            cursor: self.handle,
+            cursor: self.cursor.handle,
             keys: &mut keys,
             values,
             written: &mut written,
@@ -2725,7 +2753,7 @@ impl DocsCursor<'_> {
         unsafe { ffi::ustore_docs_cursor_next(&mut arguments) };
         check(outcome)?;
         arena.host()?;
-        // SAFETY: a successful pull wrote `written` keys into the arena, which stays borrowed for `'arena`.
+        // SAFETY: a successful pull wrote `written` keys into the arena the result borrows.
         Ok(unsafe { exported_slice(keys, written as usize) })
     }
 }

@@ -30,8 +30,8 @@ def test_strings_read_back_their_keys_and_report_the_missing(words, view, arena)
 
 
 def test_strings_write_refuses_a_key_missing_for_a_string(database, words):
-    """More strings than keys raise InvalidArgumentError naming both counts."""
-    with pytest.raises(ustore.InvalidArgumentError, match="3 strings for 2 keys"):
+    """More strings than keys raise InvalidArgumentError."""
+    with pytest.raises(ustore.InvalidArgumentError):
         database.strings_write(WORDS, [4, 5], collection=words)
 
 

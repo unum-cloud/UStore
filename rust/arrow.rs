@@ -191,7 +191,7 @@ impl ArrowDeviceArray {
 pub struct ArrowExport<'arena> {
     pub(crate) schema: ArrowSchema,
     pub(crate) array: ArrowDeviceArray,
-    pub(crate) marker: PhantomData<&'arena Arena>,
+    pub(crate) marker: PhantomData<&'arena Arena<'arena>>,
 }
 
 impl ArrowExport<'_> {
@@ -526,7 +526,7 @@ struct ExportStream {
     /// The cursor of the modality, null until opened.
     cursor: ExportCursor,
     /// Where a graph's vertices land before their edges are read into a batch's arena.
-    vertices_arena: Option<Arena>,
+    vertices_arena: Option<Arena<'static>>,
     /// Why the last callback failed.
     failure: CString,
 }
@@ -599,7 +599,7 @@ unsafe extern "C" fn release_batch(batch: *mut ArrowArray) {
 struct HeldColumn {
     release: Option<unsafe extern "C" fn(*mut ArrowArray)>,
     private_data: *mut c_void,
-    arena: Arc<Arena>,
+    arena: Arc<Arena<'static>>,
 }
 
 unsafe extern "C" fn release_held_column(column: *mut ArrowArray) {
@@ -663,7 +663,7 @@ fn exported_schema(modality: Modality) -> ArrowSchema {
 
 impl ExportedBatch {
     /// Exports `count` keys out of `arena` as the next column.
-    fn keys(&mut self, keys: ustore_keys_view_t, count: ustore_size_t, arena: &Arena) -> Result<()> {
+    fn keys(&mut self, keys: ustore_keys_view_t, count: ustore_size_t, arena: &Arena<'_>) -> Result<()> {
         let mut schema = ArrowSchema::empty();
         let mut column = ArrowDeviceArray::empty();
         // SAFETY: a call wrote the keys into the arena, which the column's share keeps alive.
@@ -675,7 +675,7 @@ impl ExportedBatch {
     }
 
     /// Exports `count` strings out of `arena` as the next column, as `binary`, which the stream's schema names.
-    fn strings(&mut self, strings: ustore_strings_view_t, count: ustore_size_t, arena: &Arena) -> Result<()> {
+    fn strings(&mut self, strings: ustore_strings_view_t, count: ustore_size_t, arena: &Arena<'_>) -> Result<()> {
         let mut schema = ArrowSchema::empty();
         let mut column = ArrowDeviceArray::empty();
         // SAFETY: a call wrote the tape into the arena, which the column's share keeps alive.
@@ -697,7 +697,7 @@ impl ExportedBatch {
 
     /// The batch of `rows` rows over the exported columns, which its release releases, each column
     /// holding a share of `arena` until its own release, as a consumer may move columns out.
-    fn into_array(mut self: Box<Self>, rows: ustore_size_t, arena: Arena) -> ArrowArray {
+    fn into_array(mut self: Box<Self>, rows: ustore_size_t, arena: Arena<'static>) -> ArrowArray {
         // Only the count is shared: no column reads the arena, and the last release, on any thread,
         // frees it.
         let arena = Arc::new(arena);
@@ -928,7 +928,7 @@ impl ExportStream {
         &mut self,
         cursor: graph_ffi::ustore_graph_vertices_cursor_t,
         // Before the batch, as parameters drop in reverse, so a failed pull releases columns first.
-        arena: Arena,
+        arena: Arena<'static>,
         mut batch: Box<ExportedBatch>,
     ) -> Result<Option<ArrowArray>> {
         let vertices_arena = self.vertices_arena.as_ref().map_or(ptr::null_mut(), |arena| arena.handle);
@@ -1449,7 +1449,7 @@ mod tests {
 
     /// Fills a `posters` collection of `database` with 50 blobs, answering it.
     fn posters(database: &Database) -> crate::Collection<'_> {
-        let mut posters = database.collection("posters").unwrap();
+        let posters = database.find_or_create("posters", Modality::Blobs).unwrap();
         for index in 1..=50u64 {
             posters.blobs().set(key(index), format!("poster-{index}").as_bytes()).unwrap();
         }
@@ -1458,9 +1458,9 @@ mod tests {
 
     /// Ingests the posters of `database` into another collection, which then exports the same rows.
     fn ingests_every_row(database: &Database) {
-        let mut posters = posters(database);
+        let posters = posters(database);
         database.collection_create("copies", Modality::Blobs).unwrap();
-        let mut copies = database.collection("copies").unwrap();
+        let copies = database.collection("copies").unwrap();
         let exported = posters.export_arrow().unwrap();
         let landed = copies.ingest_arrow(exported, IngestOrder::Sorted, Durability::Buffered);
         assert_eq!(landed.unwrap(), 50);
@@ -1470,9 +1470,9 @@ mod tests {
     #[test]
     fn arrow_export_imports_into_another_collection() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
-        let mut posters = posters(&database);
+        let posters = posters(&database);
         database.collection_create("copies", Modality::Blobs).unwrap();
-        let mut copies = database.collection("copies").unwrap();
+        let copies = database.collection("copies").unwrap();
 
         let exported = posters.export_arrow().unwrap();
         assert_eq!(copies.import_arrow(exported, Durability::Buffered).unwrap(), 50);

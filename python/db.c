@@ -186,19 +186,19 @@ static PyObject* database_opened(ustore_database_t handle, ustore_outcome_t* out
 
 #pragma region Databases
 
-static char const doc_Database[] =                                                             //
-    "An embedded database, opened through one class method per engine.\n"                      //
-    "\n"                                                                                       //
-    "Database.open_ram(), open_rocksdb(), view_rocksdb(), open_leveldb() and open_nvme()\n"    //
-    "each take what their engine can be asked; engines_compiled() names the ones this build\n" //
-    "carries, and the others refuse to open. Each takes an `executor` keyword and blocks\n"    //
-    "on it, as it blocks on the calling thread without one. The directory belongs to\n"        //
-    "the database, so no two processes may open the same one at once. No collection exists\n"  //
-    "until `collection_create` makes it, and names starting with `_` are reserved.\n"          //
-    "\n"                                                                                       //
-    "Indexing it by name, as `db['movies']`, answers a Collection, whose `blobs`, `docs`,\n"   //
-    "`graph` and `table` views create it on their first write. Its verbs run on the calling\n" //
-    "thread; `on(executor)` and `deferred(executor)` answer views running them on threads.";
+static char const doc_Database[] =                                                                         //
+    "An embedded database, opened through one class method per engine.\n"                                  //
+    "\n"                                                                                                   //
+    "Database.open_ram(), open_rocksdb(), view_rocksdb(), open_leveldb() and open_nvme() each take what\n" //
+    "their engine can be asked; engines_compiled() names the ones this build carries, and the others\n"    //
+    "refuse to open. Each takes an `executor` keyword and blocks on it, as it blocks on the calling\n"     //
+    "thread without one. The directory belongs to the database, so no two processes may open the same\n"   //
+    "one at once. No collection exists until `collection_create` makes it; names starting with `_` are\n"  //
+    "reserved by the library.\n"                                                                           //
+    "\n"                                                                                                   //
+    "Indexing it by name, as `db['movies']`, answers a Collection, which only finds the collection,\n"     //
+    "never creating it. Its verbs run on the calling thread; `on(executor)` and `deferred(executor)`\n"    //
+    "answer views running them on threads.";                                                               //
 
 static PyObject* Database_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNUSED(arguments),
                                  PyObject* Py_UNUSED(keywords)) {
@@ -1441,7 +1441,7 @@ static char const doc_Transaction[] =                                           
     "\n"                                                                                      //
     "Indexing it by name, as `txn['payments']`, answers a Collection whose writes stage\n"    //
     "here: its reads resolve the name through this transaction, while its writes resolve\n"   //
-    "it at the head, where a missing collection is created.";
+    "it at the head.";
 
 static PyObject* Transaction_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNUSED(arguments),
                                     PyObject* Py_UNUSED(keywords)) {

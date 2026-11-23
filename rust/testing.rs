@@ -113,6 +113,11 @@ pub(crate) fn block_on<F: core::future::Future>(future: F) -> F::Output {
 }
 // endregion Shared Testing
 
+/// Polls `future` once on this thread with a no-op waker, which submits a deferred call.
+pub(crate) fn poll_once<F: core::future::Future>(future: core::pin::Pin<&mut F>) -> core::task::Poll<F::Output> {
+    future.poll(&mut core::task::Context::from_waker(core::task::Waker::noop()))
+}
+
 /// A collection holding `modality`, named after it, since a database holds none until
 /// one is created.
 pub(crate) fn created(database: &Database, modality: Modality) -> CollectionID {

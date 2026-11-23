@@ -51,6 +51,7 @@ static struct {
     {"On", &OnType},
     {"DeferredOn", &DeferredOnType},
     {"Deferred", &DeferredType},
+    {"Batch", &BatchType},
     {"Values", &ValuesType},
     {"Keys", &KeysType},
     {"Columns", &ColumnsType},
