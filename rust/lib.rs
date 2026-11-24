@@ -224,15 +224,15 @@ pub use db::{
     Admission, Arena, ArenaDescription, Blocking, CPUClass, CaseSensitivity, ChangeKind, Changes, ChangesCursor,
     ChangesCursorConfig, CollectionID, Collections, CommitStamp, CompactConfig, CompactPlan, DataDirectory, Database,
     Deferred, DeferredOn, Deferring, Description, DropMode, Durability, Engine, Error, Executor, GPUClass, GPUDevice,
-    GPUVendor, Gds, IOOptions, Isolation, Key, KeyRange, LevelDBOptions, Matching, Modality, Mood, NVMEOptions, On,
-    PatternKind, Phase, PhaseProgress, PredicateCallback, PredicateCost, ProgressCallback, RAMOptions, ReadStamp,
-    Residency, Result, RocksDBOptions, SaveConfig, ScanDirection, ScanMode, Snapshot, Status, Tape, Transaction,
-    Transport, UUID, Wait, Watch, gpu_devices, key_unknown, version,
+    GPUVendor, Gds, IOOptions, Isolation, Key, KeyRange, LevelDBOptions, Matching, Modality, Mood, NVMEOptions,
+    NVMEViewOptions, On, PatternKind, Phase, PhaseProgress, PredicateCallback, PredicateCost, ProgressCallback,
+    RAMOptions, ReadStamp, Residency, Result, RocksDBOptions, SaveConfig, ScanDirection, ScanMode, Snapshot, Status,
+    Tape, Transaction, Transport, UUID, Wait, Watch, gpu_devices, key_unknown, version,
 };
 pub use docs::{
-    Binary, Bitmap, Column, ColumnFormat, Columns, DocsCursor, DocsCursorConfig, DocsGatherConfig, DocsSampleConfig,
-    DocsScanConfig, Document, DocumentEntry, FieldAddress, FieldEntry, FieldFormat, FieldType, Half, Json, KeyedBy,
-    Modification, Paths, ReadFormat, Scalar, StringColumn, Text, WritableScalar,
+    Batches, Binary, Bitmap, Column, ColumnFormat, Columns, DocsCursor, DocsCursorConfig, DocsGatherConfig,
+    DocsSampleConfig, DocsScanConfig, Document, DocumentEntry, FieldAddress, FieldEntry, FieldFormat, FieldType, Half,
+    Json, KeyedBy, Modification, Paths, ReadFormat, Scalar, StringColumn, Text, WritableScalar,
 };
 pub use graph::{
     Degree, Edge, GraphSampleVerticesConfig, GraphScanVerticesConfig, GraphVerticesCursor, GraphVerticesCursorConfig,

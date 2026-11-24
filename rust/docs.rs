@@ -87,7 +87,7 @@ use std::str::FromStr;
 use stringtape::CharsTape;
 
 use crate::arrow::{ArrowDeviceArray, ArrowExport, ArrowSchema, ffi as arrow_ffi};
-use crate::blobs::{Bounds, Found, Measurement, Page, Values};
+use crate::blobs::{Bounds, Found, Measurement, Values};
 use crate::db::ffi::{
     ustore_arena_t, ustore_byte_t, ustore_bytes_view_t, ustore_collection_id_t, ustore_collections_view_t,
     ustore_completion_t, ustore_database_t, ustore_durability_t, ustore_enum_t, ustore_executor_t, ustore_key_t,
@@ -224,6 +224,17 @@ pub(crate) mod ffi {
         pub direction: ustore_scan_direction_t,
         pub filter: ustore_bytes_view_t,
         pub predicate: ustore_predicate_t,
+        pub fields_count: ustore_size_t,
+        pub fields: ustore_strings_view_t,
+        pub columns_types: *const ustore_enum_t,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    pub struct ustore_docs_batch_view_t {
+        pub count: ustore_size_t,
+        pub keys: *const ustore_key_t,
+        pub columns: *const ustore_docs_column_view_t,
     }
 
     #[repr(C)]
@@ -233,9 +244,8 @@ pub(crate) mod ffi {
         pub outcome: *mut ustore_outcome_t,
         pub completion: ustore_completion_t,
         pub cursor: ustore_docs_cursor_t,
-        pub keys: *mut *const ustore_key_t,
-        pub values: *mut ustore_strings_view_t,
-        pub written: *mut ustore_size_t,
+        pub batches: *mut *const ustore_docs_batch_view_t,
+        pub batches_count: *mut ustore_size_t,
         pub arena: ustore_arena_t,
         pub wanted: ustore_size_t,
         pub progress: ustore_progress_callback_t,
@@ -525,8 +535,9 @@ pub trait ColumnFormat: Format {}
 impl<Value: Scalar> ColumnFormat for Value {}
 impl ColumnFormat for Text {}
 impl ColumnFormat for Binary {}
+impl ColumnFormat for Json {}
 
-/// How a write combines what it carries with what the document already holds.
+/// How a write combines what it holds with what the document already holds.
 #[repr(i32)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
 pub enum Modification {
@@ -761,7 +772,7 @@ impl<'field> Column<'field> {
 }
 
 /// Writes the view of the field of every column `indices` names out of the slice of [`Column`]s at `handle`.
-unsafe extern "C" fn column_fields(
+pub(crate) unsafe extern "C" fn column_fields(
     handle: *const c_void,
     indices: *const ustore_size_t,
     count: ustore_size_t,
@@ -1009,11 +1020,20 @@ impl<Requested> From<Requested> for DocsGatherConfig<Requested> {
 pub struct DocsCursorConfig<'config> {
     /// Admits only the documents its filter and predicate approve; every document by default.
     pub matching: Matching<'config>,
+    /// The columns every row gathers, the empty field gathered as [`Json`] being the whole
+    /// document; none for keys alone.
+    pub columns: Vec<Column<'config>>,
 }
 
 impl<'config> From<Matching<'config>> for DocsCursorConfig<'config> {
     fn from(matching: Matching<'config>) -> Self {
-        DocsCursorConfig { matching }
+        DocsCursorConfig { matching, columns: Vec::new() }
+    }
+}
+
+impl<'config> From<Vec<Column<'config>>> for DocsCursorConfig<'config> {
+    fn from(columns: Vec<Column<'config>>) -> Self {
+        DocsCursorConfig { matching: Matching::default(), columns }
     }
 }
 
@@ -1214,7 +1234,7 @@ impl<'arena, 'field, Requested: AsRef<[Column<'field>]>> Columns<'arena, Request
     pub fn strings(&self, column: usize) -> Result<StringColumn<'arena>> {
         let terminator = match self.requested_format(column)? {
             Text::TYPE => 1,
-            Binary::TYPE => 0,
+            Binary::TYPE | Json::TYPE => 0,
             _ => return Err(fail(Status::InvalidArgument, "the column was not gathered as strings")),
         };
         let validities = self.bitmap(column, |view| view.validities)?.unwrap_or(Bitmap { bytes: &[], count: 0 });
@@ -2005,10 +2025,13 @@ mod tests {
         let (database, docs, mut arena) = populated();
         let graces = Matching { filter: Some(r#"?@.name == "Grace""#), ..Matching::default() };
         let head = database.head();
-        let mut cursor = head.docs_cursor(docs, key(0), graces).unwrap();
-        let page = cursor.next_pairs(8, &mut arena).unwrap();
-        assert_eq!(page.keys(), &keys([2]));
-        assert!(std::str::from_utf8(page.get(0).unwrap()).unwrap().contains("Rear Admiral"));
+        let config = DocsCursorConfig { matching: graces, columns: vec![Column::new::<Json>("")] };
+        let mut cursor = head.docs_cursor(docs, key(0), config).unwrap();
+        let batches = cursor.next(8, &mut arena).unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches.keys(0).unwrap(), &keys([2]));
+        let documents = batches.columns(0).unwrap().strings(0).unwrap();
+        assert!(std::str::from_utf8(documents.get(0).unwrap()).unwrap().contains("Rear Admiral"));
         assert!(cursor.next(8, &mut arena).unwrap().is_empty());
     }
 
@@ -2029,7 +2052,8 @@ mod tests {
         assert!(measured.min_cardinality <= 1 && measured.max_cardinality >= measured.min_cardinality);
         head.docs_remove_range(docs, key(1)..key(2), Durability::Buffered).unwrap();
         let mut cursor = head.docs_cursor(docs, key(0), Matching::default()).unwrap();
-        assert_eq!(cursor.next(8, &mut arena).unwrap(), &keys([2]));
+        let batches = cursor.next(8, &mut arena).unwrap();
+        assert_eq!((batches.len(), batches.keys(0).unwrap()), (1, &keys([2])[..]));
     }
 
     /// The text of the field at `index`, or `None` when it is absent.
@@ -2636,6 +2660,7 @@ pub struct DocsCursor<'view> {
     database: ustore_database_t,
     executor: ustore_executor_t,
     matched: Box<Matching<'view>>,
+    columns: Box<[Column<'view>]>,
     marker: PhantomData<&'view ()>,
 }
 
@@ -2651,13 +2676,16 @@ impl<'view, Parent> On<'view, Parent> {
         config: impl Into<DocsCursorConfig<'view>>,
     ) -> Result<DocsCursor<'view>> {
         let range: KeyRange = range.into();
+        let config = config.into();
         let mut cursor = DocsCursor {
             handle: ptr::null_mut(),
             database: self.database(),
             executor: self.executor(),
-            matched: Box::new(config.into().matching),
+            matched: Box::new(config.matching),
+            columns: config.columns.into_boxed_slice(),
             marker: PhantomData,
         };
+        let formats: Vec<c_int> = cursor.columns.iter().map(|column| column.format).collect();
         let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_docs_cursor_init_t {
             cursor: &mut cursor.handle,
@@ -2671,41 +2699,75 @@ impl<'view, Parent> On<'view, Parent> {
             direction: range.direction,
             filter: cursor.matched.lowered_filter(),
             predicate: cursor.matched.lowered_predicate(),
+            fields_count: cursor.columns.len() as ustore_size_t,
+            fields: ustore_strings_view_t::accessor(column_fields, cursor.columns.as_ptr().cast()),
+            columns_types: formats.as_ptr(),
         };
-        // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
+        // SAFETY: every pointer in `arguments` outlives the call, which is final on return and
+        // copies the columns.
         unsafe { ffi::ustore_docs_cursor_init(&mut arguments) };
         check(outcome).map(|()| cursor)
     }
 }
 
+/// The batches one pull of a [`DocsCursor`] wrote into an arena, in walk order: each the keys of
+/// its rows and a column per field the cursor gathers.
+#[derive(Clone, Copy, Debug)]
+pub struct Batches<'arena, 'cursor> {
+    /// The arena holding the batches, borrowed for `'arena`.
+    arena: ustore_arena_t,
+    views: &'arena [ffi::ustore_docs_batch_view_t],
+    columns: &'cursor [Column<'cursor>],
+}
+
+impl<'arena, 'cursor> Batches<'arena, 'cursor> {
+    /// How many batches the pull wrote, none once the walk is exhausted.
+    pub fn len(&self) -> usize {
+        self.views.len()
+    }
+
+    /// Whether the walk was exhausted before this pull.
+    pub fn is_empty(&self) -> bool {
+        self.views.is_empty()
+    }
+
+    /// How many rows the batches hold together.
+    pub fn rows(&self) -> usize {
+        self.views.iter().map(|view| view.count as usize).sum()
+    }
+
+    /// The keys of batch `index` in walk order, or `None` past the last batch.
+    pub fn keys(&self, index: usize) -> Option<&'arena [Key]> {
+        let view = self.views.get(index)?;
+        // SAFETY: a successful pull wrote every batch's keys into the arena, which stays
+        // borrowed for `'arena`.
+        Some(unsafe { exported_slice(view.keys.cast::<Key>(), view.count as usize) })
+    }
+
+    /// The columns of batch `index`, one per field the cursor gathers, or `None` past
+    /// the last batch.
+    pub fn columns(&self, index: usize) -> Option<Columns<'arena, &'cursor [Column<'cursor>]>> {
+        let view = self.views.get(index)?;
+        // SAFETY: a successful pull wrote every batch's column views into the arena, which stays
+        // borrowed for `'arena`.
+        let views = unsafe { exported_slice(view.columns, self.columns.len()) };
+        Some(Columns { requested: self.columns, rows: view.count as usize, arena: self.arena, views })
+    }
+
+    /// Every batch as its keys and its columns, in walk order.
+    pub fn iter(&self) -> impl Iterator<Item = (&'arena [Key], Columns<'arena, &'cursor [Column<'cursor>]>)> + '_ {
+        (0..self.len()).filter_map(|index| Some((self.keys(index)?, self.columns(index)?)))
+    }
+}
+
 impl DocsCursor<'_> {
-    /// Pulls up to `wanted` next keys into `arena`, fewer once the walk nears its end and none past it.
+    /// Pulls batches of up to `wanted` rows in all into `arena`, one per task of the executor that
+    /// found rows, none once the walk is exhausted.
     ///
     /// Calls `ustore_docs_cursor_next`.
-    pub fn next<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena) -> Result<&'arena [Key]> {
-        self.pull(wanted, arena, ptr::null_mut())
-    }
-
-    /// Pulls up to `wanted` next keys with their whole documents into `arena` in one call.
-    ///
-    /// Calls `ustore_docs_cursor_next`.
-    pub fn next_pairs<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena) -> Result<Page<'arena>> {
-        let mut values = ustore_strings_view_t::default();
-        let keys = self.pull(wanted, arena, &mut values)?;
-        // SAFETY: the pull succeeded, writing a value per key as a tape into the arena borrowed for `'arena`.
-        let values = unsafe { Strings::exported(values, keys.len())? };
-        Ok(Page::new(keys, values))
-    }
-
-    /// Pulls a page of keys into `arena`, with their values into `values` unless it is null.
-    fn pull<'arena>(
-        &mut self,
-        wanted: usize,
-        arena: &'arena mut Arena,
-        values: *mut ustore_strings_view_t,
-    ) -> Result<&'arena [Key]> {
-        let mut keys: *const ustore_key_t = ptr::null();
-        let mut written: ustore_size_t = 0;
+    pub fn next<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena) -> Result<Batches<'arena, '_>> {
+        let mut batches: *const ffi::ustore_docs_batch_view_t = ptr::null();
+        let mut count: ustore_size_t = 0;
         let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_docs_cursor_next_t {
             database: self.database,
@@ -2713,9 +2775,8 @@ impl DocsCursor<'_> {
             outcome: &mut outcome,
             completion: ustore_completion_t::Blocking,
             cursor: self.handle,
-            keys: &mut keys,
-            values,
-            written: &mut written,
+            batches: &mut batches,
+            batches_count: &mut count,
             arena: arena.handle,
             wanted: wanted as ustore_size_t,
             progress: None,
@@ -2725,8 +2786,10 @@ impl DocsCursor<'_> {
         unsafe { ffi::ustore_docs_cursor_next(&mut arguments) };
         check(outcome)?;
         arena.host()?;
-        // SAFETY: a successful pull wrote `written` keys into the arena, which stays borrowed for `'arena`.
-        Ok(unsafe { exported_slice(keys, written as usize) })
+        // SAFETY: a successful pull wrote `count` batch views into the arena, which stays
+        // borrowed for `'arena`.
+        let views = unsafe { exported_slice(batches, count as usize) };
+        Ok(Batches { arena: arena.handle, views, columns: &self.columns })
     }
 }
 

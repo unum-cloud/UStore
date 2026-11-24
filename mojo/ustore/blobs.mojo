@@ -614,10 +614,91 @@ struct CursorNextArguments[name: StaticString](Arguments):
 
     @staticmethod
     def verb(library: Library) -> Verb[Self]:
-        comptime if Self.name == "ustore_docs_cursor_next":
-            return rebind[Verb[Self]](library.symbols().docs_cursor_next)
-        else:
-            return rebind[Verb[Self]](library.symbols().blobs_cursor_next)
+        return rebind[Verb[Self]](library.symbols().blobs_cursor_next)
+
+
+@fieldwise_init
+struct DocsBatchView(ImplicitlyCopyable):
+    """`ustore_docs_batch_view_t`: one batch of a docs cursor's pull, its rows' keys and columns in the arena."""
+
+    var count: c_size_t
+    var keys: Address
+    var columns: Address
+
+
+@fieldwise_init
+struct DocsBatchesWritten(Defaultable, ImplicitlyCopyable):
+    """The batches and their count one docs cursor pull writes, at one stable address."""
+
+    var batches: Address
+    var batches_count: c_size_t
+
+    def __init__(out self):
+        """Nothing written, which is what a failed call leaves."""
+        self = Self(NULL_ADDRESS, 0)
+
+
+@fieldwise_init
+struct DocsBatches[origin: MutOrigin](Answer, Sized):
+    """The batches of one docs cursor pull, read in place from the arena the pull wrote them into.
+
+    Parameters:
+        origin: The arena the batches live in, which must outlive this result.
+    """
+
+    comptime Written = DocsBatchesWritten
+    var arena: Pointer[Arena, Self.origin]
+    """The arena holding the batches."""
+    var generation: Int
+    """The arena's call the batches came from."""
+    var written: DocsBatchesWritten
+    """The views the engine wrote."""
+
+    def __init__(out self, arena: Address, generation: Int, written: DocsBatchesWritten, count: Int):
+        self.arena = Pointer[Arena, Self.origin](unsafe_from_address=arena)
+        self.generation = generation
+        self.written = written
+
+    def __len__(self) -> Int:
+        """The batches pulled, zero once the walk is exhausted."""
+        return Int(self.written.batches_count)
+
+    def keys(ref self, batch: Int) raises Error -> Span[Key, origin_of(self)]:
+        """The keys of the rows of `batch`, in walk order."""
+        _readable(self.arena, self.generation, "DocsBatches.keys")
+        var view = _in_arena[DocsBatchView, origin_of(self)](self.written.batches, len(self))[batch]
+        return _in_arena[Key, origin_of(self)](view.keys, Int(view.count))
+
+
+@fieldwise_init
+struct DocsCursorNextArguments(Arguments):
+    """`ustore_docs_cursor_next_t`."""
+
+    comptime Written = DocsBatchesWritten
+    comptime symbol: StaticString = "ustore_docs_cursor_next"
+    var database: Address
+    var executor: Address
+    var outcome: Optional[Pointer[Outcome, MutUntrackedOrigin]]
+    var completion: Completion
+    var cursor: Address
+    var batches: Optional[Pointer[Address, MutUntrackedOrigin]]
+    var batches_count: Optional[Pointer[c_size_t, MutUntrackedOrigin]]
+    var arena: Address
+    var wanted: c_size_t
+    var progress: Progress
+
+    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[DocsBatchesWritten, MutUntrackedOrigin], arena: Address):
+        self.database = scope.database
+        self.executor = scope.executor
+        self.outcome = outcome
+        self.completion = completion
+        self.batches = Pointer(to=written[].batches)
+        self.batches_count = Pointer(to=written[].batches_count)
+        self.arena = arena
+
+    @staticmethod
+    def verb(library: Library) -> Verb[Self]:
+        return rebind[Verb[Self]](library.symbols().docs_cursor_next)
 
 
 @fieldwise_init

@@ -345,13 +345,8 @@ class executor_handle_t {
         return make_(ustore_executor_for_ram, options);
     }
 
-    /** Borrows the ForkUnion pool @p options name for the RAM, RocksDB and LevelDB engines. */
-    static expected<executor_handle_t> on_pool(ustore_executor_on_pool_t options) noexcept {
-        return make_(ustore_executor_on_pool, options);
-    }
-
     /** Creates an executor for the NVMe engine, whose every thread submits and polls its own I/O
-     *  ring, which tells the databases opened on it how to move bytes and borrow the VRAM executor
+     *  ring, which tells the databases opened on it how to move bytes and view the VRAM executor
      *  @p options name for compactions. */
     static expected<executor_handle_t> for_nvme(ustore_executor_for_nvme_t options = {}) noexcept {
         return make_(ustore_executor_for_nvme, options);

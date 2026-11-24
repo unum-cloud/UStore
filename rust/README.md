@@ -252,8 +252,8 @@ Passing `&[Key]` to a deferred view fails to compile with "a deferred view needs
 ## Executors
 
 An `Executor` is the threads that run calls, shared by any number of databases and views, `Send` and `Sync`, and serving one call at a time, so a call submitted while another holds it answers `Status::Contended`.
-`Executor::for_ram` spawns threads near the NUMA nodes it names, every node for an empty list, where zero threads take 7/8 of their cores; `Executor::on_pool` borrows a ForkUnion pool and is `unsafe`, since the pool must outlive it.
-`Executor::for_nvme` spawns the NVMe engine's rings, and `Executor::for_vram` drives one CUDA device.
+`Executor::for_ram` spawns threads near the NUMA nodes it names, every node for an empty list, where zero threads take 7/8 of their cores.
+`Executor::for_nvme` spawns the NVMe engine's rings near the memory domains it names, or near the drives under its paths, and `Executor::for_vram` drives one CUDA device.
 Opening a database blocks, on the executor its options name or the calling thread, and dropping an executor waits as `Executor::drain` does, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#executors) describe.
 
 ```rust

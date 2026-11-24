@@ -25,6 +25,7 @@ from ustore.blobs import (
     BlobsScanArguments,
     BlobsWriteArguments,
     CursorNextArguments,
+    DocsCursorNextArguments,
     MeasureArguments,
     SampleArguments,
 )
@@ -122,7 +123,6 @@ from ustore.types import (
     ExecutorForNvme,
     ExecutorForRam,
     ExecutorForVram,
-    ExecutorOnPool,
     FromName,
     Gds,
     GPUClass,
@@ -221,7 +221,6 @@ struct Symbols:
     var gpu_class_from_name: FromName
     var gpu_devices: GPUDevices
     var executor_for_ram: ExecutorForRam
-    var executor_on_pool: ExecutorOnPool
     var executor_for_nvme: ExecutorForNvme
     var executor_for_vram: ExecutorForVram
     var executor_drain: ExecutorDrain
@@ -324,7 +323,7 @@ struct Symbols:
     var docs_remove: Verb[DocsRemoveArguments]
     var docs_scan: Verb[FilteredScanArguments["ustore_docs_scan"]]
     var docs_cursor_init: Verb[FilteredCursorInitArguments]
-    var docs_cursor_next: Verb[CursorNextArguments["ustore_docs_cursor_next"]]
+    var docs_cursor_next: Verb[DocsCursorNextArguments]
     var docs_cursor_free: Release
     var docs_sample: Verb[SampleArguments["ustore_docs_sample"]]
     var docs_measure: Verb[MeasureArguments["ustore_docs_measure"]]
@@ -390,7 +389,6 @@ struct Symbols:
         self.gpu_class_from_name = _resolve[FromName](handle, "ustore_gpu_class_from_name")
         self.gpu_devices = _resolve[GPUDevices](handle, "ustore_gpu_devices")
         self.executor_for_ram = _resolve[ExecutorForRam](handle, "ustore_executor_for_ram")
-        self.executor_on_pool = _resolve[ExecutorOnPool](handle, "ustore_executor_on_pool")
         self.executor_for_nvme = _resolve[ExecutorForNvme](handle, "ustore_executor_for_nvme")
         self.executor_for_vram = _resolve[ExecutorForVram](handle, "ustore_executor_for_vram")
         self.executor_drain = _resolve[ExecutorDrain](handle, "ustore_executor_drain")
@@ -495,7 +493,7 @@ struct Symbols:
         self.docs_remove = _resolve[Verb[DocsRemoveArguments]](handle, "ustore_docs_remove")
         self.docs_scan = _resolve[Verb[FilteredScanArguments["ustore_docs_scan"]]](handle, "ustore_docs_scan")
         self.docs_cursor_init = _resolve[Verb[FilteredCursorInitArguments]](handle, "ustore_docs_cursor_init")
-        self.docs_cursor_next = _resolve[Verb[CursorNextArguments["ustore_docs_cursor_next"]]](handle, "ustore_docs_cursor_next")
+        self.docs_cursor_next = _resolve[Verb[DocsCursorNextArguments]](handle, "ustore_docs_cursor_next")
         self.docs_cursor_free = _resolve[Release](handle, "ustore_docs_cursor_free")
         self.docs_sample = _resolve[Verb[SampleArguments["ustore_docs_sample"]]](handle, "ustore_docs_sample")
         self.docs_measure = _resolve[Verb[MeasureArguments["ustore_docs_measure"]]](handle, "ustore_docs_measure")

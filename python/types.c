@@ -539,8 +539,7 @@ PyObject* ustore_py_dlpack_device(PyObject* arena) {
     if (ustore_py_raise_on_outcome(&outcome) != 0) return NULL;
     if (description.device < 0 || (ustore_size_t)description.device >= count ||
         (ustore_size_t)description.device >= listing.devices_capacity) {
-        ustore_py_raise(ustore_status_device_k, "No device carries the ordinal %d of the arena",
-                        (int)description.device);
+        ustore_py_raise(ustore_status_device_k, "No device holds the ordinal %d of the arena", (int)description.device);
         return NULL;
     }
     ustore_gpu_device_t const* const device = &devices[description.device];
@@ -1128,10 +1127,10 @@ void ustore_py_contents_release(ustore_py_contents_t* batch) {
     Py_CLEAR(batch->held);
 }
 
-/** Borrows one text into the next view of @p texts: a string as the UTF-8 bytes it caches, a bytes-like object as it
- *  is, None refused, and any other item through @p serializer where there is one. */
-static int text_borrow(PyObject* object, ustore_py_text_serializer_t serializer, void* state,
-                       ustore_py_texts_t* texts) {
+/** Views one text into the next view of @p texts: a string as the UTF-8 bytes it caches, a
+ *  bytes-like object as it is, None refused, and any other item through @p serializer where
+ *  there is one. */
+static int text_view(PyObject* object, ustore_py_text_serializer_t serializer, void* state, ustore_py_texts_t* texts) {
     ustore_py_contents_t* const batch = &texts->contents;
     if (!PyUnicode_Check(object)) {
         if (!serializer || object == Py_None || PyObject_CheckBuffer(object))
@@ -1165,8 +1164,8 @@ int ustore_py_texts_from_object(PyObject* object, char const* argument, ustore_p
         return -1;
     }
     for (size_t task_index = 0; task_index != count; ++task_index)
-        if (text_borrow(one ? object : PyTuple_GET_ITEM(texts->held, (Py_ssize_t)task_index), serializer, state,
-                        texts) != 0) {
+        if (text_view(one ? object : PyTuple_GET_ITEM(texts->held, (Py_ssize_t)task_index), serializer, state, texts) !=
+            0) {
             ustore_py_texts_release(texts);
             return -1;
         }
@@ -2284,21 +2283,20 @@ PyTypeObject DeferredType = {
 
 #pragma region Executors
 
-static char const doc_Executor[] =                                                             //
-    "The threads that run calls, shared by any number of databases.\n"                         //
-    "\n"                                                                                       //
-    "Built through `Executor.for_ram()`, `on_pool()`, `for_nvme()` or `for_vram()`, never\n"   //
-    "by name. A receiver names it through `on(executor)`, whose calls block on it, or\n"       //
-    "`deferred(executor)`, whose calls its own first thread runs while the caller carries\n"   //
-    "on, so polling alone finishes them. It serves one call at a time: a second call while\n"  //
-    "one runs raises ContendedError once waited for. Progress callbacks run on its threads.\n" //
-    "\n"                                                                                       //
+static char const doc_Executor[] =                                                              //
+    "The threads that run calls, shared by any number of databases.\n"                          //
+    "\n"                                                                                        //
+    "Built through `Executor.for_ram()`, `for_nvme()` or `for_vram()`, never by name.\n"        //
+    "A receiver names it through `on(executor)`, whose calls block on it, or\n"                 //
+    "`deferred(executor)`, whose calls its own first thread runs while the caller continues,\n" //
+    "so polling alone finishes them. It serves one call at a time: a second call while one\n"   //
+    "runs raises ContendedError once waited for. Progress callbacks run on its threads.\n"      //
+    "\n"                                                                                        //
     "Used as a context manager, it waits for its calls and frees its threads on exit.";
 
 static PyObject* Executor_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNUSED(arguments),
                                  PyObject* Py_UNUSED(keywords)) {
-    PyErr_SetString(PyExc_TypeError,
-                    "An executor is built through Executor.for_ram(), .on_pool(), .for_nvme() or .for_vram()");
+    PyErr_SetString(PyExc_TypeError, "An executor is built through Executor.for_ram(), .for_nvme() or .for_vram()");
     return NULL;
 }
 
@@ -2431,103 +2429,105 @@ static PyObject* Executor_for_ram(PyObject* type, PyObject* const* arguments, Py
     return executor_made(type, handle, &outcome);
 }
 
-static char const doc_Executor_on_pool[] =                                                      //
-    "on_pool(pool, /, *, memory_domains=None) answers an executor over a ForkUnion pool\n"      //
-    "another library already runs.\n"                                                           //
-    "\n"                                                                                        //
-    "Runs the calls of the RAM, RocksDB and LevelDB engines on the borrowed threads, so one\n"  //
-    "process keeps one set of them, while the executor keeps its own scratch. The pool keeps\n" //
-    "its lender's mood. Calls `ustore_executor_on_pool`.\n"                                     //
-    "\n"                                                                                        //
-    "Args:\n"                                                                                   //
-    "  pool (int): The address of the `fu_pool_t` to borrow, as `ctypes` and `cffi` hand\n"     //
-    "    pointers over; the pool must outlive the executor.\n"                                  //
-    "  memory_domains (Sequence[int], optional): NUMA nodes the scratch and the arenas\n"       //
-    "    live on; None derives every node the process may allocate on.\n"                       //
-    "Returns:\n"                                                                                //
-    "  Executor: The new executor.\n"                                                           //
-    "Raises:\n"                                                                                 //
-    "  InvalidArgumentError: The address is null, or a memory domain names no NUMA node.\n"     //
-    "  ContendedError: The pool runs its lender's dispatch.";
-
-static PyObject* Executor_on_pool(PyObject* type, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
-                                  PyObject* keyword_names_tuple) {
-    static char const* const names[] = {"pool", "memory_domains"};
-    PyObject* values[2];
-    size_t memory_domains_count = 0;
-    if (factory_arguments("on_pool", arguments, positional_arguments_count, keyword_names_tuple, names, values, 2, 1,
-                          1) != 0)
-        return NULL;
-    if (!values[0]) {
-        PyErr_SetString(PyExc_TypeError, "on_pool() takes the address of the pool by position");
-        return NULL;
-    }
-    PyObject* const address = PyNumber_Index(values[0]);
-    void* const pool = address ? PyLong_AsVoidPtr(address) : NULL;
-    Py_XDECREF(address);
-    int32_t* memory_domains = NULL;
-    if (PyErr_Occurred() ||
-        identifiers_from_object(values[1], "memory_domains", &memory_domains, &memory_domains_count) != 0)
-        return NULL;
-
-    ustore_executor_t handle = NULL;
-    ustore_outcome_t outcome = {0};
-    ustore_executor_on_pool_t made = {
-        .executor = &handle,
-        .outcome = &outcome,
-        .ram = {memory_domains, (ustore_size_t)memory_domains_count},
-        .pool = pool,
-    };
-    Py_BEGIN_ALLOW_THREADS;
-    ustore_executor_on_pool(&made);
-    Py_END_ALLOW_THREADS;
-    PyMem_Free(memory_domains);
-    return executor_made(type, handle, &outcome);
-}
-
 static char const doc_Executor_for_nvme[] =                                                     //
-    "for_nvme(threads=0, *, transport=Transport.AUTOMATIC, **sizes) answers an executor of\n"   //
-    "I/O rings.\n"                                                                              //
+    "for_nvme(threads=0, *, transport=Transport.AUTOMATIC, paths=None, memory_domains=None,\n"  //
+    "**sizes) answers an executor of I/O rings.\n"                                              //
     "\n"                                                                                        //
     "Runs the calls of the NVMe engine, every thread submitting and polling a ring of its\n"    //
     "own, and tells every database Database.open_nvme() opens on it how to move bytes. Every\n" //
-    "size keyword names a field of ustore_nvme_options_t: shared_io_channels, queue_depth,\n"   //
-    "request_buffer_bytes, request_buffers_count, stream_buffer_bytes or\n"                     //
-    "stream_buffers_count, where zero keeps the engine's default. Calls\n"                      //
-    "`ustore_executor_for_nvme`.\n"                                                             //
+    "size keyword names a field of ustore_nvme_options_t: queue_depth, request_buffer_bytes,\n" //
+    "request_buffers_count, stream_buffer_bytes or stream_buffers_count, where zero keeps\n"    //
+    "the engine's default. Calls `ustore_executor_for_nvme`.\n"                                 //
     "\n"                                                                                        //
     "Args:\n"                                                                                   //
-    "  threads (int, optional): Threads to spawn; zero derives them from the cores.\n"          //
+    "  threads (int, optional): Threads to spawn; zero takes the fewest hardware queues of\n"   //
+    "    the disks under `paths`, capped by the cores.\n"                                       //
     "  transport (Transport, optional): How bytes move between the files and memory.\n"         //
+    "  paths (Sequence, optional): The data directories of the databases it will open, whose\n" //
+    "    shared NUMA node places the threads unless `memory_domains` names one.\n"              //
+    "  memory_domains (Sequence[int], optional): NUMA nodes the threads and their staging\n"    //
+    "    live on, the first placing the threads.\n"                                             //
     "Returns:\n"                                                                                //
-    "  Executor: The new executor.";
+    "  Executor: The new executor.\n"                                                           //
+    "Raises:\n"                                                                                 //
+    "  InvalidArgumentError: A memory domain names no NUMA node.";
+
+/**
+ *  @brief Encodes @p object, None or a sequence of paths, into views of their bytes.
+ *  @param[out] encoded The list the caller releases, which keeps the encoded bytes alive, or
+ *      NULL when @p object is None.
+ *  @param[out] views The views into @c encoded, or NULL for None, which the caller frees.
+ *  @param[out] count Entries of @c views.
+ *  @return 0 on success, -1 with an exception set otherwise.
+ */
+static int paths_from_object(PyObject* object, PyObject** encoded, ustore_bytes_view_t** views, size_t* count) {
+    *encoded = NULL;
+    *views = NULL;
+    *count = 0;
+    if (!object || object == Py_None) return 0;
+    PyObject* const items = PySequence_Fast(object, "The 'paths' option takes a sequence of paths");
+    if (!items) return -1;
+    Py_ssize_t const length = PySequence_Fast_GET_SIZE(items);
+    *encoded = PyList_New(length);
+    *views = PyMem_New(ustore_bytes_view_t, (size_t)length + 1);
+    int failed = !*encoded || !*views;
+    if (failed && !PyErr_Occurred()) PyErr_NoMemory();
+    for (Py_ssize_t index = 0; !failed && index != length; ++index) {
+        PyObject* bytes = NULL;
+        failed = !PyUnicode_FSConverter(PySequence_Fast_GET_ITEM(items, index), &bytes);
+        if (failed) break;
+        PyList_SET_ITEM(*encoded, index, bytes);
+        (*views)[index].data = (uint8_t const*)PyBytes_AS_STRING(bytes);
+        (*views)[index].length = (ustore_size_t)PyBytes_GET_SIZE(bytes);
+    }
+    Py_DECREF(items);
+    if (failed) {
+        Py_CLEAR(*encoded);
+        PyMem_Free(*views);
+        *views = NULL;
+        return -1;
+    }
+    *count = (size_t)length;
+    return 0;
+}
 
 /** The size keywords of @c Executor.for_nvme, in the order they follow its other arguments. */
-static char const* const nvme_size_names[] = {"shared_io_channels",    "queue_depth",         "request_buffer_bytes",
-                                              "request_buffers_count", "stream_buffer_bytes", "stream_buffers_count"};
+static char const* const nvme_size_names[] = {"queue_depth", "request_buffer_bytes", "request_buffers_count",
+                                              "stream_buffer_bytes", "stream_buffers_count"};
 
 static PyObject* Executor_for_nvme(PyObject* type, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
                                    PyObject* keyword_names_tuple) {
     static char const* const names[] = {"threads",
                                         "transport",
-                                        "shared_io_channels",
                                         "queue_depth",
                                         "request_buffer_bytes",
                                         "request_buffers_count",
                                         "stream_buffer_bytes",
-                                        "stream_buffers_count"};
-    PyObject* values[8];
-    size_t threads = 0, sizes[6] = {0};
+                                        "stream_buffers_count",
+                                        "paths",
+                                        "memory_domains"};
+    PyObject* values[9];
+    size_t threads = 0, sizes[5] = {0};
     int transport = ustore_transport_automatic_k;
-    if (factory_arguments("for_nvme", arguments, positional_arguments_count, keyword_names_tuple, names, values, 8, 1,
+    if (factory_arguments("for_nvme", arguments, positional_arguments_count, keyword_names_tuple, names, values, 9, 1,
                           0) != 0 ||
         (values[0] && ustore_py_size_from_object(values[0], "threads", &threads) != 0) ||
         (values[1] && ustore_py_enum_from_object(values[1], "transport", ustore_py_enum_transport_k, &transport) != 0))
         return NULL;
-    for (size_t index = 0; index != 6; ++index)
+    for (size_t index = 0; index != 5; ++index)
         if (values[2 + index] &&
             ustore_py_size_from_object(values[2 + index], nvme_size_names[index], &sizes[index]) != 0)
             return NULL;
+    PyObject* encoded_paths = NULL;
+    ustore_bytes_view_t* paths = NULL;
+    size_t paths_count = 0, memory_domains_count = 0;
+    int32_t* memory_domains = NULL;
+    if (paths_from_object(values[7], &encoded_paths, &paths, &paths_count) != 0) return NULL;
+    if (identifiers_from_object(values[8], "memory_domains", &memory_domains, &memory_domains_count) != 0) {
+        Py_XDECREF(encoded_paths);
+        PyMem_Free(paths);
+        return NULL;
+    }
 
     ustore_executor_t handle = NULL;
     ustore_outcome_t outcome = {0};
@@ -2537,18 +2537,23 @@ static PyObject* Executor_for_nvme(PyObject* type, PyObject* const* arguments, P
         .nvme =
             {
                 .transport = (ustore_transport_t)transport,
-                .shared_io_channels = (ustore_size_t)sizes[0],
-                .queue_depth = (ustore_size_t)sizes[1],
-                .request_buffer_bytes = (ustore_size_t)sizes[2],
-                .request_buffers_count = (ustore_size_t)sizes[3],
-                .stream_buffer_bytes = (ustore_size_t)sizes[4],
-                .stream_buffers_count = (ustore_size_t)sizes[5],
+                .queue_depth = (ustore_size_t)sizes[0],
+                .request_buffer_bytes = (ustore_size_t)sizes[1],
+                .request_buffers_count = (ustore_size_t)sizes[2],
+                .stream_buffer_bytes = (ustore_size_t)sizes[3],
+                .stream_buffers_count = (ustore_size_t)sizes[4],
+                .paths = paths,
+                .paths_count = (ustore_size_t)paths_count,
             },
+        .ram = {memory_domains, (ustore_size_t)memory_domains_count},
         .threads = (ustore_size_t)threads,
     };
     Py_BEGIN_ALLOW_THREADS;
     ustore_executor_for_nvme(&made);
     Py_END_ALLOW_THREADS;
+    Py_XDECREF(encoded_paths);
+    PyMem_Free(paths);
+    PyMem_Free(memory_domains);
     return executor_made(type, handle, &outcome);
 }
 
@@ -2690,8 +2695,6 @@ static PyObject* Executor_repr(Executor* self) {
 static PyMethodDef Executor_methods[] = {
     {"for_ram", (PyCFunction)(void (*)(void))Executor_for_ram, ustore_py_method_flags_k | METH_CLASS,
      doc_Executor_for_ram},
-    {"on_pool", (PyCFunction)(void (*)(void))Executor_on_pool, ustore_py_method_flags_k | METH_CLASS,
-     doc_Executor_on_pool},
     {"for_nvme", (PyCFunction)(void (*)(void))Executor_for_nvme, ustore_py_method_flags_k | METH_CLASS,
      doc_Executor_for_nvme},
     {"for_vram", (PyCFunction)(void (*)(void))Executor_for_vram, ustore_py_method_flags_k | METH_CLASS,
@@ -2894,9 +2897,10 @@ static PyMemberDef Description_members[] = {
      "Bytes of memory the engine holds for the data, or zero where it keeps no estimate."},
     {"disk_bytes", Py_T_ULONGLONG, offsetof(Description, description.disk_bytes), Py_READONLY,
      "Bytes the files of the database take on disk."},
-    {"pin_refused_bytes", Py_T_ULONGLONG, offsetof(Description, description.pin_refused_bytes), Py_READONLY,
+    {"unpinned_staging_bytes", Py_T_ULONGLONG, offsetof(Description, description.unpinned_staging_bytes), Py_READONLY,
      "Bytes of the NVMe engine's io_uring arena the locked-memory cap refused to pin, so each request pins its own."},
-    {"crossing_requests", Py_T_ULONGLONG, offsetof(Description, description.crossing_requests), Py_READONLY,
+    {"requests_across_registered_slots", Py_T_ULONGLONG,
+     offsetof(Description, description.requests_across_registered_slots), Py_READONLY,
      "Requests the NVMe engine sent unpinned while its arena was pinned, as each crossed a gibibyte of it."},
     {NULL, 0, 0, 0, NULL},
 };

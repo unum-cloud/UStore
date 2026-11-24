@@ -52,6 +52,7 @@ from ustore.blobs import (
     BlobsCursorConfig,
     BlobsReadConfig,
     BlobsScanConfig,
+    DocsBatches,
     KeyRuns,
     Measures,
     Pulled,

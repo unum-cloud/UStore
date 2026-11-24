@@ -40,10 +40,20 @@ static nvme_size_keyword_t const nvme_size_keywords[] = {
     {NULL, 0},
 };
 
-/** What an init call borrows from the arguments of a constructor, kept alive until the call returns. */
+/** Every size keyword of @c Database.view_nvme, as fields of @c ustore_database_view_nvme_t,
+ *  closed by a nameless row. */
+static nvme_size_keyword_t const nvme_view_size_keywords[] = {
+    {"memory_limit", offsetof(ustore_database_view_nvme_t, memory_limit)},
+    {"collection_concurrency_limit", offsetof(ustore_database_view_nvme_t, collection_concurrency_limit)},
+    {"collection_cache_limit", offsetof(ustore_database_view_nvme_t, collection_cache_limit)},
+    {NULL, 0},
+};
+
+/** What an init call reads from the arguments of a constructor, kept alive until
+ *  the call returns. */
 typedef struct opening_t {
 
-    /** The executor the init runs on, borrowed from the arguments, or NULL for the calling thread. */
+    /** The executor the init runs on, viewed from the arguments, or NULL for the calling thread. */
     ustore_executor_t executor;
 
     /** The encoded directory, or NULL for none. */
@@ -189,12 +199,13 @@ static PyObject* database_opened(ustore_database_t handle, ustore_outcome_t* out
 static char const doc_Database[] =                                                             //
     "An embedded database, opened through one class method per engine.\n"                      //
     "\n"                                                                                       //
-    "Database.open_ram(), open_rocksdb(), view_rocksdb(), open_leveldb() and open_nvme()\n"    //
-    "each take what their engine can be asked; engines_compiled() names the ones this build\n" //
-    "carries, and the others refuse to open. Each takes an `executor` keyword and blocks\n"    //
-    "on it, as it blocks on the calling thread without one. The directory belongs to\n"        //
-    "the database, so no two processes may open the same one at once. No collection exists\n"  //
-    "until `collection_create` makes it, and names starting with `_` are reserved.\n"          //
+    "Database.open_ram(), open_rocksdb(), view_rocksdb(), open_leveldb(), open_nvme() and\n"   //
+    "view_nvme() each take what their engine can be asked; engines_compiled() names the\n"     //
+    "ones this build holds, and the others refuse to open. Each takes an `executor`\n"         //
+    "keyword and blocks on it, as it blocks on the calling thread without one. The\n"          //
+    "directory belongs to the database, so no two processes may open the same one at once.\n"  //
+    "No collection exists until `collection_create` makes it, and names starting with `_`\n"   //
+    "are reserved.\n"                                                                          //
     "\n"                                                                                       //
     "Indexing it by name, as `db['movies']`, answers a Collection, whose `blobs`, `docs`,\n"   //
     "`graph` and `table` views create it on their first write. Its verbs run on the calling\n" //
@@ -202,8 +213,9 @@ static char const doc_Database[] =                                              
 
 static PyObject* Database_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNUSED(arguments),
                                  PyObject* Py_UNUSED(keywords)) {
-    PyErr_SetString(PyExc_TypeError,
-                    "Database() names no engine: use open_ram, open_rocksdb, view_rocksdb, open_leveldb or open_nvme");
+    PyErr_SetString(
+        PyExc_TypeError,
+        "Database() names no engine: use open_ram, open_rocksdb, view_rocksdb, open_leveldb, open_nvme or view_nvme");
     return NULL;
 }
 
@@ -503,6 +515,79 @@ static PyObject* Database_open_nvme(PyObject* Py_UNUSED(type), PyObject* const* 
     open_nvme.data_directories_count = (ustore_size_t)opening.data_directories_count;
     Py_BEGIN_ALLOW_THREADS;
     ustore_database_open_nvme(&open_nvme);
+    Py_END_ALLOW_THREADS;
+    opening_release(&opening);
+    return database_opened(handle, &outcome);
+
+failed:
+    opening_release(&opening);
+    return NULL;
+}
+
+static char const doc_Database_view_nvme[] =                                                  //
+    "view_nvme(manifest, *, executor=None, cpu_class_ceiling=CPUClass.UNKNOWN, **sizes)\n"    //
+    "answers a read-only database on NVMe, which writes nothing to its data directories.\n"   //
+    "\n"                                                                                      //
+    "Every size keyword names a field of ustore_database_view_nvme_t: memory_limit,\n"        //
+    "collection_concurrency_limit or collection_cache_limit, where zero keeps the default.\n" //
+    "\n"                                                                                      //
+    "Args:\n"                                                                                 //
+    "  manifest (str | bytes | PathLike): The manifest of an existing database,\n"            //
+    "    <database>.ustore.json in its first data directory.\n"                               //
+    "  executor (Executor, optional): The executor the open blocks on, or None to open on\n"  //
+    "    the calling thread.\n"                                                               //
+    "  data_directories (Sequence): Further data directories, as the database was opened\n"   //
+    "    with, each a path or a (path, max_bytes) pair.\n"                                    //
+    "  cpu_class_ceiling (CPUClass): The newest CPU class the database may confine its\n"     //
+    "    waits, atomics and string kernels to; UNKNOWN sets none.\n"                          //
+    "Returns:\n"                                                                              //
+    "  Database: The database, refusing every change with ReadOnlyError.\n"                   //
+    "Raises:\n"                                                                               //
+    "  UnsupportedError: This build holds no NVMe engine, or the manifest names raw media.\n" //
+    "  NotFoundError: The manifest does not exist.";
+
+static PyObject* Database_view_nvme(PyObject* Py_UNUSED(type), PyObject* const* arguments,
+                                    Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
+    opening_t opening = {0};
+    ustore_database_view_nvme_t view_nvme = {0};
+    Py_ssize_t const keyword_names_count = opening_positional(&opening, "view_nvme", arguments,
+                                                              positional_arguments_count, keyword_names_tuple);
+    if (keyword_names_count < 0) goto failed;
+    for (Py_ssize_t names_progress = 0; names_progress != keyword_names_count; ++names_progress) {
+        PyObject* const name = PyTuple_GET_ITEM(keyword_names_tuple, names_progress);
+        PyObject* const value = arguments[positional_arguments_count + names_progress];
+        nvme_size_keyword_t const* keyword = nvme_view_size_keywords;
+        while (keyword->name && PyUnicode_CompareWithASCIIString(name, keyword->name) != 0) ++keyword;
+        size_t size = 0;
+        int read = -1;
+        if (keyword->name) {
+            read = ustore_py_size_from_object(value, keyword->name, &size);
+            *(ustore_size_t*)((char*)&view_nvme + keyword->offset) = (ustore_size_t)size;
+        }
+        else if (PyUnicode_CompareWithASCIIString(name, "directory") == 0) read = opening_directory(&opening, value);
+        else if (PyUnicode_CompareWithASCIIString(name, "executor") == 0) read = opening_executor(&opening, value);
+        else if (PyUnicode_CompareWithASCIIString(name, "data_directories") == 0)
+            read = opening_data_directories(&opening, value);
+        else if (PyUnicode_CompareWithASCIIString(name, "cpu_class_ceiling") == 0) {
+            int cpu_class_ceiling = ustore_cpu_class_unknown_k;
+            read = ustore_py_enum_from_object(value, "cpu_class_ceiling", ustore_py_enum_cpu_class_k,
+                                              &cpu_class_ceiling);
+            view_nvme.cpu_class_ceiling = (ustore_cpu_class_t)cpu_class_ceiling;
+        }
+        else PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
+        if (read != 0) goto failed;
+    }
+
+    ustore_database_t handle = NULL;
+    ustore_outcome_t outcome = {0};
+    view_nvme.database = &handle;
+    view_nvme.executor = opening.executor;
+    view_nvme.outcome = &outcome;
+    view_nvme.directory = path_bytes(opening.directory);
+    view_nvme.data_directories = opening.data_directories;
+    view_nvme.data_directories_count = (ustore_size_t)opening.data_directories_count;
+    Py_BEGIN_ALLOW_THREADS;
+    ustore_database_view_nvme(&view_nvme);
     Py_END_ALLOW_THREADS;
     opening_release(&opening);
     return database_opened(handle, &outcome);
@@ -1868,6 +1953,8 @@ static PyMethodDef Database_methods[] = {
      doc_Database_open_leveldb},
     {"open_nvme", (PyCFunction)(void (*)(void))Database_open_nvme, ustore_py_method_flags_k | METH_CLASS,
      doc_Database_open_nvme},
+    {"view_nvme", (PyCFunction)(void (*)(void))Database_view_nvme, ustore_py_method_flags_k | METH_CLASS,
+     doc_Database_view_nvme},
     {"close", (PyCFunction)(void (*)(void))Database_close, METH_NOARGS, doc_Database_close},
     {"__enter__", (PyCFunction)(void (*)(void))Database_enter, METH_NOARGS, NULL},
     {"__exit__", (PyCFunction)(void (*)(void))Database_exit, ustore_py_method_flags_k, NULL},

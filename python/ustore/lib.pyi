@@ -60,7 +60,7 @@ type PathLikeOrStr = str | bytes | PathLike[str]
 type DataDirectory = PathLikeOrStr | tuple[PathLikeOrStr, int]
 type Progress = Callable[[int, int], bool | None]
 """Called with the units a call finished and the units it finishes in all, from whichever thread runs it but never two
-at once; None or a truthy answer carries on, any other falsy one cancels, and a raise cancels and re-raises."""
+at once; None or a truthy answer continues, any other falsy one cancels, and a raise cancels and re-raises."""
 type Predicate = Callable[[tuple[UUID, ...]], Sequence[object]]
 """Called with the keys one page of a scan or a pull listed, from whichever thread runs it, answering one truthy item
 per key kept; a raise rejects the rest and re-raises once the call is final."""
@@ -493,9 +493,12 @@ class Cursor:
     out, so a key written behind the walk never comes and one written ahead of it does. A page shorter than `wanted`
     exhausts the walk for good, whatever is written since."""
 
-    def next(self, wanted: int, arena: Arena, /, *, values: bool = False, progress: Progress | None = None) -> Page:
+    def next(
+        self, wanted: int, arena: Arena, /, *, values: bool = False, progress: Progress | None = None
+    ) -> Page | list[tuple[Page, Columns]]:
         """The next page of up to `wanted` keys in `arena`, with their values when asked, blocking on the executor the
-        cursor was opened through. Calls `ustore_blobs_cursor_next`."""
+        cursor was opened through, or for a walk over documents its batches of up to `wanted` rows in all, each its keys
+        and the columns the cursor gathers. Calls `ustore_blobs_cursor_next`."""
 
     def close(self) -> None:
         """Frees the walk with the holds it kept on its database and the transaction or snapshot it reads through."""
@@ -649,12 +652,7 @@ class Executor:
     @classmethod
     def for_ram(cls, threads: int = 0, *, memory_domains: Sequence[int] | None = None) -> Self:
         """Host threads for the RAM, RocksDB and LevelDB engines near `memory_domains`, every NUMA node for None, where
-        zero threads take 7/8 of the cores those nodes carry. Calls `ustore_executor_for_ram`."""
-
-    @classmethod
-    def on_pool(cls, pool: int, /, *, memory_domains: Sequence[int] | None = None) -> Self:
-        """The threads of a ForkUnion `fu_pool_t` at address `pool`, which another library runs and which must outlive
-        the executor. Calls `ustore_executor_on_pool`."""
+        zero threads take 7/8 of the cores those nodes hold. Calls `ustore_executor_for_ram`."""
 
     @classmethod
     def for_nvme(
@@ -662,15 +660,19 @@ class Executor:
         threads: int = 0,
         *,
         transport: Transport = Transport.AUTOMATIC,
-        shared_io_channels: int = 0,
         queue_depth: int = 0,
         request_buffer_bytes: int = 0,
         request_buffers_count: int = 0,
         stream_buffer_bytes: int = 0,
         stream_buffers_count: int = 0,
+        paths: Sequence[PathLikeOrStr] | None = None,
+        memory_domains: Sequence[int] | None = None,
     ) -> Self:
         """Threads each driving an I/O ring for the NVMe engine, telling every database `Database.open_nvme` opens on
-        it how to move bytes, where every zero size keeps the engine's default. Calls `ustore_executor_for_nvme`."""
+        it how to move bytes, where every zero size keeps the engine's default. The threads and their staging live on
+        the first of `memory_domains`, or with none named on the NUMA node the data directories `paths` share, and zero
+        threads take the fewest hardware queues of their disks, capped by the cores. Calls
+        `ustore_executor_for_nvme`."""
 
     @classmethod
     def for_vram(
@@ -950,8 +952,11 @@ class _Reads:
         filter: str | bytes | None = None,
         predicate: Predicate | None = None,
         predicate_cost: PredicateCost = PredicateCost.CHEAP,
+        fields: Sequence[str] | None = None,
+        outputs_types: FieldType | Sequence[FieldType] | None = None,
     ) -> Cursor:
-        """A walk over documents, keeping those `filter` matches. Calls `ustore_docs_cursor_init`."""
+        """A walk over documents, keeping those `filter` matches, whose every pull answers a list of `(Page, Columns)`
+        batches gathering `fields`, the empty one being the whole document. Calls `ustore_docs_cursor_init`."""
 
     def pages_cursor(
         self,
@@ -1716,6 +1721,22 @@ class Database(_Writes, _Receivers):
         `executor`, which tells it how to move bytes when `Executor.for_nvme` made it, merging on the device of
         `compactions` when `Executor.for_vram` made it, and confined to the newest class the CPU runs at or under
         `cpu_class_ceiling`."""
+
+    @classmethod
+    def view_nvme(
+        cls,
+        manifest: PathLikeOrStr,
+        *,
+        executor: Executor | None = None,
+        data_directories: Sequence[DataDirectory] = (),
+        cpu_class_ceiling: CPUClass = CPUClass.UNKNOWN,
+        memory_limit: int = 0,
+        collection_concurrency_limit: int = 0,
+        collection_cache_limit: int = 0,
+    ) -> Self:
+        """A read-only database on the NVMe engine, named by the `manifest` of an existing database, which writes
+        nothing to its data directories and refuses every change with `ReadOnlyError`, opened blocking on
+        `executor`."""
     def __enter__(self) -> Self: ...
     def __exit__(
         self,

@@ -494,8 +494,6 @@ comptime GPUDevices = Verb[GPUDevicesArguments]
 """`ustore_gpu_devices`."""
 comptime ExecutorForRam = Verb[ExecutorForRamArguments]
 """`ustore_executor_for_ram`."""
-comptime ExecutorOnPool = Verb[ExecutorOnPoolArguments]
-"""`ustore_executor_on_pool`."""
 comptime ExecutorForNvme = Verb[ExecutorForNvmeArguments]
 """`ustore_executor_for_nvme`."""
 comptime ExecutorForVram = Verb[ExecutorForVramArguments]
@@ -862,8 +860,6 @@ struct NvmeOptions(Defaultable, ImplicitlyCopyable):
 
     var transport: Transport
     """How bytes move between the files and memory."""
-    var shared_io_channels: c_size_t
-    """I/O channels the threads outside the executor share."""
     var queue_depth: c_size_t
     """Submissions a channel holds at once."""
     var request_buffer_bytes: c_size_t
@@ -874,10 +870,15 @@ struct NvmeOptions(Defaultable, ImplicitlyCopyable):
     """Bytes of each streaming buffer of a channel."""
     var stream_buffers_count: c_size_t
     """Streaming buffers of each channel."""
+    var paths: Address
+    """The `ustore_bytes_view_t` array naming the data directories of the databases it will open, read only during the
+    call, whose shared NUMA node places the threads; `NULL_ADDRESS` derives nothing from the media."""
+    var paths_count: c_size_t
+    """Entries of `paths`."""
 
     def __init__(out self):
         """Every engine default."""
-        self = Self(Transport.AUTOMATIC, 0, 0, 0, 0, 0, 0)
+        self = Self(Transport.AUTOMATIC, 0, 0, 0, 0, 0, NULL_ADDRESS, 0)
 
 
 # endregion Placement
@@ -904,16 +905,7 @@ struct ExecutorForRamArguments(ImplicitlyCopyable):
     var ram: RamOptionsArguments
     var threads: c_size_t
     var cpu_class_ceiling: CPUClass
-
-
-@fieldwise_init
-struct ExecutorOnPoolArguments(ImplicitlyCopyable):
-    """`ustore_executor_on_pool_t`, laid out as the ABI declares it."""
-
-    var executor: Optional[Pointer[Address, MutUntrackedOrigin]]
-    var outcome: Optional[Pointer[Outcome, MutUntrackedOrigin]]
-    var ram: RamOptionsArguments
-    var pool: Address
+    var scratch_limit: c_size_t
 
 
 @fieldwise_init
@@ -923,8 +915,10 @@ struct ExecutorForNvmeArguments(ImplicitlyCopyable):
     var executor: Optional[Pointer[Address, MutUntrackedOrigin]]
     var outcome: Optional[Pointer[Outcome, MutUntrackedOrigin]]
     var nvme: NvmeOptions
+    var ram: RamOptionsArguments
     var threads: c_size_t
     var cpu_class_ceiling: CPUClass
+    var scratch_limit: c_size_t
 
 
 @fieldwise_init
@@ -1037,61 +1031,42 @@ struct Executor:
         var outcome = stack_allocation[1, Outcome]().unsafe_origin_cast[MutUntrackedOrigin]()
         outcome[] = Outcome()
         _cross(
-            ExecutorForRamArguments(created, outcome, ram.arguments(), c_size_t(threads), cpu_class_ceiling),
+            ExecutorForRamArguments(created, outcome, ram.arguments(), c_size_t(threads), cpu_class_ceiling, c_size_t(0)),
             library.symbols().executor_for_ram,
         )
         return Self(library=library, address=_created(library, outcome, created, "ustore_executor_for_ram"), vram=False)
 
     @staticmethod
-    def on_pool[
+    def for_nvme[
         ram_origin: ImmOrigin, //
-    ](library: Library, pool: Address, ram: RamOptions[ram_origin] = RamOptions()) raises Error -> Self:
-        """Schedules onto a borrowed ForkUnion pool, so several libraries in one process share one set of
-        threads. Calls `ustore_executor_on_pool`.
-
-        Args:
-            library: The loaded engine, kept so the shared object stays mapped.
-            pool: A live ForkUnion `fu_pool_t`, which must outlive the executor.
-            ram: The memory domains it serves; copied, not borrowed.
-
-        Raises:
-            `Error` if the pool or the domains are refused.
-        """
-        var created = stack_allocation[1, Address]().unsafe_origin_cast[MutUntrackedOrigin]()
-        created[] = NULL_ADDRESS
-        var outcome = stack_allocation[1, Outcome]().unsafe_origin_cast[MutUntrackedOrigin]()
-        outcome[] = Outcome()
-        _cross(
-            ExecutorOnPoolArguments(created, outcome, ram.arguments(), pool),
-            library.symbols().executor_on_pool,
-        )
-        return Self(library=library, address=_created(library, outcome, created, "ustore_executor_on_pool"), vram=False)
-
-    @staticmethod
-    def for_nvme(
+    ](
         library: Library,
         nvme: NvmeOptions = NvmeOptions(),
         threads: Int = 0,
         cpu_class_ceiling: CPUClass = CPUClass.UNKNOWN,
+        ram: RamOptions[ram_origin] = RamOptions(),
     ) raises Error -> Self:
         """Creates an executor for the NVMe engine, whose every thread submits and polls its own I/O ring.
         Calls `ustore_executor_for_nvme`.
 
         Args:
             library: The loaded engine, kept so the shared object stays mapped.
-            nvme: How the databases it opens move bytes; copied, not borrowed.
-            threads: Threads to spawn; zero derives them from the cores.
+            nvme: How the databases it opens move bytes, and where their media sit; copied at creation.
+            threads: Threads to spawn; zero takes the fewest hardware queues of the disks under `nvme.paths`.
             cpu_class_ceiling: The newest class its threads may confine their waits and atomics to, narrowed to what the CPU runs, so a class it lacks is never refused; `UNKNOWN` sets none.
+            ram: The memory domains its threads and their staging live on, the first placing the threads; none named takes the domain `nvme.paths` share.
 
         Raises:
-            `Error` if the transport is unknown or the OS refuses the threads.
+            `Error` if the transport is unknown, a memory domain names no NUMA node, or the OS refuses the threads.
         """
         var created = stack_allocation[1, Address]().unsafe_origin_cast[MutUntrackedOrigin]()
         created[] = NULL_ADDRESS
         var outcome = stack_allocation[1, Outcome]().unsafe_origin_cast[MutUntrackedOrigin]()
         outcome[] = Outcome()
         _cross(
-            ExecutorForNvmeArguments(created, outcome, nvme, c_size_t(threads), cpu_class_ceiling),
+            ExecutorForNvmeArguments(
+                created, outcome, nvme, ram.arguments(), c_size_t(threads), cpu_class_ceiling, c_size_t(0)
+            ),
             library.symbols().executor_for_nvme,
         )
         return Self(library=library, address=_created(library, outcome, created, "ustore_executor_for_nvme"), vram=False)
@@ -1110,7 +1085,8 @@ struct Executor:
         Args:
             library: The loaded engine, kept so the shared object stays mapped.
             device: The UStore ordinal of the device, its position in `Library.gpu_devices`.
-            stream: A borrowed stream on that device, which must outlive the executor; null creates one.
+            stream: The caller's stream on that device, which the caller destroys after freeing the executor;
+                null takes the device's per-thread default stream. The executor creates and destroys no stream.
             scratch_limit: Ceiling on the device scratch a call takes; zero lets it grow.
             gds: How reads and compactions move bytes between the drives and the device.
 

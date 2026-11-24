@@ -68,10 +68,11 @@ static size_t field_type_width(ustore_docs_field_type_t type) {
     }
 }
 
-/** Whether a gather has a column layout for @p type: a fixed-width scalar, a UUID, a string or bytes. */
+/** Whether a gather has a column layout for @p type: a fixed-width scalar, a UUID, a string, bytes
+ *  or JSON text. */
 static int field_type_gathers(ustore_docs_field_type_t type) {
     return field_type_width(type) != 0 || type == ustore_docs_field_type_string_k ||
-           type == ustore_docs_field_type_binary_k;
+           type == ustore_docs_field_type_binary_k || type == ustore_docs_field_type_json_k;
 }
 
 /**
@@ -1001,13 +1002,63 @@ PyObject* ustore_py_api_docs_measure(PyObject* self, PyObject* const* arguments,
 
 #pragma region Gathers
 
-/**
- *  @brief A new @c Columns over the columns a gather wrote into @p arena.
- *  @param[in] types The type of every field, copied into the result.
- *  @return A new reference, or NULL with an exception set.
- */
-static PyObject* columns_new(PyObject* arena, ustore_docs_column_view_t const* columns, PyObject* fields,
-                             ustore_docs_field_type_t const* types, size_t fields_count, size_t docs_count) {
+int ustore_py_columns_request(PyObject* fields, PyObject* types, PyObject** fields_held, ustore_bytes_view_t** views,
+                              ustore_docs_field_type_t** types_out, size_t* count) {
+    if (PyUnicode_Check(fields)) {
+        PyErr_SetString(PyExc_TypeError, "The fields are a sequence of strings, not one string");
+        return -1;
+    }
+    // The tuple keeps every field name alive while a call reads the UTF-8 bytes they cache.
+    *fields_held = PySequence_Tuple(fields);
+    if (!*fields_held) return -1;
+    size_t const fields_count = (size_t)PyTuple_GET_SIZE(*fields_held);
+    *count = fields_count;
+
+    // One `FieldType` is an int, and stands for every field
+    int const broadcast = PyLong_Check(types);
+    PyObject* const types_held = broadcast ? NULL : PySequence_Tuple(types);
+    if (!broadcast && !types_held) return -1;
+    if (types_held && (size_t)PyTuple_GET_SIZE(types_held) != fields_count) {
+        ustore_py_raise(ustore_status_invalid_argument_k, "Got %zd outputs types for %zu fields",
+                        PyTuple_GET_SIZE(types_held), fields_count);
+        Py_DECREF(types_held);
+        return -1;
+    }
+    *views = (ustore_bytes_view_t*)PyMem_Malloc((fields_count + 1) * sizeof(ustore_bytes_view_t));
+    *types_out = (ustore_docs_field_type_t*)PyMem_Malloc((fields_count + 1) * sizeof(ustore_docs_field_type_t));
+    int failed = !*views || !*types_out;
+    if (failed) PyErr_NoMemory();
+    for (size_t field_index = 0; !failed && field_index != fields_count; ++field_index) {
+        PyObject* const field = PyTuple_GET_ITEM(*fields_held, (Py_ssize_t)field_index);
+        PyObject* const type_object = types_held ? PyTuple_GET_ITEM(types_held, (Py_ssize_t)field_index) : types;
+        if (!PyUnicode_Check(field)) {
+            PyErr_Format(PyExc_TypeError, "A field is a string, got %S", Py_TYPE(field));
+            failed = 1;
+            break;
+        }
+        Py_ssize_t length = 0;
+        char const* const text = PyUnicode_AsUTF8AndSize(field, &length);
+        (*views)[field_index].data = (uint8_t const*)text;
+        (*views)[field_index].length = (ustore_size_t)length;
+        int type = ustore_docs_field_type_json_k;
+        failed = !text ||
+                 ustore_py_enum_from_object(type_object, "outputs_types", ustore_py_enum_field_type_k, &type) != 0;
+        if (failed) break;
+        if (!field_type_gathers((ustore_docs_field_type_t)type)) {
+            ustore_py_raise(ustore_status_invalid_argument_k,
+                            "A gather converts into scalars, UUIDs, strings, bytes or JSON, not %s",
+                            ustore_docs_field_type_name((ustore_docs_field_type_t)type));
+            failed = 1;
+            break;
+        }
+        (*types_out)[field_index] = (ustore_docs_field_type_t)type;
+    }
+    Py_XDECREF(types_held);
+    return failed ? -1 : 0;
+}
+
+PyObject* ustore_py_columns_new(PyObject* arena, ustore_docs_column_view_t const* columns, PyObject* fields,
+                                ustore_docs_field_type_t const* types, size_t fields_count, size_t docs_count) {
     Columns* const instance = PyObject_NewVar(Columns, &ColumnsType, (Py_ssize_t)fields_count);
     if (!instance) return NULL;
     instance->arena = Py_NewRef(arena);
@@ -1096,62 +1147,12 @@ PyObject* ustore_py_api_docs_gather(PyObject* self, PyObject* const* arguments, 
                                              &options) != 0)
         return NULL;
 
-    if (PyUnicode_Check(arguments[1])) {
-        PyErr_SetString(PyExc_TypeError, "The fields are a sequence of strings, not one string");
-        return NULL;
-    }
     gather_call_t stack;
     gather_call_t* const call = ustore_py_call_open(&context, &gather_verb, &stack);
     if (!call) return NULL;
-    // The tuple keeps every field name alive while the call reads the UTF-8 bytes they cache.
-    call->fields_held = PySequence_Tuple(arguments[1]);
-    if (!call->fields_held) return ustore_py_call_discard(&context, &gather_verb, call);
-    size_t const fields_count = (size_t)PyTuple_GET_SIZE(call->fields_held);
-
-    // One `FieldType` is an int, and stands for every field
-    int const broadcast = PyLong_Check(arguments[2]);
-    PyObject* const types_held = broadcast ? NULL : PySequence_Tuple(arguments[2]);
-    if (!broadcast && !types_held) return ustore_py_call_discard(&context, &gather_verb, call);
-    if (types_held && (size_t)PyTuple_GET_SIZE(types_held) != fields_count) {
-        ustore_py_raise(ustore_status_invalid_argument_k, "Got %zd outputs types for %zu fields",
-                        PyTuple_GET_SIZE(types_held), fields_count);
-        Py_DECREF(types_held);
-        return ustore_py_call_discard(&context, &gather_verb, call);
-    }
-
-    call->fields_count = fields_count;
-    call->field_views = (ustore_bytes_view_t*)PyMem_Malloc((fields_count + 1) * sizeof(ustore_bytes_view_t));
-    call->types = (ustore_docs_field_type_t*)PyMem_Malloc((fields_count + 1) * sizeof(ustore_docs_field_type_t));
-    int failed = !call->field_views || !call->types;
-    if (failed) PyErr_NoMemory();
-
-    for (size_t field_index = 0; !failed && field_index != fields_count; ++field_index) {
-        PyObject* const field = PyTuple_GET_ITEM(call->fields_held, (Py_ssize_t)field_index);
-        PyObject* const type_object = types_held ? PyTuple_GET_ITEM(types_held, (Py_ssize_t)field_index) : arguments[2];
-        if (!PyUnicode_Check(field)) {
-            PyErr_Format(PyExc_TypeError, "A field is a string, got %S", Py_TYPE(field));
-            failed = 1;
-            break;
-        }
-        Py_ssize_t length = 0;
-        char const* const text = PyUnicode_AsUTF8AndSize(field, &length);
-        call->field_views[field_index].data = (uint8_t const*)text;
-        call->field_views[field_index].length = (ustore_size_t)length;
-        int type = ustore_docs_field_type_json_k;
-        failed = !text ||
-                 ustore_py_enum_from_object(type_object, "outputs_types", ustore_py_enum_field_type_k, &type) != 0;
-        if (failed) break;
-        if (!field_type_gathers((ustore_docs_field_type_t)type)) {
-            ustore_py_raise(ustore_status_invalid_argument_k,
-                            "A gather converts into scalars, UUIDs, strings or bytes, not %s",
-                            ustore_docs_field_type_name((ustore_docs_field_type_t)type));
-            failed = 1;
-            break;
-        }
-        call->types[field_index] = (ustore_docs_field_type_t)type;
-    }
-    Py_XDECREF(types_held);
-
+    int const failed = ustore_py_columns_request(arguments[1], arguments[2], &call->fields_held, &call->field_views,
+                                                 &call->types, &call->fields_count);
+    size_t const fields_count = call->fields_count;
     if (failed || ustore_py_keys_from_object(arguments[0], &call->keys) != 0 ||
         ustore_py_arena_from_object(arguments[3], &call->call.arena) != 0)
         return ustore_py_call_discard(&context, &gather_verb, call);

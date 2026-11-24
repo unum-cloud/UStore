@@ -371,25 +371,19 @@ pub(crate) mod ffi {
         pub ram: ustore_ram_options_t,
         pub threads: ustore_size_t,
         pub cpu_class_ceiling: ustore_enum_t,
-    }
-
-    #[repr(C)]
-    pub struct ustore_executor_on_pool_t {
-        pub executor: *mut ustore_executor_t,
-        pub outcome: *mut ustore_outcome_t,
-        pub ram: ustore_ram_options_t,
-        pub pool: *mut c_void,
+        pub scratch_limit: ustore_size_t,
     }
 
     #[repr(C)]
     pub struct ustore_nvme_options_t {
         pub transport: ustore_enum_t,
-        pub shared_io_channels: ustore_size_t,
         pub queue_depth: ustore_size_t,
         pub request_buffer_bytes: ustore_size_t,
         pub request_buffers_count: ustore_size_t,
         pub stream_buffer_bytes: ustore_size_t,
         pub stream_buffers_count: ustore_size_t,
+        pub paths: *const ustore_bytes_view_t,
+        pub paths_count: ustore_size_t,
     }
 
     #[repr(C)]
@@ -397,8 +391,10 @@ pub(crate) mod ffi {
         pub executor: *mut ustore_executor_t,
         pub outcome: *mut ustore_outcome_t,
         pub nvme: ustore_nvme_options_t,
+        pub ram: ustore_ram_options_t,
         pub threads: ustore_size_t,
         pub cpu_class_ceiling: ustore_enum_t,
+        pub scratch_limit: ustore_size_t,
     }
 
     #[repr(C)]
@@ -473,6 +469,7 @@ pub(crate) mod ffi {
         pub completion: ustore_completion_t,
         pub isolation: ustore_enum_t,
         pub cpu_class_ceiling: ustore_enum_t,
+        pub memory_limit: ustore_size_t,
     }
 
     #[repr(C)]
@@ -484,6 +481,7 @@ pub(crate) mod ffi {
         pub directory: ustore_bytes_view_t,
         pub isolation: ustore_enum_t,
         pub cpu_class_ceiling: ustore_enum_t,
+        pub memory_limit: ustore_size_t,
     }
 
     #[repr(C)]
@@ -495,6 +493,8 @@ pub(crate) mod ffi {
         pub directory: ustore_bytes_view_t,
         pub data_directories: *const ustore_data_directory_t,
         pub data_directories_count: ustore_size_t,
+        pub memory_limit: ustore_size_t,
+        pub background_threads: ustore_size_t,
     }
 
     /// The header declares the same members under a second name.
@@ -507,6 +507,8 @@ pub(crate) mod ffi {
         pub outcome: *mut ustore_outcome_t,
         pub completion: ustore_completion_t,
         pub directory: ustore_bytes_view_t,
+        pub memory_limit: ustore_size_t,
+        pub background_threads: ustore_size_t,
     }
 
     #[repr(C)]
@@ -529,6 +531,21 @@ pub(crate) mod ffi {
         pub collection_level_enlarge_factor: ustore_size_t,
         pub collection_value_size: ustore_size_t,
         pub collection_value_max_size: ustore_size_t,
+        pub cpu_class_ceiling: ustore_enum_t,
+    }
+
+    #[repr(C)]
+    pub struct ustore_database_view_nvme_t {
+        pub database: *mut ustore_database_t,
+        pub executor: ustore_executor_t,
+        pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
+        pub directory: ustore_bytes_view_t,
+        pub data_directories: *const ustore_data_directory_t,
+        pub data_directories_count: ustore_size_t,
+        pub memory_limit: ustore_size_t,
+        pub collection_concurrency_limit: ustore_size_t,
+        pub collection_cache_limit: ustore_size_t,
         pub cpu_class_ceiling: ustore_enum_t,
     }
 
@@ -769,7 +786,6 @@ pub(crate) mod ffi {
         pub fn ustore_modality_from_name(name: ustore_bytes_view_t, modality: *mut ustore_enum_t) -> ustore_status_t;
 
         pub fn ustore_executor_for_ram(arguments: *mut ustore_executor_for_ram_t);
-        pub fn ustore_executor_on_pool(arguments: *mut ustore_executor_on_pool_t);
         pub fn ustore_executor_for_nvme(arguments: *mut ustore_executor_for_nvme_t);
         pub fn ustore_executor_for_vram(arguments: *mut ustore_executor_for_vram_t);
         pub fn ustore_gpu_devices(arguments: *mut ustore_gpu_devices_t);
@@ -785,6 +801,7 @@ pub(crate) mod ffi {
         pub fn ustore_database_view_rocksdb(arguments: *mut ustore_database_view_rocksdb_t);
         pub fn ustore_database_open_leveldb(arguments: *mut ustore_database_open_leveldb_t);
         pub fn ustore_database_open_nvme(arguments: *mut ustore_database_open_nvme_t);
+        pub fn ustore_database_view_nvme(arguments: *mut ustore_database_view_nvme_t);
 
         pub fn ustore_database_describe(arguments: *mut ustore_database_describe_t);
         pub fn ustore_database_clear(arguments: *mut ustore_database_clear_t);
@@ -2345,6 +2362,9 @@ pub struct RAMOptions<'options> {
     /// the pick rather than failing and `None` sets no ceiling. [`Database::describe`] reports the
     /// class picked, and [`Status::Unsupported`] means no compiled class fits under it.
     pub cpu_class_ceiling: Option<CPUClass>,
+    /// Bytes of keys and values the database may hold, past which a write fails with
+    /// [`Status::CapacityExhausted`]; zero takes the engine's default.
+    pub memory_limit: u64,
 }
 
 /// What [`Database::open_rocksdb`] and [`Database::view_rocksdb`] open.
@@ -2356,6 +2376,10 @@ pub struct RocksDBOptions<'options> {
     pub data_directories: &'options [DataDirectory<'options>],
     /// The executor the open runs on; `None` opens on the calling thread.
     pub executor: Option<&'options Executor>,
+    /// Bytes of host memory the engine may cache and buffer; zero takes the engine's default.
+    pub memory_limit: u64,
+    /// Threads of the pool running the database's flushes and compactions; zero takes the default.
+    pub background_threads: usize,
 }
 
 impl<'options> RocksDBOptions<'options> {
@@ -2372,12 +2396,16 @@ pub struct LevelDBOptions<'options> {
     pub directory: &'options str,
     /// The executor the open runs on; `None` opens on the calling thread.
     pub executor: Option<&'options Executor>,
+    /// Bytes of host memory the engine may cache and buffer; zero takes the engine's default.
+    pub memory_limit: u64,
+    /// Threads that compact the database, of which LevelDB runs one; zero takes the default.
+    pub background_threads: usize,
 }
 
 impl<'options> LevelDBOptions<'options> {
     /// A database in an existing directory.
     pub fn at(directory: &'options str) -> Self {
-        LevelDBOptions { directory, executor: None }
+        LevelDBOptions { directory, ..LevelDBOptions::default() }
     }
 }
 
@@ -2429,6 +2457,32 @@ impl<'path> NVMEOptions<'path> {
     }
 }
 
+/// What [`Database::view_nvme`] opens, where every zero size or count keeps the engine's default.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NVMEViewOptions<'path> {
+    /// The manifest of an existing database, `<database>.ustore.json` in its first data directory.
+    pub manifest: &'path str,
+    /// Further data directories, as the database was opened with.
+    pub data_directories: &'path [DataDirectory<'path>],
+    /// The executor the open runs on; `None` opens on the calling thread.
+    pub executor: Option<&'path Executor>,
+    /// Bytes of host memory the engine may pin and cache.
+    pub memory_limit: u64,
+    /// Operations that may run on one collection at once.
+    pub collection_concurrency_limit: usize,
+    /// Bytes of values each collection may cache.
+    pub collection_cache_limit: u64,
+    /// The newest CPU class the database may confine itself to; `None` sets no ceiling.
+    pub cpu_class_ceiling: Option<CPUClass>,
+}
+
+impl<'path> NVMEViewOptions<'path> {
+    /// The database a manifest names, with every default.
+    pub fn at(manifest: &'path str) -> Self {
+        NVMEViewOptions { manifest, ..NVMEViewOptions::default() }
+    }
+}
+
 /// The C view of `directories`, pointing into the paths they borrow.
 fn data_directories(directories: &[DataDirectory<'_>]) -> Result<Vec<ffi::ustore_data_directory_t>> {
     let mut entries = Vec::new();
@@ -2461,8 +2515,6 @@ fn ram_options(memory_domains: &[i32]) -> ffi::ustore_ram_options_t {
 pub struct IOOptions {
     /// How bytes move between the files and memory.
     pub transport: Transport,
-    /// I/O channels the threads outside the executor share.
-    pub shared_io_channels: usize,
     /// Submissions a channel holds at once.
     pub queue_depth: usize,
     /// Bytes of each request buffer of a channel.
@@ -2475,16 +2527,17 @@ pub struct IOOptions {
     pub stream_buffers_count: usize,
 }
 
-/// The C view of `io`.
-fn nvme_options(io: &IOOptions) -> ffi::ustore_nvme_options_t {
+/// The C view of `io` over the media `paths`, which must outlive the call it is passed to.
+fn nvme_options(io: &IOOptions, paths: &[ffi::ustore_bytes_view_t]) -> ffi::ustore_nvme_options_t {
     ffi::ustore_nvme_options_t {
         transport: io.transport as ffi::ustore_enum_t,
-        shared_io_channels: io.shared_io_channels as ffi::ustore_size_t,
         queue_depth: io.queue_depth as ffi::ustore_size_t,
         request_buffer_bytes: io.request_buffer_bytes,
         request_buffers_count: io.request_buffers_count as ffi::ustore_size_t,
         stream_buffer_bytes: io.stream_buffer_bytes,
         stream_buffers_count: io.stream_buffers_count as ffi::ustore_size_t,
+        paths: if paths.is_empty() { ptr::null() } else { paths.as_ptr() },
+        paths_count: paths.len() as ffi::ustore_size_t,
     }
 }
 
@@ -2559,6 +2612,7 @@ impl Database {
             completion: ffi::ustore_completion_t::Blocking,
             isolation: options.isolation as ffi::ustore_enum_t,
             cpu_class_ceiling: CPUClass::to_raw(options.cpu_class_ceiling),
+            memory_limit: options.memory_limit,
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_database_init_ram(&mut arguments) };
@@ -2581,6 +2635,7 @@ impl Database {
             directory: directory.as_bytes().into(),
             isolation: options.isolation as ffi::ustore_enum_t,
             cpu_class_ceiling: CPUClass::to_raw(options.cpu_class_ceiling),
+            memory_limit: options.memory_limit,
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_database_open_ram(&mut arguments) };
@@ -2624,6 +2679,8 @@ impl Database {
             directory: options.directory.as_bytes().into(),
             data_directories: data_directories.as_ptr(),
             data_directories_count: data_directories.len() as ffi::ustore_size_t,
+            memory_limit: options.memory_limit,
+            background_threads: options.background_threads as ffi::ustore_size_t,
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { open(&mut arguments) };
@@ -2644,6 +2701,8 @@ impl Database {
             outcome: &mut outcome,
             completion: ffi::ustore_completion_t::Blocking,
             directory: options.directory.as_bytes().into(),
+            memory_limit: options.memory_limit,
+            background_threads: options.background_threads as ffi::ustore_size_t,
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_database_open_leveldb(&mut arguments) };
@@ -2682,6 +2741,37 @@ impl Database {
         };
         // SAFETY: every pointer in `arguments` outlives the call, the paths included.
         unsafe { ffi::ustore_database_open_nvme(&mut arguments) };
+        check(outcome)?;
+        database.opened()
+    }
+
+    /// Serves the database a manifest names through the NVMe engine, read-only, or fails with
+    /// [`Status::Unsupported`] in a build without it.
+    ///
+    /// The database reads the state its manifest named at open and writes nothing to any data
+    /// directory, refusing every call that would change it with [`Status::ReadOnly`]. Snapshots and
+    /// their saves still serve.
+    ///
+    /// Calls `ustore_database_view_nvme`.
+    pub fn view_nvme(options: &NVMEViewOptions<'_>) -> Result<Self> {
+        let data_directories = data_directories(options.data_directories)?;
+        let mut database = Database { handle: ptr::null_mut() };
+        let mut outcome = ffi::ustore_outcome_t::default();
+        let mut arguments = ffi::ustore_database_view_nvme_t {
+            database: &mut database.handle,
+            executor: executor_handle(options.executor),
+            outcome: &mut outcome,
+            completion: ffi::ustore_completion_t::Blocking,
+            directory: options.manifest.as_bytes().into(),
+            data_directories: data_directories.as_ptr(),
+            data_directories_count: data_directories.len() as ffi::ustore_size_t,
+            memory_limit: options.memory_limit,
+            collection_concurrency_limit: options.collection_concurrency_limit as ffi::ustore_size_t,
+            collection_cache_limit: options.collection_cache_limit,
+            cpu_class_ceiling: CPUClass::to_raw(options.cpu_class_ceiling),
+        };
+        // SAFETY: every pointer in `arguments` outlives the call, the paths included.
+        unsafe { ffi::ustore_database_view_nvme(&mut arguments) };
         check(outcome)?;
         database.opened()
     }
@@ -3957,53 +4047,33 @@ impl Executor {
             ram: ram_options(memory_domains),
             threads: threads as ffi::ustore_size_t,
             cpu_class_ceiling: CPUClass::to_raw(None),
+            scratch_limit: 0,
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return and copies the domains.
         unsafe { ffi::ustore_executor_for_ram(&mut arguments) };
         Executor::created(handle, outcome)
     }
 
-    /// Creates an executor for the RAM, RocksDB and LevelDB engines over a ForkUnion pool it borrows, so several
-    /// libraries in one process share one set of threads, while it keeps their scratch on `memory_domains`.
-    ///
-    /// A call finding the pool running its lender's dispatch finishes with [`Status::Contended`]
-    /// rather than forking over the lender, and so does this creation.
-    ///
-    /// Calls `ustore_executor_on_pool`.
-    ///
-    /// # Safety
-    /// `pool` must address a live ForkUnion `fu_pool_t` that outlives the executor.
-    pub unsafe fn on_pool(memory_domains: &[i32], pool: *mut c_void) -> Result<Self> {
-        unsafe {
-            let mut handle: ffi::ustore_executor_t = ptr::null_mut();
-            let mut outcome = ffi::ustore_outcome_t::default();
-            let mut arguments = ffi::ustore_executor_on_pool_t {
-                executor: &mut handle,
-                outcome: &mut outcome,
-                ram: ram_options(memory_domains),
-                pool,
-            };
-            // SAFETY: every pointer in `arguments` outlives the call, which is final on return, and
-            // the caller vouches for the pool.
-            ffi::ustore_executor_on_pool(&mut arguments);
-            Executor::created(handle, outcome)
-        }
-    }
-
     /// Creates an executor for the NVMe engine, whose every thread submits and polls its own I/O
-    /// ring, where zero `threads` derives them from the cores, and tells every database
-    /// [`Database::open_nvme`] opens on it to move bytes as `io` says.
+    /// ring, and tells every database [`Database::open_nvme`] opens on it to move bytes as `io`
+    /// says. Its threads and their staging live on the first of `memory_domains`, or with none
+    /// named on the memory domain the data directories `paths` share, and zero `threads` takes the
+    /// fewest hardware queues of their disks, capped by the cores. Its threads pin to the first
+    /// cores the calling thread may run on, so make several executors under narrowed masks.
     ///
     /// Calls `ustore_executor_for_nvme`.
-    pub fn for_nvme(threads: usize, io: &IOOptions) -> Result<Self> {
+    pub fn for_nvme(threads: usize, io: &IOOptions, paths: &[&str], memory_domains: &[i32]) -> Result<Self> {
+        let paths: Vec<ffi::ustore_bytes_view_t> = paths.iter().map(|path| path.as_bytes().into()).collect();
         let mut handle: ffi::ustore_executor_t = ptr::null_mut();
         let mut outcome = ffi::ustore_outcome_t::default();
         let mut arguments = ffi::ustore_executor_for_nvme_t {
             executor: &mut handle,
             outcome: &mut outcome,
-            nvme: nvme_options(io),
+            nvme: nvme_options(io, &paths),
+            ram: ram_options(memory_domains),
             threads: threads as ffi::ustore_size_t,
             cpu_class_ceiling: CPUClass::to_raw(None),
+            scratch_limit: 0,
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_executor_for_nvme(&mut arguments) };
@@ -4956,13 +5026,14 @@ mod tests {
     fn executors_take_memory_domains_or_refuse_them() {
         let unknown = [1 << 20];
         assert_eq!(Executor::for_ram(&unknown, 1).unwrap_err().status, Status::InvalidArgument);
-        // SAFETY: a null pool is refused before anything reads it.
-        let lent = unsafe { Executor::on_pool(&[], ptr::null_mut()) };
-        assert_eq!(lent.unwrap_err().status, Status::InvalidArgument);
         let blocking = IOOptions { transport: Transport::Blocking, ..IOOptions::default() };
-        drop(Executor::for_nvme(1, &blocking).unwrap());
-        // A build without CUDA refuses every device, and one with CUDA refuses an ordinal no device carries.
-        // SAFETY: a null stream lends nothing, so the executor creates its own.
+        drop(Executor::for_nvme(1, &blocking, &[], &[]).unwrap());
+        assert_eq!(Executor::for_nvme(1, &blocking, &[], &unknown).unwrap_err().status, Status::InvalidArgument);
+        // The media's disk places the threads and counts them; a path no disk backs adds nothing.
+        let directory = std::env::temp_dir();
+        drop(Executor::for_nvme(0, &blocking, &[directory.to_str().unwrap(), "/no/such/directory"], &[]).unwrap());
+        // A build without CUDA refuses every device, and one with CUDA refuses an ordinal no device
+        // holds. SAFETY: a null stream takes the device's default stream, which no one destroys.
         let devices = unsafe { Executor::for_vram(1 << 20, ptr::null_mut(), 0, Gds::Automatic) }.unwrap_err().status;
         assert!(devices == Status::Unsupported || devices == Status::Device);
 

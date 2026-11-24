@@ -14,12 +14,12 @@ from std.memory import stack_allocation
 from std.sys.info import size_of
 
 from ustore.blobs import (
-    CursorNextArguments,
+    DocsBatches,
+    DocsCursorNextArguments,
     KeyRuns,
     KeyRunsWritten,
     MeasureArguments,
     Measures,
-    Pulled,
     SampleArguments,
     Values,
     ValuesWritten,
@@ -660,6 +660,10 @@ struct FilteredCursorInitArguments(ImplicitlyCopyable):
     var direction: ScanDirection
     var filter: BytesViewArguments
     var predicate: Predicate
+    var fields_count: c_size_t
+    """Zero for pages, whose init ends at the predicate."""
+    var fields: StringsViewArguments
+    var columns_types: Address
 
 
 def _filtered_scan[
@@ -689,7 +693,7 @@ def _filtered_cursor(scope: Scope, collection: CollectionID, start_key: Key, end
     _cross(
         FilteredCursorInitArguments(
             created, scope.database, scope.executor, outcome, scope.view, collection, start_key,
-            Int(end) if bounded else NULL_ADDRESS, direction, filter, predicate,
+            Int(end) if bounded else NULL_ADDRESS, direction, filter, predicate, 0, StringsViewArguments(), NULL_ADDRESS,
         ),
         verb,
     )
@@ -725,19 +729,20 @@ struct DocsCursor(Movable):
         _ = self.library^
 
     def next(
-        self, executor: Executor, mut arena: Arena, wanted: Int, values: Bool = True, progress: Progress = Progress()
-    ) raises Error -> Pulled[origin_of(arena)]:
-        """Pulls the next page of up to `wanted` keys, with the whole documents when asked. Calls `ustore_docs_cursor_next`.
+        self, executor: Executor, mut arena: Arena, wanted: Int, progress: Progress = Progress()
+    ) raises Error -> DocsBatches[origin_of(arena)]:
+        """Pulls batches of up to `wanted` rows in all, one per executor task that found rows, none once the walk is
+        exhausted. Calls `ustore_docs_cursor_next`.
 
         Raises:
             `Error` with `CANCELLED` when `progress` stops the pull, which leaves the cursor where it was.
         """
         return _block(
             Scope(self.library, self.database, executor.address, NULL_ADDRESS, NULL_ADDRESS, NULL_ADDRESS, Watch.KEYS),
-            _Crossing[CursorNextArguments["ustore_docs_cursor_next"], Pulled[origin_of(arena)], origin_of(arena), ImmUntrackedOrigin](
-                CursorNextArguments["ustore_docs_cursor_next"](
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, self.address, None, None, None, NULL_ADDRESS,
-                    c_size_t(wanted), progress, values,
+            _Crossing[DocsCursorNextArguments, DocsBatches[origin_of(arena)], origin_of(arena), ImmUntrackedOrigin](
+                DocsCursorNextArguments(
+                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, self.address, None, None, NULL_ADDRESS,
+                    c_size_t(wanted), progress,
                 ),
                 Pointer(to=arena),
                 0,

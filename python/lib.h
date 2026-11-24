@@ -1022,6 +1022,27 @@ void ustore_py_keys_release(ustore_py_keys_t* batch);
 /** A strings view whose accessor writes @p views[i] for string @c i, reading only memory the call keeps in place. */
 ustore_strings_view_t ustore_py_strings_each(ustore_bytes_view_t const* views);
 
+/**
+ *  @brief Reads the fields and the types of the columns a gather or a docs cursor asks for, one
+ *      type for every field or one per field, refusing a type with no column layout.
+ *  @param[out] fields_held A tuple of the field names, keeping alive the UTF-8 bytes @p
+ *      views point into.
+ *  @param[out] views One view per field, freed with @c PyMem_Free.
+ *  @param[out] types_out One type per field, freed with @c PyMem_Free.
+ *  @return 0 on success, -1 with an exception set otherwise, leaving what it allocated to
+ *      the caller's release.
+ */
+int ustore_py_columns_request(PyObject* fields, PyObject* types, PyObject** fields_held, ustore_bytes_view_t** views,
+                              ustore_docs_field_type_t** types_out, size_t* count);
+
+/**
+ *  @brief A new @c Columns over the columns a gather or a docs pull wrote into @p arena.
+ *  @param[in] types The type of every field, copied into the result.
+ *  @return A new reference, or NULL with an exception set.
+ */
+PyObject* ustore_py_columns_new(PyObject* arena, ustore_docs_column_view_t const* columns, PyObject* fields,
+                                ustore_docs_field_type_t const* types, size_t fields_count, size_t docs_count);
+
 /** A strings view whose accessor writes @p view for every string, which is how one string reaches every task. */
 ustore_strings_view_t ustore_py_strings_repeated(ustore_bytes_view_t const* view);
 

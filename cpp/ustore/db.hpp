@@ -663,12 +663,14 @@ class ingest_t {
      *  - @c status_code_t::not_found_k The collection does not exist.
      */
     static expected<ingest_t> make(ustore_database_t database, ustore_collection_id_t collection,
-                                   ustore_ingest_order_t order = ustore_ingest_sorted_k) noexcept {
+                                   ustore_ingest_order_t order = ustore_ingest_sorted_k,
+                                   ustore_executor_t executor = nullptr) noexcept {
         ingest_t ingest;
         ustore_outcome_t outcome {};
         ustore_ingest_init_t init {};
         init.ingest = &ingest.ingest_;
         init.database = database;
+        init.executor = executor;
         init.outcome = &outcome;
         init.collection = collection;
         init.order = order;
@@ -690,13 +692,14 @@ class ingest_t {
      *    JSON, or a page no XML.
      */
     template <strings_batch_concept values_type_>
-    status_t append(keys_view_t keys, values_type_ const& values) noexcept {
+    status_t append(keys_view_t keys, values_type_ const& values, ustore_executor_t executor = nullptr) noexcept {
         // The call has one count, so only this side sees the keys and the values disagree
         if (keys.size() != std::size(values))
             return status_t {status_code_t::invalid_argument_k, "Every key needs its own value"};
         ustore_outcome_t outcome {};
         ustore_ingest_append_t append {};
         append.ingest = ingest_;
+        append.executor = executor;
         append.outcome = &outcome;
         append.count = keys.size();
         append.keys = {keys.data(), keys.stride()};
@@ -705,12 +708,13 @@ class ingest_t {
         return status_t {outcome};
     }
 
-    /** Hands the ingest of a graph collection one batch of @p edges, refusing what the other
-     *  @c append refuses. */
-    status_t append(edges_view_t const& edges) noexcept {
+    /** Hands the ingest of a graph collection one batch of @p edges on @p executor, refusing what
+     *  the other @c append refuses. */
+    status_t append(edges_view_t const& edges, ustore_executor_t executor = nullptr) noexcept {
         ustore_outcome_t outcome {};
         ustore_ingest_append_t append {};
         append.ingest = ingest_;
+        append.executor = executor;
         append.outcome = &outcome;
         append.count = edges.size();
         append.sources = {edges.sources.data(), edges.sources.stride()};
@@ -729,11 +733,13 @@ class ingest_t {
      *  - @c status_code_t::not_found_k The collection was dropped meanwhile.
      *  - @c status_code_t::contended_k Memory runs kept refilling while the ingest waited them out.
      */
-    expected<commit_stamp_t> finish(ustore_durability_t durability = ustore_durability_buffered_k) noexcept {
+    expected<commit_stamp_t> finish(ustore_durability_t durability = ustore_durability_buffered_k,
+                                    ustore_executor_t executor = nullptr) noexcept {
         ustore_stamp_t stamp = 0;
         ustore_outcome_t outcome {};
         ustore_ingest_finish_t finish {};
         finish.ingest = ingest_;
+        finish.executor = executor;
         finish.outcome = &outcome;
         finish.durability = durability;
         finish.commit_stamp = &stamp;
@@ -1157,6 +1163,12 @@ class database_t {
      *  lending it the executor they name until close. */
     static expected<database_t> open_nvme(ustore_database_open_nvme_t options) noexcept {
         return open_(ustore_database_open_nvme, options, options.executor);
+    }
+
+    /** Serves the database the manifest @p options name through the NVMe engine, read-only, writing
+     *  nothing to its data directories, blocking on the executor they name or on the caller. */
+    static expected<database_t> view_nvme(ustore_database_view_nvme_t options) noexcept {
+        return open_(ustore_database_view_nvme, options, options.executor);
     }
 
     /** Drops this handle, closing the database once no transaction or snapshot of it

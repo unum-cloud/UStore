@@ -415,25 +415,24 @@ PyObject* ustore_py_values_remove(ustore_py_context_t const* context, ustore_py_
     return ustore_py_call_run(context, &ustore_py_remove_verb, call, &remove);
 }
 
-char const doc_write[] =                                                                     //
-    "write(keys, values, *, collection, durability=Durability.BUFFERED) answers None.\n"     //
-    "\n"                                                                                     //
-    "Upserts a batch of binary values in one call. Every value is borrowed for the\n"        //
-    "length of the call rather than copied, so a memory-mapped buffer reaches the engine\n"  //
-    "untouched.\n"                                                                           //
-    "\n"                                                                                     //
-    "Args:\n"                                                                                //
-    "  keys (Sequence[KeyLike] | buffer): The keys to write.\n"                              //
-    "  values (Sequence[bytes-like] | bytes-like | tape): One value per key, a tape of\n"    //
-    "    them, or a single bytes-like object broadcast to every key. A tape is an Arrow\n"   //
-    "    `binary`, `large_binary`, `string` or `large_string` array, such as `Values`, or\n" //
-    "    a `(data, offsets)` tuple of buffers with unsigned 32-bit or 64-bit offsets, and\n" //
-    "    passes without a copy. None is refused, since `remove` removes keys.\n"             //
-    "  collection (UUID | str): The collection, by identifier or by name.\n"                 //
-    "  durability (Durability, optional): `Durability.FLUSHED` reaches the drive before\n"   //
-    "    returning.\n"                                                                       //
-    "Raises:\n"                                                                              //
-    "  TypeError: A value is None or exports no buffer.\n"                                   //
+char const doc_write[] =                                                                      //
+    "write(keys, values, *, collection, durability=Durability.BUFFERED) answers None.\n"      //
+    "\n"                                                                                      //
+    "Upserts a batch of binary values in one call. Every value is viewed for the length of\n" //
+    "the call rather than copied, so a memory-mapped buffer reaches the engine untouched.\n"  //
+    "\n"                                                                                      //
+    "Args:\n"                                                                                 //
+    "  keys (Sequence[KeyLike] | buffer): The keys to write.\n"                               //
+    "  values (Sequence[bytes-like] | bytes-like | tape): One value per key, a tape of\n"     //
+    "    them, or a single bytes-like object broadcast to every key. A tape is an Arrow\n"    //
+    "    `binary`, `large_binary`, `string` or `large_string` array, such as `Values`, or\n"  //
+    "    a `(data, offsets)` tuple of buffers with unsigned 32-bit or 64-bit offsets, and\n"  //
+    "    passes without a copy. None is refused, since `remove` removes keys.\n"              //
+    "  collection (UUID | str): The collection, by identifier or by name.\n"                  //
+    "  durability (Durability, optional): `Durability.FLUSHED` reaches the drive before\n"    //
+    "    returning.\n"                                                                        //
+    "Raises:\n"                                                                               //
+    "  TypeError: A value is None or exports no buffer.\n"                                    //
     "  Error: Whatever the engine reported.";
 
 PyObject* ustore_py_api_write(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
@@ -1440,6 +1439,13 @@ typedef struct Cursor {
 
     /** The executor every pull blocks on, held, or NULL for the calling thread. */
     Executor* executor;
+
+    /** A tuple of the fields every pull of a walk over documents gathers, or NULL for keys
+     *  alone. */
+    PyObject* fields;
+
+    /** The type of every one of @c fields, owned by the object. */
+    ustore_docs_field_type_t* types;
 } Cursor;
 
 /** The keys one pull wrote into an arena, and their values when it asked, viewed until the arena rewinds. */
@@ -1597,17 +1603,60 @@ static PyObject* pull_answer_pairs(void* erased) {
 
 static void pull_release(void* call) { ustore_py_call_release(&((pull_call_t*)call)->call); }
 
+/** One pull of a walk over documents, whose batches land in the arena its header holds. */
+typedef struct docs_pull_call_t {
+
+    /** What the call keeps until it finishes. */
+    ustore_py_call_t call;
+
+    /** The cursor whose fields name the columns of every batch. */
+    Cursor* cursor;
+
+    /** Output slot for the batches, inside the arena. */
+    ustore_docs_batch_view_t const* batches;
+
+    /** Output slot for the batches written. */
+    ustore_size_t batches_count;
+} docs_pull_call_t;
+
+/** Answers a list of one tuple per batch: a Page holding its keys, then its Columns. */
+static PyObject* docs_pull_answer(void* erased) {
+    docs_pull_call_t const* const call = (docs_pull_call_t const*)erased;
+    PyObject* const list = PyList_New((Py_ssize_t)call->batches_count);
+    if (!list) return NULL;
+    Cursor const* const cursor = call->cursor;
+    size_t const fields_count = cursor->fields ? (size_t)PyTuple_GET_SIZE(cursor->fields) : 0;
+    for (size_t index = 0; index != call->batches_count; ++index) {
+        ustore_docs_batch_view_t const* const batch = &call->batches[index];
+        PyObject* const keys = page_new(call->call.arena, batch->keys, (size_t)batch->count, Py_NewRef(Py_None));
+        PyObject* const columns = ustore_py_columns_new(call->call.arena, batch->columns,
+                                                        cursor->fields ? cursor->fields : Py_None, cursor->types,
+                                                        fields_count, (size_t)batch->count);
+        PyObject* const pair = keys && columns ? PyTuple_Pack(2, keys, columns) : NULL;
+        Py_XDECREF(keys);
+        Py_XDECREF(columns);
+        if (!pair) {
+            Py_DECREF(list);
+            return NULL;
+        }
+        PyList_SET_ITEM(list, (Py_ssize_t)index, pair);
+    }
+    return list;
+}
+
+static void docs_pull_release(void* call) { ustore_py_call_release(&((docs_pull_call_t*)call)->call); }
+
+/** A pull of documents, answering its batches. */
+static ustore_py_verb_t const docs_pull_verb = {sizeof(docs_pull_call_t), docs_pull_submit, docs_pull_answer,
+                                                docs_pull_release};
+
 /** A pull answering the keys alone. */
 static ustore_py_verb_t const pull_keys_verb = {sizeof(pull_call_t), pull_submit, pull_answer_keys, pull_release};
 
 /** A pull answering the keys with their values. */
 static ustore_py_verb_t const pull_pairs_verb = {sizeof(pull_call_t), pull_submit, pull_answer_pairs, pull_release};
 
-// A pull of documents, pages or vertices answers as a pull of blobs does
-static ustore_py_verb_t const docs_pull_keys_verb = {sizeof(pull_call_t), docs_pull_submit, pull_answer_keys,
-                                                     pull_release};
-static ustore_py_verb_t const docs_pull_pairs_verb = {sizeof(pull_call_t), docs_pull_submit, pull_answer_pairs,
-                                                      pull_release};
+/* A pull of pages or vertices answers as a pull of blobs does. */
 static ustore_py_verb_t const pages_pull_keys_verb = {sizeof(pull_call_t), pages_pull_submit, pull_answer_keys,
                                                       pull_release};
 static ustore_py_verb_t const pages_pull_pairs_verb = {sizeof(pull_call_t), pages_pull_submit, pull_answer_pairs,
@@ -1635,6 +1684,8 @@ static void Cursor_dealloc(Cursor* self) {
     cursor_close(self);
     Py_XDECREF((PyObject*)self->executor);
     Py_XDECREF(self->predicate.callable);
+    Py_XDECREF(self->fields);
+    PyMem_Free(self->types);
     PyObject_Free(self);
 }
 
@@ -1649,36 +1700,43 @@ static PyObject* cursor_pull(Cursor* self, void* handle, size_t wanted, PyObject
         PyErr_SetString(PyExc_TypeError, "A walk over vertices pulls keys alone");
         return NULL;
     }
-    ustore_py_verb_t const* const verb = self->modality == ustore_modality_docs_k
-                                             ? (values ? &docs_pull_pairs_verb : &docs_pull_keys_verb)
-                                         : self->modality == ustore_modality_pages_k
-                                             ? (values ? &pages_pull_pairs_verb : &pages_pull_keys_verb)
-                                         : self->modality == ustore_modality_graph_k ? &vertices_pull_keys_verb
-                                         : values                                    ? &pull_pairs_verb
-                                                                                     : &pull_keys_verb;
+    if (values && self->modality == ustore_modality_docs_k) {
+        PyErr_SetString(PyExc_TypeError, "A walk over documents gathers the fields it was opened with");
+        return NULL;
+    }
     ustore_py_context_t const context = {.executor = self->executor, .completion = ustore_completion_blocking_k};
-    pull_call_t stack;
-    pull_call_t* const call = ustore_py_call_open(&context, verb, &stack);
-    if (ustore_py_arena_from_object(arena, &call->call.arena) != 0) return ustore_py_call_discard(&context, verb, call);
-    call->call.progress = Py_XNewRef(progress);
-    PyObject* page = NULL;
     if (self->modality == ustore_modality_docs_k) {
+        docs_pull_call_t stack;
+        docs_pull_call_t* const call = ustore_py_call_open(&context, &docs_pull_verb, &stack);
+        if (ustore_py_arena_from_object(arena, &call->call.arena) != 0)
+            return ustore_py_call_discard(&context, &docs_pull_verb, call);
+        call->call.progress = Py_XNewRef(progress);
+        call->cursor = self;
         ustore_docs_cursor_next_t next = {
             .database = self->database,
             .executor = ustore_py_context_executor(&context),
             .outcome = &call->call.outcome,
             .cursor = (ustore_docs_cursor_t)handle,
-            .keys = &call->keys,
-            .values = values ? &call->values : NULL,
-            .written = &call->written,
+            .batches = &call->batches,
+            .batches_count = &call->batches_count,
             .arena = ustore_py_arena_handle(call->call.arena),
             .wanted = wanted,
             .progress = ustore_py_progress_callback(&call->call),
             .progress_state = &call->call,
         };
-        page = ustore_py_call_run(&context, verb, call, &next);
+        return ustore_py_call_run(&context, &docs_pull_verb, call, &next);
     }
-    else if (self->modality == ustore_modality_pages_k) {
+    ustore_py_verb_t const* const verb = self->modality == ustore_modality_pages_k
+                                             ? (values ? &pages_pull_pairs_verb : &pages_pull_keys_verb)
+                                         : self->modality == ustore_modality_graph_k ? &vertices_pull_keys_verb
+                                         : values                                    ? &pull_pairs_verb
+                                                                                     : &pull_keys_verb;
+    pull_call_t stack;
+    pull_call_t* const call = ustore_py_call_open(&context, verb, &stack);
+    if (ustore_py_arena_from_object(arena, &call->call.arena) != 0) return ustore_py_call_discard(&context, verb, call);
+    call->call.progress = Py_XNewRef(progress);
+    PyObject* page = NULL;
+    if (self->modality == ustore_modality_pages_k) {
         ustore_pages_cursor_next_t next = {
             .database = self->database,
             .executor = ustore_py_context_executor(&context),
@@ -1856,14 +1914,16 @@ char const doc_cursor[] =                                                       
     "Returns:\n"                                                                                 //
     "  Cursor: The walk, pulled page by page.";
 
-char const doc_docs_cursor[] =                                                                    //
-    "docs_cursor(start=None, /, *, collection, end=None, direction=ScanDirection.ASCENDING,\n"    //
-    "filter=None, predicate=None, predicate_cost=PredicateCost.CHEAP) answers a Cursor over\n"    //
-    "documents.\n"                                                                                //
-    "\n"                                                                                          //
-    "Walks as `cursor()` does, every page keeping the documents `filter`, a JSONPath or a bare\n" //
-    "root filter such as `?@.age > 30`, matches, and its pulls reading whole documents when\n"    //
-    "asked. Calls `ustore_docs_cursor_init`.";
+char const doc_docs_cursor[] =                                                                  //
+    "docs_cursor(start=None, /, *, collection, end=None, direction=ScanDirection.ASCENDING,\n"  //
+    "filter=None, predicate=None, predicate_cost=PredicateCost.CHEAP, fields=None,\n"           //
+    "outputs_types=None) answers a Cursor over documents.\n"                                    //
+    "\n"                                                                                        //
+    "Walks as `cursor()` does, keeping the documents `filter`, a JSONPath or a bare root\n"     //
+    "filter such as `?@.age > 30`, matches. Every pull answers a list of `(Page, Columns)`\n"   //
+    "batches, one per executor task that found rows, gathering `fields`, the empty one being\n" //
+    "the whole document, into `outputs_types`, JSON by default. Calls\n"                        //
+    "`ustore_docs_cursor_init`.";
 
 char const doc_pages_cursor[] =                                                                  //
     "pages_cursor(start=None, /, *, collection, end=None, direction=ScanDirection.ASCENDING,\n"  //
@@ -1899,6 +1959,8 @@ static PyObject* cursor_open(PyObject* self, PyObject* const* arguments, Py_ssiz
     int outputs_encoding = ustore_page_encoding_xml_k;
     int direction = ustore_scan_ascending_k;
     PyObject* end_object = NULL;
+    PyObject* fields_object = NULL;
+    PyObject* types_object = NULL;
     Py_ssize_t const keyword_names_count = keyword_names_tuple ? PyTuple_GET_SIZE(keyword_names_tuple) : 0;
     for (Py_ssize_t names_progress = 0; names_progress != keyword_names_count; ++names_progress) {
         PyObject* const keyword = PyTuple_GET_ITEM(keyword_names_tuple, names_progress);
@@ -1919,6 +1981,14 @@ static PyObject* cursor_open(PyObject* self, PyObject* const* arguments, Py_ssiz
         }
         if (PyUnicode_CompareWithASCIIString(keyword, "end") == 0) {
             end_object = value == Py_None ? NULL : value;
+            continue;
+        }
+        if (modality == ustore_modality_docs_k && PyUnicode_CompareWithASCIIString(keyword, "fields") == 0) {
+            fields_object = value == Py_None ? NULL : value;
+            continue;
+        }
+        if (modality == ustore_modality_docs_k && PyUnicode_CompareWithASCIIString(keyword, "outputs_types") == 0) {
+            types_object = value == Py_None ? NULL : value;
             continue;
         }
         int const matched = scan_match_from_keyword(keyword, value, &match);
@@ -1949,16 +2019,33 @@ static PyObject* cursor_open(PyObject* self, PyObject* const* arguments, Py_ssiz
     cursor->predicate.callable = Py_XNewRef(match.predicate);
     cursor->database = context.database_handle;
     cursor->executor = (Executor*)Py_XNewRef((PyObject*)context.executor);
-    // The patterns and the filter are compiled at init, so they are borrowed only while it runs
+    cursor->fields = NULL;
+    cursor->types = NULL;
+    // The views of the fields are read at init, which copies them
+    ustore_bytes_view_t* field_views = NULL;
+    size_t fields_count = 0;
+    PyObject* const json_type = fields_object && !types_object ? PyLong_FromLong(ustore_docs_field_type_json_k) : NULL;
+    int const requested = fields_object
+                              ? ustore_py_columns_request(fields_object, types_object ? types_object : json_type,
+                                                          &cursor->fields, &field_views, &cursor->types, &fields_count)
+                              : 0;
+    Py_XDECREF(json_type);
+    if (requested != 0) {
+        PyMem_Free(field_views);
+        Py_DECREF(cursor);
+        return NULL;
+    }
+    // The patterns and the filter are compiled at init, so they are viewed only while it runs
     keys_call_t gathered;
     memset(&gathered, 0, sizeof(gathered));
     ustore_patterns_t patterns = {0};
     ustore_bytes_view_t filter = {0};
     ustore_predicate_t const predicate = ustore_py_predicate_of(&cursor->predicate, match.cost);
-    scan_match_t borrowed = match;
-    borrowed.predicate = NULL;
-    if (match_fill(&gathered, &borrowed, &patterns, &filter) != 0) {
+    scan_match_t viewed = match;
+    viewed.predicate = NULL;
+    if (match_fill(&gathered, &viewed, &patterns, &filter) != 0) {
         keys_release(&gathered);
+        PyMem_Free(field_views);
         Py_DECREF(cursor);
         return NULL;
     }
@@ -1977,6 +2064,9 @@ static PyObject* cursor_open(PyObject* self, PyObject* const* arguments, Py_ssiz
             .direction = (ustore_scan_direction_t)direction,
             .filter = filter,
             .predicate = predicate,
+            .fields_count = fields_count,
+            .fields = field_views ? ustore_py_strings_each(field_views) : (ustore_strings_view_t) {0},
+            .columns_types = cursor->types,
         };
         Py_BEGIN_ALLOW_THREADS;
         ustore_docs_cursor_init(&init);
@@ -2036,6 +2126,7 @@ static PyObject* cursor_open(PyObject* self, PyObject* const* arguments, Py_ssiz
         Py_END_ALLOW_THREADS;
     }
     keys_release(&gathered);
+    PyMem_Free(field_views);
     cursor->handle = opened;
     if (ustore_py_raise_on_outcome(&outcome) == 0) return (PyObject*)cursor;
     Py_DECREF(cursor);

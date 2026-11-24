@@ -183,9 +183,84 @@ class keys_cursor {
 using blobs_cursor_t = keys_cursor<ustore_blobs_cursor_t, ustore_blobs_cursor_init_t, ustore_blobs_cursor_next_t,
                                    &ustore_blobs_cursor_init, &ustore_blobs_cursor_next, &ustore_blobs_cursor_free>;
 
-/** A walk over the keys of one documents collection, whose pairs are whole documents. */
-using docs_cursor_t = keys_cursor<ustore_docs_cursor_t, ustore_docs_cursor_init_t, ustore_docs_cursor_next_t,
-                                  &ustore_docs_cursor_init, &ustore_docs_cursor_next, &ustore_docs_cursor_free>;
+/** The columns a docs cursor gathers from every row: @c count fields, the empty one being the whole
+ *  document, each converted into its entry of @c types. */
+struct docs_cursor_columns_t {
+    ustore_size_t count = 0;
+    ustore_strings_view_t fields {};
+    ustore_docs_field_type_t const* types = nullptr;
+};
+
+/** Owns a walk over one documents collection, as @c keys_cursor owns a walk over keys,
+ *  every pull handing out batches of rows, each a key and a cell of every column the cursor
+ *  was opened with. */
+class docs_cursor_t {
+
+    receiver_t receiver_ {};
+    ustore_docs_cursor_t cursor_ = nullptr;
+
+    docs_cursor_t(receiver_t receiver, ustore_docs_cursor_t cursor) noexcept : receiver_(receiver), cursor_(cursor) {}
+
+  public:
+    docs_cursor_t() noexcept = default;
+    docs_cursor_t(docs_cursor_t const&) = delete;
+    docs_cursor_t& operator=(docs_cursor_t const&) = delete;
+    ~docs_cursor_t() noexcept { ustore_docs_cursor_free(cursor_); }
+
+    docs_cursor_t(docs_cursor_t&& other) noexcept
+        : receiver_(other.receiver_), cursor_(std::exchange(other.cursor_, nullptr)) {}
+
+    docs_cursor_t& operator=(docs_cursor_t&& other) noexcept {
+        std::swap(receiver_, other.receiver_);
+        std::swap(cursor_, other.cursor_);
+        return *this;
+    }
+
+    /** Opens a walk over the documents of @p collection from @p start, at the view
+     *  @p receiver reads, keeping those @p match admits and gathering @p columns from each,
+     *  both compiled once here. */
+    static expected<docs_cursor_t> make(receiver_t receiver, ustore_collection_id_t collection,
+                                        ustore_key_t start = smallest_key_k, match_t const& match = {},
+                                        docs_cursor_columns_t const& columns = {}) noexcept {
+        ustore_docs_cursor_t cursor = nullptr;
+        ustore_outcome_t outcome {};
+        ustore_docs_cursor_init_t init {};
+        init.cursor = &cursor;
+        init.database = receiver.database;
+        init.executor = receiver.executor;
+        init.outcome = &outcome;
+        init.view = receiver.view(ustore_watch_keys_k);
+        init.collection = collection;
+        init.start_key = start;
+        init.fields_count = columns.count;
+        init.fields = columns.fields;
+        init.columns_types = columns.types;
+        narrow(init, match);
+        ustore_docs_cursor_init(&init);
+        if (status_t const status {outcome}; status.failed()) return status;
+        return docs_cursor_t {receiver, cursor};
+    }
+
+    /** Pulls batches of up to @p wanted rows in all into @p arena, one per task of the executor
+     *  that found rows, none once the walk is exhausted. */
+    expected<std::span<ustore_docs_batch_view_t const>> next(std::size_t wanted, arena_t& arena) noexcept {
+        ustore_docs_batch_view_t const* batches = nullptr;
+        ustore_size_t count = 0;
+        ustore_outcome_t outcome {};
+        ustore_docs_cursor_next_t next {};
+        next.database = receiver_.database;
+        next.executor = receiver_.executor;
+        next.outcome = &outcome;
+        next.cursor = cursor_;
+        next.batches = &batches;
+        next.batches_count = &count;
+        next.arena = arena;
+        next.wanted = wanted;
+        ustore_docs_cursor_next(&next);
+        if (status_t const status {outcome}; status.failed()) return status;
+        return std::span<ustore_docs_batch_view_t const> {batches, static_cast<std::size_t>(count)};
+    }
+};
 
 /** A walk over the keys of one pages collection, whose pairs are pages rendered as their options
  *  name. */

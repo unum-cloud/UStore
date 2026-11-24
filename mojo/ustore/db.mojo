@@ -570,6 +570,7 @@ struct DatabaseInitRamArguments(ImplicitlyCopyable):
     var completion: Completion
     var isolation: Isolation
     var cpu_class_ceiling: CPUClass
+    var memory_limit: c_size_t
 
 
 @fieldwise_init
@@ -583,6 +584,7 @@ struct DatabaseOpenRamArguments(ImplicitlyCopyable):
     var directory: BytesViewArguments
     var isolation: Isolation
     var cpu_class_ceiling: CPUClass
+    var memory_limit: c_size_t
 
 
 @fieldwise_init
@@ -596,6 +598,8 @@ struct DatabaseOpenRocksdbArguments(ImplicitlyCopyable):
     var directory: BytesViewArguments
     var data_directories: Address
     var data_directories_count: c_size_t
+    var memory_limit: c_size_t
+    var background_threads: c_size_t
 
 
 @fieldwise_init
@@ -607,6 +611,8 @@ struct DatabaseOpenLeveldbArguments(ImplicitlyCopyable):
     var outcome: Optional[Pointer[Outcome, MutUntrackedOrigin]]
     var completion: Completion
     var directory: BytesViewArguments
+    var memory_limit: c_size_t
+    var background_threads: c_size_t
 
 
 @fieldwise_init
@@ -766,7 +772,7 @@ struct DatabaseCompactArguments(Arguments):
 struct DatabaseCompactPlan(Movable):
     """One compaction in flight, `ustore_database_compact_plan_t`. Binding-only.
 
-    Lent to `compact`, it opens on the first call, stays live past a cancel, continues from the unit
+    Owned by the caller and passed to `compact`, it opens on the first call, stays live past a cancel, continues from the unit
     it stopped at on every later call, and closes with `compact_plan_finish`. The database and the
     executor it was opened with must outlive that finish.
     """
@@ -1343,7 +1349,9 @@ struct IngestInitArguments(ImplicitlyCopyable):
 
     var ingest: Optional[Pointer[Address, MutUntrackedOrigin]]
     var database: Address
+    var executor: Address
     var outcome: Optional[Pointer[Outcome, MutUntrackedOrigin]]
+    var completion: Completion
     var collection: CollectionID
     var order: IngestOrder
 
@@ -1353,7 +1361,9 @@ struct IngestAppendArguments(ImplicitlyCopyable):
     """`ustore_ingest_append_t`."""
 
     var ingest: Address
+    var executor: Address
     var outcome: Optional[Pointer[Outcome, MutUntrackedOrigin]]
+    var completion: Completion
     var count: c_size_t
     var keys: StridedArguments
     var values: StringsViewArguments
@@ -1367,7 +1377,9 @@ struct IngestFinishArguments(ImplicitlyCopyable):
     """`ustore_ingest_finish_t`."""
 
     var ingest: Address
+    var executor: Address
     var outcome: Optional[Pointer[Outcome, MutUntrackedOrigin]]
+    var completion: Completion
     var durability: Durability
     var commit_stamp: Optional[Pointer[Stamp, MutUntrackedOrigin]]
 
@@ -1414,7 +1426,7 @@ struct Ingest(Movable):
         var count = _tasks(keys.tasks(), values.tasks(), sources.tasks(), targets.tasks(), edges.tasks())
         _cross(
             IngestAppendArguments(
-                self.address, outcome, c_size_t(count), keys.arguments(), values.arguments(), sources.arguments(),
+                self.address, NULL_ADDRESS, outcome, Completion.BLOCKING, c_size_t(count), keys.arguments(), values.arguments(), sources.arguments(),
                 targets.arguments(), edges.arguments(),
             ),
             self.library.symbols().ingest_append,
@@ -1431,7 +1443,10 @@ struct Ingest(Movable):
         outcome[] = Outcome()
         var stamp = stack_allocation[1, Stamp]().unsafe_origin_cast[MutUntrackedOrigin]()
         stamp[] = Stamp()
-        _cross(IngestFinishArguments(self.address, outcome, durability, stamp), self.library.symbols().ingest_finish)
+        _cross(
+            IngestFinishArguments(self.address, NULL_ADDRESS, outcome, Completion.BLOCKING, durability, stamp),
+            self.library.symbols().ingest_finish,
+        )
         self.library._check(outcome.unsafe_origin_cast[MutAnyOrigin]()[], "ustore_ingest_finish")
         return stamp.unsafe_origin_cast[MutAnyOrigin]()[]
 
@@ -1481,7 +1496,9 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         var outcome = stack_allocation[1, Outcome]().unsafe_origin_cast[MutUntrackedOrigin]()
         outcome[] = Outcome()
         _cross(
-            DatabaseInitRamArguments(created, executor.address, outcome, Completion.BLOCKING, isolation, cpu_class_ceiling),
+            DatabaseInitRamArguments(
+                created, executor.address, outcome, Completion.BLOCKING, isolation, cpu_class_ceiling, c_size_t(0)
+            ),
             executor.library.symbols().database_init_ram,
         )
         return Self(library=executor.library, address=_created(executor.library, outcome, created, "ustore_database_init_ram"))
@@ -1508,7 +1525,7 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         _cross(
             DatabaseOpenRamArguments(
                 created, executor.address, outcome, Completion.BLOCKING, BytesView.of(directory).arguments(), isolation,
-                cpu_class_ceiling,
+                cpu_class_ceiling, c_size_t(0),
             ),
             executor.library.symbols().database_open_ram,
         )
@@ -1553,7 +1570,8 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         var outcome = stack_allocation[1, Outcome]().unsafe_origin_cast[MutUntrackedOrigin]()
         outcome[] = Outcome()
         var arguments = DatabaseOpenRocksdbArguments(
-            created, executor.address, outcome, Completion.BLOCKING, directory, directories if count else NULL_ADDRESS, c_size_t(count)
+            created, executor.address, outcome, Completion.BLOCKING, directory, directories if count else NULL_ADDRESS, c_size_t(count),
+            c_size_t(0), c_size_t(0),
         )
         if read_only:
             _cross(arguments, executor.library.symbols().database_view_rocksdb)
@@ -1574,7 +1592,10 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         var outcome = stack_allocation[1, Outcome]().unsafe_origin_cast[MutUntrackedOrigin]()
         outcome[] = Outcome()
         _cross(
-            DatabaseOpenLeveldbArguments(created, executor.address, outcome, Completion.BLOCKING, BytesView.of(directory).arguments()),
+            DatabaseOpenLeveldbArguments(
+                created, executor.address, outcome, Completion.BLOCKING, BytesView.of(directory).arguments(), c_size_t(0),
+                c_size_t(0),
+            ),
             executor.library.symbols().database_open_leveldb,
         )
         return Self(library=executor.library, address=_created(executor.library, outcome, created, "ustore_database_open_leveldb"))
@@ -1691,7 +1712,10 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         created[] = NULL_ADDRESS
         var outcome = stack_allocation[1, Outcome]().unsafe_origin_cast[MutUntrackedOrigin]()
         outcome[] = Outcome()
-        _cross(IngestInitArguments(created, self.address, outcome, collection, order), self.library.symbols().ingest_init)
+        _cross(
+            IngestInitArguments(created, self.address, NULL_ADDRESS, outcome, Completion.BLOCKING, collection, order),
+            self.library.symbols().ingest_init,
+        )
         return Ingest(library=self.library, address=_created(self.library, outcome, created, "ustore_ingest_init"))
 
 
@@ -1875,8 +1899,8 @@ trait DatabaseVerbs:
         time. Calls `ustore_database_compact`.
 
         Parameters:
-            plan_origin: The lent plan's origin, inferred where one is lent.
-            phase_origin: The lent phase slot's origin, inferred where one is lent.
+            plan_origin: The caller's plan origin, inferred where one is passed.
+            phase_origin: The caller's phase slot origin, inferred where one is passed.
 
         Args:
             progress: Hears each unit; a cancel stops between units, keeping what it compacted.
@@ -1884,7 +1908,7 @@ trait DatabaseVerbs:
             phase: Receives where this call stopped, `Phase.DONE` once the compaction ended.
 
         Raises:
-            `Error` with `CANCELLED` once `progress` stops it, leaving a lent plan live, or
+            `Error` with `CANCELLED` once `progress` stops it, leaving the caller's plan live, or
             `CONTENDED` while another live plan compacts the database.
         """
         _ = _block(
