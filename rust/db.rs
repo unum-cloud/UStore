@@ -559,8 +559,8 @@ pub(crate) mod ffi {
         pub keys: ustore_size_t,
         pub memory_bytes: ustore_size_t,
         pub disk_bytes: ustore_size_t,
-        pub pin_refused_bytes: ustore_size_t,
-        pub crossing_requests: ustore_size_t,
+        pub unpinned_staging_bytes: ustore_size_t,
+        pub requests_across_registered_slots: ustore_size_t,
     }
 
     #[repr(C)]
@@ -841,7 +841,7 @@ pub(crate) mod ffi {
 
 /// What went wrong, in the vocabulary of `ustore_status_t`, whose success is left to `Result`.
 ///
-/// An [`Error`] never carries [`Status::Deferred`], which only [`Deferred::status`] reports.
+/// An [`Error`] never holds [`Status::Deferred`], which only [`Deferred::status`] reports.
 #[repr(i32)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[non_exhaustive]
@@ -868,7 +868,7 @@ pub enum Status {
     Cancelled = 15,
     /// The engine or build does not implement what the call asks for.
     Unsupported = 16,
-    /// An argument is null, contradicts another one, or carries unaccepted options.
+    /// An argument is null, contradicts another one, or holds unaccepted options.
     InvalidArgument = 17,
     /// A snapshot, collection, or document the call addresses does not exist.
     NotFound = 18,
@@ -948,7 +948,7 @@ impl FromStr for Status {
 pub struct Error {
     /// The identity of the failure, shared with the C ABI.
     pub status: Status,
-    /// The detail the status alone cannot carry.
+    /// The detail the status alone cannot hold.
     pub message: &'static str,
 }
 
@@ -1181,7 +1181,7 @@ impl fmt::Debug for CollectionID {
 
 /// The collections a batch addresses: one for every task, or one per task.
 ///
-/// The ABI carries a collection per task, so a batch may span as many collections as it has entries;
+/// The ABI holds a collection per task, so a batch may span as many collections as it has entries;
 /// [`Collections::Every`] is the common case, and every verb takes a bare [`CollectionID`] as one.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Collections<'collections> {
@@ -1265,9 +1265,9 @@ impl FromStr for Durability {
 
 /// Whether the calls of a transaction watch the keys they touch for conflicts, as `ustore_watch_t` spells it.
 ///
-/// Only a transaction watches anything, so the head of a database and a snapshot never carry this, and
-/// it changes what a call does only at [`Isolation::Snapshot`]: a strictly serializable transaction puts
-/// every read it makes into the one serial order whatever this says.
+/// Only a transaction watches anything, so the head of a database and a snapshot never hold this,
+/// and it changes what a call does only at [`Isolation::Snapshot`]: a strictly serializable
+/// transaction puts every read it makes into the one serial order whatever this says.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
 pub enum Watch {
@@ -1747,7 +1747,7 @@ impl<Results, Row> ExactSizeIterator for Rows<Results, Row> {}
 impl<Results, Row> FusedIterator for Rows<Results, Row> {}
 
 /// Writes the view of every string `indices` names out of a slice of `Record`s, each holding its view at the place
-/// `handle` addresses inside the first, so a slice of entries lends its values without a copy.
+/// `handle` addresses inside the first, so a slice of entries passes its values without a copy.
 unsafe extern "C" fn record_views<Record>(
     handle: *const c_void,
     indices: *const ffi::ustore_size_t,
@@ -1765,8 +1765,8 @@ unsafe extern "C" fn record_views<Record>(
 }
 
 impl ffi::ustore_strings_view_t {
-    /// The strings a slice of `Record`s lends through an accessor, one view inside each, `first` addressing the view
-    /// inside the first record.
+    /// The strings a slice of `Record`s passes through an accessor, one view inside each, `first`
+    /// addressing the view inside the first record.
     pub(crate) fn inside<Record>(first: &ffi::ustore_bytes_view_t) -> Self {
         ffi::ustore_strings_view_t::accessor(record_views::<Record>, ptr::from_ref(first).cast())
     }
@@ -2566,10 +2566,10 @@ pub struct Description {
     pub disk_bytes: u64,
     /// Bytes of the NVMe engine's io_uring arena the locked-memory cap refused to pin, so each
     /// request pins its own.
-    pub pin_refused_bytes: u64,
+    pub unpinned_staging_bytes: u64,
     /// Requests the NVMe engine sent unpinned while its arena was pinned, as each crossed a
     /// gibibyte of it.
-    pub crossing_requests: u64,
+    pub requests_across_registered_slots: u64,
 }
 
 impl Description {
@@ -2813,8 +2813,8 @@ impl Database {
             keys: description.keys as usize,
             memory_bytes: description.memory_bytes,
             disk_bytes: description.disk_bytes,
-            pin_refused_bytes: description.pin_refused_bytes,
-            crossing_requests: description.crossing_requests,
+            unpinned_staging_bytes: description.unpinned_staging_bytes,
+            requests_across_registered_slots: description.requests_across_registered_slots,
         })
     }
 
@@ -3337,7 +3337,7 @@ impl<Plan: BorrowMut<CompactPlan>, Phase: BorrowMut<PhaseProgress>> sealed::Call
     }
 }
 
-impl<'config, Plan: BorrowMut<CompactPlan>, Phase: BorrowMut<PhaseProgress>> sealed::Lending
+impl<'config, Plan: BorrowMut<CompactPlan>, Phase: BorrowMut<PhaseProgress>> sealed::Submitting
     for Compact<'config, Plan, Phase>
 {
     type Inputs = CompactConfig<'config, Plan, Phase>;
@@ -3609,7 +3609,7 @@ impl Matching<'_> {
         self.filter.map_or_else(ffi::ustore_bytes_view_t::default, |filter| filter.as_bytes().into())
     }
 
-    /// Whether the patterns carry weights, so a scan writes scores.
+    /// Whether the patterns hold weights, so a scan writes scores.
     pub(crate) fn scores(&self) -> bool {
         self.weights.is_some()
     }
@@ -3679,7 +3679,7 @@ unsafe extern "C" fn predicate_trampoline(
 /// Mirrors `ustore_progress_callback_t`.
 pub type ProgressCallback<'handler> = dyn FnMut(usize, usize) -> ControlFlow<()> + Send + 'handler;
 
-/// The progress handler one call lends the library.
+/// The progress handler one call owns for the library.
 pub(crate) struct Progress<'handler>(pub(crate) Option<Box<ProgressCallback<'handler>>>);
 
 impl Progress<'_> {
@@ -3764,7 +3764,7 @@ pub(crate) mod sealed {
 
     /// A verb whose inputs a deferred call hands back beside its answer, like a plan a stop left
     /// live.
-    pub trait Lending: Calling {
+    pub trait Submitting: Calling {
         /// What the verb owned.
         type Inputs;
 
@@ -3832,28 +3832,29 @@ impl sealed::Completion for Deferring {
     type Answer<Verb: sealed::Calling> = Result<Deferred<Verb>>;
 
     fn answer<Parent, Verb: sealed::Calling>(view: &On<'_, Parent, Deferring>, verb: Verb) -> Result<Deferred<Verb>> {
-        let lent = Box::into_raw(Box::new(Lent { outcome: ffi::ustore_outcome_t::default(), verb }));
-        // SAFETY: the box is fresh and reached through `lent` alone, and the arguments point into its fields, where
-        // they stay until the box is freed, while submission copies the arguments themselves. A verb that reaches no
-        // engine leaves the outcome a final success.
+        let submitted = Box::into_raw(Box::new(Submitted { outcome: ffi::ustore_outcome_t::default(), verb }));
+        // SAFETY: the box is fresh and reached through `submitted` alone, and the arguments point
+        // into its fields, where they stay until the box is freed, while submission copies the
+        // arguments themselves. A verb that reaches no engine leaves the outcome a final success.
         unsafe {
-            let outcome = ptr::addr_of_mut!((*lent).outcome);
-            match (*lent).verb.arguments(view, outcome, ffi::ustore_completion_t::Deferred) {
+            let outcome = ptr::addr_of_mut!((*submitted).outcome);
+            match (*submitted).verb.arguments(view, outcome, ffi::ustore_completion_t::Deferred) {
                 Ok(Some(mut arguments)) => Verb::call(&mut arguments),
                 Ok(None) => {}
                 Err(refusal) => {
-                    drop(Box::from_raw(lent));
+                    drop(Box::from_raw(submitted));
                     return Err(refusal);
                 }
             }
-            Ok(Deferred { lent: NonNull::new_unchecked(lent) })
+            Ok(Deferred { submitted: NonNull::new_unchecked(submitted) })
         }
     }
 }
 
 impl<Input> sealed::Accepts<Input> for Blocking {}
 
-// Owned inputs alone, so a forgotten `Deferred` leaks them rather than lending the library memory freed under it
+// Owned inputs alone, so a forgotten `Deferred` leaks them rather than leaving the library memory
+// freed under it
 impl sealed::Accepts<Vec<Key>> for Deferring {}
 impl<const COUNT: usize> sealed::Accepts<[Key; COUNT]> for Deferring {}
 impl<Keys, Offset: stringtape::OffsetType> sealed::Accepts<(Keys, BytesTape<Offset>)> for Deferring where
@@ -3900,7 +3901,7 @@ impl sealed::Writable for Transaction<'_> {}
 /// Rust-only; polling calls `ustore_outcome_status`, and waiting and dropping call `ustore_outcome_wait`.
 #[must_use = "a deferred call's outcome is seen only through `status`, `wait` or `.await`"]
 pub struct Deferred<Verb: sealed::Calling> {
-    lent: NonNull<Lent<Verb>>,
+    submitted: NonNull<Submitted<Verb>>,
 }
 
 impl<Verb: sealed::Calling> Deferred<Verb> {
@@ -3909,7 +3910,7 @@ impl<Verb: sealed::Calling> Deferred<Verb> {
     /// Calls `ustore_outcome_status`.
     pub fn status(&self) -> std::result::Result<(), Status> {
         // SAFETY: the outcome lives in the box this `Deferred` owns until it is final.
-        Status::from_raw(unsafe { ffi::ustore_outcome_status(ptr::addr_of_mut!((*self.lent.as_ptr()).outcome)) })
+        Status::from_raw(unsafe { ffi::ustore_outcome_status(ptr::addr_of_mut!((*self.submitted.as_ptr()).outcome)) })
     }
 
     /// Blocks until the call is final, then hands back what it produced.
@@ -3923,17 +3924,17 @@ impl<Verb: sealed::Calling> Deferred<Verb> {
 
     /// Blocks until the call is final, then frees the box, handing back its outcome and the verb.
     fn waited(self) -> (ffi::ustore_outcome_t, Verb) {
-        let lent = ManuallyDrop::new(self).lent.as_ptr();
+        let submitted = ManuallyDrop::new(self).submitted.as_ptr();
         // SAFETY: once the outcome is final the library touches the box no more, so it is freed here.
-        let Lent { outcome, verb } = unsafe {
-            ffi::ustore_outcome_wait(ptr::addr_of_mut!((*lent).outcome));
-            *Box::from_raw(lent)
+        let Submitted { outcome, verb } = unsafe {
+            ffi::ustore_outcome_wait(ptr::addr_of_mut!((*submitted).outcome));
+            *Box::from_raw(submitted)
         };
         (outcome, verb)
     }
 }
 
-impl<Verb: sealed::Lending> Deferred<Verb> {
+impl<Verb: sealed::Submitting> Deferred<Verb> {
     /// Blocks until the call is final, then hands back what it produced beside the inputs it owned,
     /// like a plan a stop left live.
     ///
@@ -3947,11 +3948,11 @@ impl<Verb: sealed::Lending> Deferred<Verb> {
 
 impl<Verb: sealed::Calling> Drop for Deferred<Verb> {
     fn drop(&mut self) {
-        let lent = self.lent.as_ptr();
+        let submitted = self.submitted.as_ptr();
         // SAFETY: once the outcome is final the library touches the box no more, and this `Deferred` owned it.
         unsafe {
-            ffi::ustore_outcome_wait(ptr::addr_of_mut!((*lent).outcome));
-            drop(Box::from_raw(lent));
+            ffi::ustore_outcome_wait(ptr::addr_of_mut!((*submitted).outcome));
+            drop(Box::from_raw(submitted));
         }
     }
 }
@@ -3999,10 +4000,11 @@ impl<Verb: sealed::Calling> Future for Wait<Verb> {
     }
 }
 
-/// One deferred call and everything it lends the library, at one heap address until its status is final.
+/// One deferred call and everything the library reads, at one heap address until its
+/// status is final.
 ///
 /// The argument struct is not among them, since submission copies it.
-struct Lent<Verb: sealed::Calling> {
+struct Submitted<Verb: sealed::Calling> {
     /// The outcome the library finishes.
     outcome: ffi::ustore_outcome_t,
     /// The inputs, the output slots and the arena borrow.
@@ -4032,10 +4034,11 @@ impl Executor {
     /// Creates an executor of host threads for the RAM, RocksDB and LevelDB engines across the
     /// compute domains local to `memory_domains`, NUMA nodes as the operating system numbers them.
     ///
-    /// An empty list derives every domain the process may allocate on, and an identifier no domain carries is refused
-    /// with [`Status::InvalidArgument`]. The scratch of each thread, and every arena the executor makes, lives on the
-    /// domains named. Zero `threads` takes 7/8 of the cores those domains carry, rounded down and at least one, which
-    /// leaves the rest to blocking calls and to the background work of RocksDB and LevelDB.
+    /// An empty list derives every domain the process may allocate on, and an identifier no domain
+    /// holds is refused with [`Status::InvalidArgument`]. The scratch of each thread, and every
+    /// arena the executor makes, lives on the domains named. Zero `threads` takes 7/8 of the cores
+    /// those domains hold, rounded down and at least one, which leaves the rest to blocking calls
+    /// and to the background work of RocksDB and LevelDB.
     ///
     /// Calls `ustore_executor_for_ram`.
     pub fn for_ram(memory_domains: &[i32], threads: usize) -> Result<Self> {
@@ -4080,17 +4083,20 @@ impl Executor {
         Executor::created(handle, outcome)
     }
 
-    /// Opens one submission stream on `device`, a [`GPUDevice::ordinal`] of any vendor, or borrows
-    /// the caller's `stream`, fed by the calling thread, which is why this takes no thread count,
-    /// moving bytes as `gds` says. Zero `scratch_limit` lets scratch grow as calls ask. It fails
-    /// with [`Status::Device`] for an ordinal no device carries. [`NVMEOptions::compactions`]
+    /// Orders work on the caller's `stream` on `device`, a [`GPUDevice::ordinal`] of any vendor, or
+    /// on the device's default one, fed by the calling thread, which is why this takes no thread
+    /// count, moving bytes as `gds` says. Zero `scratch_limit` lets scratch grow as calls ask. It
+    /// fails with [`Status::Device`] for an ordinal no device holds. [`NVMEOptions::compactions`]
     /// places the merges of an NVMe database on one of an NVIDIA device.
     ///
     /// Calls `ustore_executor_for_vram`.
     ///
     /// # Safety
-    /// `stream` must be null or a live stream on `device` that outlives the executor: a
-    /// `cudaStream_t` on NVIDIA, a `hipStream_t` on AMD and an `id<MTLCommandQueue>` on Apple.
+    /// `stream` must be null or a live stream on `device`, which the caller destroys only after
+    /// dropping the executor: a `cudaStream_t` on NVIDIA, a `hipStream_t` on AMD and an
+    /// `id<MTLCommandQueue>` on Apple. Null orders work on the device's per-thread default stream,
+    /// or on Apple on the queue the process opened for the device; the executor creates and
+    /// destroys no stream.
     pub unsafe fn for_vram(device: i32, stream: *mut c_void, scratch_limit: usize, gds: Gds) -> Result<Self> {
         unsafe {
             let mut handle: ffi::ustore_executor_t = ptr::null_mut();
@@ -4143,9 +4149,9 @@ impl Drop for Executor {
 
 /// An optimistic transaction grouping reads and writes across collections and modalities.
 ///
-/// It serves one call at a time, so a call on a transaction that serves an unfinished deferred one finishes with
-/// [`Status::Contended`]. It is freed before its database closes, which the borrow of the database carries, and
-/// dropping it waits for every deferred call naming it to finish.
+/// It serves one call at a time, so a call on a transaction that serves an unfinished deferred one
+/// finishes with [`Status::Contended`]. It is freed before its database closes, which the borrow of
+/// the database holds, and dropping it waits for every deferred call naming it to finish.
 #[derive(Debug)]
 pub struct Transaction<'db> {
     database: &'db Database,
@@ -4621,7 +4627,8 @@ impl ChangesCursor<'_> {
         self.pull(wanted, arena, ptr::null_mut())
     }
 
-    /// Pulls up to `wanted` next changes with the bytes every one carries into `arena` in one call.
+    /// Pulls up to `wanted` next changes with the bytes every one holds, copied into `arena` in one
+    /// call.
     pub fn next_pairs<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena) -> Result<Changes<'arena>> {
         let mut values = ffi::ustore_strings_view_t::default();
         let mut changes = self.pull(wanted, arena, &mut values)?;
@@ -4720,7 +4727,7 @@ impl<'arena> Changes<'arena> {
         self.kinds
     }
 
-    /// The bytes the change at `index` carries, empty for a removal, or `None` past the end or when
+    /// The bytes the change at `index` holds, empty for a removal, or `None` past the end or when
     /// the pull read no values.
     pub fn value(&self, index: usize) -> Option<&'arena [u8]> {
         self.values.get(index)
@@ -5488,12 +5495,12 @@ mod tests {
         let mut arena = Arena::new_in(&executor).unwrap();
         let (database, blobs) = crowded(100_000);
         let scan = database.head().deferred(&executor).scan(blobs, key(0), 100_000, &mut arena).unwrap();
-        let lent = scan.lent;
+        let submitted = scan.submitted;
         std::mem::forget(scan);
 
         // The free waits in the library for the call naming the database, which the forgotten box still holds.
         drop(database);
-        let scan = Deferred { lent };
+        let scan = Deferred { submitted };
         assert_eq!(scan.status(), Ok(()));
         assert_eq!(scan.wait().unwrap().keys.len(), 100_000);
     }

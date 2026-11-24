@@ -209,7 +209,7 @@ print(Int(leaving.degrees()[1]))  # 0, as vertex 2 leaves by no edge
 
 The receiver chooses where a verb runs, what it sees and how it completes, and the verb stays the same, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#receivers--deferred-calls) describe in full.
 A database, transaction or snapshot runs a verb on the calling thread, `handle.on(executor)` blocks on an executor, and `handle.deferred(executor)` submits there and answers a `Deferred`.
-A `Deferred` owns its outcome and outputs and borrows its arena and inputs, which Mojo's origins keep alive for as long as it is; `wait` blocks in `ustore_outcome_wait` and answers the result or raises, `status` polls, and destroying an unfinished one waits for it.
+A `Deferred` owns its outcome and outputs and views its arena and inputs, which Mojo's origins keep alive for as long as it is; `wait` blocks in `ustore_outcome_wait` and answers the result or raises, `status` polls, and destroying an unfinished one waits for it.
 
 ```mojo
 db.write(collections, keys, values)                       # the head, on the calling thread
@@ -235,7 +235,7 @@ executor.drain(Mood.SPINNING)  # waits, then keeps its threads hot
 
 ## Batches and Arenas
 
-Every verb takes a batch, and its shortest packed input sets how many tasks it carries, so the library never reads past a view.
+Every verb takes a batch, and its shortest packed input sets how many tasks it holds, so the library never reads past a view.
 Fixed-width inputs are strided views, `KeysView`, `CollectionsView`, `LengthsView` and `VertexRolesView`, made from a span with `.of(...)` or from one element repeated for every task with `.repeating(...)`, and ragged inputs are `StringsView` tapes of 32-bit or 64-bit offsets.
 Every output whose length only the call knows lands in an `Arena`, and each call rewinds it, so the previous call's views die and reading one raises `Status.INVALID_ARGUMENT`, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#batches-and-arenas) describe.
 
@@ -248,7 +248,7 @@ _ = db.read(CollectionsView.repeating(people), KeysView.of(keys), arena)
 _ = first.present(0)  # raises: its arena served a later call
 ```
 
-Every view tracks the origin of what it borrows, so the data outlives the call that reads it, and every deferred call takes an arena of its own.
+Every view tracks the origin of what it views, so the data outlives the call that reads it, and every deferred call takes an arena of its own.
 
 Outputs export in place through the Arrow C data interface: `keys_to_arrow`, `tape_to_arrow` and `column_to_arrow` answer an `ArrowExport` whose schema and array addresses any Arrow consumer imports, and `keys_from_arrow` and `strings_from_arrow` read an Arrow column back as a call's input.
 
@@ -261,7 +261,7 @@ _ = exported^  # Mojo frees at last use, so the export outlives every view of it
 
 ## Errors
 
-Every fallible entry point raises `Error` and nothing else, since Mojo allows one error type per function, and an `Error` carries a `Status` shared with the C interface.
+Every fallible entry point raises `Error` and nothing else, since Mojo allows one error type per function, and an `Error` holds a `Status` shared with the C interface.
 An `Error` keeps the engine mapped while it lives, since its name and message are the engine's own static text.
 
 ```mojo
@@ -280,7 +280,7 @@ except error:
 `Database.init_ram` starts a database in memory alone, and `Database.open_ram`, `open_rocksdb`, `open_leveldb` and `open_nvme` serve a directory or a manifest, each opening blocking on the executor it is handed.
 The RAM and NVMe opens take a `cpu_class_ceiling`, the newest `CPUClass` the database's kernels may run as, intersected with the machine.
 `describe`, `clear`, `compact` and `flush` act on the whole database through any receiver, and a `DatabaseCompactPlan` keeps a cancelled compaction open until `compact_plan_finish`.
-On Linux the engine builds against conda-forge's glibc 2.39 sysroot, whose kernel headers carry the `io_uring` flags the NVMe engine needs.
+On Linux the engine builds against conda-forge's glibc 2.39 sysroot, whose kernel headers hold the `io_uring` flags the NVMe engine needs.
 
 ### What This Binding Does Not Expose
 

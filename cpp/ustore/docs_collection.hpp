@@ -43,7 +43,7 @@ status_t fields_view_(fields_type_ const& fields, std::size_t count, ustore_stri
  *      @p completion_ says.
  *
  *  A blocking handle answers an @c outcome, while a deferred one answers a @c deferred call,
- *  borrowing the handle, its inputs and its arena until the call is final. A handle with
+ *  viewing the handle, its inputs and its arena until the call is final. A handle with
  *  @c collection_access_t::read_only_k only reads, as a snapshot hands out. The type of a handle
  *  shapes only how values cross it, since documents are stored as JSON whatever they arrive as.
  */
@@ -109,11 +109,11 @@ class docs_collection_on {
     /**
      *  @brief Reads the documents of @p keys, or the fields @p fields name inside them,
      *      into @p arena.
-     *  @param[in] keys Keys to read, borrowed until the call is final.
-     *  @param[in] arena Memory the values land in, borrowed until the call is final, which
-     *      the answer views.
+     *  @param[in] keys Keys to read, owned by the caller until the call is final.
+     *  @param[in] arena Memory the values land in, owned by the caller until the call is final,
+     *      which the answer views.
      *  @param[in] fields None for whole documents, one field for every key, or one per key,
-     *      borrowed until final.
+     *      owned by the caller until final.
      *  @param[in] type Format the values are exported in.
      *  @param[in] watch Whether a read inside a transaction records the keys for conflicts.
      *
@@ -134,10 +134,10 @@ class docs_collection_on {
     /**
      *  @brief Writes @p values to the documents of @p keys pairwise, or to the fields @p fields
      *      name inside them.
-     *  @param[in] keys Keys to write, borrowed until the call is final.
-     *  @param[in] values One value per key, borrowed until the call is final.
+     *  @param[in] keys Keys to write, owned by the caller until the call is final.
+     *  @param[in] values One value per key, owned by the caller until the call is final.
      *  @param[in] fields None for whole documents, one field for every key, or one per key,
-     *      borrowed until final.
+     *      owned by the caller until final.
      *  @param[in] modification Whether the values upsert, update or insert, or patch or merge
      *      what they find.
      *  @param[in] type Format the values arrive in.
@@ -167,7 +167,7 @@ class docs_collection_on {
     /**
      *  @brief Removes the documents of @p keys whole, while a patch or a merge removes
      *      fields inside them.
-     *  @param[in] keys Keys to remove, borrowed until the call is final.
+     *  @param[in] keys Keys to remove, owned by the caller until the call is final.
      *  @param[in] durability Whether the call finishes only after the data reaches the disk.
      */
     answer<completion_, void> remove(keys_view_t keys,
@@ -179,9 +179,9 @@ class docs_collection_on {
 
     /**
      *  @brief Lists the unique paths to the leaves of the documents of @p keys into @p arena.
-     *  @param[in] keys Keys of the documents, borrowed until the call is final.
-     *  @param[in] arena Memory the paths land in, borrowed until the call is final, which
-     *      the answer views.
+     *  @param[in] keys Keys of the documents, owned by the caller until the call is final.
+     *  @param[in] arena Memory the paths land in, owned by the caller until the call is final,
+     *      which the answer views.
      *  @param[in] watch Whether a read inside a transaction records the keys for conflicts.
      */
     answer<completion_, sz::strings_view_t> gist(keys_view_t keys, arena_t& arena,
@@ -193,12 +193,12 @@ class docs_collection_on {
      *  @brief Gathers the columns @p header names from the documents of @p keys into @p arena, as
      *      a table typed at runtime, whose index views @p keys and this handle and whose header
      *      views @p header.
-     *  @param[in] keys Keys of the documents, one per row, borrowed until the call is final and
-     *      read by the table.
-     *  @param[in] header Field and type of every column, borrowed until the call is final and read
-     *      by the table.
-     *  @param[in] arena Memory the columns land in, borrowed until the call is final, which
-     *      the table views.
+     *  @param[in] keys Keys of the documents, one per row, owned by the caller until the call is
+     *      final and read by the table.
+     *  @param[in] header Field and type of every column, owned by the caller until the call is
+     *      final and read by the table.
+     *  @param[in] arena Memory the columns land in, owned by the caller until the call is final,
+     *      which the table views.
      *  @param[in] watch Whether a read inside a transaction records the keys for conflicts.
      */
     answer<completion_, docs_table_t> gather(keys_view_t keys, table_header_view_t const& header, arena_t& arena,
@@ -207,7 +207,7 @@ class docs_collection_on {
     }
 
     /** Gathers the columns @p header names from the documents of @p keys into @p arena, as a table
-     *  typed at compile time, borrowing what the runtime-typed form borrows. */
+     *  typed at compile time, viewing what the runtime-typed form views. */
     template <typename... column_types_>
     answer<completion_, docs_table<column_types_...>> gather(
         keys_view_t keys, table_header<column_types_...> const& header, arena_t& arena,
@@ -219,7 +219,7 @@ class docs_collection_on {
     /**
      *  @brief Draws up to @p wanted document keys at random into @p arena, exporting no documents,
      *      so a read or a gather follows the sample.
-     *  @param[in] arena Memory the keys land in, which the answer views, borrowed until the
+     *  @param[in] arena Memory the keys land in, which the answer views, viewed until the
      *      call is final.
      *  @param[in] watch Whether a read inside a transaction records the keys for conflicts.
      */
@@ -232,9 +232,9 @@ class docs_collection_on {
     /**
      *  @brief Estimates the documents and the space from @p start_key, inclusive, to @p end_key,
      *      exclusive, into @p arena.
-     *  @param[in] start_key First key of the range, borrowed until the call is final.
-     *  @param[in] end_key Key the range stops before, borrowed until the call is final.
-     *  @param[in] arena Memory the bounds land in, borrowed until the call is final.
+     *  @param[in] start_key First key of the range, owned by the caller until the call is final.
+     *  @param[in] end_key Key the range stops before, owned by the caller until the call is final.
+     *  @param[in] arena Memory the bounds land in, owned by the caller until the call is final.
      *  @param[in] watch Whether a read inside a transaction records the range for conflicts.
      */
     answer<completion_, size_estimates_t> measure(ustore_key_t const& start_key, ustore_key_t const& end_key,

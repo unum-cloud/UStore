@@ -45,4 +45,4 @@ There is no media modality, so `browser.py` keeps its photographs in an ordinary
 
 cuxfilter reached end of life with RAPIDS 26.06, its final release, and cuSpatial stopped publishing after 25.04.
 `banks_atm_olap.yml` therefore pins the whole RAPIDS stack at 26.06 and drops cuSpatial, which the example never used.
-Create it with `conda env create -f examples/banks_atm_olap.yml`, and set `channel_priority` from the command line, since a Conda environment file cannot carry it.
+Create it with `conda env create -f examples/banks_atm_olap.yml`, and set `channel_priority` from the command line, since a Conda environment file cannot hold it.

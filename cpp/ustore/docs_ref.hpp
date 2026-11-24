@@ -28,10 +28,10 @@ namespace unum::ustore {
  *  @brief Reads what @p answer_type_ asks of the documents at @p places, or of the fields @p fields
  *      name inside them, into @p arena: the values exported as @p type, their lengths, or only
  *      whether each is present.
- *  @param[in] places Collections and keys to read, borrowed until the call is final.
- *  @param[in] fields None for whole documents, or one field per place, borrowed until the
+ *  @param[in] places Collections and keys to read, owned by the caller until the call is final.
+ *  @param[in] fields None for whole documents, or one field per place, viewed until the
  *      call is final.
- *  @param[in] arena Memory the answer lands in, borrowed until the call is final, which
+ *  @param[in] arena Memory the answer lands in, owned by the caller until the call is final, which
  *      the answer views.
  */
 template <ustore_completion_t completion_, typename answer_type_>
@@ -62,7 +62,7 @@ answer<completion_, answer_type_> docs_read_(receiver_t const& receiver, place_b
 /**
  *  @brief Writes @p values to the documents at @p places, or to the fields @p fields name inside
  *      them, as @p modification says.
- *  @param[in] values Values arriving as @p type, borrowed until the call is final.
+ *  @param[in] values Values arriving as @p type, owned by the caller until the call is final.
  *  @param[in] durability Whether the call finishes only after the data reaches the disk.
  */
 template <ustore_completion_t completion_>
@@ -132,8 +132,8 @@ answer<completion_, sz::strings_view_t> docs_gist_(receiver_t const& receiver, p
 }
 
 /** Gathers every column of @p header from the documents at @p places into @p arena, as a table
- *  whose index and header view the places and the header, both borrowed until the call is final and
- *  read by the table after. */
+ *  whose index and header view the places and the header, both owned by the caller until the call
+ *  is final and read by the table after. */
 template <ustore_completion_t completion_, typename table_type_>
 answer<completion_, table_type_> docs_gather_(receiver_t const& receiver, place_batch_t const& places,
                                               table_header_view_t const& header, arena_t& arena,

@@ -7,7 +7,7 @@ Every integer is little-endian, and every section of a run starts on a 4096-byte
 ## Sorted Runs
 
 A run is one immutable sorted run of one collection's LSM tree, at most 1 GiB less 4 KiB.
-On a filesystem it is the file `<database>-<run id>.ustore`, where the run ID is the UUID its header carries as `content_id`.
+On a filesystem it is the file `<database>-<run id>.ustore`, where the run ID is the UUID its header holds as `content_id`.
 On raw media it is an extent inside a slot, which the manifest locates by offset.
 
 ```c
@@ -40,7 +40,7 @@ struct strings_run {                      // every section starts on a 4096-byte
 };
 ```
 
-The header carries everything a reader needs to locate every other section, so a run lifted out of its database still describes itself.
+The header holds everything a reader needs to locate every other section, so a run lifted out of its database still describes itself.
 
 | Offset | Bytes | Field                    | Meaning                                                 |
 | -----: | ----: | :----------------------- | :------------------------------------------------------ |
@@ -55,7 +55,7 @@ The header carries everything a reader needs to locate every other section, so a
 |     40 |    16 | `content_id`             | the run ID, which also names the file                   |
 |     56 |     8 | `stamps_bytes`           | bytes of the saved stamps column                        |
 |     64 |     8 | `stamps_floor`           | the stamp every stamp of the run was raised to at least |
-|     72 |     8 | `newest_stamp`           | the newest stamp any cell carries                       |
+|     72 |     8 | `newest_stamp`           | the newest stamp any cell holds                       |
 |     80 |     8 | `kinds_bytes`            | bytes of the saved kinds column                         |
 |     88 |     4 | `key_tape_bytes`         | bytes of every key of a run of strings whole            |
 |     92 |     4 | `layers_bytes`           | bytes of the layers section of a run of strings         |
@@ -68,7 +68,7 @@ A lookup descends the saved tree of the keys, whose rank is the cell's position.
 A cell that is its key alone, for fixed-width and variable-width values, is not saved, as the tree's leaf rows hold every key; a reader or a device compactor takes keys from those rows, 16-byte keys stored as a column of high words and a column of low words per row.
 A run of strings files every key under its 16-byte head, its first 15 bytes and its length, and keeps the keys whole on the key tape.
 A tie of equal heads wider than one row of the tree gets a layer over the next 15 bytes of its keys, nested as deep as they keep tying, so a lookup compares at most one row of whole keys.
-Each cell's kind tells a removal, an empty value and a fold's change apart, so no length or offset carries a sentinel.
+Each cell's kind tells a removal, an empty value and a fold's change apart, so no length or offset holds a sentinel.
 
 A range tombstone is what one range removal leaves: every key from its start up to its exclusive end, hidden from a reader at or past its stamp for every version older than it.
 Its stamp stays raw, never raised to the floor, and a version it hides is older by position: one of a deeper level, of an older run of level zero, or of its own run stamped below it.
@@ -95,7 +95,7 @@ The top-level keys:
 
 - `__metadata__`: the format name and version, both strings.
 - `database`: the name the database is opened by, which prefixes every run file.
-- `id`: the database's UUID, minted at its first open and carried by every slot it holds.
+- `id`: the database's UUID, minted at its first open and held by every slot it holds.
 - `generation`: how many manifests the database has published, this one included.
 - `durable_stamp`: every commit at or below this stamp is wholly inside the files named, and a mount drops every one above.
 - `collections`: every collection with what a mount needs to open it again: its UUID, name, store tag, value widths, level growth factor, cache and memory-run bounds.
@@ -106,7 +106,7 @@ A file entry names its bytes in one of two ways, and one manifest never mixes th
 - `path`, on a filesystem: the run file's name, relative to the data directory its `medium` names, the manifest's own directory when `medium` is absent.
 - `medium` and `offset`, on raw media: the data directory's index and the run's first byte inside that medium.
 
-Either way it carries `bytes`, and a run also carries its `collection` index into `collections`, its `level`, zero being the level flushes land on, and the `stamp` an ingest assigned a run written at stamp zero.
+Either way it holds `bytes`, and a run also holds its `collection` index into `collections`, its `level`, zero being the level flushes land on, and the `stamp` an ingest assigned a run written at stamp zero.
 A saved snapshot's manifest also gives every file a `sha256`, 64 lowercase hex digits over its bytes, hashed while the save copies them.
 A mount hashes every file whose entry names one before anything reads it, and refuses a mismatch with `ustore_status_malformed_k`.
 The manifests the database publishes after that mount name no digests, so only the first open of a restored database hashes its runs; every later save hashes them again while copying.

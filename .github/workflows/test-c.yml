@@ -461,7 +461,7 @@ jobs:
           cmake --preset android_arm64
           cmake --build --preset android_arm64
 
-  # glibc 2.28 and Linux 4.18 headers, which carry no io_uring, so the NVMe engine builds from its own kernel mirrors;
+  # glibc 2.28 and Linux 4.18 headers, which hold no io_uring, so the NVMe engine builds from its own kernel mirrors;
   # the test runs on the runner's new kernel, where the mirrors meet the real ABI.
   test_old_kernel_headers:
     name: Build C Library on Old Kernel Headers

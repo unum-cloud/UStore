@@ -5,7 +5,7 @@
  *  @brief Binary values: writes, reads, scans, samples, measurements and cursors.
  *
  *  Every verb here is written once and reached from every receiver's method table, since receivers
- *  differ only in what their calls address and how they run, which the shared context carries.
+ *  differ only in what their calls address and how they run, which the shared context holds.
  *  Each one detaches the thread state around the call. A verb whose outputs scale with the call
  *  takes an @c Arena as its last positional argument and answers results viewing it, while `get`
  *  and `contains`, which read one key, make a one-off arena and copy out of it. Every verb fills a
@@ -220,7 +220,7 @@ char const doc_contains[] =                                                     
     "  key (KeyLike): The key to look for.\n"                                            //
     "  collection (UUID | str): The collection, by identifier or by name.\n"             //
     "Returns:\n"                                                                         //
-    "  bool: Whether the key carries a value.";
+    "  bool: Whether the key holds a value.";
 
 static PyObject* contains_answer(void* erased) {
     return PyBool_FromLong(ustore_py_present(((ustore_py_read_call_t const*)erased)->presences, 0));
@@ -290,7 +290,7 @@ int ustore_py_contents_from_object(PyObject* object, size_t count, ustore_py_con
     // makes `write(keys, b"same")` mean what it reads like.
     if (PyObject_CheckBuffer(object)) {
         if (ustore_py_contents_reserve(batch, 1, ustore_py_contents_broadcast_k) != 0) return -1;
-        if (ustore_py_contents_borrow(object, batch) != 0) {
+        if (ustore_py_contents_view(object, batch) != 0) {
             ustore_py_contents_release(batch);
             return -1;
         }
@@ -310,7 +310,7 @@ int ustore_py_contents_from_object(PyObject* object, size_t count, ustore_py_con
         return -1;
     }
     for (size_t task_index = 0; task_index != count; ++task_index)
-        if (ustore_py_contents_borrow(PySequence_Fast_GET_ITEM(sequence, (Py_ssize_t)task_index), batch) != 0) {
+        if (ustore_py_contents_view(PySequence_Fast_GET_ITEM(sequence, (Py_ssize_t)task_index), batch) != 0) {
             Py_DECREF(sequence);
             ustore_py_contents_release(batch);
             return -1;
@@ -463,7 +463,7 @@ char const doc_set[] =                                                          
     "\n"                                                                                   //
     "Args:\n"                                                                              //
     "  key (KeyLike): The key to write.\n"                                                 //
-    "  value (bytes-like): The bytes to store, borrowed rather than copied.\n"             //
+    "  value (bytes-like): The bytes to store, viewed rather than copied.\n"               //
     "  collection (UUID | str): The collection, by identifier or by name.\n"               //
     "  durability (Durability, optional): `Durability.FLUSHED` reaches the drive before\n" //
     "    returning.\n"                                                                     //
@@ -489,7 +489,7 @@ PyObject* ustore_py_api_set(PyObject* self, PyObject* const* arguments, Py_ssize
     call->keys.count = 1;
     if (ustore_py_key_from_object(arguments[0], &call->keys.inline_keys[0]) != 0 ||
         ustore_py_contents_reserve(&call->contents, 1, ustore_py_contents_per_task_k) != 0 ||
-        ustore_py_contents_borrow(arguments[1], &call->contents) != 0)
+        ustore_py_contents_view(arguments[1], &call->contents) != 0)
         return ustore_py_call_discard(&context, &ustore_py_write_verb, call);
     return ustore_py_values_write(&context, &options, call);
 }
@@ -537,7 +537,8 @@ PyObject* ustore_py_api_remove(PyObject* self, PyObject* const* arguments, Py_ss
 
 #pragma region Scans
 
-/** What a scan or a cursor matches, as its keywords named it, every object borrowed from the arguments. */
+/** What a scan or a cursor matches, as its keywords named it, every object viewed
+ *  from the arguments. */
 typedef struct scan_match_t {
 
     /** The sequence of `str` or bytes-like patterns, or NULL. */
@@ -678,7 +679,7 @@ typedef struct keys_call_t {
     /** Which way every scan walks from its start. */
     ustore_scan_direction_t direction;
 
-    /** Scans or samples the batch carries. */
+    /** Scans or samples the batch holds. */
     size_t tasks;
 
     /** Output slot for the offsets into @c keys, inside the arena. */
@@ -687,16 +688,17 @@ typedef struct keys_call_t {
     /** Output slot for the keys every task found, inside the arena. */
     ustore_key_t const* keys;
 
-    /** Output slot for the BM25 scores of the keys, inside the arena, when the patterns carry weights. */
+    /** Output slot for the BM25 scores of the keys, inside the arena, when the patterns hold
+     *  weights. */
     float const* scores;
 
-    /** The patterns, borrowed until the call finishes. */
+    /** The patterns, owned by the caller until the call finishes. */
     ustore_py_texts_t patterns;
 
     /** One weight per pattern, copied, or NULL. */
     float* weights;
 
-    /** The JSONPath or XPath filter, borrowed until the call finishes. */
+    /** The JSONPath or XPath filter, owned by the caller until the call finishes. */
     ustore_py_texts_t filter;
 } keys_call_t;
 
@@ -716,8 +718,9 @@ static void keys_release(void* erased) {
     ustore_py_call_release(&call->call);
 }
 
-/** Gathers into @p call what @p match names, borrowing its patterns, copying its weights and holding its filter until
- *  the call finishes, then writes the ABI's spelling of them into @p patterns and @p filter. */
+/** Gathers into @p call what @p match names, viewing its patterns, copying its weights and
+ *  holding its filter until the call finishes, then writes the ABI's spelling of them into
+ *  @p patterns and @p filter. */
 static int match_fill(keys_call_t* call, scan_match_t const* match, ustore_patterns_t* patterns,
                       ustore_bytes_view_t* filter) {
     call->call.predicate.callable = Py_XNewRef(match->predicate);
@@ -1419,7 +1422,7 @@ PyObject* ustore_py_api_measure(PyObject* self, PyObject* const* arguments, Py_s
  *  arena each pull names. */
 typedef struct Cursor {
 
-    /** The object header every instance carries. */
+    /** The object header every instance holds. */
     PyObject ob_base;
 
     /** The cursor of the modality @c modality names, or NULL once closed. */
@@ -1451,7 +1454,7 @@ typedef struct Cursor {
 /** The keys one pull wrote into an arena, and their values when it asked, viewed until the arena rewinds. */
 typedef struct Page {
 
-    /** The object header every instance carries. */
+    /** The object header every instance holds. */
     PyObject ob_base;
 
     /** The @c Arena the keys live in, kept alive so they outlive every other name for them. */
@@ -1689,7 +1692,8 @@ static void Cursor_dealloc(Cursor* self) {
     PyObject_Free(self);
 }
 
-/** Pulls the next page of the cursor @p handle, which @p self lent its pull, as @p verb answers it. */
+/** Pulls the next page of the cursor @p handle, which @p self handed to its pull, as @p verb
+ *  answers it. */
 static PyObject* cursor_pull(Cursor* self, void* handle, size_t wanted, PyObject* arena, int values,
                              PyObject* progress) {
     if (self->executor && !self->executor->handle) {
@@ -1811,7 +1815,7 @@ static char const doc_Cursor_next[] =                                           
     "Args:\n"                                                                                   //
     "  wanted (int): Most keys the page holds.\n"                                               //
     "  arena (Arena): Where the keys and values land, rewound by this pull.\n"                  //
-    "  values (bool, optional): Whether the page carries the values of its keys.\n"             //
+    "  values (bool, optional): Whether the page holds the values of its keys.\n"               //
     "  progress (Callable[[int, int], bool | None], optional): Called once for the pull,\n"     //
     "    which a falsy answer other than None cancels before the cursor advances.\n"            //
     "Returns:\n"                                                                                //
@@ -2161,7 +2165,7 @@ PyObject* ustore_py_api_graph_vertices_cursor(PyObject* self, PyObject* const* a
  *  arena each pull names. */
 typedef struct ChangesCursor {
 
-    /** The object header every instance carries. */
+    /** The object header every instance holds. */
     PyObject ob_base;
 
     /** The feed, or NULL once closed. */
@@ -2180,7 +2184,7 @@ static void changes_pull_submit(void* arguments) {
 }
 
 /** Answers the @c Changes the pull @p call wrote into, once it built the objects over its
- *  slots, carrying @p values, a @c Values or None, which it takes. */
+ *  slots, holding @p values, a @c Values or None, which it takes. */
 static PyObject* changes_answer(changes_pull_call_t const* call, PyObject* values) {
     Changes* const changes = (Changes*)call->call.result;
     size_t const count = (size_t)changes->count;
@@ -2243,14 +2247,14 @@ static char const doc_ChangesCursor_next[] =                                    
     "next(wanted, arena, /, *, values=False) answers a Changes tuple.\n"                       //
     "\n"                                                                                       //
     "Pulls up to `wanted` changes past the last pull into `arena`, with the bytes every one\n" //
-    "carries in the same call when asked, on the calling thread. An empty pull, whose keys\n"  //
+    "holds in the same call when asked, on the calling thread. An empty pull, whose keys\n"    //
     "are falsy, reached the newest commit, and later pulls see later commits. A pull that\n"   //
     "fails leaves the feed where it was.\n"                                                    //
     "\n"                                                                                       //
     "Args:\n"                                                                                  //
     "  wanted (int): Most changes the pull yields.\n"                                          //
     "  arena (Arena): Where the keys and values land, rewound by this pull.\n"                 //
-    "  values (bool, optional): Whether the pull carries the bytes of every change, empty\n"   //
+    "  values (bool, optional): Whether the pull holds the bytes of every change, empty\n"     //
     "    for a removal.\n"                                                                     //
     "Returns:\n"                                                                               //
     "  Changes: The keys as a Page, their Values or None, and a tuple each of commit stamps\n" //

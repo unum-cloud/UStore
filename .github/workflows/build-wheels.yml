@@ -55,7 +55,7 @@ jobs:
         run: |
           ls -la wheelhouse/
           count=$(find wheelhouse -name "*-cp${{ matrix.python-version }}-*.whl" | wc -l)
-          echo "wheels carrying ABI tag cp${{ matrix.python-version }}: ${count}"
+          echo "wheels holding ABI tag cp${{ matrix.python-version }}: ${count}"
           test "$count" -gt 0
 
       - name: Upload Wheels
@@ -83,7 +83,7 @@ jobs:
           python -m build --sdist
 
       # The extension configures from the siblings' CMake trees and instruction-set probes, so the sdist must configure
-      # on its own, not merely carry the headers.
+      # on its own, not merely hold the headers.
       - name: Configure the Unpacked Source Distribution
         run: |
           mkdir sdist_check && tar xzf dist/*.tar.gz -C sdist_check --strip-components=1

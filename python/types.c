@@ -56,7 +56,7 @@ static struct {
     {ustore_status_unsupported_k, "ustore.UnsupportedError", &ErrorType, &PyExc_NotImplementedError,
      "The engine or this build does not implement what the call asks for."},
     {ustore_status_invalid_argument_k, "ustore.InvalidArgumentError", &ErrorType, &PyExc_ValueError,
-     "An argument is null, contradicts another one, or carries a choice the call does not accept."},
+     "An argument is null, contradicts another one, or holds a choice the call does not accept."},
     {ustore_status_not_found_k, "ustore.NotFoundError", &ErrorType, &PyExc_KeyError,
      "A collection, a directory, or a document a modification needs does not exist."},
     {ustore_status_already_exists_k, "ustore.AlreadyExistsError", &ErrorType, &PyExc_ValueError,
@@ -72,7 +72,7 @@ static struct {
 };
 
 int ustore_py_raise(ustore_status_t status, char const* format, ...) {
-    // A status this specific supersedes whatever the caller was carrying, and building the
+    // A status this specific supersedes whatever the caller was holding, and building the
     // instance below must not start with an exception already set.
     PyErr_Clear();
     PyObject* type = (size_t)status < ustore_py_table_size_(status_error_types) ? status_error_types[status] : NULL;
@@ -135,7 +135,7 @@ int ustore_py_raise_from_cause(PyObject* kind, char const* format, ...) {
 }
 
 static char const doc_Error[] =                                                                 //
-    "Every failure the engine reports, carrying the status shared with the C ABI.\n"            //
+    "Every failure the engine reports, holding the status shared with the C ABI.\n"             //
     "\n"                                                                                        //
     "Each failing status raises a subclass of its own, such as `NotFoundError`, which also\n"   //
     "derives the built-in naming the same fault where one exists, so `except KeyError` still\n" //
@@ -145,7 +145,7 @@ static char const doc_Error[] =                                                 
     "\n"                                                                                        //
     "Attributes:\n"                                                                             //
     "  status (Status): The status, such as `Status.WRITE_CONFLICT`.\n"                         //
-    "  args (tuple): The detail the status cannot carry, as on any exception.";
+    "  args (tuple): The detail the status cannot hold, as on any exception.";
 
 static char const doc_ConflictError[] =
     "A concurrent writer touched what this transaction wrote, read or scanned; retry the transaction.";
@@ -315,20 +315,20 @@ typedef struct {
     uint64_t byte_offset;
 } DLTensor;
 
-/** The tensor a "dltensor" capsule carries, which its consumer deletes. */
+/** The tensor a "dltensor" capsule holds, which its consumer deletes. */
 typedef struct DLManagedTensor {
     DLTensor dl_tensor;
     void* manager_ctx;
     void (*deleter)(struct DLManagedTensor* self);
 } DLManagedTensor;
 
-/** The DLPack version a "dltensor_versioned" capsule carries. */
+/** The DLPack version a "dltensor_versioned" capsule holds. */
 typedef struct {
     uint32_t major;
     uint32_t minor;
 } DLPackVersion;
 
-/** The tensor a "dltensor_versioned" capsule carries, which its consumer deletes. */
+/** The tensor a "dltensor_versioned" capsule holds, which its consumer deletes. */
 typedef struct DLManagedTensorVersioned {
     DLPackVersion version;
     void* manager_ctx;
@@ -695,7 +695,7 @@ int ustore_py_uuid_import(void) {
 PyObject* ustore_py_uuid_to_object(ustore_uuid_t const* uuid) {
     PyObject* const bytes = PyBytes_FromStringAndSize((char const*)uuid->bytes, (Py_ssize_t)sizeof(uuid->bytes));
     if (!bytes) return NULL;
-    // The slot before the arguments is scratch the callee may borrow, as the offset flag permits.
+    // The slot before the arguments is scratch the callee may view, as the offset flag permits.
     PyObject* arguments[2] = {NULL, bytes};
     PyObject* const object = PyObject_Vectorcall(UUIDType, arguments + 1, PY_VECTORCALL_ARGUMENTS_OFFSET,
                                                  uuid_bytes_keyword);
@@ -761,11 +761,12 @@ static int keys_from_integers(void const* data, size_t count, int is_signed, ust
     return 0;
 }
 
-/** Whether a batch of keys travels as a borrowed buffer, converts from one, or reads element by element. */
+/** Whether a batch of keys travels as a viewed buffer, converts from one, or reads
+ *  element by element. */
 typedef enum keys_route_t {
 
-    /** A contiguous run of 16-byte keys the batch borrows outright. */
-    keys_route_borrowed_k,
+    /** A contiguous run of 16-byte keys the batch views outright. */
+    keys_route_viewed_k,
 
     /** A contiguous run of 64-bit integers, converted into keys and released. */
     keys_route_converted_k,
@@ -777,7 +778,7 @@ typedef enum keys_route_t {
     keys_route_failed_k,
 } keys_route_t;
 
-/** Tries the DLPack routes: packed 16-byte keys are borrowed wherever they live, as the library
+/** Tries the DLPack routes: packed 16-byte keys are viewed wherever they live, as the library
  *  classifies the address, and packed 64-bit integers convert where the host reads them. */
 static keys_route_t keys_from_dlpack(PyObject* object, ustore_py_keys_t* batch) {
     DLTensor const* tensor = NULL;
@@ -792,7 +793,7 @@ static keys_route_t keys_from_dlpack(PyObject* object, ustore_py_keys_t* batch) 
         batch->dlpack = capsule;
         batch->count = (size_t)rows;
         batch->keys = rows ? (ustore_key_t*)data : NULL;
-        return keys_route_borrowed_k;
+        return keys_route_viewed_k;
     }
     int const readable = tensor->device.device_type == kDLCPU || tensor->device.device_type == kDLCUDAManaged;
     if (!readable || !integral || tensor->dtype.bits != 64 || tensor->ndim != 1 ||
@@ -817,24 +818,24 @@ static keys_route_t keys_from_buffer(PyObject* object, ustore_py_keys_t* batch) 
         PyErr_Clear();
         return keys_route_sequence_k;
     }
-    batch->borrowed = 1;
+    batch->viewed = 1;
     Py_buffer const* const buffer = &batch->buffer;
     if (buffer_holds_keys(buffer)) {
         batch->count = (size_t)buffer->shape[0];
         // The ABI spells an empty batch with no keys at all, and refuses an address for no tasks.
         batch->keys = batch->count ? (ustore_key_t*)buffer->buf : NULL;
-        return keys_route_borrowed_k;
+        return keys_route_viewed_k;
     }
     if (buffer_holds_integers(buffer)) {
         char const kind = buffer->format[0] == '@' || buffer->format[0] == '=' ? buffer->format[1] : buffer->format[0];
         int const is_signed = kind == 'q' || kind == 'l' || kind == 'n';
         int const converted = keys_from_integers(buffer->buf, (size_t)buffer->shape[0], is_signed, batch);
         PyBuffer_Release(&batch->buffer);
-        batch->borrowed = 0;
+        batch->viewed = 0;
         return converted == 0 ? keys_route_converted_k : keys_route_failed_k;
     }
     PyBuffer_Release(&batch->buffer);
-    batch->borrowed = 0;
+    batch->viewed = 0;
     return keys_route_sequence_k;
 }
 
@@ -849,7 +850,7 @@ int ustore_py_keys_from_object(PyObject* object, ustore_py_keys_t* batch) {
     keys_route_t route = keys_from_dlpack(object, batch);
     if (route == keys_route_sequence_k) route = keys_from_buffer(object, batch);
     switch (route) {
-    case keys_route_borrowed_k:
+    case keys_route_viewed_k:
     case keys_route_converted_k: return 0;
     case keys_route_failed_k: ustore_py_keys_release(batch); return -1;
     case keys_route_sequence_k: break;
@@ -883,10 +884,10 @@ int ustore_py_keys_from_subscript(PyObject* object, ustore_py_keys_t* batch) {
 }
 
 void ustore_py_keys_release(ustore_py_keys_t* batch) {
-    if (batch->borrowed) PyBuffer_Release(&batch->buffer);
+    if (batch->viewed) PyBuffer_Release(&batch->buffer);
     if (batch->dlpack) dlpack_import_release(batch->dlpack);
     if (batch->owned) PyMem_Free(batch->owned);
-    batch->borrowed = 0;
+    batch->viewed = 0;
     batch->dlpack = NULL;
     batch->owned = NULL;
     batch->keys = NULL;
@@ -933,7 +934,7 @@ ustore_bytes_view_t ustore_py_tape_string(ustore_strings_view_t const* tape, siz
         begin = tape->data.u32_tape.offsets[index], end = tape->data.u32_tape.offsets[index + 1];
     }
     else begin = tape->data.u64_tape.offsets[index], end = tape->data.u64_tape.offsets[index + 1];
-    // A tape of empty strings may carry no bytes at all, and no address may be offset from NULL.
+    // A tape of empty strings may hold no bytes at all, and no address may be offset from NULL.
     ustore_bytes_view_t const string = {data ? data + begin : data, end - begin};
     return string;
 }
@@ -975,12 +976,12 @@ int ustore_py_contents_reserve(ustore_py_contents_t* batch, size_t count, ustore
     return 0;
 }
 
-int ustore_py_contents_borrow(PyObject* object, ustore_py_contents_t* batch) {
-    Py_buffer* const buffer = &batch->buffers[batch->borrowed];
+int ustore_py_contents_view(PyObject* object, ustore_py_contents_t* batch) {
+    Py_buffer* const buffer = &batch->buffers[batch->viewed];
     if (PyObject_GetBuffer(object, buffer, PyBUF_SIMPLE) != 0)
         return ustore_py_raise_from_cause(PyExc_TypeError, "A value must be bytes-like, not %S; remove() removes keys",
                                           Py_TYPE(object));
-    ++batch->borrowed;
+    ++batch->viewed;
     batch->views[batch->count].data = (uint8_t const*)buffer->buf;
     batch->views[batch->count].length = (ustore_size_t)buffer->len;
     ++batch->count;
@@ -1019,7 +1020,7 @@ static int contents_from_pair(PyObject* object, ustore_py_contents_t* batch) {
         return ustore_py_raise_from_cause(PyExc_TypeError, "The data of a tape must be bytes-like, not %S",
                                           Py_TYPE(PyTuple_GET_ITEM(object, 0)));
     }
-    batch->borrowed = 2;
+    batch->viewed = 2;
     batch->count = (size_t)offsets->shape[0] - 1;
 
     // The engine reads every string as the difference of two neighbouring offsets, so they must climb within the data.
@@ -1077,7 +1078,7 @@ static int contents_from_arrow(PyObject* object, ustore_py_contents_t* batch) {
                      "An Arrow array of values is binary, large_binary, string or large_string, not of format '%s'",
                      format);
     else if (array->n_buffers != 3)
-        PyErr_Format(PyExc_TypeError, "An Arrow array of values carries three buffers, not %lld",
+        PyErr_Format(PyExc_TypeError, "An Arrow array of values holds three buffers, not %lld",
                      (long long)array->n_buffers);
     else if (arrow_holds_null(array))
         ustore_py_raise(ustore_status_invalid_argument_k,
@@ -1118,9 +1119,9 @@ int ustore_py_contents_from_tape(PyObject* object, ustore_py_contents_t* batch) 
 }
 
 void ustore_py_contents_release(ustore_py_contents_t* batch) {
-    for (size_t buffer_index = 0; buffer_index != batch->borrowed; ++buffer_index)
+    for (size_t buffer_index = 0; buffer_index != batch->viewed; ++buffer_index)
         PyBuffer_Release(&batch->buffers[buffer_index]);
-    batch->borrowed = 0;
+    batch->viewed = 0;
     if (batch->block) PyMem_Free(batch->block);
     batch->block = NULL;
     batch->count = 0;
@@ -1134,7 +1135,7 @@ static int text_view(PyObject* object, ustore_py_text_serializer_t serializer, v
     ustore_py_contents_t* const batch = &texts->contents;
     if (!PyUnicode_Check(object)) {
         if (!serializer || object == Py_None || PyObject_CheckBuffer(object))
-            return ustore_py_contents_borrow(object, batch);
+            return ustore_py_contents_view(object, batch);
         return serializer(object, state);
     }
     Py_ssize_t length = 0;
@@ -1193,7 +1194,7 @@ int ustore_py_buffer_fill(Py_buffer* view, PyObject* owner, void const* data, ch
     Py_ssize_t items = 1;
     for (int dimension = 0; dimension != ndim; ++dimension) items *= shape[dimension];
 
-    // An empty run may carry no address at all, and a buffer must still point somewhere.
+    // An empty run may hold no address at all, and a buffer must still point somewhere.
     view->buf = data ? (void*)data : (void*)owner;
     view->obj = Py_NewRef(owner);
     view->len = items * itemsize;
@@ -1577,7 +1578,7 @@ static PyObject* Keys_get_counts(Keys* self, void* Py_UNUSED(closure)) {
 }
 
 static char const doc_Keys_scores[] =
-    "One BM25 score per key, in the order of the tape, when the scan's patterns carried weights, or None.";
+    "One BM25 score per key, in the order of the tape, when the scan's patterns held weights, or None.";
 
 static PyObject* Keys_get_scores(Keys* self, void* Py_UNUSED(closure)) {
     if (!self->scores) Py_RETURN_NONE;
@@ -1776,7 +1777,7 @@ static char const* const enum_names[ustore_py_enums_count_k] = {
 /** Every enumerator of every closed set fits a byte, as the C suite checks, so walks find all. */
 enum { enum_values_limit_k = 256 };
 
-/** What the C `_name` functions answer for a value no enumerator carries. */
+/** What the C <tt>_name</tt> functions answer for a value no enumerator holds. */
 static char const enum_unrecognized_k[] = "unrecognized";
 
 /** The canonical spelling of @p value as an enumerator of @p kind, or "unrecognized" where it is none. */
@@ -2025,9 +2026,10 @@ int ustore_py_progress_from_object(PyObject* object, PyObject** progress) {
 /**
  *  @brief Re-enters Python for one report of the call whose header is @p state, from whichever thread runs it.
  *
- *  Reports never overlap and never follow the final status, but nothing places them on the calling thread, so the
- *  interpreter is attached here rather than assumed. An answer of None carries on, as does a truthy one, while a
- *  falsy one cancels, and a raise reports through the unraisable hook and cancels.
+ *  Reports never overlap and never follow the final status, but nothing places them on the
+ *  calling thread, so the interpreter is attached here rather than assumed. An answer of None
+ *  continues, as does a truthy one, while a falsy one cancels, and a raise reports through the
+ *  unraisable hook and cancels.
  */
 static ustore_continuation_t progress_trampoline(ustore_size_t finished, ustore_size_t total, void* state) {
     ustore_py_call_t* const call = (ustore_py_call_t*)state;
@@ -2107,20 +2109,20 @@ ustore_predicate_t ustore_py_predicate_of(ustore_py_predicate_t* predicate, int 
 
 #pragma region Deferred Calls
 
-static char const doc_Deferred[] =                                                                //
-    "A call a deferred view submitted, which answers once it finishes.\n"                         //
-    "\n"                                                                                          //
-    "Built by the verbs of a DeferredOn, never by name. `await` suspends the coroutine until\n"   //
-    "the call is final, polling `status` between sleeps growing from 1 us to 1 ms and parking\n"  //
-    "no thread, and `wait()` blocks the thread instead. Either answers what the blocking verb\n"  //
-    "would have answered, or raises what it would have raised, as many times as it is asked.\n"   //
-    "The object holds the outcome, the keys and buffers the call borrows, its output slots and\n" //
-    "its arena until the call finishes, so dropping it waits for that, and C refuses another\n"   //
-    "call naming the arena with ContendedError until it finishes.\n"                              //
-    "\n"                                                                                          //
-    "Example:\n"                                                                                  //
-    "  >>> async def read(database, executor, keys):\n"                                           //
-    "  ...     reading = database.deferred(executor).read(keys, ustore.Arena(executor))\n"        //
+static char const doc_Deferred[] =                                                               //
+    "A call a deferred view submitted, which answers once it finishes.\n"                        //
+    "\n"                                                                                         //
+    "Built by the verbs of a DeferredOn, never by name. `await` suspends the coroutine until\n"  //
+    "the call is final, polling `status` between sleeps growing from 1 us to 1 ms and parking\n" //
+    "no thread, and `wait()` blocks the thread instead. Either answers what the blocking verb\n" //
+    "would have answered, or raises what it would have raised, as many times as it is asked.\n"  //
+    "The object holds the outcome, the keys and buffers the call views, its output slots and\n"  //
+    "its arena until the call finishes, so dropping it waits for that, and C refuses another\n"  //
+    "call naming the arena with ContendedError until it finishes.\n"                             //
+    "\n"                                                                                         //
+    "Example:\n"                                                                                 //
+    "  >>> async def read(database, executor, keys):\n"                                          //
+    "  ...     reading = database.deferred(executor).read(keys, ustore.Arena(executor))\n"       //
     "  ...     return await reading  # or: reading.wait()";
 
 /** The outcome of the call @p deferred holds. */
@@ -2204,7 +2206,8 @@ static PyObject* Deferred_await(Deferred* self) {
 
 static void Deferred_dealloc(Deferred* self) {
     PyObject_GC_UnTrack(self);
-    // The library writes into the call this object holds, and reads the inputs it borrows, until the call finishes
+    // The library writes into the call this object holds, and reads the inputs it views, until
+    // the call finishes
     if (!atomic_load(&self->answering)) {
         deferred_block(self);
         call_release(self->verb, self->call);
@@ -2301,7 +2304,8 @@ static PyObject* Executor_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNU
 }
 
 /**
- *  @brief Reads the arguments of an executor factory into @p values, each left NULL when the call carried none.
+ *  @brief Reads the arguments of an executor factory into @p values, each left NULL when the
+ *      call held none.
  *  @param[in] names The names of the arguments, in the order they may come by position.
  *  @param[in] positional How many of @p names may come by position.
  *  @param[in] keyword The first of @p names that may come by name, so those before it come by position alone.
@@ -2393,7 +2397,7 @@ static char const doc_Executor_for_ram[] =                                      
     "\n"                                                                                         //
     "Args:\n"                                                                                    //
     "  threads (int, optional): Threads to spawn; zero takes 7/8 of the cores the memory\n"      //
-    "    domains carry, leaving the rest to blocking callers and the engines' own background\n"  //
+    "    domains hold, leaving the rest to blocking callers and the engines' own background\n"   //
     "    work.\n"                                                                                //
     "  memory_domains (Sequence[int], optional): NUMA nodes the threads stay near and keep\n"    //
     "    their memory on; None derives every node the process may allocate on.\n"                //
@@ -2574,7 +2578,7 @@ static char const doc_Executor_for_vram[] =                                     
     "Returns:\n"                                                                                //
     "  Executor: The new executor.\n"                                                           //
     "Raises:\n"                                                                                 //
-    "  DeviceError: No device carries the ordinal, or its driver refuses a stream.";
+    "  DeviceError: No device holds the ordinal, or its driver refuses a stream.";
 
 static PyObject* Executor_for_vram(PyObject* type, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
                                    PyObject* keyword_names_tuple) {
@@ -2842,7 +2846,7 @@ static PyMemberDef Changes_members[] = {
     {"keys", Py_T_OBJECT_EX, offsetof(Changes, keys_object), Py_READONLY,
      "The Page of the key of every change, oldest change first."},
     {"values", Py_T_OBJECT_EX, offsetof(Changes, values_object), Py_READONLY,
-     "The Values of the bytes every change carries when the pull asked for them, or None."},
+     "The Values of the bytes every change holds when the pull asked for them, or None."},
     {"stamps", Py_T_OBJECT_EX, offsetof(Changes, stamps_object), Py_READONLY,
      "The stamp every change was committed at."},
     {"kinds", Py_T_OBJECT_EX, offsetof(Changes, kinds_object), Py_READONLY, "What every change did, as a ChangeKind."},
@@ -2919,7 +2923,7 @@ PyTypeObject DescriptionType = {
 /** One GPU this process can drive, as @c ustore_gpu_devices wrote it, and its place there. */
 typedef struct GPUDevice {
 
-    /** The object header every instance carries. */
+    /** The object header every instance holds. */
     PyObject ob_base;
 
     /** The ordinal <tt>Executor.for_vram()</tt> names the device by, its position in the listing. */

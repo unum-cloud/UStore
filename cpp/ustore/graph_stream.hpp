@@ -78,11 +78,12 @@ inline ustore_key_t const** edges_output_(outputs<edges_view_t>& written) noexce
 /**
  *  @brief Reads the degrees of @p vertices in @p roles into @p arena, and their edges too when
  *      @p answer_type_ asks.
- *  @param[in] collection Collection every vertex lives in, borrowed until the call is final.
- *  @param[in] vertices Vertices to read, borrowed until the call is final.
- *  @param[in] roles Role every vertex plays in the wanted edges, empty for any, borrowed until the
+ *  @param[in] collection Collection every vertex lives in, owned by the caller until the
  *      call is final.
- *  @param[in] arena Memory the answer lands in, borrowed until the call is final, which
+ *  @param[in] vertices Vertices to read, owned by the caller until the call is final.
+ *  @param[in] roles Role every vertex plays in the wanted edges, empty for any, viewed until the
+ *      call is final.
+ *  @param[in] arena Memory the answer lands in, owned by the caller until the call is final, which
  *      the answer views.
  *  @param[in] watch Whether a read inside a transaction records the vertices for conflicts.
  */
@@ -186,7 +187,7 @@ class graph_stream_t {
         return {};
     }
 
-    /** Advances like @c advance, but a failed fetch ends the stream since a reference carries no
+    /** Advances like @c advance, but a failed fetch ends the stream since a reference holds no
      *  status. */
     graph_stream_t& operator++() noexcept {
         if (advance().succeeded()) return *this;

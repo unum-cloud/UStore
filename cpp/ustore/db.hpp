@@ -105,7 +105,7 @@ inline expected<ustore_collection_id_t> collection_named(receiver_t const& recei
  *      another modality than @p modality.
  *
  *  @par Statuses:
- *  - @c status_code_t::not_found_k No collection carries @p name.
+ *  - @c status_code_t::not_found_k No collection holds @p name.
  *  - @c status_code_t::invalid_argument_k The collection holds another modality than @p modality.
  */
 inline expected<ustore_collection_id_t> collection_named(receiver_t const& receiver, std::string_view name,
@@ -126,7 +126,7 @@ inline expected<bool> collection_exists(receiver_t const& receiver, std::string_
 }
 
 /** Lists the collections at the head, or at the snapshot of @p receiver, with their identifiers in
- *  @p arena, borrowed until the call is final. */
+ *  @p arena, owned by the caller until the call is final. */
 template <ustore_completion_t completion_>
 answer<completion_, collections_list_t> collections_list_(receiver_t const& receiver, arena_t& arena) noexcept {
     return called_<completion_, collections_list_t>(
@@ -421,14 +421,15 @@ class snapshot_on {
 
 #pragma region Verbs
 
-    /** Lists the collections at the snapshot, with their identifiers in @p arena, borrowed until
+    /** Lists the collections at the snapshot, with their identifiers in @p arena, viewed until
      *  the call is final. */
     answer<completion_, collections_list_t> collections(arena_t& arena) const noexcept {
         return collections_list_<completion_>(receiver_, arena);
     }
 
-    /** Saves the snapshot as a new database at @p path, borrowed until the call is final, reporting
-     *  the bytes saved to @p progress, which may cancel the save and so remove what it wrote. */
+    /** Saves the snapshot as a new database at @p path, owned by the caller until the call is
+     *  final, reporting the bytes saved to @p progress, which may cancel the save and so remove
+     *  what it wrote. */
     answer<completion_, void> save(std::string_view path, progress_arg_t progress = {}) const noexcept {
         return called_<completion_, void>([&](ustore_outcome_t* outcome, outputs<void>*) noexcept {
             ustore_snapshot_save_t save {};
@@ -522,7 +523,7 @@ struct changes_t {
     /** What every change did, which @c ustore_change_kind_name spells. */
     std::span<ustore_change_kind_t const> kinds;
 
-    /** The bytes every change carries, empty for a removal, or none when the pull read none. */
+    /** The bytes every change holds, empty for a removal, or none when the pull read none. */
     sz::strings_view_t values {strings_of({}, 0)};
 };
 
@@ -616,8 +617,8 @@ class changes_cursor_t {
      *  commit. */
     expected<changes_t> next(std::size_t wanted, arena_t& arena) noexcept { return pull_(wanted, arena, nullptr); }
 
-    /** Pulls up to @p wanted next changes with the bytes every one carries into @p arena in one
-     *  call. */
+    /** Pulls up to @p wanted next changes with the bytes every one holds, copied
+     *  into @p arena in one call. */
     expected<changes_t> next_pairs(std::size_t wanted, arena_t& arena) noexcept {
         ustore_strings_view_t values {};
         return pull_(wanted, arena, &values);
@@ -634,8 +635,9 @@ class changes_cursor_t {
  *      rows of an unfinished one.
  *
  *  It joins no transaction and watches nothing, so a reader sees all of the ingest or none of it.
- *  Its calls run on the calling thread, one at a time, and copy their rows before returning, so
- *  every input may die after the call. It moves but never copies.
+ *  Its calls run one at a time, each blocking on the executor it names or on the calling thread
+ *  without one, and copy their rows before returning, so every input may die after the call. Its
+ *  state lives on the memory domain of the executor @c make names. It moves but never copies.
  */
 class ingest_t {
     ustore_ingest_t ingest_ = nullptr;
@@ -654,7 +656,8 @@ class ingest_t {
     operator ustore_ingest_t() const noexcept { return ingest_; }
 
     /**
-     *  @brief Opens an ingest into @p collection of @p database, whose rows arrive in @p order.
+     *  @brief Opens an ingest into @p collection of @p database on @p executor, whose rows arrive
+     *      in @p order.
      *
      *  @par Statuses:
      *  - @c status_code_t::read_only_k The database was opened read-only.
@@ -682,7 +685,7 @@ class ingest_t {
     /**
      *  @brief Hands the ingest one batch of @p values beside their @p keys, pairwise: the values
      *      of blobs, JSON documents and XML pages, or the strings of a strings collection beside
-     *      the keys they map onto.
+     *      the keys they map onto, parsed over the threads of @p executor.
      *
      *  @par Statuses:
      *  - @c status_code_t::invalid_argument_k The @p keys and @p values differ in count, the ingest
@@ -725,8 +728,8 @@ class ingest_t {
     }
 
     /**
-     *  @brief Lands every row appended as one commit and ends the ingest, whatever it answers,
-     *      answering the one stamp every row landed at.
+     *  @brief Lands every row appended as one commit on @p executor and ends the ingest, whatever
+     *      it answers, answering the one stamp every row landed at.
      *
      *  @par Statuses:
      *  - @c status_code_t::invalid_argument_k The ingest is finished.
@@ -829,7 +832,7 @@ class database_on {
      *      @p collection_type_, completing as this receiver does.
      *
      *  @par Statuses:
-     *  - @c status_code_t::not_found_k No collection carries @p name.
+     *  - @c status_code_t::not_found_k No collection holds @p name.
      *  - @c status_code_t::invalid_argument_k The collection holds another modality than
      *    @p collection_type_.
      */
@@ -866,14 +869,14 @@ class database_on {
             });
     }
 
-    /** Lists the collections at the head, with their identifiers in @p arena, borrowed until the
+    /** Lists the collections at the head, with their identifiers in @p arena, viewed until the
      *  call is final. */
     answer<completion_, collections_list_t> collections(arena_t& arena) const noexcept {
         return collections_list_<completion_>(receiver_, arena);
     }
 
-    /** Creates a collection holding the modality of @p collection_type_ under @p name, borrowed
-     *  until the call is final, which no other collection may carry, answering a handle completing
+    /** Creates a collection holding the modality of @p collection_type_ under @p name, viewed
+     *  until the call is final, which no other collection may hold, answering a handle completing
      *  as this receiver does. */
     template <typename collection_type_ = blobs_collection_t>
     answer<completion_, typename collection_type_::template completed_as<completion_>> create(
@@ -922,7 +925,7 @@ class database_on {
      *  @brief Reclaims the space overwritten and removed data still takes, through its flush,
      *      merge and reclaim phases, reporting its advance to @p progress, which may cancel
      *      it between units.
-     *  @param[in] progress Hears every unit, and may cancel the call there, borrowed until the
+     *  @param[in] progress Hears every unit, and may cancel the call there, viewed until the
      *      call is final.
      *  @param[in,out] plan The plan a cancel leaves live, opened by the first call naming it and
      *      continued by every later one, which writes where it stopped; @c nullptr runs the
@@ -1025,7 +1028,7 @@ class database_on {
         return find_or_create(name);
     }
 
-    /** The collection named @p name, created when no collection carries the name. */
+    /** The collection named @p name, created when no collection holds the name. */
     template <typename collection_type_ = blobs_collection_t>
     expected<typename collection_type_::template completed_as<completion_>> find_or_create(
         std::string_view name) const noexcept
@@ -1160,7 +1163,7 @@ class database_t {
     }
 
     /** Serves the directories @p options name through the NVMe engine on the calling thread,
-     *  lending it the executor they name until close. */
+     *  using the executor they name until close. */
     static expected<database_t> open_nvme(ustore_database_open_nvme_t options) noexcept {
         return open_(ustore_database_open_nvme, options, options.executor);
     }

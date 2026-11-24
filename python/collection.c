@@ -21,7 +21,7 @@
 /** A collection a receiver names, resolved by every verb and created by its first write. */
 typedef struct Collection {
 
-    /** The object header every instance carries. */
+    /** The object header every instance holds. */
     PyObject ob_base;
 
     /** The receiver indexed, which every verb runs through and which this keeps alive. */
@@ -34,7 +34,7 @@ typedef struct Collection {
 /** One of the mapping views a collection answers, which all share this shape. */
 typedef struct CollectionView {
 
-    /** The object header every instance carries. */
+    /** The object header every instance holds. */
     PyObject ob_base;
 
     /** The collection the view reads and writes. */
@@ -53,7 +53,7 @@ static char const* modality_noun(ustore_modality_t modality) {
     }
 }
 
-/** What resolving a name does when no collection carries it. */
+/** What resolving a name does when no collection holds it. */
 typedef enum collection_missing_t {
 
     /** Raise @c NotFoundError, as every read does. */
@@ -295,7 +295,7 @@ static char const doc_Collection_sample[] =                                     
     "Returns:\n"                                                                                //
     "  dict[UUID, bytes | None]: Every key drawn, in the order drawn, onto its value.\n"        //
     "Raises:\n"                                                                                 //
-    "  NotFoundError: No collection carries the name.";
+    "  NotFoundError: No collection holds the name.";
 
 static PyObject* Collection_sample(Collection* self, PyObject* wanted_object) {
     size_t wanted = 0;
@@ -313,7 +313,8 @@ static PyObject* Collection_sample(Collection* self, PyObject* wanted_object) {
     PyObject* const drawn = drawing ? ustore_py_keys_sample(&context, &options, held, wanted, drawing) : NULL;
     Py_XDECREF(drawing);
     if (!drawn) return NULL;
-    // The tape of the draw exports as 16-byte keys, which the read borrows in place from the other arena
+    // The tape of the draw exports as 16-byte keys, which the read views in place from
+    // the other arena
     int const documents = held == ustore_modality_docs_k;
     ustore_py_verb_t const* const verb = documents ? &ustore_py_docs_read_drawn_verb : &ustore_py_read_drawn_verb;
     ustore_py_read_call_t call;
@@ -380,7 +381,7 @@ static char const doc_Collection[] =                                            
     "A collection a receiver addresses by name, as `db['movies']` or `snapshot['movies']`.\n"  //
     "\n"                                                                                       //
     "The name resolves on every call, at the snapshot of a snapshot and at the head\n"         //
-    "otherwise, raising NotFoundError on a read when no collection carries it. A write\n"      //
+    "otherwise, raising NotFoundError on a read when no collection holds it. A write\n"        //
     "through `blobs` or `docs`, or an access of `graph` or `table`, creates a missing\n"       //
     "collection at the head to hold that modality, so a transaction never conflicts with a\n"  //
     "collection made for it. A view of another modality raises InvalidArgumentError.\n"        //
@@ -541,7 +542,7 @@ static int BlobsView_ass_subscript(CollectionView* self, PyObject* key, PyObject
     int gathered = one < 0 ? -1 : 0;
     if (one > 0) {
         gathered = ustore_py_contents_reserve(&call.contents, 1, ustore_py_contents_per_task_k);
-        if (gathered == 0) gathered = ustore_py_contents_borrow(value, &call.contents);
+        if (gathered == 0) gathered = ustore_py_contents_view(value, &call.contents);
     }
     else if (one == 0) { gathered = ustore_py_contents_from_object(value, call.keys.count, &call.contents); }
 

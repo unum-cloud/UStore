@@ -16,7 +16,7 @@
  *
  *  @section python_receivers Receivers and Deferred Calls
  *
- *  A receiver carries what every argument struct puts before its inputs: the view, the executor and
+ *  A receiver holds what every argument struct puts before its inputs: the view, the executor and
  *  the completion. A @c Database, @c Transaction and @c Snapshot run their calls on the calling
  *  thread, an @c On runs them blocking on an executor, and a @c DeferredOn submits them and answers
  *  a @c Deferred at once. Constructors address no database yet, so they take an @c executor keyword
@@ -24,7 +24,7 @@
  *  across threads freely. A verb gathers its call, fills the C argument struct on its own stack and
  *  submits it, which copies the struct, so the call keeps only the outcome, the inputs it owns, the
  *  output slots and its arena: on the stack when it blocks, and inside its @c Deferred otherwise,
- *  which gathers the keys and the borrowed buffers in place, because a batch's inline storage points
+ *  which gathers the keys and the viewed buffers in place, because a batch's inline storage points
  *  into itself.
  *
  *  The binding starts no threads, keeps no queues and counts no deferred calls: the C executor owns
@@ -62,7 +62,7 @@
  *
  *  Every ragged input reaches the ABI as one @c ustore_strings_view_t. An Arrow array of binary or
  *  text, or a `(data, offsets)` pair of buffers, passes as the u32 or u64 tape it already is. Every
- *  other batch is borrowed value by value into an array of @c ustore_bytes_view_t inside the call,
+ *  other batch is viewed value by value into an array of @c ustore_bytes_view_t inside the call,
  *  which an accessor reads on the executor's thread: it reads only those views, pinned when the
  *  call was gathered, never a Python container the caller may change meanwhile. Ragged outputs are
  *  tapes of either offset width, which results read through @c ustore_py_tape_string.
@@ -90,8 +90,9 @@
 #ifndef UNUM_USTORE_PYTHON_LIB_H
 #define UNUM_USTORE_PYTHON_LIB_H
 
-/*  CPython defines preprocessor macros that reach into the standard headers, so it leads rather
- *  than joining the group below, and it carries `<string.h>` for the byte moves every unit makes. */
+/** CPython defines preprocessor macros that reach into the standard headers, so it leads rather
+ *  than joining the group below, and it holds the standard string header for the byte moves
+ *  every unit makes. */
 #define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
@@ -117,7 +118,7 @@ enum {
     /** Keys one batch lays out on the stack before it reaches for the heap. */
     ustore_py_keys_inline_k = 64,
 
-    /** Values one batch borrows on the stack before it reaches for the heap. */
+    /** Values one batch views on the stack before it reaches for the heap. */
     ustore_py_contents_inline_k = 16,
 };
 
@@ -162,7 +163,7 @@ extern PyTypeObject CompactPlanType;
 /** A compaction in flight, continued by every compact naming it until its finish frees it. */
 typedef struct CompactPlan {
 
-    /** The object header every instance carries. */
+    /** The object header every instance holds. */
     PyObject ob_base;
 
     /** The plan, NULL until a call opens it and once its finish took it. */
@@ -181,7 +182,7 @@ extern PyTypeObject GPUDeviceType;
 /** What an engine supports, as a database and its description report it. */
 typedef struct Capabilities {
 
-    /** The object header every instance carries. */
+    /** The object header every instance holds. */
     PyObject ob_base;
 
     /** The flags the engine reports. */
@@ -192,7 +193,7 @@ typedef struct Capabilities {
  *  bounds copied out of them once it succeeded, before the arena serves another call. */
 typedef struct Measurement {
 
-    /** The object header every instance carries. */
+    /** The object header every instance holds. */
     PyObject ob_base;
 
     /** Output slots for the six bounds inside the arena, in the order of @c bounds. */
@@ -205,7 +206,7 @@ typedef struct Measurement {
 /** The changes one feed pull answers: the slots the call writes, and the objects over them. */
 typedef struct Changes {
 
-    /** The object header every instance carries. */
+    /** The object header every instance holds. */
     PyObject ob_base;
 
     /** Output slot for the changes the pull yielded. */
@@ -234,7 +235,7 @@ typedef struct Changes {
 /** What an open database reports about itself, as @c ustore_database_describe writes it. */
 typedef struct Description {
 
-    /** The object header every instance carries. */
+    /** The object header every instance holds. */
     PyObject ob_base;
 
     /** The description the call fills whole. */
@@ -325,7 +326,7 @@ PyObject* ustore_py_enum_to_object(ustore_py_enum_t kind, int value);
 /** An open database and the capabilities its engine reports. */
 typedef struct Database {
 
-    /** The object header every instance carries. */
+    /** The object header every instance holds. */
     PyObject ob_base;
 
     /** The open database, or NULL once it has been closed. */
@@ -338,7 +339,7 @@ typedef struct Database {
 /** An optimistic transaction grouping operations across collections and modalities. */
 typedef struct Transaction {
 
-    /** The object header every instance carries. */
+    /** The object header every instance holds. */
     PyObject ob_base;
 
     /** The open transaction, or NULL once it has been closed. */
@@ -357,7 +358,7 @@ typedef struct Transaction {
 /** A point-in-time state of the whole database, whose read verbs see what it pinned. */
 typedef struct Snapshot {
 
-    /** The object header every instance carries. */
+    /** The object header every instance holds. */
     PyObject ob_base;
 
     /** The pinned view, or NULL once it has been closed. */
@@ -376,7 +377,7 @@ typedef struct Snapshot {
 /** The threads that run calls, which the C executor owns. */
 typedef struct Executor {
 
-    /** The object header every instance carries. */
+    /** The object header every instance holds. */
     PyObject ob_base;
 
     /** The executor, or NULL once it has been closed. */
@@ -390,7 +391,7 @@ typedef struct Executor {
  */
 typedef struct Arena {
 
-    /** The object header every instance carries. */
+    /** The object header every instance holds. */
     PyObject ob_base;
 
     /** The arena, freed once the object dies, which waits in C for the deferred calls naming it. */
@@ -400,7 +401,7 @@ typedef struct Arena {
 /** What a call addresses and how it runs, fixed per receiver: the header of every argument struct. */
 typedef struct On {
 
-    /** The object header every instance carries. */
+    /** The object header every instance holds. */
     PyObject ob_base;
 
     /** The @c Database, @c Transaction or @c Snapshot the calls address, held. */
@@ -420,7 +421,7 @@ typedef struct ustore_py_context_t {
     ustore_database_t database_handle;
 
     /** The @c Database, @c Transaction or @c Snapshot the verb addresses, or the @c Database class an open builds,
-     *  borrowed. */
+     *  viewed. */
     PyObject* origin;
 
     /** The transaction the verb joins, or NULL. */
@@ -435,7 +436,7 @@ typedef struct ustore_py_context_t {
     /** What a read sees: the head, the transaction under @c watch, or the snapshot. */
     ustore_view_t view;
 
-    /** The executor running the call, borrowed, or NULL for the calling thread. */
+    /** The executor running the call, viewed, or NULL for the calling thread. */
     Executor* executor;
 
     /** Whether the call answers once final or once submitted. */
@@ -489,10 +490,10 @@ typedef struct ustore_py_verb_t {
 } ustore_py_verb_t;
 
 /** A deferred call owning everything the library touches until it finishes, the object being the allocation, so
- *  nothing it lends ever moves. */
+ *  nothing it points into ever moves. */
 typedef struct Deferred {
 
-    /** The object header every instance carries, sized in bytes of the verb's call. */
+    /** The object header every instance holds, sized in bytes of the verb's call. */
     PyVarObject ob_base;
 
     /** How the call answers and lets go. */
@@ -536,8 +537,8 @@ typedef struct ustore_py_keys_t {
     /** The buffer backing @c keys when the caller exported one. */
     Py_buffer buffer;
 
-    /** Whether a buffer was borrowed and must be released. */
-    int borrowed;
+    /** Whether a buffer was viewed and must be released. */
+    int viewed;
 
     /** The DLPack capsule whose tensor backs @c keys when the caller exported one, or NULL. */
     PyObject* dlpack;
@@ -546,7 +547,7 @@ typedef struct ustore_py_keys_t {
     ustore_key_t inline_keys[ustore_py_keys_inline_k];
 } ustore_py_keys_t;
 
-/** Whether one value repeats for every task, or every task carries its own. */
+/** Whether one value repeats for every task, or every task holds its own. */
 typedef enum ustore_py_contents_spread_t {
 
     /** One value per task. */
@@ -557,27 +558,29 @@ typedef enum ustore_py_contents_spread_t {
 } ustore_py_contents_spread_t;
 
 /**
- *  @brief The values one write batch hands the ABI as one strings view, every byte borrowed until the call finishes.
+ *  @brief The values one write batch hands the ABI as one strings view, every byte owned by the
+ *      caller until the call finishes.
  *
- *  A tape passes as it is. Any other batch is borrowed value by value into @c views, which an accessor reads, and its
- *  buffers stay exported for the whole call. A value is never @c None, since removals take a verb of their own.
+ *  A tape passes as it is. Any other batch is viewed value by value into @c views, which an
+ *  accessor reads, and its buffers stay exported for the whole call. A value is never @c None,
+ *  since removals take a verb of their own.
  */
 typedef struct ustore_py_contents_t {
 
     /** The values as the call passes them: the caller's tape, or an accessor over @c views. */
     ustore_strings_view_t view;
 
-    /** The view of every borrowed value, or of the one value every task repeats. */
+    /** The view of every viewed value, or of the one value every task repeats. */
     ustore_bytes_view_t* views;
 
-    /** One exported buffer per borrowed value, or the bytes and the offsets of a pair of buffers. */
+    /** One exported buffer per viewed value, or the bytes and the offsets of a pair of buffers. */
     Py_buffer* buffers;
 
     /** Values the batch holds, one when it broadcasts. */
     size_t count;
 
     /** Buffers already exported, so a failure releases exactly those. */
-    size_t borrowed;
+    size_t viewed;
 
     /** Whether the values repeat for every task or stand one per task. */
     ustore_py_contents_spread_t spread;
@@ -600,7 +603,7 @@ typedef struct ustore_py_contents_t {
  *
  *  A tape passes as it is. A string travels as the UTF-8 bytes it caches, so the batch holds the one text or a tuple of
  *  every text until the call finishes, which no concurrent change to the caller's list can release, and a bytes-like
- *  object is borrowed as it is.
+ *  object is viewed as it is.
  */
 typedef struct ustore_py_texts_t {
 
@@ -628,7 +631,7 @@ typedef int (*ustore_py_text_serializer_t)(PyObject* object, void* state);
  */
 typedef struct Values {
 
-    /** The object header every instance carries. */
+    /** The object header every instance holds. */
     PyObject ob_base;
 
     /** The @c Arena the outputs live in, kept alive so they outlive every other name for them. */
@@ -640,7 +643,7 @@ typedef struct Values {
     /** The values as the read wrote them, a tape of 32-bit or 64-bit offsets, zeroed for a read of no tasks. */
     ustore_strings_view_t tape;
 
-    /** Tasks the read carried. */
+    /** Tasks the read held. */
     size_t count;
 } Values;
 
@@ -652,7 +655,7 @@ typedef struct Values {
  */
 typedef struct Keys {
 
-    /** The object header every instance carries. */
+    /** The object header every instance holds. */
     PyObject ob_base;
 
     /** The @c Arena the outputs live in, kept alive so they outlive every other name for them. */
@@ -664,10 +667,10 @@ typedef struct Keys {
     /** The keys every task found, laid end to end. */
     ustore_key_t const* tape;
 
-    /** One BM25 score per key when the scan's patterns carried weights, or NULL. */
+    /** One BM25 score per key when the scan's patterns held weights, or NULL. */
     float const* scores;
 
-    /** Tasks the scan or sample carried. */
+    /** Tasks the scan or sample held. */
     size_t count;
 
     /** The shape the whole tape exports: keys, then the sixteen bytes of each. */
@@ -685,7 +688,7 @@ typedef struct Keys {
  */
 typedef struct Columns {
 
-    /** The object header every instance carries, sized in fields of trailing storage. */
+    /** The object header every instance holds, sized in fields of trailing storage. */
     PyVarObject ob_base;
 
     /** The @c Arena the columns live in, kept alive so they outlive every other name for them. */
@@ -694,10 +697,10 @@ typedef struct Columns {
     /** One view per field, inside the arena, or NULL for a gather of no fields. */
     ustore_docs_column_view_t const* columns;
 
-    /** Fields the gather carried, the columns of the result. */
+    /** Fields the gather held, the columns of the result. */
     size_t fields_count;
 
-    /** Documents the gather carried, the rows of every column. */
+    /** Documents the gather held, the rows of every column. */
     size_t docs_count;
 
     /** A tuple of the field names the gather read, which name the children of an Arrow export. */
@@ -716,7 +719,7 @@ typedef struct Columns {
  */
 typedef struct Neighborhoods {
 
-    /** The object header every instance carries. */
+    /** The object header every instance holds. */
     PyObject ob_base;
 
     /** The @c Arena the tape, the offsets and the degrees live in, kept alive so they outlive every other name for
@@ -732,7 +735,7 @@ typedef struct Neighborhoods {
     /** The degree of every vertex, or @c ustore_vertex_degree_missing_k where it is absent. */
     ustore_vertex_degree_t const* degrees;
 
-    /** Vertices the lookup carried. */
+    /** Vertices the lookup held. */
     size_t count;
 
     /** The shape the whole tape exports: edges, the three keys of each, and the sixteen bytes of a key. */
@@ -745,13 +748,13 @@ typedef struct Neighborhoods {
 /**
  *  @brief A read-only window into an arena, which a @c memoryview is built over.
  *
- *  A view of one task carries its own shape and format while keeping the arena alive, so no slice
+ *  A view of one task holds its own shape and format while keeping the arena alive, so no slice
  *  or cast is needed and an empty run still exports its shape. Each buffer it exports stays valid
  *  until the next call naming the arena rewinds it.
  */
 typedef struct Span {
 
-    /** The object header every instance carries. */
+    /** The object header every instance holds. */
     PyObject ob_base;
 
     /** The @c Arena the window lies in, kept alive for as long as this window is. */
@@ -870,7 +873,7 @@ int ustore_py_verb_option_from_keyword(ustore_py_context_t const* context, PyObj
  *  @brief Walks the keywords of a verb that takes none of its own.
  *  @param[in] context The database and view the verb runs against.
  *  @param[in] arguments The fast-call arguments, positional ones first.
- *  @param[in] positional_arguments_count Positional arguments the call carried.
+ *  @param[in] positional_arguments_count Positional arguments the call held.
  *  @param[in] keyword_names_tuple The keyword names, or NULL when none followed.
  *  @param[out] options Where every recognized keyword lands.
  *  @return 0 on success, -1 with an exception set otherwise.
@@ -880,10 +883,10 @@ int ustore_py_verb_options_from_keywords(ustore_py_context_t const* context, PyO
                                          ustore_py_verb_options_t* options);
 
 /**
- *  @brief Walks a verb's keywords, reading shared ones and borrowing those its own @p names lists.
+ *  @brief Walks a verb's keywords, reading shared ones and viewing those its own @p names lists.
  *  @param[in] names The keywords of the verb's own, ended by NULL.
  *  @param[out] options Where every shared keyword lands.
- *  @param[out] values One borrowed value per name, NULL where it is missing or None.
+ *  @param[out] values One viewed value per name, NULL where it is missing or None.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
 int ustore_py_verb_keywords_from_arguments(ustore_py_context_t const* context, PyObject* const* arguments,
@@ -947,9 +950,10 @@ void ustore_py_call_release(ustore_py_call_t* call);
 PyObject* ustore_py_call_answer_none(void* call);
 
 /**
- *  @brief Reads the `progress` keyword of a verb, borrowing the callable for the call to hold once it opens.
+ *  @brief Reads the @c progress keyword of a verb, viewing the callable for the call to hold
+ *      once it opens.
  *  @param[in] object A callable taking the units finished and the units in all, or None.
- *  @param[out] progress The callable, borrowed, or NULL for None.
+ *  @param[out] progress The callable, viewed, or NULL for None.
  *  @return 0 on success, -1 with a @c TypeError set when @p object is neither callable nor None.
  */
 int ustore_py_progress_from_object(PyObject* object, PyObject** progress);
@@ -1053,12 +1057,12 @@ ustore_bytes_view_t ustore_py_tape_string(ustore_strings_view_t const* tape, siz
 ustore_size_t ustore_py_tape_bytes(ustore_strings_view_t const* tape, size_t count);
 
 /**
- *  @brief Borrows the bytes of one value into the next view of @p batch.
+ *  @brief Views the bytes of one value into the next view of @p batch.
  *  @param[in] object The value, as anything exporting a buffer.
- *  @param[out] batch The batch the borrowed value joins.
+ *  @param[out] batch The batch the viewed value joins.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
-int ustore_py_contents_borrow(PyObject* object, ustore_py_contents_t* batch);
+int ustore_py_contents_view(PyObject* object, ustore_py_contents_t* batch);
 
 /**
  *  @brief Sizes @p batch for @p count values, laying their views inline or in one heap block, and points its strings
@@ -1080,7 +1084,7 @@ int ustore_py_contents_reserve(ustore_py_contents_t* batch, size_t count, ustore
 int ustore_py_contents_from_tape(PyObject* object, ustore_py_contents_t* batch);
 
 /**
- *  @brief Releases every buffer @p batch borrowed, the block they shared and the tape it held.
+ *  @brief Releases every buffer @p batch viewed, the block they shared and the tape it held.
  *  @param[in,out] batch The batch to release.
  */
 void ustore_py_contents_release(ustore_py_contents_t* batch);
@@ -1164,11 +1168,11 @@ int ustore_py_size_from_object(PyObject* object, char const* field, size_t* valu
 /**
  *  @brief Reads the one optional argument of a verb, given after its required ones by position or as @p keyword.
  *  @param[in] verb The method's name, as a failure should read it.
- *  @param[in] positional_arguments_count Positional arguments the call carried.
+ *  @param[in] positional_arguments_count Positional arguments the call held.
  *  @param[in] keyword_names_tuple The keyword names, or NULL when none followed.
  *  @param[in] required_positional Positional arguments the verb fixes before the optional one.
  *  @param[in] keyword The name the optional argument goes by.
- *  @param[out] argument The argument, left untouched when the call carried none.
+ *  @param[out] argument The argument, left untouched when the call held none.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
 int ustore_py_optional_argument(char const* verb, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
@@ -1178,7 +1182,7 @@ int ustore_py_optional_argument(char const* verb, PyObject* const* arguments, Py
 /**
  *  @brief Checks a fast-call's shape and reports how many keywords followed.
  *  @param[in] verb The method's name, as a failure should read it.
- *  @param[in] positional_arguments_count Positional arguments the call carried.
+ *  @param[in] positional_arguments_count Positional arguments the call held.
  *  @param[in] keyword_names_tuple The keyword names, or NULL when none followed.
  *  @param[in] required_positional Positional arguments the verb fixes.
  *  @return The keyword count, or -1 with an exception set when the shape is wrong.
@@ -1196,7 +1200,7 @@ typedef enum ustore_py_naming_t {
     /** The name addresses the collection written to @c collection. */
     ustore_py_naming_found_k = 0,
 
-    /** No collection carries the name. */
+    /** No collection holds the name. */
     ustore_py_naming_missing_k = 1,
 
     /** The lookup failed and an exception is set. */
@@ -1324,7 +1328,7 @@ void ustore_py_read_release(void* call);
  *  @brief Reads the keys gathered into @p call: the core of `read`, of `Collection.blobs[key]` and of
  *      `Collection.sample`.
  *  @param[in] context The receiver the read runs through.
- *  @param[in] options The collection and knobs the read carries.
+ *  @param[in] options The collection and knobs the read holds.
  *  @param[in] verb How the read answers, the verb @p call was opened with.
  *  @param[in,out] call What @c ustore_py_call_open answered, its keys gathered and its subscript set for one key.
  *  @param[in] arena The @c Arena the outputs land in, held here.
@@ -1351,8 +1355,8 @@ PyObject* ustore_py_document_contains(ustore_py_context_t const* context, ustore
 /**
  *  @brief Gathers the values of a batch write, broadcasting one value to every key.
  *  @param[in] object The values: a sequence, or one buffer to broadcast.
- *  @param[in] count Keys the batch carries.
- *  @param[out] batch The borrowed runs the ABI reads, and the layout they travel with.
+ *  @param[in] count Keys the batch holds.
+ *  @param[out] batch The viewed runs the ABI reads, and the layout they travel with.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
 int ustore_py_contents_from_object(PyObject* object, size_t count, ustore_py_contents_t* batch);
@@ -1366,7 +1370,7 @@ typedef struct ustore_py_write_call_t {
     /** The keys to write. */
     ustore_py_keys_t keys;
 
-    /** The borrowed values, one per key or one for every key. */
+    /** The viewed values, one per key or one for every key. */
     ustore_py_contents_t contents;
 } ustore_py_write_call_t;
 
@@ -1418,7 +1422,7 @@ PyObject* ustore_py_values_remove(ustore_py_context_t const* context, ustore_py_
  *  @brief Lists up to @p wanted keys from @p start upwards through the scan of @p modality: the core of `scan`,
  *      `docs_scan`, `graph_scan_vertices` and of `Collection.scan`.
  *  @param[in] mode In what order the keys come.
- *  @param[in] progress The callable the scan reports to, borrowed, or NULL for none.
+ *  @param[in] progress The callable the scan reports to, viewed, or NULL for none.
  *  @param[in] arena The @c Arena the keys land in, held here.
  *  @return A new @c Keys of one task, or its @c Deferred, or NULL with an exception set.
  */

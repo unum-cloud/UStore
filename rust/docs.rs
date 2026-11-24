@@ -1,9 +1,9 @@
 //! JSON documents - the Rust twin of `c/ustore/docs.h`.
 //!
-//! The ABI carries documents as JSON text both ways and parses them inside the engine, so nothing here
-//! parses JSON. A field is a top-level key or an RFC 6901 pointer, which crosses as the bytes of a `&str`
-//! with no terminator, so a `"/user/name"` literal crosses as it stands, and an empty field addresses the
-//! whole document.
+//! The ABI holds documents as JSON text both ways and parses them inside the engine, so nothing
+//! here parses JSON. A field is a top-level key or an RFC 6901 pointer, which crosses as the bytes
+//! of a `&str` with no terminator, so a `"/user/name"` literal crosses as it stands, and an empty
+//! field addresses the whole document.
 //!
 //! ```no_run
 //! use ustore::{Arena, Column, RAMOptions, Database, DocumentEntry, Durability, FieldAddress, FieldEntry};
@@ -37,7 +37,7 @@
 //! let fields = [FieldEntry::<i64>::new(ada, "age", &36), FieldEntry::<Json>::new(ada, "name", "\"Ada\"")];
 //! ```
 //!
-//! A batch of whole documents carries one format too, so the same mixture is refused there:
+//! A batch of whole documents holds one format too, so the same mixture is refused there:
 //!
 //! ```compile_fail
 //! use ustore::{DocumentEntry, Json, Key};
@@ -46,7 +46,7 @@
 //! let documents = [DocumentEntry::<Json>::new(ada, "{}"), DocumentEntry::<i64>::new(born, &1815)];
 //! ```
 //!
-//! Neither [`Half`] nor [`UUID`] is a format a write carries, so a document written as one does not
+//! Neither [`Half`] nor [`UUID`] is a format a write holds, so a document written as one does not
 //! compile either, however it reads back in a gathered column:
 //!
 //! ```compile_fail
@@ -350,8 +350,8 @@ pub(crate) mod sealed {
         const TYPE: c_int;
     }
 
-    /// What one docs write carries: whole documents under their keys, documents keyed by a field of their own, or
-    /// values written into fields, each borrowed or owned.
+    /// What one docs write holds: whole documents under their keys, documents keyed by a field of
+    /// their own, or values written into fields, each borrowed or owned.
     pub trait Writes {
         /// The tasks of the batch, pointing into `self`, or `None` for no documents.
         fn tasks(&self) -> Result<Option<WriteTasks>>;
@@ -386,7 +386,7 @@ use sealed::{Addresses, Format, ReadTasks, WriteTasks, Writes};
 /// A fixed-width value a gathered column converts into.
 pub trait Scalar: Format + Copy {}
 
-/// A scalar a write carries into a whole document or into one of its fields.
+/// A scalar a write puts into a whole document or into one of its fields.
 ///
 /// [`Half`] and [`UUID`] are gathered but never written: the engine builds a document from the bytes
 /// of a scalar and has no JSON spelling for either.
@@ -489,7 +489,7 @@ impl WritableScalar for u16 {}
 impl WritableScalar for u8 {}
 impl WritableScalar for bool {}
 
-/// The format of the values one field write carries, which the whole batch shares.
+/// The format of the values one field write holds, which the whole batch shares.
 pub trait FieldFormat: Format {
     /// What a field of this format is written from.
     type Value: ?Sized;
@@ -548,9 +548,9 @@ pub enum Modification {
     Update = 1,
     /// Creates the document or the field, which must not exist.
     Insert = 2,
-    /// Applies the carried RFC 6902 patch.
+    /// Applies the held RFC 6902 patch.
     Patch = 3,
-    /// Applies the carried RFC 7386 merge patch.
+    /// Applies the held RFC 7386 merge patch.
     Merge = 4,
 }
 
@@ -696,8 +696,8 @@ impl<'value, Format: FieldFormat> DocumentEntry<'value, Format> {
     }
 }
 
-/// A document carrying its own key under an id field, which [`KeyedBy`] names, laid out so a slice of them crosses
-/// through an accessor.
+/// A document holding its own key under an id field, which [`KeyedBy`] names, laid out so a slice
+/// of them crosses through an accessor.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Document<'text> {
@@ -712,9 +712,9 @@ impl<'text> Document<'text> {
     }
 }
 
-/// Documents carrying their keys under one field of their own, as a docs write takes them: borrowed [`Document`]
-/// values, or an owned `stringtape::CharsTape` of JSON texts, which a deferred write needs beside an owned or
-/// `'static` field.
+/// Documents holding their keys under one field of their own, as a docs write takes them: borrowed
+/// [`Document`] values, or an owned `stringtape::CharsTape` of JSON texts, which a deferred write
+/// needs beside an owned or `'static` field.
 #[derive(Clone, Debug)]
 pub struct KeyedBy<Field, Texts>(
     /// The field holding the key of every document, such as "_id": a non-negative integer, spelled as
@@ -1015,7 +1015,8 @@ impl<Requested> From<Requested> for DocsGatherConfig<Requested> {
     }
 }
 
-/// What admits the keys a cursor hands out; see [`On::docs_cursor`].
+/// What admits the rows a cursor hands out, and the columns it gathers from each; see
+/// [`On::docs_cursor`].
 #[derive(Debug, Default)]
 pub struct DocsCursorConfig<'config> {
     /// Admits only the documents its filter and predicate approve; every document by default.
@@ -1230,7 +1231,7 @@ impl<'arena, 'field, Requested: AsRef<[Column<'field>]>> Columns<'arena, Request
         Ok(unsafe { exported_slice(view.scalars.cast::<Value>(), self.rows) })
     }
 
-    /// The values of a column gathered as [`Text`] or [`Binary`].
+    /// The values of a column gathered as [`Text`], [`Binary`] or [`Json`].
     pub fn strings(&self, column: usize) -> Result<StringColumn<'arena>> {
         let terminator = match self.requested_format(column)? {
             Text::TYPE => 1,
@@ -1337,7 +1338,7 @@ impl<Parent: Writable, Completion: crate::db::sealed::Completion> On<'_, Parent,
     /// The batch is one of:
     /// - borrowed [`DocumentEntry`] values of one format, which is [`Json`] for the text the engine parses and a
     ///   [`WritableScalar`] or [`Text`] for a document that is one scalar;
-    /// - [`KeyedBy`] documents, carrying their keys under a field of their own;
+    /// - [`KeyedBy`] documents, holding their keys under a field of their own;
     /// - borrowed [`FieldEntry`] values of one format, writing into fields of existing documents;
     /// - the owned forms a deferred write needs: keys beside a `stringtape::CharsTape` of JSON texts, keys and a tape
     ///   of paths beside a tape of JSON values, or a tape of JSON texts keyed by a field.
@@ -2128,7 +2129,7 @@ mod tests {
     }
 
     #[test]
-    fn documents_carry_their_keys_under_an_id_field() {
+    fn documents_hold_their_keys_under_an_id_field() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let docs = created(&database, Modality::Docs);
         let mut arena = Arena::new().unwrap();
@@ -2650,8 +2651,9 @@ mod tests {
 
 // region: Cursors
 
-/// A walk over the keys of one documents collection, which every pull resumes past the last key the pull before it handed out, as a
-/// [`crate::Cursor`] walks blobs, keeping the keys its [`Matching`] admits.
+/// A walk over one documents collection, which every pull resumes past the last key the pull before
+/// it handed out, as a [`crate::Cursor`] walks blobs, keeping the rows its [`Matching`] admits and
+/// gathering its columns from each.
 ///
 /// Mirrors `ustore_docs_cursor_t`; dropping it calls `ustore_docs_cursor_free`.
 #[derive(Debug)]
@@ -2665,8 +2667,8 @@ pub struct DocsCursor<'view> {
 }
 
 impl<'view, Parent> On<'view, Parent> {
-    /// Opens a walk over the keys of one documents collection's `range`, compiling what `matching`
-    /// names once, whose predicate lives as long as the cursor.
+    /// Opens a walk over one documents collection's `range`, compiling what `config` matches and
+    /// gathers once, whose predicate lives as long as the cursor.
     ///
     /// Calls `ustore_docs_cursor_init`.
     pub fn docs_cursor(

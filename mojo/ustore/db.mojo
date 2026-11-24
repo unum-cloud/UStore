@@ -49,7 +49,7 @@ from ustore.types import (
     Verb,
     _address_of,
     _anchor,
-    _borrowed,
+    _viewed,
     _bit,
     _block,
     _created,
@@ -195,11 +195,11 @@ struct StridedArguments(Defaultable, ImplicitlyCopyable, TrivialRegisterPassable
 
 @fieldwise_init
 struct StridedView[T: Copyable, origin: ImmOrigin = ImmUntrackedOrigin](ImplicitlyCopyable, Sized):
-    """A borrowed strided run of fixed-width elements, one per task, where a zero stride repeats the first.
+    """A viewed strided run of fixed-width elements, one per task, where a zero stride repeats the first.
 
     Parameters:
         T: The element, laid out as the ABI declares it.
-        origin: The borrowed elements, which the view keeps alive for as long as it is used.
+        origin: The viewed elements, which the view keeps alive for as long as it is used.
     """
 
     var data: Optional[Pointer[Self.T, Self.origin]]
@@ -223,18 +223,18 @@ struct StridedView[T: Copyable, origin: ImmOrigin = ImmUntrackedOrigin](Implicit
 
     @staticmethod
     def of[items_origin: ImmOrigin, //](items: Span[Self.T, items_origin]) -> StridedView[Self.T, items_origin]:
-        """Borrows elements packed one after another."""
+        """Views elements packed one after another."""
         return StridedView[Self.T, items_origin](
-            _borrowed[Self.T, items_origin](Int(items.unsafe_ptr())), size_of[Self.T](), len(items)
+            _viewed[Self.T, items_origin](Int(items.unsafe_ptr())), size_of[Self.T](), len(items)
         )
 
     @staticmethod
     def repeating[item_origin: ImmOrigin, //](ref[item_origin] item: Self.T) -> StridedView[Self.T, item_origin]:
-        """Borrows one element, repeated for every task."""
-        return StridedView[Self.T, item_origin](_borrowed[Self.T, item_origin](Int(Pointer(to=item))), 0, 1)
+        """Views one element, repeated for every task."""
+        return StridedView[Self.T, item_origin](_viewed[Self.T, item_origin](Int(Pointer(to=item))), 0, 1)
 
     def arguments(self) -> StridedArguments:
-        """The C layout, erased only inside a verb so the borrow lives through the call."""
+        """The C layout, erased only inside a verb so the view lives through the call."""
         return StridedArguments(_address_of(self.data), c_size_t(self.stride))
 
 
@@ -364,7 +364,7 @@ struct Modality(Equatable, ImplicitlyCopyable, TrivialRegisterPassable):
     var code: c_int
     """The raw `ustore_modality_t` value the ABI exchanges."""
     comptime NONE = Self(0)
-    """No modality, as a name no collection carries finds."""
+    """No modality, as a name no collection holds finds."""
     comptime BLOBS = Self(1)
     """Binary values."""
     comptime DOCS = Self(2)
@@ -519,7 +519,7 @@ struct DataDirectory[origin: ImmOrigin = ImmUntrackedOrigin](ImplicitlyCopyable)
     """A directory the data files may occupy, with the bytes they may take there, `ustore_data_directory_t`.
 
     Parameters:
-        origin: The borrowed path, kept alive for as long as the entry is used.
+        origin: The viewed path, kept alive for as long as the entry is used.
     """
 
     var path: BytesView[Self.origin]
@@ -675,9 +675,9 @@ struct DatabaseDescription(Answer, Defaultable, ImplicitlyCopyable):
     """Bytes of memory the engine holds for the data."""
     var disk_bytes: c_size_t
     """Bytes the files of the database take on disk."""
-    var pin_refused_bytes: c_size_t
+    var unpinned_staging_bytes: c_size_t
     """Bytes of the NVMe engine's io_uring arena the locked-memory cap refused to pin, so each request pins its own."""
-    var crossing_requests: c_size_t
+    var requests_across_registered_slots: c_size_t
     """Requests the NVMe engine sent unpinned while its arena was pinned, as each crossed a gibibyte of it."""
 
     def __init__(out self):
@@ -759,7 +759,7 @@ struct DatabaseCompactArguments(Arguments):
         plan: Optional[Pointer[DatabaseCompactPlan, plan_origin]],
         phase: Optional[Pointer[PhaseProgress, phase_origin]],
     ) -> Self:
-        """The arguments with the plan's handle slot and the phase slot lent, either one absent."""
+        """The arguments with the plan's handle slot and the phase slot the caller owns, either one absent."""
         var plan_slot: Optional[Pointer[Address, MutUntrackedOrigin]] = None
         if plan:
             plan_slot = Pointer(to=plan.value()[].address).unsafe_origin_cast[MutUntrackedOrigin]()
@@ -912,10 +912,10 @@ struct CollectionListArguments(Arguments):
 
 @fieldwise_init
 struct CollectionList[origin: MutOrigin](Answer, Sized):
-    """The collections of a database, read in place from the arena a listing borrows.
+    """The collections of a database, read in place from the arena a listing views.
 
     Parameters:
-        origin: The arena the listing lives in, which this result borrows.
+        origin: The arena the listing lives in, which this result views.
     """
 
     comptime Written = CollectionListWritten
@@ -1016,10 +1016,10 @@ struct CollectionFindArguments(Arguments):
 
 @fieldwise_init
 struct CollectionsFound[origin: MutOrigin](Answer, Sized):
-    """The collections a batch of names address, read in place from the arena a find borrows.
+    """The collections a batch of names address, read in place from the arena a find views.
 
     Parameters:
-        origin: The arena the answers live in, which this result borrows.
+        origin: The arena the answers live in, which this result views.
     """
 
     comptime Written = CollectionFindWritten
@@ -1043,7 +1043,7 @@ struct CollectionsFound[origin: MutOrigin](Answer, Sized):
         return self.count
 
     def present(self, index: Int) raises Error -> Bool:
-        """Whether a collection carries name `index`."""
+        """Whether a collection holds name `index`."""
         _readable(self.arena, self.generation, "CollectionsFound.present")
         return _bit(self.written.presences, index)
 
@@ -1251,10 +1251,10 @@ struct ChangesCursorNextArguments(Arguments):
 
 @fieldwise_init
 struct Changes[origin: MutOrigin](Answer, Sized):
-    """The changes one pull of a feed yielded, oldest first, read in place from the arena it borrows.
+    """The changes one pull of a feed yielded, oldest first, read in place from the arena it views.
 
     Parameters:
-        origin: The arena the changes live in, which this result borrows.
+        origin: The arena the changes live in, which this result views.
     """
 
     comptime Written = ChangesWritten
@@ -1290,7 +1290,7 @@ struct Changes[origin: MutOrigin](Answer, Sized):
         return _in_arena[ChangeKind, origin_of(self)](self.written.kinds, len(self))
 
     def values(self) -> Tape[Self.origin]:
-        """The bytes every change carries, empty for a removal or when the pull skipped them."""
+        """The bytes every change holds, empty for a removal or when the pull skipped them."""
         return Tape[Self.origin](self.arena, self.generation, self.written.values, len(self))
 
 
@@ -1318,9 +1318,9 @@ struct ChangesCursor(Movable):
 
         Args:
             executor: The executor the pull runs on.
-            arena: The arena to rewind and refill, which the result borrows.
+            arena: The arena to rewind and refill, which the result views.
             wanted: Most changes the pull yields.
-            values: Whether the bytes every change carries come too.
+            values: Whether the bytes every change holds come too.
 
         Raises:
             `Error` if the collection was dropped meanwhile.
@@ -1483,7 +1483,7 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         """Starts an empty database of the in-memory engine, which persists nowhere. Calls `ustore_database_init_ram`.
 
         Args:
-            executor: The executor the open runs on; it also lends its engine.
+            executor: The executor the open runs on; it also supplies its engine.
             isolation: How transactions see each other.
             cpu_class_ceiling: The newest class the database may confine its kernels to, narrowed to what the CPU runs, so a class it lacks is never refused; `UNKNOWN` sets none.
 
@@ -1772,7 +1772,7 @@ struct Snapshot(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
     """A point-in-time state of the whole database, released when it goes out of scope. It pins the
     versions its reads need and holds its database open.
 
-    Verbs called on it read at its state on the calling thread; writes, carrying no transaction, land
+    Verbs called on it read at its state on the calling thread; writes, holding no transaction, land
     at the head. `snap.on(executor)` and `snap.deferred(executor)` route the same verbs to an executor.
     """
 
@@ -1820,7 +1820,7 @@ struct On[origin: ImmOrigin](BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, I
     """A database, transaction or snapshot bound to the executor its verbs block on. Binding-only.
 
     Parameters:
-        origin: The handle and the executor, which this receiver borrows.
+        origin: The handle and the executor, which this receiver views.
     """
 
     var scope: Scope
@@ -1836,12 +1836,12 @@ struct DeferredOn[origin: ImmOrigin](
     BlobsDeferredVerbs, DatabaseDeferredVerbs, DocsDeferredVerbs, GraphDeferredVerbs, ImplicitlyCopyable, PagesDeferredVerbs, StringsDeferredVerbs
 ):
     """A database, transaction or snapshot bound to the executor its verbs are submitted to: every verb
-    answers a `Deferred` at once, borrowing its arena and inputs until final. Binding-only.
+    answers a `Deferred` at once, viewing its arena and inputs until final. Binding-only.
 
     The verbs and their arguments are those of the blocking receivers.
 
     Parameters:
-        origin: The handle and the executor, which this receiver borrows.
+        origin: The handle and the executor, which this receiver views.
     """
 
     var scope: Scope
@@ -1974,7 +1974,7 @@ trait DatabaseVerbs:
         """Creates an empty collection, unnamed for an empty `name`. Calls `ustore_collection_create`.
 
         Raises:
-            `Error` with `ALREADY_EXISTS` when another collection carries the name.
+            `Error` with `ALREADY_EXISTS` when another collection holds the name.
         """
         var view = BytesView.of(name).arguments() if name.byte_length() else BytesViewArguments.empty()
         return _block(
@@ -2002,7 +2002,7 @@ trait DatabaseVerbs:
         """Removes or clears a collection. Calls `ustore_collection_drop`.
 
         Raises:
-            `Error` with `NOT_FOUND` when no collection carries the identifier.
+            `Error` with `NOT_FOUND` when no collection holds the identifier.
         """
         _ = _block(
             self._scope(),
@@ -2116,7 +2116,7 @@ trait DatabaseDeferredVerbs:
             ImmOrigin(origin_of(_anchor[plan_origin](), _anchor[phase_origin]())),
         ]
     ]:
-        """Submits `DatabaseVerbs.compact`; the plan and phase slots stay borrowed until final.
+        """Submits `DatabaseVerbs.compact`; the plan and phase slots stay owned by the caller until final.
         Calls `ustore_database_compact`."""
         return {
             self._scope(),

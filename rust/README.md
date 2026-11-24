@@ -66,7 +66,7 @@ Collections are created under a name and the modality they hold, resolved by nam
 A name starting with `_` is refused with `Status::InvalidArgument`, as the engines keep their own system collections there.
 `collection_find` answers the identifier and modality of a name, `collection_list` every identifier, and `collection_names` a page of names from a prefix.
 `Database::collection_drop` empties a collection of its pairs or values with `DropMode::Pairs` or `DropMode::Values`, or drops it whole with `DropMode::Collection`.
-The ABI carries a collection per task, so every batch verb takes a `Collections`: a bare `CollectionID` converts into `Collections::Every`, and `Collections::Each` names one per entry.
+The ABI holds a collection per task, so every batch verb takes a `Collections`: a bare `CollectionID` converts into `Collections::Every`, and `Collections::Each` names one per entry.
 
 ```rust
 use ustore::{Collections, DropMode, Modality};
@@ -86,7 +86,7 @@ database.collection_drop(people, DropMode::Collection)?;
 An `Entry` pairs a key with borrowed bytes, laid out so a slice of them crosses as it stands: the keys as one strided run, and the values through an accessor over the same entries.
 A write also takes owned keys beside a `stringtape::BytesTape<u32>` or `BytesTape<u64>`, which the library reads as it stands.
 A read hands back `Values`, which addresses the tape in the arena rather than copying out of it, reports a missing key as `None`, and exports the whole batch through `Values::tape` in Arrow's `binary` or `large_binary` layout.
-A write carries values and nothing else, so an empty slice writes an empty value, and `remove` and `remove_range` remove keys in batches of their own.
+A write holds values and nothing else, so an empty slice writes an empty value, and `remove` and `remove_range` remove keys in batches of their own.
 
 ```rust
 use ustore::{Arena, Durability, Entry, Key, Modality};
@@ -108,6 +108,7 @@ database.head().remove(people, &[grace], Durability::Buffered)?;
 Scans, cursors and measures take a `KeyRange` of a start key, inclusive, an end key, exclusive, and a `ScanDirection`, where a key alone walks up from it and `start..end` walks up between them.
 `scan` lists up to the count it wants, `sample` draws keys at random, and `measure` bounds the keys and bytes a range holds without walking it; `docs_sample`, `pages_sample` and `graph_sample_vertices` serve the other modalities.
 A `Cursor` walks one collection page by page, each pull resuming past the last key the one before it handed out, and a page shorter than wanted exhausts it for good.
+`DocsCursor::next` pulls `Batches` of rows instead, each its keys and the `Columns` the cursor gathers, one per executor task that found rows, none once the walk is exhausted.
 `Database::changes_cursor` opens a feed of the changes committed after a `CommitStamp`, oldest first, pinning that stamp as a snapshot does.
 
 ```rust
@@ -127,7 +128,7 @@ loop {
 
 ### Progress and Cancellation
 
-The configs of `compact`, `save` and the scans carry an optional progress handler, an `FnMut(finished, total) -> ControlFlow<()>`, called on whichever thread advances the work, never on two at once and never after the call is final.
+The configs of `compact`, `save` and the scans hold an optional progress handler, an `FnMut(finished, total) -> ControlFlow<()>`, called on whichever thread advances the work, never on two at once and never after the call is final.
 Answering `ControlFlow::Break(())` cancels the call, which fails with `Status::Cancelled` and publishes nothing, a cancelled save removing what it wrote.
 A handler must not panic, since unwinding out of the library's `extern "C"` frame aborts the process.
 
@@ -184,8 +185,8 @@ snapshot.save("/var/lib/people-copy")?;
 ## Documents
 
 `Collection::docs` parses what it reads through JsonTape: `get` hands out a `jsontape::Json`, `get_json` the text itself, and `set` writes a `jsontape::Json`, while with the `serde` feature `get_as` deserializes into any `DeserializeOwned` type.
-The batch verbs carry documents as text both ways and parse nothing on the Rust side.
-A field is a top-level key or an RFC 6901 pointer, a write carries one format for the whole batch, named by the type of its entries, and `Modification` chooses between an upsert, an update, an insert, an RFC 6902 patch and an RFC 7386 merge.
+The batch verbs hold documents as text both ways and parse nothing on the Rust side.
+A field is a top-level key or an RFC 6901 pointer, a write holds one format for the whole batch, named by the type of its entries, and `Modification` chooses between an upsert, an update, an insert, an RFC 6902 patch and an RFC 7386 merge.
 A gather converts fields into typed columns, a row per key, handing out scalar columns as slices straight out of the arena beside their validity, conversion and collision bitmaps.
 
 ```rust
@@ -231,7 +232,7 @@ database.head().graph_remove_vertices(follows, [first], Roles::Every(Role::Any),
 
 The receiver a verb is called on chooses what it sees, where it runs and how it completes, while the verb stays, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#receivers--deferred-calls) describe in full.
 `database.head()`, `transaction.view(watch)` and `snapshot.view()` run on the calling thread, `.on(&executor)` blocks on an executor, and `.deferred(&executor)` answers a `Deferred` once the call is submitted.
-The borrow checker carries the lifetime rules: a deferred verb takes only owned inputs, since the library reads them after it returns, while its result borrows the arena as a blocking one does.
+The borrow checker holds the lifetime rules: a deferred verb takes only owned inputs, since the library reads them after it returns, while its result borrows the arena as a blocking one does.
 A `Deferred` is `IntoFuture`, so `.await` polls its status and asks to be polled again, `wait` blocks in `ustore_outcome_wait`, and dropping an unfinished one waits for its call.
 
 ```rust
@@ -289,8 +290,8 @@ An arena is `Send` and never shared, so deferred calls submitted together take o
 
 ## Errors
 
-Every fallible call answers `Result<T, Error>`, where the error carries the `Status` the C ABI reported and the static message beside it, so nothing allocates on the failure path.
-`Status` leaves success to `Result`, so an `Error` never carries `Status::Deferred`, and a status a newer library added reads as `Status::Internal`.
+Every fallible call answers `Result<T, Error>`, where the error holds the `Status` the C ABI reported and the static message beside it, so nothing allocates on the failure path.
+`Status` leaves success to `Result`, so an `Error` never holds `Status::Deferred`, and a status a newer library added reads as `Status::Internal`.
 `Status`, `Durability`, `Watch`, `Modality` and the other enums print through `Display` and parse through `FromStr` the spellings the C tables own, such as `"not-found"` or `"strict-serializable"`.
 
 ```rust
@@ -305,7 +306,7 @@ println!("{}", ustore::version()); // the library the program runs against, such
 
 ### Engines
 
-`Database::init_ram` starts an empty database in memory alone, `open_ram` serves a directory as one image, `open_rocksdb`, `open_leveldb` and `open_nvme` serve a directory in place, and `view_rocksdb` serves one read-only, refusing every change with `Status::ReadOnly`.
+`Database::init_ram` starts an empty database in memory alone, `open_ram` serves a directory as one image, `open_rocksdb`, `open_leveldb` and `open_nvme` serve a directory in place, and `view_rocksdb` and `view_nvme` serve one read-only, refusing every change with `Status::ReadOnly`.
 `RAMOptions` and `NVMEOptions` take a `cpu_class_ceiling`, the newest `CPUClass` the database's kernels may run as, intersected with the machine, and `describe` reports the class picked as `cpu_class` beside the engine, the isolation and the sizes it estimates.
 `clear` empties every collection at once, and `compact` reclaims space through the phases its engine runs, where a `CompactPlan` keeps a stopped compaction open until `compact_plan_finish`.
 
@@ -323,14 +324,14 @@ people.compact(None)?;            // reclaims what overwritten and removed data 
 
 - Deferred opens, describes, collection creates, transaction and snapshot inits, and cursor pulls: these block whatever receiver you hold, as does every call through a `Collection`.
 - The strings cursor, which `export_arrow` drives, and the range removals of `ustore_pages_remove`.
-- The progress of a cursor pull, and the lengths a read writes beside its values, which the tape's offsets carry.
+- The progress of a cursor pull, and the lengths a read writes beside its values, which the tape's offsets hold.
 
 ### Design
 
 - __`On<'view, Parent, Completion>` makes the receiver a type, not a flag.__
   Each verb is written once, generic over the completion, and the parent decides what compiles: only a transaction commits, only the head clears and compacts, and nothing writes through a snapshot.
 - __Ragged inputs cross as they lie.__
-  A slice of entries lends its keys as a strided run and its values through an accessor over the same records, and owned values cross as a tape, so nothing is staged on the way in.
+  A slice of entries passes its keys as a strided run and its values through an accessor over the same records, and owned values cross as a tape, so nothing is staged on the way in.
 - __The borrow checker retires stale views.__
   Every verb borrows its arena as `&mut Arena`, blocking or deferred, and no handle keeps an arena of its own.
 - __No life of its own.__

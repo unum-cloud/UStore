@@ -35,7 +35,7 @@ struct strings_pages_t {
      *  the last page. */
     std::span<ustore_length_t const> pages;
 
-    /** One BM25 score per string when the patterns carry weights, or @c nullptr. */
+    /** One BM25 score per string when the patterns hold weights, or @c nullptr. */
     float const* scores = nullptr;
 };
 
@@ -80,11 +80,12 @@ ustore_key_t const** strings_keys_output_(outputs<answer_type_>&) noexcept {
 inline ustore_key_t const** strings_keys_output_(outputs<keys_view_t>& written) noexcept { return &written.keys; }
 
 /**
- *  @brief Reads what @p answer_type_ asks of the @p count strings @p texts lends: the key each maps
+ *  @brief Reads what @p answer_type_ asks of the @p count strings @p texts holds: the key each maps
  *      onto, the nil UUID for a missing one, or whether each is present.
- *  @param[in] collection Collection every string lives in, borrowed until the call is final.
- *  @param[in] texts Strings to read, borrowed until the call is final.
- *  @param[in] arena Memory the answer lands in, borrowed until the call is final, which
+ *  @param[in] collection Collection every string lives in, owned by the caller until the
+ *      call is final.
+ *  @param[in] texts Strings to read, owned by the caller until the call is final.
+ *  @param[in] arena Memory the answer lands in, owned by the caller until the call is final, which
  *      the answer views.
  */
 template <ustore_completion_t completion_, typename answer_type_>
@@ -109,7 +110,7 @@ answer<completion_, answer_type_> strings_read_(receiver_t const& receiver, usto
     });
 }
 
-/** Upserts the @p count keys @p keys lends onto the strings @p texts lends, pairwise. */
+/** Upserts the @p count keys of @p keys onto the strings of @p texts, pairwise. */
 template <ustore_completion_t completion_>
 answer<completion_, void> strings_write_(receiver_t const& receiver, ustore_collection_id_t const& collection,
                                          ustore_strings_view_t texts, ustore_key_t const* keys, std::size_t count,
@@ -130,7 +131,7 @@ answer<completion_, void> strings_write_(receiver_t const& receiver, ustore_coll
     });
 }
 
-/** Removes the @p count strings @p texts lends together with their keys. */
+/** Removes the @p count strings of @p texts together with their keys. */
 template <ustore_completion_t completion_>
 answer<completion_, void> strings_remove_(receiver_t const& receiver, ustore_collection_id_t const& collection,
                                           ustore_strings_view_t texts, std::size_t count,
@@ -151,11 +152,12 @@ answer<completion_, void> strings_remove_(receiver_t const& receiver, ustore_col
 }
 
 /**
- *  @brief Lists up to @p limit strings of each of the @p count prefixes @p prefixes lends into @p
+ *  @brief Lists up to @p limit strings of each of the @p count prefixes of @p prefixes into @p
  *      arena, in the order of their text, each page from its start in @p starts, keeping the
  *      strings @p match admits.
- *  @param[in] starts None to start every page at its prefix, or the smallest string of every page,
- *      which the page holds too when the collection does, borrowed until the call is final.
+ *  @param[in] starts None to start every page at its prefix, or the smallest string of every
+ *      page, which the page holds too when the collection does, owned by the caller until the
+ *      call is final.
  */
 template <ustore_completion_t completion_>
 answer<completion_, strings_pages_t> strings_scan_(receiver_t const& receiver, ustore_collection_id_t const& collection,
@@ -270,8 +272,8 @@ class strings_cursor_t {
  *      order of their text.
  *
  *  As shorthand for a range-based loop, which has no place for an arena, it owns one arena for its
- *  lifetime, where @c strings_cursor_t takes the caller's per pull. The prefix it walks is
- *  borrowed, so it outlives the stream, a page short of the read-ahead ends the walk, and a
+ *  lifetime, where @c strings_cursor_t takes the caller's per pull. The prefix it walks is viewed,
+ *  so it outlives the stream, a page short of the read-ahead ends the walk, and a
  *  default-constructed stream is the end of every walk.
  */
 class strings_stream_t {
@@ -344,7 +346,7 @@ class strings_stream_t {
         return {};
     }
 
-    /** Advances like @c advance, but a failed pull ends the walk since a reference carries no
+    /** Advances like @c advance, but a failed pull ends the walk since a reference holds no
      *  status. */
     strings_stream_t& operator++() noexcept {
         if (advance().succeeded()) return *this;
@@ -381,9 +383,9 @@ class strings_stream_t {
  *  any number of threads share it, and never outlives its database. A blocking handle answers an
  *  @c outcome, while a deferred one answers a
  *
- *  @c deferred call, borrowing the handle, its inputs and its arena until the call is final. A
+ *  @c deferred call, viewing the handle, its inputs and its arena until the call is final. A
  *  handle with @c collection_access_t::read_only_k only reads, as a snapshot hands out. Strings
- *  carry explicit lengths, so a zero byte inside one is stored like any other, and the empty string
+ *  hold explicit lengths, so a zero byte inside one is stored like any other, and the empty string
  *  is an ordinary key.
  */
 template <ustore_completion_t completion_, collection_access_t access_>
@@ -432,8 +434,8 @@ class strings_collection_on {
     /**
      *  @brief Reads the keys @p texts map onto into @p arena, where a missing string reads as
      *      the nil UUID.
-     *  @param[in] texts Strings to read, borrowed until the call is final.
-     *  @param[in] arena Memory the keys land in, borrowed until the call is final, which
+     *  @param[in] texts Strings to read, owned by the caller until the call is final.
+     *  @param[in] arena Memory the keys land in, owned by the caller until the call is final, which
      *      the answer views.
      *  @param[in] watch Whether a read inside a transaction records the strings for conflicts.
      */
@@ -446,8 +448,8 @@ class strings_collection_on {
 
     /**
      *  @brief Upserts the keys of @p keys onto the strings of @p texts pairwise.
-     *  @param[in] texts Strings to write, borrowed until the call is final.
-     *  @param[in] keys One key per string, borrowed until the call is final.
+     *  @param[in] texts Strings to write, owned by the caller until the call is final.
+     *  @param[in] keys One key per string, owned by the caller until the call is final.
      *  @param[in] durability Whether the call finishes only after the data reaches the disk.
      *
      *  @par Statuses:
@@ -467,7 +469,7 @@ class strings_collection_on {
 
     /**
      *  @brief Removes the strings of @p texts together with their keys.
-     *  @param[in] texts Strings to remove, borrowed until the call is final.
+     *  @param[in] texts Strings to remove, owned by the caller until the call is final.
      *  @param[in] durability Whether the call finishes only after the data reaches the disk.
      */
     template <strings_batch_concept texts_type_>
@@ -482,14 +484,15 @@ class strings_collection_on {
     /**
      *  @brief Lists up to @p limit strings of every prefix of @p prefixes into @p arena, in the
      *      order of their text.
-     *  @param[in] prefixes Prefixes to walk, a page each, borrowed until the call is final.
-     *  @param[in] limit Most strings a page holds.
-     *  @param[in] arena Memory the strings land in, borrowed until the call is final, which
-     *      the answer views.
-     *  @param[in] starts None to start every page at its prefix, or the smallest string of
-     *      every page, which the page holds too when the collection does, borrowed until the
+     *  @param[in] prefixes Prefixes to walk, a page each, owned by the caller until the
      *      call is final.
-     *  @param[in] match What the strings are narrowed by, borrowed until the call is final.
+     *  @param[in] limit Most strings a page holds.
+     *  @param[in] arena Memory the strings land in, owned by the caller until the call is final,
+     *      which the answer views.
+     *  @param[in] starts None to start every page at its prefix, or the smallest string of every
+     *      page, which the page holds too when the collection does, viewed until the call is final.
+     *  @param[in] match What the strings are narrowed by, owned by the caller until the
+     *      call is final.
      *  @param[in] watch Whether a read inside a transaction records the strings for conflicts.
      *
      *  @par Statuses:
@@ -510,7 +513,7 @@ class strings_collection_on {
 
     /**
      *  @brief Draws up to @p wanted strings at random into @p arena, as one page.
-     *  @param[in] arena Memory the strings land in, which the answer views, borrowed until the
+     *  @param[in] arena Memory the strings land in, which the answer views, viewed until the
      *      call is final.
      *  @param[in] watch Whether a read inside a transaction records the strings for conflicts.
      */
@@ -539,17 +542,17 @@ class strings_collection_on {
      *  @brief Estimates the strings and the space from @p start, inclusive, to @p end, exclusive,
      *      into @p arena.
      *  @param[in] start First string of the range, or an empty one to start at the first string,
-     *      borrowed until the call is final.
-     *  @param[in] end String the range stops before, or an empty one to bound nothing, borrowed
+     *      owned by the caller until the call is final.
+     *  @param[in] end String the range stops before, or an empty one to bound nothing, viewed
      *      until the call is final.
-     *  @param[in] arena Memory the bounds land in, borrowed until the call is final.
+     *  @param[in] arena Memory the bounds land in, owned by the caller until the call is final.
      *  @param[in] watch Whether a read inside a transaction records the range for conflicts.
      */
     answer<completion_, size_estimates_t> measure(value_view_t const& start, value_view_t const& end, arena_t& arena,
                                                   ustore_watch_t watch = ustore_watch_keys_k) const noexcept {
         return called_<completion_, size_estimates_t>(
             [&](ustore_outcome_t* outcome, outputs<size_estimates_t>* written) noexcept {
-                // An empty bound is the zeroed view, so it never borrows the caller's text
+                // An empty bound is the zeroed view, so it never views the caller's text
                 std::span<value_view_t const> const starts {&start, start.empty() ? 0u : 1u};
                 std::span<value_view_t const> const ends {&end, end.empty() ? 0u : 1u};
                 ustore_strings_measure_t measure {};

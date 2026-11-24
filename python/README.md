@@ -17,7 +17,7 @@ python -c "import ustore; print(ustore.__version__, ustore.version(), ustore.eng
 ```
 
 From a checkout, `pip install .` builds through `scikit-build-core` and the project's own CMake, and `CMAKE_ARGS="-DUSTORE_WITH_LEVELDB=OFF"` leaves an engine out.
-The wheels carry the RAM, RocksDB and LevelDB engines for CPython 3.12 through 3.15 and the free-threaded 3.14t and 3.15t.
+The wheels hold the RAM, RocksDB and LevelDB engines for CPython 3.12 through 3.15 and the free-threaded 3.14t and 3.15t.
 The suite runs from the repository root:
 
 ```sh
@@ -69,7 +69,7 @@ database.collection_drop("posters", ustore.DropMode.PAIRS)  # empties it, keepin
 ## Reads and Writes
 
 `write`, `set`, `read`, `get`, `contains` and `remove` address binary values by key.
-A write takes one bytes-like value per key, one value broadcast to every key, or a tape, and borrows every value for the length of the call rather than copying it.
+A write takes one bytes-like value per key, one value broadcast to every key, or a tape, and views every value for the length of the call rather than copying it.
 A tape is an Arrow `binary`, `large_binary`, `string` or `large_string` array, or a `(data, offsets)` tuple of buffers, and reaches the C ABI as the tape it already is.
 A read answers the tape the engine wrote, exported through the Arrow C data interface as `binary` or `large_binary`, with `None` for a missing key.
 `read(keys, arena, offset=16, limit=64)` reads a slice of every value, and `remove(keys, ends=ends)` removes ranges in one atomic call.
@@ -258,7 +258,7 @@ Shorthand such as `get`, `contains` and `view[name].blobs[key]` makes a one-off 
 
 ## Errors
 
-Every failure raises a subclass of `ustore.Error`, itself a `RuntimeError`, carrying the status the C ABI reported as its `status` attribute, a `ustore.Status` member.
+Every failure raises a subclass of `ustore.Error`, itself a `RuntimeError`, holding the status the C ABI reported as its `status` attribute, a `ustore.Status` member.
 Each status has its own class, which also derives the built-in naming the same fault: `NotFoundError` is a `KeyError`, `InvalidArgumentError` a `ValueError`, `UnsupportedError` a `NotImplementedError`, `InputOutputError` an `OSError`, and `CapacityExhaustedError` an `OverflowError`.
 `WriteConflictError`, `ReadConflictError` and `PhantomConflictError` share `ConflictError`, the one clause a retry loop needs.
 A closed handle raises `UninitializedError`, and an argument of the wrong Python type raises `TypeError`.
@@ -280,7 +280,7 @@ Every C enum is an `enum.IntEnum` built at import through the C `_name` function
 
 ### Engines
 
-`engines_compiled()` names the engines a build carries, each opened through its own class method: `Database.open_ram()`, `open_rocksdb()`, `open_leveldb()` or `open_nvme()`, and `view_rocksdb()` for a read-only RocksDB database, which raises `ReadOnlyError` from every change.
+`engines_compiled()` names the engines a build holds, each opened through its own class method: `Database.open_ram()`, `open_rocksdb()`, `open_leveldb()` or `open_nvme()`, and `view_rocksdb()` or `view_nvme()` for a read-only RocksDB or NVMe database, which raises `ReadOnlyError` from every change.
 `open_ram(directory)` persists the database as one image there, while `open_ram()` keeps it in memory alone, and `open_nvme(manifest)` names the database by its manifest or the raw address of its first slot, such as `/dev/nvme0n1@64GiB`.
 `open_ram` and `open_nvme` take `cpu_class_ceiling=`, the newest `CPUClass` the database's kernels may run as, where a class the CPU lacks narrows the pick, `UnsupportedError` comes only when no compiled class fits, and `describe().cpu_class` reports the class picked.
 `describe()`, `clear(mode)` and `compact()` report on, empty and reclaim every collection at once, and `on(executor).compact(plan=ustore.CompactPlan())` leaves a stopped compaction open for the next call to continue.
@@ -297,8 +297,8 @@ The extension declares `Py_MOD_GIL_NOT_USED`, so free-threaded builds run withou
 - __The receiver chooses, the verb stays.__
   `db.read(keys, arena)` takes no executor or completion, and `db.on(executor)`, `db.deferred(executor)`, `snapshot` and `txn.unwatched()` choose where it runs and what it sees.
 - __Ragged inputs keep their layout.__
-  An Arrow array or a pair of NumPy buffers passes as the tape it is, and anything else is borrowed into views the call pins at submission.
-- __Arenas are lent, never hidden.__
+  An Arrow array or a pair of NumPy buffers passes as the tape it is, and anything else is wrapped in views the call pins at submission.
+- __Arenas are the caller's, never hidden.__
   No handle keeps an arena of its own, and shorthand pays an allocation and a copy that a verb handed a reused arena never pays.
 - __No life of its own.__
   The binding starts no threads and keeps no queues or counts, and `await` polls instead of parking a thread.

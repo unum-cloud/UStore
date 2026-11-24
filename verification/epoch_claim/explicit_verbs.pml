@@ -10,7 +10,7 @@
  *  only if it took the claim, the tally, the release and the retake, with the tally once more
  *  under a retaken claim. Every holder reads the tally relaxed, checks it counts every holder
  *  before it, and writes it back one higher, relaxed as well, so only the claim's acquire and
- *  release carry it between holders.
+ *  release hold it between holders.
  *
  *  - One holder at a time, and every holder reads its predecessors' writes.
  *  - Nobody parks for good: every taker's park ends with a release's notify.
@@ -41,7 +41,7 @@
  *      @c take_if_free takes the claim beside the taker it was handed to
  *  @verify fail rc11,far waiting=handoff handoff_order=order_relaxed: relaxed, the handed taker
  *      reads the tally from before its predecessor's increment
- *  @verify pass sc waiting=handoff handoff_order=order_relaxed: sequential memory carries the
+ *  @verify pass sc waiting=handoff handoff_order=order_relaxed: sequential memory holds the
  *      predecessor's increment to the handed taker without the release
  */
 #define thread_count 3

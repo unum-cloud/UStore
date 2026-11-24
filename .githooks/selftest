@@ -3121,6 +3121,18 @@ assert_accepts "span of C strings spelled const char" include/$project_directory
 void probe_name(std::span<const char* const> names) noexcept;
 FIXTURE
 
+assert_rejects "executor address comparison" "compares executor addresses" src/probe.cpp <<'FIXTURE'
+std::size_t probe_thread(probe_view_t const& view, probe_state_t const& state) noexcept {
+    return view.executor == state.executor ? view.thread_index : 0;
+}
+FIXTURE
+
+assert_accepts "null executor test and an executor's width" src/probe.cpp <<'FIXTURE'
+std::size_t probe_threads(probe_view_t const& view) noexcept {
+    return view.executor != nullptr && view.executor->size() != 0 ? view.executor->size() : 1;
+}
+FIXTURE
+
 assert_rejects "N-API mutex in a binding" "locks in a binding" javascript/probe.c <<'FIXTURE'
 static uv_mutex_t probe_guard;
 FIXTURE
@@ -3973,6 +3985,24 @@ struct cufile_io_event_t {
 };
 FIXTURE
 
+assert_rejects "a hand-over word in an identifier" "names a thing by a hand-over word" include/ustore/probe.hpp <<'FIXTURE'
+struct merge_buffers_t {
+    int lent_buffer_count = 0;
+};
+FIXTURE
+
+assert_accepts "a hand-over word in prose and a Rust std name" include/ustore/probe.hpp <<'FIXTURE'
+/** The buffers a caller owns and does not borrow. */
+struct merge_buffers_t {
+    int owned_buffer_count = 0;
+};
+FIXTURE
+
+assert_accepts "Rust std borrow names" rust/probe.rs <<'FIXTURE'
+use std::borrow::BorrowMut;
+
+fn compact<Plan: BorrowMut<u8>>(plan: &mut Plan) -> u8 { *plan.borrow_mut() }
+FIXTURE
 
 assert_rejects "two blank lines in Markdown" "separates paragraphs with more than one blank line" docs/probe.md <<'FIXTURE'
 First paragraph.

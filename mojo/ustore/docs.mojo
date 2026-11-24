@@ -152,10 +152,10 @@ struct GistWritten(Defaultable, ImplicitlyCopyable):
 
 @fieldwise_init
 struct Gist[origin: MutOrigin](Answer, Sized):
-    """The unique paths to the leaves of the requested documents, read in place from the arena a gist borrows.
+    """The unique paths to the leaves of the requested documents, read in place from the arena a gist views.
 
     Parameters:
-        origin: The arena the paths live in, which this result borrows.
+        origin: The arena the paths live in, which this result views.
     """
 
     comptime Written = GistWritten
@@ -208,7 +208,7 @@ struct Column[origin: MutOrigin](ImplicitlyCopyable, Sized):
     """One gathered field over every document, as an Apache Arrow array of its type.
 
     Parameters:
-        origin: The arena the column lives in, which this result borrows.
+        origin: The arena the column lives in, which this result views.
     """
 
     var arena: Pointer[Arena, Self.origin]
@@ -251,10 +251,10 @@ struct Column[origin: MutOrigin](ImplicitlyCopyable, Sized):
 
 @fieldwise_init
 struct Columns[origin: MutOrigin](Answer, Sized):
-    """Every gathered field of every document, one column per field, read in place from the arena a gather borrows.
+    """Every gathered field of every document, one column per field, read in place from the arena a gather views.
 
     Parameters:
-        origin: The arena the columns live in, which this result borrows.
+        origin: The arena the columns live in, which this result views.
     """
 
     comptime Written = ColumnsWritten
@@ -295,8 +295,8 @@ struct DocsWriteConfig[fields_origin: ImmOrigin = ImmUntrackedOrigin, id_origin:
     """Where inside the documents a write lands, how its values read, and how it applies.
 
     Parameters:
-        fields_origin: The borrowed fields.
-        id_origin: The borrowed name of the key field.
+        fields_origin: The viewed fields.
+        id_origin: The viewed name of the key field.
     """
 
     var fields: StringsView[Self.fields_origin]
@@ -331,7 +331,7 @@ struct DocsReadConfig[fields_origin: ImmOrigin = ImmUntrackedOrigin](ImplicitlyC
     """Where inside the documents a read looks, and what it exports.
 
     Parameters:
-        fields_origin: The borrowed fields.
+        fields_origin: The viewed fields.
     """
 
     var fields: StringsView[Self.fields_origin]
@@ -358,8 +358,8 @@ struct DocsScanConfig[end_origin: ImmOrigin = ImmUntrackedOrigin, filter_origin:
     """The bounds, order and filter of a scan over document keys.
 
     Parameters:
-        end_origin: The borrowed end keys.
-        filter_origin: The borrowed filter.
+        end_origin: The viewed end keys.
+        filter_origin: The viewed filter.
     """
 
     var end_keys: KeysView[Self.end_origin]
@@ -398,7 +398,7 @@ struct DocsCursorConfig[filter_origin: ImmOrigin = ImmUntrackedOrigin](Implicitl
     """The bound, order and filter of a walk over one collection, the filter copied when the walk opens.
 
     Parameters:
-        filter_origin: The borrowed filter.
+        filter_origin: The viewed filter.
     """
 
     var end_key: Optional[Key]
@@ -647,7 +647,7 @@ struct FilteredScanArguments[name: StaticString](Arguments):
 
 @fieldwise_init
 struct FilteredCursorInitArguments(ImplicitlyCopyable):
-    """`ustore_docs_cursor_init_t`, and `ustore_pages_cursor_init_t` with the same layout."""
+    """`ustore_docs_cursor_init_t`, whose fields up to the predicate `ustore_pages_cursor_init_t` shares."""
 
     var cursor: Optional[Pointer[Address, MutUntrackedOrigin]]
     var database: Address

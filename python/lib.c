@@ -80,13 +80,13 @@ static PyObject* api_version(PyObject* Py_UNUSED(module), PyObject* Py_UNUSED(ar
     return PyUnicode_FromString(ustore_version_name());
 }
 
-static char const doc_engines_compiled[] =                         //
-    "engines_compiled() answers the engines this build carries.\n" //
-    "\n"                                                           //
-    "Returns:\n"                                                   //
+static char const doc_engines_compiled[] =                       //
+    "engines_compiled() answers the engines this build holds.\n" //
+    "\n"                                                         //
+    "Returns:\n"                                                 //
     "  tuple[str, ...]: Some of 'ram', 'rocksdb', 'leveldb' and 'nvme', in that order.";
 
-/** The engines this build carries, in the order @c engines_compiled answers them. */
+/** The engines this build holds, in the order @c engines_compiled answers them. */
 static char const* const engines_compiled[] = {
     "ram",
 #if USTORE_WITH_ROCKSDB

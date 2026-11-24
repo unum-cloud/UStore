@@ -100,10 +100,10 @@ struct EdgesWritten(Defaultable, ImplicitlyCopyable):
 
 @fieldwise_init
 struct Edges[origin: MutOrigin](Answer, Sized):
-    """The edges of a batch of vertices, three keys per edge, read in place from the arena a read borrows.
+    """The edges of a batch of vertices, three keys per edge, read in place from the arena a read views.
 
     Parameters:
-        origin: The arena the edges live in, which this result borrows.
+        origin: The arena the edges live in, which this result views.
     """
 
     comptime Written = EdgesWritten
@@ -114,7 +114,7 @@ struct Edges[origin: MutOrigin](Answer, Sized):
     var written: EdgesWritten
     """The views the engine wrote."""
     var count: Int
-    """Vertices the read carried."""
+    """Vertices the read held."""
 
     def __init__(out self, arena: Address, generation: Int, written: EdgesWritten, count: Int):
         self.arena = Pointer[Arena, Self.origin](unsafe_from_address=arena)
@@ -123,7 +123,7 @@ struct Edges[origin: MutOrigin](Answer, Sized):
         self.count = count
 
     def __len__(self) -> Int:
-        """The vertices the read carried."""
+        """The vertices the read held."""
         return self.count
 
     def degrees(ref self) raises Error -> Span[UInt32, origin_of(self)]:
@@ -154,7 +154,7 @@ struct GraphScanConfig[end_origin: ImmOrigin = ImmUntrackedOrigin](ImplicitlyCop
     """The bounds, order and verdict of a scan over vertices.
 
     Parameters:
-        end_origin: The borrowed end keys.
+        end_origin: The viewed end keys.
     """
 
     var end_keys: KeysView[Self.end_origin]

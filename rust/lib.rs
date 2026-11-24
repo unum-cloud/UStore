@@ -55,7 +55,7 @@
 //! assert_eq!(values.get(0), Some(b"Ada".as_slice()));
 //! assert_eq!(values.get(2), None);
 //!
-//! // A batch carries a collection per task, and a bare one gives every task the same.
+//! // A batch holds a collection per task, and a bare one gives every task the same.
 //! let spanned = [people, places];
 //! let across = [Entry::new(ada, b"Ada"), Entry::new(ada, b"Kent")];
 //! database.head().write(spanned.as_slice(), &across, Durability::Buffered)?;
@@ -211,7 +211,7 @@ mod testing;
 pub use jsontape;
 pub use stringtape;
 
-// Named only so their archives link, carrying the objects the UStore archive leaves out.
+// Named only so their archives link, holding the objects the UStore archive leaves out.
 extern crate forkunion as _;
 extern crate stringzilla as _;
 

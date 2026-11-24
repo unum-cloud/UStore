@@ -27,7 +27,7 @@ from ustore.types import (
     StringsView,
     StringsViewArguments,
     Tape,
-    _borrowed,
+    _viewed,
 )
 
 # region Layouts
@@ -257,7 +257,7 @@ def keys_from_arrow(arena: Arena, schema: Address, array: Address) raises Error 
         ),
         "ustore_keys_view_from_arrow",
     )
-    return KeysView(_borrowed[Key, ImmUntrackedOrigin](keys[].data), Int(keys[].stride), Int(count[]))
+    return KeysView(_viewed[Key, ImmUntrackedOrigin](keys[].data), Int(keys[].stride), Int(count[]))
 
 
 def strings_from_arrow(arena: Arena, schema: Address, array: Address) raises Error -> StringsView[ImmUntrackedOrigin]:
@@ -273,7 +273,7 @@ def strings_from_arrow(arena: Arena, schema: Address, array: Address) raises Err
     )
     _exported(status, "ustore_strings_view_from_arrow")
     var view = strings[]
-    return StringsView(_borrowed[UInt8, ImmUntrackedOrigin](view.data), view.offsets, view.layout, Int(count[]))
+    return StringsView(_viewed[UInt8, ImmUntrackedOrigin](view.data), view.offsets, view.layout, Int(count[]))
 
 
 # endregion Imports

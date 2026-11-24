@@ -72,7 +72,7 @@ def version() -> str:
     """The version of the library this module runs against, like "1.0.0". Calls `ustore_version_name`."""
 
 def engines_compiled() -> tuple[str, ...]:
-    """The engines this build carries: some of "ram", "rocksdb", "leveldb" and "nvme", in that order."""
+    """The engines this build holds: some of "ram", "rocksdb", "leveldb" and "nvme", in that order."""
 
 def gpu_devices() -> tuple[GPUDevice, ...]:
     """Every GPU this process can drive, NVIDIA devices first, then AMD, then Apple, each at the ordinal
@@ -340,7 +340,7 @@ class OutOfMemoryError(Error, MemoryError):
     """An allocation could not be satisfied."""
 
 class InvalidArgumentError(Error, ValueError):
-    """An argument is null, contradicts another one, or carries a choice the call does not accept, like a collection
+    """An argument is null, contradicts another one, or holds a choice the call does not accept, like a collection
     of another modality."""
 
 class UninitializedError(Error):
@@ -517,7 +517,7 @@ class ChangesCursor:
     resumes every pull past the last change the pull before it handed out."""
 
     def next(self, wanted: int, arena: Arena, /, *, values: bool = False) -> Changes:
-        """The next up to `wanted` changes in `arena`, with the bytes every one carries when asked; an empty pull
+        """The next up to `wanted` changes in `arena`, with the bytes every one holds when asked; an empty pull
         reached the newest commit."""
 
     def close(self) -> None:
@@ -684,7 +684,7 @@ class Executor:
     ) -> Self:
         """One stream on `device`, a `GPUDevice.ordinal` of any vendor, every call queues on, fed by one host thread,
         which `Database.open_nvme` takes as its `compactions` on an NVIDIA device, refused with `DeviceError` for an
-        ordinal no device carries; zero `scratch_limit` lets scratch grow as calls ask. Calls
+        ordinal no device holds; zero `scratch_limit` lets scratch grow as calls ask. Calls
         `ustore_executor_for_vram`."""
 
     def drain(self, mood: Mood = Mood.PARKED) -> None:
@@ -770,7 +770,7 @@ class Changes:
 
     @property
     def values(self) -> Values | None:
-        """The Values of the bytes every change carries when the pull asked for them, or None."""
+        """The Values of the bytes every change holds when the pull asked for them, or None."""
 
     @property
     def stamps(self) -> tuple[int, ...]:
@@ -874,12 +874,12 @@ class Description:
         """Bytes the files of the database take on disk."""
 
     @property
-    def pin_refused_bytes(self) -> int:
+    def unpinned_staging_bytes(self) -> int:
         """Bytes of the NVMe engine's io_uring arena the locked-memory cap refused to pin, so each request
         pins its own."""
 
     @property
-    def crossing_requests(self) -> int:
+    def requests_across_registered_slots(self) -> int:
         """Requests the NVMe engine sent unpinned while its arena was pinned, as each crossed a gibibyte of it."""
 
 @type_check_only
@@ -1372,7 +1372,7 @@ class _Writes(_Reads):
         collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
     ) -> None:
-        """Upserts a batch of binary values in one call. Every value is borrowed for the
+        """Upserts a batch of binary values in one call. Every value is viewed for the
         length of the call rather than copied, so a memory-mapped buffer reaches the engine
         untouched.
 
@@ -1402,7 +1402,7 @@ class _Writes(_Reads):
 
         Args:
           key (KeyLike): The key to write.
-          value (bytes-like): The bytes to store, borrowed rather than copied.
+          value (bytes-like): The bytes to store, viewed rather than copied.
           collection (UUID | str): The collection, by identifier or by name.
           durability (Durability, optional): `Durability.FLUSHED` reaches the drive before
             returning.
@@ -1431,7 +1431,7 @@ class _Writes(_Reads):
         durability: Durability = Durability.BUFFERED,
     ) -> None:
         """Writes a batch of JSON documents, or one field inside each of them. Every document is
-        borrowed for the length of the call rather than copied.
+        viewed for the length of the call rather than copied.
 
         Args:
           keys (Sequence[KeyLike] | buffer | None): The keys to write; None reads every key from
@@ -1772,7 +1772,7 @@ class Database(_Writes, _Receivers):
         """The collection ID the name addresses."""
 
     def collection_contains(self, name: str) -> bool:
-        """Whether a collection carries the name, read into a one-off arena."""
+        """Whether a collection holds the name, read into a one-off arena."""
 
     def collection_list(self, arena: Arena, /) -> tuple[UUID, ...]:
         """The IDs of every collection, never a system one."""
@@ -2437,7 +2437,7 @@ class DeferredOn:
         Returns:
           UUID: The identifier addressing the collection.
         Raises:
-          NotFoundError: No collection carries the name.
+          NotFoundError: No collection holds the name.
         """
 
     def collection_list(self, arena: Arena, /) -> Deferred[tuple[UUID, ...]]:
@@ -2542,7 +2542,7 @@ class DeferredOn:
 
         Returns:
           Description: The `capabilities`, `engine`, `isolation`, `keys`, `memory_bytes`,
-          `disk_bytes`, `pin_refused_bytes` and `crossing_requests` of the database.
+          `disk_bytes`, `unpinned_staging_bytes` and `requests_across_registered_slots` of the database.
         """
 
     def write(
@@ -2555,7 +2555,7 @@ class DeferredOn:
     ) -> Deferred[None]:
         """write(keys, values, *, collection, durability=Durability.BUFFERED) answers None.
 
-        Upserts a batch of binary values in one call. Every value is borrowed for the
+        Upserts a batch of binary values in one call. Every value is viewed for the
         length of the call rather than copied, so a memory-mapped buffer reaches the engine
         untouched.
 
@@ -2588,7 +2588,7 @@ class DeferredOn:
 
         Args:
           key (KeyLike): The key to write.
-          value (bytes-like): The bytes to store, borrowed rather than copied.
+          value (bytes-like): The bytes to store, viewed rather than copied.
           collection (UUID | str): The collection, by identifier or by name.
           durability (Durability, optional): `Durability.FLUSHED` reaches the drive before
             returning.
@@ -2636,7 +2636,7 @@ class DeferredOn:
                    type=FieldType.JSON, id_field=None, durability=Durability.BUFFERED) answers None.
 
         Writes a batch of JSON documents, or one field inside each of them. Every document is
-        borrowed for the length of the call rather than copied.
+        viewed for the length of the call rather than copied.
 
         Args:
           keys (Sequence[KeyLike] | buffer | None): The keys to write; None reads every key from

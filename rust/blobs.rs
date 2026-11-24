@@ -1,9 +1,10 @@
 //! Binary values - the Rust twin of `c/ustore/blobs.h`.
 //!
-//! Every verb takes a batch, and one operation is a batch of one. Keys cross as strided runs the ABI reads in place,
-//! and values as a tape or through an accessor over the entries carrying them, so nothing is staged on the way in;
-//! outputs land in the [`Arena`] the call borrows, so nothing is copied on the way out. A blocking view takes borrowed
-//! or owned inputs, while a deferred one takes only owned ones, and both borrow the arena.
+//! Every verb takes a batch, and one operation is a batch of one. Keys cross as strided runs the
+//! ABI reads in place, and values as a tape or through an accessor over the entries holding them,
+//! so nothing is staged on the way in; outputs land in the [`Arena`] the call borrows, so nothing
+//! is copied on the way out. A blocking view takes borrowed or owned inputs, while a deferred one
+//! takes only owned ones, and both borrow the arena.
 //!
 //! File: rust/blobs.rs
 //! Author: Ash Vardanian
@@ -233,7 +234,8 @@ impl<'value> Entry<'value> {
 mod sealed {
     use super::*;
 
-    /// The keys and values one write carries: borrowed entries, or owned keys beside an owned tape of their values.
+    /// The keys and values one write holds: borrowed entries, or owned keys beside an owned tape
+    /// of their values.
     pub trait Pairs {
         /// The keys and the values of the pairs, pointing into `self`, or `None` for no pairs at all.
         fn pairs(&self) -> Result<Option<PairsView>>;
@@ -927,13 +929,13 @@ pub struct Scan<'arena, 'matching> {
     scores: Address<f32>,
 }
 
-/// The keys one scan listed, and their BM25 scores when its patterns carried weights; see
+/// The keys one scan listed, and their BM25 scores when its patterns held weights; see
 /// [`On::scan`].
 #[derive(Clone, Copy, Debug)]
 pub struct Scanned<'arena> {
     /// The keys, in the order of the scan's direction.
     pub keys: &'arena [Key],
-    /// One score per key when the patterns carried weights.
+    /// One score per key when the patterns held weights.
     pub scores: Option<&'arena [f32]>,
 }
 
@@ -1393,7 +1395,7 @@ mod tests {
     }
 
     #[test]
-    fn entries_borrow_what_they_carry() {
+    fn entries_view_what_they_hold() {
         let value = [1u8, 2, 3];
         let entry = Entry::new(key(42), &value);
         assert_eq!(entry.key(), key(42));

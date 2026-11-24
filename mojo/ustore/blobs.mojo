@@ -2,7 +2,7 @@
 
 Every verb takes a batch, so a single operation is a batch of one. Keys arrive as a strided run and
 values as a tape, so a tape a read wrote is written back as it is. Every output whose length scales
-with the call lands in the `Arena` the verb takes, and the result borrows it in turn. The results
+with the call lands in the `Arena` the verb takes, and the result views it in turn. The results
 here also serve the documents, graph and pages verbs, which list keys and read values the same way.
 
 File: mojo/ustore/blobs.mojo
@@ -78,11 +78,11 @@ struct ValuesWritten(Defaultable, ImplicitlyCopyable):
 
 @fieldwise_init
 struct Values[origin: MutOrigin](Answer, Sized):
-    """What a read wrote into the arena it borrows: an Apache Arrow binary array of one value per task,
+    """What a read wrote into the arena it views: an Apache Arrow binary array of one value per task,
     a missing key reading as an unset presence bit and an empty value.
 
     Parameters:
-        origin: The arena the values live in, which this result borrows.
+        origin: The arena the values live in, which this result views.
     """
 
     comptime Written = ValuesWritten
@@ -93,7 +93,7 @@ struct Values[origin: MutOrigin](Answer, Sized):
     var written: ValuesWritten
     """The views the engine wrote."""
     var count: Int
-    """Tasks the read carried."""
+    """Tasks the read held."""
 
     def __init__(out self, arena: Address, generation: Int, written: ValuesWritten, count: Int):
         self.arena = Pointer[Arena, Self.origin](unsafe_from_address=arena)
@@ -102,7 +102,7 @@ struct Values[origin: MutOrigin](Answer, Sized):
         self.count = count
 
     def __len__(self) -> Int:
-        """The tasks the read carried."""
+        """The tasks the read held."""
         return self.count
 
     def present(self, index: Int) raises Error -> Bool:
@@ -136,10 +136,10 @@ struct KeyRunsWritten(Defaultable, ImplicitlyCopyable):
 
 @fieldwise_init
 struct KeyRuns[origin: MutOrigin](Answer, Sized):
-    """The keys a scan or a sample listed into the arena it borrows, run after run, one run per task.
+    """The keys a scan or a sample listed into the arena it views, run after run, one run per task.
 
     Parameters:
-        origin: The arena the keys live in, which this result borrows.
+        origin: The arena the keys live in, which this result views.
     """
 
     comptime Written = KeyRunsWritten
@@ -202,10 +202,10 @@ struct MeasuresWritten(Defaultable, ImplicitlyCopyable):
 
 @fieldwise_init
 struct Measures[origin: MutOrigin](Answer, Sized):
-    """The bounds a measure estimated into the arena it borrows, one per range.
+    """The bounds a measure estimated into the arena it views, one per range.
 
     Parameters:
-        origin: The arena the bounds live in, which this result borrows.
+        origin: The arena the bounds live in, which this result views.
     """
 
     comptime Written = MeasuresWritten
@@ -273,10 +273,10 @@ struct PulledWritten(Defaultable, ImplicitlyCopyable):
 
 @fieldwise_init
 struct Pulled[origin: MutOrigin](Answer, Sized):
-    """One page of a cursor's walk, read in place from the arena the pull borrows.
+    """One page of a cursor's walk, read in place from the arena the pull views.
 
     Parameters:
-        origin: The arena the page lives in, which this result borrows.
+        origin: The arena the page lives in, which this result views.
     """
 
     comptime Written = PulledWritten
@@ -317,8 +317,8 @@ struct BlobsReadConfig[offsets_origin: ImmOrigin = ImmUntrackedOrigin, limits_or
     """The ranges a read takes of each value, and whether it copies the bytes.
 
     Parameters:
-        offsets_origin: The borrowed start offsets.
-        limits_origin: The borrowed byte limits.
+        offsets_origin: The viewed start offsets.
+        limits_origin: The viewed byte limits.
     """
 
     var offsets: LengthsView[Self.offsets_origin]
@@ -347,8 +347,8 @@ struct BlobsScanConfig[end_origin: ImmOrigin = ImmUntrackedOrigin, patterns_orig
     """The bounds, order and filters of a scan over keys.
 
     Parameters:
-        end_origin: The borrowed end keys.
-        patterns_origin: The borrowed patterns.
+        end_origin: The viewed end keys.
+        patterns_origin: The viewed patterns.
     """
 
     var end_keys: KeysView[Self.end_origin]
@@ -364,7 +364,7 @@ struct BlobsScanConfig[end_origin: ImmOrigin = ImmUntrackedOrigin, patterns_orig
     var progress: Progress
     """Reports the scans finished, and stops the call where it says to."""
     var scores: Bool
-    """Whether one score per listed key comes too, when the patterns carry weights."""
+    """Whether one score per listed key comes too, when the patterns hold weights."""
 
     def __init__(
         out self,
@@ -391,7 +391,7 @@ struct BlobsCursorConfig[patterns_origin: ImmOrigin = ImmUntrackedOrigin](Implic
     """The bound, order and filters of a walk over one collection.
 
     Parameters:
-        patterns_origin: The borrowed patterns, compiled once when the walk opens.
+        patterns_origin: The viewed patterns, compiled once when the walk opens.
     """
 
     var end_key: Optional[Key]
@@ -585,7 +585,7 @@ struct BlobsCursorInitArguments(ImplicitlyCopyable):
 
 @fieldwise_init
 struct CursorNextArguments[name: StaticString](Arguments):
-    """`ustore_blobs_cursor_next_t`, and `ustore_docs_cursor_next_t` with the same layout."""
+    """`ustore_blobs_cursor_next_t`."""
 
     comptime Written = PulledWritten
     comptime symbol: StaticString = Self.name
@@ -836,7 +836,7 @@ struct BlobsCursor(Movable):
 
         Args:
             executor: The executor the pull runs on, of the kind the walk was opened for.
-            arena: The arena to rewind and refill, which the result borrows.
+            arena: The arena to rewind and refill, which the result views.
             wanted: Most keys the page holds; a page of fewer exhausts the walk.
             values: Whether the values of the page's keys come too.
             progress: Reports the pull, and may cancel it before the cursor advances.

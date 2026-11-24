@@ -23,7 +23,7 @@ typedef struct single_batch_stream_t {
     struct ArrowArray batch;
 } single_batch_stream_t;
 
-/** Lets go of nothing, as the schema a single-batch stream answers borrows the one it owns. */
+/** Lets go of nothing, as the schema a single-batch stream answers views the one it owns. */
 static void single_schema_release(struct ArrowSchema* schema) { schema->release = NULL; }
 
 static int single_get_schema(struct ArrowArrayStream* stream, struct ArrowSchema* out) {
@@ -49,7 +49,8 @@ static void single_release(struct ArrowArrayStream* stream) {
     stream->release = NULL;
 }
 
-/** The pointer @p capsule carries under @p name, or NULL with a TypeError naming the protocol @p method broke. */
+/** The pointer @p capsule holds under @p name, or NULL with a TypeError naming the protocol
+ *  @p method broke. */
 static void* capsule_pointer(PyObject* capsule, char const* name, char const* method) {
     void* const pointer = PyCapsule_IsValid(capsule, name) ? PyCapsule_GetPointer(capsule, name) : NULL;
     if (!pointer) PyErr_Format(PyExc_TypeError, "%s must answer a capsule named '%s'", method, name);

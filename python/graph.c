@@ -18,7 +18,7 @@
  *  @param[in] context The database and view the verb runs against.
  *  @param[in] verb The method's name, as a failure should read it.
  *  @param[in] arguments The fast-call arguments, positional ones first.
- *  @param[in] positional_arguments_count Positional arguments the call carried.
+ *  @param[in] positional_arguments_count Positional arguments the call held.
  *  @param[in] keyword_names_tuple The keyword names, or NULL when none followed.
  *  @param[in] required_positional Positional arguments the verb fixes.
  *  @param[out] options Where every shared keyword lands.
@@ -79,7 +79,7 @@ static void edge_batches_release(edge_batches_t* batches) {
  *  @param[in] context The database and view the verb runs against.
  *  @param[in] verb The method's name, as a failure should read it.
  *  @param[in] arguments The fast-call arguments, positional ones first.
- *  @param[in] positional_arguments_count Positional arguments the call carried.
+ *  @param[in] positional_arguments_count Positional arguments the call held.
  *  @param[in] keyword_names_tuple The keyword names, or NULL when none followed.
  *  @param[out] batches The keys and options the verb runs with.
  *  @return 0 on success, -1 with an exception set otherwise.

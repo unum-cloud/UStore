@@ -24,8 +24,8 @@ namespace unum::ustore {
  *  @brief Reads what @p answer_type_ asks of the values at @p places into @p arena: the values,
  *      their lengths, or only whether each is present.
  *  @param[in] receiver The database, executor, and transaction or snapshot the read sees.
- *  @param[in] places Collections and keys to read, borrowed until the call is final.
- *  @param[in] arena Memory the answer lands in, borrowed until the call is final, which
+ *  @param[in] places Collections and keys to read, owned by the caller until the call is final.
+ *  @param[in] arena Memory the answer lands in, owned by the caller until the call is final, which
  *      the answer views.
  *  @param[in] watch Whether a read inside a transaction records the keys for conflicts.
  */
@@ -53,7 +53,7 @@ answer<completion_, answer_type_> blobs_read_(receiver_t const& receiver, place_
 
 /**
  *  @brief Writes @p values to @p places pairwise, or one value to every place.
- *  @param[in] values Values to write, borrowed until the call is final.
+ *  @param[in] values Values to write, owned by the caller until the call is final.
  *  @param[in] durability Whether the call finishes only after the data reaches the disk.
  */
 template <ustore_completion_t completion_>

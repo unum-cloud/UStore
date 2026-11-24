@@ -164,7 +164,7 @@ struct table_index_view_t {
 };
 
 /** The header row of a table, naming the field and type of every column, each back to back, as a
- *  gather borrows them. */
+ *  gather views them. */
 struct table_header_view_t {
     std::string_view const* fields_begin {nullptr};
     ustore_docs_field_type_t const* types_begin {nullptr};

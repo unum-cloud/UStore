@@ -67,7 +67,7 @@ int main() {
 ## Collections
 
 No collection exists until one is created, and each collection type names the modality it holds as `modality_k`.
-`create` records it and refuses a name starting with `_`, which system collections keep, `find` refuses a collection holding another modality with `status_code_t::invalid_argument_k`, and `find_or_create` creates only when no collection carries the name.
+`create` records it and refuses a name starting with `_`, which system collections keep, `find` refuses a collection holding another modality with `status_code_t::invalid_argument_k`, and `find_or_create` creates only when no collection holds the name.
 A collection handle is cheap to construct and holds no state, so threads share one, each passing its own arena.
 A snapshot hands out the read-only twin of every collection, such as `docs_read_collection_t` for `find<docs_collection_t>`, so nothing writes through it.
 
@@ -145,6 +145,7 @@ for (std::size_t pulled = wanted; cursor_status.succeeded() && pulled == wanted;
 ```
 
 `strings_cursor_t::make` takes a prefix and an optional start string, and its `next` pulls strings in the order of their text.
+`docs_cursor_t::make` also takes the columns every row gathers, and its `next` pulls batches of rows, one per executor task that found any, none once the walk is exhausted.
 
 `sample` draws entries at random and `measure` bounds how many entries and bytes a range holds, on strings, documents and pages, while graphs spell them `sample_vertices` and `measure_vertices`.
 Both export into the arena they are given and answer deferred calls on a deferred handle.
@@ -185,7 +186,7 @@ A conflicting commit answers `status_code_t::write_conflict_k`, `read_conflict_k
 
 `db.on().snapshot()` pins the whole database at one point, and its `on()` hands out the read-only twin of every collection.
 `read_stamp()` is the stamp it reads at, and `save(path)` writes it out as a new database of the same engine, taking an optional progress callable.
-A progress callable answers `ustore_continue_k` or `ustore_cancel_k` and is `noexcept`, so one that may throw does not compile, and the call borrows it until it is final, so a temporary does not compile either.
+A progress callable answers `ustore_continue_k` or `ustore_cancel_k` and is `noexcept`, so one that may throw does not compile, and the call views it until it is final, so a temporary does not compile either.
 
 ```cpp
 expected<snapshot_t> snapshot = db.on().snapshot();
@@ -239,7 +240,7 @@ expected<values_view_t> rendered = pages.read(page, arena, {}, ustore_page_encod
 
 ### Gathered Tables
 
-`gather` reads fields of many documents into a `docs_table`, converting each field into its column type on a best-effort basis, and every cell carries `valid`, `converted` and `collides` flags beside its `value`.
+`gather` reads fields of many documents into a `docs_table`, converting each field into its column type on a best-effort basis, and every cell holds `valid`, `converted` and `collides` flags beside its `value`.
 A header whose column types are known at compile time is built column by column, and one known only at runtime views an array of fields and an array of types.
 
 ```cpp
@@ -280,7 +281,7 @@ edges_view_t of_missing = leaving->of_vertex(1); // empty, as vertex 7 is missin
 
 The receiver chooses where a call runs, and the verb stays, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#receivers--deferred-calls) describe in full.
 `db.on(executor)`, `transaction->on(executor)` and `snapshot->on(executor)` hand out the same collections, proxies and operators, whose calls block on the executor, and `deferred(executor)` hands out the deferred twin of every collection, whose verbs answer a `deferred<verb>` once submitted.
-RAII carries the lifetime rules: a deferred verb takes owned inputs, a `std::array`, an `st::vector` or a `values_tape_t`, so a borrowed span does not compile, while its arena is an `arena_t&` borrowed until the call is final.
+RAII holds the lifetime rules: a deferred verb takes owned inputs, a `std::array`, an `st::vector` or a `values_tape_t`, so a viewed span does not compile, while its arena is an `arena_t&` owned by the caller until the call is final.
 `status()` polls without blocking, `std::move(call).wait()` answers what the call produced, and a `deferred` dropped unwaited waits in its destructor.
 
 ```cpp
@@ -302,7 +303,7 @@ The deferred database also creates, drops and lists collections, and describes, 
 
 An executor owns the threads that run calls, serves one call at a time, and is shared by any number of databases, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#executors) describe.
 `executor_handle_t::for_ram` spawns host threads, and the handle frees the executor on destruction, waiting for the calls naming it.
-Opening blocks, as every constructor does: `init_ram`, `open_ram`, `open_rocksdb`, `view_rocksdb` and `open_leveldb` take the executor to block on as their last argument, while `open_nvme` blocks on the executor its options name.
+Opening blocks, as every constructor does: `init_ram`, `open_ram`, `open_rocksdb`, `view_rocksdb` and `open_leveldb` take the executor to block on as their last argument, while `open_nvme` and `view_nvme` block on the executor their options name.
 Either way the database runs its own calls on the calling thread until a receiver names an executor.
 
 ```cpp
@@ -384,7 +385,7 @@ status = db.on().compact_plan_finish(std::move(plan));
 
 ### Design
 
-- __Deferred inputs are owned, arenas borrowed.__
+- __Deferred inputs are owned, arenas viewed.__
   A `deferred<verb>` keeps one heap block that never moves, holding the outcome, the owned inputs and the outputs, while the C argument structure dies on the stack it was filled on.
 - __Answers view the arena.__
   A finished read answers the views a blocking one does, and a finished gather owns its rows, columns and field names beside a table whose cells stay in the arena.

@@ -48,7 +48,7 @@ byte copy_cached[2];
 byte copy_durable[2];
 
 /** The commit: which copy is in force and how many runs it measures, cached and durable. One
- *  logical block carries both, so they land together unless the commit spans two blocks. */
+ *  logical block holds both, so they land together unless the commit spans two blocks. */
 byte pointer_cached = 0;
 byte pointer_durable = 0;
 byte length_cached = 0;

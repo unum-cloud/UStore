@@ -109,8 +109,8 @@ active proctype device() {
     device_finished = 1
 }
 
-// The one thread that submits on this lease and reaps it, which is the only thread either is legal
-// from. It breaks when nothing anywhere can move, which is the quiescence the properties read.
+/** The one thread that submits on this claim and reaps it, which is the only thread either is legal
+ *  from. It breaks when nothing anywhere can move, which is the quiescence the properties read. */
 active proctype owner() {
     do
     :: atomic { submitted != requests && (!credit_bound || outstanding < credit) -> submitted++; flights++ }

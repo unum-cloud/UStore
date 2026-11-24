@@ -293,7 +293,7 @@ impl Accepts<StringsScanConfig<'static>> for Deferring {}
 mod sealed {
     use super::*;
 
-    /// The strings one batch carries: borrowed `&str` slices, or an owned tape of them.
+    /// The strings one batch holds: borrowed `&str` slices, or an owned tape of them.
     pub trait Texts {
         /// How many strings there are and their view, pointing into `self`, or `None` for no
         /// strings at all.
@@ -346,7 +346,7 @@ impl<'text> From<&'text str> for TextRange<'text> {
 }
 
 /// The view of the one string `text` holds, or a zeroed one when there is none.
-fn lent(text: &Option<&str>) -> ustore_strings_view_t {
+fn strings_view_of(text: &Option<&str>) -> ustore_strings_view_t {
     text.as_ref().map_or_else(ustore_strings_view_t::default, |text| {
         ustore_strings_view_t::accessor(string_views, ptr::from_ref(text).cast())
     })
@@ -390,7 +390,7 @@ impl<'arena> Mapped<'arena> {
 }
 
 /// The strings one scan or sample listed, as byte runs inside the arena, and the BM25 scores of a
-/// scan whose patterns carried weights.
+/// scan whose patterns held weights.
 #[derive(Clone, Copy, Debug)]
 pub struct Listing<'arena> {
     strings: Strings<'arena>,
@@ -436,7 +436,7 @@ impl<'arena> Listing<'arena> {
         Rows::new(*self, self.len(), |listing, index| listing.get(index).unwrap_or_default())
     }
 
-    /// One score per string when the patterns carried weights.
+    /// One score per string when the patterns held weights.
     pub fn scores(&self) -> Option<&'arena [f32]> {
         self.scores
     }
@@ -768,9 +768,9 @@ impl<'arena> Calling for StringsScan<'arena, '_, '_> {
             view: view.view(),
             count: 1,
             collections: ustore_strided_view_t::repeated(&self.collection),
-            prefixes: lent(&self.range.prefix),
-            start_strings: lent(&self.range.start),
-            end_strings: lent(&self.range.end),
+            prefixes: strings_view_of(&self.range.prefix),
+            start_strings: strings_view_of(&self.range.start),
+            end_strings: strings_view_of(&self.range.end),
             direction: self.range.direction,
             patterns: self.matched.lowered_patterns(),
             predicate: self.matched.lowered_predicate(),
@@ -881,8 +881,8 @@ impl Calling for StringsMeasure<'_, '_> {
             view: view.view(),
             count: 1,
             collections: ustore_strided_view_t::repeated(&self.collection),
-            start_strings: lent(&self.range.0),
-            end_strings: lent(&self.range.1),
+            start_strings: strings_view_of(&self.range.0),
+            end_strings: strings_view_of(&self.range.1),
             direction: ScanDirection::Ascending,
             min_cardinalities: &mut min_cardinalities.0,
             max_cardinalities: &mut max_cardinalities.0,
@@ -909,7 +909,7 @@ impl Calling for StringsMeasure<'_, '_> {
 
 // region: Names
 
-/// Creates a collection under `name`, which no other collection may carry, answering its identifier.
+/// Creates a collection under `name`, which no other collection may hold, answering its identifier.
 pub(crate) fn create_named(database: ustore_database_t, name: &str, modality: Modality) -> Result<CollectionID> {
     let mut collection = CollectionID::default();
     let mut outcome = ustore_outcome_t::default();

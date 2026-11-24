@@ -44,7 +44,7 @@ namespace unum::ustore {
 template <typename batch_type_>
 concept batch_concept = requires { typename std::remove_cvref_t<batch_type_>::value_type; };
 
-/** A batch that carries its own byte stride instead of stepping by the size of its elements. */
+/** A batch that holds its own byte stride instead of stepping by the size of its elements. */
 template <typename batch_type_>
 concept strided_batch_concept = batch_concept<batch_type_> &&
                                 requires(std::remove_cvref_t<batch_type_> const& elements) { elements.stride(); };
@@ -416,7 +416,7 @@ struct edges_span {
     edges_span(strided_span<id_type_> sources, strided_span<id_type_> targets, strided_span<id_type_> ids) noexcept
         : sources(sources), targets(targets), ids(ids) {}
 
-    /** Edges between @p sources and @p targets that all carry the default edge identifier. */
+    /** Edges between @p sources and @p targets that all hold the default edge identifier. */
     edges_span(strided_span<id_type_> sources, strided_span<id_type_> targets) noexcept
         : sources(sources), targets(targets) {
         static_assert(std::is_const_v<id_type_>,
@@ -590,7 +590,7 @@ struct places_arg_extractor {
         return {&locations, 0};
     }
 
-    /** A batch that carries its stride steps by it. */
+    /** A batch that holds its stride steps by it. */
     static strided_iterator<element_t const> elements(location_t const& locations) noexcept
         requires(!is_one_k && strided_batch_concept<location_t>)
     {
@@ -675,14 +675,14 @@ concept string_like_concept = std::same_as<element_type_, value_view_t> ||
 
 /** Whether @p text_type_ is a null-terminated string, which may be null. */
 template <typename text_type_>
-concept c_string_concept = std::is_convertible_v<text_type_ const&, char const*>;
+concept c_stdisk_concept = std::is_convertible_v<text_type_ const&, char const*>;
 
 /** The bytes @p text spells as an element of a batch, where a missing value spells an empty one. */
 inline ustore_bytes_view_t bytes_of(value_view_t const& text) noexcept { return text.bytes(); }
 
 /** The bytes @p text spells as an element of a batch, where a null string spells an empty one. */
 template <string_like_concept text_type_>
-    requires c_string_concept<text_type_>
+    requires c_stdisk_concept<text_type_>
 ustore_bytes_view_t bytes_of(text_type_ const& text) noexcept {
     char const* const string = text;
     return string ? bytes_of(std::string_view {string}) : ustore_bytes_view_t {};
@@ -736,7 +736,7 @@ inline ustore_strings_view_t tape_slice(ustore_strings_view_t tape, std::size_t 
 }
 
 /**
- *  @brief Lends a strided run of string-like elements to the C ABI through a
+ *  @brief Passes a strided run of string-like elements to the C ABI through a
  *      @c ustore_strings_view_t accessor, where a zero stride repeats the first element
  *      for every task.
  *
@@ -834,7 +834,7 @@ ustore_strings_view_t repeated_view_of(strings_type_ const& strings) noexcept {
     return view;
 }
 
-/** A batch of strings a verb reads where it lies, so a deferred call borrows it: a tape, or values
+/** A batch of strings a verb reads where it lies, so a deferred call views it: a tape, or values
  *  laid out back to back. */
 template <typename strings_type_>
 concept strings_batch_concept = requires(strings_type_ const& strings) {

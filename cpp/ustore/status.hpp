@@ -60,7 +60,7 @@ expected<answer_type_> answered_(ustore_outcome_t const& reported, outputs<answe
 
 /**
  *  @brief A submitted call: its outcome and its outputs, owned until the call is final, while the
- *      receiver, the inputs, the arena and the handlers it was handed stay borrowed until then.
+ *      receiver, the inputs, the arena and the handlers it was handed stay viewed until then.
  *
  *  It never moves, as the library writes into it, and its one owner polls @c status or blocks in @c
  *  wait; destruction waits the same way, so nothing the call writes into goes away under it.

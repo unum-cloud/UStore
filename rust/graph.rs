@@ -267,7 +267,7 @@ pub const fn degree_missing() -> Degree {
     Degree::MAX
 }
 
-/// The identifier an edge carries when it was given none, every bit of it set like [`key_unknown`].
+/// The identifier an edge holds when it was given none, every bit of it set like [`key_unknown`].
 pub const fn default_edge_id() -> Key {
     key_unknown()
 }
@@ -348,12 +348,12 @@ pub struct Edge {
 }
 
 impl Edge {
-    /// An edge carrying the default identifier.
+    /// An edge holding the default identifier.
     pub fn new(source: Key, target: Key) -> Self {
         Edge { source, target, id: default_edge_id() }
     }
 
-    /// An edge carrying its own identifier.
+    /// An edge holding its own identifier.
     pub fn with_id(source: Key, target: Key, id: Key) -> Self {
         Edge { source, target, id }
     }
@@ -1523,7 +1523,7 @@ mod tests {
     }
 
     #[test]
-    fn edges_carry_the_default_identifier_and_name_their_neighbors() {
+    fn edges_hold_the_default_identifier_and_name_their_neighbors() {
         assert_eq!(Edge::new(key(1), key(2)).id, default_edge_id());
         assert_eq!(Edge::new(key(1), key(2)).neighbor_of(key(2)), Some(key(1)));
         assert_eq!(Edge::new(key(1), key(2)).neighbor_of(key(3)), None);

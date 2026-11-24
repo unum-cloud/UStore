@@ -8,7 +8,7 @@
  *  This is `explicit_verbs.pml` with one blocking taker fewer, so that its weaker memory models fit
  *  a search. The taker is @c take with @c waiting at @c handoff, the trier is @c maintain. A taker
  *  refused by the trier announces itself, and the trier's release hands it the claim. Every holder
- *  reads the tally relaxed, so only the handoff's orders carry the trier's increment to the taker.
+ *  reads the tally relaxed, so only the handoff's orders bring the trier's increment to the taker.
  *
  *  - One holder at a time, and every holder reads its predecessors' writes.
  *  - The taker never parks for good.

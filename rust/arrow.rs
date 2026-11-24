@@ -102,7 +102,7 @@ pub struct ArrowArray {
 /// An Arrow array and the device holding its buffers, as `struct ArrowDeviceArray` lays them out.
 ///
 /// The buffers of an array on a device are addresses there, which only the raw pointers of
-/// [`ArrowArray`] carry, so no safe host slice ever reads them.
+/// [`ArrowArray`] hold, so no safe host slice ever reads them.
 #[repr(C)]
 #[derive(Debug)]
 pub struct ArrowDeviceArray {
@@ -354,7 +354,7 @@ struct Columns {
 /// Matches the children of `schema` to the columns of `modality` by name, refusing a missing, repeated or unknown one.
 fn resolve_columns(schema: &ArrowSchema, modality: Modality) -> Result<Columns> {
     let unknown =
-        fail(Status::InvalidArgument, "the stream carries a column its modality does not name, or names one twice");
+        fail(Status::InvalidArgument, "the stream holds a column its modality does not name, or names one twice");
     let mut columns = Columns::default();
     for index in 0..schema.n_children.max(0) as usize {
         // SAFETY: a live schema holds `n_children` live children, each named or not.
@@ -1457,7 +1457,8 @@ mod tests {
         assert_eq!(formats, [c"w:16", c"z"]);
         let mut rows = Vec::new();
         while let Some(batch) = stream.next_batch().unwrap() {
-            // SAFETY: the batch carries a keys child of two buffers and a values child of three, as its schema says.
+            // SAFETY: the batch holds a keys child of two buffers and a values child of three, as
+            // its schema says.
             unsafe {
                 let keys = &**batch.children;
                 let values = &**batch.children.add(1);
@@ -1539,7 +1540,7 @@ mod tests {
 
     #[test]
     #[cfg(not(feature = "rocksdb"))]
-    fn arrow_ingest_is_unsupported_and_takes_the_stream() {
+    fn arrow_ingest_lands_every_row_on_rocksdb() {
         crate::testing::skipped("built without the rocksdb feature");
     }
 }

@@ -29,7 +29,7 @@ namespace unum::ustore {
  *      @p completion_ says.
  *
  *  A blocking handle answers an @c outcome, while a deferred one answers a @c deferred call,
- *  borrowing the handle, its inputs and its arena until the call is final. A handle with
+ *  viewing the handle, its inputs and its arena until the call is final. A handle with
  *  @c collection_access_t::read_only_k only reads, as a snapshot hands out. It holds no state of
  *  its own, so any number of threads share it, and it never outlives its database.
  */
@@ -93,9 +93,9 @@ class blobs_collection_on {
     /**
      *  @brief Reads the values of @p keys into @p arena, the verb that reuses one arena
      *      call after call.
-     *  @param[in] keys Keys to read, borrowed until the call is final.
-     *  @param[in] arena Memory the values land in, borrowed until the call is final, which
-     *      the answer views.
+     *  @param[in] keys Keys to read, owned by the caller until the call is final.
+     *  @param[in] arena Memory the values land in, owned by the caller until the call is final,
+     *      which the answer views.
      *  @param[in] watch Whether a read inside a transaction records the keys for conflicts.
      */
     answer<completion_, values_view_t> read(keys_view_t keys, arena_t& arena,
@@ -105,8 +105,8 @@ class blobs_collection_on {
 
     /**
      *  @brief Writes @p values to @p keys pairwise.
-     *  @param[in] keys Keys to write, borrowed until the call is final.
-     *  @param[in] values One value per key, borrowed until the call is final.
+     *  @param[in] keys Keys to write, owned by the caller until the call is final.
+     *  @param[in] values One value per key, owned by the caller until the call is final.
      *  @param[in] durability Whether the call finishes only after the data reaches the disk.
      *
      *  @par Statuses:
@@ -125,7 +125,7 @@ class blobs_collection_on {
 
     /**
      *  @brief Removes @p keys together with their values.
-     *  @param[in] keys Keys to remove, borrowed until the call is final.
+     *  @param[in] keys Keys to remove, owned by the caller until the call is final.
      *  @param[in] durability Whether the call finishes only after the data reaches the disk.
      */
     answer<completion_, void> remove(keys_view_t keys,

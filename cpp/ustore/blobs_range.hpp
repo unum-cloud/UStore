@@ -274,8 +274,8 @@ using graph_vertices_cursor_t = keys_cursor<ustore_graph_vertices_cursor_t, usto
 
 /** Scans up to @p wanted keys of @p collection from @p start into @p arena through @p scan_, the
  *  scan of one modality keyed by UUIDs, at the view @p receiver reads, keeping the keys @p match
- *  admits, and writing one BM25 score per key into @p scores when it is not null and the patterns
- *  carry weights. */
+ *  admits, and writing one BM25 score per key into @p scores when it is not null and the
+ *  patterns hold weights. */
 template <typename scan_type_, void (*scan_)(scan_type_*)>
 expected<std::span<ustore_key_t const>> scan_keys_through(receiver_t receiver, ustore_collection_id_t collection,
                                                           ustore_key_t start, std::size_t wanted, arena_t& arena,
@@ -404,7 +404,7 @@ class keys_stream_t {
         return {};
     }
 
-    /** Advances like @c advance, but a failed pull ends the stream since a reference carries no
+    /** Advances like @c advance, but a failed pull ends the stream since a reference holds no
      *  status. */
     keys_stream_t& operator++() noexcept {
         if (advance().succeeded()) return *this;
@@ -505,7 +505,7 @@ class pairs_stream_t {
         return {};
     }
 
-    /** Advances like @c advance, but a failed pull ends the stream since a reference carries no
+    /** Advances like @c advance, but a failed pull ends the stream since a reference holds no
      *  status. */
     pairs_stream_t& operator++() noexcept {
         if (advance().succeeded()) return *this;
@@ -609,7 +609,7 @@ void measure_outputs_(measure_type_& measure, outputs<size_estimates_t>& written
  *  @brief Draws up to @p wanted keys of @p collection at random into @p arena through
  *      @p sample_, the sample of one modality keyed by UUIDs, as the documents, the vertices and
  *      the pages are.
- *  @param[in] collection Collection to draw from, borrowed until the call is final.
+ *  @param[in] collection Collection to draw from, owned by the caller until the call is final.
  */
 template <ustore_completion_t completion_, typename sample_type_, void (*sample_)(sample_type_*)>
 answer<completion_, std::span<ustore_key_t const>> sample_keys_(receiver_t const& receiver,
@@ -638,9 +638,9 @@ answer<completion_, std::span<ustore_key_t const>> sample_keys_(receiver_t const
  *  @brief Estimates the entries and the space between @p start_key, inclusive, and @p end_key,
  *      exclusive, of @p collection into @p arena through @p measure_, the measure of one modality
  *      keyed by UUIDs.
- *  @param[in] collection Collection to measure, borrowed until the call is final.
- *  @param[in] start_key First key of the range, borrowed until the call is final.
- *  @param[in] end_key Key the range stops before, borrowed until the call is final.
+ *  @param[in] collection Collection to measure, owned by the caller until the call is final.
+ *  @param[in] start_key First key of the range, owned by the caller until the call is final.
+ *  @param[in] end_key Key the range stops before, owned by the caller until the call is final.
  */
 template <ustore_completion_t completion_, typename measure_type_, void (*measure_)(measure_type_*)>
 answer<completion_, size_estimates_t> measure_keys_(receiver_t const& receiver,

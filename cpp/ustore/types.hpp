@@ -372,8 +372,9 @@ class executor_handle_t {
         return static_cast<std::size_t>(count);
     }
 
-    /** Opens one submission stream on the NVIDIA or AMD device @p options name by its UStore
-     *  ordinal, fed by the calling thread; an NVMe database compacts on it on an NVIDIA device. */
+    /** Orders work on one stream of the device @p options name by its UStore ordinal, the caller's
+     *  or the device's default one, fed by the calling thread; an NVMe database compacts on it on
+     *  an NVIDIA device. */
     static expected<executor_handle_t> for_vram(ustore_executor_for_vram_t options = {}) noexcept {
         return make_(ustore_executor_for_vram, options);
     }
@@ -388,14 +389,15 @@ class executor_handle_t {
 };
 
 /** Whether @p progress_type_ can watch a long call: given the units finished and the units in
- *  total, it answers whether the call carries on, and never throws. */
+ *  total, it answers whether the call continues, and never throws. */
 template <typename progress_type_>
 concept progress_concept = requires(progress_type_& progress, ustore_size_t finished, ustore_size_t total) {
     { progress(finished, total) } noexcept -> std::same_as<ustore_continuation_t>;
 };
 
-/** A callable lent to a long call as the C ABI receives it, a callback and the state it reads, or
- *  neither for a call nothing watches. The call borrows the callable until it is final. */
+/** A callable the caller keeps alive for a long call, as the C ABI receives it, a callback and
+ *  the state it reads, or neither for a call nothing watches. The call views the callable until
+ *  it is final. */
 class progress_arg_t {
 
     template <progress_concept progress_type_>
@@ -413,7 +415,7 @@ class progress_arg_t {
 
     progress_arg_t() noexcept = default;
 
-    /** Lends @p progress, which answers @c ustore_cancel_k to stop the call. */
+    /** Views @p progress, which answers @c ustore_cancel_k to stop the call. */
     template <progress_concept progress_type_>
     progress_arg_t(progress_type_& progress) noexcept : callback(&report_<progress_type_>), state(&progress) {}
 };

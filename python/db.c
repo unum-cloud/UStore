@@ -307,7 +307,7 @@ static char const doc_Database_open_rocksdb[] =                                 
     "Returns:\n"                                                                             //
     "  Database: The opened database.\n"                                                     //
     "Raises:\n"                                                                              //
-    "  UnsupportedError: This build carries no RocksDB engine.";
+    "  UnsupportedError: This build holds no RocksDB engine.";
 
 /** Reads the arguments both RocksDB constructors take: the directory, the data directories and the executor. */
 static int rocksdb_opening(opening_t* opening, char const* verb, PyObject* const* arguments,
@@ -370,7 +370,7 @@ static char const doc_Database_view_rocksdb[] =                                 
     "Returns:\n"                                                                             //
     "  Database: The opened database.\n"                                                     //
     "Raises:\n"                                                                              //
-    "  UnsupportedError: This build carries no RocksDB engine.";
+    "  UnsupportedError: This build holds no RocksDB engine.";
 
 static PyObject* Database_view_rocksdb(PyObject* Py_UNUSED(type), PyObject* const* arguments,
                                        Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
@@ -406,7 +406,7 @@ static char const doc_Database_open_leveldb[] =                                 
     "Returns:\n"                                                                             //
     "  Database: The opened database.\n"                                                     //
     "Raises:\n"                                                                              //
-    "  UnsupportedError: This build carries no LevelDB engine.";
+    "  UnsupportedError: This build holds no LevelDB engine.";
 
 static PyObject* Database_open_leveldb(PyObject* Py_UNUSED(type), PyObject* const* arguments,
                                        Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
@@ -467,7 +467,7 @@ static char const doc_Database_open_nvme[] =                                    
     "Returns:\n"                                                                                 //
     "  Database: The opened database.\n"                                                         //
     "Raises:\n"                                                                                  //
-    "  UnsupportedError: This build carries no NVMe engine, or no class it compiled fits\n"      //
+    "  UnsupportedError: This build holds no NVMe engine, or no class it compiled fits\n"        //
     "    under the `cpu_class_ceiling` on this CPU.\n"                                           //
     "  DeviceError: The `compactions` executor was not made by Executor.for_vram().";
 
@@ -655,7 +655,7 @@ static int database_context(PyObject* self, char const* verb, ustore_py_context_
 
 /**
  *  @brief Reads the `progress` keyword a verb takes after its @p required positional arguments, its only keyword.
- *  @param[out] progress The callable, borrowed, or NULL when the call carried none.
+ *  @param[out] progress The callable, viewed, or NULL when the call held none.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
 static int progress_keyword(char const* verb, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
@@ -935,7 +935,7 @@ static char const doc_Database_describe[] =                                     
     "\n"                                                                                   //
     "Returns:\n"                                                                           //
     "  Description: The `capabilities`, `engine`, `isolation`, `keys`, `memory_bytes`,\n"  //
-    "  `disk_bytes`, `pin_refused_bytes` and `crossing_requests` of the database.";
+    "  `disk_bytes`, `unpinned_staging_bytes` and `requests_across_registered_slots` of the database.";
 
 static void describe_submit(void* arguments) { ustore_database_describe((ustore_database_describe_t*)arguments); }
 
@@ -980,7 +980,7 @@ static char const doc_Database_collection_create[] =                            
     "Returns:\n"                                                                              //
     "  UUID: The identifier addressing the new collection.\n"                                 //
     "Raises:\n"                                                                               //
-    "  AlreadyExistsError: A collection already carries the name.\n"                          //
+    "  AlreadyExistsError: A collection already holds the name.\n"                            //
     "  InvalidArgumentError: The name is empty or starts with `_`, reserved for the system.";
 
 static PyObject* Database_collection_create(PyObject* self, PyObject* const* arguments,
@@ -1049,7 +1049,7 @@ static char const doc_Database_collection_find[] =                              
     "Returns:\n"                                                                         //
     "  UUID: The identifier addressing the collection.\n"                                //
     "Raises:\n"                                                                          //
-    "  NotFoundError: No collection carries the name.";
+    "  NotFoundError: No collection holds the name.";
 
 /** A lookup of the collection one name addresses, whose identifier lands in the arena its header holds. */
 typedef struct find_call_t {
@@ -1126,12 +1126,12 @@ static PyObject* Database_collection_find(PyObject* self, PyObject* const* argum
     return ustore_py_call_run(&context, &find_verb, call, &find);
 }
 
-static char const doc_Database_collection_contains[] =                           //
-    "collection_contains(name) answers whether a collection carries the name.\n" //
-    "\n"                                                                         //
-    "Args:\n"                                                                    //
-    "  name (str): The name to look for.\n"                                      //
-    "Returns:\n"                                                                 //
+static char const doc_Database_collection_contains[] =                         //
+    "collection_contains(name) answers whether a collection holds the name.\n" //
+    "\n"                                                                       //
+    "Args:\n"                                                                  //
+    "  name (str): The name to look for.\n"                                    //
+    "Returns:\n"                                                               //
     "  bool: Whether the name is taken.";
 
 static PyObject* Database_collection_contains(PyObject* self, PyObject* name_object) {
@@ -1231,9 +1231,9 @@ static char const doc_Database_collection_names[] =                             
     "Args:\n"                                                                                  //
     "  arena (Arena): Where the listing lands before it is copied out, rewound by this\n"      //
     "    call.\n"                                                                              //
-    "  after (str, optional): The smallest name the page may carry; None starts at the\n"      //
+    "  after (str, optional): The smallest name the page may hold; None starts at the\n"       //
     "    first one. The name given is itself included, so a resuming caller drops it.\n"       //
-    "  limit (int, optional): Most names the page carries.\n"                                  //
+    "  limit (int, optional): Most names the page holds.\n"                                    //
     "Returns:\n"                                                                               //
     "  tuple[str, ...]: The names recorded for collections, in order.";
 
@@ -1287,7 +1287,7 @@ static char const doc_Database_collection_drop[] =                              
     "    in it, `DropMode.PAIRS` removes every key and value, and `DropMode.VALUES` every\n" //
     "    value.\n"                                                                           //
     "Raises:\n"                                                                              //
-    "  NotFoundError: No collection carries the name.";
+    "  NotFoundError: No collection holds the name.";
 
 static PyObject* Database_collection_drop(PyObject* self, PyObject* const* arguments,
                                           Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
