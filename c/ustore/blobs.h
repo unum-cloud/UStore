@@ -277,8 +277,8 @@ typedef struct ustore_blobs_scan_t {
     /** Output for the found keys, scan after scan, inside @c arena. */
     ustore_key_t const** keys;
 
-    /** Optional output for one BM25 score per listed key when @c patterns carry weights, inside @c arena; @c NULL
-     *  skips them. */
+    /** Optional output for one BM25 score per listed key when @c patterns hold weights, inside @c
+     *  arena; @c NULL skips them. */
     float const** scores;
 
     /** Rewound by this call, then holding every output it writes; @c NULL is refused. */

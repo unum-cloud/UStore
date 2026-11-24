@@ -31,7 +31,7 @@ namespace unum::ustore::test::abi {
 #pragma region Write And Read Calls
 
 /** The value every deferred write stores under each of its keys, in static storage, since a
- *  deferred call borrows what its struct points to until final. */
+ *  deferred call views what its struct points to until final. */
 constexpr std::string_view stored_value_k = "value";
 strided_strings<std::string_view> const stored_values_k {{&stored_value_k, 0}};
 
@@ -54,9 +54,8 @@ inline bool write_text(ustore_database_t database, ustore_collection_id_t const&
     return expect_success(outcome);
 }
 
-/** Submits one deferred write of @c stored_value_k per key of @p keys in @p collection
- *  to @p executor, each into its own outcome, borrowing @p collection until every
- *  write is final. */
+/** Submits one deferred write of @c stored_value_k per key of @p keys in @p collection to @p
+ *  executor, each into its own outcome, viewing @p collection until every write is final. */
 inline void submit_writes(ustore_database_t database, ustore_collection_id_t const& collection,
                           ustore_executor_t executor, std::span<ustore_key_t const> keys,
                           std::span<ustore_outcome_t> outcomes) noexcept {
@@ -74,16 +73,30 @@ inline void submit_writes(ustore_database_t database, ustore_collection_id_t con
     }
 }
 
-/** An executor of two threads. */
-expected<ustore_executor_t> spawn_executor() noexcept {
+/** An executor of @p threads threads, each keeping at most @p scratch_limit bytes of scratch, zero
+ *  for the default, of the kind the engine under test takes: NVMe queues moving bytes as the
+ *  suite's transport names on NVMe, host threads on every other engine. */
+expected<ustore_executor_t> spawn_executor(std::size_t threads = 2, std::size_t scratch_limit = 0) noexcept {
+    engine_names_t names;
+    if (unnamed_flag_t const unnamed = read_engine_names(test_run.settings.engine, names); !unnamed.flag.empty())
+        return {{}, status_t {status_code_t::invalid_argument_k, "The suite's engine has no such name"}};
     ustore_executor_t executor = nullptr;
     ustore_outcome_t outcome {};
-    ustore_executor_for_ram_t spawn {
-        .executor = &executor,
-        .outcome = &outcome,
-        .threads = 2,
-    };
-    ustore_executor_for_ram(&spawn);
+    if (names.engine == ustore_engine_nvme_k) {
+        ustore_executor_for_nvme_t spawn {.executor = &executor,
+                                          .outcome = &outcome,
+                                          .nvme = {.transport = names.transport},
+                                          .threads = threads,
+                                          .scratch_limit = scratch_limit};
+        ustore_executor_for_nvme(&spawn);
+    }
+    else {
+        ustore_executor_for_ram_t spawn {.executor = &executor,
+                                         .outcome = &outcome,
+                                         .threads = threads,
+                                         .scratch_limit = scratch_limit};
+        ustore_executor_for_ram(&spawn);
+    }
     if (outcome.status != ustore_status_success_k) return {{}, status_of<status_t, status_code_t>(outcome)};
     return {executor};
 }
@@ -108,6 +121,16 @@ inline expected<ustore_collection_id_t> collection_named(ustore_database_t datab
     if (outcome.status != ustore_status_success_k) return {{}, status_of<status_t, status_code_t>(outcome)};
     if (!(presences[0] & 1)) return {{}, status_t {status_code_t::not_found_k, "No such collection"}};
     return {collections[0]};
+}
+
+/** The C++ handle of an executor of two threads of the kind the engine under test takes, moving
+ *  bytes as the suite's transport names on NVMe. */
+inline expected<executor_t> spawn_executor_handle() noexcept {
+    engine_names_t names;
+    if (unnamed_flag_t const unnamed = read_engine_names(test_run.settings.engine, names); !unnamed.flag.empty())
+        return {{}, status_t {status_code_t::invalid_argument_k, "The suite's engine has no such name"}};
+    if (names.engine != ustore_engine_nvme_k) return executor_t::for_ram({.threads = 2});
+    return executor_t::for_nvme({.nvme = {.transport = names.transport}, .threads = 2});
 }
 
 /** Creates a collection named @p name, which holds @p modality. */

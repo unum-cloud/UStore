@@ -1,9 +1,9 @@
 //! JSON documents - the Rust twin of `c/ustore/docs.h`.
 //!
-//! The ABI carries documents as JSON text both ways and parses them inside the engine, so nothing here
-//! parses JSON. A field is a top-level key or an RFC 6901 pointer, which crosses as the bytes of a `&str`
-//! with no terminator, so a `"/user/name"` literal crosses as it stands, and an empty field addresses the
-//! whole document.
+//! The ABI holds documents as JSON text both ways and parses them inside the engine, so nothing
+//! here parses JSON. A field is a top-level key or an RFC 6901 pointer, which crosses as the bytes
+//! of a `&str` with no terminator, so a `"/user/name"` literal crosses as it stands, and an empty
+//! field addresses the whole document.
 //!
 //! ```no_run
 //! use ustore::{Arena, Column, Database, DocsVerbs, DocumentEntry, Durability, FieldAddress, FieldEntry, RAMOptions};
@@ -37,7 +37,7 @@
 //! let fields = [FieldEntry::<i64>::new(ada, "age", &36), FieldEntry::<Json>::new(ada, "name", "\"Ada\"")];
 //! ```
 //!
-//! A batch of whole documents carries one format too, so the same mixture is refused there:
+//! A batch of whole documents holds one format too, so the same mixture is refused there:
 //!
 //! ```compile_fail
 //! use ustore::{DocumentEntry, Json, Key};
@@ -46,7 +46,7 @@
 //! let documents = [DocumentEntry::<Json>::new(ada, "{}"), DocumentEntry::<i64>::new(born, &1815)];
 //! ```
 //!
-//! Neither [`Half`] nor [`UUID`] is a format a write carries, so a document written as one does not
+//! Neither [`Half`] nor [`UUID`] is a format a write holds, so a document written as one does not
 //! compile either, however it reads back in a gathered column:
 //!
 //! ```compile_fail
@@ -55,8 +55,8 @@
 //! let documents = [DocumentEntry::<Half>::new(Key::from(1u64), &Half(0x3e00))];
 //! ```
 //!
-//! Gathered columns borrow the arena like any other result, so the call that would overwrite them does not compile
-//! while they live:
+//! Gathered columns view the arena like any other result, so the call that would overwrite them
+//! does not compile while they live:
 //!
 //! ```compile_fail,E0499
 //! use ustore::{Arena, Column, RAMOptions, Database, Key, Modality, Text, DocsVerbs};
@@ -87,7 +87,7 @@ use std::str::FromStr;
 use stringtape::CharsTape;
 
 use crate::arrow::{ArrowDeviceArray, ArrowExport, ArrowSchema, ffi as arrow_ffi};
-use crate::blobs::{Bounds, Found, Measurement, Page, Values};
+use crate::blobs::{Bounds, Found, Measurement, Values};
 use crate::db::ffi::{
     ustore_arena_t, ustore_byte_t, ustore_bytes_view_t, ustore_collection_id_t, ustore_collections_view_t,
     ustore_completion_t, ustore_database_t, ustore_durability_t, ustore_enum_t, ustore_executor_t, ustore_key_t,
@@ -98,8 +98,8 @@ use crate::db::ffi::{
 use crate::db::sealed::{Accepts, Calling, Completion, Handles, TapeOffset, Writable};
 use crate::db::{
     Address, Arena, CollectionID, Collections, CursorOn, Deferrable, Deferring, Durability, Error, Executor, Key,
-    KeyRange, Matching, On, Progress, Result, Rows, ScanMode, Status, Strings, UUID, ViewVerbs, check, exported_slice,
-    fail, host_arena, lowered_progress, read_spelling, spelling,
+    KeyRange, Matching, On, Progress, Result, Rows, ScanMode, Status, Strings, UUID, ViewVerbs, check, executor_handle,
+    exported_slice, fail, host_arena, lowered_progress, read_spelling, spelling,
 };
 
 // region: Raw Declarations
@@ -224,6 +224,17 @@ pub(crate) mod ffi {
         pub direction: ustore_scan_direction_t,
         pub filter: ustore_bytes_view_t,
         pub predicate: ustore_predicate_t,
+        pub fields_count: ustore_size_t,
+        pub fields: ustore_strings_view_t,
+        pub columns_types: *const ustore_enum_t,
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    pub struct ustore_docs_batch_view_t {
+        pub count: ustore_size_t,
+        pub keys: *const ustore_key_t,
+        pub columns: *const ustore_docs_column_view_t,
     }
 
     #[repr(C)]
@@ -233,9 +244,8 @@ pub(crate) mod ffi {
         pub outcome: *mut ustore_outcome_t,
         pub completion: ustore_completion_t,
         pub cursor: ustore_docs_cursor_t,
-        pub keys: *mut *const ustore_key_t,
-        pub values: *mut ustore_strings_view_t,
-        pub written: *mut ustore_size_t,
+        pub batches: *mut *const ustore_docs_batch_view_t,
+        pub batches_count: *mut ustore_size_t,
         pub arena: ustore_arena_t,
         pub wanted: ustore_size_t,
         pub progress: ustore_progress_callback_t,
@@ -340,14 +350,15 @@ pub(crate) mod sealed {
         const TYPE: c_int;
     }
 
-    /// What one docs write carries: whole documents under their keys, documents keyed by a field of their own, or
-    /// values written into fields, each borrowed or owned.
+    /// What one docs write holds: whole documents under their keys, documents keyed by a field of
+    /// their own, or values written into fields, each viewed or owned.
     pub trait Writes {
         /// The tasks of the batch, pointing into `self`, or `None` for no documents.
         fn tasks(&self) -> Result<Option<WriteTasks>>;
     }
 
-    /// What one docs read addresses: whole documents under keys, or fields inside them, borrowed or owned.
+    /// What one docs read addresses: whole documents under keys, or fields inside them,
+    /// viewed or owned.
     pub trait Addresses {
         /// The keys and fields of the batch, pointing into `self`.
         fn tasks(&self) -> Result<ReadTasks>;
@@ -376,7 +387,7 @@ use sealed::{Addresses, Format, ReadTasks, WriteTasks, Writes};
 /// A fixed-width value a gathered column converts into.
 pub trait Scalar: Format + Copy {}
 
-/// A scalar a write carries into a whole document or into one of its fields.
+/// A scalar a write puts into a whole document or into one of its fields.
 ///
 /// [`Half`] and [`UUID`] are gathered but never written: the engine builds a document from the bytes
 /// of a scalar and has no JSON spelling for either.
@@ -479,7 +490,7 @@ impl WritableScalar for u16 {}
 impl WritableScalar for u8 {}
 impl WritableScalar for bool {}
 
-/// The format of the values one field write carries, which the whole batch shares.
+/// The format of the values one field write holds, which the whole batch shares.
 pub trait FieldFormat: Format {
     /// What a field of this format is written from.
     type Value: ?Sized;
@@ -525,8 +536,9 @@ pub trait ColumnFormat: Format {}
 impl<Value: Scalar> ColumnFormat for Value {}
 impl ColumnFormat for Text {}
 impl ColumnFormat for Binary {}
+impl ColumnFormat for Json {}
 
-/// How a write combines what it carries with what the document already holds.
+/// How a write combines what it holds with what the document already holds.
 #[repr(i32)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Hash)]
 pub enum Modification {
@@ -537,9 +549,9 @@ pub enum Modification {
     Update = 1,
     /// Creates the document or the field, which must not exist.
     Insert = 2,
-    /// Applies the carried RFC 6902 patch.
+    /// Applies the held RFC 6902 patch.
     Patch = 3,
-    /// Applies the carried RFC 7386 merge patch.
+    /// Applies the held RFC 7386 merge patch.
     Merge = 4,
 }
 
@@ -670,13 +682,13 @@ impl FromStr for FieldType {
 pub struct DocumentEntry<'value, Format: FieldFormat> {
     key: Key,
     value: ustore_bytes_view_t,
-    marker: PhantomData<&'value Format::Value>,
+    caller_value: PhantomData<&'value Format::Value>,
 }
 
 impl<'value, Format: FieldFormat> DocumentEntry<'value, Format> {
     /// Pairs a key with the document to store under it.
     pub fn new(key: Key, value: &'value Format::Value) -> Self {
-        DocumentEntry { key, value: Format::bytes(value).into(), marker: PhantomData }
+        DocumentEntry { key, value: Format::bytes(value).into(), caller_value: PhantomData }
     }
 
     /// The key this entry stores under.
@@ -685,25 +697,25 @@ impl<'value, Format: FieldFormat> DocumentEntry<'value, Format> {
     }
 }
 
-/// A document carrying its own key under an id field, which [`KeyedBy`] names, laid out so a slice of them crosses
-/// through an accessor.
+/// A document holding its own key under an id field, which [`KeyedBy`] names, laid out so a slice
+/// of them crosses through an accessor.
 #[repr(C)]
 #[derive(Clone, Copy, Debug)]
 pub struct Document<'text> {
     text: ustore_bytes_view_t,
-    marker: PhantomData<&'text str>,
+    caller_text: PhantomData<&'text str>,
 }
 
 impl<'text> Document<'text> {
-    /// Borrows the JSON text of a document.
+    /// Views the JSON text of a document.
     pub fn new(text: &'text str) -> Self {
-        Document { text: text.as_bytes().into(), marker: PhantomData }
+        Document { text: text.as_bytes().into(), caller_text: PhantomData }
     }
 }
 
-/// Documents carrying their keys under one field of their own, as a docs write takes them: borrowed [`Document`]
-/// values, or an owned `stringtape::CharsTape` of JSON texts, which a deferred write needs beside an owned or
-/// `'static` field.
+/// Documents holding their keys under one field of their own, as a docs write takes them: viewed
+/// [`Document`] values, or an owned `stringtape::CharsTape` of JSON texts, which a deferred write
+/// needs beside an owned or `'static` field.
 #[derive(Clone, Debug)]
 pub struct KeyedBy<Field, Texts>(
     /// The field holding the key of every document, such as "_id": a non-negative integer, spelled as
@@ -720,13 +732,18 @@ pub struct FieldEntry<'value, Format: FieldFormat> {
     key: Key,
     field: ustore_bytes_view_t,
     value: ustore_bytes_view_t,
-    marker: PhantomData<&'value Format::Value>,
+    caller_value: PhantomData<&'value Format::Value>,
 }
 
 impl<'value, Format: FieldFormat> FieldEntry<'value, Format> {
     /// Pairs a field with the value to write into it.
     pub fn new(key: Key, field: &'value str, value: &'value Format::Value) -> Self {
-        FieldEntry { key, field: field.as_bytes().into(), value: Format::bytes(value).into(), marker: PhantomData }
+        FieldEntry {
+            key,
+            field: field.as_bytes().into(),
+            value: Format::bytes(value).into(),
+            caller_value: PhantomData,
+        }
     }
 }
 
@@ -736,17 +753,17 @@ impl<'value, Format: FieldFormat> FieldEntry<'value, Format> {
 pub struct FieldAddress<'field> {
     key: Key,
     field: ustore_bytes_view_t,
-    marker: PhantomData<&'field str>,
+    caller_field: PhantomData<&'field str>,
 }
 
 impl<'field> FieldAddress<'field> {
     /// Addresses `field` of the document under `key`.
     pub fn new(key: Key, field: &'field str) -> Self {
-        FieldAddress { key, field: field.as_bytes().into(), marker: PhantomData }
+        FieldAddress { key, field: field.as_bytes().into(), caller_field: PhantomData }
     }
 }
 
-/// A field to gather from every document, borrowed or owned, and the type to convert it into.
+/// A field to gather from every document, viewed or owned, and the type to convert it into.
 #[derive(Clone, Debug)]
 pub struct Column<'field> {
     field: Cow<'field, str>,
@@ -761,7 +778,7 @@ impl<'field> Column<'field> {
 }
 
 /// Writes the view of the field of every column `indices` names out of the slice of [`Column`]s at `handle`.
-unsafe extern "C" fn column_fields(
+pub(crate) unsafe extern "C" fn column_fields(
     handle: *const c_void,
     indices: *const ustore_size_t,
     count: ustore_size_t,
@@ -995,7 +1012,7 @@ impl From<usize> for DocsSampleConfig {
 /// The typed columns a gather reads; see [`DocsVerbs::docs_gather`].
 #[derive(Clone, Copy, Debug)]
 pub struct DocsGatherConfig<Requested> {
-    /// The fields and the format each lands in, borrowed or owned.
+    /// The fields and the format each lands in, viewed or owned.
     pub columns: Requested,
 }
 
@@ -1005,16 +1022,26 @@ impl<Requested> From<Requested> for DocsGatherConfig<Requested> {
     }
 }
 
-/// What admits the keys a cursor hands out; see [`On::docs_cursor`].
+/// What admits the rows a cursor hands out, and the columns it gathers from each; see
+/// [`On::docs_cursor`].
 #[derive(Debug, Default)]
 pub struct DocsCursorConfig<'config> {
     /// Admits only the documents its filter and predicate approve; every document by default.
     pub matching: Matching<'config>,
+    /// The columns every row gathers, the empty field gathered as [`Json`] being the whole
+    /// document; none for keys alone.
+    pub columns: Vec<Column<'config>>,
 }
 
 impl<'config> From<Matching<'config>> for DocsCursorConfig<'config> {
     fn from(matching: Matching<'config>) -> Self {
-        DocsCursorConfig { matching }
+        DocsCursorConfig { matching, columns: Vec::new() }
+    }
+}
+
+impl<'config> From<Vec<Column<'config>>> for DocsCursorConfig<'config> {
+    fn from(columns: Vec<Column<'config>>) -> Self {
+        DocsCursorConfig { matching: Matching::default(), columns }
     }
 }
 
@@ -1165,7 +1192,7 @@ impl<'arena> IntoIterator for &StringColumn<'arena> {
 pub struct Columns<'arena, Requested> {
     requested: Requested,
     rows: usize,
-    /// The arena holding the columns, borrowed for `'arena`.
+    /// The arena holding the columns, held for `'arena`.
     arena: ustore_arena_t,
     /// One view per requested column, or none for a gather that reached no engine.
     views: &'arena [ffi::ustore_docs_column_view_t],
@@ -1207,21 +1234,21 @@ impl<'arena, 'field, Requested: AsRef<[Column<'field>]>> Columns<'arena, Request
         };
         host_arena(self.arena)?;
         // SAFETY: a successful gather writes every row of a column of the requested type into the arena, which stays
-        // borrowed; a C++ `bool` holds only zero or one.
+        // held; a C++ `bool` holds only zero or one.
         Ok(unsafe { exported_slice(view.scalars.cast::<Value>(), self.rows) })
     }
 
-    /// The values of a column gathered as [`Text`] or [`Binary`].
+    /// The values of a column gathered as [`Text`], [`Binary`] or [`Json`].
     pub fn strings(&self, column: usize) -> Result<StringColumn<'arena>> {
         let terminator = match self.requested_format(column)? {
             Text::TYPE => 1,
-            Binary::TYPE => 0,
+            Binary::TYPE | Json::TYPE => 0,
             _ => return Err(fail(Status::InvalidArgument, "the column was not gathered as strings")),
         };
         let validities = self.bitmap(column, |view| view.validities)?.unwrap_or(Bitmap { bytes: &[], count: 0 });
         let strings = match self.views.get(column) {
             // SAFETY: a successful gather exports the strings of every row of a string column as a tape in the arena,
-            // which stays borrowed.
+            // which stays held.
             Some(view) => unsafe { Strings::exported(view.strings, self.rows)? },
             None => Strings::empty(),
         };
@@ -1233,7 +1260,7 @@ impl<'arena, 'field, Requested: AsRef<[Column<'field>]>> Columns<'arena, Request
     ///
     /// Scalars and [`Binary`] columns export in place, and [`Text`] ones copied without their
     /// terminators. The columns of a device arena stay on the device, as
-    /// [`ArrowDeviceArray::device_type`] says. Each export borrows the arena, so the call that
+    /// [`ArrowDeviceArray::device_type`] says. Each export views the arena, so the call that
     /// would rewind it does not compile while one lives:
     ///
     /// ```compile_fail,E0499
@@ -1259,7 +1286,7 @@ impl<'arena, 'field, Requested: AsRef<[Column<'field>]>> Columns<'arena, Request
         for (column, request) in (0..self.views.len()).zip(self.requested.as_ref()) {
             let mut schema = ArrowSchema::empty();
             let mut array = ArrowDeviceArray::empty();
-            // SAFETY: the view is an address in the borrowed arena, which the library reads
+            // SAFETY: the view is an address in the held arena, which the library reads
             // wherever it lives.
             let status = unsafe {
                 arrow_ffi::ustore_docs_column_view_to_arrow(
@@ -1272,7 +1299,7 @@ impl<'arena, 'field, Requested: AsRef<[Column<'field>]>> Columns<'arena, Request
                 )
             };
             check(ustore_outcome_t { status, message: c"failed to export a gathered column".as_ptr() })?;
-            exported.push(ArrowExport { schema, array, marker: PhantomData });
+            exported.push(ArrowExport { schema, array, arena: PhantomData });
         }
         Ok(exported)
     }
@@ -1320,10 +1347,10 @@ pub trait DocsVerbs<'view>: ViewVerbs<'view> {
     /// [`DocsVerbs::docs_remove`] removes documents, and merging a JSON `null` removes a field.
     ///
     /// The batch is one of:
-    /// - borrowed [`DocumentEntry`] values of one format, which is [`Json`] for the text the engine parses and a
-    ///   [`WritableScalar`] or [`Text`] for a document that is one scalar;
-    /// - [`KeyedBy`] documents, carrying their keys under a field of their own;
-    /// - borrowed [`FieldEntry`] values of one format, writing into fields of existing documents;
+    /// - viewed [`DocumentEntry`] values of one format, which is [`Json`] for the text the engine
+    ///   parses and a [`WritableScalar`] or [`Text`] for a document that is one scalar;
+    /// - [`KeyedBy`] documents, holding their keys under a field of their own;
+    /// - viewed [`FieldEntry`] values of one format, writing into fields of existing documents;
     /// - the owned forms a deferred write needs: keys beside a `stringtape::CharsTape` of JSON texts, keys and a tape
     ///   of paths beside a tape of JSON values, or a tape of JSON texts keyed by a field.
     ///
@@ -1434,7 +1461,7 @@ pub trait DocsVerbs<'view>: ViewVerbs<'view> {
     /// Reads whole documents or fields inside them into the arena in `format`, [`Json`] or [`Text`], reporting a
     /// missing document or field as absent.
     ///
-    /// The batch is keys of whole documents, borrowed [`FieldAddress`] values, or owned keys beside a
+    /// The batch is keys of whole documents, viewed [`FieldAddress`] values, or owned keys beside a
     /// `stringtape::CharsTape` of paths, a path per key, which a deferred read needs.
     ///
     /// Calls `ustore_docs_read`.
@@ -1485,8 +1512,8 @@ pub trait DocsVerbs<'view>: ViewVerbs<'view> {
 
     /// Reads `columns` of the documents under `keys` into typed columns in the arena, a row per key.
     ///
-    /// The answered [`Columns`] hold the requested columns, borrowed or owned, while a deferred gather needs owned
-    /// keys and owned columns, whose paths are owned or `'static`.
+    /// The answered [`Columns`] hold the requested columns, viewed or owned, while a deferred
+    /// gather needs owned keys and owned columns, whose paths are owned or `'static`.
     ///
     /// Calls `ustore_docs_gather`.
     fn docs_gather<'arena, 'collections, Keys: AsRef<[Key]>, Requested>(
@@ -1706,7 +1733,7 @@ impl<'arena> Calling for DocsScan<'arena, '_> {
 
     fn finish(self) -> Result<&'arena [Key]> {
         self.arena.host()?;
-        // SAFETY: the scan succeeded, and the arena stays borrowed for `'arena`.
+        // SAFETY: the scan succeeded, and the arena stays held for `'arena`.
         Ok(unsafe { self.found.keys() })
     }
 }
@@ -1751,7 +1778,7 @@ impl<'arena> Calling for DocsSample<'arena> {
 
     fn finish(self) -> Result<&'arena [Key]> {
         self.arena.host()?;
-        // SAFETY: the sample succeeded, and the arena stays borrowed for `'arena`.
+        // SAFETY: the sample succeeded, and the arena stays held for `'arena`.
         Ok(unsafe { self.found.keys() })
     }
 }
@@ -1869,7 +1896,7 @@ impl<'arena, Targets: Addresses> Calling for DocsRead<'arena, '_, Targets> {
 
     fn finish(self) -> Result<Values<'arena>> {
         self.arena.host()?;
-        // SAFETY: the read succeeded over every task, and the arena stays borrowed for `'arena`.
+        // SAFETY: the read succeeded over every task, and the arena stays held for `'arena`.
         unsafe { Values::exported(self.count, self.presences, self.values) }
     }
 }
@@ -1916,7 +1943,7 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for DocsGist<'arena, '_, Keys> {
 
     fn finish(self) -> Result<Paths<'arena>> {
         self.arena.host()?;
-        // SAFETY: the gist succeeded, and the arena stays borrowed for `'arena`.
+        // SAFETY: the gist succeeded, and the arena stays held for `'arena`.
         unsafe { Paths::exported(self.written, self.fields) }
     }
 }
@@ -1977,8 +2004,8 @@ impl<'arena, 'field, Keys: AsRef<[Key]>, Requested: AsRef<[Column<'field>]>> Cal
 
     fn finish(self) -> Result<Columns<'arena, Requested>> {
         let fields = self.columns.as_ref().len();
-        // SAFETY: the gather succeeded into the arena, which stays borrowed for `'arena`, or reached no engine and left
-        // the views null.
+        // SAFETY: the gather succeeded into the arena, which stays held for `'arena`, or reached no
+        // engine and left the views null.
         let views = unsafe { exported_slice(self.views.0, fields) };
         Ok(Columns { rows: self.keys.as_ref().len(), arena: self.arena.handle, requested: self.columns, views })
     }
@@ -2015,10 +2042,13 @@ mod tests {
         let (database, docs, mut arena) = populated();
         let graces = Matching { filter: Some(r#"?@.name == "Grace""#), ..Matching::default() };
         let head = database.head();
-        let mut cursor = head.docs_cursor(docs, key(0), graces).unwrap();
-        let page = cursor.next_pairs(8, &mut arena).unwrap();
-        assert_eq!(page.keys(), &keys([2]));
-        assert!(std::str::from_utf8(page.get(0).unwrap()).unwrap().contains("Rear Admiral"));
+        let config = DocsCursorConfig { matching: graces, columns: vec![Column::new::<Json>("")] };
+        let mut cursor = head.docs_cursor(docs, key(0), config).unwrap();
+        let batches = cursor.next(8, &mut arena).unwrap();
+        assert_eq!(batches.len(), 1);
+        assert_eq!(batches.keys(0).unwrap(), &keys([2]));
+        let documents = batches.columns(0).unwrap().strings(0).unwrap();
+        assert!(std::str::from_utf8(documents.get(0).unwrap()).unwrap().contains("Rear Admiral"));
         assert!(cursor.next(8, &mut arena).unwrap().is_empty());
     }
 
@@ -2039,7 +2069,8 @@ mod tests {
         assert!(measured.min_cardinality <= 1 && measured.max_cardinality >= measured.min_cardinality);
         head.docs_remove_range(docs, key(1)..key(2), Durability::Buffered).unwrap();
         let mut cursor = head.docs_cursor(docs, key(0), Matching::default()).unwrap();
-        assert_eq!(cursor.next(8, &mut arena).unwrap(), &keys([2]));
+        let batches = cursor.next(8, &mut arena).unwrap();
+        assert_eq!((batches.len(), batches.keys(0).unwrap()), (1, &keys([2])[..]));
     }
 
     /// The text of the field at `index`, or `None` when it is absent.
@@ -2114,7 +2145,7 @@ mod tests {
     }
 
     #[test]
-    fn documents_carry_their_keys_under_an_id_field() {
+    fn documents_hold_their_keys_under_an_id_field() {
         let database = Database::init_ram(&RAMOptions::default()).unwrap();
         let docs = created(&database, Modality::Docs);
         let mut arena = Arena::new().unwrap();
@@ -2636,20 +2667,22 @@ mod tests {
 
 // region: Cursors
 
-/// A walk over the keys of one documents collection, which every pull resumes past the last key the pull before it handed out, as a
-/// [`crate::Cursor`] walks blobs, keeping the keys its [`Matching`] admits.
+/// A walk over one documents collection, which every pull resumes past the last key the pull before
+/// it handed out, as a [`crate::Cursor`] walks blobs, keeping the rows its [`Matching`] admits and
+/// gathering its columns from each.
 ///
 /// Mirrors `ustore_docs_cursor_t`; dropping it calls `ustore_docs_cursor_free`.
 #[derive(Debug)]
 pub struct DocsCursor<'view> {
     handle: ffi::ustore_docs_cursor_t,
     database: ustore_database_t,
-    marker: PhantomData<&'view ()>,
+    columns: Box<[Column<'view>]>,
+    view: PhantomData<&'view ()>,
 }
 
 impl<'view, Parent> On<'view, Parent> {
-    /// Opens a walk over the keys of one documents collection's `range`, compiling what `matching`
-    /// names once, whose predicate lives as long as the cursor.
+    /// Opens a walk over one documents collection's `range`, compiling what `config` matches and
+    /// gathers once, whose predicate lives as long as the cursor.
     ///
     /// Calls `ustore_docs_cursor_init`.
     pub fn docs_cursor(
@@ -2659,8 +2692,14 @@ impl<'view, Parent> On<'view, Parent> {
         config: impl Into<DocsCursorConfig<'view>>,
     ) -> Result<DocsCursor<'view>> {
         let range: KeyRange = range.into();
-        let matching = config.into().matching;
-        let mut cursor = DocsCursor { handle: ptr::null_mut(), database: self.database(), marker: PhantomData };
+        let DocsCursorConfig { matching, columns } = config.into();
+        let mut cursor = DocsCursor {
+            handle: ptr::null_mut(),
+            database: self.database(),
+            columns: columns.into_boxed_slice(),
+            view: PhantomData,
+        };
+        let formats: Vec<c_int> = cursor.columns.iter().map(|column| column.format).collect();
         let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_docs_cursor_init_t {
             cursor: &mut cursor.handle,
@@ -2674,10 +2713,64 @@ impl<'view, Parent> On<'view, Parent> {
             direction: range.direction,
             filter: matching.lowered_filter(),
             predicate: matching.lowered_predicate(),
+            fields_count: cursor.columns.len() as ustore_size_t,
+            fields: ustore_strings_view_t::accessor(column_fields, cursor.columns.as_ptr().cast()),
+            columns_types: formats.as_ptr(),
         };
-        // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
+        // SAFETY: every pointer in `arguments` outlives the call, which is final on return and
+        // copies the columns.
         unsafe { ffi::ustore_docs_cursor_init(&mut arguments) };
         check(outcome).map(|()| cursor)
+    }
+}
+
+/// The batches one pull of a [`DocsCursor`] wrote into an arena, in walk order: each the keys of
+/// its rows and a column per field the cursor gathers.
+#[derive(Clone, Copy, Debug)]
+pub struct Batches<'arena, 'cursor> {
+    /// The arena holding the batches, held for `'arena`.
+    arena: ustore_arena_t,
+    views: &'arena [ffi::ustore_docs_batch_view_t],
+    columns: &'cursor [Column<'cursor>],
+}
+
+impl<'arena, 'cursor> Batches<'arena, 'cursor> {
+    /// How many batches the pull wrote, none once the walk is exhausted.
+    pub fn len(&self) -> usize {
+        self.views.len()
+    }
+
+    /// Whether the walk was exhausted before this pull.
+    pub fn is_empty(&self) -> bool {
+        self.views.is_empty()
+    }
+
+    /// How many rows the batches hold together.
+    pub fn rows(&self) -> usize {
+        self.views.iter().map(|view| view.count as usize).sum()
+    }
+
+    /// The keys of batch `index` in walk order, or `None` past the last batch.
+    pub fn keys(&self, index: usize) -> Option<&'arena [Key]> {
+        let view = self.views.get(index)?;
+        // SAFETY: a successful pull wrote every batch's keys into the arena, which stays
+        // held for `'arena`.
+        Some(unsafe { exported_slice(view.keys.cast::<Key>(), view.count as usize) })
+    }
+
+    /// The columns of batch `index`, one per field the cursor gathers, or `None` past
+    /// the last batch.
+    pub fn columns(&self, index: usize) -> Option<Columns<'arena, &'cursor [Column<'cursor>]>> {
+        let view = self.views.get(index)?;
+        // SAFETY: a successful pull wrote every batch's column views into the arena, which stays
+        // held for `'arena`.
+        let views = unsafe { exported_slice(view.columns, self.columns.len()) };
+        Some(Columns { requested: self.columns, rows: view.count as usize, arena: self.arena, views })
+    }
+
+    /// Every batch as its keys and its columns, in walk order.
+    pub fn iter(&self) -> impl Iterator<Item = (&'arena [Key], Columns<'arena, &'cursor [Column<'cursor>]>)> + '_ {
+        (0..self.len()).filter_map(|index| Some((self.keys(index)?, self.columns(index)?)))
     }
 }
 
@@ -2687,63 +2780,34 @@ impl DocsCursor<'_> {
         CursorOn::new(self, Some(executor))
     }
 
-    /// Pulls up to `wanted` next keys into `arena`, fewer once the walk nears its end and none past it.
+    /// Pulls batches of up to `wanted` rows in all into `arena`, none once the walk is exhausted.
     ///
     /// Calls `ustore_docs_cursor_next`.
     ///
     /// Runs on the calling thread; [`DocsCursor::on`] names an executor for one pull.
-    pub fn next<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena<'_>) -> Result<&'arena [Key]> {
+    pub fn next<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena<'_>) -> Result<Batches<'arena, '_>> {
         CursorOn::new(self, None).next(wanted, arena)
-    }
-
-    /// Pulls up to `wanted` next keys with their whole documents into `arena` in one call.
-    ///
-    /// Calls `ustore_docs_cursor_next`.
-    ///
-    /// Runs on the calling thread; [`DocsCursor::on`] names an executor for one pull.
-    pub fn next_pairs<'arena>(&mut self, wanted: usize, arena: &'arena mut Arena<'_>) -> Result<Page<'arena>> {
-        CursorOn::new(self, None).next_pairs(wanted, arena)
     }
 }
 
-impl CursorOn<'_, DocsCursor<'_>> {
-    /// Pulls up to `wanted` next keys into `arena`, fewer near the walk's end and none past it.
+impl<'cursor> CursorOn<'cursor, DocsCursor<'_>> {
+    /// Pulls batches of up to `wanted` rows in all into `arena`, one per task of this receiver's
+    /// executor that found rows, none once the walk is exhausted.
     ///
     /// Calls `ustore_docs_cursor_next`.
-    pub fn next<'arena>(self, wanted: usize, arena: &'arena mut Arena<'_>) -> Result<&'arena [Key]> {
-        self.pull(wanted, arena, ptr::null_mut())
-    }
-
-    /// Pulls up to `wanted` next keys with their whole documents into `arena` in one call.
-    ///
-    /// Calls `ustore_docs_cursor_next`.
-    pub fn next_pairs<'arena>(self, wanted: usize, arena: &'arena mut Arena<'_>) -> Result<Page<'arena>> {
-        let mut values = ustore_strings_view_t::default();
-        let keys = self.pull(wanted, arena, &mut values)?;
-        // SAFETY: the pull succeeded, writing a value per key as a tape into the result's arena.
-        let values = unsafe { Strings::exported(values, keys.len())? };
-        Ok(Page::new(keys, values))
-    }
-
-    /// Pulls a page of keys into `arena`, with their values into `values` unless it is null.
-    fn pull<'arena>(
-        self,
-        wanted: usize,
-        arena: &'arena mut Arena<'_>,
-        values: *mut ustore_strings_view_t,
-    ) -> Result<&'arena [Key]> {
-        let mut keys: *const ustore_key_t = ptr::null();
-        let mut written: ustore_size_t = 0;
+    pub fn next<'arena>(self, wanted: usize, arena: &'arena mut Arena<'_>) -> Result<Batches<'arena, 'cursor>> {
+        let cursor: &'cursor DocsCursor<'_> = self.cursor;
+        let mut batches: *const ffi::ustore_docs_batch_view_t = ptr::null();
+        let mut count: ustore_size_t = 0;
         let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_docs_cursor_next_t {
-            database: self.cursor.database,
-            executor: self.executor,
+            database: cursor.database,
+            executor: executor_handle(self.executor),
             outcome: &mut outcome,
             completion: ustore_completion_t::Blocking,
-            cursor: self.cursor.handle,
-            keys: &mut keys,
-            values,
-            written: &mut written,
+            cursor: cursor.handle,
+            batches: &mut batches,
+            batches_count: &mut count,
             arena: arena.handle,
             wanted: wanted as ustore_size_t,
             progress: None,
@@ -2753,8 +2817,9 @@ impl CursorOn<'_, DocsCursor<'_>> {
         unsafe { ffi::ustore_docs_cursor_next(&mut arguments) };
         check(outcome)?;
         arena.host()?;
-        // SAFETY: a successful pull wrote `written` keys into the arena the result borrows.
-        Ok(unsafe { exported_slice(keys, written as usize) })
+        // SAFETY: a successful pull wrote `count` batch views into the arena the result views.
+        let views = unsafe { exported_slice(batches, count as usize) };
+        Ok(Batches { arena: arena.handle, views, columns: &cursor.columns })
     }
 }
 

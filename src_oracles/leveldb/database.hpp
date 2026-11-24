@@ -19,6 +19,7 @@
 #include <system_error> // `std::errc`
 #include <utility>      // `std::exchange`
 
+#include <leveldb/cache.h>
 #include <leveldb/db.h>
 #include <leveldb/write_batch.h>
 
@@ -110,7 +111,7 @@ inline ::leveldb::Slice tail_of(::leveldb::Slice const& stored) noexcept {
 struct collections_entry_t {
     ustore_modality_t modality {};
 
-    /** The name the collection carries, empty for none, viewing the bytes the entry was read from. */
+    /** The name the collection holds, empty for none, viewing the bytes the entry was read from. */
     std::string_view name;
 };
 
@@ -143,8 +144,14 @@ class collection_walk_t {
 /** The calls this engine serves, which stamp every handle it hands out. */
 extern engine_t const engine_k;
 
+/** Bytes of host memory a database caches and buffers when its open names no @c memory_limit. */
+constexpr std::size_t memory_limit_default_k = std::size_t {1} << 30;
+
 /** The open database and its options. */
 struct database_t {
+
+    /** The block cache @c options names, declared before @c native so it outlives the close. */
+    std::unique_ptr<::leveldb::Cache> block_cache;
 
     /** Options the database opened with, reused to create the databases snapshots save. */
     ::leveldb::Options options;
@@ -154,6 +161,10 @@ struct database_t {
 
     /** Serializes changes to both system collections, so a name is checked and taken in one step. */
     std::mutex collections_mutex;
+
+    /** Snapshots handed out and not yet freed, which a collection drop refuses to run under,
+     *  touched through @c floor_atomic_ref. */
+    std::size_t open_snapshots = 0;
 };
 
 /** What a snapshot holds, behind its snapshot handle, pinning one LevelDB snapshot of its database until freed. */
@@ -372,6 +383,8 @@ status_t seek_each(database_t& database, place_batch_t const& places, ::leveldb:
 status_t database_open(ustore_database_open_leveldb_t const& arguments, cpu_ceiling_t, view_t const&) {
     if (!arguments.database) return {status_code_t::invalid_argument_k, "Need an output for the database"};
     if (!names_path(arguments.directory)) return {status_code_t::invalid_argument_k, "A database needs a directory"};
+    if (arguments.background_threads > 1)
+        return {status_code_t::unsupported_k, "LevelDB compacts on one background thread"};
 
     std::string const root(chars_of(arguments.directory));
     auto [root_exists, directory_exists_status] = directory_exists(root.c_str());
@@ -383,6 +396,11 @@ status_t database_open(ustore_database_open_leveldb_t const& arguments, cpu_ceil
     database_t& database = *made.state;
     database.options.compression = ::leveldb::kNoCompression;
     database.options.create_if_missing = true;
+    // A quarter of the budget caches blocks and a quarter buffers writes
+    std::size_t const memory_limit = arguments.memory_limit ? arguments.memory_limit : memory_limit_default_k;
+    database.block_cache.reset(::leveldb::NewLRUCache(memory_limit / 4));
+    database.options.block_cache = database.block_cache.get();
+    database.options.write_buffer_size = memory_limit / 4;
 
     native_t* native = nullptr;
     native_status_t const status = native_t::Open(database.options, root, &native);
@@ -426,6 +444,7 @@ status_t snapshot_init(ustore_snapshot_init_t const& arguments, view_t const&) {
     made.state->native = database.native->GetSnapshot();
     if (!made.state->native) return {status_code_t::internal_k, "Failed to take a snapshot"};
     made.state->database = &database;
+    count_reader_opened<cpu_ladder_floor_k>(database.open_snapshots);
     // LevelDB keeps a snapshot's sequence number behind its private interface
     if (arguments.read_stamp) *arguments.read_stamp = 0;
     *arguments.snapshot = made.release();
@@ -455,27 +474,26 @@ status_t snapshot_save(ustore_snapshot_save_t const& arguments, view_t const& vi
     // Batches the size of a memtable keep writes few without holding the whole copy in memory
     ::leveldb::WriteBatch batch;
     ustore_size_t batched = 0;
-    bool carries_on = true;
-    for (iterator->SeekToFirst(); iterator->Valid() && status.ok() && carries_on; iterator->Next()) {
+    bool keeps_going = true;
+    for (iterator->SeekToFirst(); iterator->Valid() && status.ok() && keeps_going; iterator->Next()) {
         batch.Put(iterator->key(), iterator->value());
         batched += iterator->key().size() + iterator->value().size();
         if (batch.ApproximateSize() < database.options.write_buffer_size) continue;
         status = saved->Write(::leveldb::WriteOptions(), &batch);
-        carries_on = progress.advance(std::exchange(batched, 0));
+        keeps_going = progress.advance(std::exchange(batched, 0));
         batch.Clear();
     }
     if (status.ok()) status = iterator->status();
-    if (status.ok() && carries_on) status = saved->Write(::leveldb::WriteOptions(), &batch);
-    if (status.ok() && carries_on) carries_on = progress.advance(batched);
+    if (status.ok() && keeps_going) status = saved->Write(::leveldb::WriteOptions(), &batch);
+    if (status.ok() && keeps_going) keeps_going = progress.advance(batched);
     iterator.reset();
     saved.reset();
 
-    if (status.ok() && carries_on) return {};
+    if (status.ok() && keeps_going) return {};
     // A failed save removes what it wrote, and says so when it cannot, since the path then
     // refuses every retry
-    status_t failure = carries_on ? status_of(status) : progress_cancelled_k;
-    if (!::leveldb::DestroyDB(path, database.options).ok())
-        failure.message = "Failed to save the snapshot, and to remove the files it left behind";
+    status_t failure = keeps_going ? status_of(status) : progress_cancelled_k;
+    if (!::leveldb::DestroyDB(path, database.options).ok()) failure.note = "The failed save left its files behind";
     return failure;
 }
 
@@ -538,7 +556,7 @@ status_t collection_create(ustore_collection_create_t const& arguments, view_t c
         std::string record;
         native_status_t const looked_up = database.native->Get(::leveldb::ReadOptions(),
                                                                string_key(names_collection_k, name, name_key), &record);
-        if (looked_up.ok()) return {status_code_t::already_exists_k, "A collection already carries the name"};
+        if (looked_up.ok()) return {status_code_t::already_exists_k, "A collection already holds the name"};
         if (!looked_up.IsNotFound()) return status_of(looked_up);
     }
     auto [id, mint_status] = mint_collection_id();
@@ -562,6 +580,8 @@ status_t collection_drop(ustore_collection_drop_t const& arguments, view_t const
 
     database_t& database = *state_of<database_t>(arguments.database);
     if (arguments.mode == ustore_drop_collection_k) {
+        if (floor_atomic_ref<std::size_t> {database.open_snapshots}.load(std::memory_order_relaxed) != 0)
+            return {status_code_t::contended_k, "A snapshot holds the collection"};
         std::lock_guard lock {database.collections_mutex};
         return drop_collection(database, arguments.collection);
     }
@@ -640,6 +660,9 @@ status_t database_clear(ustore_database_clear_t const& arguments, view_t const&)
     if (status_t const status = validate_drop_mode(mode); status.failed()) return status;
 
     database_t& database = *state_of<database_t>(arguments.database);
+    if (mode == ustore_drop_collection_k &&
+        floor_atomic_ref<std::size_t> {database.open_snapshots}.load(std::memory_order_relaxed) != 0)
+        return {status_code_t::contended_k, "A snapshot holds the collections"};
     std::lock_guard lock {database.collections_mutex};
     ::leveldb::WriteOptions buffered;
     ::leveldb::WriteOptions synced;
@@ -806,8 +829,10 @@ void database_free(ustore_database_t database) noexcept { delete state_of<databa
 
 void snapshot_free(ustore_snapshot_t handle) noexcept {
     snapshot_t* const snapshot = state_of<snapshot_t>(handle);
-    snapshot->database->native->ReleaseSnapshot(snapshot->native);
+    database_t& database = *snapshot->database;
+    database.native->ReleaseSnapshot(snapshot->native);
     delete snapshot;
+    [[maybe_unused]] bool const last = count_reader_closed<cpu_ladder_floor_k>(database.open_snapshots);
 }
 
 #pragma endregion Memory

@@ -8,9 +8,9 @@
  *  A key slot is a stored key, with an inline value beside it for the layouts holding values
  *  inline, and the kind of its delta sits in its run's kinds column beside the stamps. A value held
  *  apart is found by the key slot's sorted position: by stride for fixed-width values, and through
- *  the run's value offsets column for variable-width ones. Keys carry their bounds through
- *  @c limit, and the 16-byte key is ordered like @c memcmp. A sorted run keeps its key slots in
- *  sorted order, which both compactors lay out the same way.
+ *  the run's value offsets column for variable-width ones. Keys hold their bounds through @c limit,
+ *  and the 16-byte key is ordered like @c memcmp. A sorted run keeps its key slots in sorted order,
+ *  which both compactors lay out the same way.
  */
 
 #pragma once
@@ -73,7 +73,8 @@ using database_id_t = uuid128_t;
 using snapshot_id_t = std::uint64_t;
 
 /**
- *  @brief The position of one commit in its ledger's order, which a reader reads at and every version carries.
+ *  @brief The position of one commit in its ledger's order, which a reader reads at and
+ *      every version holds.
  *
  *  A counter rather than a clock: @c std::chrono::system_clock is neither steady nor distinct across threads, so
  *  two commits could share an instant and one would hide the other's writes.
@@ -128,19 +129,19 @@ enum class missing_locations_t : bool {
     keep_k,
 };
 
-/** What a lookup of one key found, named after the kind of the newest delta carrying it. */
+/** What a lookup of one key found, named after the kind of the newest delta holding it. */
 enum class lookup_result_t : std::uint8_t {
 
-    /** No delta carries the key. */
+    /** No delta holds the key. */
     missing_k,
 
-    /** A write delta carries the whole value, or a fold completed it. */
+    /** A write delta holds the whole value, or a fold completed it. */
     written_k,
 
-    /** A remove delta carries the key, so it holds no value. */
+    /** A remove delta holds the key, so it holds no value. */
     removed_k,
 
-    /** A change delta carries the key, which older deltas complete. */
+    /** A change delta holds the key, which older deltas complete. */
     changed_k,
 
     /** The medium moved fewer bytes than the delta claims, so this one key failed. */
@@ -148,7 +149,7 @@ enum class lookup_result_t : std::uint8_t {
 };
 
 /** Whether a run keeps the bytes of each key past its 16-byte head beside its key slots, as strings runs do. */
-enum class key_tails_t : bool { absent_k = false, carried_k = true };
+enum class key_tails_t : bool { absent_k = false, present_k = true };
 
 /** Whether files reach their destination as copies or leave their source. */
 enum class transfer_mode_t : bool {
@@ -283,13 +284,13 @@ constexpr value_type_ stored_key_before(value_type_ key) noexcept {
     return static_cast<value_type_>(key - 1);
 }
 
-/** The 16-byte key right before @p key, which is not the least, borrowing across both words. */
+/** The 16-byte key right before @p key, which is not the least, decrementing across both words. */
 constexpr st::key128_t stored_key_before(st::key128_t key) noexcept {
     if (key.low != 0) return {key.high, key.low - 1};
     return {key.high - 1, ~std::uint64_t {0}};
 }
 
-/** Hashes a key a key slot carries through SmashTable's own hash. */
+/** Hashes a key a key slot holds through SmashTable's own hash. */
 struct stored_key_hash_t {
     template <typename stored_key_type_>
     std::size_t operator()(stored_key_type_ const& key) const noexcept {
@@ -297,7 +298,8 @@ struct stored_key_hash_t {
     }
 };
 
-/** A key a key slot carries: trivially copyable, ordered by @c < and @c ==, with bounds from @c limit. */
+/** A key a key slot holds: trivially copyable, ordered by @c < and @c ==, with bounds from @c
+ *  limit. */
 template <typename stored_key_type_>
 concept stored_key_concept = std::is_trivially_copyable_v<stored_key_type_> &&
                              requires(stored_key_type_ const& first, stored_key_type_ const& second) {
@@ -343,7 +345,7 @@ concept inline_value_layout_concept = is_inline(value_layout_);
  *  @brief Where the value of one key sits, in the shape the collection's value layout gives it.
  *
  *  The unspecialized template is the common head every layout extends, and reports no value at all,
- *  so a collection whose layout is not yet known carries locations that read as missing.
+ *  so a collection whose layout is not yet known holds locations that read as missing.
  */
 template <value_layout_t value_layout_ = value_layout_t::unknown_k>
 struct stored_value_location {
@@ -443,7 +445,7 @@ struct stored_value_location<value_layout_t::fixed_width_k> {
     stored_value_size_t buffer_padding() const noexcept { return extent.offset - aligned_offset_in_file(); }
 };
 
-/** A variable-width value sits at one offset of one file, and carries its own width. */
+/** A variable-width value sits at one offset of one file, and holds its own width. */
 template <>
 struct stored_value_location<value_layout_t::variable_width_k> {
 
@@ -479,9 +481,9 @@ struct stored_value_location<value_layout_t::variable_width_k> {
 };
 
 /**
- *  @brief A batch of locations of one layout, borrowed from whoever owns the arrays.
+ *  @brief A batch of locations of one layout, viewed from whoever owns the arrays.
  *
- *  The span also borrows the two totals the batch keeps, so recalculating them updates the owner's
+ *  The span also views the two totals the batch keeps, so recalculating them updates the owner's
  *  copies rather than a duplicate the caller would have to write back.
  */
 template <value_layout_t value_layout_, locations_mutability_t mutability_ = locations_mutability_t::mutable_k>
@@ -630,13 +632,13 @@ class stored_value_locations {
         return aligned_offsets_in_buffer[index] + locations[index].buffer_padding();
     }
 
-    /** The batch as a span whoever reads or writes it borrows. */
+    /** The batch as a span whoever reads or writes it views. */
     stored_value_locations_span_t span() noexcept {
         return {std::span {locations}, std::span {aligned_offsets_in_buffer}, stored_values_found,
                 aligned_buffer_size_bytes};
     }
 
-    /** The batch as a view whoever reads it borrows. */
+    /** The batch as a view whoever reads it views. */
     stored_value_locations_view_t view() const noexcept {
         return {std::span {locations}, std::span {aligned_offsets_in_buffer}, stored_values_found,
                 aligned_buffer_size_bytes};
@@ -647,7 +649,7 @@ class stored_value_locations {
 };
 
 /**
- *  @brief A batch of locations of whichever layout its collection carries, borrowed.
+ *  @brief A batch of locations of whichever layout its collection holds, viewed.
  *
  *  Every member forwards to the alternative the batch holds, so a caller that does not know the
  *  layout still reads sizes and offsets without a virtual call.
@@ -661,7 +663,7 @@ class any_stored_value_locations_span {
                                    stored_value_locations_span<value_layout_t::fixed_width_k, mutability_>,
                                    stored_value_locations_span<value_layout_t::variable_width_k, mutability_>>;
 
-    /** The batch of whichever layout the collection carries. */
+    /** The batch of whichever layout the collection holds. */
     variant_t variant;
 
     /** Locations in the batch, whether or not they name a value. */
@@ -700,13 +702,13 @@ class any_stored_value_locations_span {
     }
 };
 
-/** A borrowed batch of locations of whichever layout its collection carries. */
+/** A viewed batch of locations of whichever layout its collection holds. */
 using any_stored_value_locations_span_t = any_stored_value_locations_span<>;
 
-/** A read-only batch of locations of whichever layout its collection carries. */
+/** A read-only batch of locations of whichever layout its collection holds. */
 using any_stored_value_locations_view_t = any_stored_value_locations_span<locations_mutability_t::immutable_k>;
 
-/** A batch of locations of whichever layout its collection carries, with the arrays it owns. */
+/** A batch of locations of whichever layout its collection holds, with the arrays it owns. */
 template <template <typename> typename allocator_ = heap_allocator>
 class any_stored_value_locations {
   public:
@@ -716,7 +718,7 @@ class any_stored_value_locations {
                                    stored_value_locations<value_layout_t::fixed_width_k, allocator_>,
                                    stored_value_locations<value_layout_t::variable_width_k, allocator_>>;
 
-    /** The batch of whichever layout the collection carries. */
+    /** The batch of whichever layout the collection holds. */
     variant_t variant;
 
     /** Locations in the batch, whether or not they name a value. */
@@ -749,13 +751,13 @@ class any_stored_value_locations {
         return std::visit([index](auto const& locations) { return locations.offset_in_buffer(index); }, variant);
     }
 
-    /** The batch as a span whoever reads or writes it borrows. */
+    /** The batch as a span whoever reads or writes it views. */
     any_stored_value_locations_span_t span() noexcept {
         return std::visit([](auto& locations) { return any_stored_value_locations_span_t {locations.span()}; },
                           variant);
     }
 
-    /** The batch as a view whoever reads it borrows. */
+    /** The batch as a view whoever reads it views. */
     any_stored_value_locations_view_t view() const noexcept {
         return std::visit([](auto const& locations) { return any_stored_value_locations_view_t {locations.view()}; },
                           variant);
@@ -859,7 +861,7 @@ template <typename stored_key_type_, key_tails_t key_tails_>
 struct key_slot<stored_key_type_, value_layout_t::variable_width_k, key_tails_> {
     using stored_key_t = stored_key_type_;
     static constexpr value_layout_t value_layout_k = value_layout_t::variable_width_k;
-    static constexpr bool carries_tails_k = key_tails_ == key_tails_t::carried_k;
+    static constexpr bool has_tails_k = key_tails_ == key_tails_t::present_k;
 
     stored_key_t stored_key = limit<stored_key_t>::max_k;
 
@@ -874,7 +876,7 @@ template <typename stored_key_type_, key_tails_t key_tails_>
 struct key_slot<stored_key_type_, value_layout_t::uuid_k, key_tails_> {
     using stored_key_t = stored_key_type_;
     static constexpr value_layout_t value_layout_k = value_layout_t::uuid_k;
-    static constexpr bool carries_tails_k = key_tails_ == key_tails_t::carried_k;
+    static constexpr bool has_tails_k = key_tails_ == key_tails_t::present_k;
     static constexpr stored_value_size_t size = 16;
 
     stored_key_t stored_key = limit<stored_key_t>::max_k;
@@ -890,13 +892,13 @@ static_assert(sizeof(key_slot<st::key128_t, value_layout_t::inline_12_bytes_k>) 
               "A small inline cell is its 16-byte key, its 4-byte size and 12 bytes of value");
 static_assert(sizeof(key_slot<st::key128_t, value_layout_t::inline_44_bytes_k>) == 64,
               "A wide inline cell is its 16-byte key, its 4-byte size and 44 bytes of value");
-static_assert(sizeof(key_slot<st::key128_t, value_layout_t::uuid_k, key_tails_t::carried_k>) == 32,
+static_assert(sizeof(key_slot<st::key128_t, value_layout_t::uuid_k, key_tails_t::present_k>) == 32,
               "A strings cell is a 16-byte head and its 16-byte value");
 static_assert(sizeof(key_slot<st::key128_t, value_layout_t::fixed_width_k>) == 16,
               "A fixed-width cell is its 16-byte key alone");
 static_assert(sizeof(key_slot<st::key128_t, value_layout_t::variable_width_k>) == 16,
               "A variable-width cell is its 16-byte key alone");
-static_assert(sizeof(key_slot<st::key128_t, value_layout_t::variable_width_k, key_tails_t::carried_k>) == 16,
+static_assert(sizeof(key_slot<st::key128_t, value_layout_t::variable_width_k, key_tails_t::present_k>) == 16,
               "A tailed variable-width cell is its 16-byte head alone");
 
 #pragma endregion Key Slot

@@ -6,7 +6,7 @@ The tools run on the embedded C ABI of `c/ustore/db.h` and never see which engin
 
 `cli.cpp` builds into one executable, `ustore_cli`, when CMake is configured with `-DUSTORE_BUILD_TOOLS=1`.
 It opens the database in the `--directory` it is given, runs one command and exits, with status 1 when the flags do not parse or the command fails, and 130 when a signal stops it.
-Status lines go to standard error, so an export to `--output -` leaves standard output carrying only Arrow bytes.
+Status lines go to standard error, so an export to `--output -` leaves standard output holding only Arrow bytes.
 
 ```sh
 cmake --preset release -DUSTORE_BUILD_TOOLS=1 -DUSTORE_WITH_ROCKSDB=1
@@ -15,7 +15,7 @@ build_release/build/bin/ustore_cli --engine rocksdb --directory /dev/shm/ustore 
     collection import --input data/twitter/tweets.ndjson --id-field id --memory-limit 1G --collection tweets
 ```
 
-Arrow streams and files carry every modality, and `-` reads standard input or writes standard output, so object stores are reached through their own tools:
+Arrow streams and files hold every modality, and `-` reads standard input or writes standard output, so object stores are reached through their own tools:
 
 ```sh
 aws s3 cp s3://bucket/posters.arrows - | ustore_cli --engine nvme --directory /mnt/db \
@@ -44,8 +44,9 @@ ustore_cli --directory /mnt/db collection export --collection movies --output mo
 | `--engine <name>`           | `ram`, the default, `rocksdb`, `leveldb` or `nvme`                       |
 | `--isolation <name>`        | Isolation of `ram`: `strict-serializable`, the default, or `snapshot`    |
 | `--engine-transport <name>` | Transport of `nvme`: `automatic`, `blocking`, `linux-uring` and others   |
+| `--threads <count>`         | Threads of the one executor every call runs on, 0 for the affinity mask  |
 | `--collection <name>`       | Collection a command acts on; required                                   |
-| `--input <file>`            | File a collection import reads, or `-` for standard input                |
+| `--input <files>`           | Files a collection import reads, comma-separated, or `-` for stdin       |
 | `--output <file>`           | File a collection export writes, or `-` for standard output              |
 | `--id-field <field>`        | Field holding the keys of imported documents, integers or UUID text      |
 | `--memory-limit <bytes>`    | Bytes an NDJSON or CSV import or export buffers per batch, like `1G`     |
@@ -55,6 +56,10 @@ ustore_cli --directory /mnt/db collection export --collection movies --output mo
 | `--alignment <bytes>`       | Where an Arrow export starts every buffer: 64 or 4096                    |
 | `--batch-rows <count>`      | Most rows per batch of an Arrow export                                   |
 | `--database <name>`         | NVMe database a `manifest` or `recover` names                            |
+
+Several `--input` files of one Arrow schema import as one: under `--ingest sorted` each must be sorted, and they merge into one key order, a key several hold landing from the last of them, as `batched` and `unsorted` imports land it too.
+The CLI spawns one executor of `--threads` threads and runs every call on it.
+Its budgets come from the process's cgroup: the database may hold half of the smallest `memory.max` among the cgroup and its ancestors, and the threads' scratch together a quarter of it, while without a limit the library's defaults apply.
 
 Every flag takes its default from a `USTORE_<FLAG>` variable, its name upper-cased with dashes turned into underscores, so `USTORE_DIRECTORY=/mnt/db` stands for `--directory /mnt/db` and a flag given on the command line wins; `--help` prints each one beside its flag as `[env: …]`.
 Byte counts are an integer with an optional `K`, `M`, `G` or `T` for its binary multiple, like `64M`.
@@ -74,10 +79,10 @@ A stopped import keeps the batches it wrote, and drops an `--ingest sorted` or `
 A second signal ends the process at once.
 
 `snapshot save` writes the engine's own image, which keeps internal forms such as half-edges and page trees but loads only on the engine that wrote it.
-`snapshot export` is the portable form: it takes one snapshot, so every collection reads at the same stamp, and writes one Arrow file per named collection, whose schema metadata carries `ustore.modality` and `ustore.collection`.
+`snapshot export` is the portable form: it takes one snapshot, so every collection reads at the same stamp, and writes one Arrow file per named collection, whose schema metadata holds `ustore.modality` and `ustore.collection`.
 A name that cannot be a file name, or clashes with one already written, takes the collection's UUID as its file name instead, while the schema keeps the name, and unnamed collections are skipped.
 It refuses a directory that is not empty, so an export never mixes with an older one.
-`snapshot import` creates each collection under the name its schema carries and lands its file as one sorted ingest where the engine ingests, since exports write keys in order, and in batches otherwise.
+`snapshot import` creates each collection under the name its schema holds and lands its file as one sorted ingest where the engine ingests, since exports write keys in order, and in batches otherwise.
 Both take any path, so a bucket mounted through `mountpoint-s3` works as a directory:
 
 ```sh

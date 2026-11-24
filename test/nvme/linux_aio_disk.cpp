@@ -26,7 +26,7 @@
 
 #include "ustore/utilities/types.hpp" // `status_t`, `expected`
 
-#include "ustore/utilities/nvme_linux_aio_disk.hpp" // `linux_aio_files_disk_t`, `linux_aio_disk_config_t`
+#include "ustore/utilities/nvme_linux_aio_disk.hpp" // `linux_aio_queue_t`, `linux_aio_disk_config_t`
 
 #include "nvme/ring_cases.hpp" // `ring_cases`, every transport-independent result
 
@@ -45,8 +45,9 @@ constexpr util::queue_depth_t deep_queue_depth_k = 256;
 constexpr std::uint64_t deep_volume_bytes_k = 32ull * 1024ull * 1024ull;
 
 /**
- *  @brief Takes a queue pair of @p depth, registers @p bytes of aligned memory, runs @p body and gives both back.
- *  @param[in,out] disk The mounted disk the queue pair and the range come from.
+ *  @brief Makes a queue of @p depth holding @p disk, registers @p bytes of aligned memory, runs @p
+ *      body and gives both back.
+ *  @param[in,out] disk The mounted disk the range is registered on.
  *  @param[in] bytes Bytes of buffer to register, which the body addresses through the registered memory.
  *  @param[in] depth Requests the queue pair keeps in flight.
  *  @param[in] body Called with the queue pair, the registered memory and the buffer it covers.
@@ -57,27 +58,25 @@ void on_queue_pair(linux_aio_files_disk_t& disk, std::size_t bytes, util::queue_
     expect_equal(buffer.size(), bytes);
     if (buffer.size() != bytes) return;
 
-    auto [queue_pair, acquire_status] = disk.acquire_queue_pair(depth);
-    expect_true(acquire_status.succeeded());
-    if (acquire_status.failed()) return;
+    auto [queue, make_queue_status] = util::linux_aio_queue_t::make(depth, {});
+    expect_true(make_queue_status.succeeded());
+    if (make_queue_status.failed()) return;
+    util::queue_ref_t queue_pair {queue, util::queue_id_t {0}};
+    expect_true(disk.register_media(queue_pair).succeeded());
 
     auto [registered_memory, register_status] = disk.register_memory(whole(buffer), util::memory_space_t::host_k);
     expect_true(register_status.succeeded());
-    if (register_status.failed()) {
-        expect_true(disk.release_queue_pair(queue_pair).succeeded());
-        return;
-    }
+    if (register_status.failed()) return;
 
     body(queue_pair, registered_memory, whole(buffer));
 
     expect_true(disk.drain(queue_pair).succeeded());
     expect_equal(disk.outstanding(queue_pair), std::size_t {0});
     expect_true(disk.unregister_memory(registered_memory).succeeded());
-    expect_true(disk.release_queue_pair(queue_pair).succeeded());
 }
 
 /** Submits all of @p requests, resubmitting what the credit left after each poll, and collects every completion. */
-void submit_and_poll_all(linux_aio_files_disk_t& disk, util::queue_pair_t const& queue_pair,
+void submit_and_poll_all(linux_aio_files_disk_t& disk, util::queue_ref_t const& queue_pair,
                          std::span<util::request_t const> requests, std::span<util::completion_t> completions) {
     std::size_t submitted = 0;
     std::size_t collected = 0;
@@ -102,7 +101,7 @@ void submit_and_poll_all(linux_aio_files_disk_t& disk, util::queue_pair_t const&
 void test_aio_moves_batches_at_depth(linux_aio_files_disk_t& disk, util::medium_reference_t medium, std::size_t block,
                                      std::size_t count, util::queue_depth_t depth) {
     on_queue_pair(disk, 2 * block * count, depth,
-                  [&](util::queue_pair_t& queue_pair, util::registered_memory_t& registered_memory,
+                  [&](util::queue_ref_t& queue_pair, util::registered_memory_t& registered_memory,
                       std::span<util::byte_t> buffer) {
                       std::span<util::byte_t> const source = buffer.first(block * count);
                       std::span<util::byte_t> const destination = buffer.subspan(block * count);
@@ -145,7 +144,7 @@ void test_aio_moves_batches_at_depth(linux_aio_files_disk_t& disk, util::medium_
 void test_aio_fails_misaligned_requests_alone(linux_aio_files_disk_t& disk, util::medium_reference_t medium) {
     on_queue_pair(
         disk, 2 * block_bytes_k, queue_pair_depth_k,
-        [&](util::queue_pair_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
+        [&](util::queue_ref_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
             std::array<util::request_t, 4> batch {};
             batch[0] = util::read_request(medium, util::extent_t {1, block_bytes_k}, registered_memory.reference(0),
                                           queue_pair.token(0));
@@ -186,7 +185,7 @@ void test_aio_splits_a_partially_refused_batch(linux_aio_files_disk_t& disk, uti
 
     on_queue_pair(
         disk, 4 * block_bytes_k, queue_pair_depth_k,
-        [&](util::queue_pair_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
+        [&](util::queue_ref_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
             std::array<util::request_t, 5> batch {};
             batch[0] = util::read_request(medium, util::extent_t {0, block_bytes_k}, registered_memory.reference(0),
                                           queue_pair.token(0));
@@ -222,7 +221,7 @@ void test_aio_runs_a_chain_in_order(linux_aio_files_disk_t& disk, util::medium_r
     constexpr std::size_t links_k = 5;
     on_queue_pair(
         disk, links_k * block_bytes_k, queue_pair_depth_k,
-        [&](util::queue_pair_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
+        [&](util::queue_ref_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
             std::array<util::request_t, links_k> chain {};
             for (std::size_t index = 0; index != links_k; ++index) {
                 chain[index] = util::read_request(medium, util::extent_t {index * block_bytes_k, block_bytes_k},
@@ -247,7 +246,7 @@ void test_aio_cancels_a_held_chain(linux_aio_files_disk_t& disk, util::medium_re
     constexpr std::size_t links_k = 4;
     on_queue_pair(
         disk, (links_k + 1) * block_bytes_k, queue_pair_depth_k,
-        [&](util::queue_pair_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
+        [&](util::queue_ref_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
             std::array<util::request_t, links_k + 1> batch {};
             for (std::size_t index = 0; index != links_k; ++index) {
                 batch[index] = util::read_request(medium, util::extent_t {index * block_bytes_k, block_bytes_k},
@@ -280,7 +279,7 @@ void test_aio_cancels_a_held_chain(linux_aio_files_disk_t& disk, util::medium_re
 void test_aio_polls_through_a_narrow_window(linux_aio_files_disk_t& disk, util::medium_reference_t medium) {
     on_queue_pair(
         disk, deep_queue_depth_k * block_bytes_k, deep_queue_depth_k,
-        [&](util::queue_pair_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
+        [&](util::queue_ref_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
             st::vector<util::request_t> batch;
             if (!expect_true(batch.resize(deep_queue_depth_k) == st::status_t::success_k)) return;
             for (std::size_t round = 0; round != 3; ++round) {
@@ -312,7 +311,6 @@ void test_aio_polls_through_a_narrow_window(linux_aio_files_disk_t& disk, util::
  */
 void test_aio_flushes_synchronously_where_the_kernel_refuses() {
     util::linux_aio_disk_config_t config;
-    config.depth_limit = queue_pair_depth_k;
     config.buffering = util::file_buffering_t::buffered_k;
     auto [disk, make_status] = linux_aio_files_disk_t::make(config);
     expect_true(make_status.succeeded());
@@ -328,7 +326,7 @@ void test_aio_flushes_synchronously_where_the_kernel_refuses() {
 
     on_queue_pair(
         disk, block_bytes_k, queue_pair_depth_k,
-        [&](util::queue_pair_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
+        [&](util::queue_ref_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
             std::array<util::request_t, 2> const batch {
                 util::write_request(medium, util::extent_t {0, 100}, registered_memory.reference(0),
                                     queue_pair.token(0)),
@@ -347,6 +345,36 @@ void test_aio_flushes_synchronously_where_the_kernel_refuses() {
     expect_true(disk.unregister_medium(registered).succeeded());
 }
 
+/** A blocking queue, which a call without an executor reads through, moves bytes on an AIO disk
+ *  with positioned transfers, addressing its own blocks through @c queue_range_k. */
+void test_aio_serves_a_blocking_queue(linux_aio_files_disk_t& disk, util::medium_reference_t medium) {
+    test_buffer_t blocks = make_buffer(2 * block_bytes_k);
+    expect_equal(blocks.size(), 2 * block_bytes_k);
+    if (blocks.size() != 2 * block_bytes_k) return;
+    auto [queue, make_queue_status] = util::blocking_queue_t::make(queue_pair_depth_k, whole(blocks));
+    expect_true(make_queue_status.succeeded());
+    if (make_queue_status.failed()) return;
+    util::queue_ref_t const queue_pair {queue, util::queue_id_t {0}};
+    expect_true(disk.register_media(queue_pair).succeeded());
+
+    paint(whole(blocks).first(block_bytes_k), 5);
+    std::array<util::request_t, 2> batch {
+        util::write_request(medium, util::extent_t {0, block_bytes_k},
+                            util::memory_reference_t {util::registered_memory_id_t::queue_range_k, 0, 0},
+                            queue_pair.token(0)),
+        util::read_request(medium, util::extent_t {0, block_bytes_k},
+                           util::memory_reference_t {util::registered_memory_id_t::queue_range_k, 0, block_bytes_k},
+                           queue_pair.token(1)),
+    };
+    batch[0].chaining = util::request_chaining_t::chained_k;
+    expect_true(disk.submit(queue_pair, std::span<util::request_t const> {batch}) == std::size_t {2});
+    std::array<util::completion_t, polling_room_k> completions {};
+    expect_true(util::poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<util::completion_t> {completions},
+                                                          2) == std::size_t {2});
+    expect_true(completions[0].completed_in_full() && completions[1].completed_in_full());
+    expect_true(same_bytes(whole(blocks).first(block_bytes_k), whole(blocks).subspan(block_bytes_k)));
+}
+
 #pragma endregion Cases
 
 #pragma region Driver
@@ -354,8 +382,6 @@ void test_aio_flushes_synchronously_where_the_kernel_refuses() {
 /** Mounts the Linux AIO transport on preallocated volumes and runs the suite on it. */
 void aio_transport(char const* directory) {
     util::linux_aio_disk_config_t config;
-    config.queue_pairs_limit = 4;
-    config.depth_limit = deep_queue_depth_k;
     config.registered_memory_limit = 4;
     config.media_limit = 4;
     config.buffering = util::file_buffering_t::unbuffered_k;
@@ -376,6 +402,7 @@ void aio_transport(char const* directory) {
                   run_test_case("test_aio_cancels_a_held_chain", test_aio_cancels_a_held_chain, disk, medium);
                   run_test_case("test_aio_polls_through_a_narrow_window", test_aio_polls_through_a_narrow_window, disk,
                                 medium);
+                  run_test_case("test_aio_serves_a_blocking_queue", test_aio_serves_a_blocking_queue, disk, medium);
               });
 
     std::string const deep_path = fmt::format("{}/{}", directory, "volume_deep.bin");
@@ -390,10 +417,10 @@ void aio_transport(char const* directory) {
                       util::queue_depth_t {16});
     });
 
-    std::string const borrowed_path = fmt::format("{}/{}", directory, "volume_borrowed.bin");
+    std::string const viewed_path = fmt::format("{}/{}", directory, "volume_viewed.bin");
     run_test_case("test_ring_holds_a_medium_in_flight<linux_aio_files_disk_t>",
                   test_ring_holds_a_medium_in_flight<linux_aio_files_disk_t>, disk,
-                  volume_request(borrowed_path.c_str()));
+                  volume_request(viewed_path.c_str()));
     std::string const durable_path = fmt::format("{}/{}", directory, "volume_durable.bin");
     run_test_case("test_ring_keeps_what_it_flushed<linux_aio_files_disk_t>",
                   test_ring_keeps_what_it_flushed<linux_aio_files_disk_t>, disk, volume_request(durable_path.c_str()));

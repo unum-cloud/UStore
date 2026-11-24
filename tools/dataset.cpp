@@ -9,7 +9,7 @@
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::int64_t`, `std::uint64_t`
-#include <cstdlib> // `std::free`
+#include <cstring> // `std::memcpy`
 
 #include <algorithm>    // `std::find`
 #include <charconv>     // `std::from_chars`, `std::to_chars`
@@ -19,7 +19,7 @@
 #include <system_error> // `std::errc`
 #include <utility>      // `std::move`, `std::exchange`
 
-#include <yyjson.h> // `yyjson_read`, `yyjson_mut_doc`
+#include <yyjson.h> // `yyjson_read_opts`, `yyjson_mut_doc`, `yyjson_mut_write_opts`
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 #include <stringzilla/stringzilla.hpp> // `sz::string_t`, `sz::string_view_t`, `sz::split`
@@ -29,10 +29,12 @@
 #include "ustore/utilities/ranges.hpp" // `bits_view_t`, `tape_string`, `u64_tape`
 #include "ustore/utilities/types.hpp"  // `sz`, `st`
 
+#include "ustore/docs/json_values.hpp"         // `json_allocator`
 #include "ustore/utilities/blocking_files.hpp" // `mapped_file_t`, `open_native_file`, `write_native_file`
+#include "ustore/utilities/ram_buffers.hpp"    // `arena_rewind`
 
 #include "dataset.h"   // `ustore_docs_import_t`, `ustore_graph_export_t`
-#include "dataset.hpp" // `format_of`, `failed`, `copy_path`, `place`, `task_arena_t`, `staged_output_t`
+#include "dataset.hpp" // `format_of`, `failed`, `copy_path`, `place`, `staged_output_t`
 
 namespace unum::ustore::tools {
 
@@ -175,35 +177,23 @@ void copy_path(ustore_bytes_view_t path, sz::string_t& copy, ustore_outcome_t* o
 
 #pragma region JSON
 
-/** Owns a parsed yyjson document. */
-struct json_document_t {
-    yyjson_doc* handle = nullptr;
+/** Parses @p row as JSON into @p arena, which holds the document until it is next rewound, through
+ *  @p text, a copy reused across rows, as yyjson reads only from a mutable buffer. */
+[[nodiscard]] yyjson_doc* parse_row(std::string_view row, sz::string_t& text, ustore_arena_t arena,
+                                    ustore_outcome_t* outcome) noexcept {
+    if (text.assign(sz::string_view_t {row}) != sz::status_t::success_k) {
+        *outcome = {ustore_status_out_of_memory_k, "Failed to copy a row"};
+        return nullptr;
+    }
+    yyjson_alc const allocator = docs::json_allocator(arena);
+    return yyjson_read_opts(text.data(), text.size(), 0, &allocator, nullptr);
+}
 
-    explicit json_document_t(yyjson_doc* document) noexcept : handle(document) {}
-    json_document_t(json_document_t const&) = delete;
-    json_document_t& operator=(json_document_t const&) = delete;
-    ~json_document_t() noexcept { yyjson_doc_free(handle); }
-};
-
-/** Owns a yyjson document under construction. */
-struct json_builder_t {
-    yyjson_mut_doc* handle = nullptr;
-
-    explicit json_builder_t(yyjson_mut_doc* document) noexcept : handle(document) {}
-    json_builder_t(json_builder_t const&) = delete;
-    json_builder_t& operator=(json_builder_t const&) = delete;
-    ~json_builder_t() noexcept { yyjson_mut_doc_free(handle); }
-};
-
-/** Owns the text yyjson serialized. */
-struct json_text_t {
-    char* handle = nullptr;
-
-    explicit json_text_t(char* text) noexcept : handle(text) {}
-    json_text_t(json_text_t const&) = delete;
-    json_text_t& operator=(json_text_t const&) = delete;
-    ~json_text_t() noexcept { std::free(handle); }
-};
+/** Starts an empty JSON document in @p arena, which holds it until it is next rewound. */
+[[nodiscard]] yyjson_mut_doc* build_row(ustore_arena_t arena) noexcept {
+    yyjson_alc const allocator = docs::json_allocator(arena);
+    return yyjson_mut_doc_new(&allocator);
+}
 
 /** Field names, resolved once from the strings the C ABI passes. */
 using field_list_t = std::span<std::string_view const>;
@@ -255,33 +245,36 @@ void place(yyjson_mut_doc* builder, yyjson_mut_val* root, std::string_view field
     if (name && copy) { [[maybe_unused]] bool const added = yyjson_mut_obj_add(parent, name, copy); }
 }
 
-/** Serializes the root of @p builder into @p output. */
-void append_json(yyjson_mut_doc* builder, sz::string_t& output, ustore_outcome_t* outcome) noexcept {
+/** Serializes the root of @p builder into @p output, through text laid out in @p arena. */
+void append_json(yyjson_mut_doc* builder, sz::string_t& output, ustore_arena_t arena,
+                 ustore_outcome_t* outcome) noexcept {
+    yyjson_alc const allocator = docs::json_allocator(arena);
     std::size_t length = 0;
-    json_text_t const text {yyjson_mut_write(builder, 0, &length)};
-    if (!text.handle) {
+    char const* const text = yyjson_mut_write_opts(builder, 0, &allocator, &length, nullptr);
+    if (!text) {
         *outcome = {ustore_status_out_of_memory_k, "Failed to serialize the document"};
         return;
     }
-    if (output.append(text.handle, length) != sz::status_t::success_k)
+    if (output.append(text, length) != sz::status_t::success_k)
         *outcome = {ustore_status_out_of_memory_k, "Failed to buffer a document"};
 }
 
 /** Serializes the @p fields of @p document into @p output, nesting JSON pointers into objects and skipping missing
- *  fields. */
-void project(yyjson_val* document, field_list_t fields, sz::string_t& output, ustore_outcome_t* outcome) noexcept {
-    json_builder_t const builder {yyjson_mut_doc_new(nullptr)};
-    yyjson_mut_val* const root = builder.handle ? yyjson_mut_obj(builder.handle) : nullptr;
+ *  fields, building the projection in @p arena. */
+void project(yyjson_val* document, field_list_t fields, sz::string_t& output, ustore_arena_t arena,
+             ustore_outcome_t* outcome) noexcept {
+    yyjson_mut_doc* const builder = build_row(arena);
+    yyjson_mut_val* const root = builder ? yyjson_mut_obj(builder) : nullptr;
     if (!root) {
         *outcome = {ustore_status_out_of_memory_k, "Failed to allocate a JSON document"};
         return;
     }
-    yyjson_mut_doc_set_root(builder.handle, root);
+    yyjson_mut_doc_set_root(builder, root);
     for (std::string_view const field : fields) {
         yyjson_val* const value = lookup(document, field);
-        if (value) place(builder.handle, root, field, value);
+        if (value) place(builder, root, field, value);
     }
-    append_json(builder.handle, output, outcome);
+    append_json(builder, output, arena, outcome);
 }
 
 #pragma endregion JSON
@@ -528,6 +521,7 @@ class document_batch_t {
         if (offsets_.size() == 0) return;
         ustore_docs_write_t write {};
         write.database = task.database;
+        write.executor = task.executor;
         write.outcome = task.outcome;
         write.durability = task.durability;
         write.count = offsets_.size() - 1;
@@ -546,6 +540,7 @@ class document_batch_t {
 /** Imports one document per NDJSON line, whole or projected onto @p fields. */
 void import_ndjson_documents(ustore_docs_import_t const& task, field_list_t fields, sz::string_view_t text) noexcept {
     document_batch_t batch;
+    sz::string_t parsed;
     for (sz::string_view_t line : sz::split(text, "\n")) {
         std::string_view const row = without_carriage_return(line);
         if (row.empty()) continue;
@@ -555,13 +550,15 @@ void import_ndjson_documents(ustore_docs_import_t const& task, field_list_t fiel
                 *task.outcome = {ustore_status_out_of_memory_k, "Failed to buffer a document"};
         }
         else {
-            json_document_t const document {yyjson_read(row.data(), row.size(), 0)};
-            yyjson_val* const root = yyjson_doc_get_root(document.handle);
+            // Each row parses in the task's arena, rewound per row, so warm rows allocate nothing
+            util::arena_rewind(task.arena);
+            yyjson_val* const root = yyjson_doc_get_root(parse_row(row, parsed, task.arena, task.outcome));
+            if (failed(task.outcome)) return;
             if (!yyjson_is_obj(root)) {
                 *task.outcome = {ustore_status_malformed_k, "The input file holds a line that is not a JSON object"};
                 return;
             }
-            project(root, fields, batch.text(), task.outcome);
+            project(root, fields, batch.text(), task.arena, task.outcome);
         }
         if (failed(task.outcome)) return;
 
@@ -584,13 +581,14 @@ void import_csv_documents(ustore_docs_import_t const& task, field_list_t fields,
 
     document_batch_t batch;
     while (reader.has_record()) {
-        json_builder_t const builder {yyjson_mut_doc_new(nullptr)};
-        yyjson_mut_val* const root = builder.handle ? yyjson_mut_obj(builder.handle) : nullptr;
+        util::arena_rewind(task.arena);
+        yyjson_mut_doc* const builder = build_row(task.arena);
+        yyjson_mut_val* const root = builder ? yyjson_mut_obj(builder) : nullptr;
         if (!root) {
             *task.outcome = {ustore_status_out_of_memory_k, "Failed to allocate a JSON document"};
             return;
         }
-        yyjson_mut_doc_set_root(builder.handle, root);
+        yyjson_mut_doc_set_root(builder, root);
 
         csv_boundary_t boundary = csv_boundary_t::next_field_k;
         for (std::size_t index = 0; boundary == csv_boundary_t::next_field_k; ++index) {
@@ -601,16 +599,16 @@ void import_csv_documents(ustore_docs_import_t const& task, field_list_t fields,
                 return;
             }
             if (index >= columns.size() || columns[index].use == column_use_t::skipped_k) continue;
-            yyjson_mut_val* const name = yyjson_mut_strncpy(builder.handle, names.data() + columns[index].offset,
+            yyjson_mut_val* const name = yyjson_mut_strncpy(builder, names.data() + columns[index].offset,
                                                             columns[index].length);
-            yyjson_mut_val* const value = csv_value(builder.handle, field);
+            yyjson_mut_val* const value = csv_value(builder, field);
             if (!name || !value || !yyjson_mut_obj_add(root, name, value)) {
                 *task.outcome = {ustore_status_out_of_memory_k, "Failed to allocate a JSON document"};
                 return;
             }
         }
 
-        append_json(builder.handle, batch.text(), task.outcome);
+        append_json(builder, batch.text(), task.arena, task.outcome);
         if (failed(task.outcome)) return;
         batch.commit(task.outcome);
         if (failed(task.outcome)) return;
@@ -633,8 +631,7 @@ void import_csv_documents(ustore_docs_import_t const& task, field_list_t fields,
  */
 template <typename scan_type_, void (*scan_)(scan_type_*), typename task_type_, typename consumer_type_>
 void scan_keys(task_type_ const& task, ustore_size_t batch_size, consumer_type_&& consume) noexcept {
-    task_arena_t const keys_arena {nullptr, task.outcome};
-    if (failed(task.outcome)) return;
+    st::vector<ustore_key_t> kept;
     ustore_key_t start = util::smallest_key_k;
     ustore_size_t scanned = 0;
     while (true) {
@@ -642,6 +639,7 @@ void scan_keys(task_type_ const& task, ustore_size_t batch_size, consumer_type_&
         ustore_key_t const* page = nullptr;
         scan_type_ scan {};
         scan.database = task.database;
+        scan.executor = task.executor;
         scan.outcome = task.outcome;
         scan.view = task.view;
         scan.count = 1;
@@ -649,15 +647,19 @@ void scan_keys(task_type_ const& task, ustore_size_t batch_size, consumer_type_&
         scan.start_keys = {&start, 0};
         scan.offsets = &offsets;
         scan.keys = &page;
-        scan.arena = keys_arena.get();
+        scan.arena = task.arena;
         scan.wanted = batch_size;
         scan_(&scan);
         if (failed(task.outcome) || !offsets || offsets[1] == offsets[0]) return;
 
         ustore_length_t const count = offsets[1] - offsets[0];
-        ustore_key_t const* const keys = page + offsets[0];
-        ustore_key_t const last = keys[count - 1];
-        consume(std::span<ustore_key_t const>(keys, count));
+        if (st::failed(kept.resize(count))) {
+            *task.outcome = {ustore_status_out_of_memory_k, "Failed to keep the keys of a batch"};
+            return;
+        }
+        std::memcpy(kept.data(), page + offsets[0], count * sizeof(ustore_key_t));
+        ustore_key_t const last = kept[count - 1];
+        consume(std::span<ustore_key_t const>(kept.data(), count));
         scanned += count;
         if (failed(task.outcome) || count < batch_size || last == util::largest_key_k) return;
         if (!advance(task, scanned, 0)) return;
@@ -690,6 +692,7 @@ void upsert_edges(ustore_graph_import_t const& task, st::vector<edge_row_t>& edg
     if (edges.size() == 0) return;
     ustore_graph_write_edges_t write {};
     write.database = task.database;
+    write.executor = task.executor;
     write.outcome = task.outcome;
     write.durability = task.durability;
     write.count = edges.size();
@@ -718,12 +721,14 @@ void stage_edge(ustore_graph_import_t const& task, st::vector<edge_row_t>& edges
 /** Imports one edge per NDJSON line, reading its vertices and edge from integer fields. */
 void import_ndjson_edges(ustore_graph_import_t const& task, sz::string_view_t text) noexcept {
     st::vector<edge_row_t> edges;
+    sz::string_t parsed;
     for (sz::string_view_t line : sz::split(text, "\n")) {
         std::string_view const row = without_carriage_return(line);
         if (row.empty()) continue;
 
-        json_document_t const document {yyjson_read(row.data(), row.size(), 0)};
-        yyjson_val* const root = yyjson_doc_get_root(document.handle);
+        util::arena_rewind(task.arena);
+        yyjson_val* const root = yyjson_doc_get_root(parse_row(row, parsed, task.arena, task.outcome));
+        if (failed(task.outcome)) return;
         edge_row_t edge {{}, {}, ustore_edge_id_default_k};
         if (!yyjson_is_obj(root) || !read_key(root, util::chars_of(task.source_id_field), edge.source) ||
             !read_key(root, util::chars_of(task.target_id_field), edge.target) ||
@@ -798,6 +803,10 @@ void ustore_docs_import(ustore_docs_import_t* task_pointer) {
         *task.outcome = {ustore_status_uninitialized_k, "Database is uninitialized"};
         return;
     }
+    if (!task.arena) {
+        *task.outcome = {ustore_status_invalid_argument_k, "The task needs an arena"};
+        return;
+    }
     st::vector<std::string_view> fields;
     resolve_fields(task.fields, task.fields_count, fields, task.outcome);
     if (failed(task.outcome)) return;
@@ -838,6 +847,10 @@ void ustore_docs_export(ustore_docs_export_t* task_pointer) {
         *task.outcome = {ustore_status_uninitialized_k, "Database is uninitialized"};
         return;
     }
+    if (!task.arena) {
+        *task.outcome = {ustore_status_invalid_argument_k, "The task needs an arena"};
+        return;
+    }
     st::vector<std::string_view> fields;
     resolve_fields(task.fields, task.fields_count, fields, task.outcome);
     if (failed(task.outcome)) return;
@@ -851,19 +864,18 @@ void ustore_docs_export(ustore_docs_export_t* task_pointer) {
     ustore_dataset_format_t const format = text_format_of(path.view(), task.outcome);
     if (failed(task.outcome)) return;
 
-    task_arena_t const arena {task.arena, task.outcome};
-    if (failed(task.outcome)) return;
     output_file_t output;
     output.create(path.c_str(), task.max_batch_size, task.outcome);
     if (failed(task.outcome)) return;
     if (format == ustore_dataset_format_csv_k) output.append("_id,doc\n", task.outcome);
 
-    sz::string_t projected;
+    sz::string_t projected, parsed;
     auto const export_batch = [&](std::span<ustore_key_t const> keys) noexcept {
         ustore_octet_t const* presences = nullptr;
         ustore_strings_view_t values {};
         ustore_docs_read_t read {};
         read.database = task.database;
+        read.executor = task.executor;
         read.outcome = task.outcome;
         read.view = task.view;
         read.count = keys.size();
@@ -871,7 +883,7 @@ void ustore_docs_export(ustore_docs_export_t* task_pointer) {
         read.keys = {keys.data(), sizeof(ustore_key_t)};
         read.presences = &presences;
         read.values = &values;
-        read.arena = arena.get();
+        read.arena = task.arena;
         read.outputs_type = ustore_docs_field_type_json_k;
         ustore_docs_read(&read);
         if (failed(task.outcome)) return;
@@ -882,10 +894,12 @@ void ustore_docs_export(ustore_docs_export_t* task_pointer) {
             sz::string_view_t document {util::chars_of(util::tape_string(values, index))};
             while (document.size() != 0 && document[document.size() - 1] == '\n')
                 document = sz::string_view_t(document.data(), document.size() - 1);
+            // A projection parses past the read's outputs, which the next read rewinds
             if (fields.size() != 0) {
-                json_document_t const parsed {yyjson_read(document.data(), document.size(), 0)};
                 projected.clear();
-                project(yyjson_doc_get_root(parsed.handle), fields, projected, task.outcome);
+                yyjson_doc* const parsed_document = parse_row(document, parsed, task.arena, task.outcome);
+                if (failed(task.outcome)) return;
+                project(yyjson_doc_get_root(parsed_document), fields, projected, task.arena, task.outcome);
                 document = projected.view();
             }
             if (format == ustore_dataset_format_ndjson_k) {
@@ -914,6 +928,10 @@ void ustore_graph_import(ustore_graph_import_t* task_pointer) {
 
     if (!task.database) {
         *task.outcome = {ustore_status_uninitialized_k, "Database is uninitialized"};
+        return;
+    }
+    if (!task.arena) {
+        *task.outcome = {ustore_status_invalid_argument_k, "The task needs an arena"};
         return;
     }
     if (!task.source_id_field.length || !task.target_id_field.length) {
@@ -948,6 +966,10 @@ void ustore_graph_export(ustore_graph_export_t* task_pointer) {
         *task.outcome = {ustore_status_uninitialized_k, "Database is uninitialized"};
         return;
     }
+    if (!task.arena) {
+        *task.outcome = {ustore_status_invalid_argument_k, "The task needs an arena"};
+        return;
+    }
     std::string_view const source_id_field = util::chars_of(task.source_id_field);
     std::string_view const target_id_field = util::chars_of(task.target_id_field);
     std::string_view const edge_id_field = util::chars_of(task.edge_id_field);
@@ -972,8 +994,6 @@ void ustore_graph_export(ustore_graph_export_t* task_pointer) {
     ustore_dataset_format_t const format = text_format_of(path.view(), task.outcome);
     if (failed(task.outcome)) return;
 
-    task_arena_t const arena {task.arena, task.outcome};
-    if (failed(task.outcome)) return;
     output_file_t output;
     output.create(path.c_str(), task.max_batch_size, task.outcome);
     if (failed(task.outcome)) return;
@@ -996,6 +1016,7 @@ void ustore_graph_export(ustore_graph_export_t* task_pointer) {
         ustore_key_t const* edges = nullptr;
         ustore_graph_read_edges_t read {};
         read.database = task.database;
+        read.executor = task.executor;
         read.outcome = task.outcome;
         read.view = task.view;
         read.count = vertices.size();
@@ -1005,7 +1026,7 @@ void ustore_graph_export(ustore_graph_export_t* task_pointer) {
         read.degrees_per_vertex = &degrees;
         read.edges_offsets = &offsets;
         read.edges_per_vertex = &edges;
-        read.arena = arena.get();
+        read.arena = task.arena;
         ustore_graph_read_edges(&read);
         if (failed(task.outcome)) return;
 

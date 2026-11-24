@@ -133,7 +133,7 @@ hidden byte passed;           // scratch: the take a retake looks at
 /** A sequentially consistent fence: an acquire-release read-modify-write of @c fences. Two of them
  *  are ordered like any two writes to one word, and the later one acquires everything before the
  *  earlier one, which is the store buffering RC11's fences forbid; it is stronger than a fence only
- *  in carrying the earlier thread's whole view, and never in what a mutant drops. */
+ *  in holding the earlier thread's whole view, and never in what a mutant drops. */
 inline fence_seq_cst(t) { read_modify_write(t, fences, order_acq_rel, fenced, 0) }
 
 /** The held bit set with @c take_order, which writes an odd word back unchanged; @p seen is what it

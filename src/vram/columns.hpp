@@ -21,7 +21,7 @@
 #include "ustore/utilities/ram_buffers.hpp" // `arena_copy`, `device_blocks_t`, `divide_round_up`
 #include "ustore/utilities/vram_device.hpp" // `carve`, `gpu_executor_concept`
 
-#include "utilities/arguments.hpp" // `answers_scores_concept`, `carries_keys_concept`, `carries_values_concept`
+#include "utilities/arguments.hpp" // `answers_scores_concept`, `has_keys_concept`, `has_values_concept`
 
 namespace unum::ustore {
 
@@ -122,12 +122,12 @@ template <typename arguments_type_, typename uploader_type_>
     }
 void output_columns(arguments_type_ const& arguments, uploader_type_& uploader) noexcept {
     std::size_t const written = static_cast<std::size_t>(*arguments.written);
-    if constexpr (carries_keys_concept<arguments_type_>) uploader.move_output(arguments.keys, written);
-    if constexpr (carries_strings_concept<arguments_type_>) uploader.move(*arguments.strings, written);
-    if constexpr (carries_ragged_values_concept<arguments_type_>) {
+    if constexpr (has_keys_concept<arguments_type_>) uploader.move_output(arguments.keys, written);
+    if constexpr (has_strings_concept<arguments_type_>) uploader.move(*arguments.strings, written);
+    if constexpr (has_ragged_values_concept<arguments_type_>) {
         if (arguments.values) uploader.move(*arguments.values, written);
     }
-    else if constexpr (carries_values_concept<arguments_type_>) uploader.move_output(arguments.values, written);
+    else if constexpr (has_values_concept<arguments_type_>) uploader.move_output(arguments.values, written);
 }
 
 /** The output columns of a strings read: presence bits and one key per string. */
@@ -175,6 +175,35 @@ void output_columns(ustore_docs_gather_t const& arguments, uploader_type_& uploa
         uploader.move(view.strings, rows);
     }
     *arguments.columns = uploader.move(views.data(), views.size()).data();
+}
+
+/** The output columns of a docs pull: every batch's keys and columns, then the views naming them,
+ *  each view repointed in a copy before it moves. */
+template <typename arguments_type_, typename uploader_type_>
+    requires std::is_same_v<arguments_type_, ustore_docs_cursor_next_t>
+void output_columns(arguments_type_ const& arguments, uploader_type_& uploader) noexcept {
+    if (!*arguments.batches_count) return;
+    docs_columns_t const& requested = arguments.cursor->columns;
+    std::size_t const fields = requested.fields.size();
+    std::span<ustore_docs_batch_view_t> const batches = uploader.copy_into_bounce(
+        *arguments.batches, static_cast<std::size_t>(*arguments.batches_count));
+    for (ustore_docs_batch_view_t& batch : batches) {
+        std::size_t const rows = static_cast<std::size_t>(batch.count);
+        std::size_t const bitmap_bytes = util::divide_round_up(rows, util::bits_in_byte_k);
+        batch.keys = uploader.move(batch.keys, rows).data();
+        std::span<ustore_docs_column_view_t> const columns = uploader.copy_into_bounce(batch.columns, fields);
+        for (std::size_t field = 0; field != columns.size(); ++field) {
+            ustore_docs_column_view_t& column = columns[field];
+            column.validities = uploader.move(column.validities, bitmap_bytes).data();
+            column.conversions = uploader.move(column.conversions, bitmap_bytes).data();
+            column.collisions = uploader.move(column.collisions, bitmap_bytes).data();
+            column.scalars =
+                uploader.move(column.scalars, rows * docs::field_size_bytes(requested.types[field])).data();
+            uploader.move(column.strings, rows);
+        }
+        batch.columns = uploader.move(columns.data(), columns.size()).data();
+    }
+    *arguments.batches = uploader.move(batches.data(), batches.size()).data();
 }
 
 /** Moves every output column of @p hosted, which a host verb wrote into @p executor's bounce, into @p blocks, the

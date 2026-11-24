@@ -12,7 +12,7 @@
  *  struct, the engines by value laid out as their C structs with every pointer a host address,
  *  reached through the block table as @c vram_kernels_apple.metal reaches its own.
  *
- *  The host splices, ahead of this source: @c vram_apple_shared.h , then StringZilla's
+ *  The host splices, ahead of this source: @c vram_apple_shared.hpp , then StringZilla's
  *  @c types.metal , @c utf8_uncased_fold/tables.h , @c utf8_uncased_fold/metal.metal ,
  *  @c substrings/metal.metal , @c regex/metal.metal and @c subdocuments/metal.metal , then
  *  @c vram_kernels_apple.metal . The regex walks read their start state, acceptance bound and row

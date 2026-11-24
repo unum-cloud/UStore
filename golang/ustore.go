@@ -8,7 +8,7 @@
 //   - [Database], [Transaction] and [Snapshot]: the head, a group of changes, and a point in time.
 //   - [DatabaseOn.On] and [DatabaseOn.Deferred]: the receivers that pick an executor and whether a
 //     verb blocks or answers a [Deferred].
-//   - [Arena]: where every output whose length scales with a call lands, borrowed by its views.
+//   - [Arena]: where each output whose length scales with a call lands, viewed until its next call.
 //   - [Executor]: the threads, rings or stream calls run on.
 //
 // A blocking verb allocates one pinned frame, and a deferred one adds its [Deferred] and the

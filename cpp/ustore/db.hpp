@@ -99,11 +99,11 @@ struct outputs<collection_type_> {
  *      when it names one, into @p arena, as @p collection_type_, completing as @p completion_ says.
  *
  *  Collections are created and dropped only at the head, so names are read at the snapshot or at
- *  the head and never join a transaction's conflicts. The bytes of @p name stay borrowed until the
- *  call is final.
+ *  the head and never join a transaction's conflicts. The caller keeps the bytes of @p name until
+ *  the call is final.
  *
  *  @par Statuses:
- *  - @c status_code_t::not_found_k No collection carries @p name.
+ *  - @c status_code_t::not_found_k No collection holds @p name.
  *  - @c status_code_t::invalid_argument_k The collection holds another modality than
  *    @p collection_type_.
  */
@@ -165,7 +165,7 @@ inline expected<bool> collection_exists_(receiver_t const& receiver, std::string
 }
 
 /** Lists the collections at the head, or at the snapshot of @p receiver, with their identifiers in
- *  @p arena, borrowed until the call is final. */
+ *  @p arena, owned by the caller until the call is final. */
 template <ustore_completion_t completion_>
 deferrable<collections_list_t, completion_> collections_list_(receiver_t const& receiver, arena_t& arena) noexcept {
     return answered_<deferrable<collections_list_t, completion_>>(
@@ -227,16 +227,16 @@ class transaction {
     receiver_t receiver() const noexcept { return {database_, receiver_.executor(), receiver_.handle(), nullptr}; }
 
     /** The same handle, whose verbs block on @p executor. */
-    transaction<borrowing<ustore_transaction_t, ustore_completion_blocking_k>> on(
+    transaction<caller_owned<ustore_transaction_t, ustore_completion_blocking_k>> on(
         executor_t const& executor) const noexcept {
-        return transaction<borrowing<ustore_transaction_t, ustore_completion_blocking_k>>(
+        return transaction<caller_owned<ustore_transaction_t, ustore_completion_blocking_k>>(
             {receiver_.handle(), executor.handle()}, database_);
     }
 
     /** The same handle, whose verbs submit to @p executor and answer deferred calls. */
-    transaction<borrowing<ustore_transaction_t, ustore_completion_deferred_k>> deferred(
+    transaction<caller_owned<ustore_transaction_t, ustore_completion_deferred_k>> deferred(
         executor_t const& executor) const noexcept {
-        return transaction<borrowing<ustore_transaction_t, ustore_completion_deferred_k>>(
+        return transaction<caller_owned<ustore_transaction_t, ustore_completion_deferred_k>>(
             {receiver_.handle(), executor.handle()}, database_);
     }
 
@@ -383,9 +383,10 @@ class transaction {
  *  @c database_t. Its verbs block on the calling thread, or run through @c on and @c deferred. */
 using transaction_t = transaction<owning<ustore_transaction_t, ustore_transaction_free>>;
 
-/** A borrowed transaction and its executor, completing its verbs as @p completion_ says. */
+/** A transaction the caller owns and the executor its verbs run on, completing as
+ *  @p completion_ says. */
 template <ustore_completion_t completion_>
-using transaction_on = transaction<borrowing<ustore_transaction_t, completion_>>;
+using transaction_on = transaction<caller_owned<ustore_transaction_t, completion_>>;
 
 /** A transaction whose verbs block, as the calls on one executor see it, without owning either. */
 using transaction_ref_t = transaction_on<ustore_completion_blocking_k>;
@@ -433,15 +434,16 @@ class snapshot {
     read_stamp_t read_stamp() const noexcept { return read_stamp_; }
 
     /** The same handle, whose verbs block on @p executor. */
-    snapshot<borrowing<ustore_snapshot_t, ustore_completion_blocking_k>> on(executor_t const& executor) const noexcept {
-        return snapshot<borrowing<ustore_snapshot_t, ustore_completion_blocking_k>>(
+    snapshot<caller_owned<ustore_snapshot_t, ustore_completion_blocking_k>> on(
+        executor_t const& executor) const noexcept {
+        return snapshot<caller_owned<ustore_snapshot_t, ustore_completion_blocking_k>>(
             {receiver_.handle(), executor.handle()}, database_, read_stamp_);
     }
 
     /** The same handle, whose verbs submit to @p executor and answer deferred calls. */
-    snapshot<borrowing<ustore_snapshot_t, ustore_completion_deferred_k>> deferred(
+    snapshot<caller_owned<ustore_snapshot_t, ustore_completion_deferred_k>> deferred(
         executor_t const& executor) const noexcept {
-        return snapshot<borrowing<ustore_snapshot_t, ustore_completion_deferred_k>>(
+        return snapshot<caller_owned<ustore_snapshot_t, ustore_completion_deferred_k>>(
             {receiver_.handle(), executor.handle()}, database_, read_stamp_);
     }
 
@@ -508,14 +510,15 @@ class snapshot {
 
 #pragma region Verbs
 
-    /** Lists the collections at the snapshot, with their identifiers in @p arena, borrowed until
+    /** Lists the collections at the snapshot, with their identifiers in @p arena, viewed until
      *  the call is final. */
     deferrable<collections_list_t> collections(arena_t& arena) const noexcept {
         return collections_list_<completion_k>(receiver(), arena);
     }
 
-    /** Saves the snapshot as a new database at @p path, borrowed until the call is final, reporting
-     *  the bytes saved to @p progress, which may cancel the save and so remove what it wrote. */
+    /** Saves the snapshot as a new database at @p path, owned by the caller until the call is
+     *  final, reporting the bytes saved to @p progress, which may cancel the save and so remove
+     *  what it wrote. */
     deferrable<> save(std::string_view path, progress_t progress = {}) const noexcept {
         return answered_<deferrable<>>([&](ustore_outcome_t* outcome, outputs<void>*) noexcept {
             ustore_snapshot_save_t arguments {.snapshot = receiver().snapshot,
@@ -554,9 +557,10 @@ class snapshot {
  *  @c deferred run them on an executor instead. */
 using snapshot_t = snapshot<owning<ustore_snapshot_t, ustore_snapshot_free>>;
 
-/** A borrowed snapshot and its executor, completing its verbs as @p completion_ says. */
+/** A snapshot the caller owns and the executor its verbs run on, completing as @p completion_
+ *  says. */
 template <ustore_completion_t completion_>
-using snapshot_on = snapshot<borrowing<ustore_snapshot_t, completion_>>;
+using snapshot_on = snapshot<caller_owned<ustore_snapshot_t, completion_>>;
 
 /** A snapshot whose verbs block, as the calls on one executor see it, without owning either. */
 using snapshot_ref_t = snapshot_on<ustore_completion_blocking_k>;
@@ -577,7 +581,7 @@ struct changes_t {
     /** What every change did, which @c ustore_change_kind_name spells. */
     std::span<ustore_change_kind_t const> kinds;
 
-    /** The bytes every change carries, empty for a removal, or none when the pull read none. */
+    /** The bytes every change holds, empty for a removal, or none when the pull read none. */
     strings_view_t values {};
 };
 
@@ -655,7 +659,7 @@ class changes_cursor_t {
         return pull_(wanted, arena, executor, nullptr);
     }
 
-    /** Pulls up to @p wanted next changes with the bytes every one carries into @p arena in one
+    /** Pulls up to @p wanted next changes with the bytes every one holds into @p arena in one
      *  call, on @p executor, or on the calling thread without one. */
     expected<changes_t> next_pairs(std::size_t wanted, arena_t& arena, executor_t const& executor = {}) noexcept {
         ustore_strings_view_t values {};
@@ -673,8 +677,9 @@ class changes_cursor_t {
  *      rows of an unfinished one.
  *
  *  It joins no transaction and watches nothing, so a reader sees all of the ingest or none of it.
- *  Its calls run on the calling thread, one at a time, and copy their rows before returning, so
- *  every input may die after the call. It moves but never copies.
+ *  Its calls run one at a time, each blocking on the executor it names or on the calling thread
+ *  without one, and copy their rows before returning, so every input may die after the call. Its
+ *  state lives on the memory domain of the executor @c make names. It moves but never copies.
  */
 class ingest_t {
     owner<ustore_ingest_t, ustore_ingest_free> owner_;
@@ -686,7 +691,8 @@ class ingest_t {
     ustore_ingest_t* handle_field() noexcept { return owner_.handle_field(); }
 
     /**
-     *  @brief Opens an ingest into @p collection of @p database, whose rows arrive in @p order.
+     *  @brief Opens an ingest into @p collection of the database @p receiver names, whose rows
+     *      arrive in @p order, blocking on its executor, whose memory domain holds the ingest.
      *
      *  @par Statuses:
      *  - @c status_code_t::read_only_k The database was opened read-only.
@@ -694,16 +700,20 @@ class ingest_t {
      *    modality.
      *  - @c status_code_t::not_found_k The collection does not exist.
      */
-    static expected<ingest_t> make(ustore_database_t database, ustore_collection_id_t collection,
+    static expected<ingest_t> make(receiver_t receiver, ustore_collection_id_t collection,
                                    ustore_ingest_order_t order = ustore_ingest_sorted_k) noexcept {
-        ustore_ingest_init_t arguments {.database = database, .collection = collection, .order = order};
+        ustore_ingest_init_t arguments {.database = receiver.database,
+                                        .executor = receiver.executor,
+                                        .collection = collection,
+                                        .order = order};
         return opened_<ingest_t>(ustore_ingest_init, arguments, &ustore_ingest_init_t::ingest);
     }
 
     /**
      *  @brief Hands the ingest one batch of @p values beside their @p keys, pairwise: the values
      *      of blobs, JSON documents and XML pages, or the strings of a strings collection beside
-     *      the keys they map onto.
+     *      the keys they map onto, parsed over the threads of @p executor, or on the calling
+     *      thread without one.
      *
      *  @par Statuses:
      *  - @c status_code_t::invalid_argument_k The @p keys and @p values differ in count, the ingest
@@ -713,11 +723,12 @@ class ingest_t {
      *    JSON, or a page no XML.
      */
     template <strings_batch values_type_>
-    status_t append(keys_view_t keys, values_type_ const& values) noexcept {
+    status_t append(keys_view_t keys, values_type_ const& values, executor_t const& executor = {}) noexcept {
         // The call has one count, so only this side sees the keys and the values disagree
         if (keys.size() != std::size(values))
             return status_t {status_code_t::invalid_argument_k, "Every key needs its own value"};
         ustore_ingest_append_t arguments {.ingest = handle(),
+                                          .executor = executor.handle(),
                                           .count = keys.size(),
                                           .keys = {keys.data(), keys.stride()},
                                           .values = strings_view_of(values)};
@@ -727,10 +738,11 @@ class ingest_t {
         });
     }
 
-    /** Hands the ingest of a graph collection one batch of @p edges, refusing what the other
-     *  @c append refuses. */
-    status_t append(edges_view_t const& edges) noexcept {
+    /** Hands the ingest of a graph collection one batch of @p edges on @p executor, or on the
+     *  calling thread without one, refusing what the other @c append refuses. */
+    status_t append(edges_view_t const& edges, executor_t const& executor = {}) noexcept {
         ustore_ingest_append_t arguments {.ingest = handle(),
+                                          .executor = executor.handle(),
                                           .count = edges.size(),
                                           .sources = {edges.sources.data(), edges.sources.stride()},
                                           .targets = {edges.targets.data(), edges.targets.stride()},
@@ -742,17 +754,22 @@ class ingest_t {
     }
 
     /**
-     *  @brief Lands every row appended as one commit and ends the ingest, whatever it answers,
-     *      answering the one stamp every row landed at.
+     *  @brief Lands every row appended as one commit on @p executor, or on the calling thread
+     *      without one, and ends the ingest, whatever it answers, answering the one stamp every
+     *      row landed at.
      *
      *  @par Statuses:
      *  - @c status_code_t::invalid_argument_k The ingest is finished.
      *  - @c status_code_t::not_found_k The collection was dropped meanwhile.
      *  - @c status_code_t::contended_k Memory runs kept refilling while the ingest waited them out.
      */
-    expected<commit_stamp_t> finish(ustore_durability_t durability = ustore_durability_buffered_k) noexcept {
+    expected<commit_stamp_t> finish(ustore_durability_t durability = ustore_durability_buffered_k,
+                                    executor_t const& executor = {}) noexcept {
         ustore_stamp_t stamp = 0;
-        ustore_ingest_finish_t arguments {.ingest = handle(), .durability = durability, .commit_stamp = &stamp};
+        ustore_ingest_finish_t arguments {.ingest = handle(),
+                                          .executor = executor.handle(),
+                                          .durability = durability,
+                                          .commit_stamp = &stamp};
         status_t const status = answered_<status_t>([&](ustore_outcome_t* outcome, outputs<void>*) noexcept {
             arguments.outcome = outcome;
             ustore_ingest_finish(&arguments);
@@ -774,8 +791,8 @@ class database;
  *      later one, until @c compact_plan_finish consumes it.
  *
  *  Nothing finishes it on destruction: a dropped live plan leaks and keeps its database closed to
- *  another compaction, as an unfinished plan does in C. The database and the executor it was opened
- *  with outlive every call naming it and its finish.
+ *  another compaction, as an unfinished plan does in C. It opens only on an executor, continues or
+ *  finishes on any host executor, and its database outlives every call naming it and its finish.
  */
 class database_compact_plan_t {
     ustore_database_compact_plan_t handle_ = nullptr;
@@ -803,8 +820,8 @@ class database_compact_plan_t {
 };
 
 /** The head of a database as a map from collection names to collections, whose verbs complete as @p
- *  receiver_type_ says: an owning handle blocks on the calling thread, a borrowed one runs on the
- *  executor it names. */
+ *  receiver_type_ says: an owning handle blocks on the calling thread, and one viewing a handle the
+ *  caller owns runs on the executor it names. */
 template <typename receiver_type_>
 class database {
     static constexpr ustore_completion_t completion_k = receiver_type_::completion;
@@ -841,15 +858,16 @@ class database {
     receiver_t receiver() const noexcept { return {receiver_.handle(), receiver_.executor()}; }
 
     /** The same handle, whose verbs block on @p executor. */
-    database<borrowing<ustore_database_t, ustore_completion_blocking_k>> on(executor_t const& executor) const noexcept {
-        return database<borrowing<ustore_database_t, ustore_completion_blocking_k>>(
+    database<caller_owned<ustore_database_t, ustore_completion_blocking_k>> on(
+        executor_t const& executor) const noexcept {
+        return database<caller_owned<ustore_database_t, ustore_completion_blocking_k>>(
             {receiver_.handle(), executor.handle()});
     }
 
     /** The same handle, whose verbs submit to @p executor and answer deferred calls. */
-    database<borrowing<ustore_database_t, ustore_completion_deferred_k>> deferred(
+    database<caller_owned<ustore_database_t, ustore_completion_deferred_k>> deferred(
         executor_t const& executor) const noexcept {
-        return database<borrowing<ustore_database_t, ustore_completion_deferred_k>>(
+        return database<caller_owned<ustore_database_t, ustore_completion_deferred_k>>(
             {receiver_.handle(), executor.handle()});
     }
 
@@ -858,7 +876,7 @@ class database {
      *      modality than @p collection_type_, completing as this receiver does.
      *
      *  @par Statuses:
-     *  - @c status_code_t::not_found_k No collection carries @p name.
+     *  - @c status_code_t::not_found_k No collection holds @p name.
      *  - @c status_code_t::invalid_argument_k The collection holds another modality than
      *    @p collection_type_.
      */
@@ -908,14 +926,14 @@ class database {
             });
     }
 
-    /** Lists the collections at the head, with their identifiers in @p arena, borrowed until the
+    /** Lists the collections at the head, with their identifiers in @p arena, viewed until the
      *  call is final. */
     deferrable<collections_list_t> collections(arena_t& arena) const noexcept {
         return collections_list_<completion_k>(receiver(), arena);
     }
 
-    /** Creates a collection holding the modality of @p collection_type_ under @p name, borrowed
-     *  until the call is final, which no other collection may carry, answering a handle completing
+    /** Creates a collection holding the modality of @p collection_type_ under @p name, viewed
+     *  until the call is final, which no other collection may hold, answering a handle completing
      *  as this receiver does. */
     template <typename collection_type_ = blobs_collection_t>
     deferrable<typename collection_type_::template completed_as<completion_k>> create(
@@ -934,7 +952,13 @@ class database {
         });
     }
 
-    /** Drops what @p mode names of the collection @p collection identifies. */
+    /**
+     *  @brief Drops what @p mode names of the collection @p collection identifies.
+     *
+     *  @par Statuses:
+     *  - @c status_code_t::contended_k Dropping the collection while a snapshot is open, or on NVMe
+     *    while a snapshot or a transaction is open.
+     */
     deferrable<> drop(ustore_collection_id_t collection,
                       ustore_drop_mode_t mode = ustore_drop_collection_k) const noexcept {
         return collection_drop_<completion_k>(receiver(), collection, mode);
@@ -944,8 +968,8 @@ class database {
      *  @brief Empties every collection at once, as @p mode names.
      *
      *  @par Statuses:
-     *  - @c status_code_t::invalid_argument_k The RAM and RocksDB engines refuse to drop the
-     *    collections while a snapshot is open.
+     *  - @c status_code_t::contended_k Dropping the collections while a snapshot is open, or on
+     *    NVMe while a snapshot or a transaction is open.
      */
     deferrable<> clear(ustore_drop_mode_t mode) const noexcept {
         return answered_<deferrable<>>([&](ustore_outcome_t* outcome, outputs<void>*) noexcept {
@@ -962,7 +986,7 @@ class database {
      *  @brief Reclaims the space overwritten and removed data still takes, through its flush,
      *      merge and reclaim phases, reporting its advance to @p progress, which may cancel
      *      it between units.
-     *  @param[in] progress Hears every unit, and may cancel the call there, borrowed until the
+     *  @param[in] progress Hears every unit, and may cancel the call there, viewed until the
      *      call is final.
      *  @param[in,out] plan The plan a cancel leaves live, opened by the first call naming it and
      *      continued by every later one, which writes where it stopped; @c nullptr runs the
@@ -1067,7 +1091,7 @@ class database {
         return find(name);
     }
 
-    /** The collection named @p name, created when no collection carries the name. */
+    /** The collection named @p name, created when no collection holds the name. */
     template <typename collection_type_ = blobs_collection_t>
     expected<typename collection_type_::template completed_as<completion_k>> find_or_create(
         std::string_view name) const noexcept
@@ -1088,13 +1112,14 @@ class database {
         return changes_cursor_t::make(receiver(), collection, since);
     }
 
-    /** Opens an ingest into @p collection, whose rows arrive in @p order and whose calls run on the
-     *  calling thread. */
+    /** Opens an ingest into @p collection, whose rows arrive in @p order, blocking on
+     *  this receiver's executor, whose memory domain holds the ingest; its later calls
+     *  name their own. */
     expected<ingest_t> ingest(ustore_collection_id_t collection,
                               ustore_ingest_order_t order = ustore_ingest_sorted_k) const noexcept
         requires blocks<completion_k>
     {
-        return ingest_t::make(receiver().database, collection, order);
+        return ingest_t::make(receiver(), collection, order);
     }
 
     /** Drops the collection @p name addresses, which takes the name with it. */
@@ -1164,8 +1189,17 @@ class database {
         return opened_<database>(ustore_database_open_nvme, options, &ustore_database_open_nvme_t::database, executor);
     }
 
-    /** Drops this handle, closing the database once no transaction or snapshot of it
-     *  holds it open. */
+    /** Serves the database the manifest @p options name through the NVMe engine, read-only,
+     *  writing nothing to its data directories, blocking on @p executor or on the calling
+     *  thread without it. */
+    static expected<database> view_nvme(ustore_database_view_nvme_t options, executor_t const& executor = {}) noexcept
+        requires owns_handle<receiver_type_>
+    {
+        return opened_<database>(ustore_database_view_nvme, options, &ustore_database_view_nvme_t::database, executor);
+    }
+
+    /** Drops this handle, closing the database once no transaction or snapshot of it holds it
+     *  open; closing writes nothing, so @c flush first makes buffered commits durable. */
     void close() noexcept
         requires owns_handle<receiver_type_>
     {
@@ -1179,9 +1213,10 @@ class database {
  *  hands out, while the transactions and snapshots it begins may outlive the database itself. */
 using database_t = database<owning<ustore_database_t, ustore_database_free>>;
 
-/** A borrowed database head and its executor, completing its verbs as @p completion_ says. */
+/** A database head the caller owns and the executor its verbs run on, completing as
+ *  @p completion_ says. */
 template <ustore_completion_t completion_>
-using database_on = database<borrowing<ustore_database_t, completion_>>;
+using database_on = database<caller_owned<ustore_database_t, completion_>>;
 
 /** The head of a database whose verbs block, as the calls on one executor see it, without owning
  *  either. */

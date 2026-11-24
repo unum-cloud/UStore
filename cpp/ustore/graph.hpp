@@ -78,11 +78,9 @@ inline ustore_key_t const** edges_output_(outputs<edges_view_t>& written) noexce
 /**
  *  @brief Reads the degrees of @p vertices in @p roles into @p arena, and their edges too when
  *      @p answer_type_ asks.
- *  @param[in] collection Collection every vertex lives in, borrowed until the call is final.
- *  @param[in] vertices Vertices to read, borrowed until the call is final.
- *  @param[in] roles Role every vertex plays in the wanted edges, empty for any, borrowed until the
+ *  @param[in] collection Collection every vertex lives in, owned by the caller until the
  *      call is final.
- *  @param[in] arena Memory the answer lands in, borrowed until the call is final, which
+ *  @param[in] arena Memory the answer lands in, owned by the caller until the call is final, which
  *      the answer views.
  *  @param[in] watch Whether a read inside a transaction records the vertices for conflicts.
  */
@@ -325,7 +323,7 @@ class graph_stream_t {
         return {};
     }
 
-    /** Advances like @c advance, but a failed fetch ends the stream since a reference carries no
+    /** Advances like @c advance, but a failed fetch ends the stream since a reference holds no
      *  status. */
     graph_stream_t& operator++() noexcept {
         if (!advance().failed()) return *this;
@@ -365,9 +363,9 @@ class graph_stream_t {
  *      edges, cheap to construct and to copy, whose verbs answer as @p completion_ says.
  *
  *  A blocking handle answers a @c status_t or an @c expected, while a deferred one answers a
- *  @c deferred call, borrowing the handle, its inputs and its arena until the call is final. A
- *  handle with @c collection_access_t::read_only_k only reads, as a snapshot hands out. It holds no
- *  state, so any number of threads share it, at the head, inside a transaction or at a snapshot.
+ *  @c deferred call, viewing the handle, its inputs and its arena until the call is final. A handle
+ *  with @c collection_access_t::read_only_k only reads, as a snapshot hands out. It holds no state,
+ *  so any number of threads share it, at the head, inside a transaction or at a snapshot.
  */
 template <ustore_completion_t completion_, collection_access_t access_>
 class graph_collection_on {
@@ -413,10 +411,11 @@ class graph_collection_on {
 
     /**
      *  @brief Reads the degree of every vertex of @p vertices into @p arena.
-     *  @param[in] vertices Vertices whose edges are counted, borrowed until the call is final.
-     *  @param[in] arena Memory the degrees land in, borrowed until the call is final, which
-     *      the answer views.
-     *  @param[in] roles Role every vertex plays in the counted edges, empty for any, borrowed until
+     *  @param[in] vertices Vertices whose edges are counted, owned by the caller until the
+     *      call is final.
+     *  @param[in] arena Memory the degrees land in, owned by the caller until the call is final,
+     *      which the answer views.
+     *  @param[in] roles Role every vertex plays in the counted edges, empty for any, viewed until
      *      the call is final.
      *  @param[in] watch Whether a read inside a transaction records the vertices for conflicts.
      */
@@ -431,10 +430,11 @@ class graph_collection_on {
      *      split by vertex through the offsets of the answer, where undirected graphs may repeat
      *      an edge reversed.
      *
-     *  @param[in] vertices Vertices whose edges are read, borrowed until the call is final.
-     *  @param[in] arena Memory the edges land in, borrowed until the call is final, which
-     *      the answer views.
-     *  @param[in] roles Role every vertex plays in the wanted edges, empty for any, borrowed until
+     *  @param[in] vertices Vertices whose edges are read, owned by the caller until the
+     *      call is final.
+     *  @param[in] arena Memory the edges land in, owned by the caller until the call is final,
+     *      which the answer views.
+     *  @param[in] roles Role every vertex plays in the wanted edges, empty for any, viewed until
      *      the call is final.
      *  @param[in] watch Whether a read inside a transaction records the vertices for conflicts.
      */
@@ -444,7 +444,8 @@ class graph_collection_on {
         return graph_read_edges_<completion_, edges_view_t>(receiver_, collection_, vertices, roles, arena, watch);
     }
 
-    /** Writes @p edges, borrowed until the call is final, between existing or new vertices. */
+    /** Writes @p edges, owned by the caller until the call is final, between existing or new
+     *  vertices. */
     deferrable<> write_edges(edges_view_t const& edges,
                              ustore_durability_t durability = ustore_durability_buffered_k) const noexcept
         requires writes_k
@@ -452,7 +453,7 @@ class graph_collection_on {
         return graph_write_edges_<completion_>(receiver_, collection_, edges, durability);
     }
 
-    /** Removes @p edges, borrowed until the call is final, keeping their vertices. */
+    /** Removes @p edges, owned by the caller until the call is final, keeping their vertices. */
     deferrable<> remove_edges(edges_view_t const& edges,
                               ustore_durability_t durability = ustore_durability_buffered_k) const noexcept
         requires writes_k
@@ -460,8 +461,8 @@ class graph_collection_on {
         return graph_remove_edges_<completion_>(receiver_, collection_, edges, durability);
     }
 
-    /** Writes @p vertices, borrowed until the call is final, without edges, keeping those already
-     *  present. */
+    /** Writes @p vertices, owned by the caller until the call is final, without edges, keeping
+     *  those already present. */
     deferrable<> write_vertices(strided_span<ustore_key_t const> vertices,
                                 ustore_durability_t durability = ustore_durability_buffered_k) const noexcept
         requires writes_k
@@ -471,8 +472,8 @@ class graph_collection_on {
 
     /**
      *  @brief Removes @p vertices together with every edge they belong to.
-     *  @param[in] vertices Vertices to remove, borrowed until the call is final.
-     *  @param[in] roles Role every vertex plays, which only joining graphs need, borrowed until the
+     *  @param[in] vertices Vertices to remove, owned by the caller until the call is final.
+     *  @param[in] roles Role every vertex plays, which only joining graphs need, viewed until the
      *      call is final.
      *  @param[in] durability Whether the call finishes only after the data reaches the disk.
      */
@@ -486,7 +487,7 @@ class graph_collection_on {
 
     /**
      *  @brief Draws up to @p wanted vertices at random into @p arena.
-     *  @param[in] arena Memory the vertices land in, which the answer views, borrowed until the
+     *  @param[in] arena Memory the vertices land in, which the answer views, viewed until the
      *      call is final.
      *  @param[in] watch Whether a read inside a transaction records the vertices for conflicts.
      */
@@ -499,9 +500,10 @@ class graph_collection_on {
     /**
      *  @brief Estimates the vertices and the space from @p start_key, inclusive, to @p end_key,
      *      exclusive, into @p arena.
-     *  @param[in] start_key First vertex of the range, borrowed until the call is final.
-     *  @param[in] end_key Vertex the range stops before, borrowed until the call is final.
-     *  @param[in] arena Memory the bounds land in, borrowed until the call is final.
+     *  @param[in] start_key First vertex of the range, owned by the caller until the call is final.
+     *  @param[in] end_key Vertex the range stops before, owned by the caller until the
+     *      call is final.
+     *  @param[in] arena Memory the bounds land in, owned by the caller until the call is final.
      *  @param[in] watch Whether a read inside a transaction records the range for conflicts.
      */
     deferrable<size_estimates_t> measure_vertices(ustore_key_t const& start_key, ustore_key_t const& end_key,

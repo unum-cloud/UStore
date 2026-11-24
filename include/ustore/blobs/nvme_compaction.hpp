@@ -14,7 +14,7 @@
  *  compactors, one per vendor, which carve, copy and launch through their executors: their
  *  kernels compile into the library's bundles, and @c compaction.cpp instantiates their
  *  compaction for the engine's key slots, so a host TU calls them, and a device whose bundle
- *  carries no kernels makes no device compactor.
+ *  holds no kernels makes no device compactor.
  */
 
 #pragma once
@@ -43,7 +43,7 @@
 #include "ustore/utilities/algorithm.hpp"          // `loser_tree`
 #include "ustore/utilities/blocking_files.hpp"     // `path_max_bytes_k`
 #include "ustore/utilities/folds.hpp"              // `fold_concept`, `fold_delta_pair`, `delta_kind_t`
-#include "ustore/utilities/nvme_ring.hpp"          // `extent_t`, `ring_concept`, `queue_pair_t`, `read_request`
+#include "ustore/utilities/nvme_ring.hpp"          // `extent_t`, `disk_concept`, `queue_ref_t`, `read_request`
 #include "ustore/utilities/ram_buffers.hpp"        // `local_arena_t`, `arena_allocator`
 #include "ustore/utilities/types.hpp"              // `round_up_to_multiple`, `expected`, `uuid128_t`
 #include "ustore/utilities/vram_amd_device.hpp"    // `hip_executor_t`
@@ -59,6 +59,12 @@ using utilities::loser_tree;
 /** Bytes per row of the S+ trees a sorted run saves, fixed because the rows are part of the run's
  *  on-disk layout. */
 inline constexpr std::size_t sorted_run_row_bytes_k = 512;
+
+/** The saved S+ tree of a sorted run's keys of @p key_type_, in rows of
+ *  @c sorted_run_row_bytes_k. */
+template <typename key_type_>
+using sorted_run_tree_view =
+    st::immutable_splus_tree_view<key_type_, st::keys_per_row<key_type_>(sorted_run_row_bytes_k)>;
 
 /** A key slot shape compaction merges: trivially copyable and keyed by a stored key, with the kind of each delta in
  *  its run's kinds column. */
@@ -83,15 +89,15 @@ concept locates_stored_values_concept = requires {
     requires is_fixed_or_variable_width(key_slot_type_::value_layout_k);
 };
 
-/** A key slot shape whose stored key is the head of a longer key, as a string's 16-byte head is, so its runs carry the
- *  tails the heads cut short, and two key slots carry one key only where their tails match too. Only the host
- *  compactor merges these. */
+/** A key slot shape whose stored key is the head of a longer key, as a string's 16-byte head is, so
+ *  its runs hold the tails the heads cut short, and two key slots hold one key only where their
+ *  tails match too. Only the host compactor merges these. */
 template <typename key_slot_type_>
 concept tailed_key_slot_concept = compactable_key_slot_concept<key_slot_type_> &&
-                                  requires { requires key_slot_type_::carries_tails_k; };
+                                  requires { requires key_slot_type_::has_tails_k; };
 
 /** The tails of the keys a run's heads cut short, in sorted order: key slot @c i's tail is @c bytes from
- *  @c offsets[i] to @c offsets[i + 1], and a run of whole keys carries no offsets at all. */
+ *  @c offsets[i] to @c offsets[i + 1], and a run of whole keys holds no offsets at all. */
 struct key_tails_column_t {
 
     /** One offset per key slot into @c bytes and one past the last, or none for a run of whole keys. */
@@ -150,8 +156,8 @@ struct sorted_run_extents_t {
     /** Where the saved kinds start inside the trailer. */
     std::uint64_t kinds_begin = 0;
 
-    /** The stamp an ingest gave every version of a run its blob stamps zero, or zero for a run carrying its own, which
-     *  the device raises every stamp it unpacks from the trailer to. */
+    /** The stamp an ingest gave every version of a run its blob stamps zero, or zero for a run
+     *  holding its own, which the device raises every stamp it unpacks from the trailer to. */
     std::uint64_t assigned_stamp = 0;
 
     /** The section of the saved key tree, which a run of keys alone is read through. */
@@ -181,7 +187,7 @@ struct range_tombstone {
 };
 
 /** The range tombstones of one source run as a merge reads them, on the host or on a device: both
- *  columns of @c range_tombstones, borrowed. */
+ *  columns of @c range_tombstones, viewed. */
 template <typename stored_key_type_>
 struct range_tombstones_view { // device-boundary
 
@@ -273,7 +279,7 @@ class range_tombstones {
         for (std::uint64_t& held : stamps_) held = stamp;
     }
 
-    /** The newest stamp a tombstone carries, or zero for none. */
+    /** The newest stamp a tombstone holds, or zero for none. */
     [[nodiscard]] std::uint64_t newest_stamp() const noexcept {
         std::uint64_t newest = 0;
         for (std::uint64_t const stamp : stamps_) newest = stamp > newest ? stamp : newest;
@@ -311,7 +317,7 @@ class range_tombstones {
     }
 
     /** The pieces of every tombstone from @p lower up to @p upper, exclusive, which one of several
-     *  runs cut from the same versions carries, so no piece hides a key of another run. */
+     *  runs cut from the same versions holds, so no piece hides a key of another run. */
     expected<range_tombstones> clipped(stored_key_t const& lower, stored_key_t const& upper,
                                        allocator_t allocator = {}) const noexcept {
         range_tombstones pieces {allocator};
@@ -472,7 +478,7 @@ class range_tombstones<std::string_view, allocator_type_> {
         for (std::uint64_t& held : stamps_) held = stamp;
     }
 
-    /** The newest stamp a tombstone carries, or zero for none. */
+    /** The newest stamp a tombstone holds, or zero for none. */
     [[nodiscard]] std::uint64_t newest_stamp() const noexcept {
         std::uint64_t newest = 0;
         for (std::uint64_t const stamp : stamps_) newest = stamp > newest ? stamp : newest;
@@ -549,7 +555,7 @@ struct sorted_run_index_view {
     std::span<stored_value_offset_t const> value_offsets;
 
     /** The saved tree of the run's keys, which a view without @c cells reads key slots through. */
-    st::immutable_splus_tree_view<typename key_slot_type_::stored_key_t> const* keys = nullptr;
+    sorted_run_tree_view<typename key_slot_type_::stored_key_t> const* keys = nullptr;
 
     /** The run's range tombstones, or null for none, which a device uploads beside its keys. */
     blobs::range_tombstones<typename key_slot_type_::stored_key_t> const* range_tombstones = nullptr;
@@ -559,7 +565,7 @@ struct sorted_run_index_view {
     std::uint64_t first = 0;
 };
 
-/** One version a merge of strings carries: its source run and its sorted position there. */
+/** One version a merge of strings holds: its source run and its sorted position there. */
 struct strings_version_t {
 
     /** Its source: the upper runs in their order, then the lower runs. */
@@ -574,7 +580,7 @@ struct strings_version_t {
 struct strings_run_view {
 
     /** The saved S+ tree of the run's heads. */
-    st::immutable_splus_tree_view<st::key128_t> const* heads = nullptr;
+    sorted_run_tree_view<st::key128_t> const* heads = nullptr;
 
     /** One offset per key into @c keys and one past the last. */
     std::span<std::uint32_t const> key_offsets;
@@ -732,13 +738,13 @@ struct located_tailed_key_slot {
     std::string_view tail;
 };
 
-/** The located key slot @p record carries, which is itself for a whole key. */
+/** The located key slot @p record holds, which is itself for a whole key. */
 template <typename key_slot_type_>
 constexpr located_key_slot<key_slot_type_>& located_of(located_key_slot<key_slot_type_>& record) noexcept {
     return record;
 }
 
-/** The located key slot @p record carries beside its tail. */
+/** The located key slot @p record holds beside its tail. */
 template <typename key_slot_type_>
 constexpr located_key_slot<key_slot_type_>& located_of(located_tailed_key_slot<key_slot_type_>& record) noexcept {
     return record.located;
@@ -755,14 +761,14 @@ constexpr located_key_slot<key_slot_type_> const& located_of(
     return record.located;
 }
 
-/** Whether @p first and @p second carry one key, which their stored keys decide. */
+/** Whether @p first and @p second hold one key, which their stored keys decide. */
 template <typename key_slot_type_>
 constexpr bool same_key(located_key_slot<key_slot_type_> const& first,
                         located_key_slot<key_slot_type_> const& second) noexcept {
     return first.key_slot.stored_key == second.key_slot.stored_key;
 }
 
-/** Whether @p first and @p second carry one key, which their heads and then their tails decide. */
+/** Whether @p first and @p second hold one key, which their heads and then their tails decide. */
 template <typename key_slot_type_>
 constexpr bool same_key(located_tailed_key_slot<key_slot_type_> const& first,
                         located_tailed_key_slot<key_slot_type_> const& second) noexcept {
@@ -948,8 +954,8 @@ constexpr bool survives(located_key_slot<key_slot_type_> const* previous,
     return !(writes_bottom(kind) && current.kind == delta_kind_t::remove_k && oldest);
 }
 
-/** As @c survives for whole keys, where a record before @p current that shares its head and not its tail carries
- *  another key, so @p current is that key's newest version. */
+/** As @c survives for whole keys, where a record before @p current that shares its head and not its
+ *  tail holds another key, so @p current is that key's newest version. */
 template <typename key_slot_type_>
 constexpr bool survives(located_tailed_key_slot<key_slot_type_> const* previous,
                         located_tailed_key_slot<key_slot_type_> const& current, compaction_kind_t kind,
@@ -960,8 +966,8 @@ constexpr bool survives(located_tailed_key_slot<key_slot_type_> const* previous,
 
 /** Whether a source of @p upper or @p lower has a range tombstone to check its versions against. */
 template <typename key_slot_type_>
-bool carries_range_tombstones(std::span<sorted_run_index_view<key_slot_type_> const> upper,
-                              std::span<sorted_run_index_view<key_slot_type_> const> lower) noexcept {
+bool has_range_tombstones(std::span<sorted_run_index_view<key_slot_type_> const> upper,
+                          std::span<sorted_run_index_view<key_slot_type_> const> lower) noexcept {
     for (sorted_run_index_view<key_slot_type_> const& view : upper)
         if (view.range_tombstones != nullptr && !view.range_tombstones->empty()) return true;
     for (sorted_run_index_view<key_slot_type_> const& view : lower)
@@ -1014,7 +1020,7 @@ constexpr bool drops_range_tombstone(compaction_kind_t kind, compaction_stamps_t
 }
 
 /** Bytes the value at sorted @p position takes in its run's values section: through @p value_offsets where the run
- *  carries them, and @p value_stride otherwise, which is zero for values held inline. */
+ *  holds them, and @p value_stride otherwise, which is zero for values held inline. */
 constexpr std::uint32_t stored_value_bytes(stored_value_offset_t const* value_offsets, std::uint64_t value_stride,
                                            std::uint64_t position) noexcept {
     return value_offsets != nullptr ? value_offsets[position + 1] - value_offsets[position]
@@ -1026,12 +1032,12 @@ constexpr std::uint32_t stored_value_bytes(stored_value_offset_t const* value_of
 template <typename key_slot_type_>
 constexpr std::uint64_t stored_values_offset(sorted_run_bounds_t const& bounds,
                                              std::uint64_t key_slots_count) noexcept {
-    // Only cells carrying inline values are saved; the key tree holds every key of the others.
+    // Only cells holding inline values are saved; the key tree holds every key of the others.
     std::uint64_t cells_bytes = 0;
     if constexpr (!locates_stored_values_concept<key_slot_type_>)
         cells_bytes = key_slots_count * sizeof(key_slot_type_);
     std::uint64_t const keys_bytes = sizeof(st::splus_tree_header_t) +
-                                     st::immutable_splus_tree_view<typename key_slot_type_::stored_key_t>::size_bytes(
+                                     sorted_run_tree_view<typename key_slot_type_::stored_key_t>::size_bytes(
                                          static_cast<std::size_t>(key_slots_count));
     std::uint64_t offsets_bytes = 0;
     if constexpr (locates_stored_values_concept<key_slot_type_>)
@@ -1050,9 +1056,8 @@ constexpr std::uint64_t sorted_run_file_bytes(sorted_run_bounds_t const& bounds,
     // A run of strings keeps its heads in a saved S+ tree, then its values, key offsets, keys
     // and layers apart.
     if constexpr (tailed_key_slot_concept<key_slot_type_>) {
-        std::uint64_t const heads = sizeof(st::splus_tree_header_t) +
-                                    st::immutable_splus_tree_view<st::key128_t>::size_bytes(
-                                        static_cast<std::size_t>(key_slots_count));
+        std::uint64_t const heads = sizeof(st::splus_tree_header_t) + sorted_run_tree_view<st::key128_t>::size_bytes(
+                                                                          static_cast<std::size_t>(key_slots_count));
         return bounds.header_bytes + round_up_to_multiple(heads, bounds.alignment_bytes) +
                round_up_to_multiple(key_slots_count * key_slot_type_::size, bounds.alignment_bytes) +
                round_up_to_multiple((key_slots_count + 1) * sizeof(std::uint32_t), bounds.alignment_bytes) +
@@ -1277,7 +1282,7 @@ st::status_t keep_key_whole(std::uint64_t first, std::uint64_t key_slots_count, 
     bool inside = true;
     while (inside && boundary != first + 1)
         if (status_t const status = shares_key(--boundary, inside); status != status_t::success_k) return status;
-    // Every survivor of the run so far carries one key, so the run takes it whole, however long.
+    // Every survivor of the run so far holds one key, so the run takes it whole, however long.
     if (inside)
         for (boundary = first + taken + 1; boundary != key_slots_count; ++boundary) {
             if (status_t const status = shares_key(boundary, inside); status != status_t::success_k) return status;
@@ -1301,8 +1306,8 @@ st::status_t keep_key_whole(std::uint64_t first, std::uint64_t key_slots_count, 
  *  @param[in] bounds The file limit every sorted run holds to.
  *  @param[in] read_prefix Called as @c read_prefix(index, bytes) to write the stored value bytes of the first @c index
  *      survivors.
- *  @param[in] shares_key Called as @c shares_key(index, shared) to say whether survivor @c index carries the key
- *      survivor @c index - 1 does.
+ *  @param[in] shares_key Called as <tt>shares_key(index, shared)</tt> to say whether survivor @c index
+ *      holds the key survivor @c index - 1 does.
  *  @param[out] sorted_runs The planned sorted runs, replacing what it held.
  */
 template <typename key_slot_type_, typename prefix_reader_type_, typename key_sharing_type_, typename sorted_runs_type_>
@@ -1631,7 +1636,7 @@ struct host_compactor_t {
         // so the versions below drop and a change folds onto nothing, and then drops itself, as the
         // tombstone stays with the new runs. Survival settles before any fold, so a fold sees every
         // version dropped behind its change.
-        bool const tombstoned = carries_range_tombstones(upper, lower);
+        bool const tombstoned = has_range_tombstones(upper, lower);
         using stored_key_t = typename key_slot_type_::stored_key_t;
         auto const tombstones_of = [&](std::uint32_t source) noexcept {
             range_tombstones<stored_key_t> const* const tombstones = view_of(source).range_tombstones;
@@ -1771,31 +1776,31 @@ struct host_compactor_t {
 /** The device fold of a collection whose changes no device composes, so the host folds them. */
 struct no_device_fold_t {};
 
-/** A borrowed fold, called as @c host_compactor_t calls its own, so one device compaction compiled
+/** A viewed fold, called as @c host_compactor_t calls its own, so one device compaction compiled
  *  per key slot folds on the host for a store of any fold. */
 class fold_ref_t {
   public:
 
-    /** Borrows @p fold, which must outlive every call. */
+    /** Views @p fold, which must outlive every call. */
     template <utilities::fold_concept fold_type_>
     explicit fold_ref_t(fold_type_ const& fold) noexcept
         : fold_(&fold), apply_(&apply_through_<fold_type_>), compose_(&compose_through_<fold_type_>),
           closes_(&closes_through_<fold_type_>) {}
 
-    /** The value @p base becomes once @p deltas apply, as the borrowed fold answers it. */
+    /** The value @p base becomes once @p deltas apply, as the viewed fold answers it. */
     expected<std::span<byte_t const>> apply(std::span<byte_t const> base,
                                             std::span<utilities::delta_view_t const> deltas,
                                             utilities::arena_allocator<byte_t>& arena) const noexcept {
         return apply_(fold_, base, deltas, arena);
     }
 
-    /** One delta standing for @p deltas, as the borrowed fold answers it. */
+    /** One delta standing for @p deltas, as the viewed fold answers it. */
     expected<std::span<byte_t const>> compose(std::span<utilities::delta_view_t const> deltas,
                                               utilities::arena_allocator<byte_t>& arena) const noexcept {
         return compose_(fold_, deltas, arena);
     }
 
-    /** Whether no delta older than @p delta matters, as the borrowed fold answers it. */
+    /** Whether no delta older than @p delta matters, as the viewed fold answers it. */
     bool closes(utilities::delta_view_t const& delta) const noexcept { return closes_(fold_, delta); }
 
   private:
@@ -1825,23 +1830,23 @@ class fold_ref_t {
         return static_cast<fold_type_ const*>(fold)->closes(delta);
     }
 
-    /** The borrowed fold. */
+    /** The viewed fold. */
     void const* fold_ = nullptr;
 
-    /** Applies through the borrowed fold as its own type. */
+    /** Applies through the viewed fold as its own type. */
     apply_t apply_ = nullptr;
 
-    /** Composes through the borrowed fold as its own type. */
+    /** Composes through the viewed fold as its own type. */
     compose_t compose_ = nullptr;
 
-    /** Asks the borrowed fold as its own type. */
+    /** Asks the viewed fold as its own type. */
     closes_t closes_ = nullptr;
 };
 
 static_assert(utilities::fold_concept<fold_ref_t>);
 
-/** A borrowed reader of the values a fold reads, called as @c host_compactor_t calls its own, so one device compaction
- *  compiled per key slot serves a reader of any type. */
+/** A viewed reader of the values a fold reads, called as @c host_compactor_t calls its own, so one
+ *  device compaction compiled per key slot serves a reader of any type. */
 template <typename key_slot_type_>
 class located_value_reader {
   public:
@@ -1849,7 +1854,7 @@ class located_value_reader {
     /** A reader refusing every read, for a merge that folds nothing. */
     located_value_reader() noexcept = default;
 
-    /** Borrows @p reader, which must outlive every read. */
+    /** Views @p reader, which must outlive every read. */
     template <typename reader_type_>
     located_value_reader(reader_type_ const& reader) noexcept
         : context_(&reader), read_(&read_through_<reader_type_>) {}
@@ -1876,10 +1881,10 @@ class located_value_reader {
         return st::status_t::invalid_argument_k;
     }
 
-    /** The borrowed reader. */
+    /** The viewed reader. */
     void const* context_ = nullptr;
 
-    /** Calls the borrowed reader as its own type. */
+    /** Calls the viewed reader as its own type. */
     read_t read_ = &refuse_;
 };
 
@@ -1900,16 +1905,16 @@ struct device_section_read_t {
     utilities::uuid128_t run {};
 };
 
-/** A borrowed transport moving run sections from their volumes into a device compactor's scratch, so one compaction
- *  compiled per key slot reads through a transport of any type; an empty one reaches no volume, and the compactor
- *  uploads every run from its memory instead. */
+/** A viewed transport moving run sections from their volumes into a device compactor's scratch, so
+ *  one compaction compiled per key slot reads through a transport of any type; an empty one reaches
+ *  no volume, and the compactor uploads every run from its memory instead. */
 class device_sections_reader_t {
   public:
 
     /** A reader reaching no volume. */
     device_sections_reader_t() noexcept = default;
 
-    /** Borrows @p reader, which must outlive the compactor holding it. */
+    /** Views @p reader, which must outlive the compactor holding it. */
     template <typename reader_type_>
     explicit device_sections_reader_t(reader_type_* reader) noexcept
         : context_(reader), read_(&read_through_<reader_type_>), release_(&release_through_<reader_type_>) {}
@@ -1946,13 +1951,13 @@ class device_sections_reader_t {
 
     static void forget_nothing_(void*) noexcept {}
 
-    /** The borrowed reader. */
+    /** The viewed reader. */
     void* context_ = nullptr;
 
-    /** Calls the borrowed reader's @c read as its own type. */
+    /** Calls the viewed reader's @c read as its own type. */
     read_t read_ = &refuse_;
 
-    /** Calls the borrowed reader's @c release as its own type. */
+    /** Calls the viewed reader's @c release as its own type. */
     release_t release_ = &forget_nothing_;
 };
 
@@ -1969,7 +1974,7 @@ class device_sections_reader_t {
  *  @tparam volume_type_ The directory volume naming the run files, or @c void for raw media alone.
  */
 template <typename disk_type_, typename waiter_type_, typename volume_type_ = void>
-    requires utilities::ring_concept<disk_type_>
+    requires utilities::disk_concept<disk_type_>
 class ring_sections_reader {
   public:
 
@@ -1992,22 +1997,18 @@ class ring_sections_reader {
             if (register_status.failed()) return register_status;
             reader.media_[volume] = std::move(registered);
         }
-        auto [acquired, acquire_status] = reader.disk_.acquire_queue_pair(depth_k);
-        if (acquire_status.failed()) return acquire_status;
-        reader.queue_pair_ = std::move(acquired);
+        if (status_t const opened = reader.open_queue_(); opened.failed()) return opened;
         return reader;
     }
 
-    /** Takes @p disk in, reading each run from its own file in @p volume, and acquires a pair. */
+    /** Takes @p disk in, reading each run from its own file in @p volume, and makes its queue. */
     template <typename named_volume_type_>
         requires std::same_as<named_volume_type_, volume_type_>
     static expected<ring_sections_reader> make(disk_type_&& disk, named_volume_type_ const& volume) noexcept {
         ring_sections_reader reader;
         reader.disk_ = std::move(disk);
         reader.volume_ = &volume;
-        auto [acquired, status] = reader.disk_.acquire_queue_pair(depth_k);
-        if (status.failed()) return status;
-        reader.queue_pair_ = std::move(acquired);
+        if (status_t const opened = reader.open_queue_(); opened.failed()) return opened;
         return reader;
     }
 
@@ -2015,15 +2016,17 @@ class ring_sections_reader {
     ring_sections_reader() noexcept = default;
     ring_sections_reader(ring_sections_reader&& other) noexcept
         : disk_(std::move(other.disk_)), media_(std::move(other.media_)), runs_(std::move(other.runs_)),
-          volume_(std::exchange(other.volume_, nullptr)), queue_pair_(std::move(other.queue_pair_)),
-          registered_(std::move(other.registered_)) {}
+          volume_(std::exchange(other.volume_, nullptr)), queue_(std::move(other.queue_)),
+          queue_pair_(queue_, utilities::queue_id_t {0}), registered_(std::move(other.registered_)) {
+        other.queue_pair_ = utilities::queue_ref_t {};
+    }
     ring_sections_reader(ring_sections_reader const&) = delete;
     ring_sections_reader& operator=(ring_sections_reader const&) = delete;
     ring_sections_reader& operator=(ring_sections_reader&&) = delete;
     ~ring_sections_reader() noexcept {
         release();
         if (queue_pair_.held()) [[maybe_unused]]
-            status_t const released = disk_.release_queue_pair(queue_pair_);
+            status_t const drained = disk_.drain(queue_pair_);
         for (utilities::registered_medium_t& medium : media_)
             if (medium.held()) [[maybe_unused]]
                 status_t const detached = disk_.unregister_medium(medium);
@@ -2084,6 +2087,15 @@ class ring_sections_reader {
     }
 
   private:
+    /** Makes the queue of @c depth_k requests every batch goes through and registers the disk's
+     *  media on it. */
+    status_t open_queue_() noexcept {
+        auto [queue, make_queue_status] = disk_type_::queue_t::make(depth_k, {});
+        if (make_queue_status.failed()) return make_queue_status;
+        queue_ = std::move(queue);
+        queue_pair_ = utilities::queue_ref_t {queue_, utilities::queue_id_t {0}};
+        return disk_.register_media(queue_pair_);
+    }
     /** One run file a merge reads, registered at its first section. */
     struct run_medium_t {
         utilities::uuid128_t run {};
@@ -2133,8 +2145,11 @@ class ring_sections_reader {
     /** The directory volume naming the run files, or null on raw media. */
     volume_type_ const* volume_ = nullptr;
 
-    /** The queue pair every batch goes through. */
-    utilities::queue_pair_t queue_pair_;
+    /** The queue every batch goes through, which the reader owns as a thread owns its own. */
+    typename disk_type_::queue_t queue_;
+
+    /** The handle on @c queue_ the disk reads it through. */
+    utilities::queue_ref_t queue_pair_;
 
     /** The scratch the reads land in, as the ring registered it. */
     utilities::registered_memory_t registered_;

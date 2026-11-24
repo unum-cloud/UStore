@@ -54,7 +54,9 @@ status_t upload_through_host(arguments_type_ const& arguments, rest_types_&... r
     arguments_type_ hosted = arguments;
     hosted.arena = executor.bounce();
     status_t const served = [&]<std::size_t... index_>(std::index_sequence<index_...>) noexcept {
-        return verb(hosted, std::get<index_>(tail)..., view);
+        // A scan of documents uploads its keys alone
+        if constexpr (std::is_same_v<arguments_type_, ustore_docs_scan_t>) return verb(hosted, nullptr, view);
+        else return verb(hosted, std::get<index_>(tail)..., view);
     }(std::make_index_sequence<ragged_count> {});
     if (served.failed()) return served;
     return upload_output_columns(hosted, *blocks, executor);

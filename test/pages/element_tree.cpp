@@ -122,7 +122,7 @@ std::string random_text(split_mix_generator_t& random, std::size_t longest) {
     return result;
 }
 
-/** A random name an XML tag or attribute may carry. */
+/** A random name an XML tag or attribute may hold. */
 std::string random_name(split_mix_generator_t& random) {
     static constexpr std::string_view names[] = {"p", "div", "span", "x:item", "row", "cell"};
     return std::string(names[random.below(std::size(names))]);
@@ -373,7 +373,7 @@ void test_xml_round_trip_random() {
         chars_t first_text {test_allocator<char>(&arena)}, second_text {test_allocator<char>(&arena)};
         expect_true(render_xml<strings_kit_t>(tree, tree.root(), first).succeeded());
         expect_true(render_text(tree, tree.root(), first_text).succeeded());
-        // Comments may hold `-->` or `--` that the random text spells, which no XML can carry
+        // Comments may hold `-->` or `--` that the random text spells, which no XML can hold
         if (view_of(first).find("<!--") != std::string_view::npos) {
             bool spoiled = false;
             for (element_index_t at = 0; at != tree.capacity(); ++at)

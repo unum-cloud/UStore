@@ -85,7 +85,8 @@ class single_collection_database_snapshot {
     [[nodiscard]] transaction_stamp_t stamp() const noexcept { return pinned_.stamp(); }
 
     /**
-     *  @brief Whether the database carried @p stored_key at the snapshot's stamp, and how many bytes its value took.
+     *  @brief Whether the database held @p stored_key at the snapshot's stamp, and how many bytes
+     *      its value took.
      *  @param[in] stored_key The key to look for.
      *  @param[out] size Bytes the value takes, which is zero for anything but @c written_k.
      */
@@ -131,7 +132,7 @@ class single_collection_database_snapshot {
 /**
  *  @brief An indivisible group of reads and writes over one single-collection database.
  *
- *  The core carries the writes, the watches, the stamps and the two-phase lifecycle; what is here
+ *  The core holds the writes, the watches, the stamps and the two-phase lifecycle; what is here
  *  reads through the one collection on the caller's channel, its own writes ahead of the database.
  *  Nothing throws: every modifying call answers a status, and a
  *  caller reading @c status_code_t::write_conflict_k rolls back and
@@ -251,7 +252,7 @@ class single_collection_database_transaction {
 #pragma region Lookups
 
     /**
-     *  @brief Whether anything carries @p stored_key, watching the database when it is what answered.
+     *  @brief Whether anything holds @p stored_key, watching the database when it is what answered.
      *  @param[in] stored_key The key to look for.
      *  @param[out] size Bytes the value takes, which is zero for anything but @c written_k.
      */
@@ -267,9 +268,9 @@ class single_collection_database_transaction {
             return lookup_result_t::missing_k;
         transaction_stamp_t const at = core_.template read_stamp_for<watch_schedule_>();
         transaction_stamp_t const watch_from = core_.template watch_stamp_for<watch_schedule_>();
-        lookup_result_t const carried = core_.store().find(stored_key, size, at);
+        lookup_result_t const held = core_.store().find(stored_key, size, at);
         core_.template watch_later<watch_schedule_>(single_collection_id_k, only, watch_from, watch_purpose_t::read_k);
-        return carried;
+        return held;
     }
 
     /** What this transaction's own deltas hold under @p stored_key, without touching the database. */
@@ -330,7 +331,7 @@ class single_collection_database_transaction {
      *  @param[out] results What every key answered, which separates a miss from a removal.
      *  @param[in] sink Called as @c sink(request, offset, bytes) for every key that locates a value.
      *
-     *  @note A value this transaction wrote arrives as one call carrying all of it, while one the
+     *  @note A value this transaction wrote arrives as one call holding all of it, while one the
      *      database answers arrives as one call per block, exactly as a read of the database does.
      */
     template <watch_schedule_t watch_schedule_ = watch_schedule_t::default_k, typename sink_type_>
@@ -437,7 +438,7 @@ class single_collection_database_transaction {
 
 #pragma region Manifest Collection
 
-/** The name the one collection of a single-collection database carries in its manifest. */
+/** The name the one collection of a single-collection database holds in its manifest. */
 inline constexpr char single_collection_name_k[] = "records";
 
 #pragma endregion Manifest Collection
@@ -523,20 +524,13 @@ class basic_single_collection_database {
     basic_single_collection_database(basic_single_collection_database&&) = delete;
     basic_single_collection_database& operator=(basic_single_collection_database&&) = delete;
 
-    /** Writes whatever the memory runs still hold onto the volume and names every run, so the data outlives this. */
-    ~basic_single_collection_database() noexcept {
-        // A database that never mounted whole, or was destroyed, must not publish over its gaps.
-        if (published_generation_ == 0) return;
-        claim_guard_t const held {*this};
-        if (adopt_channels_().failed()) return;
-        [[maybe_unused]] status_t const flushed = collection_.flush(writing_channel_);
-        [[maybe_unused]] status_t const published = publish_manifest_();
-    }
+    /** Lets the memory runs go without writing them, so only @c flush makes them outlive this. */
+    ~basic_single_collection_database() noexcept = default;
 
     /**
      *  @brief Opens a database over @p volume, publishing a manifest when the volume read none.
      *  @param[in,out] volume The volume every run and the user data land on, outliving it.
-     *  @param[in,out] writing_channel The channel every write, flush and commit runs on, borrowed
+     *  @param[in,out] writing_channel The channel every write, flush and commit runs on, viewed
      *      for the database's life.
      *  @param[in,out] merging_channel The second channel a compaction writes its new runs on, which
      *      is not @p writing_channel.
@@ -617,7 +611,7 @@ class basic_single_collection_database {
 #pragma region Lookups
 
     /**
-     *  @brief Whether anything carries @p stored_key, and how many bytes its value takes.
+     *  @brief Whether anything holds @p stored_key, and how many bytes its value takes.
      *  @param[in] stored_key The key to look for.
      *  @param[out] size Bytes the value takes, which is zero for anything but @c written_k.
      *  @param[in] stamp The stamp a reader is pinned at, which sees the newest version at or below it.
@@ -662,13 +656,13 @@ class basic_single_collection_database {
     /** Writes @p stored_value under @p stored_key as a commit of its own, flushing when the memory runs are full. */
     status_t insert(stored_key_t stored_key, std::span<byte_t const> stored_value) noexcept {
         keyed_delta<stored_key_t> delta {stored_key, delta_view_t {delta_kind_t::write_k, stored_value}};
-        return commit_alone_(collection_.seal(std::span<keyed_delta<stored_key_t>> {&delta, 1}));
+        return commit_one_collection_(collection_.seal(std::span<keyed_delta<stored_key_t>> {&delta, 1}));
     }
 
     /** Removes @p stored_key as a commit of its own. */
     status_t remove(stored_key_t stored_key) noexcept {
         keyed_delta<stored_key_t> delta {stored_key, delta_view_t {delta_kind_t::remove_k, {}}};
-        return commit_alone_(collection_.seal(std::span<keyed_delta<stored_key_t>> {&delta, 1}));
+        return commit_one_collection_(collection_.seal(std::span<keyed_delta<stored_key_t>> {&delta, 1}));
     }
 
     /**
@@ -679,12 +673,12 @@ class basic_single_collection_database {
      */
     status_t insert(std::span<stored_key_t const> stored_keys, std::span<byte_t const> stored_values,
                     std::span<stored_value_size_t const> sizes) noexcept {
-        return commit_alone_(collection_.seal_writes(stored_keys, stored_values, sizes));
+        return commit_one_collection_(collection_.seal_writes(stored_keys, stored_values, sizes));
     }
 
     /** Removes every key of @p stored_keys as one commit of its own. */
     status_t remove(std::span<stored_key_t const> stored_keys) noexcept {
-        return commit_alone_(collection_.seal_removals(stored_keys));
+        return commit_one_collection_(collection_.seal_removals(stored_keys));
     }
 
 #pragma endregion Writes
@@ -710,7 +704,7 @@ class basic_single_collection_database {
         lsm_tree_publication_hook_t published;
         published.notify = &record_manifest_;
         published.context = this;
-        return collection_.compact(writing_channel_, merging_channel_, lent_merge_buffers_(), compactor_, published);
+        return collection_.compact(writing_channel_, merging_channel_, merge_buffers_for_(), compactor_, published);
     }
 
     /** How many memory runs the collection holds, and how many commits they hold. */
@@ -726,8 +720,7 @@ class basic_single_collection_database {
         lsm_tree_publication_hook_t published;
         published.notify = &record_manifest_;
         published.context = this;
-        return collection_.truncate_above(writing_channel_, merging_channel_, lent_merge_buffers_(), ceiling,
-                                          published);
+        return collection_.truncate_above(writing_channel_, merging_channel_, merge_buffers_for_(), ceiling, published);
     }
 
     /** Pins the newest published stamp, at which every read through the snapshot answers, and flushes nothing. */
@@ -825,9 +818,9 @@ class basic_single_collection_database {
     }
 
     /** Seals every delta of @p written into @p sealed on the committing thread, flushing first when the memory runs
-     *  are full, so the commit that follows cannot fail halfway. */
+     *  are full on the database's own channels, so the commit that follows cannot fail halfway. */
     status_t seal_collection(collection_id_t collection_id, transaction_deltas_t const& written,
-                             sealed_commit<stored_key_t, atomic_reference_>& sealed) noexcept {
+                             sealed_commit<stored_key_t, atomic_reference_>& sealed, nvme_queues_ref_t = {}) noexcept {
         st::vector<keyed_delta<stored_key_t>> deltas;
         if (deltas.reserve(written.count(collection_id)) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room to hand a commit over"};
@@ -836,7 +829,7 @@ class basic_single_collection_database {
                 st::assume_reserved, keyed_delta<stored_key_t> {stored_key, delta});
         });
         auto [taken, seal_status] = collection_.seal(std::span<keyed_delta<stored_key_t>> {deltas}, {},
-                                                     written.lendable_bytes());
+                                                     written.adoptable_bytes());
         if (seal_status.failed()) return seal_status;
         sealed = std::move(taken);
         return make_room_(sealed);
@@ -846,9 +839,10 @@ class basic_single_collection_database {
      *  @brief Claims a memory-run record for a commit sealed for the collection, before the commit
      *      takes the leader word: a free one, else the flush of the memory runs while nobody holds
      *      the claim, else one vacated while this waits.
-     *  @note Called outside the ledger's epochs, which every flush waits out.
+     *  @note Called outside the ledger's epochs, which every flush waits out, flushing on the
+     *      database's own channels whatever queue set the commit names.
      */
-    status_t claim_memory_record(collection_id_t, memory_run_claim_t& claimed) noexcept {
+    status_t claim_memory_record(collection_id_t, memory_run_claim_t& claimed, nvme_queues_ref_t = {}) noexcept {
         atomic_reference_<std::uint32_t const> const vacated {collection_.vacated()};
         for (;;) {
             std::uint32_t const observed = vacated.load(std::memory_order_acquire);
@@ -903,9 +897,11 @@ class basic_single_collection_database {
      *
      *  Returns at once while another writer holds the claim, since that writer looks at the memory runs again
      *  after it lets go, so no commit waits behind another's maintenance.
-     *  @note Called outside the ledger's epochs.
+     *
+     *  @note Called outside the ledger's epochs, maintaining on the database's own channels
+     *      whatever queue set the commit names.
      */
-    status_t maintain(collection_id_t) noexcept {
+    status_t maintain(collection_id_t, nvme_queues_ref_t = {}) noexcept {
         if (!collection_.maintenance_due()) return {};
         claim_guard_t const held = claim_guard_t::taken_if_free(*this);
         if (!held.holding()) return {};
@@ -957,7 +953,7 @@ class basic_single_collection_database {
         published.notify = &record_manifest_;
         published.context = this;
         if (status_t const truncated = collection_.truncate_above(writing_channel_, merging_channel_,
-                                                                  lent_merge_buffers_(), durable_stamp, published);
+                                                                  merge_buffers_for_(), durable_stamp, published);
             truncated.failed()) {
             published_generation_ = 0;
             return truncated;
@@ -970,17 +966,17 @@ class basic_single_collection_database {
 
 #pragma region Claim
 
-    /** Binds both channels to the thread that took the claim, which every write through them needs. */
+    /** Holds the disk into both channels' queues, which every write through them needs. */
     status_t adopt_channels_() noexcept {
-        channel_adoption_ = volume_.disk().bind_queue_pair(writing_channel_.queue_pair());
+        channel_adoption_ = volume_.disk().register_media(writing_channel_.queue_pair());
         if (channel_adoption_.succeeded())
-            channel_adoption_ = volume_.disk().bind_queue_pair(merging_channel_.queue_pair());
+            channel_adoption_ = volume_.disk().register_media(merging_channel_.queue_pair());
         return channel_adoption_;
     }
 
     /** Lands @p sealed as a commit of its own, making room first while the memory runs are past twice their bounds,
      *  and maintains the collection once it lands. */
-    status_t commit_alone_(expected<sealed_commit<stored_key_t, atomic_reference_>> sealed) noexcept {
+    status_t commit_one_collection_(expected<sealed_commit<stored_key_t, atomic_reference_>> sealed) noexcept {
         if (!sealed) return sealed.status();
         if (sealed->empty()) return {};
         if (status_t const room = make_room_(*sealed); room.failed()) return room;
@@ -1015,8 +1011,8 @@ class basic_single_collection_database {
         return {};
     }
 
-    /** The buffers lent to the merge the caller claimed. */
-    std::span<typename collection_t::merge_buffers_t> lent_merge_buffers_() noexcept {
+    /** The buffers of the merge the caller claimed, owned by this database. */
+    std::span<typename collection_t::merge_buffers_t> merge_buffers_for_() noexcept {
         return std::span<typename collection_t::merge_buffers_t> {merge_buffers_};
     }
 
@@ -1030,7 +1026,7 @@ class basic_single_collection_database {
         published.context = this;
         while (collection_.needs_compaction()) {
             auto [outcome, compact_status] = collection_.compact(writing_channel_, merging_channel_,
-                                                                 lent_merge_buffers_(), compactor_, published);
+                                                                 merge_buffers_for_(), compactor_, published);
             if (compact_status.failed()) return compact_status;
             if (outcome == compaction_outcome_t::nothing_to_compact_k) break;
         }
@@ -1052,9 +1048,10 @@ class basic_single_collection_database {
      *
      *  A writer that finds the claim taken again, or a caller parked on it, stops, since that
      *  holder looks once more after it lets go, and a failed adoption or maintenance is met again
-     *  by the next commit.
+     *  by the next commit. The holder's queue set goes unused, since this database writes on the
+     *  two channels it was built with, and takes them for its maintenance too.
      */
-    void release_claim_() noexcept {
+    void release_claim_(nvme_queues_ref_t) noexcept {
         // Every release looks again, so a commit that found the claim held is met after it.
         for (;;) {
             claim_.release();
@@ -1075,9 +1072,9 @@ class basic_single_collection_database {
         if (loaded.collections.empty()) return {};
         if (loaded.collections.size() != 1)
             return {status_code_t::malformed_k, "The volume's manifest names more than one collection"};
-        manifest_collection_t const& carried = loaded.collections[0];
-        if (carried.store != static_cast<std::uint16_t>(value_layout_k) ||
-            carried.value_max_size != collection_.value_max_size())
+        manifest_collection_t const& held = loaded.collections[0];
+        if (held.store != static_cast<std::uint16_t>(value_layout_k) ||
+            held.value_max_size != collection_.value_max_size())
             return {status_code_t::invalid_argument_k, "The volume holds another value layout"};
 
         st::vector<lsm_tree_run_record_t> runs;
@@ -1207,13 +1204,16 @@ class basic_single_collection_database {
 
 #pragma region Private Members
 
-    /** The volume every run and every blob lives on, borrowed and outliving the database. */
+    /** The volume every run and every blob lives on, owned by the caller and outliving the
+     *  database. */
     volume_t& volume_;
 
-    /** The channel every write, flush and commit runs on, borrowed and outliving the database. */
+    /** The channel every write, flush and commit runs on, owned by the caller and
+     *  outliving the database. */
     io_channel_t& writing_channel_;
 
-    /** The second channel a compaction writes its new runs on, borrowed and outliving the database. */
+    /** The second channel a compaction writes its new runs on, owned by the caller and outliving
+     *  the database. */
     io_channel_t& merging_channel_;
 
     /** The bounds this database was opened with. */

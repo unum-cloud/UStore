@@ -39,8 +39,8 @@ std::string_view format_of(ArrowSchema const* schema, ArrowArray const* array) n
     return schema->format;
 }
 
-/** Refuses a column of the right format that is dictionary-encoded, holds a null, or carries fewer than @p buffers
- *  buffers, reading only its lengths and pointers. */
+/** Refuses a column of the right format that is dictionary-encoded, holds a null, or holds fewer
+ *  than @p buffers buffers, reading only its lengths and pointers. */
 ustore_status_t check_column(ArrowSchema const& schema, ArrowArray const& array, std::int64_t buffers) noexcept {
     if (schema.dictionary || array.dictionary) return ustore_status_unsupported_k;
     if (array.length < 0 || array.offset < 0 || array.n_buffers < buffers || !array.buffers)
@@ -242,8 +242,8 @@ ustore_status_t visit_export_executor(ustore_arena_t arena, visitor_type_&& visi
     if (gpu_class == gpu_class_t::unknown_k) return ustore_status_unsupported_k;
     std::variant<std::monostate, cuda_executor_t, hip_executor_t, metal_executor_t> spawned;
     if (util::status_t const status = spawn_gpu_executor(runtime.drivers, runtime.cuda_kernels, runtime.hip_kernels,
-                                                         runtime.metal_kernels, runtime.devices[listed], gpu_class,
-                                                         nullptr, 0, ustore_gds_compatibility_k, spawned);
+                                                         runtime.metal_kernels, runtime.devices[listed], gpu_class, 0,
+                                                         ustore_gds_compatibility_k, spawned);
         status.failed())
         return static_cast<ustore_status_t>(status.code);
     return std::visit(

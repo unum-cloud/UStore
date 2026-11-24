@@ -2,7 +2,7 @@
 
 Every verb takes a batch, so a single operation is a batch of one. Keys arrive as a strided run and
 values as a tape, so a tape a read wrote is written back as it is. Every output whose length scales
-with the call lands in the `Arena` the verb takes, and the result borrows it in turn. The results
+with the call lands in the `Arena` the verb takes, and the result views it in turn. The results
 here also serve the documents, graph and pages verbs, which list keys and read values the same way.
 
 File: mojo/ustore/blobs.mojo
@@ -78,11 +78,11 @@ struct ValuesWritten(Defaultable, ImplicitlyCopyable):
 
 @fieldwise_init
 struct Values[origin: MutOrigin](Deferrable, Sized):
-    """What a read wrote into the arena it borrows: an Apache Arrow binary array of one value per task,
+    """What a read wrote into the arena it views: an Apache Arrow binary array of one value per task,
     a missing key reading as an unset presence bit and an empty value.
 
     Parameters:
-        origin: The arena the values live in, which this result borrows.
+        origin: The arena the values live in, which this result views.
     """
 
     comptime Written = ValuesWritten
@@ -93,7 +93,7 @@ struct Values[origin: MutOrigin](Deferrable, Sized):
     var written: ValuesWritten
     """The views the engine wrote."""
     var count: Int
-    """Tasks the read carried."""
+    """Tasks the read held."""
 
     def __init__(out self, arena: Address, generation: Int, written: ValuesWritten, count: Int):
         self.arena = Pointer[Arena[ImmUntrackedOrigin], Self.origin](unsafe_from_address=arena)
@@ -102,7 +102,7 @@ struct Values[origin: MutOrigin](Deferrable, Sized):
         self.count = count
 
     def __len__(self) -> Int:
-        """The tasks the read carried."""
+        """The tasks the read held."""
         return self.count
 
     def present(self, index: Int) raises Error -> Bool:
@@ -136,10 +136,10 @@ struct KeyRunsWritten(Defaultable, ImplicitlyCopyable):
 
 @fieldwise_init
 struct KeyRuns[origin: MutOrigin](Deferrable, Sized):
-    """The keys a scan or a sample listed into the arena it borrows, run after run, one run per task.
+    """The keys a scan or a sample listed into the arena it views, run after run, one run per task.
 
     Parameters:
-        origin: The arena the keys live in, which this result borrows.
+        origin: The arena the keys live in, which this result views.
     """
 
     comptime Written = KeyRunsWritten
@@ -202,10 +202,10 @@ struct MeasuresWritten(Defaultable, ImplicitlyCopyable):
 
 @fieldwise_init
 struct Measures[origin: MutOrigin](Deferrable, Sized):
-    """The bounds a measure estimated into the arena it borrows, one per range.
+    """The bounds a measure estimated into the arena it views, one per range.
 
     Parameters:
-        origin: The arena the bounds live in, which this result borrows.
+        origin: The arena the bounds live in, which this result views.
     """
 
     comptime Written = MeasuresWritten
@@ -273,10 +273,10 @@ struct PulledWritten(Defaultable, ImplicitlyCopyable):
 
 @fieldwise_init
 struct Pulled[origin: MutOrigin](Deferrable, Sized):
-    """One page of a cursor's walk, read in place from the arena the pull borrows.
+    """One page of a cursor's walk, read in place from the arena the pull views.
 
     Parameters:
-        origin: The arena the page lives in, which this result borrows.
+        origin: The arena the page lives in, which this result views.
     """
 
     comptime Written = PulledWritten
@@ -317,8 +317,8 @@ struct BlobsReadConfig[offsets_origin: ImmOrigin = ImmUntrackedOrigin, limits_or
     """The ranges a read takes of each value, and whether it copies the bytes.
 
     Parameters:
-        offsets_origin: The borrowed start offsets.
-        limits_origin: The borrowed byte limits.
+        offsets_origin: The viewed start offsets.
+        limits_origin: The viewed byte limits.
     """
 
     var offsets: LengthsView[Self.offsets_origin]
@@ -347,8 +347,8 @@ struct BlobsScanConfig[end_origin: ImmOrigin = ImmUntrackedOrigin, patterns_orig
     """The bounds, order and filters of a scan over keys.
 
     Parameters:
-        end_origin: The borrowed end keys.
-        patterns_origin: The borrowed patterns.
+        end_origin: The viewed end keys.
+        patterns_origin: The viewed patterns.
     """
 
     var end_keys: KeysView[Self.end_origin]
@@ -364,7 +364,7 @@ struct BlobsScanConfig[end_origin: ImmOrigin = ImmUntrackedOrigin, patterns_orig
     var progress: Progress
     """Reports the scans finished, and stops the call where it says to."""
     var scores: Bool
-    """Whether one score per listed key comes too, when the patterns carry weights."""
+    """Whether one score per listed key comes too, when the patterns hold weights."""
 
     def __init__(
         out self,
@@ -391,7 +391,7 @@ struct BlobsCursorConfig[patterns_origin: ImmOrigin = ImmUntrackedOrigin](Implic
     """The bound, order and filters of a walk over one collection.
 
     Parameters:
-        patterns_origin: The borrowed patterns, compiled once when the walk opens.
+        patterns_origin: The viewed patterns, compiled once when the walk opens.
     """
 
     var end_key: Optional[Key]
@@ -585,7 +585,7 @@ struct BlobsCursorInitArguments(ImplicitlyCopyable):
 
 @fieldwise_init
 struct CursorNextArguments[name: StaticString](Arguments):
-    """`ustore_blobs_cursor_next_t`, and `ustore_docs_cursor_next_t` with the same layout."""
+    """`ustore_blobs_cursor_next_t`."""
 
     comptime Written = PulledWritten
     comptime symbol: StaticString = Self.name
@@ -614,10 +614,91 @@ struct CursorNextArguments[name: StaticString](Arguments):
 
     @staticmethod
     def verb(library: Library) -> Verb[Self]:
-        comptime if Self.name == "ustore_docs_cursor_next":
-            return rebind[Verb[Self]](library.symbols().docs_cursor_next)
-        else:
-            return rebind[Verb[Self]](library.symbols().blobs_cursor_next)
+        return rebind[Verb[Self]](library.symbols().blobs_cursor_next)
+
+
+@fieldwise_init
+struct DocsBatchView(ImplicitlyCopyable):
+    """`ustore_docs_batch_view_t`: one batch of a docs cursor's pull, its rows' keys and columns in the arena."""
+
+    var count: c_size_t
+    var keys: Address
+    var columns: Address
+
+
+@fieldwise_init
+struct DocsBatchesWritten(Defaultable, ImplicitlyCopyable):
+    """The batches and their count one docs cursor pull writes, at one stable address."""
+
+    var batches: Address
+    var batches_count: c_size_t
+
+    def __init__(out self):
+        """Nothing written, which is what a failed call leaves."""
+        self = Self(NULL_ADDRESS, 0)
+
+
+@fieldwise_init
+struct DocsBatches[origin: MutOrigin](Deferrable, Sized):
+    """The batches of one docs cursor pull, read in place from the arena the pull wrote them into.
+
+    Parameters:
+        origin: The arena the batches live in, which must outlive this result.
+    """
+
+    comptime Written = DocsBatchesWritten
+    var arena: Pointer[Arena[ImmUntrackedOrigin], Self.origin]
+    """The arena holding the batches."""
+    var generation: Int
+    """The arena's call the batches came from."""
+    var written: DocsBatchesWritten
+    """The views the engine wrote."""
+
+    def __init__(out self, arena: Address, generation: Int, written: DocsBatchesWritten, count: Int):
+        self.arena = Pointer[Arena[ImmUntrackedOrigin], Self.origin](unsafe_from_address=arena)
+        self.generation = generation
+        self.written = written
+
+    def __len__(self) -> Int:
+        """The batches pulled, zero once the walk is exhausted."""
+        return Int(self.written.batches_count)
+
+    def keys(ref self, batch: Int) raises Error -> Span[Key, origin_of(self)]:
+        """The keys of the rows of `batch`, in walk order."""
+        _readable(self.arena, self.generation, "DocsBatches.keys")
+        var view = _in_arena[DocsBatchView, origin_of(self)](self.written.batches, len(self))[batch]
+        return _in_arena[Key, origin_of(self)](view.keys, Int(view.count))
+
+
+@fieldwise_init
+struct DocsCursorNextArguments(Arguments):
+    """`ustore_docs_cursor_next_t`."""
+
+    comptime Written = DocsBatchesWritten
+    comptime symbol: StaticString = "ustore_docs_cursor_next"
+    var database: Address
+    var executor: Address
+    var outcome: Optional[Pointer[Outcome, MutUntrackedOrigin]]
+    var completion: Completion
+    var cursor: Address
+    var batches: Optional[Pointer[Address, MutUntrackedOrigin]]
+    var batches_count: Optional[Pointer[c_size_t, MutUntrackedOrigin]]
+    var arena: Address
+    var wanted: c_size_t
+    var progress: Progress
+
+    def bind(mut self, scope: Scope, completion: Completion, outcome: Pointer[Outcome, MutUntrackedOrigin], written: Pointer[DocsBatchesWritten, MutUntrackedOrigin], arena: Address):
+        self.database = scope.database
+        self.executor = scope.executor
+        self.outcome = outcome
+        self.completion = completion
+        self.batches = Pointer(to=written[].batches)
+        self.batches_count = Pointer(to=written[].batches_count)
+        self.arena = arena
+
+    @staticmethod
+    def verb(library: Library) -> Verb[Self]:
+        return rebind[Verb[Self]](library.symbols().docs_cursor_next)
 
 
 @fieldwise_init
@@ -755,7 +836,7 @@ struct BlobsCursor(Movable):
 
         Args:
             executor: The executor the pull runs on, of the kind the walk was opened for.
-            arena: The arena to rewind and refill, which the result borrows.
+            arena: The arena to rewind and refill, which the result views.
             wanted: Most keys the page holds; a page of fewer exhausts the walk.
             values: Whether the values of the page's keys come too.
             progress: Reports the pull, and may cancel it before the cursor advances.

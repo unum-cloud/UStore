@@ -25,7 +25,6 @@
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <type_traits> // `std::remove_cv_t`, `std::conditional_t`, `std::remove_reference_t`
-#include <utility>     // `std::declval`
 
 #include <forkunion/types.hpp>         // `fu::min_of`
 #include <stringzilla/stringzilla.hpp> // `sz::strings_view_t`, `sz::indexed_container_iterator`
@@ -209,7 +208,9 @@ template <typename container_type_, typename element_type_>
 concept contiguous_of_concept =
     std::ranges::contiguous_range<container_type_> && std::ranges::sized_range<container_type_> &&
     std::same_as<std::ranges::range_value_t<container_type_>, std::remove_cv_t<element_type_>> &&
-    std::convertible_to<decltype(std::ranges::data(std::declval<container_type_&>())), element_type_*>;
+    requires(container_type_& container) {
+        { std::ranges::data(container) } -> std::convertible_to<element_type_*>;
+    };
 
 /** A counted run of strided elements, writable unless @p element_type_ is @c const,
  *  like @c std::span. */
@@ -442,7 +443,7 @@ inline ustore_strings_view_t tape_slice(ustore_strings_view_t tape, std::size_t 
 }
 
 /**
- *  @brief Lends a strided run of texts to a call through an accessor, where a zero stride repeats
+ *  @brief Views a strided run of texts for a call through an accessor, where a zero stride repeats
  *      the first text for every task.
  *
  *  The view it hands out points at the object itself, so the object outlives every call

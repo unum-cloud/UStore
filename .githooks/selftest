@@ -505,7 +505,7 @@ struct probe_t {
 FIXTURE
 
 assert_rejects "bare trailing doc marker" "with a trailing marker" include/$project_directory/probe.h <<'FIXTURE'
-static int probe_value; //< The value.
+static int const probe_value = 1; //< The value.
 FIXTURE
 
 assert_rejects "trailing field comment" "on its own line's tail" include/$project_directory/probe.h <<'FIXTURE'
@@ -1478,13 +1478,13 @@ FIXTURE
 # region C and C++ Idiom Fixtures
 
 assert_rejects "unpinned string split" "splits a string literal" include/$project_directory/probe.h <<'FIXTURE'
-static char const *probe_text = "first half "
-                                "second half";
+static char const *const probe_text = "first half "
+                                      "second half";
 FIXTURE
 
 assert_accepts "pinned string split" include/$project_directory/probe.h <<'FIXTURE'
-static char const *probe_text = "first half " //
-                                "second half";
+static char const *const probe_text = "first half " //
+                                      "second half";
 FIXTURE
 
 stage_edited_fixture include/$project_directory/probe.h 's/^#pragma once$/#pragma once\n#define PROBE_FIRST "first"/; s/^int settled(void);$/"second";/'
@@ -2285,7 +2285,7 @@ assert_rejects "URL in code after a code block closing with its docblock" "misma
  *  @endcode */
 int probe(void);
 
-static char const *site = "https://example.com/probe";
+static char const *const site = "https://example.com/probe";
 FIXTURE
 
 stage_fixture_with_header include/$project_directory/probe.hpp <<'FIXTURE'
@@ -2898,8 +2898,8 @@ stage_committed_fixture() { # stage_committed_fixture <relative-path> <sed-expre
 }
 
 stage_committed_fixture include/$project_directory/probe.hpp 's/probe_text =$/probe_text = "first half "/' <<'FIXTURE'
-static char const *probe_text =
-                                "second half";
+static char const *const probe_text =
+                                      "second half";
 FIXTURE
 run_precommit
 expect_rejection "string split by an added line before an unchanged fragment" "splits a string literal without"
@@ -3123,6 +3123,18 @@ FIXTURE
 
 assert_accepts "span of C strings spelled const char" include/$project_directory/probe.hpp <<'FIXTURE'
 void probe_name(std::span<const char* const> names) noexcept;
+FIXTURE
+
+assert_rejects "executor address comparison" "compares executor addresses" src/probe.cpp <<'FIXTURE'
+std::size_t probe_thread(probe_view_t const& view, probe_state_t const& state) noexcept {
+    return view.executor == state.executor ? view.thread_index : 0;
+}
+FIXTURE
+
+assert_accepts "null executor test and an executor's width" src/probe.cpp <<'FIXTURE'
+std::size_t probe_threads(probe_view_t const& view) noexcept {
+    return view.executor != nullptr && view.executor->size() != 0 ? view.executor->size() : 1;
+}
 FIXTURE
 
 assert_rejects "N-API mutex in a binding" "locks in a binding" javascript/probe.c <<'FIXTURE'
@@ -4002,6 +4014,234 @@ struct cufile_io_event_t {
 };
 FIXTURE
 
+assert_rejects "a hand-over word in an identifier" "names a thing by a hand-over word" include/ustore/probe.hpp <<'FIXTURE'
+struct merge_buffers_t {
+    int lent_buffer_count = 0;
+};
+FIXTURE
+
+assert_accepts "a hand-over word in prose and a Rust std name" include/ustore/probe.hpp <<'FIXTURE'
+/** The buffers a caller owns and does not borrow. */
+struct merge_buffers_t {
+    int owned_buffer_count = 0;
+};
+FIXTURE
+
+assert_accepts "Rust std borrow names" rust/probe.rs <<'FIXTURE'
+use std::borrow::BorrowMut;
+
+fn compact<Plan: BorrowMut<u8>>(plan: &mut Plan) -> u8 { *plan.borrow_mut() }
+FIXTURE
+
+assert_rejects "a camelCase hand-over word in Go" "names a thing by a hand-over word" golang/probe.go <<'FIXTURE'
+package ustore
+
+func probe(lentDevices []int) int { return len(lentDevices) }
+FIXTURE
+
+assert_rejects "a hand-over word in a Python identifier" "names a thing by a hand-over word" python/ustore/probe.py <<'FIXTURE'
+
+def probe(contents_borrowed):
+    return contents_borrowed
+FIXTURE
+
+assert_accepts "a hand-over word in a Python comment and string" python/ustore/probe.py <<'FIXTURE'
+
+def probe(contents):  # the caller keeps what it would otherwise borrow
+    return contents or "nothing lent"
+FIXTURE
+
+assert_rejects "a pytest match on a message" "asserts on a fragment of a repr, a message or a note" test/probe.py <<'FIXTURE'
+import pytest
+
+
+def test_probe_refuses(database):
+    with pytest.raises(ValueError, match="needs a key"):
+        database.probe()
+FIXTURE
+
+assert_rejects "a Go test comparing an error's text" "asserts on a fragment of a repr, a message or a note" golang/probe_test.go <<'FIXTURE'
+package ustore
+
+func TestProbe(t *testing.T) {
+	if err := probe(); err.Error() == "needs a key" {
+		t.Fatal(err)
+	}
+}
+FIXTURE
+
+assert_rejects "a status note past eight words" "writes a status note past eight words" src/probe.cpp <<'FIXTURE'
+inline util::status_t probe() noexcept {
+    return {util::status_code_t::io_k, "The queue could not read the header of the sorted run"};
+}
+FIXTURE
+
+assert_rejects "a status note closed with a period" "writes a status note past eight words" include/ustore/probe.hpp <<'FIXTURE'
+inline status_t probe() noexcept { return {status_code_t::io_k, "Header read short."}; }
+FIXTURE
+
+assert_accepts "a status note of eight words" src/probe.cpp <<'FIXTURE'
+inline util::status_t probe() noexcept {
+    return {util::status_code_t::io_k, "A sorted run's header did not read whole"};
+}
+FIXTURE
+
+assert_rejects "pool spawned in make_call_executor" "spawns a pool or probes a topology" src/probe.hpp <<'FIXTURE'
+inline ustore_executor_t make_call_executor(call_executor_t& call_executor) noexcept {
+    fu_pool_t pool = nullptr;
+    if (fu_pool_new("call", fu_capabilities_all_k, &pool) != fu_success_k) return nullptr;
+    return call_executor.adopt(pool);
+}
+FIXTURE
+
+assert_accepts "pool spawned in the RAM device" include/$project_directory/utilities/ram_device.hpp <<'FIXTURE'
+inline fu_status_t spawn_probe(fu_topology_t topology, fu_pool_t pool, std::size_t threads) noexcept {
+    return fu_pool_spawn(topology, pool, threads, fu_caller_inclusive_k);
+}
+FIXTURE
+
+assert_rejects "function-local static executor" "adds a static object" src/probe.hpp <<'FIXTURE'
+inline util::ram_executor_t& probe_executor() noexcept {
+    static util::ram_executor_t executor;
+    return executor;
+}
+FIXTURE
+
+assert_rejects "constinit static counter" "adds a static object" src/probe.hpp <<'FIXTURE'
+static constinit int probe_calls = 0;
+FIXTURE
+
+assert_rejects "static mutable pointer to const characters" "adds a static object" src/probe.hpp <<'FIXTURE'
+static char const* probe_cursor = nullptr;
+FIXTURE
+
+assert_rejects "static object built by a call" "adds a static object" src/probe.hpp <<'FIXTURE'
+static probe_pool_t probe_threads(make_probe_threads());
+FIXTURE
+
+assert_accepts "static constexpr table and a static function" src/probe.hpp <<'FIXTURE'
+struct probe_table_t {
+    static constexpr std::size_t widths_k[2] = {8, 16};
+    static std::size_t width(std::size_t index) noexcept { return widths_k[index]; }
+};
+FIXTURE
+
+assert_rejects "flush inside a free" "does I/O inside a free" src/probe.cpp <<'FIXTURE'
+void probe_free(probe_state_t& state) noexcept {
+    [[maybe_unused]] util::status_t const flushed = state.store.flush();
+    state.memory.reset();
+}
+FIXTURE
+
+assert_rejects "persist inside a free" "does I/O inside a free" src/probe.cpp <<'FIXTURE'
+void probe_free(probe_state_t& state) noexcept {
+    [[maybe_unused]] util::status_t const persisted = state.image.persist();
+    state.memory.reset();
+}
+FIXTURE
+
+assert_accepts "flush in the flush verb" src/probe.cpp <<'FIXTURE'
+util::status_t probe_flush(probe_state_t& state) noexcept { return state.store.flush(); }
+
+void probe_free(probe_state_t& state) noexcept { state.memory.reset(); }
+FIXTURE
+
+assert_rejects "per-thread stream handle" "names a per-thread default stream" include/$project_directory/utilities/probe.hpp <<'FIXTURE'
+inline cuda_stream_handle_t probe_stream() noexcept { return cuda_stream_per_thread_k; }
+FIXTURE
+
+assert_accepts "null legacy stream" include/$project_directory/utilities/probe.hpp <<'FIXTURE'
+inline cuda_stream_handle_t probe_stream() noexcept { return nullptr; }
+FIXTURE
+
+assert_rejects "Arc around an executor" "counts references in a binding" rust/probe.rs <<'FIXTURE'
+use std::sync::Arc;
+
+struct Probe {
+    executor: Arc<Executor>,
+}
+FIXTURE
+
+assert_rejects "arena count kept on a C binding handle" "counts references in a binding" python/probe.c <<'FIXTURE'
+typedef struct probe_executor_t {
+    ustore_executor_t handle;
+    size_t arenas;
+} probe_executor_t;
+FIXTURE
+
+assert_rejects "atomic hold count on a C binding handle" "counts references in a binding" javascript/probe.c <<'FIXTURE'
+typedef struct probe_arena_t {
+    ustore_arena_t handle;
+    atomic_size_t holds;
+} probe_arena_t;
+FIXTURE
+
+assert_accepts "arena referencing its executor object" python/probe.c <<'FIXTURE'
+typedef struct probe_arena_t {
+    ustore_arena_t handle;
+    PyObject* executor;
+} probe_arena_t;
+FIXTURE
+
+assert_accepts "lifetime-bound arena" rust/probe.rs <<'FIXTURE'
+struct Probe<'executor> {
+    arena: Arena<'executor>,
+}
+FIXTURE
+
+assert_rejects "offset_of! in a Rust test" "asserts a struct's layout" rust/probe.rs <<'FIXTURE'
+#[test]
+fn probe_layout() {
+    assert_eq!(offset_of!(ffi::ustore_probe_t, width), 8);
+}
+FIXTURE
+
+assert_accepts "size_of for a stride" rust/probe.rs <<'FIXTURE'
+fn probe_stride() -> usize {
+    size_of::<Edge>() + offset_of!(Edge, source)
+}
+FIXTURE
+
+# Commits a C struct and its Rust mirror, then adds a member to the struct and stages it, with the mirror's
+# matching member when asked.
+stage_struct_mirror_fixture() { # stage_struct_mirror_fixture <with-mirror|without-mirror>
+    stage_fixture_with_header c/$project_directory/probe.h <<'FIXTURE'
+/** A probe's shape. */
+typedef struct ustore_probe_t {
+
+    /** How wide it is. */
+    int width;
+} ustore_probe_t;
+FIXTURE
+    mkdir -p "$fixture_directory/rust"
+    printf '%s\n' '//! One staged fixture for one rule.' '//!' '//! File: rust/probe.rs' '//! Author: Selftest' \
+        '//! Date: January 1, 2026' '' '/// A probe'"'"'s shape.' '#[repr(C)]' 'pub struct ustore_probe_t {' \
+        '    /// How wide it is.' '    pub width: i32,' '}' > "$fixture_directory/rust/probe.rs"
+    git -C "$fixture_directory" add -- rust/probe.rs
+    git -C "$fixture_directory" commit --quiet -m "Chore: Seed the fixture"
+    local edited
+    edited=$(awk '{ print } /int width;/ { print ""; print "    /** How deep it goes. */"; print "    int depth;" }' \
+        "$fixture_directory/c/$project_directory/probe.h")
+    printf '%s\n' "$edited" > "$fixture_directory/c/$project_directory/probe.h"
+    git -C "$fixture_directory" add -- c/$project_directory/probe.h
+    [ "$1" = with-mirror ] || return 0
+    edited=$(awk '{ print } /pub width: i32,/ { print "    /// How deep it goes."; print "    pub depth: i32," }' \
+        "$fixture_directory/rust/probe.rs")
+    printf '%s\n' "$edited" > "$fixture_directory/rust/probe.rs"
+    git -C "$fixture_directory" add -- rust/probe.rs
+}
+
+stage_struct_mirror_fixture without-mirror
+run_precommit
+expect_rejection "C struct changed without its Rust mirror" "without the bindings that lay it out by hand"
+
+stage_struct_mirror_fixture with-mirror
+run_precommit
+expect_acceptance "C struct changed with its Rust mirror"
+
+stage_edited_fixture src/probe.cpp 's/^int settled(void);$/int settled(void); \/\/ Answers how settled the probe is./'
+run_precommit
+expect_acceptance "comment edit beside a code edit"
 
 assert_rejects "two blank lines in Markdown" "separates paragraphs with more than one blank line" docs/probe.md <<'FIXTURE'
 First paragraph.

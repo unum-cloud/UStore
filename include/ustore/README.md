@@ -6,7 +6,7 @@ Every subfolder `ustore/<dir>/` opens `unum::ustore::<dir>`, and every header is
 
 ## Stability
 
-These headers carry no stability promise.
+These headers hold no stability promise.
 Their names, layouts and signatures change with the engines that instantiate them, in any release, and only the C ABI of `c/ustore/*.h` is versioned.
 Pin a commit, not a version, when building on them.
 
@@ -14,16 +14,18 @@ Pin a commit, not a version, when building on them.
 
 - `utilities/`, in `unum::ustore::utilities`:
   - `types.hpp`: `status_t`, `status_code_t` and `expected`, UUIDs, keys and collection IDs with their orders, hashes and text, edges, value views, byte views and the serialization over them, owned text and integer rounding.
-    `cpp/ustore/status.hpp` and `cpp/ustore/types.hpp` re-export it all into `unum::ustore`.
+    `cpp/ustore/types.hpp` keeps an identical copy of `status_t` and `expected`, so a status reads the same on both sides of the C layer.
   - `ram_buffers.hpp`: the growing arena behind `ustore_arena_t` and every call's scratch, the `arena_allocator` SmashTable's containers take, the aligned and budgeted allocators of unbuffered I/O with the buffers they grow, and `growing_strings`, a column of strings exported as a tape.
-  - `ram_device.hpp`: `topology_t`, `executor_t`, `lent_pool_t` and `pool_view_t` over ForkUnion's C ABI.
+  - `ram_device.hpp`: `topology_t`, `ram_executor_t` and `pool_view_t` over ForkUnion's C ABI.
   - `vram_device.hpp`: the vendor-neutral face of the GPU residency, every vendor's driver, the device listing, and the kernels every vendor's executor launches.
   - `vram_nvidia_device.hpp`: CUDA devices, streams, events and buffers from the host.
   - `vram_amd_device.hpp`: AMD devices from the host, the HIP runtime opened at first use, the device listing, modules, events and the executor.
+  - `vram_apple_device.hpp`: Apple devices from the host, Metal opened at first use, the device listing, modules of MSL source and the executor.
   - `vram_matching.hpp` and `vram_matching.cuh`: the device matching kernels of the library's bundles as one executor's device resolved them, and the kernels themselves.
   - `vram_scan.cuh`: the device scan steps every kernel compacts with, what a block scan kit answers and a chain of blocks.
   - `vram_nvidia_scan.cuh` and `vram_amd_scan.hip`: the block scan kits of each GPU generation, `ampere_scan_t`, `cdna3_scan_t` and `cdna5_scan_t`, which a class unit names.
   - `tapes.hpp` and `tapes.cuh`: the strings a tape is assembled from, the segments a device gathers them in, and the host twin of the device kernels.
+  - `ranges.hpp`: strided iterators, spans and tapes viewing the batched arguments and results of the C ABI inside the engines.
   - `blocking_files.hpp`: whole-file mappings, paths joined into one buffer, directories created and removed, and shared libraries opened by name.
   - `algorithm.hpp`: searches over sorted batches, reservoir sampling over ordered iterators, and inserts and erases in trivially copyable buffers.
   - `folds.hpp`: `fold_concept`, which folds the base of a key with the deltas newer than it, and `last_write_fold_t`, where the newest delta wins.
@@ -31,7 +33,8 @@ Pin a commit, not a version, when building on them.
     It reaches no StringZilla, so CUDA translation units include it.
   - `nvme_disks.hpp`: the ring machinery every disk shares, the volume in memory, and the blocking floor of positioned reads and writes.
   - `nvme_linux_uring_disk.hpp`, `nvme_linux_aio_disk.hpp`, `nvme_linux_cufile_disk.hpp` and `nvme_linux_spdk_disk.hpp`: the io_uring, Linux AIO, cuFile and SPDK transports.
-  - `nvme_channels.hpp`: the pinned buffer pool, the channels checking a queue pair out with its blocks, and the pipelines holding a ring at depth.
+  - `nvme_channels.hpp`: the blocks a channel views, the channels holding a thread's queue with its blocks, and the pipelines holding a ring at depth.
+  - `nvme_queues.hpp`: the transport a queue set resolves to, and `nvme_queues_t`, one reading and one writing queue per executor thread over that thread's own blocks.
   - `nvme_slots.hpp`: the 1 GB slots of a raw medium, the owner block opening every slot a database holds, and the slot record.
   - `nvme_manifest.hpp`: the `<database>.ustore.json` manifest naming a database's collections and run files.
   - `nvme_volume.hpp`: data directory addresses, the slot allocator, and the directory and slotted volumes placing runs across every data directory.
@@ -45,7 +48,7 @@ Pin a commit, not a version, when building on them.
   - `nvme_tree.hpp`: configurations and schemas, the merge of one level into the next, and the level set readers see; `nvme_lsm_level.hpp`: the LSM levels.
   - `nvme_published_runs.hpp`: `commit_ledger`, `stamp_pin` and `pinned_snapshot`, the stamps and the sequencer every NVMe store commits through, `maintenance_claim`, the claim a database's maintenance runs under, and `published_runs`, the tree, memory runs and published view every NVMe store owns, with the commits, merges, flushes, compactions and truncations that move its runs.
   - `nvme_store.hpp`: `nvme_store`, the store of one collection, memory runs in front of a tree, with its snapshots; `nvme_value_cache.hpp`: its value cache; `nvme_store_cursor.hpp`: `nvme_store_cursor`.
-  - `nvme_transactions.hpp`: `transaction_deltas` and the read sets one transaction carries, `transaction_registry`, which orders and conflict-checks the transactions of one store, and `transaction_core`, the lifecycle, stamps and watches every transaction is made of.
+  - `nvme_transactions.hpp`: `transaction_deltas` and the read sets one transaction holds, `transaction_registry`, which orders and conflict-checks the transactions of one store, and `transaction_core`, the lifecycle, stamps and watches every transaction is made of.
   - `nvme_database.hpp`: databases of named collections, with their snapshots and optimistic transactions over the shared registry and core.
   - `nvme_single_collection_database.hpp`: single-collection databases, with their snapshots and transactions over the same registry and core.
 - `graph/`, in `unum::ustore::graph`:
@@ -76,7 +79,7 @@ Pin a commit, not a version, when building on them.
 ## Building
 
 Every template that owns a shared word or waits on one takes the atomic reference and the waiter as template parameters, wrapping the waiter in SmashTable's parking policy itself, and names no CPU class, instruction or ForkUnion `preferred_*` alias; `src/` picks both per CPU class.
-CMake exports the headers as the `ustore::templates` interface target, which carries the include paths of `c/` and `include/` and links the header targets of ForkUnion, SmashTable and StringZilla, plus the include paths of yyjson and fmt, in the build tree.
+CMake exports the headers as the `ustore::templates` interface target, which holds the include paths of `c/` and `include/` and links the header targets of ForkUnion, SmashTable and StringZilla, plus the include paths of yyjson and fmt, in the build tree.
 An install copies `include/ustore/` beside `c/ustore/` and `cpp/ustore/`, but none of the siblings' headers, so a consumer of the installed package brings each sibling's own package, as the C++ SDK already asks.
 Headers that call ForkUnion's C ABI, such as `ram_buffers.hpp` and `ram_device.hpp`, also need `forkunion::static` or `ustore::static` at link time.
 `docs/json_paths.hpp` calls StringZilla's dispatched kernels, which its header-only build answers with `sz_missing_library_k`, so it resolves nothing without `stringzilla::static` or `ustore::static`, and its callers fall back to yyjson.

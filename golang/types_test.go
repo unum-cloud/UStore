@@ -27,7 +27,7 @@ func fixture(t *testing.T) (*ustore.Database, ustore.CollectionID, *ustore.Arena
 	if err != nil {
 		t.Fatalf("the collection must be created: %v", err)
 	}
-	executor, err := ustore.ExecutorForRam(nil, 2, ustore.CPUClassUnknown)
+	executor, err := ustore.ExecutorForRam(nil, 2, ustore.CPUClassUnknown, 0)
 	if err != nil {
 		t.Fatalf("the executor must spawn: %v", err)
 	}
@@ -91,7 +91,7 @@ func TestArenasLiveOnTheHost(t *testing.T) {
 
 func TestClosedHandlesRefuseBeforeCrossing(t *testing.T) {
 	database, people, arena, executor := fixture(t)
-	closed, err := ustore.ExecutorForRam(nil, 1, ustore.CPUClassUnknown)
+	closed, err := ustore.ExecutorForRam(nil, 1, ustore.CPUClassUnknown, 0)
 	if err != nil {
 		t.Fatalf("the executor must spawn: %v", err)
 	}

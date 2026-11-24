@@ -78,7 +78,7 @@ Shorthand such as `value()` makes a one-off arena per call and owns it in its an
 ## Collections
 
 No collection exists until one is created, and each collection type names the modality it holds as `modality_k`.
-`create` records it and refuses a name starting with `_`, which system collections keep, `find` refuses a missing name with `status_code_t::not_found_k` and a collection holding another modality with `status_code_t::invalid_argument_k`, and `find_or_create` creates only when no collection carries the name.
+`create` records it and refuses a name starting with `_`, which system collections keep, `find` refuses a missing name with `status_code_t::not_found_k` and a collection holding another modality with `status_code_t::invalid_argument_k`, and `find_or_create` creates only when no collection holds the name.
 Brackets only find, so `db["articles"]` never creates a collection.
 `find(name, arena)` reads the name into an arena on any receiver, a deferred one included, while `find(name)` is the blocking shorthand over a one-off arena.
 A collection handle is cheap to construct and holds no state, so threads share one, each passing its own arena, and `handle()` answers the identifier the C calls take.
@@ -125,6 +125,7 @@ us::expected<std::size_t> count = words.size("ap");
 ```
 
 `ingest` opens an `ingest_t` that lands every row appended to it as one commit of its own, joining no transaction, and `finish` answers that commit's stamp.
+It opens on the receiver's executor, whose memory domain holds it, while `append` and `finish` each take an executor of their own, the calling thread without one.
 
 ```cpp
 auto [ingest, ingest_status] = db.ingest(blobs.handle(), ustore_ingest_unsorted_k);
@@ -161,6 +162,14 @@ for (std::size_t pulled = wanted; !cursor_status.failed() && pulled == wanted;) 
 }
 ```
 
+`docs_cursor_t::make` also takes a table header naming the columns every row gathers, and its `next` pulls batches of rows, one per executor task that found any, none once the walk is exhausted.
+
+```cpp
+auto header = us::make_table_header().with<std::int64_t>("age");
+auto [rows, rows_status] = us::docs_cursor_t::make(db.receiver(), people.handle(), us::smallest_key_k, {}, header.view());
+auto [batches, batches_status] = rows.next(256, arena, executor); // each batch holds keys and one column per field
+```
+
 `sample` draws entries at random, on blobs, strings, documents and pages, and `measure` bounds how many entries and bytes a range holds, on strings, documents and pages, while graphs spell them `sample_vertices` and `measure_vertices`.
 A `changes_cursor_t` is a feed of what was committed to one collection after a stamp, oldest first, which pins that stamp as a snapshot does.
 
@@ -173,8 +182,8 @@ auto [changes, changes_status] = feed.next_pairs(256, arena, executor); // or on
 
 ### Progress and Cancellation
 
-`compact` and `save` take an optional progress handler, a `noexcept` callable answering `ustore_continue_k` or `ustore_cancel_k` for the units finished of a total, lent to the call as a `progress_t`.
-A handler that may throw does not compile, and the call borrows it until it is final, so a temporary does not compile either.
+`compact` and `save` take an optional progress handler, a `noexcept` callable answering `ustore_continue_k` or `ustore_cancel_k` for the units finished of a total, which the call views as a `progress_t`.
+A handler that may throw does not compile, and the caller keeps it until the call is final, so a temporary does not compile either.
 Answering `ustore_cancel_k` fails the call with `status_code_t::cancelled_k`, a cancelled save removing what it wrote.
 
 ```cpp
@@ -271,9 +280,9 @@ The receiver chooses where a call runs, and the verb stays, as [the C rules](htt
 - `blobs.on(executor).read(keys, arena)` blocks on the executor, as `db.on(executor)` and the `on` of a transaction or a snapshot do.
 - `blobs.deferred(executor).read(keys, arena)` submits the call and answers a `deferred<T>`.
 
-The database, a transaction and a snapshot are each one class template over the receiver, such as `database<receiver>`, so every verb is written once: `database_t` owns the handle, and `on` and `deferred` answer a `database_on<completion>` that borrows it with the executor.
+The database, a transaction and a snapshot are each one class template over the receiver, such as `database<receiver>`, so every verb is written once: `database_t` owns the handle, and `on` and `deferred` answer a `database_on<completion>` that views it with the executor.
 Only the owning handles open, begin transactions, pin snapshots and open feeds.
-A `deferred<T>` never moves, so it lives on the caller's stack or in its coroutine frame, and the deferred handle, the inputs and the arena it names stay borrowed until the call is final.
+A `deferred<T>` never moves, so it lives on the caller's stack or in its coroutine frame, and the caller keeps the deferred handle, the inputs and the arena it names until the call is final.
 
 ```cpp
 auto [executor, executor_status] = us::executor_t::for_ram({.threads = 4});
@@ -328,8 +337,10 @@ The deferred database also finds, creates, drops and lists collections, and desc
 ## Executors
 
 An executor owns the threads that run calls, serves one call at a time, and is shared by any number of databases, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#executors) describe.
-`executor_t::for_ram` spawns host threads, `for_nvme` the NVMe engine's rings, `for_vram` one device stream and `on_pool` borrows a ForkUnion pool, and the owner frees the executor on destruction, waiting for the calls naming it.
-Opening blocks, as every constructor does: `init_ram`, `open_ram`, `open_rocksdb`, `view_rocksdb`, `open_leveldb` and `open_nvme` take the executor to block on as their last argument, and an NVMe database moves bytes as the placement of an NVMe executor names.
+`executor_t::for_ram` spawns host threads, `for_nvme` the NVMe engine's rings, and `for_vram` one device stream it owns, a caller's stream answering `status_code_t::unsupported_k` since the executor drives only its own, and the owner frees the executor on destruction, waiting for the calls naming it.
+Closing a database or dropping its handle writes nothing to disk, so `flush` on an executor makes commits with `ustore_durability_buffered_k` durable first.
+Every arena is freed before the executor that made it, so declare the executor first and its arenas after it, and their destructors run in that order.
+Opening blocks, as every constructor does: `init_ram`, `open_ram`, `open_rocksdb`, `view_rocksdb`, `open_leveldb`, `open_nvme` and `view_nvme` take the executor to block on as their last argument, and an NVMe database moves bytes as the placement of an NVMe executor names.
 
 ```cpp
 auto [executor, executor_status] = us::executor_t::for_ram({.threads = 4});
@@ -424,7 +435,7 @@ status = db.compact_plan_finish(std::move(plan));
 - __Each verb is written once.__
   A receiver's completion is a template parameter, so `blocks<completion>` gates the shorthand, each class's `deferrable<T>` names a `deferred<T>` where a blocking call answers an `expected<T>` or a `status_t`, and nothing writes through a snapshot.
 
-  The owning handle and its borrowed `*_on<completion>` twins are one class template over `owning` or `borrowing` receiver storage.
+  The owning handle and its `*_on<completion>` twins, which view it, are one class template over `owning` or `caller_owned` receiver storage.
 - __The Rust analogy holds call for call.__
   `*_on<completion>` mirrors Rust's `On<'index, Index, Completion>`, `deferred<T>` its `Deferred`, `~deferred` its waiting `Drop`, and `wait(loop)` with its `awaiter` the `Future` that re-wakes itself, posting a function pointer and a state pointer as a `RawWaker` posts its two words.
 - __Executors are named per call.__

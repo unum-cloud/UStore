@@ -1,10 +1,10 @@
 # UStoreNVMe
 
 UStoreNVMe is UStore's NVMe-focused LSM engine, with `io_uring`, Linux AIO, SPDK and blocking transports, GPU compaction and GPUDirect Storage, and SIMD row kits.
-Every collection is a log-structured merge tree of immutable sorted runs, each carrying a saved S+ tree of its keys that every lookup descends in place.
+Every collection is a log-structured merge tree of immutable sorted runs, each holding a saved S+ tree of its keys that every lookup descends in place.
 Keys are fixed-width stored keys, `ustore_key_t` at the C ABI, and values are opaque bytes whose width a collection fixes at compile time.
 The C ABI in `variants.hpp` backs each UStore database with one `database` and each collection with one `nvme_store` under the same UUID.
-Every call is a template on the CPU class, whose atomic reference and waiter instantiate the `database`, and `src/nvme/variants_<class>.cpp` compiles one class each; the open in `engine.cpp` takes the newest class its ceiling fits, ending on the serial floor, and every handle it hands out carries that class's table.
+Every call is a template on the CPU class, whose atomic reference and waiter instantiate the `database`, and `src/nvme/variants_<class>.cpp` compiles one class each; the open in `engine.cpp` takes the newest class its ceiling fits, ending on the serial floor, and every handle it hands out holds that class's table.
 It mounts on files through whichever file transport its executor names, reserves the `_collections` and `_names` system collections, and creates every other collection with a variable-width value layout so an empty value keeps its key.
 Every write of a caller commits through a transaction of the registry, while both system collections change straight in the store under a claim of their own, as no caller's transaction reaches them.
 A stage checks a transaction and hands the database's claim back at once, so the commit checks it again; a held claim would stall every other call.
@@ -77,7 +77,7 @@ A `database` mixes collections of different value layouts, and its collection sc
 ### Stamps and snapshots
 
 Every commit draws one stamp from the database's `commit_ledger_t`, over SmashTable's `commit_order_t`, and a graph's two databases share one ledger.
-A memory run carries the stamp of the commit that wrote each of its deltas, and every sorted run carries a column of its key slots' stamps as an `immutable_packed_array` trailer, frame-of-reference coded from a floor no reader can tell apart, so a cold run spends no bit on them.
+A memory run holds the stamp of the commit that wrote each of its deltas, and every sorted run holds a column of its key slots' stamps as an `immutable_packed_array` trailer, frame-of-reference coded from a floor no reader can tell apart, so a cold run spends no bit on them.
 The trailer's second column holds every key slot's `delta_kind_t`, which tells a write, a removal and a fold's change apart, so no value offset or width is a sentinel, and a run of writes alone spends no bit on it.
 A run may hold several versions of one key, newest first, and the run cutter never splits them.
 
@@ -90,7 +90,7 @@ A reader the memory budget cannot keep history for is refused at its next read w
 
 ### Crash atomicity
 
-The manifest carries a generation and the durable stamp D: every commit at or below D is wholly in the runs it names.
+The manifest holds a generation and the durable stamp D: every commit at or below D is wholly in the runs it names.
 D is the least stamp below the oldest commit any collection holds in memory runs alone, or the published stamp while no collection holds one.
 A mount reads the manifest in force, resumes the stamps at D and merges down every level holding a version above D, dropping those versions, so a crash loses a suffix of commits and never half of one.
 A graph truncates both of its databases at the lesser of their two promises.
@@ -130,7 +130,7 @@ Commits are ordered by the stamps the ledger issues, which keeps a transaction t
 
 - An open names a directory, which becomes the metadata directory; a data directory it does not name defaults to `data` beneath it, and a capacity it does not name defaults to one gibibyte.
 - The executor of `ustore_executor_for_nvme` names the transport, the channels and their buffers, and the VRAM executor compactions run on, read once at the open; any other executor and none keep the defaults.
-- The `_collections` and `_names` system collections live under two UUIDs no UUIDv7 spells, which every call refuses as unknown, as it does the nil UUID; every other collection carries the UUIDv7 its create minted.
+- The `_collections` and `_names` system collections live under two UUIDs no UUIDv7 spells, which every call refuses as unknown, as it does the nil UUID; every other collection holds the UUIDv7 its create minted.
 - A read measures a key and copies its value into the call's scratch, measuring again when the value changed its width in between.
 - A scan, a sample and a measurement walk one collection's runs and memory runs under the database's claim, binary-searching each run for the start key, and merge a transaction's own writes over them; a descending scan walks its range ascending and keeps the last keys of the page.
 - A range removal of blobs, documents, whole pages, graph vertices or strings is one range tombstone per range in the commit, a range of strings bounded by whole strings and reaching past the last one for an empty end.
@@ -153,7 +153,7 @@ The host and GPU compactors share one comparator, survival rule, sorted run spli
 The GPU compactors, `cuda_compactor_t` on NVIDIA, `hip_compactor_t` on AMD and `metal_compactor_t` on Apple, each over its vendor's executor, launch three kernels of the library's bundle per merge, ranking, packing and placing, link no CUDA, HIP or Metal runtime, CUB or Thrust, take their devices, streams and buffers from `include/ustore/utilities/vram_nvidia_device.hpp`, `vram_amd_device.hpp` and `vram_apple_device.hpp`, and are chosen once a device is present and a merge exceeds `cuda_compaction_threshold_k`, 900,000 key slots.
 An NVIDIA device reads run sections by extent through cuFile where GPUDirect Storage allows it, and AMD and Apple devices upload them from the runs' memory.
 Metal has no 64-bit atomics, so where CUDA and HIP pack the survivors and write the folded adjacency in one chained scan, an Apple device runs the select of `src/vram/vram_kernels_apple.metal` first, and sorts a graph chain of at most 4096 records in its 32 KiB of threadgroup memory, folding longer ones on the host.
-GPU compaction is part of v1 and runs on both Hopper and Blackwell; the AMD bundle carries the same kernels for CDNA and the Apple bundle for Apple7 and later, both untested on hardware.
+GPU compaction is part of v1 and runs on both Hopper and Blackwell; the AMD bundle holds the same kernels for CDNA and the Apple bundle for Apple7 and later, both untested on hardware.
 
 ## Storage I/O
 

@@ -51,4 +51,23 @@ func TestDocumentsGatherIntoColumns(t *testing.T) {
 	if scalars := ustore.DocsColumnScalars[uint64](years); scalars[0] != 2009 || scalars[1] != 1997 {
 		t.Fatalf("gathered %v", scalars)
 	}
+	cursor, err := database.DocsCursorInit(movies, ustore.Key{}, &ustore.DocsCursorConfig{Fields: ustore.TapeOf("year"), ColumnsTypes: []ustore.DocsFieldType{ustore.DocsFieldTypeU64}})
+	if err != nil {
+		t.Fatalf("the cursor must open: %v", err)
+	}
+	defer cursor.Close()
+	batches, err := cursor.Next(8, arena)
+	if err != nil {
+		t.Fatalf("the cursor must pull: %v", err)
+	}
+	rows := uint(0)
+	for index := uint(0); index != batches.Len(); index++ {
+		if columns := batches.Columns(index); columns.Len() != 1 || columns.Column(0).Len() != uint(len(batches.Keys(index))) {
+			t.Fatal("a batch holds one column of its own row count")
+		}
+		rows += uint(len(batches.Keys(index)))
+	}
+	if rows != 2 {
+		t.Fatalf("the cursor pulled %d rows of 2", rows)
+	}
 }

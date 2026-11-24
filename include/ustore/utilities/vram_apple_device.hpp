@@ -16,8 +16,8 @@
  *  unified Metal allocator, which StringZilla's own device engines read too, and the address the
  *  host hands around is its host address. A launch binds the kernel's arguments packed as one
  *  struct and the device's table of live blocks, which turns every host address the arguments
- *  carry, embedded ones included, into a device one. The layer reaching that allocator and its
- *  registry compiles where StringZilla's Metal kernels do, @c STRINGZILLA_TARGET_METAL, and every
+ *  hold, embedded ones included, into a device one. The layer reaching that allocator and its
+ *  registry compiles where the unit holds Apple executors, @c USTORE_ARCH_METAL_, and every
  *  other build refuses Apple executors with @c device_k.
  */
 
@@ -32,10 +32,19 @@
 
 #include <stringzilla/metal.h> // `sz_allocator_init_unified_metal`, `sz_stream_synchronize_metal`
 
-#include "ustore/utilities/blocking_files.hpp"  // `shared_library_t`
-#include "ustore/utilities/ram_buffers.hpp"     // `managed_blocks_t`, `free_blocks`, `host_blocks_t`
-#include "ustore/utilities/types.hpp"           // `gpu_device_t`, `expected`, `status_t`
-#include "ustore/utilities/vram_apple_shared.h" // `metal_arguments_slot_k`, `metal_simdgroup_width_k`
+#include "ustore/utilities/blocking_files.hpp"    // `shared_library_t`
+#include "ustore/utilities/ram_buffers.hpp"       // `managed_blocks_t`, `free_blocks`, `host_blocks_t`
+#include "ustore/utilities/types.hpp"             // `gpu_device_t`, `expected`, `status_t`
+#include "ustore/utilities/vram_apple_shared.hpp" // `metal_arguments_slot_k`, `metal_simdgroup_width_k`
+
+/** Whether this unit holds Apple executors, which CMake sets beside StringZilla's Metal switch,
+ *  since the toolchain alone cannot tell such a unit from one that only sees them. */
+#if !defined(USTORE_ARCH_METAL_)
+#define USTORE_ARCH_METAL_ 0
+#endif
+#if USTORE_ARCH_METAL_ && !STRINGZILLA_TARGET_METAL
+#error "USTORE_ARCH_METAL_ needs StringZilla's Metal layer, which the Apple executor calls"
+#endif
 
 namespace unum::ustore::utilities {
 
@@ -304,7 +313,7 @@ class metal_module_t {
 
 #pragma region Metal Layer
 
-#if STRINGZILLA_TARGET_METAL
+#if USTORE_ARCH_METAL_
 
 /** Shared storage of @p bytes on the device of @p queue, an @c id<MTLCommandQueue>, from
  *  StringZilla's unified allocator, answering its host address, or null on exhaustion. */
@@ -409,7 +418,7 @@ inline status_t metal_dispatch(void*, metal_function_handle_t, std::span<byte_t 
     return {status_code_t::device_k, "The library compiled no Metal layer"};
 }
 
-#endif // STRINGZILLA_TARGET_METAL
+#endif // USTORE_ARCH_METAL_
 
 /** Frees every run of @p blocks, an arena on an Apple device, as an arena outliving its executor is
  *  freed; the work still queued on a run keeps it alive until it finishes. */
@@ -422,6 +431,41 @@ inline void free_metal_blocks(device_blocks_t& blocks) noexcept {
 
 template <typename module_type_>
 struct kernel_table;
+
+/** An @c id<MTLCommandQueue> on one device, created by @c open and released with this owner once
+ *  everything committed to it ran. */
+class metal_stream_t {
+  public:
+    metal_stream_t() noexcept = default;
+    metal_stream_t(metal_stream_t&& other) noexcept
+        : api_(other.api_), handle_(std::exchange(other.handle_, nullptr)) {}
+    metal_stream_t& operator=(metal_stream_t&& other) noexcept {
+        std::swap(api_, other.api_), std::swap(handle_, other.handle_);
+        return *this;
+    }
+    metal_stream_t(metal_stream_t const&) = delete;
+    metal_stream_t& operator=(metal_stream_t const&) = delete;
+    ~metal_stream_t() noexcept {
+        if (!handle_) return;
+        metal_synchronize(handle_);
+        metal_send<void>(*api_, handle_, "release");
+    }
+
+    /** Creates a queue through @p api, which outlives it, on @p device, an @c id<MTLDevice>. */
+    static expected<metal_stream_t> open(metal_api_t const& api, void* device) noexcept {
+        metal_stream_t stream;
+        stream.api_ = &api;
+        stream.handle_ = metal_send(api, device, "newCommandQueue");
+        if (!stream.handle_) return status_t {status_code_t::device_k, "Metal refused a command queue"};
+        return stream;
+    }
+
+    operator void*() const noexcept { return handle_; }
+
+  private:
+    metal_api_t const* api_ = nullptr;
+    void* handle_ = nullptr;
+};
 
 /** The queue every call on one Apple device commits to, the device's class, and the ceiling on
  *  the scratch those calls walk with. Work is committed, never waited on but by @c wait, so one
@@ -438,27 +482,23 @@ class metal_executor_t {
     using function_t = metal_function_handle_t;
 
     /** Binds @p device, as the Metal listing reports it, @p handle its @c id<MTLDevice>, and
-     *  commits to @p borrowed, an @c id<MTLCommandQueue> of the caller's on that device which
-     *  outlives the executor, or to one of its own for null; its scratch never grows past
-     *  @p scratch_limit bytes, zero for no limit, and its launches find their kernels in
-     *  @p kernels, the device's table of the library's bundle, or none for null. */
+     *  commits to a queue of its own, created here and released with the executor; its scratch
+     *  never grows past @p scratch_limit bytes, zero for no limit, and its launches find their
+     *  kernels in @p kernels, the device's table of the library's bundle, or none for null. */
     static expected<metal_executor_t> spawn(metal_api_t const& api, void* handle, gpu_device_t const& device,
-                                            void* borrowed, std::size_t scratch_limit,
+                                            std::size_t scratch_limit,
                                             kernel_table<metal_module_t> const* kernels = nullptr) noexcept {
         if (!api || !handle) return status_t {status_code_t::device_k, "Metal refused the device"};
-        if constexpr (!STRINGZILLA_TARGET_METAL)
+        if constexpr (!USTORE_ARCH_METAL_)
             return status_t {status_code_t::device_k, "The library compiled no Metal layer"};
         metal_executor_t executor;
         executor.api_ = &api;
         executor.device_ = device;
         executor.scratch_limit_ = scratch_limit;
         executor.kernels_ = kernels;
-        executor.queue_ = borrowed;
-        if (!borrowed) {
-            executor.owned_queue_ = metal_send(api, handle, "newCommandQueue");
-            if (!executor.owned_queue_) return status_t {status_code_t::device_k, "The device gave no command queue"};
-            executor.queue_ = executor.owned_queue_;
-        }
+        auto [stream, stream_status] = metal_stream_t::open(api, handle);
+        if (stream_status.failed()) return stream_status;
+        executor.stream_ = std::move(stream);
         executor.bounce_.memory = host_blocks_t {.newest = nullptr, .memory_domain = 0};
         return executor;
     }
@@ -474,16 +514,15 @@ class metal_executor_t {
     metal_executor_t& operator=(metal_executor_t const&) = delete;
     ~metal_executor_t() noexcept {
         if (!api_) return;
-        metal_synchronize(queue_);
+        metal_synchronize(stream_);
         free_blocks(managed_.blocks, [this](std::uintptr_t address) noexcept { free_managed(address); });
         arena_free_blocks(bounce_);
-        if (owned_queue_) metal_send<void>(*api_, owned_queue_, "release");
     }
 
     /** Waits until everything committed to the queue ran, reporting a failure among it
      *  as @c device_k. */
     status_t wait() noexcept {
-        if (!metal_synchronize(queue_)) return {status_code_t::device_k, "A device call on the executor failed"};
+        if (!metal_synchronize(stream_)) return {status_code_t::device_k, "A device call on the executor failed"};
         return {};
     }
 
@@ -493,8 +532,8 @@ class metal_executor_t {
     /** Bytes of scratch a call may take, zero for no limit. */
     std::size_t scratch_limit() const noexcept { return scratch_limit_; }
 
-    /** The @c id<MTLCommandQueue> every call commits to, owned or borrowed. */
-    void* stream() const noexcept { return queue_; }
+    /** The @c id<MTLCommandQueue> every call commits to, the executor's own. */
+    void* stream() const noexcept { return stream_; }
 
     /** The runtime table every call goes through. */
     metal_api_t const& api() const noexcept { return *api_; }
@@ -511,14 +550,14 @@ class metal_executor_t {
 
     /** Allocates @p bytes of shared storage on the device, answering its host address. */
     expected<std::uintptr_t> allocate_async(std::size_t bytes) noexcept {
-        void* const address = metal_allocate_shared(queue_, bytes);
+        void* const address = metal_allocate_shared(stream_, bytes);
         if (!address) return status_t {status_code_t::out_of_memory_k, "The device refused an allocation"};
         return reinterpret_cast<std::uintptr_t>(address);
     }
 
     /** Releases @p address, which @c allocate_async answered; the work still queued on it
      *  keeps it alive. */
-    void free_async(std::uintptr_t address) noexcept { metal_free_shared(queue_, reinterpret_cast<void*>(address)); }
+    void free_async(std::uintptr_t address) noexcept { metal_free_shared(stream_, reinterpret_cast<void*>(address)); }
 
     /** Allocates @p bytes the host and the device both reach, which every block on Apple is. */
     expected<std::uintptr_t> allocate_managed(std::size_t bytes) noexcept { return allocate_async(bytes); }
@@ -569,17 +608,14 @@ class metal_executor_t {
 
   private:
     void swap(metal_executor_t& other) noexcept {
-        std::swap(api_, other.api_), std::swap(owned_queue_, other.owned_queue_), std::swap(queue_, other.queue_);
+        std::swap(api_, other.api_), std::swap(stream_, other.stream_);
         std::swap(device_, other.device_), std::swap(scratch_limit_, other.scratch_limit_);
         std::swap(kernels_, other.kernels_), std::swap(bounce_, other.bounce_), std::swap(managed_, other.managed_);
     }
 
     metal_api_t const* api_ = nullptr;
 
-    /** The queue made here and released with the executor, null when the caller lent @c queue_. */
-    void* owned_queue_ = nullptr;
-
-    void* queue_ = nullptr;
+    metal_stream_t stream_;
     gpu_device_t device_ {};
     std::size_t scratch_limit_ = 0;
     kernel_table<metal_module_t> const* kernels_ = nullptr;

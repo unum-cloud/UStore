@@ -35,7 +35,7 @@ using utilities::resource_constraint;
 enum class lsm_level_order_t : std::uint8_t {
 
     /** Runs written by flushes, which overlap, so the youngest run holding a key
-     *  carries its value. */
+     *  holds its value. */
     overlapping_k,
 
     /** Runs written by a merge, which are disjoint and ascending, so at most one run
@@ -78,7 +78,7 @@ struct lsm_level_position_t {
  *  a handle reads only its record, which its holder keeps alive. Every byte of the records is
  *  charged to the budget the pool was made with.
  *
- *  @tparam record_type_ What a record holds, whose move assignment carries its payload and
+ *  @tparam record_type_ What a record holds, whose move assignment holds its payload and
  *      keeps its generation and any list links, so a taken record is filled and a vacated one
  *      emptied in place.
  *  @tparam index_type_ Names a record, and is the width of its generation.
@@ -367,10 +367,9 @@ class lsm_level {
         return {};
     }
 
-    /** Names every run @p other names but those @p skipped lists, in the order @p other holds
-     *  them, which is how a prepared level set carries a level a merge leaves alone or
-     *  consumes in part. */
-    status_t carry(lsm_level const& other, std::span<run_handle_t const> skipped) noexcept {
+    /** Names every run @p other names but those @p skipped lists, in the order @p other holds them,
+     *  which is how a prepared level set holds a level a merge leaves alone or consumes in part. */
+    status_t inherit_runs(lsm_level const& other, std::span<run_handle_t const> skipped) noexcept {
         if (runs_.reserve(runs_.size() + other.runs_.size()) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A level could not name that many runs"};
         for (std::size_t index = 0; index != other.runs_.size(); ++index) {
@@ -427,7 +426,7 @@ class lsm_level {
     /** Bytes every run of the level takes on its volume. */
     [[nodiscard]] std::uint64_t size_bytes() const noexcept { return size_bytes_; }
 
-    /** Range tombstones all runs of the level carry; a read skips them when there are none. */
+    /** Range tombstones all runs of the level hold; a read skips them when there are none. */
     [[nodiscard]] std::uint64_t range_tombstones_count() const noexcept { return range_tombstones_count_; }
 
     /** The least key any run of the level holds, or the greatest key of the type for
@@ -449,7 +448,7 @@ class lsm_level {
 #pragma region Lookups
 
     /**
-     *  @brief Whether the level carries @p stored_key, and whether the key slot holding it
+     *  @brief Whether the level holds @p stored_key, and whether the key slot holding it
      *      locates a value.
      *  @param[in] stored_key The key to look for.
      *  @param[out] position Where the key sits, which is meaningless when the answer
@@ -478,26 +477,26 @@ class lsm_level {
             return lookup_result_t::missing_k;
         }
 
+        std::size_t const index = run_holding_key(stored_key);
+        if (index == runs_.size() || stored_key < run_at_(index).lower_stored_key()) return lookup_result_t::missing_k;
+        std::uint64_t at = 0;
+        lookup_result_t const found = run_at_(index).find(stored_key, stamp, at);
+        if (found != lookup_result_t::missing_k)
+            position = lsm_level_position_t {static_cast<std::uint32_t>(index), at};
+        return found;
+    }
+
+    /** The first run of a sorted level whose keys do not all order below @p stored_key, which is
+     *  the only run that may hold it, or @c size when every run orders below it. */
+    [[nodiscard]] std::size_t run_holding_key(stored_key_t stored_key) const noexcept {
         std::size_t low = 0;
         std::size_t high = runs_.size();
         while (low != high) {
             std::size_t const middle = low + (high - low) / 2;
-            sorted_run_t const& run = run_at_(middle);
-            if (run.upper_stored_key() < stored_key) {
-                low = middle + 1;
-                continue;
-            }
-            if (stored_key < run.lower_stored_key()) {
-                high = middle;
-                continue;
-            }
-            std::uint64_t at = 0;
-            lookup_result_t const found = run.find(stored_key, stamp, at);
-            if (found != lookup_result_t::missing_k)
-                position = lsm_level_position_t {static_cast<std::uint32_t>(middle), at};
-            return found;
+            if (run_at_(middle).upper_stored_key() < stored_key) low = middle + 1;
+            else high = middle;
         }
-        return lookup_result_t::missing_k;
+        return low;
     }
 
     /** The key slot at @p position, which must have come from a @c find that answered
@@ -516,7 +515,7 @@ class lsm_level {
      *      order of keys.
      *
      *  @note An overlapping level reports one position per key, the youngest run's, and skips the
-     *      versions the older runs still carry; a sorted level walks its runs one after another.
+     *      versions the older runs still hold; a sorted level walks its runs one after another.
      */
     template <typename visitor_type_>
     status_t for_each_key_slot(visitor_type_&& visitor) const noexcept {
@@ -600,7 +599,7 @@ class lsm_level {
     /** The greatest key any run holds. */
     stored_key_t upper_ = limit<stored_key_t>::min_k;
 
-    /** Range tombstones every run carries, kept as runs are named rather than recounted. */
+    /** Range tombstones every run holds, kept as runs are named rather than recounted. */
     std::uint64_t range_tombstones_count_ = 0;
 
 #pragma endregion Private Members

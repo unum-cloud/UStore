@@ -40,7 +40,7 @@ using store_status_t = st::status_t;
 /** The isolation level a store instantiation promises. */
 using isolation_t = st::isolation_t;
 
-/** Whether a walk carries on after an element. */
+/** Whether a walk continues after an element. */
 using walk_control_t = st::walk_control_t;
 
 /** Whether a transaction's writes sit in the store, invisible. */

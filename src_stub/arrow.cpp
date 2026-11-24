@@ -24,7 +24,7 @@ std::string_view format_of(ArrowSchema const* schema, ArrowArray const* array) n
     return schema->format;
 }
 
-/** Refuses a column of the right format that is dictionary-encoded, holds a null, or carries
+/** Refuses a column of the right format that is dictionary-encoded, holds a null, or holds
  *  fewer than @p buffers buffers, reading only its lengths and pointers. */
 ustore_status_t check_column(ArrowSchema const& schema, ArrowArray const& array, std::int64_t buffers) noexcept {
     if (schema.dictionary || array.dictionary) return ustore_status_unsupported_k;

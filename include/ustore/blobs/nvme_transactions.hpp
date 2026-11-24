@@ -3,7 +3,7 @@
  *  @author Ash Vardanian
  *  @date July 10, 2023
  *  @brief The transaction machinery every NVMe database composes: the deltas and read sets one
- *      transaction carries, the registry that orders and conflict-checks the transactions of one
+ *      transaction holds, the registry that orders and conflict-checks the transactions of one
  *      store, and the core of one transaction.
  *
  *  Transactions are optimistic. Writes go to deltas of the transaction's own and reach the store
@@ -12,7 +12,7 @@
  *  watch is scoped from that stamp or later, never from one a commit drew before landing it. There
  *  is no table of conflicts: every write lands in a collection under its commit's stamp, so a
  *  stage asks the store whether a commit newer than the watch wrote the key, and the store answers
- *  from its memory runs and from the runs that carry the key. A written key's watch lives beside
+ *  from its memory runs and from the runs that hold the key. A written key's watch lives beside
  *  its write, the read set holds the keys read or tracked, and the one exclusion is the ledger's
  *  leader word, which a staged transaction holds from @c stage until @c commit. Every collection a
  *  commit writes is sealed into a memory run before its stamp is drawn, so a commit lands whole or
@@ -53,6 +53,7 @@ namespace unum::ustore::blobs {
 
 using utilities::constrained_allocator;
 using utilities::notifier;
+using utilities::nvme_queues_ref_t;
 using utilities::resources_shared_ptr;
 
 #pragma region Transaction Deltas
@@ -179,10 +180,10 @@ class transaction_deltas {
     /** The bytes a landed commit takes over with the buffer: every written byte when one collection
      *  holds them and they fill half the buffer or more, so a run holds at most twice the bytes its
      *  memory bounds count, or none, which the seal copies. */
-    [[nodiscard]] std::span<byte_t const> lendable_bytes() const noexcept {
-        bool const lends = collections_by_id.size() == 1 && 2 * next_inserted_offset >= insertions_buffer.size();
-        return lends ? std::span<byte_t const> {insertions_buffer}.first(next_inserted_offset)
-                     : std::span<byte_t const> {};
+    [[nodiscard]] std::span<byte_t const> adoptable_bytes() const noexcept {
+        bool const adoptable = collections_by_id.size() == 1 && 2 * next_inserted_offset >= insertions_buffer.size();
+        return adoptable ? std::span<byte_t const> {insertions_buffer}.first(next_inserted_offset)
+                         : std::span<byte_t const> {};
     }
     inline std::size_t count() const noexcept { return elements_count_; }
 
@@ -1092,7 +1093,7 @@ struct transaction_share_t {
     void (*forget)(void* context) noexcept = nullptr;
 };
 
-/** Everything one transaction carries between its start and its commit. */
+/** Everything one transaction holds between its start and its commit. */
 template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
           typename row_kit_type_ = st::native_row_kit_t>
 struct transaction_state {
@@ -1240,17 +1241,17 @@ concept transaction_store_concept = requires(
     store_type_& store, collection_id_t collection_id, stored_key_type_ stored_key,
     transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_> const& deltas,
     sealed_commit<stored_key_type_, atomic_reference_, row_kit_type_>& sealed, memory_run_claim_t& claimed,
-    transaction_stamp_t stamp) {
+    transaction_stamp_t stamp, nvme_queues_ref_t queues) {
     { store.ledger() } -> std::same_as<commit_ledger<atomic_reference_, waiter_type_>&>;
     { store.written_since(collection_id, stored_key, stamp) } -> std::same_as<bool>;
     { store.range_written_since(collection_id, stored_key, stored_key, stamp) } -> std::same_as<bool>;
     { store.replaced_since(collection_id, stored_key, stamp) } -> std::same_as<bool>;
-    { store.seal_collection(collection_id, deltas, sealed) } -> std::same_as<status_t>;
-    { store.claim_memory_record(collection_id, claimed) } -> std::same_as<status_t>;
+    { store.seal_collection(collection_id, deltas, sealed, queues) } -> std::same_as<status_t>;
+    { store.claim_memory_record(collection_id, claimed, queues) } -> std::same_as<status_t>;
     { store.prepare_collection(collection_id, sealed, std::move(claimed)) } -> std::same_as<status_t>;
     { store.publish_collection(collection_id, sealed, stamp) } -> std::same_as<void>;
     { store.forget_collection(collection_id) } -> std::same_as<void>;
-    { store.maintain(collection_id) } -> std::same_as<status_t>;
+    { store.maintain(collection_id, queues) } -> std::same_as<status_t>;
 };
 
 #pragma endregion Store Interface
@@ -1270,7 +1271,7 @@ class transaction_core;
  *
  *  Nothing here is shared state of its own: the stamps come from the store's ledger, and a conflict
  *  is a key the store says was written since the watch, read from the memory runs and the runs that
- *  carry the key.
+ *  hold the key.
  */
 template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
           typename waiter_type_, typename row_kit_type_ = st::native_row_kit_t>
@@ -1328,15 +1329,16 @@ class transaction_registry {
         transaction_stamp_t start_stamp = invalid_transaction_stamp_k;
     };
 
-    inline status_t stage_(transaction_state_t& data, transaction_stamp_t start_stamp,
-                           transaction_stamp_t& stage_stamp) noexcept;
-    inline transaction_stamp_t commit_staged_(transaction_state_t& data) noexcept;
-    inline expected<transaction_stamp_t> commit_(transaction_state_t& data, transaction_stamp_t start_stamp) noexcept;
+    inline status_t stage_(transaction_state_t& data, transaction_stamp_t start_stamp, transaction_stamp_t& stage_stamp,
+                           nvme_queues_ref_t queues) noexcept;
+    inline transaction_stamp_t commit_staged_(transaction_state_t& data, nvme_queues_ref_t queues) noexcept;
+    inline expected<transaction_stamp_t> commit_(transaction_state_t& data, transaction_stamp_t start_stamp,
+                                                 nvme_queues_ref_t queues) noexcept;
     inline void discard_(transaction_state_t& data) noexcept;
-    inline status_t seal_(transaction_state_t& data) noexcept;
+    inline status_t seal_(transaction_state_t& data, nvme_queues_ref_t queues) noexcept;
     inline status_t prepare_(transaction_state_t& data, transaction_stamp_t start_stamp) noexcept;
     inline void forget_(transaction_state_t& data, std::size_t prepared) noexcept;
-    inline void maintain_(transaction_state_t& data) noexcept;
+    inline void maintain_(transaction_state_t& data, nvme_queues_ref_t queues) noexcept;
     static inline status_t prepare_commit_(void* context) noexcept;
     static inline void publish_commit_(void* context, transaction_stamp_t stamp) noexcept;
 
@@ -1395,11 +1397,12 @@ template <typename stored_key_type_, typename store_type_, template <typename> t
           typename waiter_type_, typename row_kit_type_>
 inline status_t transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_,
                                      row_kit_type_>::stage_(transaction_state_t& data, transaction_stamp_t start_stamp,
-                                                            transaction_stamp_t& stage_stamp) noexcept {
+                                                            transaction_stamp_t& stage_stamp,
+                                                            nvme_queues_ref_t queues) noexcept {
 
     // Sealed and claimed before the leader word is taken, so the sort, the copy and any flush hold
     // up no other committer.
-    if (status_t const sealed = seal_(data); sealed.failed()) return sealed;
+    if (status_t const sealed = seal_(data, queues); sealed.failed()) return sealed;
     store_->ledger().lead();
     stage_stamp = current_stamp_();
     status_t const prepared = prepare_(data, start_stamp);
@@ -1412,7 +1415,8 @@ inline status_t transaction_registry<stored_key_type_, store_type_, atomic_refer
 template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
           typename waiter_type_, typename row_kit_type_>
 inline transaction_stamp_t transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_,
-                                                row_kit_type_>::commit_staged_(transaction_state_t& data) noexcept {
+                                                row_kit_type_>::commit_staged_(transaction_state_t& data,
+                                                                               nvme_queues_ref_t queues) noexcept {
 
     // The stage prepared every collection's view, so from the stamp on nothing can fail.
     commit_t committing {this, &data, invalid_transaction_stamp_k};
@@ -1420,7 +1424,7 @@ inline transaction_stamp_t transaction_registry<stored_key_type_, store_type_, a
     request.context = &committing;
     request.publish = &publish_commit_;
     transaction_stamp_t const commit_stamp = store_->ledger().commit_leading(request);
-    maintain_(data);
+    maintain_(data, queues);
     data.sealed.clear();
     return commit_stamp;
 }
@@ -1429,9 +1433,9 @@ template <typename stored_key_type_, typename store_type_, template <typename> t
           typename waiter_type_, typename row_kit_type_>
 inline expected<transaction_stamp_t>
 transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_, row_kit_type_>::commit_(
-    transaction_state_t& data, transaction_stamp_t start_stamp) noexcept {
+    transaction_state_t& data, transaction_stamp_t start_stamp, nvme_queues_ref_t queues) noexcept {
 
-    if (status_t const sealed = seal_(data); sealed.failed()) return sealed;
+    if (status_t const sealed = seal_(data, queues); sealed.failed()) return sealed;
     // Even a commit that wrote nothing draws a stamp, so every commit has a place of its own
     // in the order.
     commit_t committing {this, &data, start_stamp};
@@ -1440,7 +1444,7 @@ transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_ty
     request.prepare = &prepare_commit_;
     request.publish = &publish_commit_;
     auto const [committed, status] = store_->ledger().submit(request);
-    if (!status.failed()) maintain_(data);
+    if (!status.failed()) maintain_(data, queues);
     data.sealed.clear();
     if (status.failed()) return status;
     return committed;
@@ -1461,7 +1465,8 @@ inline void transaction_registry<stored_key_type_, store_type_, atomic_reference
 template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
           typename waiter_type_, typename row_kit_type_>
 inline status_t transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_,
-                                     row_kit_type_>::seal_(transaction_state_t& data) noexcept {
+                                     row_kit_type_>::seal_(transaction_state_t& data,
+                                                           nvme_queues_ref_t queues) noexcept {
     data.sealed.clear();
     if (data.sealed.reserve(data.deltas.collections_by_id.size()) != st::status_t::success_k)
         return status_t {status_code_t::out_of_memory_k, "No room to seal a commit"};
@@ -1470,12 +1475,12 @@ inline status_t transaction_registry<stored_key_type_, store_type_, atomic_refer
         if (status.failed()) return;
         typename transaction_state_t::sealed_collection_t sealed;
         sealed.id = collection.id;
-        status = store_->seal_collection(collection.id, data.deltas, sealed.commit);
+        status = store_->seal_collection(collection.id, data.deltas, sealed.commit, queues);
         // Claimed before the leader word, waiting on a flush when every record is out, so the
         // commit cannot be refused one; a flush never needs a record, so holding this claim while
         // waiting for the next cannot deadlock.
         if (status.succeeded() && !sealed.commit.empty())
-            status = store_->claim_memory_record(collection.id, sealed.record);
+            status = store_->claim_memory_record(collection.id, sealed.record, queues);
         if (status.succeeded()) [[maybe_unused]]
             st::status_t const kept = data.sealed.push_back(st::assume_reserved, std::move(sealed));
     });
@@ -1526,9 +1531,10 @@ inline void transaction_registry<stored_key_type_, store_type_, atomic_reference
 template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
           typename waiter_type_, typename row_kit_type_>
 inline void transaction_registry<stored_key_type_, store_type_, atomic_reference_, waiter_type_,
-                                 row_kit_type_>::maintain_(transaction_state_t& data) noexcept {
+                                 row_kit_type_>::maintain_(transaction_state_t& data,
+                                                           nvme_queues_ref_t queues) noexcept {
     for (auto const& sealed : data.sealed) [[maybe_unused]]
-        status_t const maintained = store_->maintain(sealed.id);
+        status_t const maintained = store_->maintain(sealed.id, queues);
 }
 
 template <typename stored_key_type_, typename store_type_, template <typename> typename atomic_reference_,
@@ -1651,7 +1657,7 @@ class transaction_core {
     /** The store every committed write of this transaction lands in. */
     using store_t = typename registry_t::store_t;
 
-    /** The uncommitted writes and the watched keys this transaction carries. */
+    /** The uncommitted writes and the watched keys this transaction holds. */
     using state_t = typename registry_t::transaction_state_t;
 
     /** The uncommitted deltas alone, filed under the collection they belong to. */
@@ -1706,12 +1712,12 @@ class transaction_core {
      *
      *  A failure keeps the changes, so a caller can still log what it could not stage, and a
      *  success holds the leader word until @c commit or @c rollback hands it back; readers never
-     *  wait for it, later committers do.
+     *  wait for it, later committers do. A flush the seal needs runs on the thread of @p queues.
      */
-    status_t stage() noexcept {
+    status_t stage(nvme_queues_ref_t queues = {}) noexcept {
         if (phase_ != phase_t::started_k) return {status_code_t::invalid_argument_k, "That transaction is staged"};
         transaction_stamp_t staged_stamp = invalid_transaction_stamp_k;
-        status_t const staged = registry_.stage_(data_, start_stamp_, staged_stamp);
+        status_t const staged = registry_.stage_(data_, start_stamp_, staged_stamp, queues);
         if (staged.succeeded()) {
             last_stage_stamp_ = staged_stamp;
             phase_ = phase_t::staged_k;
@@ -1724,12 +1730,13 @@ class transaction_core {
      *      already holds the leader word, and returns once its stamp is published.
      *
      *  @note Nothing is held on return, and only a success clears the changes and the watches and
-     *      starts the transaction again.
+     *      starts the transaction again. A flush or a merge the commit pays for runs on the
+     *      thread of @p queues, as every maintenance a commit leaves due does.
      */
-    status_t commit() noexcept {
-        if (phase_ == phase_t::staged_k) last_try_to_commit_stamp_ = registry_.commit_staged_(data_);
+    status_t commit(nvme_queues_ref_t queues = {}) noexcept {
+        if (phase_ == phase_t::staged_k) last_try_to_commit_stamp_ = registry_.commit_staged_(data_, queues);
         else {
-            auto [committed, commit_status] = registry_.commit_(data_, start_stamp_);
+            auto [committed, commit_status] = registry_.commit_(data_, start_stamp_, queues);
             if (commit_status.failed()) {
                 last_try_to_commit_stamp_ = registry_.current_stamp_();
                 return commit_status;
@@ -1916,7 +1923,7 @@ class transaction_core {
      *  ledger's leader word. */
     [[nodiscard]] bool started() const noexcept { return phase_ == phase_t::started_k; }
 
-    /** The writes and the watches this transaction carries, which a read of it also fills. */
+    /** The writes and the watches this transaction holds, which a read of it also fills. */
     [[nodiscard]] state_t& state() noexcept { return data_; }
     [[nodiscard]] state_t const& state() const noexcept { return data_; }
 
@@ -1929,7 +1936,7 @@ class transaction_core {
 
 #pragma region Private Methods
 
-    /** Clears what a landed commit carried and starts again at the stamp it published. */
+    /** Clears what a landed commit held and starts again at the stamp it published. */
     void restart_() noexcept {
         phase_ = phase_t::started_k;
         last_stage_stamp_ = last_try_to_commit_stamp_;
@@ -1946,7 +1953,7 @@ class transaction_core {
     /** The registry that orders this transaction and checks its watches, outliving it. */
     registry_t& registry_;
 
-    /** The writes and the watches this transaction carries. */
+    /** The writes and the watches this transaction holds. */
     state_t data_;
 
     /** The start stamp, pinned so the history this transaction reads at stays kept. */

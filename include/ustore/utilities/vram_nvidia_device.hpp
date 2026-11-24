@@ -55,8 +55,8 @@ enum cuda_device_attribute_t : int {
     cuda_attribute_host_numa_id_k = 134,
 };
 
-/** The flags UStore passes, @c CU_STREAM_NON_BLOCKING, @c CU_EVENT_BLOCKING_SYNC and @c CU_EVENT_DISABLE_TIMING, and
- *  the @c CUpointer_attribute values it reads. */
+/** The flags UStore passes, @c CU_STREAM_NON_BLOCKING, @c CU_EVENT_BLOCKING_SYNC and
+ *  @c CU_EVENT_DISABLE_TIMING, and the @c CUpointer_attribute values it reads. */
 inline constexpr unsigned cuda_stream_non_blocking_k = 1;
 inline constexpr unsigned cuda_event_blocking_sync_k = 1;
 inline constexpr unsigned cuda_event_disable_timing_k = 2;
@@ -250,6 +250,38 @@ class cuda_event_t {
     cuda_event_handle_t handle_ = nullptr;
 };
 
+/** A non-blocking stream in the context current at its creation, created by @c open and destroyed
+ *  with this owner once everything queued on it ran. */
+class cuda_stream_t {
+  public:
+    cuda_stream_t() noexcept = default;
+    cuda_stream_t(cuda_stream_t&& other) noexcept : api_(other.api_), handle_(std::exchange(other.handle_, nullptr)) {}
+    cuda_stream_t& operator=(cuda_stream_t&& other) noexcept {
+        std::swap(api_, other.api_), std::swap(handle_, other.handle_);
+        return *this;
+    }
+    cuda_stream_t(cuda_stream_t const&) = delete;
+    cuda_stream_t& operator=(cuda_stream_t const&) = delete;
+    ~cuda_stream_t() noexcept {
+        if (handle_) api_->stream_synchronize(handle_), api_->stream_destroy(handle_);
+    }
+
+    /** Creates a stream through @p api, which outlives it, in the current context. */
+    static expected<cuda_stream_t> open(cuda_api_t const& api) noexcept {
+        cuda_stream_t stream;
+        stream.api_ = &api;
+        if (api.stream_create(&stream.handle_, cuda_stream_non_blocking_k) != cuda_success_k)
+            return status_t {status_code_t::device_k, "Driver refused a stream"};
+        return stream;
+    }
+
+    operator cuda_stream_handle_t() const noexcept { return handle_; }
+
+  private:
+    cuda_api_t const* api_ = nullptr;
+    cuda_stream_handle_t handle_ = nullptr;
+};
+
 /** One fatbin loaded into one device's primary context and unloaded with this owner; kernels are found by name. */
 class cuda_module_t {
   public:
@@ -312,14 +344,12 @@ class cuda_executor_t {
     using function_t = cuda_function_handle_t;
 
     /** Binds @p device, as the CUDA listing reports it, through @p context, its retained primary
-     *  context, and queues on @p borrowed, a @c cudaStream_t of the caller's on that device which
-     *  outlives the executor, or on one of its own for null; its scratch never grows past
-     *  @p scratch_limit bytes, zero for no limit, bytes move between the drives and the device as
-     *  @p gds asks, and its launches find their kernels in @p kernels, the device's table of the
-     *  library's bundle, or none for null. */
+     *  context, and queues on a stream of its own, created here and destroyed with the executor;
+     *  its scratch never grows past @p scratch_limit bytes, zero for no limit, bytes move between
+     *  the drives and the device as @p gds asks, and its launches find their kernels in @p kernels,
+     *  the device's table of the library's bundle, or none for null. */
     static expected<cuda_executor_t> spawn(cuda_api_t const& api, cuda_context_handle_t context,
-                                           gpu_device_t const& device, void* borrowed, std::size_t scratch_limit,
-                                           ustore_gds_t gds,
+                                           gpu_device_t const& device, std::size_t scratch_limit, ustore_gds_t gds,
                                            kernel_table<cuda_module_t> const* kernels = nullptr) noexcept {
         if (!api || !context || api.set_current_context(context) != cuda_success_k)
             return status_t {status_code_t::device_k, "The CUDA driver refused the device"};
@@ -330,12 +360,9 @@ class cuda_executor_t {
         executor.scratch_limit_ = scratch_limit;
         executor.gds_ = gds;
         executor.kernels_ = kernels;
-        executor.stream_ = static_cast<cuda_stream_handle_t>(borrowed);
-        if (!borrowed) {
-            if (api.stream_create(&executor.owned_stream_, cuda_stream_non_blocking_k) != cuda_success_k)
-                return status_t {status_code_t::device_k, "The device gave no stream"};
-            executor.stream_ = executor.owned_stream_;
-        }
+        auto [stream, stream_status] = cuda_stream_t::open(api);
+        if (stream_status.failed()) return stream_status;
+        executor.stream_ = std::move(stream);
         executor.event_ = cuda_event_t {api};
         if (!executor.event_) return status_t {status_code_t::device_k, "The device gave no event"};
         // The bounce stays on node zero where the driver places the device on no NUMA node
@@ -361,7 +388,6 @@ class cuda_executor_t {
         if (!api_ || api_->set_current_context(context_) != cuda_success_k) return;
         api_->stream_synchronize(stream_);
         free_blocks(managed_.blocks, [this](std::uintptr_t address) noexcept { free_managed(address); });
-        if (owned_stream_) api_->stream_destroy(owned_stream_);
     }
 
     /** Waits until everything queued on the stream ran, reporting a failure among it as @c device_k. */
@@ -380,7 +406,7 @@ class cuda_executor_t {
     /** How bytes move between the drives and the device, which the compactions on the executor read sections by. */
     ustore_gds_t gds() const noexcept { return gds_; }
 
-    /** The stream every call queues on, owned or borrowed. */
+    /** The stream every call queues on, the executor's own. */
     cuda_stream_handle_t stream() const noexcept { return stream_; }
 
     /** The driver table every call goes through. */
@@ -464,8 +490,7 @@ class cuda_executor_t {
   private:
     void swap(cuda_executor_t& other) noexcept {
         std::swap(api_, other.api_), std::swap(context_, other.context_);
-        std::swap(owned_stream_, other.owned_stream_), std::swap(stream_, other.stream_);
-        std::swap(event_, other.event_), std::swap(device_, other.device_);
+        std::swap(stream_, other.stream_), std::swap(event_, other.event_), std::swap(device_, other.device_);
         std::swap(scratch_limit_, other.scratch_limit_), std::swap(gds_, other.gds_),
             std::swap(kernels_, other.kernels_);
         std::swap(bounce_, other.bounce_), std::swap(managed_, other.managed_);
@@ -476,10 +501,7 @@ class cuda_executor_t {
     /** The device's primary context, which the process's GPU runtime retained and never releases. */
     cuda_context_handle_t context_ = nullptr;
 
-    /** The stream made here and destroyed with the executor, null when the caller lent @c stream_. */
-    cuda_stream_handle_t owned_stream_ = nullptr;
-
-    cuda_stream_handle_t stream_ = nullptr;
+    cuda_stream_t stream_;
     cuda_event_t event_;
     gpu_device_t device_ {};
     std::size_t scratch_limit_ = 0;

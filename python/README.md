@@ -17,7 +17,7 @@ python -c "import ustore; print(ustore.__version__, ustore.version(), ustore.eng
 ```
 
 From a checkout, `pip install .` builds through `scikit-build-core` and the project's own CMake, and `CMAKE_ARGS="-DUSTORE_WITH_LEVELDB=OFF"` leaves an engine out.
-The wheels carry the RAM, RocksDB and LevelDB engines for CPython 3.12 through 3.15 and the free-threaded 3.14t and 3.15t.
+The wheels hold the RAM, RocksDB and LevelDB engines for CPython 3.12 through 3.15 and the free-threaded 3.14t and 3.15t.
 The suite runs from the repository root:
 
 ```sh
@@ -73,7 +73,7 @@ database.collection_drop("posters", ustore.DropMode.PAIRS)  # empties it, keepin
 ## Reads and Writes
 
 `write`, `set`, `read`, `get`, `contains` and `remove` address binary values by key.
-A write takes one bytes-like value per key, one value broadcast to every key, or a tape, and borrows every value for the length of the call rather than copying it.
+A write takes one bytes-like value per key, one value broadcast to every key, or a tape, and views every value for the length of the call rather than copying it.
 A tape is an Arrow `binary`, `large_binary`, `string` or `large_string` array, or a `(data, offsets)` tuple of buffers, and reaches the C ABI as the tape it already is.
 A read answers the tape the engine wrote, with `None` for a missing key.
 `read(keys, arena, offset=16, limit=64)` reads a slice of every value, and `remove(keys, ends=ends)` removes ranges in one atomic call.
@@ -95,6 +95,8 @@ database.remove([7], collection=posters)
 `scan_batch` runs one scan per start in one call, `sample` and `sample_batch` draw keys at random, and `measure(start, end, arena)` answers a `Measurement` of bounds on the entries, value bytes and space in a range, without walking it.
 `docs_scan`, `graph_scan_vertices` and `pages_scan` list the other modalities, with `_sample` and `_measure` beside them.
 `cursor(start, collection=...)` opens a walk whose `next(wanted, arena, values=True)` pulls a page with its values, resuming past the last key it handed out, until a short page ends it for good.
+The cursor keeps no executor: `next` runs on the calling thread, and `cursor.on(executor).next(...)` blocks one pull on an executor.
+`docs_cursor(fields=..., columns_types=...)` pulls lists of `(Page, Columns)` batches, one per executor task that found rows.
 
 ```python
 from ustore import ScanDirection
@@ -130,6 +132,7 @@ database.scan(None, 100, arena, collection=posters, predicate=ustore.Batch(even,
 
 Both views are valid only for the call, and the admissions start as rejections.
 An exception inside a predicate goes to `sys.unraisablehook` and rejects the rest of its page.
+The library may ask a predicate from several of the executor's threads at once, each entry taking the interpreter, so a handler keeps no state it changes.
 
 ### Progress and Cancellation
 
@@ -258,8 +261,8 @@ Python's `in`, assignments, `del` and the table view take several calls or must 
 ## Executors
 
 An executor owns threads, and a database owns its data, so one executor serves any number of databases, one call at a time; a second call while one runs raises `ContendedError` once awaited.
-`Executor.for_ram(threads=0, *, memory_domains=None)` spawns threads near the NUMA nodes it names, where zero threads take 7/8 of their cores, leaving the rest to blocking calls and the engines' background work.
-`Executor.on_pool(pool)` borrows a ForkUnion `fu_pool_t` by its integer address, which must outlive the executor, `Executor.for_nvme` makes the I/O rings of the NVMe engine, and `Executor.for_vram(device)` drives one CUDA device.
+`Executor.for_ram(threads=0, *, memory_domains=None, scratch_limit=0)` spawns threads near the NUMA nodes it names, where zero threads take 7/8 of their cores, leaving the rest to blocking calls and the engines' background work, and each thread's scratch stops at `scratch_limit` bytes, 16 GiB for zero.
+`Executor.for_nvme` makes the I/O rings of the NVMe engine, and `Executor.for_vram(device)` drives one CUDA device.
 Used as a context manager, an executor waits for its calls and closes on exit, and progress callbacks on its threads take the GIL as they enter Python.
 
 ```python
@@ -294,7 +297,7 @@ Shorthand such as `get`, `contains` and `view[name].blobs[key]` makes a one-off 
 
 ## Errors
 
-Every failure raises a subclass of `ustore.Error`, itself a `RuntimeError`, carrying the status the C ABI reported as its `status` attribute, a `ustore.Status` member.
+Every failure raises a subclass of `ustore.Error`, itself a `RuntimeError`, holding the status the C ABI reported as its `status` attribute, a `ustore.Status` member.
 Each status has its own class, which also derives the built-in naming the same fault: `NotFoundError` is a `KeyError`, `InvalidArgumentError` a `ValueError`, `UnsupportedError` a `NotImplementedError`, `InputOutputError` an `OSError`, and `CapacityExhaustedError` an `OverflowError`.
 `WriteConflictError`, `ReadConflictError` and `PhantomConflictError` share `ConflictError`, the one clause a retry loop needs.
 A closed handle raises `UninitializedError`, and an argument of the wrong Python type raises `TypeError`.
@@ -335,8 +338,9 @@ database.ingest_arrow(table, collection="copies", order="sorted")  # or landed a
 
 ### Engines
 
-`engines_compiled()` names the engines a build carries, each opened through its own class method: `Database.open_ram()`, `open_rocksdb()`, `open_leveldb()` or `open_nvme()`, and `view_rocksdb()` for a read-only RocksDB database, which raises `ReadOnlyError` from every change.
-`open_ram(directory)` persists the database as one image there, while `open_ram()` keeps it in memory alone, and `open_nvme(manifest)` names the database by its manifest or the raw address of its first slot, such as `/dev/nvme0n1@64GiB`.
+`engines_compiled()` names the engines a build holds, each opened through its own class method: `Database.open_ram()`, `open_rocksdb()`, `open_leveldb()` or `open_nvme()`, and `view_rocksdb()` or `view_nvme()` for a read-only RocksDB or NVMe database, which raises `ReadOnlyError` from every change.
+`open_ram(directory)` persists the database as one image there on every `flush()`, since closing writes nothing, while `open_ram()` keeps it in memory alone, and `open_nvme(manifest)` names the database by its manifest or the raw address of its first slot, such as `/dev/nvme0n1@64GiB`.
+`open_ram`, `open_rocksdb`, `view_rocksdb` and `open_leveldb` take `memory_limit=`, and the RocksDB and LevelDB opens `background_threads=`, the threads of the pool the database owns for its flushes and compactions.
 `open_ram` and `open_nvme` take `cpu_class_ceiling=`, the newest `CPUClass` the database's kernels may run as, where a class the CPU lacks narrows the pick, `UnsupportedError` comes only when no compiled class fits, and `describe().cpu_class` reports the class picked.
 `describe()`, `clear(mode)` and `compact()` report on, empty and reclaim every collection at once, and `on(executor).compact(plan=ustore.CompactPlan())` leaves a stopped compaction open for the next call to continue.
 The extension declares `Py_MOD_GIL_NOT_USED`, so free-threaded builds run without the interpreter lock, and critical sections fence the few fields the binding mutates.
@@ -344,7 +348,7 @@ The extension declares `Py_MOD_GIL_NOT_USED`, so free-threaded builds run withou
 ### Left Unbound
 
 - The strings cursor, which `export_arrow` drives.
-- Deferred constructors and cursors: an open takes `executor=` and blocks on it, and every pull blocks.
+- Deferred constructors and cursors: an open takes `executor=` and blocks on it, and every pull blocks, on the calling thread or on the executor `on(executor)` names.
 - The `_name` functions themselves, which build the enums at import, so no string ever reaches a verb.
 
 ### Design
@@ -352,8 +356,8 @@ The extension declares `Py_MOD_GIL_NOT_USED`, so free-threaded builds run withou
 - __The receiver chooses, the verb stays.__
   `db.read(keys, arena)` takes no executor or completion, and `db.on(executor)`, `db.deferred(executor)`, `snapshot` and `txn.unwatched()` choose where it runs and what it sees.
 - __Ragged inputs keep their layout.__
-  An Arrow array or a pair of NumPy buffers passes as the tape it is, and anything else is borrowed into views the call pins at submission.
-- __Arenas are lent, never hidden.__
+  An Arrow array or a pair of NumPy buffers passes as the tape it is, and anything else is wrapped in views the call pins at submission.
+- __Arenas are the caller's, never hidden.__
   No handle keeps an arena of its own, and shorthand pays an allocation and a copy that a verb handed a reused arena never pays.
 - __No life of its own.__
   The binding starts no threads and keeps no queues or counts, and `await` polls instead of parking a thread.

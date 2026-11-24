@@ -14,7 +14,6 @@ import pytest
 from ustore import FieldType, UnsupportedError
 from ustore.table_view import WRITE_TYPES, Table
 
-# A NumPy dtype, the type a write spells it as, and the values a column carries.
 COLUMN_DTYPES = {
     FieldType.F64: (np.float64, [1.5, -2.25, 3.75]),
     FieldType.F32: (np.float32, [1.5, -2.25, 3.75]),
@@ -28,6 +27,7 @@ COLUMN_DTYPES = {
     FieldType.U8: (np.uint8, [0, 1, 255]),
     FieldType.BOOL: (np.bool_, [True, False, True]),
 }
+"""A NumPy dtype, the type a write spells it as, and the values a column holds."""
 
 # The UUID the gather parses, and the sixteen bytes it decodes into.
 UUID_TEXT = "12345678-1234-5678-1234-567812345678"
@@ -58,7 +58,7 @@ def test_column_write_round_trip(view, docs, arena, field_type: FieldType):
 
 
 def test_column_write_accepts_bytes(view, docs, arena):
-    """A plain buffer of bytes carries no width of its own, so it splits by the field's."""
+    """A plain buffer of bytes holds no width of its own, so it splits by the field's."""
     keys = [1, 2, 3]
     view.docs_write(keys, ["{}"] * len(keys), collection=docs)
     view.docs_write(keys, struct.pack("<3i", 7, 8, 9), field="v", type=FieldType.I32, collection=docs)
@@ -74,7 +74,7 @@ def test_column_write_broadcasts_one_scalar(view, docs, arena):
 
 
 def test_column_write_refuses_a_strided_view(view, docs, arena):
-    """A column is borrowed rather than copied, so a slice with gaps in it is refused outright."""
+    """A column is viewed rather than copied, so a slice with gaps in it is refused outright."""
     keys = [1, 2, 3]
     view.docs_write(keys, ["{}"] * len(keys), collection=docs)
     strided = np.arange(6, dtype=np.int64)[::2]
@@ -220,9 +220,9 @@ def test_gather_holds_its_arena(view, docs, arena):
     assert bytes(column) == UUID_BYTES
 
 
-@pytest.mark.parametrize("field_type", [FieldType.JSON, FieldType.NULL, 128])
+@pytest.mark.parametrize("field_type", [FieldType.NULL, 128])
 def test_gather_refuses_unconvertible_types(view, docs, arena, field_type: FieldType | int):
-    """A gather converts into scalars, UUIDs, strings or bytes, and into no other type or value."""
+    """A gather converts into scalars, UUIDs, strings, bytes or JSON, and into no other type or value."""
     view.docs_write([0], "{}", collection=docs)
     with pytest.raises(ValueError):  # noqa: PT011
         view.docs_gather([0], ["v"], field_type, arena, collection=docs)

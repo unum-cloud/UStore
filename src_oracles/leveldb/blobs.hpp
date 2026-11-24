@@ -93,7 +93,8 @@ status_t blobs_read(ustore_blobs_read_t const& arguments, view_t const& view) {
     if (outputs_status.failed()) return outputs_status;
 
     // Metadata and data come in one pass, as reading from disk is expensive
-    auto read_slice = [&](std::size_t first, std::size_t length, view_t const& slice_view) noexcept -> status_t {
+    auto read_slice = [&](std::size_t first, std::size_t length, std::size_t,
+                          view_t const& slice_view) noexcept -> status_t {
         auto const offset = static_cast<std::ptrdiff_t>(first);
         place_batch_t const slice {places.collections_begin + offset, places.keys_begin + offset, {}, length};
         auto data_enumerator = [&](std::size_t task, value_view_t value) noexcept -> status_t {

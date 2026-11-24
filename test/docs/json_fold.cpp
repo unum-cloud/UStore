@@ -336,7 +336,7 @@ operation_t random_operation(split_mix_generator_t& random, value_writer_t& writ
 
 #pragma region Chains
 
-/** One delta a collection holds: its kind and the bytes it carries. */
+/** One delta a collection holds: its kind and the bytes it holds. */
 struct pending_t {
     util::delta_kind_t kind = util::delta_kind_t::change_k;
     std::string bytes;

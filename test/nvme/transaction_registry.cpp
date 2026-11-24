@@ -128,7 +128,8 @@ class test_store_t {
     /** Seals @p written for the commit that follows, flushing the collection first when it reports itself full. */
     util::status_t seal_collection(collection_id_t collection_id,
                                    transaction_deltas<stored_key_t, atomic_reference, waiter_t> const& written,
-                                   sealed_commit<stored_key_t, atomic_reference>& sealed) noexcept {
+                                   sealed_commit<stored_key_t, atomic_reference>& sealed,
+                                   util::nvme_queues_ref_t) noexcept {
         if (behaviour == store_behaviour_t::always_flushing_k || behaviour == store_behaviour_t::refusing_flushes_k) {
             ++flushes;
             if (behaviour == store_behaviour_t::refusing_flushes_k)
@@ -149,7 +150,9 @@ class test_store_t {
     }
 
     /** Claims nothing, since balances live in place and need no memory-run record. */
-    util::status_t claim_memory_record(collection_id_t, memory_run_claim_t&) noexcept { return {}; }
+    util::status_t claim_memory_record(collection_id_t, memory_run_claim_t&, util::nvme_queues_ref_t) noexcept {
+        return {};
+    }
 
     /** Takes the sealed changes for the commit that follows, or refuses them. */
     util::status_t prepare_collection(collection_id_t, sealed_commit<stored_key_t, atomic_reference>&,
@@ -178,7 +181,7 @@ class test_store_t {
     void forget_collection(collection_id_t) noexcept {}
 
     /** Maintains nothing, since balances live in place. */
-    util::status_t maintain(collection_id_t) noexcept { return {}; }
+    util::status_t maintain(collection_id_t, util::nvme_queues_ref_t) noexcept { return {}; }
 
     /** The balance @p stored_key holds right now, which a later commit may already have moved. */
     std::uint64_t balance(stored_key_t stored_key) const noexcept {

@@ -3,19 +3,20 @@
  *  @author Ash Vardanian
  *  @date September 19, 2026
  *  @brief The ring SPDK offers: a user-space NVMe driver over the namespaces of one controller, one
- *      queue pair per queue pair.
+ *      I/O queue pair per queue set queue and controller.
  *
  *  This transport presents each namespace it registers as a target, named by its number, and keeps
  *  no name mapping of its own; the manifest above it names what the extents hold, so a torn write
  *  of a map cannot lose a drive. The driver attaches a controller once per process, so every disk
- *  opened on one address shares that attachment and takes queue pairs of its own from it, and no
- *  two disks register the same namespace. Nothing here blocks, as the driver offers no interrupt:
- *  @c spdk_nvme_qpair_process_completions is the only way a command is ever seen to finish.
+ *  opened on one address shares that attachment, and no two disks register the same namespace.
+ *  Nothing here blocks, as the driver offers no interrupt: @c spdk_nvme_qpair_process_completions
+ *  is the only way a command is ever seen to finish.
  *
- *  A queue pair is a queue pair rather than a label, since an @c spdk_nvme_qpair carries no lock
- *  and a second thread polling one corrupts its tracker list without a word. @c queue_pairs_limit
- *  is therefore the controller's queue-pair count, which may be fewer than the executor has
- *  threads, and a handover is a move of the queue pair announced with @c adopt.
+ *  An I/O queue pair belongs to a thread's queue, since an @c spdk_nvme_qpair holds no lock and a
+ *  second thread polling one corrupts its tracker list without a word. The queue allocates it on
+ *  the first @c register_media of a disk on its controller and every later disk on that controller
+ *  shares it; @c queue_pairs_limit is the controller's queue-pair count, which a queue set of more
+ *  queues than that exhausts at @c register_media.
  *
  *  The environment is the hazard the rest of the file is arranged around. @c rte_eal_init
  *  calls @c exit on the process when it wants hugepages and finds none, when the drive is
@@ -63,7 +64,7 @@
 #include <smashtable/basic_growing_pool.hpp> // `st::basic_growing_pool`
 #include <smashtable/basic_vector.hpp>       // `st::vector`
 
-#include "ustore/utilities/nvme_ring.hpp" // `request_t`, `completion_t`, `queue_pair_t`, `portable_alignment_k`, `is_address_aligned`
+#include "ustore/utilities/nvme_ring.hpp" // `request_t`, `completion_t`, `queue_ref_t`, `portable_alignment_k`, `is_address_aligned`
 #include "ustore/utilities/types.hpp" // `status_t`, `status_code_t`, `expected`, `byte_t`
 
 namespace unum::ustore::utilities {
@@ -365,20 +366,8 @@ struct linux_spdk_controller_identity_t {
     char model[41] = {};
 };
 
-/**
- *  @brief What a mount fixes about an SPDK disk before any queue pair queue pairs a share of it.
- *
- *  @c queue_pairs_limit is a request rather than a promise: the mount lowers it to the queue pairs the
- *  controller actually offers, which on a consumer drive is far fewer than a large executor has
- *  threads, so a caller reads @c capabilities to learn how many queue pairs it really got.
- */
+/** What a mount fixes about an SPDK disk before any queue set's queue holds it. */
 struct linux_spdk_disk_config_t {
-
-    /** Queue pairs the mount asks the controller for, which is the queue pairs it hands out. */
-    std::uint16_t queue_pairs_limit = 1;
-
-    /** Requests one queue pair may keep in flight, which is also the depth of its queue pair. */
-    queue_depth_t depth_limit = 64;
 
     /** Memory ranges the disk registers at once, every one of which must be hugepage-backed. */
     std::uint16_t registered_memory_limit = 8;
@@ -495,8 +484,9 @@ linux_spdk_probe_t linux_spdk_environment<atomic_reference_, waiter_type_>::prob
  *  @brief One connection to a controller, which every disk opened on its address shares.
  *
  *  The driver attaches a controller once per process, so a second mount on the same address takes
- *  this one rather than connecting again. Every open disk and every namespace registered holds a
- *  share, and the last share given back detaches the controller alone, so its drive may be pulled.
+ *  this one rather than connecting again. Every open disk, every namespace registered and every
+ *  queue holding an I/O queue pair on it holds a share, and the last share given back detaches the
+ *  controller alone, so its drive may be pulled.
  */
 struct linux_spdk_attachment_t {
 
@@ -506,7 +496,8 @@ struct linux_spdk_attachment_t {
     /** The controller, null until the first share connects it. */
     spdk_nvme_ctrlr* controller = nullptr;
 
-    /** Disks open and namespaces registered on the connection, zero while the record is free. */
+    /** Disks open, namespaces registered and queues holding an I/O queue pair on the connection,
+     *  zero while the record is free. */
     std::uint32_t holders = 0;
 
     /** Held while a share connects the controller or finds it failed. */
@@ -595,7 +586,7 @@ status_t linux_spdk_environment<atomic_reference_, waiter_type_>::initialise_(
 template <template <typename> typename atomic_reference_, typename waiter_type_>
 expected<linux_spdk_environment<atomic_reference_, waiter_type_>>
 linux_spdk_environment<atomic_reference_, waiter_type_>::acquire(linux_spdk_environment_config_t const&) noexcept {
-    return status_t {status_code_t::unsupported_k, "This build carries no SPDK"};
+    return status_t {status_code_t::unsupported_k, "This build holds no SPDK"};
 }
 
 #endif
@@ -740,6 +731,244 @@ void linux_spdk_release_namespace(linux_spdk_attachment_t& attachment, std::uint
 
 #pragma endregion Attachments
 
+#pragma region Queue
+
+template <template <typename> typename atomic_reference_, typename waiter_type_>
+class linux_spdk_disk;
+
+/**
+ *  @brief The I/O queue pairs one thread owns, one per controller it held a disk of, with
+ *      the credit, the commands the device holds, the chained successors held back and the
+ *      completions the disk answered itself.
+ *
+ *  The first @c register_media of a disk on a controller allocates the pair and every later disk on
+ *  that controller finds it, so a queue set takes at most one of the controller's queue pairs per
+ *  queue. Each pair holds a share of its controller's attachment, so the controller stays attached
+ *  while the queue lives, even past the last disk's release.
+ *
+ *  The thread's blocks come from @c linux_spdk_dma_allocator, so they sit in the driver's map
+ *  already; a controller reached by DMA checks that they translate when the queue first registers
+ *  one of its disks.
+ */
+class linux_spdk_queue_t {
+  public:
+
+    linux_spdk_queue_t() noexcept = default;
+    linux_spdk_queue_t(linux_spdk_queue_t const&) = delete;
+    linux_spdk_queue_t& operator=(linux_spdk_queue_t const&) = delete;
+
+    linux_spdk_queue_t(linux_spdk_queue_t&& other) noexcept
+        : submitted_requests_(std::move(other.submitted_requests_)), staged_(std::move(other.staged_)),
+          completions_made_by_queue_(std::move(other.completions_made_by_queue_)), pairs_(std::move(other.pairs_)),
+          pinned_staging_(other.pinned_staging_), media_controller_(std::exchange(other.media_controller_, nullptr)),
+          media_pair_(std::exchange(other.media_pair_, nullptr)), depth_(other.depth_),
+          outstanding_(other.outstanding_), first_free_submitted_request_(other.first_free_submitted_request_),
+          staged_count_(other.staged_count_), staged_free_(other.staged_free_),
+          completions_made_by_queue_first_(other.completions_made_by_queue_first_),
+          completions_made_by_queue_count_(other.completions_made_by_queue_count_), idle_polls_(other.idle_polls_) {}
+
+    linux_spdk_queue_t& operator=(linux_spdk_queue_t&& other) noexcept {
+        if (this == &other) return *this;
+        teardown_();
+        submitted_requests_ = std::move(other.submitted_requests_);
+        staged_ = std::move(other.staged_);
+        completions_made_by_queue_ = std::move(other.completions_made_by_queue_);
+        pairs_ = std::move(other.pairs_);
+        pinned_staging_ = other.pinned_staging_;
+        media_controller_ = std::exchange(other.media_controller_, nullptr);
+        media_pair_ = std::exchange(other.media_pair_, nullptr);
+        depth_ = other.depth_;
+        outstanding_ = other.outstanding_;
+        first_free_submitted_request_ = other.first_free_submitted_request_;
+        staged_count_ = other.staged_count_;
+        staged_free_ = other.staged_free_;
+        completions_made_by_queue_first_ = other.completions_made_by_queue_first_;
+        completions_made_by_queue_count_ = other.completions_made_by_queue_count_;
+        idle_polls_ = other.idle_polls_;
+        return *this;
+    }
+
+    ~linux_spdk_queue_t() noexcept { teardown_(); }
+
+    /**
+     *  @brief Sizes the windows of a queue of @p depth requests over @p range, with no pair yet.
+     *  @param[in] depth Requests the queue keeps in flight at once.
+     *  @param[in] range The thread's DMA blocks, which @c queue_range_k addresses, or empty.
+     */
+    static expected<linux_spdk_queue_t> make(queue_depth_t depth, std::span<byte_t> range) noexcept {
+        if (depth == 0 || depth > depth_ceiling_k)
+            return status_t {status_code_t::invalid_argument_k, "An SPDK queue holds 1 to 16384 requests"};
+        linux_spdk_queue_t queue;
+        if (queue.submitted_requests_.resize(depth) != st::status_t::success_k ||
+            queue.staged_.resize(depth) != st::status_t::success_k ||
+            queue.completions_made_by_queue_.resize(depth) != st::status_t::success_k)
+            return status_t {status_code_t::out_of_memory_k, "An SPDK queue could not size its windows"};
+        queue.depth_ = depth;
+        queue.pinned_staging_ = range;
+        for (std::uint32_t index = 0; index != depth; ++index) {
+            queue.submitted_requests_[index].next_free = index + 1 == depth ? no_entry_k : index + 1;
+            queue.staged_[index].next_free = index + 1 == depth ? no_entry_k : index + 1;
+        }
+        queue.first_free_submitted_request_ = 0;
+        queue.staged_free_ = 0;
+        return queue;
+    }
+
+    /** Requests the queue keeps in flight at once. */
+    [[nodiscard]] queue_depth_t depth() const noexcept { return depth_; }
+
+  private:
+
+    template <template <typename> typename atomic_reference_, typename waiter_type_>
+    friend class linux_spdk_disk;
+
+    /** Whether a submitted slot is free, holds a command the device holds, or holds its result. */
+    enum class submitted_request_state_t : std::uint8_t {
+
+        /** Nothing occupies the slot, which is on the queue's free list. */
+        vacant_k,
+
+        /** The device holds the command and has not answered for it. */
+        outstanding_k,
+
+        /** The completion callback has written the result, which the next poll copies out. */
+        finished_k,
+    };
+
+    /** The index that names no slot, in a free list and in a chain alike. */
+    static constexpr std::uint32_t no_entry_k = 0xFFFFFFFFu;
+
+    /** Requests one queue keeps in flight at most, which bounds the depth a queue set
+     *  may ask for. */
+    static constexpr queue_depth_t depth_ceiling_k = 16384;
+
+    /** One command the device holds, and the result its completion callback writes into it. */
+    struct submitted_request_t {
+
+        /** The token the queue minted, which the completion holds back unchanged. */
+        request_token_t token;
+
+        /** Bytes the extent asked for, which an NVMe command moves whole or not at all. */
+        std::uint64_t length = 0;
+
+        /** Bytes the device moved, which the callback fills in. */
+        std::uint64_t transferred_bytes = 0;
+
+        /** Why the command ended this way, which the callback fills in. */
+        status_t status;
+
+        /** The range the request viewed, given back when its completion is completed. */
+        memory_reference_t buffer;
+
+        /** The target the request viewed, given back when its completion is completed. */
+        medium_reference_t medium;
+
+        /** The staged request waiting on this one, or @c no_entry_k when none does. */
+        std::uint32_t successor = no_entry_k;
+
+        /** The next free slot while this one is vacant, which is how the free list is linked. */
+        std::uint32_t next_free = no_entry_k;
+
+        /** How the command ended, which the callback fills in. */
+        completion_state_t outcome = completion_state_t::completed_k;
+
+        /** Whether the slot is free, holds a command, or holds its result. */
+        submitted_request_state_t state = submitted_request_state_t::vacant_k;
+
+        /** The command's opcode, which a command-specific status is spelled by. */
+        std::uint8_t opcode = 0;
+    };
+
+    /** One successor of a chained request, held back until its predecessor transfers in full. */
+    struct staged_t {
+
+        /** The request itself, issued unchanged when the chain reaches it. */
+        request_t request;
+
+        /** The staged request waiting on this one, or @c no_entry_k when none does. */
+        std::uint32_t next = no_entry_k;
+
+        /** The next free slot while this one is vacant, which is how the free list is linked. */
+        std::uint32_t next_free = no_entry_k;
+    };
+
+    /** One controller's I/O queue pair, and the share of its attachment that keeps it connected. */
+    struct pair_t {
+
+        /** The controller the pair was allocated on, which a later hold looks it up by. */
+        spdk_nvme_ctrlr* controller = nullptr;
+
+        /** The pair itself, which only the thread owning the queue ever polls. */
+        spdk_nvme_qpair* queue = nullptr;
+
+        /** The connection whose share the pair holds. */
+        linux_spdk_attachment_t* attachment = nullptr;
+
+        /** Gives the share back through the claims of the disk that allocated the pair. */
+        void (*detach)(linux_spdk_attachment_t&) noexcept = nullptr;
+    };
+
+    /** Frees every pair, then gives back each pair's share, which may detach its controller. */
+    void teardown_() noexcept {
+        // An abort the queue issued lands on the admin queue, so it is polled before the pair goes
+        for (pair_t& pair : pairs_) {
+            [[maybe_unused]] std::int32_t const polled = spdk_nvme_ctrlr_process_admin_completions(pair.controller);
+            spdk_nvme_ctrlr_free_io_qpair(pair.queue);
+        }
+        for (pair_t& pair : pairs_) pair.detach(*pair.attachment);
+        pairs_.clear();
+        media_controller_ = nullptr;
+        media_pair_ = nullptr;
+    }
+
+    /** The commands the device holds, addressed through a free list. */
+    st::vector<submitted_request_t> submitted_requests_;
+
+    /** The held successors of chained requests, addressed through a free list. */
+    st::vector<staged_t> staged_;
+
+    /** The completions the disk answered itself, read as a circle. */
+    st::vector<completion_t> completions_made_by_queue_;
+
+    /** One pair per controller the queue registered a disk of. */
+    st::vector<pair_t> pairs_;
+
+    /** The thread's DMA blocks, which a request naming @c queue_range_k addresses. */
+    std::span<byte_t> pinned_staging_;
+
+    /** The controller of the disk registered last, whose pair every submission goes to. */
+    spdk_nvme_ctrlr* media_controller_ = nullptr;
+
+    /** The pair on @c media_controller_. */
+    spdk_nvme_qpair* media_pair_ = nullptr;
+
+    /** Requests the queue keeps in flight at once. */
+    queue_depth_t depth_ = 0;
+
+    /** Commands the device holds for this queue, plus the results not yet copied out. */
+    std::uint32_t outstanding_ = 0;
+
+    /** Head of the free submitted slots, @c no_entry_k when every one is taken. */
+    std::uint32_t first_free_submitted_request_ = no_entry_k;
+
+    /** Successors of chained requests the queue is holding back. */
+    std::uint32_t staged_count_ = 0;
+
+    /** Head of the free staging slots, @c no_entry_k when every one is taken. */
+    std::uint32_t staged_free_ = no_entry_k;
+
+    /** Where the oldest unreaped local completion sits inside @c completions_made_by_queue_. */
+    std::uint32_t completions_made_by_queue_first_ = 0;
+
+    /** Completions the disk answered itself, which no command ever held. */
+    std::uint32_t completions_made_by_queue_count_ = 0;
+
+    /** Reaps since the admin queue was last polled that found nothing on the pair. */
+    std::uint32_t idle_polls_ = 0;
+};
+
+#pragma endregion Queue
+
 #pragma region Disk
 
 /**
@@ -760,25 +989,25 @@ void linux_spdk_release_namespace(linux_spdk_attachment_t& attachment, std::uint
  *  lands. What a registered memory must prove depends on the transport: a controller reached by DMA
  *  needs every page in the driver's map, while one reached over a socket takes any host memory.
  *
- *  @tparam atomic_reference_ The reference the claim and in-flight words are owned through.
+ *  @tparam atomic_reference_ The reference the claim and in-submitted words are owned through.
  *  @tparam waiter_type_ What a draining core does after a poll that moved nothing.
  */
 template <template <typename> typename atomic_reference_, typename waiter_type_>
 class linux_spdk_disk {
   public:
 
+    /** The queue a thread owns for this transport. */
+    using queue_t = linux_spdk_queue_t;
+
     linux_spdk_disk() noexcept = default;
     linux_spdk_disk(linux_spdk_disk const&) = delete;
     linux_spdk_disk& operator=(linux_spdk_disk const&) = delete;
 
     linux_spdk_disk(linux_spdk_disk&& other) noexcept
-        : environment_(std::move(other.environment_)), queue_pairs_(std::move(other.queue_pairs_)),
-          registered_memories_(std::move(other.registered_memories_)), media_(std::move(other.media_)),
-          flights_(std::move(other.flights_)), staged_(std::move(other.staged_)), locals_(std::move(other.locals_)),
-          attachment_(std::exchange(other.attachment_, nullptr)),
+        : environment_(std::move(other.environment_)), registered_memories_(std::move(other.registered_memories_)),
+          media_(std::move(other.media_)), attachment_(std::exchange(other.attachment_, nullptr)),
           controller_(std::exchange(other.controller_, nullptr)), sector_bytes_(std::exchange(other.sector_bytes_, 0)),
           max_transfer_bytes_(std::exchange(other.max_transfer_bytes_, 0)),
-          depth_limit_(std::exchange(other.depth_limit_, 0)),
           queue_pairs_limit_(std::exchange(other.queue_pairs_limit_, 0)),
           registered_memories_limit_(std::exchange(other.registered_memories_limit_, 0)), reach_(other.reach_) {}
 
@@ -786,17 +1015,12 @@ class linux_spdk_disk {
         if (this == &other) return *this;
         assert(!attachment_ && "release a disk before another takes its place");
         environment_ = std::move(other.environment_);
-        queue_pairs_ = std::move(other.queue_pairs_);
         registered_memories_ = std::move(other.registered_memories_);
         media_ = std::move(other.media_);
-        flights_ = std::move(other.flights_);
-        staged_ = std::move(other.staged_);
-        locals_ = std::move(other.locals_);
         attachment_ = std::exchange(other.attachment_, nullptr);
         controller_ = std::exchange(other.controller_, nullptr);
         sector_bytes_ = std::exchange(other.sector_bytes_, 0);
         max_transfer_bytes_ = std::exchange(other.max_transfer_bytes_, 0);
-        depth_limit_ = std::exchange(other.depth_limit_, 0);
         queue_pairs_limit_ = std::exchange(other.queue_pairs_limit_, 0);
         registered_memories_limit_ = std::exchange(other.registered_memories_limit_, 0);
         reach_ = other.reach_;
@@ -810,7 +1034,7 @@ class linux_spdk_disk {
      *      bookkeeping by the controller's first active namespace.
      *  @param[in] environment A counted share of an initialised environment, kept for the disk's life.
      *  @param[in] address The PCIe address of the controller, or a fabric transport ID the driver parses.
-     *  @param[in] config The queue pairs wanted, the per-queue pair depth and the ranges registered at once.
+     *  @param[in] config The ranges registered at once.
      *  @return The mounted disk, or why the controller would not answer.
      */
     static expected<linux_spdk_disk> open(linux_spdk_environment<atomic_reference_, waiter_type_> environment,
@@ -841,15 +1065,13 @@ class linux_spdk_disk {
         }
         if (!chosen) {
             linux_spdk_detach<atomic_reference_, waiter_type_>(*attachment);
-            return status_t {status_code_t::not_found_k, "The controller carries no active namespace"};
+            return status_t {status_code_t::not_found_k, "The controller holds no active namespace"};
         }
 
         spdk_nvme_ctrlr_opts const* const controller_options = spdk_nvme_ctrlr_get_opts(controller);
         std::uint32_t const queues = controller_options && controller_options->num_io_queues != 0
                                          ? controller_options->num_io_queues
                                          : 1u;
-        std::uint16_t const queue_pairs = static_cast<std::uint16_t>(
-            config.queue_pairs_limit < queues ? config.queue_pairs_limit : queues);
 
         linux_spdk_disk disk;
         disk.environment_ = std::move(environment);
@@ -857,25 +1079,19 @@ class linux_spdk_disk {
         disk.controller_ = controller;
         disk.sector_bytes_ = spdk_nvme_ns_get_sector_size(chosen);
         disk.max_transfer_bytes_ = spdk_nvme_ns_get_max_io_xfer_size(chosen);
-        disk.depth_limit_ = config.depth_limit;
-        disk.queue_pairs_limit_ = queue_pairs;
+        // NVMe numbers its queues in 16 bits, so the count always fits
+        disk.queue_pairs_limit_ = static_cast<std::uint16_t>(queues);
         disk.registered_memories_limit_ = config.registered_memory_limit;
         disk.reach_ = transport.trtype == SPDK_NVME_TRANSPORT_TCP ? reach_t::copied_k : reach_t::translated_k;
-        std::size_t const window = static_cast<std::size_t>(queue_pairs) * config.depth_limit;
         status_t sized;
         if (disk.sector_bytes_ == 0 || !std::has_single_bit(disk.sector_bytes_))
             sized = {status_code_t::unsupported_k, "The namespace reports no power-of-two sector"};
-        if (sized.succeeded()) sized = size_(disk.queue_pairs_, queue_pairs);
         if (sized.succeeded()) sized = size_(disk.registered_memories_, config.registered_memory_limit);
         if (sized.succeeded()) sized = size_(disk.media_, targets_limit_k);
-        if (sized.succeeded()) sized = size_(disk.flights_, window);
-        if (sized.succeeded()) sized = size_(disk.staged_, window);
-        if (sized.succeeded()) sized = size_(disk.locals_, window);
         if (sized.failed()) {
             disk.release();
             return sized;
         }
-        for (std::size_t seat = 0; seat != disk.queue_pairs_.size(); ++seat) disk.link_free_lists_(seat);
         return disk;
     }
 
@@ -891,13 +1107,13 @@ class linux_spdk_disk {
     }
 
     /** What this disk accepts, which the namespace's sector size and the controller's limits fix. */
-    [[nodiscard]] ring_capabilities_t capabilities() const noexcept {
-        ring_capabilities_t reported;
+    [[nodiscard]] disk_capabilities_t capabilities() const noexcept {
+        disk_capabilities_t reported;
         reported.memory_alignment = portable_alignment_k;
         reported.offset_alignment = sector_bytes_;
         reported.length_granularity = sector_bytes_;
         reported.max_transfer_bytes = max_transfer_bytes_;
-        reported.depth_limit = depth_limit_;
+        reported.depth_limit = linux_spdk_queue_t::depth_ceiling_k;
         reported.queue_pairs_limit = queue_pairs_limit_;
         reported.media_limit = targets_limit_k;
         reported.reaches_gpu_memory = false;
@@ -914,88 +1130,70 @@ class linux_spdk_disk {
         return identity;
     }
 
-#pragma region Queue Pairs
+#pragma region Queues
 
     /**
-     *  @brief Takes a queue pair on @p depth requests and allocates the queue pair that carries them.
-     *  @param[in] depth Requests this queue pair may keep in flight, at most the mount's limit.
-     *  @return The queue pair, or @c capacity_exhausted_k when every queue pair is already out.
+     *  @brief Points @p queue_pair's queue at its I/O queue pair on this disk's
+     *      controller, allocating it on the queue's first registration of a disk there;
+     *      one comparison once warm.
+     *  @param[in] queue_pair The queue the calling thread owns, drained before it moves on.
+     *  @return @c invalid_argument_k for another transport's queue, for one still holding
+     *      requests on another controller, or for blocks a DMA controller cannot translate;
+     *      @c unsupported_k for a blocking queue; @c capacity_exhausted_k once the controller
+     *      granted every queue pair it has.
      *
-     *  @note The ceiling is the controller's queue-pair count rather than the executor's thread
-     *      count, so a large executor sees fewer queue pairs than it has threads and must move them.
+     *  @note The first pair on a controller takes a share of its attachment, which the queue
+     *      gives back when it dies, so the controller outlives the release of every disk on it.
      */
-    expected<queue_pair_t> acquire_queue_pair(queue_depth_t depth) noexcept {
-        if (depth == 0 || depth > depth_limit_)
-            return status_t {status_code_t::invalid_argument_k, "The queue pair depth exceeds the ring's"};
-        for (std::size_t seat = 0; seat != queue_pairs_.size(); ++seat) {
-            queue_pair_slot_t& slot = queue_pairs_[seat];
-            std::int32_t expected_free = 0;
-            if (!claim_(slot.acquired)
-                     .compare_exchange_strong(expected_free, 1, std::memory_order_acquire, std::memory_order_relaxed))
-                continue;
-            spdk_nvme_io_qpair_opts options {};
-            spdk_nvme_ctrlr_get_default_io_qpair_opts(controller_, &options, sizeof(options));
-            options.io_queue_size = depth_limit_ + 1;
-            options.io_queue_requests = depth_limit_ * 2;
-            slot.queue = spdk_nvme_ctrlr_alloc_io_qpair(controller_, &options, sizeof(options));
-            if (!slot.queue) {
-                claim_(slot.acquired).store(0, std::memory_order_release);
-                return status_t {status_code_t::capacity_exhausted_k, "The controller would not give a queue pair"};
-            }
-            slot.depth = depth;
-            slot.locals_first = 0;
-            slot.locals_count = 0;
-            link_free_lists_(seat);
-            return queue_pair_t {disk_handle_t {static_cast<std::uint16_t>(seat), slot.generation}, depth};
+    status_t register_media(queue_ref_t const& queue_pair) noexcept {
+        auto [queue, queue_status] = queue_of_(queue_pair);
+        if (queue_status.failed()) return queue_status;
+        if (queue->media_controller_ == controller_) return {};
+        // The old pair's flights would never be polled again once submissions go to another pair
+        if (outstanding_requests_(*queue) != 0)
+            return {status_code_t::invalid_argument_k, "Drain the queue before it holds another controller"};
+        for (linux_spdk_queue_t::pair_t& pair : queue->pairs_) {
+            if (pair.controller != controller_) continue;
+            queue->media_controller_ = controller_;
+            queue->media_pair_ = pair.queue;
+            return {};
         }
-        return status_t {status_code_t::capacity_exhausted_k, "Every queue pair of the ring is held"};
-    }
 
-    /**
-     *  @brief Makes the calling thread the one that polls @p queue pair.
-     *  @param[in] queue_pair The queue pair this thread has just taken over, with nothing outstanding on it.
-     *
-     *  @note A queue pair carries no lock, so a second thread polling one corrupts its
-     *      tracker list in silence; that is why a handover is announced and why the queue
-     *      pair must be empty first.
-     */
-    status_t bind_queue_pair(queue_pair_t const& queue_pair) noexcept {
-        queue_pair_slot_t* const slot = slot_of_(queue_pair);
-        if (!slot) return {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
-        if (outstanding_(*slot) != 0)
-            return {status_code_t::invalid_argument_k, "Drain the queue pair before handing it over"};
+        if (reach_ == reach_t::translated_k && !queue->pinned_staging_.empty())
+            if (status_t const reachable = inspect_translation_(queue->pinned_staging_); reachable.failed())
+                return reachable;
+        spdk_nvme_io_qpair_opts options {};
+        spdk_nvme_ctrlr_get_default_io_qpair_opts(controller_, &options, sizeof(options));
+        options.io_queue_size = queue->depth_ + 1;
+        options.io_queue_requests = queue->depth_ * 2;
+        spdk_nvme_qpair* const allocated = spdk_nvme_ctrlr_alloc_io_qpair(controller_, &options, sizeof(options));
+        if (!allocated)
+            return {status_code_t::capacity_exhausted_k, "The controller would not give another queue pair"};
+        linux_spdk_queue_t::pair_t pair;
+        pair.controller = controller_;
+        pair.queue = allocated;
+        pair.attachment = attachment_;
+        pair.detach = &linux_spdk_detach<atomic_reference_, waiter_type_>;
+        if (queue->pairs_.push_back(std::move(pair)) != st::status_t::success_k) {
+            spdk_nvme_ctrlr_free_io_qpair(allocated);
+            return {status_code_t::out_of_memory_k, "The queue could not record another queue pair"};
+        }
+        linux_spdk_process_t& process = linux_spdk_process();
+        lock_claim<atomic_reference_, waiter_type_>(process.attachments_claim);
+        ++attachment_->holders;
+        unlock_claim<atomic_reference_>(process.attachments_claim);
+        queue->media_controller_ = controller_;
+        queue->media_pair_ = allocated;
         return {};
     }
 
-    /**
-     *  @brief Frees @p queue pair once it has nothing outstanding, and empties the handle.
-     *  @param[in,out] queue_pair The queue pair to return, surrendered on success and untouched on failure.
-     *
-     *  @note The admin queue is polled first, so an abort issued for this queue pair finishes before the
-     *      queue pair it names is gone.
-     */
-    status_t release_queue_pair(queue_pair_t& queue_pair) noexcept {
-        queue_pair_slot_t* const slot = slot_of_(queue_pair);
-        if (!slot) return {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
-        if (outstanding_(*slot) != 0)
-            return {status_code_t::invalid_argument_k, "Drain the queue pair before releasing it"};
-        [[maybe_unused]] std::int32_t const polled = spdk_nvme_ctrlr_process_admin_completions(controller_);
-        if (slot->queue) spdk_nvme_ctrlr_free_io_qpair(slot->queue);
-        slot->queue = nullptr;
-        ++slot->generation;
-        slot->depth = 0;
-        claim_(slot->acquired).store(0, std::memory_order_release);
-        queue_pair.surrender();
-        return {};
+    /** Requests @p queue_pair has submitted and not yet completed, staged successors included. */
+    [[nodiscard]] std::size_t outstanding(queue_ref_t const& queue_pair) const noexcept {
+        linux_spdk_queue_t const* const queue = queue_pair.template queue<linux_spdk_queue_t>();
+        return queue ? outstanding_requests_(*queue) : 0;
     }
 
-    /** Requests @p queue pair has submitted and not yet completed, staged successors included. */
-    [[nodiscard]] std::size_t outstanding(queue_pair_t const& queue_pair) const noexcept {
-        queue_pair_slot_t const* const slot = slot_of_(queue_pair);
-        return slot ? outstanding_(*slot) : 0;
-    }
-
-#pragma endregion Queue Pairs
+#pragma endregion Queues
 
 #pragma region Registrations
 
@@ -1068,7 +1266,7 @@ class linux_spdk_disk {
             return status_t {status_code_t::invalid_argument_k, "A namespace is named by its number"};
         spdk_nvme_ns* const chosen = spdk_nvme_ctrlr_get_ns(controller_, namespace_id);
         if (!chosen || !spdk_nvme_ns_is_active(chosen))
-            return status_t {status_code_t::not_found_k, "The controller carries no such active namespace"};
+            return status_t {status_code_t::not_found_k, "The controller holds no such active namespace"};
         if (spdk_nvme_ns_get_sector_size(chosen) != sector_bytes_ ||
             spdk_nvme_ns_get_max_io_xfer_size(chosen) < max_transfer_bytes_)
             return status_t {status_code_t::unsupported_k, "The namespace geometry differs from the first"};
@@ -1118,60 +1316,60 @@ class linux_spdk_disk {
 #pragma region Ring
 
     /**
-     *  @brief Takes as much of @p requests as @p queue pair still has credit for, and never waits.
-     *  @param[in] queue_pair The queue pair submitting, held by the calling thread.
+     *  @brief Takes as much of @p requests as @p queue_pair still has credit for, and never waits.
+     *  @param[in] queue_pair The queue submitting, owned by the calling thread, holding this disk.
      *  @param[in] requests The batch, of which a prefix is taken.
      *  @return How many were taken, which is zero on a full queue and never a reason to block.
      */
-    expected<std::size_t> submit(queue_pair_t const& queue_pair, std::span<request_t const> requests) noexcept {
-        queue_pair_slot_t* const slot = slot_of_(queue_pair);
-        if (!slot) return status_t {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
+    expected<std::size_t> submit(queue_ref_t const& queue_pair, std::span<request_t const> requests) noexcept {
         for (request_t const& request : requests)
-            if (request.token.queue_pair() != queue_pair.id() || request.token.generation() != queue_pair.generation())
-                return status_t {status_code_t::invalid_argument_k, "A request carries another queue pair's token"};
+            if (request.token.queue_pair() != queue_pair.id())
+                return status_t {status_code_t::invalid_argument_k, "A request holds another queue pair's token"};
+        auto [queue, queue_status] = queue_of_(queue_pair);
+        if (queue_status.failed()) return queue_status;
+        assert(queue->media_controller_ == controller_ && "Hold the disk into the queue before submitting");
 
-        std::uint32_t const base = window_of_(queue_pair.id());
-        std::size_t const credit = slot->depth - outstanding_(*slot);
+        std::size_t const credit = queue->depth_ - outstanding_requests_(*queue);
         std::size_t const room = requests.size() < credit ? requests.size() : credit;
 
-        std::uint32_t chain_flight = no_entry_k;
+        std::uint32_t chained_request = no_entry_k;
         std::uint32_t chain_staged = no_entry_k;
         chaining_state_t chaining = chaining_state_t::open_k;
         std::size_t taken = 0;
         for (; taken != room; ++taken) {
             request_t const& request = requests[taken];
             if (chaining == chaining_state_t::cut_k) {
-                push_local_(*slot, base, cancelled_completion_(request.token));
+                push_completion_made_by_queue_(*queue, cancelled_completion_(request.token));
                 chaining = chains_next_(request) ? chaining_state_t::cut_k : chaining_state_t::open_k;
                 continue;
             }
             if (chaining == chaining_state_t::held_k) {
-                auto [entry, hold_status] = hold_(*slot, base, request);
+                auto [entry, hold_status] = hold_(*queue, request);
                 if (hold_status.failed()) {
-                    push_local_(*slot, base, failed_completion_(request.token, hold_status));
+                    push_completion_made_by_queue_(*queue, failed_completion_(request.token, hold_status));
                     chaining = chains_next_(request) ? chaining_state_t::cut_k : chaining_state_t::open_k;
                     continue;
                 }
-                if (chain_staged == no_entry_k) flights_[base + chain_flight].successor = entry;
-                else staged_[base + chain_staged].next = entry;
+                if (chain_staged == no_entry_k) queue->submitted_requests_[chained_request].successor = entry;
+                else queue->staged_[chain_staged].next = entry;
                 chain_staged = entry;
                 chaining = chains_next_(request) ? chaining_state_t::held_k : chaining_state_t::open_k;
                 continue;
             }
-            status_t const defect = inspect_(request);
+            status_t const defect = inspect_(queue->pinned_staging_, request);
             if (defect.failed()) {
-                push_local_(*slot, base, failed_completion_(request.token, defect));
+                push_completion_made_by_queue_(*queue, failed_completion_(request.token, defect));
                 chaining = chains_next_(request) ? chaining_state_t::cut_k : chaining_state_t::open_k;
                 continue;
             }
-            auto [started, start_status] = start_(*slot, base, request);
+            auto [started, start_status] = start_(*queue, request);
             if (start_status.failed()) {
                 if (start_status == status_code_t::capacity_exhausted_k) break;
-                push_local_(*slot, base, failed_completion_(request.token, start_status));
+                push_completion_made_by_queue_(*queue, failed_completion_(request.token, start_status));
                 chaining = chains_next_(request) ? chaining_state_t::cut_k : chaining_state_t::open_k;
                 continue;
             }
-            chain_flight = started;
+            chained_request = started;
             chain_staged = no_entry_k;
             chaining = chains_next_(request) ? chaining_state_t::held_k : chaining_state_t::open_k;
         }
@@ -1179,84 +1377,73 @@ class linux_spdk_disk {
     }
 
     /**
-     *  @brief Polls @p queue pair and copies what finished into @p into.
-     *  @param[in] queue_pair The queue pair polling, held by the calling thread that submitted on it.
+     *  @brief Polls @p queue_pair's I/O queue pair and copies what finished into @p into.
+     *  @param[in] queue_pair The queue polling, owned by the calling thread that submitted on it.
      *  @param[out] into Room for completions, which bounds how many one call moves.
      *  @return How many completions were moved, which is zero when nothing has landed.
      *
      *  @note Polling is the only mechanism the driver has, which is why nothing here waits and why
      *      a bounded wait is a spin over this call rather than a blocking one.
      */
-    expected<std::size_t> poll_completions(queue_pair_t const& queue_pair, std::span<completion_t> into) noexcept {
-        queue_pair_slot_t* const slot = slot_of_(queue_pair);
-        if (!slot) return status_t {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
+    expected<std::size_t> poll_completions(queue_ref_t const& queue_pair, std::span<completion_t> into) noexcept {
+        auto [queue, queue_status] = queue_of_(queue_pair);
+        if (queue_status.failed()) return queue_status;
         if (into.empty()) return std::size_t {0};
-        std::uint32_t const base = window_of_(queue_pair.id());
-        if (slot->flights_count != 0) {
-            std::int32_t const polled = spdk_nvme_qpair_process_completions(slot->queue,
+        if (queue->outstanding_ != 0) {
+            std::int32_t const polled = spdk_nvme_qpair_process_completions(queue->media_pair_,
                                                                             static_cast<std::uint32_t>(into.size()));
             if (polled < 0) return status_t {status_code_t::device_k, "The queue pair failed while polling"};
-            if (polled == 0) poll_admin_when_idle_(*slot);
+            if (polled == 0) poll_admin_when_idle_(*queue);
         }
-        std::size_t moved = poll_completions_(*slot, base, into);
-        moved += drain_locals_(*slot, base, into.subspan(moved));
+        std::size_t moved = poll_completions_(*queue, into);
+        moved += drain_completions_made_by_queue_(*queue, into.subspan(moved));
         return moved;
     }
 
     /**
-     *  @brief Asks the controller to abort everything @p queue pair has in flight, which it may refuse.
-     *  @param[in] queue_pair The queue pair to stop, whose started commands still run to their own end.
+     *  @brief Asks the controller to abort what @p queue_pair has in flight, which it may refuse.
+     *  @param[in] queue_pair The queue to stop, whose started commands still run to their own end.
      *
      *  @note A refused abort is not an error here: the requests finish normally and @c drain polls
-     *      until they do, so a queue pair still sees exactly one completion per request it submitted.
+     *      until they do, so a queue still sees exactly one completion per request it submitted.
      */
-    void cancel(queue_pair_t const& queue_pair) noexcept {
-        queue_pair_slot_t* const slot = slot_of_(queue_pair);
-        if (!slot || slot->flights_count == 0) return;
-        std::uint32_t const base = window_of_(queue_pair.id());
-        for (std::uint32_t index = 0; index != depth_limit_; ++index) {
-            flight_t& flight = flights_[base + index];
-            if (flight.state != flight_state_t::outstanding_k) continue;
-            [[maybe_unused]] int const asked = spdk_nvme_ctrlr_cmd_abort_ext(controller_, slot->queue, &flight,
-                                                                             &linux_spdk_disk::aborted_, nullptr);
+    void cancel(queue_ref_t const& queue_pair) noexcept {
+        linux_spdk_queue_t* const queue = queue_pair.template queue<linux_spdk_queue_t>();
+        if (!queue || queue->outstanding_ == 0) return;
+        for (std::uint32_t index = 0; index != queue->depth_; ++index) {
+            submitted_request_t& submitted = queue->submitted_requests_[index];
+            if (submitted.state != submitted_request_state_t::outstanding_k) continue;
+            [[maybe_unused]] int const asked = spdk_nvme_ctrlr_cmd_abort_ext(
+                controller_, queue->media_pair_, &submitted, &linux_spdk_disk::aborted_, nullptr);
         }
     }
 
     /**
-     *  @brief Finishes and discards everything @p queue pair has outstanding, so its buffers may be freed.
-     *  @param[in] queue_pair The queue pair to empty, which may be cancelled or still running.
+     *  @brief Finishes and discards what @p queue_pair holds, so its buffers may be freed.
+     *  @param[in] queue_pair The queue to empty, which may be cancelled or still running.
      */
-    status_t drain(queue_pair_t const& queue_pair) noexcept {
-        queue_pair_slot_t const* const slot = slot_of_(queue_pair);
-        if (!slot) return {status_code_t::invalid_argument_k, "The queue pair is not this ring's"};
+    status_t drain(queue_ref_t const& queue_pair) noexcept {
+        auto [queue, queue_status] = queue_of_(queue_pair);
+        if (queue_status.failed()) return queue_status;
         std::array<completion_t, drain_batch_k> discarded {};
         for (std::size_t spins = 0; spins != drain_spin_limit_k; ++spins) {
-            if (outstanding_(*slot) == 0) return {};
+            if (outstanding_requests_(*queue) == 0) return {};
             auto [moved, poll_completions_status] = poll_completions(queue_pair, std::span<completion_t> {discarded});
             if (poll_completions_status.failed()) return poll_completions_status;
             if (moved != 0) continue;
             if (spins == drain_patience_k) cancel(queue_pair);
             waiter_type_ {}(&spins, spins, std::size_t {0});
         }
-        return {status_code_t::io_k, "The queue pair would not drain"};
+        return {status_code_t::io_k, "The queue would not drain"};
     }
 
 #pragma endregion Ring
 
   private:
 
-    /** Whether a flight slot is free, carries a command the device holds, or carries its result. */
-    enum class flight_state_t : std::uint8_t {
-
-        /** Nothing occupies the slot, which is on the queue pair's free list. */
-        vacant_k,
-
-        /** The device holds the command and has not answered for it. */
-        outstanding_k,
-
-        /** The completion callback has written the result, which the next poll copies out. */
-        finished_k,
-    };
+    using submitted_request_t = linux_spdk_queue_t::submitted_request_t;
+    using staged_t = linux_spdk_queue_t::staged_t;
+    using submitted_request_state_t = linux_spdk_queue_t::submitted_request_state_t;
 
     /** How the controller reaches a registered range, which decides what registered memory must prove. */
     enum class reach_t : std::uint8_t {
@@ -1292,43 +1479,6 @@ class linux_spdk_disk {
 
         /** A chain was cut, so the rest of it is answered with @c cancelled_k. */
         cut_k,
-    };
-
-    /** One queue pair, its credit, and the three queues it polls from. */
-    struct queue_pair_slot_t {
-
-        /** Zero while the slot is free, one while a queue pair holds it. */
-        std::int32_t acquired = 0;
-
-        /** Raised every time the slot is acquired again, so a stale token routes nowhere. */
-        queue_pair_generation_t generation = 0;
-
-        /** Requests this queue pair may keep in flight, fixed when the queue pair was taken. */
-        queue_depth_t depth = 0;
-
-        /** Commands the device holds for this queue pair, plus the results not yet copied out. */
-        std::uint32_t flights_count = 0;
-
-        /** Head of this queue pair's free flight slots, @c no_entry_k when every one is taken. */
-        std::uint32_t flights_free = no_entry_k;
-
-        /** Successors of chained requests this queue pair is holding back. */
-        std::uint32_t staged_count = 0;
-
-        /** Head of this queue pair's free staging slots, @c no_entry_k when every one is taken. */
-        std::uint32_t staged_free = no_entry_k;
-
-        /** Where this queue pair's oldest unreaped local completion sits inside its window. */
-        std::uint32_t locals_first = 0;
-
-        /** Completions the disk answered itself, which no command ever carried. */
-        std::uint32_t locals_count = 0;
-
-        /** Reaps since the admin queue was last polled that found nothing on the queue pair. */
-        std::uint32_t idle_polls = 0;
-
-        /** The queue pair this queue pair owns, which exactly one thread may ever poll. */
-        spdk_nvme_qpair* queue = nullptr;
     };
 
     /** One range in the driver's memory map, and the count of commands still writing into it. */
@@ -1381,64 +1531,8 @@ class linux_spdk_disk {
         std::uint32_t namespace_id = 0;
     };
 
-    /** One command the device holds, and the result its completion callback writes into it. */
-    struct flight_t {
-
-        /** The token the queue pair minted, which the completion carries back unchanged. */
-        request_token_t token;
-
-        /** Bytes the extent asked for, which an NVMe command moves whole or not at all. */
-        std::uint64_t length = 0;
-
-        /** Bytes the device moved, which the callback fills in. */
-        std::uint64_t transferred_bytes = 0;
-
-        /** Why the command ended this way, which the callback fills in. */
-        status_t status;
-
-        /** The range the request borrowed, given back when its completion is completed. */
-        memory_reference_t buffer;
-
-        /** The target the request borrowed, given back when its completion is completed. */
-        medium_reference_t medium;
-
-        /** The staged request waiting on this one, or @c no_entry_k when none does. */
-        std::uint32_t successor = no_entry_k;
-
-        /** The next free slot while this one is vacant, which is how the free list is linked. */
-        std::uint32_t next_free = no_entry_k;
-
-        /** How the command ended, which the callback fills in. */
-        completion_state_t outcome = completion_state_t::completed_k;
-
-        /** Whether the slot is free, holds a command, or holds its result. */
-        flight_state_t state = flight_state_t::vacant_k;
-
-        /** The command's opcode, which a command-specific status is spelled by. */
-        std::uint8_t opcode = 0;
-    };
-
-    /** One successor of a chained request, held back until its predecessor transfers in full. */
-    struct staged_t {
-
-        /** The request itself, issued unchanged when the chain reaches it. */
-        request_t request;
-
-        /** The staged request waiting on this one, or @c no_entry_k when none does. */
-        std::uint32_t next = no_entry_k;
-
-        /** The next free slot while this one is vacant, which is how the free list is linked. */
-        std::uint32_t next_free = no_entry_k;
-    };
-
-    /** The index that names no slot, in a free list and in a chain alike. */
-    static constexpr std::uint32_t no_entry_k = 0xFFFFFFFFu;
-
     /** Namespaces one disk registers at once. */
     static constexpr std::uint16_t targets_limit_k = 16;
-
-    /** Requests one queue pair may keep in flight at most, which bounds what a mount may ask for. */
-    static constexpr queue_depth_t depth_ceiling_k = 16384;
 
     /** Completions one drain discards at a time. */
     static constexpr std::size_t drain_batch_k = 32;
@@ -1449,7 +1543,10 @@ class linux_spdk_disk {
     /** Reaps a drain performs before it calls the queue pair broken. */
     static constexpr std::size_t drain_spin_limit_k = std::size_t {1} << 24;
 
-    /** Idle polls of one queue pair between two polls of the admin queue. */
+    /** The index that names no slot, in a free list and in a chain alike. */
+    static constexpr std::uint32_t no_entry_k = linux_spdk_queue_t::no_entry_k;
+
+    /** Idle polls of one queue between two polls of the admin queue. */
     static constexpr std::uint32_t admin_poll_stride_k = 64;
 
     /** Fills @p transport from @p address, parsing a transport ID or taking a bare address as PCIe. */
@@ -1475,14 +1572,9 @@ class linux_spdk_disk {
 
     /** Whatever a mount must refuse before it touches the controller at all. */
     static status_t inspect_config_(linux_spdk_disk_config_t const& config) noexcept {
-        if (config.queue_pairs_limit == 0 || config.depth_limit == 0)
-            return {status_code_t::invalid_argument_k, "A ring needs a queue pair and depth"};
-        if (config.queue_pairs_limit == static_cast<std::uint16_t>(queue_pair_id_t::unallocated_k) ||
-            config.registered_memory_limit == static_cast<std::uint16_t>(registered_memory_id_t::unregistered_k))
-            return {status_code_t::invalid_argument_k, "A ring reserves one id for empty handles"};
+        if (config.registered_memory_limit >= static_cast<std::uint16_t>(registered_memory_id_t::queue_range_k))
+            return {status_code_t::invalid_argument_k, "A ring limit reaches a reserved id"};
         if (config.registered_memory_limit == 0) return {status_code_t::invalid_argument_k, "A ring needs a range"};
-        if (config.depth_limit > depth_ceiling_k)
-            return {status_code_t::invalid_argument_k, "A queue pair holds fewer requests than that"};
         return {};
     }
 
@@ -1509,30 +1601,30 @@ class linux_spdk_disk {
 #pragma region Callbacks
 
     /**
-     *  @brief Writes one command's result into the flight it was issued from.
+     *  @brief Writes one command's result into the submitted it was issued from.
      *
      *  The driver calls this from inside @c spdk_nvme_qpair_process_completions, on the very thread
      *  that holds the queue pair, so nothing here is shared and no atomic is needed.
      */
     static void completed_(void* context, spdk_nvme_cpl const* result) noexcept {
-        flight_t& flight = *static_cast<flight_t*>(context);
+        submitted_request_t& submitted = *static_cast<submitted_request_t*>(context);
         if (!spdk_nvme_cpl_is_error(result)) {
-            flight.transferred_bytes = flight.length;
-            flight.outcome = completion_state_t::completed_k;
-            flight.status = {};
-            flight.state = flight_state_t::finished_k;
+            submitted.transferred_bytes = submitted.length;
+            submitted.outcome = completion_state_t::completed_k;
+            submitted.status = {};
+            submitted.state = submitted_request_state_t::finished_k;
             return;
         }
-        flight.transferred_bytes = 0;
-        flight.state = flight_state_t::finished_k;
+        submitted.transferred_bytes = 0;
+        submitted.state = submitted_request_state_t::finished_k;
         if (result->status.sct == SPDK_NVME_SCT_GENERIC && result->status.sc == SPDK_NVME_SC_ABORTED_BY_REQUEST) {
-            flight.outcome = completion_state_t::cancelled_k;
-            flight.status = {status_code_t::uninitialized_k, "The queue_pair cancelled this request"};
+            submitted.outcome = completion_state_t::cancelled_k;
+            submitted.status = {status_code_t::uninitialized_k, "The queue_pair cancelled this request"};
             return;
         }
-        flight.outcome = completion_state_t::failed_k;
-        char const* const spelled = spdk_nvme_cpl_get_status_string_ext(&result->status, flight.opcode);
-        flight.status = {status_code_t::device_k, spelled};
+        submitted.outcome = completion_state_t::failed_k;
+        char const* const spelled = spdk_nvme_cpl_get_status_string_ext(&result->status, submitted.opcode);
+        submitted.status = {status_code_t::device_k, spelled};
     }
 
     /** Swallows the completion an abort posts for itself, which no queue pair ever asked for. */
@@ -1542,42 +1634,17 @@ class linux_spdk_disk {
 
 #pragma region Bookkeeping
 
-    /** Where one queue pair's flights, staged successors and local completions sit inside the windows. */
-    [[nodiscard]] std::uint32_t window_of_(queue_pair_id_t id) const noexcept {
-        return static_cast<std::uint32_t>(id) * depth_limit_;
+    /** The SPDK queue @p queue_pair names, or why this disk cannot serve it. */
+    static expected<linux_spdk_queue_t*> queue_of_(queue_ref_t const& queue_pair) noexcept {
+        if (linux_spdk_queue_t* const queue = queue_pair.template queue<linux_spdk_queue_t>(); queue) return queue;
+        if (queue_pair.template queue<blocking_queue_t>())
+            return status_t {status_code_t::unsupported_k, "No blocking queue reads an SPDK namespace"};
+        return status_t {status_code_t::invalid_argument_k, "The queue is of another transport"};
     }
 
-    /** Requests @p slot has outstanding, counting the device's, the disk's own and the held ones. */
-    [[nodiscard]] static std::size_t outstanding_(queue_pair_slot_t const& slot) noexcept {
-        return slot.flights_count + slot.staged_count + slot.locals_count;
-    }
-
-    /** Puts every flight and staging slot of @p seat back on its free lists, oldest index first. */
-    void link_free_lists_(std::size_t seat) noexcept {
-        std::uint32_t const base = static_cast<std::uint32_t>(seat) * depth_limit_;
-        queue_pair_slot_t& slot = queue_pairs_[seat];
-        for (std::uint32_t index = 0; index != depth_limit_; ++index) {
-            flights_[base + index] = flight_t {};
-            flights_[base + index].next_free = index + 1 == depth_limit_ ? no_entry_k : index + 1;
-            staged_[base + index] = staged_t {};
-            staged_[base + index].next_free = index + 1 == depth_limit_ ? no_entry_k : index + 1;
-        }
-        slot.flights_free = 0;
-        slot.flights_count = 0;
-        slot.staged_free = 0;
-        slot.staged_count = 0;
-    }
-
-    [[nodiscard]] queue_pair_slot_t* slot_of_(queue_pair_t const& queue_pair) noexcept {
-        if (!queue_pair.held() || static_cast<std::size_t>(queue_pair.id()) >= queue_pairs_.size()) return nullptr;
-        queue_pair_slot_t& slot = queue_pairs_[static_cast<std::size_t>(queue_pair.id())];
-        return slot.acquired != 0 && slot.generation == queue_pair.generation() ? &slot : nullptr;
-    }
-
-    [[nodiscard]] queue_pair_slot_t const* slot_of_(queue_pair_t const& queue_pair) const noexcept {
-        if (!queue_pair.held() || static_cast<std::size_t>(queue_pair.id()) >= queue_pairs_.size()) return nullptr;
-        queue_pair_slot_t const& slot = queue_pairs_[static_cast<std::size_t>(queue_pair.id())];
-        return slot.acquired != 0 && slot.generation == queue_pair.generation() ? &slot : nullptr;
+    /** Requests @p queue has outstanding: the device's, the disk's own and the held ones. */
+    [[nodiscard]] static std::size_t outstanding_requests_(linux_spdk_queue_t const& queue) noexcept {
+        return queue.outstanding_ + queue.staged_count_ + queue.completions_made_by_queue_count_;
     }
 
     [[nodiscard]] registered_memory_slot_t* slot_of_(registered_memory_t const& registered_memory) noexcept {
@@ -1606,60 +1673,76 @@ class linux_spdk_disk {
         return slot.registered != 0 && slot.generation == place.generation ? &slot : nullptr;
     }
 
+    /** The bytes @p place names: the submitting queue's own @p range for @c queue_range_k, else a
+     *  registered range, or nothing. */
+    [[nodiscard]] std::span<byte_t> memory_of_(std::span<byte_t> range, memory_reference_t place) noexcept {
+        if (place.memory_id == registered_memory_id_t::queue_range_k) return range;
+        registered_memory_slot_t const* const slot = resolve_(place);
+        return slot ? std::span<byte_t> {slot->base, static_cast<std::size_t>(slot->length)} : std::span<byte_t> {};
+    }
+
     /** Marks the range and the target of @p request as live, so neither can be taken back under it. */
-    void borrow_(request_t const& request) noexcept {
+    void count_request_on_slots_(request_t const& request) noexcept {
         if (registered_memory_slot_t* const slot = resolve_(request.buffer); slot)
             in_flight_(*slot).store_add(1, std::memory_order_acquire);
         if (registered_medium_slot_t* const slot = resolve_(request.medium); slot)
             in_flight_(*slot).store_add(1, std::memory_order_acquire);
     }
 
-    /** Releases both once the device is done with the bytes the request @p flight remembers. */
-    void restore_(flight_t const& flight) noexcept {
-        if (registered_memory_slot_t* const slot = resolve_(flight.buffer); slot)
+    /** Releases both once the device is done with the bytes the request @p submitted remembers. */
+    void uncount_request_on_slots_(submitted_request_t const& submitted) noexcept {
+        if (registered_memory_slot_t* const slot = resolve_(submitted.buffer); slot)
             in_flight_(*slot).store_sub(1, std::memory_order_release);
-        if (registered_medium_slot_t* const slot = resolve_(flight.medium); slot)
+        if (registered_medium_slot_t* const slot = resolve_(submitted.medium); slot)
             in_flight_(*slot).store_sub(1, std::memory_order_release);
     }
 
-    /** Takes one flight slot off @p slot's free list, or @c no_entry_k when every one is taken. */
-    [[nodiscard]] std::uint32_t take_flight_(queue_pair_slot_t& slot, std::uint32_t base) noexcept {
-        std::uint32_t const index = slot.flights_free;
+    /** Takes one submitted slot off @p queue's free list, or @c no_entry_k when every
+     *  one is taken. */
+    [[nodiscard]] static std::uint32_t take_free_submitted_request_(linux_spdk_queue_t& queue) noexcept {
+        std::uint32_t const index = queue.first_free_submitted_request_;
         if (index == no_entry_k) return no_entry_k;
-        slot.flights_free = flights_[base + index].next_free;
-        ++slot.flights_count;
+        queue.first_free_submitted_request_ = queue.submitted_requests_[index].next_free;
+        ++queue.outstanding_;
         return index;
     }
 
-    /** Puts one flight slot back on @p slot's free list, clearing what it held. */
-    void free_flight_(queue_pair_slot_t& slot, std::uint32_t base, std::uint32_t index) noexcept {
-        flights_[base + index] = flight_t {};
-        flights_[base + index].next_free = slot.flights_free;
-        slot.flights_free = index;
-        --slot.flights_count;
+    /** Puts one submitted slot back on @p queue's free list, clearing what it held. */
+    static void free_submitted_request_(linux_spdk_queue_t& queue, std::uint32_t index) noexcept {
+        queue.submitted_requests_[index] = submitted_request_t {};
+        queue.submitted_requests_[index].next_free = queue.first_free_submitted_request_;
+        queue.first_free_submitted_request_ = index;
+        --queue.outstanding_;
     }
 
-    /** Puts one staging slot back on @p slot's free list, clearing what it held. */
-    void free_staged_(queue_pair_slot_t& slot, std::uint32_t base, std::uint32_t index) noexcept {
-        staged_[base + index] = staged_t {};
-        staged_[base + index].next_free = slot.staged_free;
-        slot.staged_free = index;
-        --slot.staged_count;
+    /** Puts one staging slot back on @p queue's free list, clearing what it held. */
+    static void free_staged_(linux_spdk_queue_t& queue, std::uint32_t index) noexcept {
+        queue.staged_[index] = staged_t {};
+        queue.staged_[index].next_free = queue.staged_free_;
+        queue.staged_free_ = index;
+        --queue.staged_count_;
     }
 
-    /** Places @p completion at the back of @p slot's own queue, which poll drains after the device's. */
-    void push_local_(queue_pair_slot_t& slot, std::uint32_t base, completion_t const& completion) noexcept {
-        locals_[base + (slot.locals_first + slot.locals_count) % slot.depth] = completion;
-        ++slot.locals_count;
+    /** Queues @p completion among @p queue's own, which poll drains after the device's. */
+    static void push_completion_made_by_queue_(linux_spdk_queue_t& queue, completion_t const& completion) noexcept {
+        queue.completions_made_by_queue_[(queue.completions_made_by_queue_first_ +
+                                          queue.completions_made_by_queue_count_) %
+                                         queue.depth_] = completion;
+        ++queue.completions_made_by_queue_count_;
     }
 
     /** Moves what the disk answered itself into @p into, oldest first. */
-    std::size_t drain_locals_(queue_pair_slot_t& slot, std::uint32_t base, std::span<completion_t> into) noexcept {
-        std::size_t const moving = into.size() < slot.locals_count ? into.size() : slot.locals_count;
+    static std::size_t drain_completions_made_by_queue_(linux_spdk_queue_t& queue,
+                                                        std::span<completion_t> into) noexcept {
+        std::size_t const moving = into.size() < queue.completions_made_by_queue_count_
+                                       ? into.size()
+                                       : queue.completions_made_by_queue_count_;
         for (std::size_t index = 0; index != moving; ++index)
-            into[index] = locals_[base + (slot.locals_first + index) % slot.depth];
-        slot.locals_first = static_cast<std::uint32_t>((slot.locals_first + moving) % slot.depth);
-        slot.locals_count -= static_cast<std::uint32_t>(moving);
+            into[index] =
+                queue.completions_made_by_queue_[(queue.completions_made_by_queue_first_ + index) % queue.depth_];
+        queue.completions_made_by_queue_first_ = static_cast<std::uint32_t>(
+            (queue.completions_made_by_queue_first_ + moving) % queue.depth_);
+        queue.completions_made_by_queue_count_ -= static_cast<std::uint32_t>(moving);
         return moving;
     }
 
@@ -1721,10 +1804,11 @@ class linux_spdk_disk {
         slot.mapping = mapping_t::recorded_k;
     }
 
-    /** Polls the admin queue every @c admin_poll_stride_k idle polls of @p slot, where an abort's completion lands. */
-    void poll_admin_when_idle_(queue_pair_slot_t& slot) noexcept {
-        if (++slot.idle_polls != admin_poll_stride_k) return;
-        slot.idle_polls = 0;
+    /** Polls the admin queue, where an abort's completion lands, every @c admin_poll_stride_k idle
+     *  polls of @p queue. */
+    void poll_admin_when_idle_(linux_spdk_queue_t& queue) noexcept {
+        if (++queue.idle_polls_ != admin_poll_stride_k) return;
+        queue.idle_polls_ = 0;
         [[maybe_unused]] std::int32_t const polled = spdk_nvme_ctrlr_process_admin_completions(controller_);
     }
 
@@ -1741,8 +1825,9 @@ class linux_spdk_disk {
         return {};
     }
 
-    /** Whatever the driver would accept and the device would then corrupt, checked before it is issued. */
-    status_t inspect_(request_t const& request) noexcept {
+    /** Whatever the driver would accept and the device would then corrupt, checked before it is
+     *  issued, @p range being the submitting queue's own blocks. */
+    status_t inspect_(std::span<byte_t> range, request_t const& request) noexcept {
         registered_medium_slot_t const* const target = resolve_(request.medium);
         if (!target) return {status_code_t::invalid_argument_k, "The request names no registered target"};
         if ((request.kind == request_kind_t::write_k || request.kind == request_kind_t::deallocate_k) &&
@@ -1757,11 +1842,11 @@ class linux_spdk_disk {
                 return {status_code_t::invalid_argument_k, "The deallocation runs past the namespace"};
             return {};
         }
-        registered_memory_slot_t const* const chunk = resolve_(request.buffer);
-        if (!chunk) return {status_code_t::invalid_argument_k, "The request names no registered range"};
+        std::span<byte_t> const memory = memory_of_(range, request.buffer);
+        if (memory.empty()) return {status_code_t::invalid_argument_k, "The request names no registered range"};
         if (request.extent.length == 0)
             return {status_code_t::invalid_argument_k, "A zero byte transfer is no command"};
-        if (request.buffer.offset > chunk->length || request.extent.length > chunk->length - request.buffer.offset)
+        if (request.buffer.offset > memory.size() || request.extent.length > memory.size() - request.buffer.offset)
             return {status_code_t::invalid_argument_k, "The request runs past its registered range"};
         if (request.extent.length > max_transfer_bytes_)
             return {status_code_t::invalid_argument_k, "The request is larger than one transfer"};
@@ -1769,38 +1854,38 @@ class linux_spdk_disk {
             return {status_code_t::invalid_argument_k, "The request does not meet the namespace's sector"};
         if (!request.extent.fits_within(target->capacity))
             return {status_code_t::invalid_argument_k, "The request runs past the namespace"};
-        if (!is_address_aligned(chunk->base + request.buffer.offset, portable_alignment_k))
+        if (!is_address_aligned(memory.data() + request.buffer.offset, portable_alignment_k))
             return {status_code_t::invalid_argument_k, "The payload is not page aligned"};
         return {};
     }
 
     /**
-     *  @brief Issues @p request on @p slot's queue pair and remembers what its completion will need.
-     *  @return The flight slot it occupies, or why the driver would not take it.
+     *  @brief Issues @p request on @p queue's held pair, remembering what its completion needs.
+     *  @return The submitted slot it occupies, or why the driver would not take it.
      */
-    expected<std::uint32_t> start_(queue_pair_slot_t& slot, std::uint32_t base, request_t const& request) noexcept {
-        std::uint32_t const index = take_flight_(slot, base);
+    expected<std::uint32_t> start_(linux_spdk_queue_t& queue, request_t const& request) noexcept {
+        std::uint32_t const index = take_free_submitted_request_(queue);
         if (index == no_entry_k)
-            return status_t {status_code_t::capacity_exhausted_k, "The queue pair is out of command slots"};
-        flight_t& flight = flights_[base + index];
-        flight.token = request.token;
-        flight.length = request.kind == request_kind_t::flush_k || request.kind == request_kind_t::deallocate_k
-                            ? 0
-                            : request.extent.length;
-        flight.buffer = request.buffer;
-        flight.medium = request.medium;
-        flight.successor = no_entry_k;
-        flight.state = flight_state_t::outstanding_k;
-        borrow_(request);
+            return status_t {status_code_t::capacity_exhausted_k, "The queue is out of command slots"};
+        submitted_request_t& submitted = queue.submitted_requests_[index];
+        submitted.token = request.token;
+        submitted.length = request.kind == request_kind_t::flush_k || request.kind == request_kind_t::deallocate_k
+                               ? 0
+                               : request.extent.length;
+        submitted.buffer = request.buffer;
+        submitted.medium = request.medium;
+        submitted.successor = no_entry_k;
+        submitted.state = submitted_request_state_t::outstanding_k;
+        count_request_on_slots_(request);
 
         spdk_nvme_ns* const space = resolve_(request.medium)->space;
         int issued = 0;
-        flight.opcode = request.kind == request_kind_t::flush_k        ? SPDK_NVME_OPC_FLUSH
-                        : request.kind == request_kind_t::deallocate_k ? SPDK_NVME_OPC_DATASET_MANAGEMENT
-                        : request.kind == request_kind_t::read_k       ? SPDK_NVME_OPC_READ
-                                                                       : SPDK_NVME_OPC_WRITE;
+        submitted.opcode = request.kind == request_kind_t::flush_k        ? SPDK_NVME_OPC_FLUSH
+                           : request.kind == request_kind_t::deallocate_k ? SPDK_NVME_OPC_DATASET_MANAGEMENT
+                           : request.kind == request_kind_t::read_k       ? SPDK_NVME_OPC_READ
+                                                                          : SPDK_NVME_OPC_WRITE;
         if (request.kind == request_kind_t::flush_k) {
-            issued = spdk_nvme_ns_cmd_flush(space, slot.queue, &linux_spdk_disk::completed_, &flight);
+            issued = spdk_nvme_ns_cmd_flush(space, queue.media_pair_, &linux_spdk_disk::completed_, &submitted);
         }
         else if (request.kind == request_kind_t::deallocate_k) {
             // The driver copies the range into the command's own payload, so it may live
@@ -1808,89 +1893,88 @@ class linux_spdk_disk {
             spdk_nvme_dsm_range range {};
             range.starting_lba = request.extent.offset / sector_bytes_;
             range.length = static_cast<std::uint32_t>(request.extent.length / sector_bytes_);
-            issued = spdk_nvme_ns_cmd_dataset_management(space, slot.queue, SPDK_NVME_DSM_ATTR_DEALLOCATE, &range, 1,
-                                                         &linux_spdk_disk::completed_, &flight);
+            issued = spdk_nvme_ns_cmd_dataset_management(space, queue.media_pair_, SPDK_NVME_DSM_ATTR_DEALLOCATE,
+                                                         &range, 1, &linux_spdk_disk::completed_, &submitted);
         }
         else {
-            registered_memory_slot_t const* const chunk = resolve_(request.buffer);
-            void* const payload = chunk->base + request.buffer.offset;
+            void* const payload = memory_of_(queue.pinned_staging_, request.buffer).data() + request.buffer.offset;
             std::uint64_t const first = request.extent.offset / sector_bytes_;
             std::uint32_t const sectors = static_cast<std::uint32_t>(request.extent.length / sector_bytes_);
             issued = request.kind == request_kind_t::read_k
-                         ? spdk_nvme_ns_cmd_read(space, slot.queue, payload, first, sectors,
-                                                 &linux_spdk_disk::completed_, &flight, 0)
-                         : spdk_nvme_ns_cmd_write(space, slot.queue, payload, first, sectors,
-                                                  &linux_spdk_disk::completed_, &flight, 0);
+                         ? spdk_nvme_ns_cmd_read(space, queue.media_pair_, payload, first, sectors,
+                                                 &linux_spdk_disk::completed_, &submitted, 0)
+                         : spdk_nvme_ns_cmd_write(space, queue.media_pair_, payload, first, sectors,
+                                                  &linux_spdk_disk::completed_, &submitted, 0);
         }
         if (issued == 0) return index;
-        restore_(flight);
-        free_flight_(slot, base, index);
+        uncount_request_on_slots_(submitted);
+        free_submitted_request_(queue, index);
         if (issued == -ENOMEM)
             return status_t {status_code_t::capacity_exhausted_k, "The queue pair is out of command slots"};
         return status_t {status_code_t::device_k, "The driver would not take this command"};
     }
 
     /** Holds @p request back until the chain reaches it, answering the staging slot it occupies. */
-    expected<std::uint32_t> hold_(queue_pair_slot_t& slot, std::uint32_t base, request_t const& request) noexcept {
-        std::uint32_t const index = slot.staged_free;
+    static expected<std::uint32_t> hold_(linux_spdk_queue_t& queue, request_t const& request) noexcept {
+        std::uint32_t const index = queue.staged_free_;
         if (index == no_entry_k)
-            return status_t {status_code_t::capacity_exhausted_k, "The queue pair has no room for chains"};
-        slot.staged_free = staged_[base + index].next_free;
-        ++slot.staged_count;
-        staged_[base + index].request = request;
-        staged_[base + index].next = no_entry_k;
+            return status_t {status_code_t::capacity_exhausted_k, "The queue has no room for chains"};
+        queue.staged_free_ = queue.staged_[index].next_free;
+        ++queue.staged_count_;
+        queue.staged_[index].request = request;
+        queue.staged_[index].next = no_entry_k;
         return index;
     }
 
     /** Answers every request of the chain from @p first with @c cancelled_k, since it was cut. */
-    void cut_chain_(queue_pair_slot_t& slot, std::uint32_t base, std::uint32_t first) noexcept {
+    static void cancel_linked_chain_(linux_spdk_queue_t& queue, std::uint32_t first) noexcept {
         for (std::uint32_t entry = first; entry != no_entry_k;) {
-            std::uint32_t const next = staged_[base + entry].next;
-            push_local_(slot, base, cancelled_completion_(staged_[base + entry].request.token));
-            free_staged_(slot, base, entry);
+            std::uint32_t const next = queue.staged_[entry].next;
+            push_completion_made_by_queue_(queue, cancelled_completion_(queue.staged_[entry].request.token));
+            free_staged_(queue, entry);
             entry = next;
         }
     }
 
     /** Issues the staged request @p entry now that its predecessor transferred in full. */
-    void resume_(queue_pair_slot_t& slot, std::uint32_t base, std::uint32_t entry) noexcept {
-        request_t const request = staged_[base + entry].request;
-        std::uint32_t const next = staged_[base + entry].next;
-        free_staged_(slot, base, entry);
-        status_t const defect = inspect_(request);
+    void resume_(linux_spdk_queue_t& queue, std::uint32_t entry) noexcept {
+        request_t const request = queue.staged_[entry].request;
+        std::uint32_t const next = queue.staged_[entry].next;
+        free_staged_(queue, entry);
+        status_t const defect = inspect_(queue.pinned_staging_, request);
         if (defect.failed()) {
-            push_local_(slot, base, failed_completion_(request.token, defect));
-            cut_chain_(slot, base, next);
+            push_completion_made_by_queue_(queue, failed_completion_(request.token, defect));
+            cancel_linked_chain_(queue, next);
             return;
         }
-        auto [started, start_status] = start_(slot, base, request);
+        auto [started, start_status] = start_(queue, request);
         if (start_status.failed()) {
-            push_local_(slot, base, failed_completion_(request.token, start_status));
-            cut_chain_(slot, base, next);
+            push_completion_made_by_queue_(queue, failed_completion_(request.token, start_status));
+            cancel_linked_chain_(queue, next);
             return;
         }
-        flights_[base + started].successor = next;
+        queue.submitted_requests_[started].successor = next;
     }
 
-    /** Copies every finished command of @p slot into @p into, resuming or cutting the chains they head. */
-    std::size_t poll_completions_(queue_pair_slot_t& slot, std::uint32_t base, std::span<completion_t> into) noexcept {
+    /** Copies every finished command of @p queue into @p into, resuming or cutting their chains. */
+    std::size_t poll_completions_(linux_spdk_queue_t& queue, std::span<completion_t> into) noexcept {
         std::size_t moved = 0;
-        for (std::uint32_t index = 0; index != depth_limit_ && moved != into.size(); ++index) {
-            flight_t& flight = flights_[base + index];
-            if (flight.state != flight_state_t::finished_k) continue;
+        for (std::uint32_t index = 0; index != queue.depth_ && moved != into.size(); ++index) {
+            submitted_request_t& submitted = queue.submitted_requests_[index];
+            if (submitted.state != submitted_request_state_t::finished_k) continue;
             completion_t completion;
-            completion.token = flight.token;
-            completion.transferred_bytes = flight.transferred_bytes;
-            completion.status = flight.status;
-            completion.state = flight.outcome;
-            std::uint32_t const successor = flight.successor;
-            restore_(flight);
-            free_flight_(slot, base, index);
+            completion.token = submitted.token;
+            completion.transferred_bytes = submitted.transferred_bytes;
+            completion.status = submitted.status;
+            completion.state = submitted.outcome;
+            std::uint32_t const successor = submitted.successor;
+            uncount_request_on_slots_(submitted);
+            free_submitted_request_(queue, index);
             into[moved] = completion;
             ++moved;
             if (successor == no_entry_k) continue;
-            if (completion.state == completion_state_t::completed_k) resume_(slot, base, successor);
-            else cut_chain_(slot, base, successor);
+            if (completion.state == completion_state_t::completed_k) resume_(queue, successor);
+            else cancel_linked_chain_(queue, successor);
         }
         return moved;
     }
@@ -1900,16 +1984,12 @@ class linux_spdk_disk {
   public:
 
     /**
-     *  @brief Frees every queue pair, unmaps every range, and gives back every namespace and the
-     *      disk's share of the controller, detaching it after the last, before the disk dies.
+     *  @brief Unmaps every range, and gives back every namespace and the disk's share of the
+     *      controller, detaching it after the last holder, before the disk dies.
      *  @note It waits on the process's claims, so the mount's unmount calls it, never a destructor.
+     *      A queue still holding an I/O queue pair on the controller keeps it attached.
      */
     void release() noexcept {
-        for (std::size_t seat = 0; seat != queue_pairs_.size(); ++seat) {
-            if (!queue_pairs_[seat].queue) continue;
-            spdk_nvme_ctrlr_free_io_qpair(queue_pairs_[seat].queue);
-            queue_pairs_[seat].queue = nullptr;
-        }
         for (std::size_t index = 0; index != registered_memories_.size(); ++index) {
             registered_memory_slot_t& slot = registered_memories_[index];
             if (!slot.base) continue;
@@ -1922,7 +2002,6 @@ class linux_spdk_disk {
         if (attachment_) linux_spdk_detach<atomic_reference_, waiter_type_>(*attachment_);
         attachment_ = nullptr;
         controller_ = nullptr;
-        queue_pairs_.clear();
         registered_memories_.clear();
         media_.clear();
     }
@@ -1932,23 +2011,11 @@ class linux_spdk_disk {
     /** The environment this disk holds a share of, declared first so it outlives everything below. */
     linux_spdk_environment<atomic_reference_, waiter_type_> environment_;
 
-    /** One slot per queue pair the disk hands out, which is one queue pair each. */
-    st::vector<queue_pair_slot_t> queue_pairs_;
-
     /** One slot per memory range the driver has mapped for this disk. */
     st::vector<registered_memory_slot_t> registered_memories_;
 
     /** The namespaces registered as targets, at most @c targets_limit_k of them. */
     st::vector<registered_medium_slot_t> media_;
-
-    /** Every queue pair's commands, in windows of @c depth_limit_ addressed through a free list. */
-    st::vector<flight_t> flights_;
-
-    /** Every queue pair's held successors, in windows of @c depth_limit_ addressed through a free list. */
-    st::vector<staged_t> staged_;
-
-    /** Every queue pair's own completions, in windows of @c depth_limit_ read as a circle. */
-    st::vector<completion_t> locals_;
 
     /** The process's connection to the controller, whose share this disk gives back at close. */
     linux_spdk_attachment_t* attachment_ = nullptr;
@@ -1959,13 +2026,10 @@ class linux_spdk_disk {
     /** Bytes one sector spans, which every offset and every length must be a multiple of. */
     std::uint64_t sector_bytes_ = 0;
 
-    /** The largest extent one command carries, as the namespace reports it. */
+    /** The largest extent one command holds, as the namespace reports it. */
     std::uint64_t max_transfer_bytes_ = 0;
 
-    /** Requests one queue pair may keep in flight, and the stride of every queue pair's window. */
-    queue_depth_t depth_limit_ = 0;
-
-    /** Leases the disk hands out, lowered at mount to the queue pairs the controller offers. */
+    /** I/O queue pairs the controller grants the process, which bounds the queues it serves. */
     std::uint16_t queue_pairs_limit_ = 0;
 
     /** Memory ranges the disk maps at once. */
@@ -1981,8 +2045,21 @@ class linux_spdk_disk {
 
 #pragma region Absent
 
+/** The queue in a build that holds no SPDK, which a queue set never makes. */
+class linux_spdk_queue_t {
+  public:
+
+    /** Refuses the queue, since this build holds no driver. */
+    static expected<linux_spdk_queue_t> make(queue_depth_t, std::span<byte_t>) noexcept {
+        return status_t {status_code_t::unsupported_k, "This build holds no SPDK"};
+    }
+
+    /** Requests the queue keeps in flight, which is none. */
+    [[nodiscard]] queue_depth_t depth() const noexcept { return 0; }
+};
+
 /**
- *  @brief The same disk in a build that carries no SPDK, which mounts nowhere and refuses cleanly.
+ *  @brief The same disk in a build that holds no SPDK, which mounts nowhere and refuses cleanly.
  *
  *  The type exists so a caller compiles against it unconditionally and chooses at mount, where a
  *  refused @c open sends it to another transport rather than to a build-time branch. The probe is
@@ -1992,10 +2069,13 @@ template <template <typename> typename atomic_reference_, typename waiter_type_>
 class linux_spdk_disk {
   public:
 
-    /** Refuses the mount, since this build carries no driver to mount with. */
+    /** The queue a thread owns for this transport. */
+    using queue_t = linux_spdk_queue_t;
+
+    /** Refuses the mount, since this build holds no driver to mount with. */
     static expected<linux_spdk_disk> open(linux_spdk_environment<atomic_reference_, waiter_type_>, char const*,
                                           linux_spdk_disk_config_t const&) noexcept {
-        return status_t {status_code_t::unsupported_k, "This build carries no SPDK"};
+        return status_t {status_code_t::unsupported_k, "This build holds no SPDK"};
     }
 
     /** Whether the arena must come from DMA memory, which a disk that never
@@ -2006,66 +2086,54 @@ class linux_spdk_disk {
     [[nodiscard]] int memory_domain() const noexcept { return -1; }
 
     /** What this disk would accept, which is nothing at all. */
-    [[nodiscard]] ring_capabilities_t capabilities() const noexcept { return {}; }
+    [[nodiscard]] disk_capabilities_t capabilities() const noexcept { return {}; }
 
     /** What the controller identifies as, which is nothing, since none was ever connected. */
     [[nodiscard]] linux_spdk_controller_identity_t identity() const noexcept { return {}; }
 
-    /** Refuses the queue pair, since there is no queue pair to queue pair. */
-    expected<queue_pair_t> acquire_queue_pair(std::uint32_t) noexcept {
-        return status_t {status_code_t::unsupported_k, "This build carries no SPDK"};
-    }
-
-    /** Refuses the handover, since no queue pair was ever handed out. */
-    status_t bind_queue_pair(queue_pair_t const&) noexcept {
-        return {status_code_t::unsupported_k, "This build carries no SPDK"};
-    }
-
-    /** Refuses the return, since no queue pair was ever handed out. */
-    status_t release_queue_pair(queue_pair_t&) noexcept {
-        return {status_code_t::unsupported_k, "This build carries no SPDK"};
+    /** Refuses the registration, since there is no controller to register on a queue. */
+    status_t register_media(queue_ref_t const&) noexcept {
+        return {status_code_t::unsupported_k, "This build holds no SPDK"};
     }
 
     /** Refuses the range, since no driver would ever map it. */
     expected<registered_memory_t> register_memory(std::span<byte_t>, memory_space_t) noexcept {
-        return status_t {status_code_t::unsupported_k, "This build carries no SPDK"};
+        return status_t {status_code_t::unsupported_k, "This build holds no SPDK"};
     }
 
     /** Refuses the range, since none was ever mapped. */
     status_t unregister_memory(registered_memory_t&) noexcept {
-        return {status_code_t::unsupported_k, "This build carries no SPDK"};
+        return {status_code_t::unsupported_k, "This build holds no SPDK"};
     }
 
     /** Refuses the target, since there is no namespace to present. */
     expected<registered_medium_t> register_medium(medium_options_t const&) noexcept {
-        return status_t {status_code_t::unsupported_k, "This build carries no SPDK"};
+        return status_t {status_code_t::unsupported_k, "This build holds no SPDK"};
     }
 
     /** Refuses the target, since none was ever registered. */
     status_t unregister_medium(registered_medium_t&) noexcept {
-        return {status_code_t::unsupported_k, "This build carries no SPDK"};
+        return {status_code_t::unsupported_k, "This build holds no SPDK"};
     }
 
     /** Takes nothing, since there is no queue pair to take it into. */
-    expected<std::size_t> submit(queue_pair_t const&, std::span<request_t const>) noexcept {
-        return status_t {status_code_t::unsupported_k, "This build carries no SPDK"};
+    expected<std::size_t> submit(queue_ref_t const&, std::span<request_t const>) noexcept {
+        return status_t {status_code_t::unsupported_k, "This build holds no SPDK"};
     }
 
     /** Answers nothing, since nothing was ever submitted. */
-    expected<std::size_t> poll_completions(queue_pair_t const&, std::span<completion_t>) noexcept {
-        return status_t {status_code_t::unsupported_k, "This build carries no SPDK"};
+    expected<std::size_t> poll_completions(queue_ref_t const&, std::span<completion_t>) noexcept {
+        return status_t {status_code_t::unsupported_k, "This build holds no SPDK"};
     }
 
     /** Stops nothing, since nothing was ever submitted. */
-    void cancel(queue_pair_t const&) noexcept {}
+    void cancel(queue_ref_t const&) noexcept {}
 
     /** Refuses the drain, since no queue pair was ever handed out. */
-    status_t drain(queue_pair_t const&) noexcept {
-        return {status_code_t::unsupported_k, "This build carries no SPDK"};
-    }
+    status_t drain(queue_ref_t const&) noexcept { return {status_code_t::unsupported_k, "This build holds no SPDK"}; }
 
     /** Answers that nothing is outstanding, which is always true here. */
-    [[nodiscard]] std::size_t outstanding(queue_pair_t const&) const noexcept { return 0; }
+    [[nodiscard]] std::size_t outstanding(queue_ref_t const&) const noexcept { return 0; }
 
     /** Gives back nothing, since nothing was ever taken. */
     void release() noexcept {}

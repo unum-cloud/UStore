@@ -40,10 +40,20 @@ static nvme_size_keyword_t const nvme_size_keywords[] = {
     {NULL, 0},
 };
 
-/** What an init call borrows from the arguments of a constructor, kept alive until the call returns. */
+/** Every size keyword of @c Database.view_nvme, as fields of @c ustore_database_view_nvme_t,
+ *  closed by a nameless row. */
+static nvme_size_keyword_t const nvme_view_size_keywords[] = {
+    {"memory_limit", offsetof(ustore_database_view_nvme_t, memory_limit)},
+    {"collection_concurrency_limit", offsetof(ustore_database_view_nvme_t, collection_concurrency_limit)},
+    {"collection_cache_limit", offsetof(ustore_database_view_nvme_t, collection_cache_limit)},
+    {NULL, 0},
+};
+
+/** What an init call reads from the arguments of a constructor, kept alive until
+ *  the call returns. */
 typedef struct opening_t {
 
-    /** The executor the init runs on, borrowed from the arguments, or NULL for the calling thread. */
+    /** The executor the init runs on, viewed from the arguments, or NULL for the calling thread. */
     ustore_executor_t executor;
 
     /** The encoded directory, or NULL for none. */
@@ -57,6 +67,13 @@ typedef struct opening_t {
 
     /** Entries of @c data_directories. */
     size_t data_directories_count;
+
+    /** Bytes of host memory the engine may hold, or zero for its default. */
+    size_t memory_limit;
+
+    /** Threads of the pool the database owns for its flushes and compactions, or zero
+     *  for its default. */
+    size_t background_threads;
 } opening_t;
 
 /** Releases whatever @p opening holds. */
@@ -186,43 +203,46 @@ static PyObject* database_opened(ustore_database_t handle, ustore_outcome_t* out
 
 #pragma region Databases
 
-static char const doc_Database[] =                                                                         //
-    "An embedded database, opened through one class method per engine.\n"                                  //
-    "\n"                                                                                                   //
-    "Database.open_ram(), open_rocksdb(), view_rocksdb(), open_leveldb() and open_nvme() each take what\n" //
-    "their engine can be asked; engines_compiled() names the ones this build carries, and the others\n"    //
-    "refuse to open. Each takes an `executor` keyword and blocks on it, as it blocks on the calling\n"     //
-    "thread without one. The directory belongs to the database, so no two processes may open the same\n"   //
-    "one at once. No collection exists until `collection_create` makes it; names starting with `_` are\n"  //
-    "reserved by the library.\n"                                                                           //
-    "\n"                                                                                                   //
-    "Indexing it by name, as `db['movies']`, answers a Collection, which only finds the collection,\n"     //
-    "never creating it. Its verbs run on the calling thread; `on(executor)` and `deferred(executor)`\n"    //
-    "answer views running them on threads.";                                                               //
+static char const doc_Database[] =                                                                        //
+    "An embedded database, opened through one class method per engine.\n"                                 //
+    "\n"                                                                                                  //
+    "Database.open_ram(), open_rocksdb(), view_rocksdb(), open_leveldb(), open_nvme() and view_nvme()\n"  //
+    "each take what their engine can be asked; engines_compiled() names the ones this build holds, and\n" //
+    "the others refuse to open. Each takes an `executor` keyword and blocks on it, as it blocks on the\n" //
+    "calling thread without one. The directory belongs to the database, so no two processes may open\n"   //
+    "the same one at once. No collection exists until `collection_create` makes it; names starting\n"     //
+    "with `_` are reserved by the library.\n"                                                             //
+    "\n"                                                                                                  //
+    "Indexing it by name, as `db['movies']`, answers a Collection, which only finds the collection,\n"    //
+    "never creating it. Its verbs run on the calling thread; `on(executor)` and `deferred(executor)`\n"   //
+    "answer views running them on threads.";                                                              //
 
 static PyObject* Database_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNUSED(arguments),
                                  PyObject* Py_UNUSED(keywords)) {
-    PyErr_SetString(PyExc_TypeError,
-                    "Database() names no engine: use open_ram, open_rocksdb, view_rocksdb, open_leveldb or open_nvme");
+    PyErr_SetString(
+        PyExc_TypeError,
+        "Database() names no engine: use open_ram, open_rocksdb, view_rocksdb, open_leveldb, open_nvme or view_nvme");
     return NULL;
 }
 
 static char const doc_Database_open_ram[] =                                                  //
     "open_ram(directory=None, *, isolation=Isolation.STRICT_SERIALIZABLE, executor=None,\n"  //
-    "cpu_class_ceiling=CPUClass.UNKNOWN) answers a database in memory.\n"                    //
+    "cpu_class_ceiling=CPUClass.UNKNOWN, memory_limit=0) answers a database in memory.\n"    //
     "\n"                                                                                     //
     "Calls `ustore_database_open_ram` with a directory and `ustore_database_init_ram`\n"     //
     "without one.\n"                                                                         //
     "\n"                                                                                     //
     "Args:\n"                                                                                //
     "  directory (str | bytes | PathLike, optional): Where the database persists as one\n"   //
-    "    image, rewritten whole on a flush and on close; None keeps it in memory alone.\n"   //
+    "    image, rewritten whole on a flush; None keeps it in memory alone.\n"                //
     "  isolation (Isolation): How transactions see each other.\n"                            //
     "  executor (Executor, optional): The executor the open blocks on, or None to open on\n" //
     "    the calling thread.\n"                                                              //
     "  cpu_class_ceiling (CPUClass): The newest CPU class the database may confine its\n"    //
     "    waits, atomics and string kernels to, narrowed to what the CPU runs, so a class\n"  //
     "    the CPU lacks is never refused; UNKNOWN sets none.\n"                               //
+    "  memory_limit (int, optional): Bytes of keys and values the database may hold, past\n" //
+    "    which a write raises CapacityExhaustedError; zero takes 16 GiB.\n"                  //
     "Returns:\n"                                                                             //
     "  Database: The opened database, whose describe() reports the class picked.\n"          //
     "Raises:\n"                                                                              //
@@ -249,6 +269,8 @@ static PyObject* Database_open_ram(PyObject* Py_UNUSED(type), PyObject* const* a
         else if (PyUnicode_CompareWithASCIIString(name, "cpu_class_ceiling") == 0)
             read = ustore_py_enum_from_object(value, "cpu_class_ceiling", ustore_py_enum_cpu_class_k,
                                               &cpu_class_ceiling);
+        else if (PyUnicode_CompareWithASCIIString(name, "memory_limit") == 0)
+            read = ustore_py_size_from_object(value, "memory_limit", &opening.memory_limit);
         else PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
         if (read != 0) goto failed;
     }
@@ -261,6 +283,7 @@ static PyObject* Database_open_ram(PyObject* Py_UNUSED(type), PyObject* const* a
         .outcome = &outcome,
         .isolation = (ustore_isolation_t)isolation,
         .cpu_class_ceiling = (ustore_cpu_class_t)cpu_class_ceiling,
+        .memory_limit = (ustore_size_t)opening.memory_limit,
     };
     ustore_database_open_ram_t open_ram = {
         .database = &handle,
@@ -269,6 +292,7 @@ static PyObject* Database_open_ram(PyObject* Py_UNUSED(type), PyObject* const* a
         .directory = path_bytes(opening.directory),
         .isolation = (ustore_isolation_t)isolation,
         .cpu_class_ceiling = (ustore_cpu_class_t)cpu_class_ceiling,
+        .memory_limit = (ustore_size_t)opening.memory_limit,
     };
     Py_BEGIN_ALLOW_THREADS;
     if (opening.directory) ustore_database_open_ram(&open_ram);
@@ -283,8 +307,8 @@ failed:
 }
 
 static char const doc_Database_open_rocksdb[] =                                              //
-    "open_rocksdb(directory, *, data_directories=(), executor=None) answers a database on\n" //
-    "RocksDB.\n"                                                                             //
+    "open_rocksdb(directory, *, data_directories=(), executor=None, memory_limit=0,\n"       //
+    "background_threads=0) answers a database on RocksDB.\n"                                 //
     "\n"                                                                                     //
     "Args:\n"                                                                                //
     "  directory (str | bytes | PathLike): The database's directory, which must exist.\n"    //
@@ -292,12 +316,17 @@ static char const doc_Database_open_rocksdb[] =                                 
     "    path or a (path, max_bytes) pair, where zero bytes means no limit.\n"               //
     "  executor (Executor, optional): The executor the open blocks on, or None to open on\n" //
     "    the calling thread.\n"                                                              //
+    "  memory_limit (int, optional): Bytes the engine may cache and buffer; zero takes\n"    //
+    "    1 GiB.\n"                                                                           //
+    "  background_threads (int, optional): Threads of the pool the database owns for its\n"  //
+    "    flushes and compactions; zero takes 2.\n"                                           //
     "Returns:\n"                                                                             //
     "  Database: The opened database.\n"                                                     //
     "Raises:\n"                                                                              //
-    "  UnsupportedError: This build carries no RocksDB engine.";
+    "  UnsupportedError: This build holds no RocksDB engine.";
 
-/** Reads the arguments both RocksDB constructors take: the directory, the data directories and the executor. */
+/** Reads the arguments both RocksDB constructors take: the directory, the data directories, the
+ *  executor and the engine's budgets. */
 static int rocksdb_opening(opening_t* opening, char const* verb, PyObject* const* arguments,
                            Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
     Py_ssize_t const keyword_names_count = opening_positional(opening, verb, arguments, positional_arguments_count,
@@ -311,6 +340,10 @@ static int rocksdb_opening(opening_t* opening, char const* verb, PyObject* const
         else if (PyUnicode_CompareWithASCIIString(name, "data_directories") == 0)
             read = opening_data_directories(opening, value);
         else if (PyUnicode_CompareWithASCIIString(name, "executor") == 0) read = opening_executor(opening, value);
+        else if (PyUnicode_CompareWithASCIIString(name, "memory_limit") == 0)
+            read = ustore_py_size_from_object(value, "memory_limit", &opening->memory_limit);
+        else if (PyUnicode_CompareWithASCIIString(name, "background_threads") == 0)
+            read = ustore_py_size_from_object(value, "background_threads", &opening->background_threads);
         else PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
         if (read != 0) return -1;
     }
@@ -333,6 +366,8 @@ static PyObject* Database_open_rocksdb(PyObject* Py_UNUSED(type), PyObject* cons
         .directory = path_bytes(opening.directory),
         .data_directories = opening.data_directories,
         .data_directories_count = (ustore_size_t)opening.data_directories_count,
+        .memory_limit = (ustore_size_t)opening.memory_limit,
+        .background_threads = (ustore_size_t)opening.background_threads,
     };
     Py_BEGIN_ALLOW_THREADS;
     ustore_database_open_rocksdb(&open_rocksdb);
@@ -342,8 +377,8 @@ static PyObject* Database_open_rocksdb(PyObject* Py_UNUSED(type), PyObject* cons
 }
 
 static char const doc_Database_view_rocksdb[] =                                              //
-    "view_rocksdb(directory, *, data_directories=(), executor=None) answers a read-only\n"   //
-    "database on RocksDB.\n"                                                                 //
+    "view_rocksdb(directory, *, data_directories=(), executor=None, memory_limit=0,\n"       //
+    "background_threads=0) answers a read-only database on RocksDB.\n"                       //
     "\n"                                                                                     //
     "Reads the state the directory held when it opened, and refuses every call that would\n" //
     "change it with ReadOnlyError: writes, removes, transactions, collection creates and\n"  //
@@ -355,10 +390,14 @@ static char const doc_Database_view_rocksdb[] =                                 
     "    was opened with, each a path or a (path, max_bytes) pair.\n"                        //
     "  executor (Executor, optional): The executor the open blocks on, or None to open on\n" //
     "    the calling thread.\n"                                                              //
+    "  memory_limit (int, optional): Bytes the engine may cache and buffer; zero takes\n"    //
+    "    1 GiB.\n"                                                                           //
+    "  background_threads (int, optional): Threads of the pool the database owns for its\n"  //
+    "    flushes and compactions; zero takes 2.\n"                                           //
     "Returns:\n"                                                                             //
     "  Database: The opened database.\n"                                                     //
     "Raises:\n"                                                                              //
-    "  UnsupportedError: This build carries no RocksDB engine.";
+    "  UnsupportedError: This build holds no RocksDB engine.";
 
 static PyObject* Database_view_rocksdb(PyObject* Py_UNUSED(type), PyObject* const* arguments,
                                        Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
@@ -376,6 +415,8 @@ static PyObject* Database_view_rocksdb(PyObject* Py_UNUSED(type), PyObject* cons
         .directory = path_bytes(opening.directory),
         .data_directories = opening.data_directories,
         .data_directories_count = (ustore_size_t)opening.data_directories_count,
+        .memory_limit = (ustore_size_t)opening.memory_limit,
+        .background_threads = (ustore_size_t)opening.background_threads,
     };
     Py_BEGIN_ALLOW_THREADS;
     ustore_database_view_rocksdb(&view_rocksdb);
@@ -384,17 +425,23 @@ static PyObject* Database_view_rocksdb(PyObject* Py_UNUSED(type), PyObject* cons
     return database_opened(handle, &outcome);
 }
 
-static char const doc_Database_open_leveldb[] =                                              //
-    "open_leveldb(directory, *, executor=None) answers a database on LevelDB.\n"             //
-    "\n"                                                                                     //
-    "Args:\n"                                                                                //
-    "  directory (str | bytes | PathLike): The database's directory, which must exist.\n"    //
-    "  executor (Executor, optional): The executor the open blocks on, or None to open on\n" //
-    "    the calling thread.\n"                                                              //
-    "Returns:\n"                                                                             //
-    "  Database: The opened database.\n"                                                     //
-    "Raises:\n"                                                                              //
-    "  UnsupportedError: This build carries no LevelDB engine.";
+static char const doc_Database_open_leveldb[] =                                                 //
+    "open_leveldb(directory, *, executor=None, memory_limit=0, background_threads=0) answers\n" //
+    "a database on LevelDB.\n"                                                                  //
+    "\n"                                                                                        //
+    "Args:\n"                                                                                   //
+    "  directory (str | bytes | PathLike): The database's directory, which must exist.\n"       //
+    "  executor (Executor, optional): The executor the open blocks on, or None to open on\n"    //
+    "    the calling thread.\n"                                                                 //
+    "  memory_limit (int, optional): Bytes the engine may cache and buffer; zero takes\n"       //
+    "    1 GiB.\n"                                                                              //
+    "  background_threads (int, optional): Threads that compact the database, of which\n"       //
+    "    LevelDB runs one.\n"                                                                   //
+    "Returns:\n"                                                                                //
+    "  Database: The opened database.\n"                                                        //
+    "Raises:\n"                                                                                 //
+    "  UnsupportedError: This build holds no LevelDB engine, or `background_threads` asks\n"    //
+    "    for more than one.";
 
 static PyObject* Database_open_leveldb(PyObject* Py_UNUSED(type), PyObject* const* arguments,
                                        Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
@@ -408,6 +455,10 @@ static PyObject* Database_open_leveldb(PyObject* Py_UNUSED(type), PyObject* cons
         int read = -1;
         if (PyUnicode_CompareWithASCIIString(name, "directory") == 0) read = opening_directory(&opening, value);
         else if (PyUnicode_CompareWithASCIIString(name, "executor") == 0) read = opening_executor(&opening, value);
+        else if (PyUnicode_CompareWithASCIIString(name, "memory_limit") == 0)
+            read = ustore_py_size_from_object(value, "memory_limit", &opening.memory_limit);
+        else if (PyUnicode_CompareWithASCIIString(name, "background_threads") == 0)
+            read = ustore_py_size_from_object(value, "background_threads", &opening.background_threads);
         else PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
         if (read != 0) goto failed;
     }
@@ -419,6 +470,8 @@ static PyObject* Database_open_leveldb(PyObject* Py_UNUSED(type), PyObject* cons
         .executor = opening.executor,
         .outcome = &outcome,
         .directory = path_bytes(opening.directory),
+        .memory_limit = (ustore_size_t)opening.memory_limit,
+        .background_threads = (ustore_size_t)opening.background_threads,
     };
     Py_BEGIN_ALLOW_THREADS;
     ustore_database_open_leveldb(&open_leveldb);
@@ -455,7 +508,7 @@ static char const doc_Database_open_nvme[] =                                    
     "Returns:\n"                                                                                 //
     "  Database: The opened database.\n"                                                         //
     "Raises:\n"                                                                                  //
-    "  UnsupportedError: This build carries no NVMe engine, or no class it compiled fits\n"      //
+    "  UnsupportedError: This build holds no NVMe engine, or no class it compiled fits\n"        //
     "    under the `cpu_class_ceiling` on this CPU.\n"                                           //
     "  DeviceError: The `compactions` executor was not made by Executor.for_vram().";
 
@@ -512,6 +565,79 @@ failed:
     return NULL;
 }
 
+static char const doc_Database_view_nvme[] =                                                  //
+    "view_nvme(manifest, *, executor=None, cpu_class_ceiling=CPUClass.UNKNOWN, **sizes)\n"    //
+    "answers a read-only database on NVMe, which writes nothing to its data directories.\n"   //
+    "\n"                                                                                      //
+    "Every size keyword names a field of ustore_database_view_nvme_t: memory_limit,\n"        //
+    "collection_concurrency_limit or collection_cache_limit, where zero keeps the default.\n" //
+    "\n"                                                                                      //
+    "Args:\n"                                                                                 //
+    "  manifest (str | bytes | PathLike): The manifest of an existing database,\n"            //
+    "    <database>.ustore.json in its first data directory.\n"                               //
+    "  executor (Executor, optional): The executor the open blocks on, or None to open on\n"  //
+    "    the calling thread.\n"                                                               //
+    "  data_directories (Sequence): Further data directories, as the database was opened\n"   //
+    "    with, each a path or a (path, max_bytes) pair.\n"                                    //
+    "  cpu_class_ceiling (CPUClass): The newest CPU class the database may confine its\n"     //
+    "    waits, atomics and string kernels to; UNKNOWN sets none.\n"                          //
+    "Returns:\n"                                                                              //
+    "  Database: The database, refusing every change with ReadOnlyError.\n"                   //
+    "Raises:\n"                                                                               //
+    "  UnsupportedError: This build holds no NVMe engine, or the manifest names raw media.\n" //
+    "  NotFoundError: The manifest does not exist.";
+
+static PyObject* Database_view_nvme(PyObject* Py_UNUSED(type), PyObject* const* arguments,
+                                    Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
+    opening_t opening = {0};
+    ustore_database_view_nvme_t view_nvme = {0};
+    Py_ssize_t const keyword_names_count = opening_positional(&opening, "view_nvme", arguments,
+                                                              positional_arguments_count, keyword_names_tuple);
+    if (keyword_names_count < 0) goto failed;
+    for (Py_ssize_t names_progress = 0; names_progress != keyword_names_count; ++names_progress) {
+        PyObject* const name = PyTuple_GET_ITEM(keyword_names_tuple, names_progress);
+        PyObject* const value = arguments[positional_arguments_count + names_progress];
+        nvme_size_keyword_t const* keyword = nvme_view_size_keywords;
+        while (keyword->name && PyUnicode_CompareWithASCIIString(name, keyword->name) != 0) ++keyword;
+        size_t size = 0;
+        int read = -1;
+        if (keyword->name) {
+            read = ustore_py_size_from_object(value, keyword->name, &size);
+            *(ustore_size_t*)((char*)&view_nvme + keyword->offset) = (ustore_size_t)size;
+        }
+        else if (PyUnicode_CompareWithASCIIString(name, "directory") == 0) read = opening_directory(&opening, value);
+        else if (PyUnicode_CompareWithASCIIString(name, "executor") == 0) read = opening_executor(&opening, value);
+        else if (PyUnicode_CompareWithASCIIString(name, "data_directories") == 0)
+            read = opening_data_directories(&opening, value);
+        else if (PyUnicode_CompareWithASCIIString(name, "cpu_class_ceiling") == 0) {
+            int cpu_class_ceiling = ustore_cpu_class_unknown_k;
+            read = ustore_py_enum_from_object(value, "cpu_class_ceiling", ustore_py_enum_cpu_class_k,
+                                              &cpu_class_ceiling);
+            view_nvme.cpu_class_ceiling = (ustore_cpu_class_t)cpu_class_ceiling;
+        }
+        else PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
+        if (read != 0) goto failed;
+    }
+
+    ustore_database_t handle = NULL;
+    ustore_outcome_t outcome = {0};
+    view_nvme.database = &handle;
+    view_nvme.executor = opening.executor;
+    view_nvme.outcome = &outcome;
+    view_nvme.directory = path_bytes(opening.directory);
+    view_nvme.data_directories = opening.data_directories;
+    view_nvme.data_directories_count = (ustore_size_t)opening.data_directories_count;
+    Py_BEGIN_ALLOW_THREADS;
+    ustore_database_view_nvme(&view_nvme);
+    Py_END_ALLOW_THREADS;
+    opening_release(&opening);
+    return database_opened(handle, &outcome);
+
+failed:
+    opening_release(&opening);
+    return NULL;
+}
+
 /** Closes @p database once the deferred calls naming it finish. */
 static void database_close(Database* database) {
     ustore_database_t const handle = database->handle;
@@ -528,12 +654,12 @@ static void Database_dealloc(Database* self) {
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
 
-static char const doc_Database_close[] =                                                        //
-    "close() answers None.\n"                                                                   //
-    "\n"                                                                                        //
-    "Closes the database once every deferred call on it finishes, while the data persists on\n" //
-    "disk. Transactions and snapshots it opened keep working, as each holds the database\n"     //
-    "open until it closes too.";
+static char const doc_Database_close[] =                                                       //
+    "close() answers None.\n"                                                                  //
+    "\n"                                                                                       //
+    "Closes the database once every deferred call on it finishes, writing nothing: a commit\n" //
+    "reaches the disk only through `flush()` or `Durability.FLUSHED`. Transactions and\n"      //
+    "snapshots it opened keep working, as each holds the database open until it closes too.";
 
 static PyObject* Database_close(PyObject* self, PyObject* Py_UNUSED(ignored)) {
     database_close((Database*)self);
@@ -570,7 +696,7 @@ static int database_context(PyObject* self, char const* verb, ustore_py_context_
 
 /**
  *  @brief Reads the `progress` keyword a verb takes after its @p required positional arguments, its only keyword.
- *  @param[out] progress The callable, borrowed, or NULL when the call carried none.
+ *  @param[out] progress The callable, viewed, or NULL when the call held none.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
 static int progress_keyword(char const* verb, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
@@ -601,7 +727,7 @@ static char const doc_Database_clear[] =                                        
     "    collections, `DropMode.COLLECTION` drops every collection with its name, and\n"      //
     "    `DropMode.VALUES` empties every value and keeps the keys.\n"                         //
     "Raises:\n"                                                                               //
-    "  InvalidArgumentError: The RAM and RocksDB engines drop no collection while a\n"        //
+    "  ContendedError: The RAM, RocksDB and NVMe engines drop no collection while a\n"        //
     "    snapshot is open, since the snapshot belongs to its holder.\n"                       //
     "  ReadOnlyError: The database was opened read-only.";
 
@@ -850,7 +976,7 @@ static char const doc_Database_describe[] =                                     
     "\n"                                                                                   //
     "Returns:\n"                                                                           //
     "  Description: The `capabilities`, `engine`, `isolation`, `keys`, `memory_bytes`,\n"  //
-    "  `disk_bytes`, `pin_refused_bytes` and `crossing_requests` of the database.";
+    "  `disk_bytes`, `unpinned_staging_bytes` and `requests_across_registered_slots` of the database.";
 
 static void describe_submit(void* arguments) { ustore_database_describe((ustore_database_describe_t*)arguments); }
 
@@ -895,7 +1021,7 @@ static char const doc_Database_collection_create[] =                            
     "Returns:\n"                                                                              //
     "  UUID: The identifier addressing the new collection.\n"                                 //
     "Raises:\n"                                                                               //
-    "  AlreadyExistsError: A collection already carries the name.\n"                          //
+    "  AlreadyExistsError: A collection already holds the name.\n"                            //
     "  InvalidArgumentError: The name is empty or starts with `_`, reserved for the system.";
 
 static PyObject* Database_collection_create(PyObject* self, PyObject* const* arguments,
@@ -964,7 +1090,7 @@ static char const doc_Database_collection_find[] =                              
     "Returns:\n"                                                                         //
     "  UUID: The identifier addressing the collection.\n"                                //
     "Raises:\n"                                                                          //
-    "  NotFoundError: No collection carries the name.";
+    "  NotFoundError: No collection holds the name.";
 
 /** A lookup of the collection one name addresses, whose identifier lands in the arena its header holds. */
 typedef struct find_call_t {
@@ -1041,12 +1167,12 @@ static PyObject* Database_collection_find(PyObject* self, PyObject* const* argum
     return ustore_py_call_run(&context, &find_verb, call, &find);
 }
 
-static char const doc_Database_collection_contains[] =                           //
-    "collection_contains(name) answers whether a collection carries the name.\n" //
-    "\n"                                                                         //
-    "Args:\n"                                                                    //
-    "  name (str): The name to look for.\n"                                      //
-    "Returns:\n"                                                                 //
+static char const doc_Database_collection_contains[] =                         //
+    "collection_contains(name) answers whether a collection holds the name.\n" //
+    "\n"                                                                       //
+    "Args:\n"                                                                  //
+    "  name (str): The name to look for.\n"                                    //
+    "Returns:\n"                                                               //
     "  bool: Whether the name is taken.";
 
 static PyObject* Database_collection_contains(PyObject* self, PyObject* name_object) {
@@ -1146,9 +1272,9 @@ static char const doc_Database_collection_names[] =                             
     "Args:\n"                                                                                  //
     "  arena (Arena): Where the listing lands before it is copied out, rewound by this\n"      //
     "    call.\n"                                                                              //
-    "  after (str, optional): The smallest name the page may carry; None starts at the\n"      //
+    "  after (str, optional): The smallest name the page may hold; None starts at the\n"       //
     "    first one. The name given is itself included, so a resuming caller drops it.\n"       //
-    "  limit (int, optional): Most names the page carries.\n"                                  //
+    "  limit (int, optional): Most names the page holds.\n"                                    //
     "Returns:\n"                                                                               //
     "  tuple[str, ...]: The names recorded for collections, in order.";
 
@@ -1202,7 +1328,7 @@ static char const doc_Database_collection_drop[] =                              
     "    in it, `DropMode.PAIRS` removes every key and value, and `DropMode.VALUES` every\n" //
     "    value.\n"                                                                           //
     "Raises:\n"                                                                              //
-    "  NotFoundError: No collection carries the name.";
+    "  NotFoundError: No collection holds the name.";
 
 static PyObject* Database_collection_drop(PyObject* self, PyObject* const* arguments,
                                           Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
@@ -1868,6 +1994,8 @@ static PyMethodDef Database_methods[] = {
      doc_Database_open_leveldb},
     {"open_nvme", (PyCFunction)(void (*)(void))Database_open_nvme, ustore_py_method_flags_k | METH_CLASS,
      doc_Database_open_nvme},
+    {"view_nvme", (PyCFunction)(void (*)(void))Database_view_nvme, ustore_py_method_flags_k | METH_CLASS,
+     doc_Database_view_nvme},
     {"close", (PyCFunction)(void (*)(void))Database_close, METH_NOARGS, doc_Database_close},
     {"__enter__", (PyCFunction)(void (*)(void))Database_enter, METH_NOARGS, NULL},
     {"__exit__", (PyCFunction)(void (*)(void))Database_exit, ustore_py_method_flags_k, NULL},

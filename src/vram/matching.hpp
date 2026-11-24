@@ -253,6 +253,7 @@ class device_match {
     bool reads_values() const noexcept { return match_.reads_values(); }
     bool scores() const noexcept { return match_.host.scores(); }
     bool asks() const noexcept { return match_.host.asks(); }
+    bool matches_everything() const noexcept { return match_.matches_everything(); }
 
     util::status_t ask(ustore_predicate_cost_t phase, std::span<ustore_key_t const> keys, candidates_t& candidates,
                        ustore_arena_t work) const noexcept {
@@ -292,6 +293,17 @@ class device_match {
 
   private:
     using kits_t = util::vram_matching_kits<typename residency_executor<residency_>::function_t>;
+
+    /** Launches a regex kernel, which on Apple reads StringZilla's walk record after the parameters
+     *  CUDA's twin reads from @p engine itself. */
+    template <typename function_type_, typename... argument_types_>
+    util::status_t launch_regex_(function_type_ function, unsigned blocks, unsigned threads, unsigned shared,
+                                 sz_regex_engine_t const& engine, argument_types_... arguments) const noexcept {
+        if constexpr (residency_ == vendored_residency_t::vram_apple_k)
+            return util::launch(executor_, function, blocks, threads, shared, engine, arguments...,
+                                metal_regex_walk(engine));
+        else return util::launch(executor_, function, blocks, threads, shared, engine, arguments...);
+    }
 
     /** Packs the strings @p views name into one tape in @p work, then matches it as @c contains does. */
     util::status_t contains_packed(std::span<sz_string_view_t const> views, ustore_arena_t work,
@@ -453,14 +465,14 @@ class device_match {
                 (matching_shared_bytes_k - head) / (sz_regex_staged_bytes_simt_(&engine, 1) - head)));
             unsigned const shared = static_cast<unsigned>(sz_regex_staged_bytes_simt_(&engine, cells));
             if (!shape.per_thread.empty())
-                launched = util::launch(executor_, kits.regex.per_thread, blocks_for(shape.per_thread.size()), threads,
-                                        shared, engine, page(shape.per_thread), cells);
+                launched = launch_regex_(kits.regex.per_thread, blocks_for(shape.per_thread.size()), threads, shared,
+                                         engine, page(shape.per_thread), cells);
             if (launched.succeeded() && !shape.per_group.empty())
-                launched = util::launch(executor_, kits.regex.per_group, blocks_for(shape.per_group.size() * group_k),
-                                        threads, shared, engine, page(shape.per_group), primed, cells);
+                launched = launch_regex_(kits.regex.per_group, blocks_for(shape.per_group.size() * group_k), threads,
+                                         shared, engine, page(shape.per_group), primed, cells);
             if (launched.succeeded() && !chunks.empty())
-                launched = util::launch(executor_, kits.regex.per_chunk, blocks_for(chunks.size()), threads, shared,
-                                        engine, chunking, primed, cells, refused);
+                launched = launch_regex_(kits.regex.per_chunk, blocks_for(chunks.size()), threads, shared, engine,
+                                         chunking, primed, cells, refused);
         }
         else {
             sz_subdocuments_engine_t const& engine = std::get<sz_subdocuments_engine_t>(match_.on_device);

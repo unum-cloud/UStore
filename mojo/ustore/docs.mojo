@@ -14,12 +14,12 @@ from std.memory import stack_allocation
 from std.sys.info import size_of
 
 from ustore.blobs import (
-    CursorNextArguments,
+    DocsBatches,
+    DocsCursorNextArguments,
     KeyRuns,
     KeyRunsWritten,
     MeasureArguments,
     Measures,
-    Pulled,
     SampleArguments,
     Values,
     ValuesWritten,
@@ -152,10 +152,10 @@ struct GistWritten(Defaultable, ImplicitlyCopyable):
 
 @fieldwise_init
 struct Gist[origin: MutOrigin](Deferrable, Sized):
-    """The unique paths to the leaves of the requested documents, read in place from the arena a gist borrows.
+    """The unique paths to the leaves of the requested documents, read in place from the arena a gist views.
 
     Parameters:
-        origin: The arena the paths live in, which this result borrows.
+        origin: The arena the paths live in, which this result views.
     """
 
     comptime Written = GistWritten
@@ -208,7 +208,7 @@ struct Column[origin: MutOrigin](ImplicitlyCopyable, Sized):
     """One gathered field over every document, as an Apache Arrow array of its type.
 
     Parameters:
-        origin: The arena the column lives in, which this result borrows.
+        origin: The arena the column lives in, which this result views.
     """
 
     var arena: Pointer[Arena[ImmUntrackedOrigin], Self.origin]
@@ -251,10 +251,10 @@ struct Column[origin: MutOrigin](ImplicitlyCopyable, Sized):
 
 @fieldwise_init
 struct Columns[origin: MutOrigin](Deferrable, Sized):
-    """Every gathered field of every document, one column per field, read in place from the arena a gather borrows.
+    """Every gathered field of every document, one column per field, read in place from the arena a gather views.
 
     Parameters:
-        origin: The arena the columns live in, which this result borrows.
+        origin: The arena the columns live in, which this result views.
     """
 
     comptime Written = ColumnsWritten
@@ -295,8 +295,8 @@ struct DocsWriteConfig[fields_origin: ImmOrigin = ImmUntrackedOrigin, id_origin:
     """Where inside the documents a write lands, how its values read, and how it applies.
 
     Parameters:
-        fields_origin: The borrowed fields.
-        id_origin: The borrowed name of the key field.
+        fields_origin: The viewed fields.
+        id_origin: The viewed name of the key field.
     """
 
     var fields: StringsView[Self.fields_origin]
@@ -331,7 +331,7 @@ struct DocsReadConfig[fields_origin: ImmOrigin = ImmUntrackedOrigin](ImplicitlyC
     """Where inside the documents a read looks, and what it exports.
 
     Parameters:
-        fields_origin: The borrowed fields.
+        fields_origin: The viewed fields.
     """
 
     var fields: StringsView[Self.fields_origin]
@@ -358,8 +358,8 @@ struct DocsScanConfig[end_origin: ImmOrigin = ImmUntrackedOrigin, filter_origin:
     """The bounds, order and filter of a scan over document keys.
 
     Parameters:
-        end_origin: The borrowed end keys.
-        filter_origin: The borrowed filter.
+        end_origin: The viewed end keys.
+        filter_origin: The viewed filter.
     """
 
     var end_keys: KeysView[Self.end_origin]
@@ -394,11 +394,17 @@ struct DocsScanConfig[end_origin: ImmOrigin = ImmUntrackedOrigin, filter_origin:
         self.progress = progress
 
 
-struct DocsCursorConfig[filter_origin: ImmOrigin = ImmUntrackedOrigin](ImplicitlyCopyable):
-    """The bound, order and filter of a walk over one collection, the filter copied when the walk opens.
+struct DocsCursorConfig[
+    filter_origin: ImmOrigin = ImmUntrackedOrigin,
+    fields_origin: ImmOrigin = ImmUntrackedOrigin,
+    types_origin: ImmOrigin = ImmUntrackedOrigin,
+](ImplicitlyCopyable):
+    """The bound, order, filter and gathered fields of a walk over one collection, all copied when the walk opens.
 
     Parameters:
-        filter_origin: The borrowed filter.
+        filter_origin: The viewed filter.
+        fields_origin: The viewed fields.
+        types_origin: The viewed column types.
     """
 
     var end_key: Optional[Key]
@@ -409,6 +415,11 @@ struct DocsCursorConfig[filter_origin: ImmOrigin = ImmUntrackedOrigin](Implicitl
     """A JSONPath or bare root filter every document the walk hands out matches; zeroed walks every key."""
     var predicate: Predicate
     """The caller's verdict on the keys of every page."""
+    var fields: StringsView[Self.fields_origin]
+    """Fields every pull gathers into the columns of its batches, the empty field being the whole document; zeroed
+    pulls keys alone."""
+    var columns_types: Span[FieldType, Self.types_origin]
+    """The type each field's column is converted into, one per field."""
 
     def __init__(
         out self,
@@ -417,12 +428,16 @@ struct DocsCursorConfig[filter_origin: ImmOrigin = ImmUntrackedOrigin](Implicitl
         direction: ScanDirection = ScanDirection.ASCENDING,
         filter: BytesView[Self.filter_origin] = BytesView[Self.filter_origin](),
         predicate: Predicate = Predicate(),
+        fields: StringsView[Self.fields_origin] = StringsView[Self.fields_origin](),
+        columns_types: Span[FieldType, Self.types_origin] = Span[FieldType, Self.types_origin](),
     ):
         """Names only the knobs that differ from the defaults."""
         self.end_key = end_key
         self.direction = direction
         self.filter = filter
         self.predicate = predicate
+        self.fields = fields
+        self.columns_types = columns_types
 
 
 # endregion Configs
@@ -647,7 +662,7 @@ struct FilteredScanArguments[name: StaticString](Arguments):
 
 @fieldwise_init
 struct FilteredCursorInitArguments(ImplicitlyCopyable):
-    """`ustore_docs_cursor_init_t`, and `ustore_pages_cursor_init_t` with the same layout."""
+    """`ustore_docs_cursor_init_t`, whose fields up to the predicate `ustore_pages_cursor_init_t` shares."""
 
     var cursor: Optional[Pointer[Address, MutUntrackedOrigin]]
     var database: Address
@@ -660,6 +675,10 @@ struct FilteredCursorInitArguments(ImplicitlyCopyable):
     var direction: ScanDirection
     var filter: BytesViewArguments
     var predicate: Predicate
+    var fields_count: c_size_t
+    """Zero for pages, whose init ends at the predicate."""
+    var fields: StringsViewArguments
+    var columns_types: Address
 
 
 def _filtered_scan[
@@ -675,8 +694,21 @@ def _filtered_scan[
     )
 
 
-def _filtered_cursor(scope: Scope, collection: CollectionID, start_key: Key, end_key: Optional[Key], direction: ScanDirection, filter: BytesViewArguments, predicate: Predicate, verb: Verb[FilteredCursorInitArguments], detail: StaticString) raises Error -> Address:
-    """Opens a documents or pages walk, answering its handle."""
+def _filtered_cursor(
+    scope: Scope,
+    collection: CollectionID,
+    start_key: Key,
+    end_key: Optional[Key],
+    direction: ScanDirection,
+    filter: BytesViewArguments,
+    predicate: Predicate,
+    fields_count: Int,
+    fields: StringsViewArguments,
+    columns_types: Address,
+    verb: Verb[FilteredCursorInitArguments],
+    detail: StaticString,
+) raises Error -> Address:
+    """Opens a documents or pages walk, answering its handle; a pages walk gathers no fields."""
     var created = stack_allocation[1, Address]().unsafe_origin_cast[MutUntrackedOrigin]()
     created[] = NULL_ADDRESS
     var outcome = stack_allocation[1, Outcome]().unsafe_origin_cast[MutUntrackedOrigin]()
@@ -689,7 +721,7 @@ def _filtered_cursor(scope: Scope, collection: CollectionID, start_key: Key, end
     _cross(
         FilteredCursorInitArguments(
             created, scope.database, scope.executor, outcome, scope.view, collection, start_key,
-            Int(end) if bounded else NULL_ADDRESS, direction, filter, predicate,
+            Int(end) if bounded else NULL_ADDRESS, direction, filter, predicate, c_size_t(fields_count), fields, columns_types,
         ),
         verb,
     )
@@ -725,19 +757,20 @@ struct DocsCursor(Movable):
         _ = self.library^
 
     def next(
-        self, executor: Executor, mut arena: Arena, wanted: Int, values: Bool = True, progress: Progress = Progress()
-    ) raises Error -> Pulled[origin_of(arena)]:
-        """Pulls the next page of up to `wanted` keys, with the whole documents when asked. Calls `ustore_docs_cursor_next`.
+        self, executor: Executor, mut arena: Arena, wanted: Int, progress: Progress = Progress()
+    ) raises Error -> DocsBatches[origin_of(arena)]:
+        """Pulls batches of up to `wanted` rows in all, one per executor task that found rows, none once the walk is
+        exhausted. Calls `ustore_docs_cursor_next`.
 
         Raises:
             `Error` with `CANCELLED` when `progress` stops the pull, which leaves the cursor where it was.
         """
         return _block(
             Scope(self.library, self.database, executor.address, NULL_ADDRESS, NULL_ADDRESS, NULL_ADDRESS, Watch.KEYS),
-            _Crossing[CursorNextArguments["ustore_docs_cursor_next"], Pulled[origin_of(arena)], origin_of(arena), ImmUntrackedOrigin](
-                CursorNextArguments["ustore_docs_cursor_next"](
-                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, self.address, None, None, None, NULL_ADDRESS,
-                    c_size_t(wanted), progress, values,
+            _Crossing[DocsCursorNextArguments, DocsBatches[origin_of(arena)], origin_of(arena), ImmUntrackedOrigin](
+                DocsCursorNextArguments(
+                    NULL_ADDRESS, NULL_ADDRESS, None, Completion.BLOCKING, self.address, None, None, NULL_ADDRESS,
+                    c_size_t(wanted), progress,
                 ),
                 arena._pointer(),
                 0,
@@ -904,13 +937,19 @@ trait DocsVerbs:
         )
 
     def docs_cursor[
-        filter_origin: ImmOrigin, //
-    ](self, collection: CollectionID, start_key: Key, config: DocsCursorConfig[filter_origin] = DocsCursorConfig()) raises Error -> DocsCursor:
-        """Opens a walk over the document keys of one collection, compiling its filter once and reading nothing
-        until its first pull. Calls `ustore_docs_cursor_init`."""
+        filter_origin: ImmOrigin, fields_origin: ImmOrigin, types_origin: ImmOrigin, //
+    ](
+        self,
+        collection: CollectionID,
+        start_key: Key,
+        config: DocsCursorConfig[filter_origin, fields_origin, types_origin] = DocsCursorConfig(),
+    ) raises Error -> DocsCursor:
+        """Opens a walk over the document keys of one collection, compiling its filter and fields once and reading
+        nothing until its first pull. Calls `ustore_docs_cursor_init`."""
         var scope = self._scope()
         var address = _filtered_cursor(
             scope, collection, start_key, config.end_key, config.direction, config.filter.arguments(), config.predicate,
+            len(config.fields), config.fields.arguments(), Int(config.columns_types.unsafe_ptr()),
             scope.library.symbols().docs_cursor_init, "ustore_docs_cursor_init",
         )
         return DocsCursor(library=scope.library, database=scope.database, address=address)

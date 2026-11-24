@@ -6,7 +6,7 @@
  *      of @c ustore_docs_write to one field, replayed in commit order and composed without a base
  *      where that is sound.
  *
- *  A delta carries a stamp, its modification, its field and the JSON text of its value, and a chain
+ *  A delta holds a stamp, its modification, its field and the JSON text of its value, and a chain
  *  of them is what a @c delta_kind_t::change_k delta of the store holds. Beyond the five
  *  modifications of @c ustore_docs_write, a delta may write a whole document as it is, as a whole
  *  JSON upsert and @c ustore_blobs_write store it, or remove it.
@@ -169,7 +169,8 @@ status_t for_each_delta(std::span<byte_t const> chain, callback_type_&& callback
     return {};
 }
 
-/** The JSON text a delta carries for @p value of @p type: JSON as written, and any other type printed as JSON. */
+/** The JSON text a delta holds for @p value of @p type: JSON as written, and any other type
+ *  printed as JSON. */
 inline expected<std::string_view> modifier_text(value_view_t value, ustore_docs_field_type_t type,
                                                 ustore_arena_t arena) noexcept {
     if (type == ustore_docs_field_type_json_k) return std::string_view(value);
@@ -442,7 +443,7 @@ inline expected<yyjson_mut_val*> compose_merges(yyjson_mut_doc* document, yyjson
     return composed;
 }
 
-/** Prints @p value as the JSON text a delta carries. */
+/** Prints @p value as the JSON text a delta holds. */
 inline expected<std::string_view> print_modifier(yyjson_mut_val* value, ustore_arena_t arena) noexcept {
     auto [text, status] = json_dump({nullptr, value}, arena);
     if (status.failed()) return status;

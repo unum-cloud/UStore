@@ -25,6 +25,7 @@ from ustore.blobs import (
     BlobsScanArguments,
     BlobsWriteArguments,
     CursorNextArguments,
+    DocsCursorNextArguments,
     MeasureArguments,
     SampleArguments,
 )
@@ -90,6 +91,7 @@ from ustore.db import (
     DatabaseOpenNvmeArguments,
     DatabaseOpenRamArguments,
     DatabaseOpenRocksdbArguments,
+    DatabaseViewNvmeArguments,
     DropMode,
     Durability,
     Engine,
@@ -122,7 +124,6 @@ from ustore.types import (
     ExecutorForNvme,
     ExecutorForRam,
     ExecutorForVram,
-    ExecutorOnPool,
     FromName,
     Gds,
     GPUClass,
@@ -179,7 +180,7 @@ def _resolve[
     `get_symbol` answers `Optional` where `get_function` aborts the process, which is what lets a
     stale library name the symbol it is missing instead of dying without a message.
     """
-    comptime assert __fn_type_is_cabi[Signature](), 'the signature must carry abi("C")'
+    comptime assert __fn_type_is_cabi[Signature](), 'the signature must hold abi("C")'
     if case .Some(address) = handle.get_symbol[NoneType](name):
         return Pointer(to=address).unsafe_bitcast[Signature]()[]
     raise Error(Status.SYMBOL_MISSING, name)
@@ -221,7 +222,6 @@ struct Symbols:
     var gpu_class_from_name: FromName
     var gpu_devices: GPUDevices
     var executor_for_ram: ExecutorForRam
-    var executor_on_pool: ExecutorOnPool
     var executor_for_nvme: ExecutorForNvme
     var executor_for_vram: ExecutorForVram
     var executor_drain: ExecutorDrain
@@ -260,6 +260,7 @@ struct Symbols:
     var database_view_rocksdb: Verb[DatabaseOpenRocksdbArguments]
     var database_open_leveldb: Verb[DatabaseOpenLeveldbArguments]
     var database_open_nvme: Verb[DatabaseOpenNvmeArguments]
+    var database_view_nvme: Verb[DatabaseViewNvmeArguments]
     var database_describe: Verb[DatabaseDescribeArguments]
     var database_clear: Verb[DatabaseClearArguments]
     var database_compact: Verb[DatabaseCompactArguments]
@@ -324,7 +325,7 @@ struct Symbols:
     var docs_remove: Verb[DocsRemoveArguments]
     var docs_scan: Verb[FilteredScanArguments["ustore_docs_scan"]]
     var docs_cursor_init: Verb[FilteredCursorInitArguments]
-    var docs_cursor_next: Verb[CursorNextArguments["ustore_docs_cursor_next"]]
+    var docs_cursor_next: Verb[DocsCursorNextArguments]
     var docs_cursor_free: Release
     var docs_sample: Verb[SampleArguments["ustore_docs_sample"]]
     var docs_measure: Verb[MeasureArguments["ustore_docs_measure"]]
@@ -390,7 +391,6 @@ struct Symbols:
         self.gpu_class_from_name = _resolve[FromName](handle, "ustore_gpu_class_from_name")
         self.gpu_devices = _resolve[GPUDevices](handle, "ustore_gpu_devices")
         self.executor_for_ram = _resolve[ExecutorForRam](handle, "ustore_executor_for_ram")
-        self.executor_on_pool = _resolve[ExecutorOnPool](handle, "ustore_executor_on_pool")
         self.executor_for_nvme = _resolve[ExecutorForNvme](handle, "ustore_executor_for_nvme")
         self.executor_for_vram = _resolve[ExecutorForVram](handle, "ustore_executor_for_vram")
         self.executor_drain = _resolve[ExecutorDrain](handle, "ustore_executor_drain")
@@ -429,6 +429,7 @@ struct Symbols:
         self.database_view_rocksdb = _resolve[Verb[DatabaseOpenRocksdbArguments]](handle, "ustore_database_view_rocksdb")
         self.database_open_leveldb = _resolve[Verb[DatabaseOpenLeveldbArguments]](handle, "ustore_database_open_leveldb")
         self.database_open_nvme = _resolve[Verb[DatabaseOpenNvmeArguments]](handle, "ustore_database_open_nvme")
+        self.database_view_nvme = _resolve[Verb[DatabaseViewNvmeArguments]](handle, "ustore_database_view_nvme")
         self.database_describe = _resolve[Verb[DatabaseDescribeArguments]](handle, "ustore_database_describe")
         self.database_clear = _resolve[Verb[DatabaseClearArguments]](handle, "ustore_database_clear")
         self.database_compact = _resolve[Verb[DatabaseCompactArguments]](handle, "ustore_database_compact")
@@ -495,7 +496,7 @@ struct Symbols:
         self.docs_remove = _resolve[Verb[DocsRemoveArguments]](handle, "ustore_docs_remove")
         self.docs_scan = _resolve[Verb[FilteredScanArguments["ustore_docs_scan"]]](handle, "ustore_docs_scan")
         self.docs_cursor_init = _resolve[Verb[FilteredCursorInitArguments]](handle, "ustore_docs_cursor_init")
-        self.docs_cursor_next = _resolve[Verb[CursorNextArguments["ustore_docs_cursor_next"]]](handle, "ustore_docs_cursor_next")
+        self.docs_cursor_next = _resolve[Verb[DocsCursorNextArguments]](handle, "ustore_docs_cursor_next")
         self.docs_cursor_free = _resolve[Release](handle, "ustore_docs_cursor_free")
         self.docs_sample = _resolve[Verb[SampleArguments["ustore_docs_sample"]]](handle, "ustore_docs_sample")
         self.docs_measure = _resolve[Verb[MeasureArguments["ustore_docs_measure"]]](handle, "ustore_docs_measure")
@@ -552,7 +553,7 @@ struct _Loaded:
 struct Library(ImplicitlyCopyable):
     """A reference to the loaded engine, cheap to copy and shared by everything it creates.
 
-    Every handle carries one, which is what keeps the shared object mapped for as long as anything
+    Every handle holds one, which is what keeps the shared object mapped for as long as anything
     can still call into it.
     """
 
@@ -571,7 +572,7 @@ struct Library(ImplicitlyCopyable):
 
     @inline(.always)
     def symbols(self) -> ref[origin_of(self.shared[].symbols)] Symbols:
-        """The resolved entry points, borrowed rather than copied on every call."""
+        """The resolved entry points, viewed rather than copied on every call."""
         return self.shared[].symbols
 
     def version(self) -> Tuple[Int, Int, Int]:

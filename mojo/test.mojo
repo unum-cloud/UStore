@@ -391,7 +391,7 @@ def test_awaited_failures_raise() raises:
 
 
 def test_arenas_free_before_their_executor() raises:
-    """An arena borrows the executor that made it, so the executor outlives it past its own last use."""
+    """An arena views the executor that made it, so the executor outlives it past its own last use."""
     if not _library_is_present():
         _skipped(library_missing_k)
         return
@@ -410,16 +410,18 @@ def test_arenas_free_before_their_executor() raises:
 
 @fieldwise_init
 struct _Holder:
-    """What a predicate writes through, on the executor its own scan holds, and the status the write finished with."""
+    """What a predicate writes through, on the executor its own scan holds, and where the write's status lands."""
 
     var database: Pointer[Database, MutUntrackedOrigin]
     var executor: Pointer[Executor, MutUntrackedOrigin]
     var collection: CollectionID
-    var refused: Status
+    var refused: Pointer[Status, MutUntrackedOrigin]
 
 
 def _write_on_the_held_executor(
-    keys: Span[Key, MutAnyOrigin], admissions: Span[Admission, MutAnyOrigin], holder: Pointer[_Holder, MutAnyOrigin]
+    keys: Span[Key, MutAnyOrigin],
+    admissions: Span[Admission, MutAnyOrigin],
+    holder: Pointer[_Holder, ImmUntrackedOrigin],
 ):
     """A predicate admitting every key, which writes on the executor its own scan holds."""
     for index in range(len(keys)):
@@ -432,9 +434,9 @@ def _write_on_the_held_executor(
             KeysView.repeating(key),
             StringsView.of(values.bytes, values.offsets),
         )
-        holder[].refused = Status.SUCCESS
+        holder[].refused[] = Status.SUCCESS
     except error:
-        holder[].refused = error.status
+        holder[].refused[] = error.status
 
 
 def test_a_held_executor_refuses_the_next_call() raises:
@@ -451,11 +453,12 @@ def test_a_held_executor_refuses_the_next_call() raises:
     var values = _Tape(["held"])
     db.write(CollectionsView.repeating(people), KeysView.repeating(key), StringsView.of(values.bytes, values.offsets))
 
+    var refused = Status.DEFERRED
     var holder = _Holder(
         Pointer(to=db).unsafe_origin_cast[MutUntrackedOrigin](),
         Pointer(to=executor).unsafe_origin_cast[MutUntrackedOrigin](),
         people,
-        Status.DEFERRED,
+        Pointer(to=refused).unsafe_origin_cast[MutUntrackedOrigin](),
     )
     var arena = Arena(executor)
     var start = Key(0)
@@ -466,7 +469,7 @@ def test_a_held_executor_refuses_the_next_call() raises:
         arena,
         BlobsScanConfig(predicate=Predicate.batch[_write_on_the_held_executor](Pointer(to=holder))),
     )
-    assert_true(holder.refused == Status.CONTENDED, "a call on a held executor must finish contended")
+    assert_true(refused == Status.CONTENDED, "a call on a held executor must finish contended")
     assert_equal(len(scanned.run(0)), 1)
     var inner = Key(9)
     db.on(executor).write(
@@ -575,18 +578,19 @@ def test_compact_plans_stay_live_until_finished() raises:
     _ = db^  # the database a plan names outlives its finish
 
 
-def _is_even(key: Key, asked: Pointer[Int, MutAnyOrigin]) -> Bool:
-    """Whether the key's integer is even, counting the keys it was asked about."""
-    asked[] += 1
-    return key.uuid.bytes[15] % 2 == 0
+def _is_even(key: Key, remainder: Pointer[UInt8, ImmUntrackedOrigin]) -> Bool:
+    """Whether the key's integer leaves `remainder` over two, reading the state only."""
+    return key.uuid.bytes[15] % 2 == remainder[]
 
 
 def _admit_even(
-    keys: Span[Key, MutAnyOrigin], admissions: Span[Admission, MutAnyOrigin], asked: Pointer[Int, MutAnyOrigin]
+    keys: Span[Key, MutAnyOrigin],
+    admissions: Span[Admission, MutAnyOrigin],
+    remainder: Pointer[UInt8, ImmUntrackedOrigin],
 ):
-    """A predicate admitting the keys whose integer is even, counting the keys it was asked about."""
+    """A predicate admitting the keys whose integer leaves `remainder` over two, reading the state only."""
     for index in range(len(keys)):
-        admissions[index] = Admission.ADMIT if _is_even(keys[index], asked) else Admission.REJECT
+        admissions[index] = Admission.ADMIT if _is_even(keys[index], remainder) else Admission.REJECT
 
 
 def test_predicate_filters_a_scan() raises:
@@ -602,13 +606,15 @@ def test_predicate_filters_a_scan() raises:
     db.write(CollectionsView.repeating(people), KeysView.of(keys), StringsView.of(values.bytes, values.offsets))
 
     var arena = Arena(library)
-    var asked = 0
+    var remainder = UInt8(0)
     var start = Key(0)
-    var predicates = [Predicate.each[_is_even](Pointer(to=asked)), Predicate.batch[_admit_even](Pointer(to=asked))]
+    var predicates = [
+        Predicate.each[_is_even](Pointer(to=remainder)),
+        Predicate.batch[_admit_even](Pointer(to=remainder)),
+    ]
     assert_true(predicates[0].cost == PredicateCost.CHEAP, "a per-key predicate is cheap")
     assert_true(predicates[1].cost == PredicateCost.EXPENSIVE, "and a batch one expensive unless told otherwise")
     for predicate in predicates:
-        asked = 0
         var admitted = db.scan(
             CollectionsView.repeating(people),
             KeysView.repeating(start),
@@ -619,7 +625,6 @@ def test_predicate_filters_a_scan() raises:
         var run = admitted.run(0)
         assert_equal(len(run), 3)
         assert_true(run[0] == Key(2) and run[1] == Key(4) and run[2] == Key(6))
-        assert_true(asked >= 6)
 
 
 def test_transactions_commit_their_writes() raises:

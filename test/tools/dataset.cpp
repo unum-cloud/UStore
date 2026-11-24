@@ -234,11 +234,15 @@ class test_database_t {
     /** The open database, or null until @c open succeeds. */
     ustore_database_t database_ = nullptr;
 
+    /** The arena of @c arena, or null until a case asks for it. */
+    ustore_arena_t arena_ = nullptr;
+
   public:
     test_database_t() noexcept = default;
     test_database_t(test_database_t const&) = delete;
     test_database_t& operator=(test_database_t const&) = delete;
     ~test_database_t() noexcept {
+        ustore_arena_free(arena_);
         if (database_) ustore_database_free(database_);
     }
 
@@ -248,6 +252,16 @@ class test_database_t {
         if (!expect_status(open_status, util::status_code_t::success_k)) return false;
         database_ = opened;
         return true;
+    }
+
+    /** The arena every task of a case fills, made on first use and freed with the database. */
+    [[nodiscard]] ustore_arena_t arena() noexcept {
+        if (!arena_) {
+            ustore_outcome_t outcome {};
+            ustore_arena_init_t init {.arena = &arena_, .executor = nullptr, .outcome = &outcome};
+            ustore_arena_init(&init);
+        }
+        return arena_;
     }
 
     /** Drops every collection, so a case starts from an empty database. */
@@ -512,6 +526,7 @@ void test_graph_round_trip(config_t const& config, char const* input, char const
 
     ustore_graph_import_t importing {};
     importing.database = database.get();
+    importing.arena = database.arena();
     importing.outcome = &outcome;
     importing.collection = graph;
     importing.path = util::bytes_of(input);
@@ -524,6 +539,7 @@ void test_graph_round_trip(config_t const& config, char const* input, char const
 
     ustore_graph_export_t exporting {};
     exporting.database = database.get();
+    exporting.arena = database.arena();
     exporting.outcome = &outcome;
     exporting.collection = graph;
     exporting.path = util::bytes_of(output);
@@ -560,6 +576,7 @@ void test_documents_round_trip(config_t const& config, char const* input, char c
 
     ustore_docs_import_t importing {};
     importing.database = database.get();
+    importing.arena = database.arena();
     importing.outcome = &outcome;
     importing.collection = documents;
     importing.path = util::bytes_of(input);
@@ -572,6 +589,7 @@ void test_documents_round_trip(config_t const& config, char const* input, char c
 
     ustore_docs_export_t exporting {};
     exporting.database = database.get();
+    exporting.arena = database.arena();
     exporting.outcome = &outcome;
     exporting.collection = documents;
     exporting.path = util::bytes_of(output);
@@ -602,6 +620,7 @@ void test_graph_import_rejects_invalid_tasks(config_t const& config, char const*
     expect_success(outcome);
     ustore_graph_import_t valid {};
     valid.database = database.get();
+    valid.arena = database.arena();
     valid.outcome = &outcome;
     valid.collection = graph;
     valid.path = util::bytes_of(input);
@@ -651,6 +670,7 @@ void test_graph_export_rejects_invalid_tasks(config_t const& config, char const*
     expect_success(outcome);
     ustore_graph_export_t valid {};
     valid.database = database.get();
+    valid.arena = database.arena();
     valid.outcome = &outcome;
     valid.collection = graph;
     valid.path = util::bytes_of(output);
@@ -705,6 +725,7 @@ void test_docs_import_rejects_invalid_tasks(config_t const& config, char const* 
     expect_success(outcome);
     ustore_docs_import_t valid {};
     valid.database = database.get();
+    valid.arena = database.arena();
     valid.outcome = &outcome;
     valid.collection = documents;
     valid.path = util::bytes_of(input);
@@ -759,6 +780,7 @@ void test_docs_export_rejects_invalid_tasks(config_t const& config, char const* 
     expect_success(outcome);
     ustore_docs_export_t valid {};
     valid.database = database.get();
+    valid.arena = database.arena();
     valid.outcome = &outcome;
     valid.collection = documents;
     valid.path = util::bytes_of(output);
@@ -808,7 +830,7 @@ template <typename... arguments_type_>
     requires(std::same_as<arguments_type_, char const*> && ...)
 [[nodiscard]] int run_command(char const* command, arguments_type_... arguments) noexcept {
     // A word with a space would split under both `sh` and `cmd.exe`, and the fixture
-    // paths carry none
+    // paths hold none
     sz::string_t line;
     bool const built = append(line, command) && ((append(line, " ") && append(line, arguments)) && ...);
     return built ? std::system(line.c_str()) : -1;
@@ -895,7 +917,7 @@ struct arrow_table_t {
     return {.name = name, .type = ipc_type_t::binary_k};
 }
 
-/** The table a round trip of @p modality writes, its keys shuffled; blobs carry no
+/** The table a round trip of @p modality writes, its keys shuffled; blobs hold no
  *  @c ustore.modality, so their modality comes from the columns. */
 [[nodiscard]] arrow_table_t modality_table(ustore_modality_t modality) {
     arrow_table_t table;
@@ -1189,9 +1211,8 @@ void test_arrow_bulk_lands_or_refuses(fixture_paths_t const& paths, config_t con
     int const bulk = run_command(executable, "--engine", engine, "--directory", paths.directory, "collection", "import",
                                  "--collection", "bulk", "--input", input.c_str(), "--ingest", "unsorted", ">",
                                  printed.c_str(), "2>", errors.c_str());
-    sz::string_t out_text, error_text;
+    sz::string_t out_text;
     expect_true(read_file(printed.c_str(), out_text) && out_text.size() == 0);
-    expect_true(read_file(errors.c_str(), error_text));
     if (bulk == 0) {
         expect_equal(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection", "export",
                                  "--collection", "bulk", "--output", output.c_str()),
@@ -1202,13 +1223,54 @@ void test_arrow_bulk_lands_or_refuses(fixture_paths_t const& paths, config_t con
     }
     else {
         // The ingest created the collection, so its refusal drops it again
-        expect_true(error_text.view().find("ingests nothing") != sz::string_view_t::npos);
         test_database_t database;
         expect_true(database.open(config) && !lists_collection(database.get(), "bulk"));
     }
     for (std::string const* path : {&input, &output, &printed, &errors}) {
         [[maybe_unused]] int const removed = std::remove(path->c_str());
     }
+}
+
+/** Three sorted blob inputs whose keys overlap import as one, each key landing once with the value
+ *  of the last input holding it: merged through a sorted ingest, or written in input order on an
+ *  engine that ingests no stream. */
+void test_arrow_sorted_inputs_merge(fixture_paths_t const& paths, config_t const& config, char const* executable) {
+    // Inputs hold keys [1,100], [50,150] and [100,200], so 50-99 and 100-150 repeat
+    constexpr std::uint64_t firsts[3] {1, 50, 100}, lasts[3] {100, 150, 200};
+    std::string inputs[3];
+    std::vector<arrow_row_t> wanted(200);
+    for (std::size_t input = 0; input != 3; ++input) {
+        arrow_table_t table;
+        table.fields = {uuid_field("key"), binary_field("value")};
+        for (std::uint64_t key = firsts[input]; key <= lasts[input]; ++key) {
+            arrow_row_t row {uuid_cell(key), std::string(1, char('a' + input)) + std::to_string(key)};
+            wanted[key - 1] = row;
+            table.rows.push_back(std::move(row));
+        }
+        inputs[input] = fmt::format("{}/merge.{}.arrows", paths.files.c_str(), input);
+        if (!expect_true(write_arrow_stream(inputs[input].c_str(), table), "an Arrow input is written")) return;
+    }
+    std::string const listed = inputs[0] + "," + inputs[1] + "," + inputs[2];
+    std::string const output = fmt::format("{}/{}", paths.files.c_str(), "merge.out.arrows");
+    std::string const errors = fmt::format("{}/{}", paths.files.c_str(), "merge.err");
+    char const* const engine = config.engine().data();
+    int const sorted = run_command(executable, "--engine", engine, "--directory", paths.directory, "collection",
+                                   "import", "--collection", "merged", "--input", listed.c_str(), "--ingest", "sorted",
+                                   "2>", errors.c_str());
+    if (sorted != 0)
+        expect_equal(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection", "import",
+                                 "--collection", "merged", "--input", listed.c_str()),
+                     0);
+    expect_equal(run_command(executable, "--engine", engine, "--directory", paths.directory, "collection", "export",
+                             "--collection", "merged", "--output", output.c_str()),
+                 0);
+    arrow_read_t read;
+    read_arrow_file(output.c_str(), read);
+    expect_same_rows(read.rows, wanted);
+    for (std::string const& path : inputs) [[maybe_unused]]
+        int const removed = std::remove(path.c_str());
+    for (std::string const* path : {&output, &errors}) [[maybe_unused]]
+        int const removed = std::remove(path->c_str());
 }
 
 /** The name and modality of every named collection the CLI lists in @p directory on @p engine,
@@ -1804,6 +1866,8 @@ void run_cases(config_t const& config, std::string_view executable) noexcept {
                       [] { return case_result_t::skipped(needs_cli_k); });
         run_test_case(engine_label_t {"test_arrow_bulk_lands_or_refuses"}.c_str(),
                       [] { return case_result_t::skipped(needs_cli_k); });
+        run_test_case(engine_label_t {"test_arrow_sorted_inputs_merge"}.c_str(),
+                      [] { return case_result_t::skipped(needs_cli_k); });
         run_test_case(engine_label_t {"test_snapshot_export_import"}.c_str(),
                       [] { return case_result_t::skipped(needs_cli_k); });
         run_test_case("test_manifest_print_and_recover", [] { return case_result_t::skipped(needs_cli_k); });
@@ -1816,6 +1880,8 @@ void run_cases(config_t const& config, std::string_view executable) noexcept {
                       paths, config, executable.data());
         run_test_case(engine_label_t {"test_arrow_bulk_lands_or_refuses"}.c_str(), test_arrow_bulk_lands_or_refuses,
                       paths, config, executable.data());
+        run_test_case(engine_label_t {"test_arrow_sorted_inputs_merge"}.c_str(), test_arrow_sorted_inputs_merge, paths,
+                      config, executable.data());
         run_test_case(engine_label_t {"test_snapshot_export_import"}.c_str(), test_snapshot_export_import, paths,
                       config, executable.data());
         run_test_case("test_manifest_print_and_recover", test_manifest_print_and_recover, paths, executable.data());

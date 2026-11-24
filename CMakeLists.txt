@@ -42,15 +42,15 @@ option(USTORE_BUILD_STUB "Compile a brute-force stand-in for the C 99 interface"
 option(USTORE_BUILD_PYTHON "Compile the CPython extension; `scikit-build-core` switches it on" OFF)
 set(USTORE_CUDA_ARCH
     ""
-    CACHE STRING "NVIDIA code NVMe's GPU compaction builds for: empty, all, native or one like 100f"
+    CACHE STRING "NVIDIA code the device bundles and tests build for: empty, all, native or one like 100f"
 )
 set(USTORE_ROCM_ARCH
     ""
-    CACHE STRING "AMD processors the device bundles embed code objects for: empty, all, native or a list like gfx942"
+    CACHE STRING "AMD processors the device bundles and tests build for: empty, all, native or a list like gfx942"
 )
 set(USTORE_METAL_ARCH
     ""
-    CACHE STRING "Apple GPU family the Metal class units serve: empty, all or one like apple9"
+    CACHE STRING "Apple GPU family the device bundles and tests serve: empty, all or one like apple9"
 )
 option(USTORE_WERROR "Treat compiler warnings as errors" OFF)
 option(USTORE_BUNDLE_SIBLINGS "Copy the ForkUnion and StringZilla objects into ustore_static; Cargo links their own" ON)
@@ -175,7 +175,7 @@ include(cmake/ustore_gpu.cmake)
 
 # The RAM and NVMe engines compile one variant per CPU class, in `src/<engine>/variants_<class>.cpp`, and their opens
 # pick the newest one the running CPU admits. A class is its parent plus the ForkUnion capabilities its waiter and
-# atomic reference add beyond the spin hint every core of an architecture carries and the StringZilla capabilities its
+# atomic reference add beyond the spin hint every core of an architecture holds and the StringZilla capabilities its
 # strings kit adds, restated here row for row from `parent_class_of`, `waiter_for_cpu_class`, `atomic_ref_for_cpu_class`
 # and `stringzilla_capabilities_of` of `src/lib.hpp`. It exists when its parent does and every one of those capabilities
 # is enabled. A multiversioned build keeps every class that exists. A monoversioned build keeps none, the `serial` floor
@@ -365,13 +365,14 @@ if (${USTORE_WITH_NVME})
     list(APPEND ustore_engine_names_ "nvme")
 
     # The engine's compaction on the device, whose objects both libraries take: host C++ launching the bundles' kernels
-    # through the driver, so it builds everywhere and a device whose bundle carries no kernels makes no compactor
+    # through the driver, so it builds everywhere and a device whose bundle holds no kernels makes no compactor
     add_library(ustore_nvme_compaction OBJECT "${CMAKE_CURRENT_SOURCE_DIR}/src/nvme/compaction.cpp")
     target_link_libraries(
         ustore_nvme_compaction
         PUBLIC $<BUILD_INTERFACE:smashtable::header> $<BUILD_INTERFACE:forkunion::header>
         PRIVATE $<BUILD_INTERFACE:ustore_templates>
     )
+    target_include_directories(ustore_nvme_compaction PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     set_target_properties(ustore_nvme_compaction PROPERTIES POSITION_INDEPENDENT_CODE ON)
     if (ustore_cuda_codes_ OR ustore_rocm_codes_)
         set(ustore_device_compaction_ ON)
@@ -458,7 +459,11 @@ foreach (class_ IN LISTS ustore_nvidia_classes_ ustore_amd_classes_ ustore_apple
     )
     list(APPEND ustore_vram_objects_ $<TARGET_OBJECTS:ustore_vram_${class_}>)
 endforeach ()
-set_source_files_properties(src/vram/bundles.cpp PROPERTIES COMPILE_DEFINITIONS "${ustore_gpu_gates_}")
+# The unit filling Apple's regex walk record reads StringZilla's Metal regex header, which defines that library's
+# exports unless included header-only, as its archive already holds them
+set_source_files_properties(
+    src/vram/bundles.cpp PROPERTIES COMPILE_DEFINITIONS "${ustore_gpu_gates_};STRINGZILLA_HEADER_ONLY=1"
+)
 add_library(
     ustore_static STATIC ${ustore_library_exclusion_} ${ustore_sources_} ${ustore_vram_objects_}
                          ${ustore_dependency_objects_}
@@ -474,7 +479,7 @@ target_compile_options(
 )
 set_target_properties(ustore_static PROPERTIES EXPORT_NAME static)
 set_target_properties(ustore_shared PROPERTIES EXPORT_NAME shared)
-# `SOVERSION` carries the major alone, the only break the C ABI admits
+# `SOVERSION` holds the major alone, the only break the C ABI admits
 set_target_properties(ustore_shared PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR})
 target_compile_definitions(
     ustore_shared
@@ -491,7 +496,7 @@ target_link_libraries(
 )
 # Every GPU runtime and cuFile open through `dlopen` at first use, which glibc before 2.34 keeps in `libdl`
 target_link_libraries(ustore_static PUBLIC ${CMAKE_DL_LIBS})
-# On Apple platforms the Metal layer calls Metal and the Objective-C runtime directly, which every Mac carries
+# On Apple platforms the Metal layer calls Metal and the Objective-C runtime directly, which every Mac holds
 if (USTORE_METAL_ARCH AND APPLE)
     target_link_libraries(ustore_static PUBLIC "-framework Metal" "-framework Foundation" objc)
     target_link_libraries(ustore_shared PRIVATE "-framework Metal" "-framework Foundation" objc)
@@ -521,7 +526,7 @@ foreach (library_ IN ITEMS ustore_static ustore_shared ${ustore_compiled_objects
     target_compile_definitions(${library_} PRIVATE ${ustore_cpu_gates_} ${ustore_gpu_gates_})
     # The Apple executor allocates, binds and waits through StringZilla's Metal layer
     if (USTORE_METAL_ARCH)
-        target_compile_definitions(${library_} PRIVATE STRINGZILLA_ARCH_METAL_=1)
+        target_compile_definitions(${library_} PRIVATE USTORE_ARCH_METAL_=1 STRINGZILLA_ARCH_METAL_=1)
         target_compile_options(${library_} PRIVATE "--embed-dir=${stringzilla_SOURCE_DIR}/include")
     endif ()
     target_link_libraries(

@@ -29,6 +29,8 @@ import (
 #cgo nocallback ustore_database_open_leveldb
 #cgo noescape ustore_database_open_nvme
 #cgo nocallback ustore_database_open_nvme
+#cgo noescape ustore_database_view_nvme
+#cgo nocallback ustore_database_view_nvme
 #cgo noescape ustore_database_describe
 #cgo nocallback ustore_database_describe
 #cgo noescape ustore_database_clear
@@ -433,20 +435,20 @@ func IngestOrderFromName(name string) (IngestOrder, error) {
 // Admitter is the predicate a scan or a cursor asks about the keys it lists: a [Predicate], a
 // [BatchPredicate] or a [CheapBatchPredicate], whose type tells the library what one call costs.
 type Admitter interface {
-	// admitter lends the handler through handle, which stays in place until the library is done with
+	// admitter passes the handler through handle, which stays in place until the library is done with
 	// it.
 	admitter(handle *cgo.Handle) C.ustore_predicate_t
 }
 
 // Predicate admits one listed key into a scan or a walk, or passes over it, asked once per page
-// before patterns or filters read any value. It runs on the host thread serving the call, never on
-// two at once, and it must not panic.
+// before patterns or filters read any value. The executor's threads may ask it at once, so it must
+// be safe to call from several goroutines concurrently, and it must not panic.
 type Predicate func(key Key) bool
 
 // BatchPredicate writes an Admission for every key into admissions, which start as Reject, for
 // handlers that pay per call: it is asked once per page about every key patterns and filters kept.
-// Both slices live only until it returns. It runs on the host thread serving the call, never on
-// two at once, and it must not panic.
+// Both slices live only until it returns. The executor's threads may ask it at once, so it must be
+// safe to call from several goroutines concurrently, and it must not panic.
 type BatchPredicate func(keys []Key, admissions []Admission)
 
 // CheapBatchPredicate is a [BatchPredicate] asked once per page before patterns or filters read any
@@ -502,13 +504,13 @@ func (predicate CheapBatchPredicate) admitter(handle *cgo.Handle) C.ustore_predi
 	return admits(handle, predicate, C.ustore_predicate_cost_cheap_k)
 }
 
-// admits lends handler to the C trampoline through handle, at the cost its type names.
+// admits passes handler to the C trampoline through handle, at the cost its type names.
 func admits(handle *cgo.Handle, handler any, cost C.ustore_predicate_cost_t) C.ustore_predicate_t {
 	*handle = cgo.NewHandle(handler)
 	return C.ustore_predicate_t{callback: C.ustore_go_admits(), state: unsafe.Pointer(handle), cost: cost}
 }
 
-// predicate lends an optional predicate as the structure a filtering verb takes. It hands the
+// predicate passes an optional predicate as the structure a filtering verb takes. It hands the
 // handle slot rather than the call through the interface, so the call stays off the heap.
 func (call *call) predicate(admitter Admitter) C.ustore_predicate_t {
 	if admitter == nil {
@@ -521,15 +523,15 @@ func (call *call) predicate(admitter Admitter) C.ustore_predicate_t {
 
 // region: Helpers
 
-// keys lends a packed key slice as the strided run the library reads, zeroed when empty.
+// keys passes a packed key slice as the strided run the library reads, zeroed when empty.
 func (call *call) keys(keys []Key) C.ustore_keys_view_t {
 	if len(keys) == 0 {
 		return C.ustore_keys_view_t{}
 	}
-	return C.ustore_keys_view_t{data: (*C.ustore_key_t)(call.lend(unsafe.Pointer(unsafe.SliceData(keys)), len(keys))), stride: C.ustore_size_t(unsafe.Sizeof(Key{}))}
+	return C.ustore_keys_view_t{data: (*C.ustore_key_t)(call.pinSlice(unsafe.Pointer(unsafe.SliceData(keys)), len(keys))), stride: C.ustore_size_t(unsafe.Sizeof(Key{}))}
 }
 
-// key lends one key by address from the frame's inputs, or nil for none.
+// key passes one key by address from the frame's inputs, or nil for none.
 func (call *call) key(inputs *inputs, key *Key) *C.ustore_key_t {
 	if key == nil {
 		return nil
@@ -538,15 +540,15 @@ func (call *call) key(inputs *inputs, key *Key) *C.ustore_key_t {
 	return &inputs.key
 }
 
-// lengths lends a run of lengths, zeroed when empty.
+// lengths passes a run of lengths, zeroed when empty.
 func (call *call) lengths(lengths []uint64) C.ustore_lengths_view_t {
 	if len(lengths) == 0 {
 		return C.ustore_lengths_view_t{}
 	}
-	return C.ustore_lengths_view_t{data: (*C.ustore_length_t)(call.lend(unsafe.Pointer(unsafe.SliceData(lengths)), len(lengths))), stride: 8}
+	return C.ustore_lengths_view_t{data: (*C.ustore_length_t)(call.pinSlice(unsafe.Pointer(unsafe.SliceData(lengths)), len(lengths))), stride: 8}
 }
 
-// collections lends the collection every task shares from the frame's inputs, or one per task in
+// collections passes the collection every task shares from the frame's inputs, or one per task in
 // place.
 func (call *call) collections(inputs *inputs, collections Collections) C.ustore_collections_view_t {
 	switch collections := collections.(type) {
@@ -555,7 +557,7 @@ func (call *call) collections(inputs *inputs, collections Collections) C.ustore_
 		return C.ustore_collections_view_t{data: &inputs.collection}
 	case Each:
 		return C.ustore_collections_view_t{
-			data:   (*C.ustore_collection_id_t)(call.lend(unsafe.Pointer(unsafe.SliceData(collections)), len(collections))),
+			data:   (*C.ustore_collection_id_t)(call.pinSlice(unsafe.Pointer(unsafe.SliceData(collections)), len(collections))),
 			stride: C.ustore_size_t(unsafe.Sizeof(CollectionID{})),
 		}
 	}
@@ -583,7 +585,7 @@ func at[Value any](first *Value, index uint) Value {
 	return *(*Value)(unsafe.Add(unsafe.Pointer(first), uintptr(index)*unsafe.Sizeof(*first)))
 }
 
-// keysAt borrows count keys a call wrote into its arena from position begin.
+// keysAt views count keys a call wrote into its arena from position begin.
 func keysAt(first *C.ustore_key_t, begin, end uint64) []Key {
 	if first == nil || begin == end {
 		return nil
@@ -661,7 +663,7 @@ type DatabaseOn struct {
 // [Deferred], offering the verbs of [DatabaseOn] with the same arguments.
 //
 // The library reads a deferred call's inputs until the call is final, so the slices a verb is
-// handed must not change until then; its arena is borrowed, as a blocking verb borrows it.
+// handed must not change until then; the caller keeps its arena until then, as for a blocking verb.
 type DatabaseDeferredOn struct {
 	deferredWrites[C.ustore_database_t]
 }
@@ -749,7 +751,8 @@ func databaseOf(handle C.ustore_database_t, err error) (*Database, error) {
 }
 
 // Close releases the database once every transaction, snapshot, cursor and ingest holding it is
-// closed, waiting for every deferred call naming it. It is idempotent, and a closed database must
+// closed, waiting for every deferred call naming it. It writes nothing to disk, so a Flush comes
+// first for commits made with [DurabilityBuffered]. It is idempotent, and a closed database must
 // not be used again.
 func (database *Database) Close() error {
 	if database == nil || database.handle == nil {
@@ -768,6 +771,9 @@ type DatabaseInitRamConfig struct {
 	Isolation Isolation
 	// CPUClassCeiling is the newest class the database's kernels may run as; zero sets no ceiling.
 	CPUClassCeiling CPUClass
+	// MemoryLimit caps the bytes of keys and values the database holds, past which a write answers
+	// [StatusCapacityExhausted]; zero takes 16 GiB.
+	MemoryLimit uint64
 }
 
 // DatabaseInitRam starts an empty database in memory alone.
@@ -777,17 +783,18 @@ func DatabaseInitRam(config *DatabaseInitRamConfig) (*Database, error) {
 	if err != nil {
 		return nil, err
 	}
-	var lent lent[C.ustore_database_t]
-	arguments := open[C.ustore_database_init_ram_t](&lent)
+	var call callWithResult[C.ustore_database_t]
+	arguments := open[C.ustore_database_init_ram_t](&call)
 	*arguments = C.ustore_database_init_ram_t{
-		database:          lent.result,
+		database:          call.result,
 		executor:          executor,
-		outcome:           lent.outcome(),
+		outcome:           call.outcome(),
 		isolation:         C.ustore_isolation_t(options.Isolation),
 		cpu_class_ceiling: C.ustore_cpu_class_t(options.CPUClassCeiling),
+		memory_limit:      C.ustore_size_t(options.MemoryLimit),
 	}
 	C.ustore_database_init_ram(arguments)
-	return databaseOf(block(&lent, nil))
+	return databaseOf(block(&call, nil))
 }
 
 // DatabaseOpenRam serves directory as one in-memory image, loading it if present.
@@ -797,18 +804,19 @@ func DatabaseOpenRam(directory string, config *DatabaseInitRamConfig) (*Database
 	if err != nil {
 		return nil, err
 	}
-	var lent lent[C.ustore_database_t]
-	arguments := open[C.ustore_database_open_ram_t](&lent)
+	var call callWithResult[C.ustore_database_t]
+	arguments := open[C.ustore_database_open_ram_t](&call)
 	*arguments = C.ustore_database_open_ram_t{
-		database:          lent.result,
+		database:          call.result,
 		executor:          executor,
-		outcome:           lent.outcome(),
-		directory:         lent.text(directory),
+		outcome:           call.outcome(),
+		directory:         call.text(directory),
 		isolation:         C.ustore_isolation_t(options.Isolation),
 		cpu_class_ceiling: C.ustore_cpu_class_t(options.CPUClassCeiling),
+		memory_limit:      C.ustore_size_t(options.MemoryLimit),
 	}
 	C.ustore_database_open_ram(arguments)
-	return databaseOf(block(&lent, nil))
+	return databaseOf(block(&call, nil))
 }
 
 // DataDirectory is a directory a database spreads its files over, with the bytes they may take
@@ -820,7 +828,7 @@ type DataDirectory struct {
 	MaxBytes uint64
 }
 
-// directories lends the data directories of an open, each path borrowed rather than copied.
+// directories pins the data directories of an open, each path viewed rather than copied.
 func (call *call) directories(directories []DataDirectory) (*C.ustore_data_directory_t, C.ustore_size_t) {
 	if len(directories) == 0 {
 		return nil, 0
@@ -829,7 +837,7 @@ func (call *call) directories(directories []DataDirectory) (*C.ustore_data_direc
 	for index, directory := range directories {
 		lowered[index] = C.ustore_data_directory_t{path: call.text(directory.Path), max_bytes: C.ustore_size_t(directory.MaxBytes)}
 	}
-	return (*C.ustore_data_directory_t)(call.lend(unsafe.Pointer(unsafe.SliceData(lowered)), len(lowered))), C.ustore_size_t(len(lowered))
+	return (*C.ustore_data_directory_t)(call.pinSlice(unsafe.Pointer(unsafe.SliceData(lowered)), len(lowered))), C.ustore_size_t(len(lowered))
 }
 
 // DatabaseOpenRocksdbConfig carries the optional arguments of [DatabaseOpenRocksdb] and
@@ -839,6 +847,12 @@ type DatabaseOpenRocksdbConfig struct {
 	Executor *Executor
 	// DataDirectories spread the files beyond the directory.
 	DataDirectories []DataDirectory
+	// MemoryLimit caps the host memory the engine caches and buffers in, a quarter for one block
+	// cache and a quarter for one write buffer manager; zero takes 1 GiB.
+	MemoryLimit uint64
+	// BackgroundThreads sizes the pool the database owns for its flushes and compactions; zero
+	// takes 2.
+	BackgroundThreads uint64
 }
 
 // DatabaseOpenRocksdb serves a RocksDB directory in place, creating it if absent.
@@ -848,19 +862,21 @@ func DatabaseOpenRocksdb(directory string, config *DatabaseOpenRocksdbConfig) (*
 	if err != nil {
 		return nil, err
 	}
-	var lent lent[C.ustore_database_t]
-	arguments := open[C.ustore_database_open_rocksdb_t](&lent)
-	directories, count := lent.directories(options.DataDirectories)
+	var call callWithResult[C.ustore_database_t]
+	arguments := open[C.ustore_database_open_rocksdb_t](&call)
+	directories, count := call.directories(options.DataDirectories)
 	*arguments = C.ustore_database_open_rocksdb_t{
-		database:               lent.result,
+		database:               call.result,
 		executor:               executor,
-		outcome:                lent.outcome(),
-		directory:              lent.text(directory),
+		outcome:                call.outcome(),
+		directory:              call.text(directory),
 		data_directories:       directories,
 		data_directories_count: count,
+		memory_limit:           C.ustore_size_t(options.MemoryLimit),
+		background_threads:     C.ustore_size_t(options.BackgroundThreads),
 	}
 	C.ustore_database_open_rocksdb(arguments)
-	return databaseOf(block(&lent, nil))
+	return databaseOf(block(&call, nil))
 }
 
 // DatabaseViewRocksdb serves a RocksDB directory read-only, refusing every change with
@@ -871,38 +887,54 @@ func DatabaseViewRocksdb(directory string, config *DatabaseOpenRocksdbConfig) (*
 	if err != nil {
 		return nil, err
 	}
-	var lent lent[C.ustore_database_t]
-	arguments := open[C.ustore_database_view_rocksdb_t](&lent)
-	directories, count := lent.directories(options.DataDirectories)
+	var call callWithResult[C.ustore_database_t]
+	arguments := open[C.ustore_database_view_rocksdb_t](&call)
+	directories, count := call.directories(options.DataDirectories)
 	*arguments = C.ustore_database_view_rocksdb_t{
-		database:               lent.result,
+		database:               call.result,
 		executor:               executor,
-		outcome:                lent.outcome(),
-		directory:              lent.text(directory),
+		outcome:                call.outcome(),
+		directory:              call.text(directory),
 		data_directories:       directories,
 		data_directories_count: count,
+		memory_limit:           C.ustore_size_t(options.MemoryLimit),
+		background_threads:     C.ustore_size_t(options.BackgroundThreads),
 	}
 	C.ustore_database_view_rocksdb(arguments)
-	return databaseOf(block(&lent, nil))
+	return databaseOf(block(&call, nil))
 }
 
-// DatabaseOpenLeveldb serves a LevelDB directory in place, creating it if absent, opened on
-// executor or, for nil, the calling goroutine.
-func DatabaseOpenLeveldb(directory string, executor *Executor) (*Database, error) {
-	handle, err := executor.lower()
+// DatabaseOpenLeveldbConfig carries the optional arguments of [DatabaseOpenLeveldb].
+type DatabaseOpenLeveldbConfig struct {
+	// Executor runs the open, nil the calling goroutine.
+	Executor *Executor
+	// MemoryLimit caps the host memory the engine caches and buffers in, a quarter for the block
+	// cache and a quarter for the write buffer; zero takes 1 GiB.
+	MemoryLimit uint64
+	// BackgroundThreads is zero or one, as LevelDB compacts on one thread, and more answers
+	// [StatusUnsupported].
+	BackgroundThreads uint64
+}
+
+// DatabaseOpenLeveldb serves a LevelDB directory in place, creating it if absent.
+func DatabaseOpenLeveldb(directory string, config *DatabaseOpenLeveldbConfig) (*Database, error) {
+	options := configOf(config)
+	executor, err := options.Executor.lower()
 	if err != nil {
 		return nil, err
 	}
-	var lent lent[C.ustore_database_t]
-	arguments := open[C.ustore_database_open_leveldb_t](&lent)
+	var call callWithResult[C.ustore_database_t]
+	arguments := open[C.ustore_database_open_leveldb_t](&call)
 	*arguments = C.ustore_database_open_leveldb_t{
-		database:  lent.result,
-		executor:  handle,
-		outcome:   lent.outcome(),
-		directory: lent.text(directory),
+		database:           call.result,
+		executor:           executor,
+		outcome:            call.outcome(),
+		directory:          call.text(directory),
+		memory_limit:       C.ustore_size_t(options.MemoryLimit),
+		background_threads: C.ustore_size_t(options.BackgroundThreads),
 	}
 	C.ustore_database_open_leveldb(arguments)
-	return databaseOf(block(&lent, nil))
+	return databaseOf(block(&call, nil))
 }
 
 // DatabaseOpenNvmeConfig carries the optional arguments of [DatabaseOpenNvme], where every zero
@@ -949,14 +981,14 @@ func DatabaseOpenNvme(directory string, config *DatabaseOpenNvmeConfig) (*Databa
 	if err != nil {
 		return nil, err
 	}
-	var lent lent[C.ustore_database_t]
-	arguments := open[C.ustore_database_open_nvme_t](&lent)
-	directories, count := lent.directories(options.DataDirectories)
+	var call callWithResult[C.ustore_database_t]
+	arguments := open[C.ustore_database_open_nvme_t](&call)
+	directories, count := call.directories(options.DataDirectories)
 	*arguments = C.ustore_database_open_nvme_t{
-		database:                          lent.result,
+		database:                          call.result,
 		executor:                          executor,
-		outcome:                           lent.outcome(),
-		directory:                         lent.text(directory),
+		outcome:                           call.outcome(),
+		directory:                         call.text(directory),
 		data_directories:                  directories,
 		data_directories_count:            count,
 		compactions:                       compactions,
@@ -973,7 +1005,52 @@ func DatabaseOpenNvme(directory string, config *DatabaseOpenNvmeConfig) (*Databa
 		cpu_class_ceiling:                 C.ustore_cpu_class_t(options.CPUClassCeiling),
 	}
 	C.ustore_database_open_nvme(arguments)
-	return databaseOf(block(&lent, nil))
+	return databaseOf(block(&call, nil))
+}
+
+// DatabaseViewNvmeConfig carries the optional arguments of [DatabaseViewNvme], where every zero
+// size keeps the engine's default.
+type DatabaseViewNvmeConfig struct {
+	// Executor runs the open, nil the calling goroutine; an NVMe executor moves the bytes.
+	Executor *Executor
+	// DataDirectories are the volumes beyond the directory, as the database was opened with.
+	DataDirectories []DataDirectory
+	// MemoryLimit caps the bytes the engine keeps in memory.
+	MemoryLimit uint64
+	// CollectionConcurrencyLimit caps the calls one collection serves at once.
+	CollectionConcurrencyLimit uint64
+	// CollectionCacheLimit caps the bytes one collection caches.
+	CollectionCacheLimit uint64
+	// CPUClassCeiling is the newest class the database's kernels may run as; zero sets no ceiling.
+	CPUClassCeiling CPUClass
+}
+
+// DatabaseViewNvme serves the database a manifest names through the in-tree NVMe engine,
+// read-only, writing nothing to its data directories and refusing every change with
+// [StatusReadOnly].
+func DatabaseViewNvme(directory string, config *DatabaseViewNvmeConfig) (*Database, error) {
+	options := configOf(config)
+	executor, err := options.Executor.lower()
+	if err != nil {
+		return nil, err
+	}
+	var call callWithResult[C.ustore_database_t]
+	arguments := open[C.ustore_database_view_nvme_t](&call)
+	directories, count := call.directories(options.DataDirectories)
+	*arguments = C.ustore_database_view_nvme_t{
+		database:                     call.result,
+		executor:                     executor,
+		outcome:                      call.outcome(),
+		directory:                    call.text(directory),
+		data_directories:             directories,
+		data_directories_count:       count,
+		memory_limit:                 C.ustore_size_t(options.MemoryLimit),
+		collection_concurrency_limit: C.ustore_size_t(options.CollectionConcurrencyLimit),
+		collection_cache_limit:       C.ustore_size_t(options.CollectionCacheLimit),
+		cpu_class_ceiling:            C.ustore_cpu_class_t(options.CPUClassCeiling),
+	}
+	C.ustore_database_view_nvme(arguments)
+	return databaseOf(block(&call, nil))
 }
 
 // DatabaseDescription is what [DatabaseOn.Describe] reports, laid out as
@@ -993,67 +1070,67 @@ type DatabaseDescription struct {
 	MemoryBytes uint64
 	// DiskBytes is what the files of the database take on disk.
 	DiskBytes uint64
-	// PinRefusedBytes is the NVMe engine's io_uring arena the locked-memory cap refused to pin.
-	PinRefusedBytes uint64
-	// CrossingRequests counts the requests the NVMe engine sent unpinned while its arena was pinned.
-	CrossingRequests uint64
+	// UnpinnedStagingBytes is the NVMe engine's io_uring arena the locked-memory cap refused to pin,
+	// so each request pins its own.
+	UnpinnedStagingBytes uint64
+	// RequestsAcrossRegisteredSlots counts the requests the NVMe engine sent unpinned while its
+	// arena was pinned, as each crossed a gibibyte of it.
+	RequestsAcrossRegisteredSlots uint64
 }
-
-// The library writes the description in place, so the two layouts must agree.
-var _ = [1]struct{}{}[unsafe.Sizeof(DatabaseDescription{})-unsafe.Sizeof(C.ustore_database_description_t{})]
 
 // Describe reports the engine's capabilities, isolation, CPU class and the sizes it estimates.
 func (on DatabaseOn) Describe() (DatabaseDescription, error) {
-	var lent lent[DatabaseDescription]
-	return block(&lent, on.describe(&lent, C.ustore_completion_blocking_k))
+	var call callWithResult[DatabaseDescription]
+	return block(&call, on.describe(&call, C.ustore_completion_blocking_k))
 }
 
 // Describe submits [DatabaseOn.Describe].
 func (on DatabaseDeferredOn) Describe() (*Deferred[DatabaseDescription], error) {
 	deferred := new(Deferred[DatabaseDescription])
-	return submitted(deferred, on.describe(&deferred.lent, C.ustore_completion_deferred_k))
+	return submitted(deferred, on.describe(&deferred.call, C.ustore_completion_deferred_k))
 }
 
-func (receiver storeReceiver[Handle]) describe(lent *lent[DatabaseDescription], completion C.ustore_completion_t) error {
+func (receiver storeReceiver[Handle]) describe(call *callWithResult[DatabaseDescription], completion C.ustore_completion_t) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
 	}
-	arguments := open[C.ustore_database_describe_t](lent)
+	arguments := open[C.ustore_database_describe_t](call)
 	*arguments = C.ustore_database_describe_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		completion:  completion,
-		description: (*C.ustore_database_description_t)(unsafe.Pointer(lent.result)),
+		description: (*C.ustore_database_description_t)(unsafe.Pointer(call.result)),
 	}
 	C.ustore_database_describe(arguments)
 	return nil
 }
 
-// Clear empties every collection at once, as mode says.
+// Clear empties every collection at once, as mode says, answering [StatusContended] for a drop of
+// the collections as [DatabaseOn.CollectionDrop] does.
 func (on DatabaseOn) Clear(mode DropMode) error {
-	var lent lent[struct{}]
-	_, err := block(&lent, on.clear(&lent, C.ustore_completion_blocking_k, mode))
+	var call callWithResult[struct{}]
+	_, err := block(&call, on.clear(&call, C.ustore_completion_blocking_k, mode))
 	return err
 }
 
 // Clear submits [DatabaseOn.Clear].
 func (on DatabaseDeferredOn) Clear(mode DropMode) (*Deferred[struct{}], error) {
 	deferred := new(Deferred[struct{}])
-	return submitted(deferred, on.clear(&deferred.lent, C.ustore_completion_deferred_k, mode))
+	return submitted(deferred, on.clear(&deferred.call, C.ustore_completion_deferred_k, mode))
 }
 
-func (receiver storeReceiver[Handle]) clear(lent *lent[struct{}], completion C.ustore_completion_t, mode DropMode) error {
+func (receiver storeReceiver[Handle]) clear(call *callWithResult[struct{}], completion C.ustore_completion_t, mode DropMode) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
 	}
-	arguments := open[C.ustore_database_clear_t](lent)
+	arguments := open[C.ustore_database_clear_t](call)
 	*arguments = C.ustore_database_clear_t{
 		database:   database,
 		executor:   executor,
-		outcome:    lent.outcome(),
+		outcome:    call.outcome(),
 		completion: completion,
 		mode:       C.ustore_drop_mode_t(mode),
 	}
@@ -1062,7 +1139,8 @@ func (receiver storeReceiver[Handle]) clear(lent *lent[struct{}], completion C.u
 }
 
 // CompactPlan is a compaction kept live across calls: the handle the library opens on the first
-// call naming it, and where the last such call stopped.
+// call naming it, and where the last such call stopped. It opens only on an executor, and continues
+// or finishes on any host executor, while its database stays open until the finish.
 type CompactPlan struct {
 	// Phase is where the last call naming the plan stopped, [PhaseDone] once the compaction ended.
 	Phase  PhaseProgress
@@ -1080,35 +1158,35 @@ type CompactConfig struct {
 // Compact reclaims the space that overwritten and removed data still takes, through the phases
 // its engine runs.
 func (on DatabaseOn) Compact(config *CompactConfig) error {
-	var lent lent[struct{}]
-	_, err := block(&lent, on.compact(&lent, C.ustore_completion_blocking_k, config))
+	var call callWithResult[struct{}]
+	_, err := block(&call, on.compact(&call, C.ustore_completion_blocking_k, config))
 	return err
 }
 
 // Compact submits [DatabaseOn.Compact].
 func (on DatabaseDeferredOn) Compact(config *CompactConfig) (*Deferred[struct{}], error) {
 	deferred := new(Deferred[struct{}])
-	return submitted(deferred, on.compact(&deferred.lent, C.ustore_completion_deferred_k, config))
+	return submitted(deferred, on.compact(&deferred.call, C.ustore_completion_deferred_k, config))
 }
 
-func (receiver storeReceiver[Handle]) compact(lent *lent[struct{}], completion C.ustore_completion_t, config *CompactConfig) error {
+func (receiver storeReceiver[Handle]) compact(call *callWithResult[struct{}], completion C.ustore_completion_t, config *CompactConfig) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
 	}
 	options := configOf(config)
-	arguments := open[C.ustore_database_compact_t](lent)
-	progress, state := lent.progress(options.Progress)
+	arguments := open[C.ustore_database_compact_t](call)
+	progress, state := call.progress(options.Progress)
 	*arguments = C.ustore_database_compact_t{
 		database:       database,
 		executor:       executor,
-		outcome:        lent.outcome(),
+		outcome:        call.outcome(),
 		completion:     completion,
 		progress:       progress,
 		progress_state: state,
 	}
 	if options.Plan != nil {
-		plan := (*CompactPlan)(lent.pin(unsafe.Pointer(options.Plan)))
+		plan := (*CompactPlan)(call.pin(unsafe.Pointer(options.Plan)))
 		arguments.plan = &plan.handle
 		arguments.phase = (*C.ustore_phase_progress_t)(unsafe.Pointer(&plan.Phase))
 	}
@@ -1119,18 +1197,18 @@ func (receiver storeReceiver[Handle]) compact(lent *lent[struct{}], completion C
 // CompactPlanFinish frees a plan whatever the call answers, so another compaction may open on the
 // database, leaving the plan fresh.
 func (on DatabaseOn) CompactPlanFinish(plan *CompactPlan) error {
-	var lent lent[struct{}]
-	_, err := block(&lent, on.compactPlanFinish(&lent, C.ustore_completion_blocking_k, plan))
+	var call callWithResult[struct{}]
+	_, err := block(&call, on.compactPlanFinish(&call, C.ustore_completion_blocking_k, plan))
 	return err
 }
 
 // CompactPlanFinish submits [DatabaseOn.CompactPlanFinish].
 func (on DatabaseDeferredOn) CompactPlanFinish(plan *CompactPlan) (*Deferred[struct{}], error) {
 	deferred := new(Deferred[struct{}])
-	return submitted(deferred, on.compactPlanFinish(&deferred.lent, C.ustore_completion_deferred_k, plan))
+	return submitted(deferred, on.compactPlanFinish(&deferred.call, C.ustore_completion_deferred_k, plan))
 }
 
-func (receiver storeReceiver[Handle]) compactPlanFinish(lent *lent[struct{}], completion C.ustore_completion_t, plan *CompactPlan) error {
+func (receiver storeReceiver[Handle]) compactPlanFinish(call *callWithResult[struct{}], completion C.ustore_completion_t, plan *CompactPlan) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
@@ -1138,11 +1216,11 @@ func (receiver storeReceiver[Handle]) compactPlanFinish(lent *lent[struct{}], co
 	if plan == nil {
 		return fail(StatusInvalidArgument, "pass the plan to finish")
 	}
-	arguments := open[C.ustore_database_compact_plan_finish_t](lent)
+	arguments := open[C.ustore_database_compact_plan_finish_t](call)
 	*arguments = C.ustore_database_compact_plan_finish_t{
 		database:   database,
 		executor:   executor,
-		outcome:    lent.outcome(),
+		outcome:    call.outcome(),
 		completion: completion,
 		plan:       plan.handle,
 	}
@@ -1153,27 +1231,27 @@ func (receiver storeReceiver[Handle]) compactPlanFinish(lent *lent[struct{}], co
 
 // Flush makes every buffered write durable.
 func (on DatabaseOn) Flush() error {
-	var lent lent[struct{}]
-	_, err := block(&lent, on.flush(&lent, C.ustore_completion_blocking_k))
+	var call callWithResult[struct{}]
+	_, err := block(&call, on.flush(&call, C.ustore_completion_blocking_k))
 	return err
 }
 
 // Flush submits [DatabaseOn.Flush].
 func (on DatabaseDeferredOn) Flush() (*Deferred[struct{}], error) {
 	deferred := new(Deferred[struct{}])
-	return submitted(deferred, on.flush(&deferred.lent, C.ustore_completion_deferred_k))
+	return submitted(deferred, on.flush(&deferred.call, C.ustore_completion_deferred_k))
 }
 
-func (receiver storeReceiver[Handle]) flush(lent *lent[struct{}], completion C.ustore_completion_t) error {
+func (receiver storeReceiver[Handle]) flush(call *callWithResult[struct{}], completion C.ustore_completion_t) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
 	}
-	arguments := open[C.ustore_database_flush_t](lent)
+	arguments := open[C.ustore_database_flush_t](call)
 	*arguments = C.ustore_database_flush_t{
 		database:   database,
 		executor:   executor,
-		outcome:    lent.outcome(),
+		outcome:    call.outcome(),
 		completion: completion,
 	}
 	C.ustore_database_flush(arguments)
@@ -1204,17 +1282,17 @@ func (on DatabaseOn) SnapshotInit() (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
-	var lent lent[snapshotInit]
-	arguments := open[C.ustore_snapshot_init_t](&lent)
+	var call callWithResult[snapshotInit]
+	arguments := open[C.ustore_snapshot_init_t](&call)
 	*arguments = C.ustore_snapshot_init_t{
-		snapshot:   &lent.result.handle,
+		snapshot:   &call.result.handle,
 		database:   database,
 		executor:   executor,
-		outcome:    lent.outcome(),
-		read_stamp: &lent.result.stamp,
+		outcome:    call.outcome(),
+		read_stamp: &call.result.stamp,
 	}
 	C.ustore_snapshot_init(arguments)
-	initialized, err := block(&lent, nil)
+	initialized, err := block(&call, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1240,30 +1318,30 @@ func (snapshot *Snapshot) Close() error {
 // Save writes the snapshot out as a new database of the same engine at path, holding exactly the
 // collections and names it records; a cancelled save removes what it wrote.
 func (on SnapshotOn) Save(path string, progress ProgressCallback) error {
-	var lent lent[struct{}]
-	_, err := block(&lent, on.save(&lent, C.ustore_completion_blocking_k, path, progress))
+	var call callWithResult[struct{}]
+	_, err := block(&call, on.save(&call, C.ustore_completion_blocking_k, path, progress))
 	return err
 }
 
 // Save submits [SnapshotOn.Save].
 func (on SnapshotDeferredOn) Save(path string, progress ProgressCallback) (*Deferred[struct{}], error) {
 	deferred := new(Deferred[struct{}])
-	return submitted(deferred, on.save(&deferred.lent, C.ustore_completion_deferred_k, path, progress))
+	return submitted(deferred, on.save(&deferred.call, C.ustore_completion_deferred_k, path, progress))
 }
 
-func (receiver storeReceiver[Handle]) save(lent *lent[struct{}], completion C.ustore_completion_t, path string, progress ProgressCallback) error {
+func (receiver storeReceiver[Handle]) save(call *callWithResult[struct{}], completion C.ustore_completion_t, path string, progress ProgressCallback) error {
 	_, executor, err := receiver.lower()
 	if err != nil {
 		return err
 	}
-	arguments := open[C.ustore_snapshot_save_t](lent)
-	callback, state := lent.progress(progress)
+	arguments := open[C.ustore_snapshot_save_t](call)
+	callback, state := call.progress(progress)
 	*arguments = C.ustore_snapshot_save_t{
 		snapshot:       receiver.snapshot(),
 		executor:       executor,
-		outcome:        lent.outcome(),
+		outcome:        call.outcome(),
 		completion:     completion,
-		path:           lent.text(path),
+		path:           call.text(path),
 		progress:       callback,
 		progress_state: state,
 	}
@@ -1278,58 +1356,60 @@ func (receiver storeReceiver[Handle]) save(lent *lent[struct{}], completion C.us
 // CollectionCreate creates a collection under name holding modality; a name starting with an
 // underscore is refused, as the engines keep their own collections there.
 func (on DatabaseOn) CollectionCreate(name string, modality Modality) (CollectionID, error) {
-	var lent lent[CollectionID]
-	return block(&lent, on.collectionCreate(&lent, C.ustore_completion_blocking_k, name, modality))
+	var call callWithResult[CollectionID]
+	return block(&call, on.collectionCreate(&call, C.ustore_completion_blocking_k, name, modality))
 }
 
 // CollectionCreate submits [DatabaseOn.CollectionCreate].
 func (on DatabaseDeferredOn) CollectionCreate(name string, modality Modality) (*Deferred[CollectionID], error) {
 	deferred := new(Deferred[CollectionID])
-	return submitted(deferred, on.collectionCreate(&deferred.lent, C.ustore_completion_deferred_k, name, modality))
+	return submitted(deferred, on.collectionCreate(&deferred.call, C.ustore_completion_deferred_k, name, modality))
 }
 
-func (receiver storeReceiver[Handle]) collectionCreate(lent *lent[CollectionID], completion C.ustore_completion_t, name string, modality Modality) error {
+func (receiver storeReceiver[Handle]) collectionCreate(call *callWithResult[CollectionID], completion C.ustore_completion_t, name string, modality Modality) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
 	}
-	arguments := open[C.ustore_collection_create_t](lent)
+	arguments := open[C.ustore_collection_create_t](call)
 	*arguments = C.ustore_collection_create_t{
 		database:   database,
 		executor:   executor,
-		outcome:    lent.outcome(),
+		outcome:    call.outcome(),
 		completion: completion,
-		name:       lent.text(name),
+		name:       call.text(name),
 		modality:   C.ustore_modality_t(modality),
-		collection: (*C.ustore_collection_id_t)(unsafe.Pointer(lent.result)),
+		collection: (*C.ustore_collection_id_t)(unsafe.Pointer(call.result)),
 	}
 	C.ustore_collection_create(arguments)
 	return nil
 }
 
-// CollectionDrop empties a collection of its pairs or values, or drops it whole, as mode says.
+// CollectionDrop empties a collection of its pairs or values, or drops it whole, as mode says. A
+// whole drop answers [StatusContended] while a snapshot is open, or on NVMe while a snapshot or a
+// transaction is open.
 func (on DatabaseOn) CollectionDrop(collection CollectionID, mode DropMode) error {
-	var lent lent[struct{}]
-	_, err := block(&lent, on.collectionDrop(&lent, C.ustore_completion_blocking_k, collection, mode))
+	var call callWithResult[struct{}]
+	_, err := block(&call, on.collectionDrop(&call, C.ustore_completion_blocking_k, collection, mode))
 	return err
 }
 
 // CollectionDrop submits [DatabaseOn.CollectionDrop].
 func (on DatabaseDeferredOn) CollectionDrop(collection CollectionID, mode DropMode) (*Deferred[struct{}], error) {
 	deferred := new(Deferred[struct{}])
-	return submitted(deferred, on.collectionDrop(&deferred.lent, C.ustore_completion_deferred_k, collection, mode))
+	return submitted(deferred, on.collectionDrop(&deferred.call, C.ustore_completion_deferred_k, collection, mode))
 }
 
-func (receiver storeReceiver[Handle]) collectionDrop(lent *lent[struct{}], completion C.ustore_completion_t, collection CollectionID, mode DropMode) error {
+func (receiver storeReceiver[Handle]) collectionDrop(call *callWithResult[struct{}], completion C.ustore_completion_t, collection CollectionID, mode DropMode) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
 	}
-	arguments := open[C.ustore_collection_drop_t](lent)
+	arguments := open[C.ustore_collection_drop_t](call)
 	*arguments = C.ustore_collection_drop_t{
 		database:   database,
 		executor:   executor,
-		outcome:    lent.outcome(),
+		outcome:    call.outcome(),
 		completion: completion,
 		collection: rawCollection(collection),
 		mode:       C.ustore_drop_mode_t(mode),
@@ -1358,39 +1438,39 @@ func (list CollectionList) ID(index uint) CollectionID {
 // Modality reports what collection index holds.
 func (list CollectionList) Modality(index uint) Modality { return Modality(at(list.modalities, index)) }
 
-// Name borrows the name of collection index from the arena.
+// Name views the name of collection index in the arena.
 func (list CollectionList) Name(index uint) []byte {
 	return list.names.sized(uint(list.written)).Get(index)
 }
 
 // CollectionList lists every collection the receiver sees, with its modality and name, into arena.
 func (on reads[Handle]) CollectionList(arena *Arena) (CollectionList, error) {
-	var lent lent[CollectionList]
-	return block(&lent, on.collectionList(&lent, C.ustore_completion_blocking_k, arena))
+	var call callWithResult[CollectionList]
+	return block(&call, on.collectionList(&call, C.ustore_completion_blocking_k, arena))
 }
 
 // CollectionList submits [DatabaseOn.CollectionList].
 func (on deferredReads[Handle]) CollectionList(arena *Arena) (*Deferred[CollectionList], error) {
 	deferred := new(Deferred[CollectionList])
-	return submitted(deferred, on.collectionList(&deferred.lent, C.ustore_completion_deferred_k, arena))
+	return submitted(deferred, on.collectionList(&deferred.call, C.ustore_completion_deferred_k, arena))
 }
 
-func (receiver storeReceiver[Handle]) collectionList(lent *lent[CollectionList], completion C.ustore_completion_t, arena *Arena) error {
+func (receiver storeReceiver[Handle]) collectionList(call *callWithResult[CollectionList], completion C.ustore_completion_t, arena *Arena) error {
 	database, executor, outputs, err := receiver.lowerInto(arena)
 	if err != nil {
 		return err
 	}
-	arguments := open[C.ustore_collection_list_t](lent)
+	arguments := open[C.ustore_collection_list_t](call)
 	*arguments = C.ustore_collection_list_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		completion:  completion,
 		snapshot:    receiver.snapshot(),
-		collections: &lent.result.collections,
-		modalities:  &lent.result.modalities,
-		names:       &lent.result.names.raw,
-		written:     &lent.result.written,
+		collections: &call.result.collections,
+		modalities:  &call.result.modalities,
+		names:       &call.result.names.raw,
+		written:     &call.result.written,
 		arena:       outputs,
 	}
 	C.ustore_collection_list(arguments)
@@ -1420,34 +1500,34 @@ func (found FoundCollections) Get(index uint) (CollectionID, Modality, bool) {
 
 // CollectionFind resolves a batch of names into the collections they address, into arena.
 func (on reads[Handle]) CollectionFind(names Tape, arena *Arena) (FoundCollections, error) {
-	var lent lent[FoundCollections]
-	return block(&lent, on.collectionFind(&lent, C.ustore_completion_blocking_k, names, arena))
+	var call callWithResult[FoundCollections]
+	return block(&call, on.collectionFind(&call, C.ustore_completion_blocking_k, names, arena))
 }
 
 // CollectionFind submits [DatabaseOn.CollectionFind].
 func (on deferredReads[Handle]) CollectionFind(names Tape, arena *Arena) (*Deferred[FoundCollections], error) {
 	deferred := new(Deferred[FoundCollections])
-	return submitted(deferred, on.collectionFind(&deferred.lent, C.ustore_completion_deferred_k, names, arena))
+	return submitted(deferred, on.collectionFind(&deferred.call, C.ustore_completion_deferred_k, names, arena))
 }
 
-func (receiver storeReceiver[Handle]) collectionFind(lent *lent[FoundCollections], completion C.ustore_completion_t, names Tape, arena *Arena) error {
+func (receiver storeReceiver[Handle]) collectionFind(call *callWithResult[FoundCollections], completion C.ustore_completion_t, names Tape, arena *Arena) error {
 	database, executor, outputs, err := receiver.lowerInto(arena)
 	if err != nil {
 		return err
 	}
-	arguments := open[C.ustore_collection_find_t](lent)
-	lent.result.count = names.Len()
+	arguments := open[C.ustore_collection_find_t](call)
+	call.result.count = names.Len()
 	*arguments = C.ustore_collection_find_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		completion:  completion,
 		snapshot:    receiver.snapshot(),
 		count:       C.ustore_size_t(names.Len()),
-		names:       lent.strings(names),
-		presences:   &lent.result.presences,
-		collections: &lent.result.collections,
-		modalities:  &lent.result.modalities,
+		names:       call.strings(names),
+		presences:   &call.result.presences,
+		collections: &call.result.collections,
+		modalities:  &call.result.modalities,
 		arena:       outputs,
 	}
 	C.ustore_collection_find(arguments)
@@ -1473,16 +1553,16 @@ func (on DatabaseOn) TransactionInit() (*Transaction, error) {
 	if err != nil {
 		return nil, err
 	}
-	var lent lent[C.ustore_transaction_t]
-	arguments := open[C.ustore_transaction_init_t](&lent)
+	var call callWithResult[C.ustore_transaction_t]
+	arguments := open[C.ustore_transaction_init_t](&call)
 	*arguments = C.ustore_transaction_init_t{
-		transaction: lent.result,
+		transaction: call.result,
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 	}
 	C.ustore_transaction_init(arguments)
-	handle, err := block(&lent, nil)
+	handle, err := block(&call, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -1516,17 +1596,17 @@ func (on TransactionOn) Reset() error {
 	if err != nil {
 		return err
 	}
-	var lent lent[C.ustore_transaction_t]
-	arguments := open[C.ustore_transaction_init_t](&lent)
-	*lent.result = *on.handle
+	var call callWithResult[C.ustore_transaction_t]
+	arguments := open[C.ustore_transaction_init_t](&call)
+	*call.result = *on.handle
 	*arguments = C.ustore_transaction_init_t{
-		transaction: lent.result,
+		transaction: call.result,
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 	}
 	C.ustore_transaction_init(arguments)
-	handle, err := block(&lent, nil)
+	handle, err := block(&call, nil)
 	if err != nil {
 		return err
 	}
@@ -1537,29 +1617,29 @@ func (on TransactionOn) Reset() error {
 // Stage validates the transaction and holds its keys, answering the stamp it reads at and its
 // commit validates against.
 func (on TransactionOn) Stage() (ReadStamp, error) {
-	var lent lent[ReadStamp]
-	return block(&lent, on.stage(&lent, C.ustore_completion_blocking_k))
+	var call callWithResult[ReadStamp]
+	return block(&call, on.stage(&call, C.ustore_completion_blocking_k))
 }
 
 // Stage submits [TransactionOn.Stage].
 func (on TransactionDeferredOn) Stage() (*Deferred[ReadStamp], error) {
 	deferred := new(Deferred[ReadStamp])
-	return submitted(deferred, on.stage(&deferred.lent, C.ustore_completion_deferred_k))
+	return submitted(deferred, on.stage(&deferred.call, C.ustore_completion_deferred_k))
 }
 
-func (receiver storeReceiver[Handle]) stage(lent *lent[ReadStamp], completion C.ustore_completion_t) error {
+func (receiver storeReceiver[Handle]) stage(call *callWithResult[ReadStamp], completion C.ustore_completion_t) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
 	}
-	arguments := open[C.ustore_transaction_stage_t](lent)
+	arguments := open[C.ustore_transaction_stage_t](call)
 	*arguments = C.ustore_transaction_stage_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		completion:  completion,
 		transaction: receiver.transaction(),
-		read_stamp:  (*C.ustore_stamp_t)(unsafe.Pointer(lent.result)),
+		read_stamp:  (*C.ustore_stamp_t)(unsafe.Pointer(call.result)),
 	}
 	C.ustore_transaction_stage(arguments)
 	return nil
@@ -1568,29 +1648,29 @@ func (receiver storeReceiver[Handle]) stage(lent *lent[ReadStamp], completion C.
 // Commit lands every change of the transaction at once, or none of them with a conflict status,
 // answering its position in commit order.
 func (on TransactionOn) Commit(durability Durability) (CommitStamp, error) {
-	var lent lent[CommitStamp]
-	return block(&lent, on.commit(&lent, C.ustore_completion_blocking_k, durability))
+	var call callWithResult[CommitStamp]
+	return block(&call, on.commit(&call, C.ustore_completion_blocking_k, durability))
 }
 
 // Commit submits [TransactionOn.Commit].
 func (on TransactionDeferredOn) Commit(durability Durability) (*Deferred[CommitStamp], error) {
 	deferred := new(Deferred[CommitStamp])
-	return submitted(deferred, on.commit(&deferred.lent, C.ustore_completion_deferred_k, durability))
+	return submitted(deferred, on.commit(&deferred.call, C.ustore_completion_deferred_k, durability))
 }
 
-func (receiver storeReceiver[Handle]) commit(lent *lent[CommitStamp], completion C.ustore_completion_t, durability Durability) error {
+func (receiver storeReceiver[Handle]) commit(call *callWithResult[CommitStamp], completion C.ustore_completion_t, durability Durability) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
 	}
-	arguments := open[C.ustore_transaction_commit_t](lent)
+	arguments := open[C.ustore_transaction_commit_t](call)
 	*arguments = C.ustore_transaction_commit_t{
 		database:     database,
 		executor:     executor,
-		outcome:      lent.outcome(),
+		outcome:      call.outcome(),
 		completion:   completion,
 		transaction:  receiver.transaction(),
-		commit_stamp: (*C.ustore_stamp_t)(unsafe.Pointer(lent.result)),
+		commit_stamp: (*C.ustore_stamp_t)(unsafe.Pointer(call.result)),
 		durability:   C.ustore_durability_t(durability),
 	}
 	C.ustore_transaction_commit(arguments)
@@ -1600,27 +1680,27 @@ func (receiver storeReceiver[Handle]) commit(lent *lent[CommitStamp], completion
 // Rollback withdraws a stage while keeping the reads and writes, so that the transaction can
 // stage again.
 func (on TransactionOn) Rollback() error {
-	var lent lent[struct{}]
-	_, err := block(&lent, on.rollback(&lent, C.ustore_completion_blocking_k))
+	var call callWithResult[struct{}]
+	_, err := block(&call, on.rollback(&call, C.ustore_completion_blocking_k))
 	return err
 }
 
 // Rollback submits [TransactionOn.Rollback].
 func (on TransactionDeferredOn) Rollback() (*Deferred[struct{}], error) {
 	deferred := new(Deferred[struct{}])
-	return submitted(deferred, on.rollback(&deferred.lent, C.ustore_completion_deferred_k))
+	return submitted(deferred, on.rollback(&deferred.call, C.ustore_completion_deferred_k))
 }
 
-func (receiver storeReceiver[Handle]) rollback(lent *lent[struct{}], completion C.ustore_completion_t) error {
+func (receiver storeReceiver[Handle]) rollback(call *callWithResult[struct{}], completion C.ustore_completion_t) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
 	}
-	arguments := open[C.ustore_transaction_rollback_t](lent)
+	arguments := open[C.ustore_transaction_rollback_t](call)
 	*arguments = C.ustore_transaction_rollback_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		completion:  completion,
 		transaction: receiver.transaction(),
 	}
@@ -1641,7 +1721,7 @@ type walk struct {
 	pinner    runtime.Pinner
 }
 
-// admits lends the walk's own predicate, which outlives the init into every pull.
+// admits passes the walk's own predicate, which outlives the init into every pull.
 func (walk *walk) admits(admitter Admitter) C.ustore_predicate_t {
 	if admitter == nil {
 		return C.ustore_predicate_t{}
@@ -1670,10 +1750,10 @@ type Page struct {
 // Len reports how many keys the pull handed out; fewer than wanted exhausts the walk for good.
 func (page Page) Len() uint { return uint(page.written) }
 
-// Keys borrows the keys of the page from the arena.
+// Keys views the keys of the page in the arena.
 func (page Page) Keys() []Key { return keysAt(page.keys, 0, uint64(page.written)) }
 
-// Values borrows the values of the page from the arena, one per key, empty for a keys-only pull.
+// Values views the values of the page in the arena, one per key, empty for a keys-only pull.
 func (page Page) Values() Strings { return page.values.sized(uint(page.written)) }
 
 // endregion: Cursors
@@ -1708,19 +1788,19 @@ func (on DatabaseOn) ChangesCursorInit(collection CollectionID, since CommitStam
 	if err != nil {
 		return nil, err
 	}
-	var lent lent[C.ustore_changes_cursor_t]
-	arguments := open[C.ustore_changes_cursor_init_t](&lent)
+	var call callWithResult[C.ustore_changes_cursor_t]
+	arguments := open[C.ustore_changes_cursor_init_t](&call)
 	*arguments = C.ustore_changes_cursor_init_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		collection:  rawCollection(collection),
 		since_stamp: C.ustore_stamp_t(since),
-		cursor:      lent.result,
+		cursor:      call.result,
 	}
 	C.ustore_changes_cursor_init(arguments)
 	cursor := new(ChangesCursor)
-	if cursor.handle, err = block(&lent, nil); err != nil {
+	if cursor.handle, err = block(&call, nil); err != nil {
 		return nil, err
 	}
 	cursor.database = database
@@ -1752,7 +1832,7 @@ func (changes Changes) Stamp(index uint) CommitStamp { return CommitStamp(at(cha
 // Kind reports what change index did to its key.
 func (changes Changes) Kind(index uint) ChangeKind { return ChangeKind(at(changes.kinds, index)) }
 
-// Value borrows the bytes change index carries from the arena, empty for a removal and for a pull
+// Value views the bytes change index carries in the arena, empty for a removal and for a pull
 // through [ChangesCursor.NextKeys].
 func (changes Changes) Value(index uint) []byte {
 	values := changes.values.sized(uint(changes.count))
@@ -1764,43 +1844,43 @@ func (changes Changes) Value(index uint) []byte {
 
 // NextKeys pulls up to wanted changes into arena: their keys, stamps and kinds.
 func (on ChangesCursorOn) NextKeys(wanted uint, arena *Arena) (Changes, error) {
-	var lent lent[Changes]
-	arguments, err := on.next(&lent, wanted, arena)
+	var call callWithResult[Changes]
+	arguments, err := on.next(&call, wanted, arena)
 	if err != nil {
 		return Changes{}, err
 	}
 	C.ustore_changes_cursor_next(arguments)
-	return block(&lent, nil)
+	return block(&call, nil)
 }
 
 // NextPairs pulls up to wanted changes into arena with the bytes every change carries.
 func (on ChangesCursorOn) NextPairs(wanted uint, arena *Arena) (Changes, error) {
-	var lent lent[Changes]
-	arguments, err := on.next(&lent, wanted, arena)
+	var call callWithResult[Changes]
+	arguments, err := on.next(&call, wanted, arena)
 	if err != nil {
 		return Changes{}, err
 	}
-	arguments.values = &lent.result.values.raw
+	arguments.values = &call.result.values.raw
 	C.ustore_changes_cursor_next(arguments)
-	return block(&lent, nil)
+	return block(&call, nil)
 }
 
 // next opens a pull and fills every argument but the optional values.
-func (on ChangesCursorOn) next(lent *lent[Changes], wanted uint, arena *Arena) (*C.ustore_changes_cursor_next_t, error) {
+func (on ChangesCursorOn) next(call *callWithResult[Changes], wanted uint, arena *Arena) (*C.ustore_changes_cursor_next_t, error) {
 	cursor, _, executor, outputs, err := on.lowerInto(arena)
 	if err != nil {
 		return nil, err
 	}
-	arguments := open[C.ustore_changes_cursor_next_t](lent)
+	arguments := open[C.ustore_changes_cursor_next_t](call)
 	*arguments = C.ustore_changes_cursor_next_t{
 		cursor:   cursor,
 		executor: executor,
-		outcome:  lent.outcome(),
+		outcome:  call.outcome(),
 		wanted:   C.ustore_size_t(wanted),
-		count:    &lent.result.count,
-		keys:     &lent.result.keys,
-		stamps:   &lent.result.stamps,
-		kinds:    &lent.result.kinds,
+		count:    &call.result.count,
+		keys:     &call.result.keys,
+		stamps:   &call.result.stamps,
+		kinds:    &call.result.kinds,
 		arena:    outputs,
 	}
 	return arguments, nil
@@ -1822,32 +1902,51 @@ func (cursor *ChangesCursor) Close() error {
 // region: Ingests
 
 // Ingest lands every row appended to it into one collection as one commit of its own, joining no
-// transaction; its calls run on the calling goroutine, one at a time.
+// transaction; its calls run one at a time, on the calling goroutine, or on an executor through
+// [IngestOn.On].
 type Ingest struct {
+	IngestOn
 	handle C.ustore_ingest_t
 }
 
-// IngestInit opens an ingest into collection, whose rows arrive in order.
+// IngestOn is the receiver whose appends and finish block until their call is final: on the
+// calling goroutine when embedded in an [Ingest], and on an executor when [IngestOn.On] makes it.
+type IngestOn struct {
+	receiver[C.ustore_ingest_t]
+}
+
+// On is the receiver whose calls block on executor.
+func (on IngestOn) On(executor *Executor) IngestOn {
+	on.executor = executor
+	return on
+}
+
+// IngestInit opens an ingest into collection, whose rows arrive in order, blocking on the
+// receiver's executor, whose memory domain holds the ingest.
 func (on DatabaseOn) IngestInit(collection CollectionID, order IngestOrder) (*Ingest, error) {
-	database, _, err := on.lower()
+	database, executor, err := on.lower()
 	if err != nil {
 		return nil, err
 	}
-	var lent lent[C.ustore_ingest_t]
-	arguments := open[C.ustore_ingest_init_t](&lent)
+	var call callWithResult[C.ustore_ingest_t]
+	arguments := open[C.ustore_ingest_init_t](&call)
 	*arguments = C.ustore_ingest_init_t{
-		ingest:     lent.result,
+		ingest:     call.result,
 		database:   database,
-		outcome:    lent.outcome(),
+		executor:   executor,
+		outcome:    call.outcome(),
+		completion: C.ustore_completion_blocking_k,
 		collection: rawCollection(collection),
 		order:      C.ustore_ingest_order_t(order),
 	}
 	C.ustore_ingest_init(arguments)
-	handle, err := block(&lent, nil)
+	handle, err := block(&call, nil)
 	if err != nil {
 		return nil, err
 	}
-	return &Ingest{handle: handle}, nil
+	ingest := &Ingest{handle: handle}
+	ingest.receiver = receiver[C.ustore_ingest_t]{handle: &ingest.handle}
+	return ingest, nil
 }
 
 // IngestRows is one batch of rows: keys and values for blobs, documents and pages, values as the
@@ -1867,48 +1966,55 @@ type IngestRows struct {
 	Edges []Key
 }
 
-// Append hands the ingest one batch of rows, copied or written before it returns.
-func (ingest *Ingest) Append(rows IngestRows) error {
-	if ingest == nil || ingest.handle == nil {
-		return fail(StatusUninitialized, "the ingest is closed or was never opened")
+// Append hands the ingest one batch of rows, copied or written before it returns, parsing values
+// over the executor's threads.
+func (on IngestOn) Append(rows IngestRows) error {
+	handle, executor, err := on.lower()
+	if err != nil {
+		return err
 	}
 	count := max(len(rows.Keys), int(rows.Values.Len()), len(rows.Sources))
 	if err := shape(nil, count, len(rows.Keys), int(rows.Values.Len()), len(rows.Sources), len(rows.Targets), len(rows.Edges)); err != nil {
 		return err
 	}
-	var lent lent[struct{}]
-	arguments := open[C.ustore_ingest_append_t](&lent)
+	var call callWithResult[struct{}]
+	arguments := open[C.ustore_ingest_append_t](&call)
 	*arguments = C.ustore_ingest_append_t{
-		ingest:  ingest.handle,
-		outcome: lent.outcome(),
-		count:   C.ustore_size_t(count),
-		keys:    lent.keys(rows.Keys),
-		values:  lent.strings(rows.Values),
-		sources: lent.keys(rows.Sources),
-		targets: lent.keys(rows.Targets),
-		edges:   lent.keys(rows.Edges),
+		ingest:     handle,
+		executor:   executor,
+		outcome:    call.outcome(),
+		completion: C.ustore_completion_blocking_k,
+		count:      C.ustore_size_t(count),
+		keys:       call.keys(rows.Keys),
+		values:     call.strings(rows.Values),
+		sources:    call.keys(rows.Sources),
+		targets:    call.keys(rows.Targets),
+		edges:      call.keys(rows.Edges),
 	}
 	C.ustore_ingest_append(arguments)
-	_, err := block(&lent, nil)
+	_, err = block(&call, nil)
 	return err
 }
 
 // Finish lands every row appended as one commit and ends the ingest, answering the one stamp every
 // row landed at.
-func (ingest *Ingest) Finish(durability Durability) (CommitStamp, error) {
-	if ingest == nil || ingest.handle == nil {
-		return 0, fail(StatusUninitialized, "the ingest is closed or was never opened")
+func (on IngestOn) Finish(durability Durability) (CommitStamp, error) {
+	handle, executor, err := on.lower()
+	if err != nil {
+		return 0, err
 	}
-	var lent lent[CommitStamp]
-	arguments := open[C.ustore_ingest_finish_t](&lent)
+	var call callWithResult[CommitStamp]
+	arguments := open[C.ustore_ingest_finish_t](&call)
 	*arguments = C.ustore_ingest_finish_t{
-		ingest:       ingest.handle,
-		outcome:      lent.outcome(),
+		ingest:       handle,
+		executor:     executor,
+		outcome:      call.outcome(),
+		completion:   C.ustore_completion_blocking_k,
 		durability:   C.ustore_durability_t(durability),
-		commit_stamp: (*C.ustore_stamp_t)(unsafe.Pointer(lent.result)),
+		commit_stamp: (*C.ustore_stamp_t)(unsafe.Pointer(call.result)),
 	}
 	C.ustore_ingest_finish(arguments)
-	return block(&lent, nil)
+	return block(&call, nil)
 }
 
 // Close frees the ingest, dropping every row of an unfinished one. It is idempotent.

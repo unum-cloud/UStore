@@ -73,10 +73,10 @@ struct claim_t {
 /** The calls naming a handle, which its free waits out. */
 using named_calls_t = std::atomic<std::uint32_t>;
 
-/** A status and its static message, null exactly on success. */
+/** A status and its static note, null exactly on success. */
 struct status_t {
     ustore_status_t code = ustore_status_success_k;
-    char const* message = nullptr;
+    char const* note = nullptr;
 
     bool failed() const noexcept { return code != ustore_status_success_k; }
 };

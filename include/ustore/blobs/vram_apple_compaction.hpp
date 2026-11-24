@@ -118,7 +118,7 @@ class metal_compactor_t {
     std::uint64_t device_allocations() const noexcept { return device_allocations_; }
 
   private:
-    /** As @c compact, for a key slot the bundles carry merge kernels for. */
+    /** As @c compact, for a key slot the bundles export merge kernels for. */
     template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
               typename allocator_type_>
         requires compactable_key_slot_concept<key_slot_type_>
@@ -145,7 +145,8 @@ class metal_compactor_t {
     template <typename element_type_>
     element_type_* carve_(std::size_t count) noexcept;
 
-    /** The executor every merge queues on and allocates through, borrowed. */
+    /** The caller's executor, which every merge queues on and allocates through, valid until
+     *  the compactor is destroyed. */
     utilities::metal_executor_t* executor_ = nullptr;
 
     /** The transport run sections read through, empty where every run uploads from its memory. */

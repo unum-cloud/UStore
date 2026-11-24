@@ -7,8 +7,8 @@
  *  A document read answers the same tape a binary read does, one run of bytes per task, while a
  *  gather answers typed columns whose scalars export in place and whose strings decode on access.
  *  Every verb fills a call the driver keeps on the stack or inside a @c Deferred, holding the
- *  strings and documents it borrows until the call finishes, and every read writes into the arena
- *  it is given and answers results viewing it, or copies out of a one-off arena for a mapping view.
+ *  strings and documents it views until the call finishes, and every read writes into the arena it
+ *  is given and answers results viewing it, or copies out of a one-off arena for a mapping view.
  */
 #include "lib.h"
 
@@ -20,7 +20,7 @@ enum { uuid_bytes_k = 16 };
 /**
  *  @brief Answers the struct-module format one scalar of a field type exports as.
  *
- *  A UUID is sixteen bytes rather than a scalar @c struct spells, so it carries no format and
+ *  A UUID is sixteen bytes rather than a scalar @c struct spells, so it holds no format and
  *  travels as a two-dimensional run of bytes instead.
  *
  *  @param[in] type The field type.
@@ -68,17 +68,18 @@ static size_t field_type_width(ustore_docs_field_type_t type) {
     }
 }
 
-/** Whether a gather has a column layout for @p type: a fixed-width scalar, a UUID, a string or bytes. */
+/** Whether a gather has a column layout for @p type: a fixed-width scalar, a UUID, a string, bytes
+ *  or JSON text. */
 static int field_type_gathers(ustore_docs_field_type_t type) {
     return field_type_width(type) != 0 || type == ustore_docs_field_type_string_k ||
-           type == ustore_docs_field_type_binary_k;
+           type == ustore_docs_field_type_binary_k || type == ustore_docs_field_type_json_k;
 }
 
 /**
  *  @brief Reads an optional string keyword, caching the UTF-8 bytes a call addresses.
  *  @param[in] object The keyword's value, a string or @c None.
  *  @param[in] field The keyword to name in a failure.
- *  @param[out] text The string, borrowed, or NULL for @c None.
+ *  @param[out] text The string, viewed, or NULL for @c None.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
 static int optional_text_from_object(PyObject* object, char const* field, PyObject** text) {
@@ -350,15 +351,15 @@ static void documents_release(documents_t* documents) {
 }
 
 /**
- *  @brief Lays a contiguous buffer of fixed-width scalars out as one borrowed value per task.
+ *  @brief Lays a contiguous buffer of fixed-width scalars out as one viewed value per task.
  *
  *  A buffer holding one scalar stands for every task, and a buffer holding one per task is split in
  *  place, so a column of floats or integers reaches the ABI without ever being printed as JSON.
  *
  *  @param[in] object The column, anything exporting a C-contiguous buffer.
- *  @param[in] type The field type every scalar carries.
+ *  @param[in] type The field type every scalar holds.
  *  @param[in] tasks_count Tasks the write addresses.
- *  @param[out] documents The borrowed runs and the layout they travel with.
+ *  @param[out] documents The viewed runs and the layout they travel with.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
 static int scalars_from_object(PyObject* object, ustore_docs_field_type_t type, size_t tasks_count,
@@ -370,7 +371,7 @@ static int scalars_from_object(PyObject* object, ustore_docs_field_type_t type, 
         return ustore_py_raise_from_cause(PyExc_TypeError, "A column of %s must export a contiguous buffer, not %S",
                                           ustore_docs_field_type_name(type), Py_TYPE(object));
 
-    // A buffer of bytes carries no width of its own, so only a typed one is held to the field's.
+    // A buffer of bytes holds no width of its own, so only a typed one is held to the field's.
     if (buffer.itemsize != 1 && (size_t)buffer.itemsize != width) {
         ustore_py_raise(ustore_status_invalid_argument_k, "A column of %s holds %zu-byte items, got %zd-byte ones",
                         ustore_docs_field_type_name(type), width, buffer.itemsize);
@@ -393,10 +394,10 @@ static int scalars_from_object(PyObject* object, ustore_docs_field_type_t type, 
         PyBuffer_Release(&buffer);
         return -1;
     }
-    // One buffer backs every task, so the batch borrows once and releases once.
+    // One buffer backs every task, so the batch views once and releases once.
     ustore_py_contents_t* const batch = &documents->texts.contents;
     batch->buffers[0] = buffer;
-    batch->borrowed = 1;
+    batch->viewed = 1;
     batch->count = values_count;
     for (size_t task_index = 0; task_index != values_count; ++task_index) {
         batch->views[task_index].data = (uint8_t const*)buffer.buf + task_index * width;
@@ -457,7 +458,7 @@ typedef struct docs_write_call_t {
     /** The keys to write, empty when every key is read out of its own document. */
     ustore_py_keys_t keys;
 
-    /** The borrowed documents, one per key or one for every key. */
+    /** The viewed documents, one per key or one for every key. */
     documents_t documents;
 
     /** The top-level key or JSON Pointer written inside every document, held, or NULL for whole documents. */
@@ -545,7 +546,7 @@ char const doc_docs_write[] =                                                   
     "           type=FieldType.JSON, id_field=None, durability=Durability.BUFFERED) answers None.\n" //
     "\n"                                                                                             //
     "Writes a batch of JSON documents, or one field inside each of them. Every document is\n"        //
-    "borrowed for the length of the call rather than copied.\n"                                      //
+    "viewed for the length of the call rather than copied.\n"                                        //
     "\n"                                                                                             //
     "Args:\n"                                                                                        //
     "  keys (Sequence[KeyLike] | buffer | None): The keys to write; None reads every key from\n"     //
@@ -1001,13 +1002,62 @@ PyObject* ustore_py_api_docs_measure(PyObject* self, PyObject* const* arguments,
 
 #pragma region Gathers
 
-/**
- *  @brief A new @c Columns over the columns a gather wrote into @p arena.
- *  @param[in] types The type of every field, copied into the result.
- *  @return A new reference, or NULL with an exception set.
- */
-static PyObject* columns_new(PyObject* arena, ustore_docs_column_view_t const* columns, PyObject* fields,
-                             ustore_docs_field_type_t const* types, size_t fields_count, size_t docs_count) {
+int ustore_py_columns_request(PyObject* fields, PyObject* types, char const* option, PyObject** fields_held,
+                              ustore_bytes_view_t** views, ustore_docs_field_type_t** types_out, size_t* count) {
+    if (PyUnicode_Check(fields)) {
+        PyErr_SetString(PyExc_TypeError, "The fields are a sequence of strings, not one string");
+        return -1;
+    }
+    // The tuple keeps every field name alive while a call reads the UTF-8 bytes they cache.
+    *fields_held = PySequence_Tuple(fields);
+    if (!*fields_held) return -1;
+    size_t const fields_count = (size_t)PyTuple_GET_SIZE(*fields_held);
+    *count = fields_count;
+
+    // One `FieldType` is an int, and stands for every field
+    int const broadcast = PyLong_Check(types);
+    PyObject* const types_held = broadcast ? NULL : PySequence_Tuple(types);
+    if (!broadcast && !types_held) return -1;
+    if (types_held && (size_t)PyTuple_GET_SIZE(types_held) != fields_count) {
+        ustore_py_raise(ustore_status_invalid_argument_k, "Got %zd '%s' for %zu fields", PyTuple_GET_SIZE(types_held),
+                        option, fields_count);
+        Py_DECREF(types_held);
+        return -1;
+    }
+    *views = (ustore_bytes_view_t*)PyMem_Malloc((fields_count + 1) * sizeof(ustore_bytes_view_t));
+    *types_out = (ustore_docs_field_type_t*)PyMem_Malloc((fields_count + 1) * sizeof(ustore_docs_field_type_t));
+    int failed = !*views || !*types_out;
+    if (failed) PyErr_NoMemory();
+    for (size_t field_index = 0; !failed && field_index != fields_count; ++field_index) {
+        PyObject* const field = PyTuple_GET_ITEM(*fields_held, (Py_ssize_t)field_index);
+        PyObject* const type_object = types_held ? PyTuple_GET_ITEM(types_held, (Py_ssize_t)field_index) : types;
+        if (!PyUnicode_Check(field)) {
+            PyErr_Format(PyExc_TypeError, "A field is a string, got %S", Py_TYPE(field));
+            failed = 1;
+            break;
+        }
+        Py_ssize_t length = 0;
+        char const* const text = PyUnicode_AsUTF8AndSize(field, &length);
+        (*views)[field_index].data = (uint8_t const*)text;
+        (*views)[field_index].length = (ustore_size_t)length;
+        int type = ustore_docs_field_type_json_k;
+        failed = !text || ustore_py_enum_from_object(type_object, option, ustore_py_enum_field_type_k, &type) != 0;
+        if (failed) break;
+        if (!field_type_gathers((ustore_docs_field_type_t)type)) {
+            ustore_py_raise(ustore_status_invalid_argument_k,
+                            "A gather converts into scalars, UUIDs, strings, bytes or JSON, not %s",
+                            ustore_docs_field_type_name((ustore_docs_field_type_t)type));
+            failed = 1;
+            break;
+        }
+        (*types_out)[field_index] = (ustore_docs_field_type_t)type;
+    }
+    Py_XDECREF(types_held);
+    return failed ? -1 : 0;
+}
+
+PyObject* ustore_py_columns_new(PyObject* arena, ustore_docs_column_view_t const* columns, PyObject* fields,
+                                ustore_docs_field_type_t const* types, size_t fields_count, size_t docs_count) {
     Columns* const instance = PyObject_NewVar(Columns, &ColumnsType, (Py_ssize_t)fields_count);
     if (!instance) return NULL;
     instance->arena = Py_NewRef(arena);
@@ -1056,7 +1106,7 @@ typedef struct gather_call_t {
     /** The type every field converts into, which the answer copies. */
     ustore_docs_field_type_t* types;
 
-    /** Fields the gather carries. */
+    /** Fields the gather holds. */
     size_t fields_count;
 
     /** Output slot for one column view per field, inside the arena. */
@@ -1067,8 +1117,8 @@ static void gather_submit(void* arguments) { ustore_docs_gather((ustore_docs_gat
 
 static PyObject* gather_answer(void* erased) {
     gather_call_t const* const call = (gather_call_t const*)erased;
-    return columns_new(call->call.arena, call->columns, call->fields_held, call->types, call->fields_count,
-                       call->keys.count);
+    return ustore_py_columns_new(call->call.arena, call->columns, call->fields_held, call->types, call->fields_count,
+                                 call->keys.count);
 }
 
 static void gather_release(void* erased) {
@@ -1096,62 +1146,12 @@ PyObject* ustore_py_api_docs_gather(PyObject* self, PyObject* const* arguments, 
                                              &options) != 0)
         return NULL;
 
-    if (PyUnicode_Check(arguments[1])) {
-        PyErr_SetString(PyExc_TypeError, "The fields are a sequence of strings, not one string");
-        return NULL;
-    }
     gather_call_t stack;
     gather_call_t* const call = ustore_py_call_open(&context, &gather_verb, &stack);
     if (!call) return NULL;
-    // The tuple keeps every field name alive while the call reads the UTF-8 bytes they cache.
-    call->fields_held = PySequence_Tuple(arguments[1]);
-    if (!call->fields_held) return ustore_py_call_discard(&context, &gather_verb, call);
-    size_t const fields_count = (size_t)PyTuple_GET_SIZE(call->fields_held);
-
-    // One `FieldType` is an int, and stands for every field
-    int const broadcast = PyLong_Check(arguments[2]);
-    PyObject* const types_held = broadcast ? NULL : PySequence_Tuple(arguments[2]);
-    if (!broadcast && !types_held) return ustore_py_call_discard(&context, &gather_verb, call);
-    if (types_held && (size_t)PyTuple_GET_SIZE(types_held) != fields_count) {
-        ustore_py_raise(ustore_status_invalid_argument_k, "Got %zd outputs types for %zu fields",
-                        PyTuple_GET_SIZE(types_held), fields_count);
-        Py_DECREF(types_held);
-        return ustore_py_call_discard(&context, &gather_verb, call);
-    }
-
-    call->fields_count = fields_count;
-    call->field_views = (ustore_bytes_view_t*)PyMem_Malloc((fields_count + 1) * sizeof(ustore_bytes_view_t));
-    call->types = (ustore_docs_field_type_t*)PyMem_Malloc((fields_count + 1) * sizeof(ustore_docs_field_type_t));
-    int failed = !call->field_views || !call->types;
-    if (failed) PyErr_NoMemory();
-
-    for (size_t field_index = 0; !failed && field_index != fields_count; ++field_index) {
-        PyObject* const field = PyTuple_GET_ITEM(call->fields_held, (Py_ssize_t)field_index);
-        PyObject* const type_object = types_held ? PyTuple_GET_ITEM(types_held, (Py_ssize_t)field_index) : arguments[2];
-        if (!PyUnicode_Check(field)) {
-            PyErr_Format(PyExc_TypeError, "A field is a string, got %S", Py_TYPE(field));
-            failed = 1;
-            break;
-        }
-        Py_ssize_t length = 0;
-        char const* const text = PyUnicode_AsUTF8AndSize(field, &length);
-        call->field_views[field_index].data = (uint8_t const*)text;
-        call->field_views[field_index].length = (ustore_size_t)length;
-        int type = ustore_docs_field_type_json_k;
-        failed = !text ||
-                 ustore_py_enum_from_object(type_object, "outputs_types", ustore_py_enum_field_type_k, &type) != 0;
-        if (failed) break;
-        if (!field_type_gathers((ustore_docs_field_type_t)type)) {
-            ustore_py_raise(ustore_status_invalid_argument_k,
-                            "A gather converts into scalars, UUIDs, strings or bytes, not %s",
-                            ustore_docs_field_type_name((ustore_docs_field_type_t)type));
-            failed = 1;
-            break;
-        }
-        call->types[field_index] = (ustore_docs_field_type_t)type;
-    }
-    Py_XDECREF(types_held);
-
+    int const failed = ustore_py_columns_request(arguments[1], arguments[2], "outputs_types", &call->fields_held,
+                                                 &call->field_views, &call->types, &call->fields_count);
+    size_t const fields_count = call->fields_count;
     if (failed || ustore_py_keys_from_object(arguments[0], &call->keys) != 0 ||
         ustore_py_arena_from_object(arguments[3], &call->call.arena) != 0)
         return ustore_py_call_discard(&context, &gather_verb, call);
@@ -1184,7 +1184,7 @@ static char const doc_Columns[] =                                               
     "Indexing a scalar column answers a `memoryview` of its type over the stored scalars, a\n" //
     "`FieldType.UUID` column a two-dimensional view of sixteen bytes per document, and a\n"    //
     "string column a tuple of `str` or `bytes`, with None where the value is not valid. A\n"   //
-    "`FieldType.F16` column carries the 'e' format, which NumPy reads as float16 without a\n"  //
+    "`FieldType.F16` column holds the 'e' format, which NumPy reads as float16 without a\n"    //
     "copy.\n"                                                                                  //
     "\n"                                                                                       //
     "The bitmaps address documents least significant bit first, as Apache Arrow does. Read\n"  //
@@ -1314,7 +1314,7 @@ static PyObject* Columns_get_types(Columns* self, void* Py_UNUSED(closure)) {
     return types;
 }
 
-static char const doc_Columns_rows[] = "The documents the gather carried, the length of every column.";
+static char const doc_Columns_rows[] = "The documents the gather held, the length of every column.";
 
 static PyObject* Columns_get_rows(Columns* self, void* Py_UNUSED(closure)) {
     return PyLong_FromSize_t(self->docs_count);

@@ -5,9 +5,9 @@
 //! the collection by its identifier. Each engine keeps the names apart from every collection, so no
 //! identifier reaches them.
 //!
-//! Strings cross as borrowed `&str` slices, or as an owned `stringtape::CharsTape`, which a
-//! deferred call needs, and come back as byte runs inside the arena, since an engine orders them by
-//! their bytes and never checks UTF-8.
+//! Strings cross as viewed `&str` slices, or as an owned `stringtape::CharsTape`, which a deferred
+//! call needs, and come back as byte runs inside the arena, since an engine orders them by their
+//! bytes and never checks UTF-8.
 //!
 //! File: rust/strings.rs
 //! Author: Ash Vardanian
@@ -214,7 +214,7 @@ pub(crate) mod ffi {
 
 /// The names of collections one listing found, in the order of their text.
 ///
-/// The run borrows the arena it was exported into, and every name in it was checked for UTF-8 once,
+/// The run views the arena it was exported into, and every name in it was checked for UTF-8 once,
 /// when the listing returned.
 #[derive(Clone, Debug, Default)]
 pub struct Names<'arena> {
@@ -294,7 +294,7 @@ impl Accepts<StringsScanConfig<'static>> for Deferring {}
 mod sealed {
     use super::*;
 
-    /// The strings one batch carries: borrowed `&str` slices, or an owned tape of them.
+    /// The strings one batch holds: viewed `&str` slices, or an owned tape of them.
     pub trait Texts {
         /// How many strings there are and their view, pointing into `self`, or `None` for no
         /// strings at all.
@@ -347,7 +347,7 @@ impl<'text> From<&'text str> for TextRange<'text> {
 }
 
 /// The view of the one string `text` holds, or a zeroed one when there is none.
-fn lent(text: &Option<&str>) -> ustore_strings_view_t {
+fn strings_view_of(text: &Option<&str>) -> ustore_strings_view_t {
     text.as_ref().map_or_else(ustore_strings_view_t::default, |text| {
         ustore_strings_view_t::accessor(string_views, ptr::from_ref(text).cast())
     })
@@ -391,7 +391,7 @@ impl<'arena> Mapped<'arena> {
 }
 
 /// The strings one scan or sample listed, as byte runs inside the arena, and the BM25 scores of a
-/// scan whose patterns carried weights.
+/// scan whose patterns held weights.
 #[derive(Clone, Copy, Debug)]
 pub struct Listing<'arena> {
     strings: Strings<'arena>,
@@ -437,7 +437,7 @@ impl<'arena> Listing<'arena> {
         Rows::new(*self, self.len(), |listing, index| listing.get(index).unwrap_or_default())
     }
 
-    /// One score per string when the patterns carried weights.
+    /// One score per string when the patterns held weights.
     pub fn scores(&self) -> Option<&'arena [f32]> {
         self.scores
     }
@@ -450,7 +450,7 @@ impl<'arena> Listing<'arena> {
 pub trait StringsVerbs<'view>: ViewVerbs<'view> {
     /// Upserts a batch of strings and the keys they map onto, one key per string.
     ///
-    /// The strings are a borrowed `&[&str]`, or an owned `stringtape::CharsTape`, which a deferred
+    /// The strings are a viewed `&[&str]`, or an owned `stringtape::CharsTape`, which a deferred
     /// write needs beside owned keys, and the call hands both back. A bare [`CollectionID`] gives
     /// every string the same collection.
     ///
@@ -781,7 +781,7 @@ impl<'arena, Strs: Texts> Calling for StringsRead<'arena, '_, Strs> {
             return Ok(Mapped { presences: Bitmap::new(&[], 0), keys: &[] });
         }
         // SAFETY: the read succeeded over every string, exporting a presence bit and a key for each
-        // into the arena, which stays borrowed for `'arena`.
+        // into the arena, which stays held for `'arena`.
         unsafe {
             Ok(Mapped {
                 presences: Bitmap::new(exported_slice(self.presences.0, self.count.div_ceil(8)), self.count),
@@ -825,9 +825,9 @@ impl<'arena> Calling for StringsScan<'arena, '_, '_> {
             view: view.view(),
             count: 1,
             collections: ustore_strided_view_t::repeated(&self.collection),
-            prefixes: lent(&self.range.prefix),
-            start_strings: lent(&self.range.start),
-            end_strings: lent(&self.range.end),
+            prefixes: strings_view_of(&self.range.prefix),
+            start_strings: strings_view_of(&self.range.start),
+            end_strings: strings_view_of(&self.range.end),
             direction: self.range.direction,
             patterns: self.matched.lowered_patterns(),
             predicate: self.matched.lowered_predicate(),
@@ -851,7 +851,7 @@ impl<'arena> Calling for StringsScan<'arena, '_, '_> {
 
     fn finish(self) -> Result<Listing<'arena>> {
         self.arena.host()?;
-        // SAFETY: the scan succeeded, and the arena stays borrowed for `'arena`; a scan with
+        // SAFETY: the scan succeeded, and the arena stays held for `'arena`; a scan with
         // weighted patterns wrote one score per string into the same arena.
         unsafe { Listing::exported(self.offsets, self.strings, self.matched.scores().then_some(self.scores.0)) }
     }
@@ -898,7 +898,7 @@ impl<'arena> Calling for StringsSample<'arena> {
 
     fn finish(self) -> Result<Listing<'arena>> {
         self.arena.host()?;
-        // SAFETY: the sample succeeded, and the arena stays borrowed for `'arena`.
+        // SAFETY: the sample succeeded, and the arena stays held for `'arena`.
         unsafe { Listing::exported(self.offsets, self.strings, None) }
     }
 }
@@ -938,8 +938,8 @@ impl Calling for StringsMeasure<'_, '_> {
             view: view.view(),
             count: 1,
             collections: ustore_strided_view_t::repeated(&self.collection),
-            start_strings: lent(&self.range.0),
-            end_strings: lent(&self.range.1),
+            start_strings: strings_view_of(&self.range.0),
+            end_strings: strings_view_of(&self.range.1),
             direction: ScanDirection::Ascending,
             min_cardinalities: &mut min_cardinalities.0,
             max_cardinalities: &mut max_cardinalities.0,
@@ -966,7 +966,7 @@ impl Calling for StringsMeasure<'_, '_> {
 
 // region: Names
 
-/// Creates a collection under `name`, which no other collection may carry, answering its identifier.
+/// Creates a collection under `name`, which no other collection may hold, answering its identifier.
 pub(crate) fn create_named(database: ustore_database_t, name: &str, modality: Modality) -> Result<CollectionID> {
     let mut collection = CollectionID::default();
     let mut outcome = ustore_outcome_t::default();
@@ -1031,7 +1031,7 @@ impl<Name: AsRef<str>> Calling for CollectionFind<'_, Name> {
     fn finish(self) -> Result<(CollectionID, Modality)> {
         self.arena.host()?;
         // SAFETY: a successful lookup of one name exported its presence bit, identifier and modality into the arena,
-        // which this verb still borrows.
+        // which this verb still holds.
         let (presence, collection, modality) = unsafe { (*self.presences.0, *self.collections.0, *self.modalities.0) };
         if presence & 1 == 0 {
             return Err(fail(Status::NotFound, "no collection answers to that name"));
@@ -1112,7 +1112,7 @@ impl<'arena, Name: AsRef<str>> Calling for CollectionNames<'arena, Name> {
 
     fn finish(self) -> Result<Names<'arena>> {
         self.arena.host()?;
-        // SAFETY: the listing succeeded into the arena, which stays borrowed for `'arena`.
+        // SAFETY: the listing succeeded into the arena, which stays held for `'arena`.
         unsafe { self.listed() }
     }
 }

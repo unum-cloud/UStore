@@ -48,7 +48,7 @@ struct vram_adjacency_fold_t {
      *      in @c utilities::device_blocks_t.
      *
      *  @par Statuses:
-     *  - @c status_code_t::invalid_argument_k A delta is no change, or carries a ragged or
+     *  - @c status_code_t::invalid_argument_k A delta is no change, or holds a ragged or
      *    malformed record, which no compose reads.
      *  - @c status_code_t::capacity_exhausted_k The chains hold more records than 32-bit indices
      *    count.

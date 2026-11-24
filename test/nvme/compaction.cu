@@ -64,7 +64,7 @@ enum class key_slot_state_t : bool {
     removed_k,
 };
 
-/** The kind a key slot of @p state carries in its run's kinds column. */
+/** The kind a key slot of @p state holds in its run's kinds column. */
 inline std::uint8_t kind_of(key_slot_state_t state) noexcept {
     return static_cast<std::uint8_t>(state == key_slot_state_t::removed_k ? util::delta_kind_t::remove_k
                                                                           : util::delta_kind_t::write_k);
@@ -127,7 +127,7 @@ key_slot_type_ poison_key_slot() noexcept {
     return poison;
 }
 
-/** Whether two inline key slots carry the same inline bytes. */
+/** Whether two inline key slots hold the same inline bytes. */
 template <typename stored_key_type_>
 bool same_inline_stored_value(inline_key_slot<stored_key_type_> const& first,
                               inline_key_slot<stored_key_type_> const& second) noexcept {
@@ -259,10 +259,11 @@ struct scenario_t {
     /** Bounds of the new sorted runs. */
     sorted_run_bounds_t bounds;
 
-    /** Chance per thousand that a picked key also carries an older version inside the same sorted run. */
+    /** Chance per thousand that a picked key also holds an older version inside the
+     *  same sorted run. */
     std::uint64_t versions_per_mille = 0;
 
-    /** Stamps readers pin, drawn at random from the stamps the LSM levels carry. */
+    /** Stamps readers pin, drawn at random from the stamps the LSM levels hold. */
     std::uint64_t pinned = 0;
 
     /** Where the durable horizon sits among the stamps, per thousand of their range, a thousand keeping it past all. */
@@ -351,7 +352,8 @@ inline key_slot_state_t random_state(scenario_t const& scenario, split_mix_gener
  *  @brief Picks each key of @p keys with the scenario's density, appending its key slot to @p key_slots and its stamp,
  *      drawn from the span of era @p era, to @p stamps.
  *
- *  A key picked twice over carries two versions in this one sorted run, the newer from the upper half of the era.
+ *  A key picked twice over holds two versions in this one sorted run, the newer from the upper half
+ *  of the era.
  */
 template <typename key_slot_type_>
 st::status_t pick_key_slots(std::span<typename key_slot_type_::stored_key_t const> keys, scenario_t const& scenario,
@@ -632,8 +634,8 @@ void check_compaction(compaction_kind_t kind, sorted_run_bounds_t const& bounds,
     expect_equal(output.stamps.size(), std::size_t {key_slots_count});
     if (!expect_equal(output.kinds.size(), std::size_t {key_slots_count})) return;
 
-    // Every survivor carries its stamp raised to the floor and its kind, and the versions of one key never straddle
-    // two runs
+    // Every survivor holds its stamp raised to the floor and its kind, and the versions of one key
+    // never straddle two runs
     std::size_t wrong_stamps = 0;
     std::size_t wrong_kinds = 0;
     for (std::size_t index = 0; index != wanted_survivors.size(); ++index) {
@@ -922,7 +924,7 @@ void test_plan_sorted_runs_cuts_at_the_bounds() {
         return true;
     };
 
-    // Every survivor carries a key of its own, as a merge with no reader pinned leaves them
+    // Every survivor holds a key of its own, as a merge with no reader pinned leaves them
     auto const unshared = [](std::uint64_t, bool& shared) noexcept {
         shared = false;
         return st::status_t::success_k;
@@ -1035,7 +1037,7 @@ void test_plan_sorted_runs_cuts_at_the_bounds() {
 
     // Strings whose tails outweigh their cells cut runs by the tails too, so no run
     // outgrows the limit
-    using tailed_key_slot_t = key_slot<st::key128_t, value_layout_t::uuid_k, key_tails_t::carried_k>;
+    using tailed_key_slot_t = key_slot<st::key128_t, value_layout_t::uuid_k, key_tails_t::present_k>;
     bounds.file_bytes_limit = 4096;
     expect_true(fill_prefix(10, 1000));
     expect_true(plan_sorted_runs<tailed_key_slot_t>(10, bounds, read_prefix, unshared, sorted_runs) ==
@@ -1231,11 +1233,10 @@ util::expected<executor_type_> spawn_device_zero(options_t const& options, std::
     if (options.drivers == nullptr || options.vendor != executor_type_::vendor_k)
         return util::status_t {util::status_code_t::device_k, "No device zero of the executor's vendor"};
     if constexpr (std::is_same_v<executor_type_, util::hip_executor_t>)
-        return util::hip_executor_t::spawn(options.drivers->hip, options.device, nullptr, scratch_limit,
-                                           options.hip_kernels);
+        return util::hip_executor_t::spawn(options.drivers->hip, options.device, scratch_limit, options.hip_kernels);
     else
         return util::cuda_executor_t::spawn(options.drivers->cuda, options.drivers->cuda_contexts[0], options.device,
-                                            nullptr, scratch_limit, ustore_gds_automatic_k, options.cuda_kernels);
+                                            scratch_limit, ustore_gds_automatic_k, options.cuda_kernels);
 }
 
 /** Runs @p device_case over the executor type of the vendor the device cases run on. */
@@ -1245,7 +1246,7 @@ case_result_t on_device_zero(options_t const& options, device_case_type_ const& 
     return device_case.template operator()<util::cuda_executor_t>();
 }
 
-/** The reason a device case reports where the build carries no device compactor. */
+/** The reason a device case reports where the build holds no device compactor. */
 constexpr char const* no_device_compactor_k = "no device compactor";
 
 /** The reason a device case reports on key slots narrower than the bundle's merge kernels. */
@@ -1436,8 +1437,8 @@ void run_compaction(char const* host_label, char const* gpu_label, st::status_t 
         run_test_case(gpu_label, test_gpu_case<key_slot_type_>, kind, bounds, stamps, upper, lower, host, options);
 }
 
-/** The stamps a scenario compacts with: pins drawn from the stamps its levels carry, and bounds at fractions of
- *  their range, all widest when the scenario names none. */
+/** The stamps a scenario compacts with: pins drawn from the stamps its levels hold, and bounds at
+ *  fractions of their range, all widest when the scenario names none. */
 template <typename key_slot_type_>
 compaction_stamps_t scenario_stamps(scenario_t const& scenario, test_lsm_level<key_slot_type_> const& upper,
                                     test_lsm_level<key_slot_type_> const& lower, split_mix_generator_t& random,
@@ -1751,7 +1752,7 @@ struct graph_case_t {
     /** Vertices the levels key. */
     std::uint64_t vertices;
 
-    /** Records the change deltas carry across both levels, roughly. */
+    /** Records the change deltas hold across both levels, roughly. */
     std::uint64_t half_edges;
 
     /** Chance per thousand that a change delta removes every half-edge of its vertex somewhere among its records. */

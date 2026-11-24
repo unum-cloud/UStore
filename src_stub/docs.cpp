@@ -1393,7 +1393,8 @@ std::size_t column_width(ustore_docs_field_type_t type) noexcept {
 }
 
 bool is_column_type(ustore_docs_field_type_t type) noexcept {
-    return column_width(type) || type == ustore_docs_field_type_binary_k || type == ustore_docs_field_type_string_k;
+    return column_width(type) || type == ustore_docs_field_type_binary_k || type == ustore_docs_field_type_string_k ||
+           type == ustore_docs_field_type_json_k;
 }
 
 template <typename scalar_type_>
@@ -1442,6 +1443,55 @@ conversion_t gather_cell(json_t const* value, ustore_docs_field_type_t type, std
     }
 }
 
+/** Lays out one column of @p stored.size() rows per field of @p fields into @p arena, converted
+ *  into its entry of @p types, from the documents @p stored holds, empty where missing; the empty
+ *  field of a JSON column is the whole document as stored. */
+ustore_docs_column_view_t* write_columns(call_t& call, ustore_arena_handle_t& arena,
+                                         std::vector<std::string> const& stored,
+                                         std::vector<std::string_view> const& fields,
+                                         ustore_docs_field_type_t const* types) {
+    std::size_t const count = stored.size(), fields_count = fields.size();
+    std::vector<json_t> documents(count);
+    for (std::size_t row = 0; row != count; ++row)
+        if (!stored[row].empty() && call.failed_with(parse_json(stored[row], documents[row]))) return nullptr;
+    auto* const columns = carve<ustore_docs_column_view_t>(call, arena, fields_count);
+    for (std::size_t field = 0; field != fields_count && !call.failed(); ++field) {
+        ustore_docs_field_type_t const type = types[field];
+        std::size_t const bitmap_bytes = (count + 7) / 8;
+        auto* const validities = carve<ustore_octet_t>(call, arena, bitmap_bytes);
+        auto* const conversions = carve<ustore_octet_t>(call, arena, bitmap_bytes);
+        auto* const collisions = carve<ustore_octet_t>(call, arena, bitmap_bytes);
+        std::size_t const width = column_width(type);
+        auto* const scalars = width ? carve<std::byte>(call, arena, width * count) : nullptr;
+        std::vector<std::string> texts(width ? 0 : count);
+        if (call.failed()) return nullptr;
+        for (std::size_t row = 0; row != count; ++row) {
+            json_t const* const value = stored[row].empty() ? nullptr : lookup(documents[row], fields[field]);
+            conversion_t conversion = conversion_t::missing_k;
+            if (width) conversion = gather_cell(value, type, scalars + row * width);
+            else if (type == ustore_docs_field_type_json_k && value && fields[field].empty())
+                texts[row] = stored[row], conversion = conversion_t::exact_k;
+            else if (type == ustore_docs_field_type_json_k && value)
+                conversion = print_json(*value, texts[row]) ? conversion_t::exact_k : conversion_t::collides_k;
+            else if (value && (value->is_object() || value->is_array())) conversion = conversion_t::collides_k;
+            else conversion = to_text(value, texts[row]);
+            bool const valid = conversion == conversion_t::exact_k || conversion == conversion_t::converted_k;
+            if (!valid && !width) texts[row].clear();
+            if (valid) set_bit(validities, row);
+            if (conversion == conversion_t::converted_k) set_bit(conversions, row);
+            if (conversion == conversion_t::collides_k) set_bit(collisions, row);
+        }
+        ustore_docs_column_view_t& column = columns[field];
+        column.validities = validities, column.conversions = conversions, column.collisions = collisions;
+        column.scalars = reinterpret_cast<ustore_byte_t const*>(scalars);
+        if (!width && count &&
+            !write_tape(call, arena, texts, column.strings,
+                        type == ustore_docs_field_type_string_k ? string_end_t::terminated_k : string_end_t::open_k))
+            return nullptr;
+    }
+    return call.failed() ? nullptr : columns;
+}
+
 status_t check_document(std::string_view text) {
     json_t parsed;
     return parse_json(text, parsed);
@@ -1449,9 +1499,13 @@ status_t check_document(std::string_view text) {
 
 } // namespace unum::ustore::stub
 
-/** What @c ustore_docs_cursor_t names. */
+/** What @c ustore_docs_cursor_t names: the walk, and the columns every pull gathers, copied at
+ *  init. */
 struct ustore_docs_cursor_handle_t {
     keyed_cursor_t cursor;
+    std::vector<std::string> field_names;
+    std::vector<std::string_view> fields;
+    std::vector<ustore_docs_field_type_t> types;
 };
 
 void ustore_docs_write(ustore_docs_write_t* arguments) {
@@ -1659,56 +1713,24 @@ void ustore_docs_gather(ustore_docs_gather_t* arguments) {
         {arguments->collections.data, arguments->keys.data, first_input(arguments->fields),
          data_input(arguments->fields), arguments->outputs_types});
     if (!arena || !hold_view(call, spec)) return;
-    std::vector<json_t> documents(count);
-    std::vector<bool> found(count, false);
+    std::vector<std::string> stored(count);
     try {
         std::shared_lock lock(arguments->database->mutex);
         reader_t const reader = reader_of(arguments->database, spec, arguments->database->head);
         for (std::size_t index = 0; index != count; ++index) {
             collection_t const* const collection = reader.find(bytes_of(resolved[index]->id));
             if (!collection) return call.refuse(ustore_status_not_found_k, "A collection was dropped meanwhile");
-            std::string const* const stored = reader.get(
+            std::string const* const found = reader.get(
                 *collection, bytes_of(strided_element(arguments->keys.data, arguments->keys.stride, index)));
-            if (!stored) continue;
-            if (call.failed_with(parse_json(*stored, documents[index]))) return;
-            found[index] = true;
+            if (found) stored[index] = *found;
         }
     }
     catch (std::bad_alloc const&) {
         return call.refuse(ustore_status_out_of_memory_k, "Out of memory while gathering");
     }
-    auto* const columns = carve<ustore_docs_column_view_t>(call, *arena, fields_count);
-    for (std::size_t field = 0; field != fields_count && !call.failed(); ++field) {
-        ustore_docs_field_type_t const type = arguments->outputs_types[field];
-        std::size_t const bitmap_bytes = (count + 7) / 8;
-        auto* const validities = carve<ustore_octet_t>(call, *arena, bitmap_bytes);
-        auto* const conversions = carve<ustore_octet_t>(call, *arena, bitmap_bytes);
-        auto* const collisions = carve<ustore_octet_t>(call, *arena, bitmap_bytes);
-        std::size_t const width = column_width(type);
-        auto* const scalars = width ? carve<std::byte>(call, *arena, width * count) : nullptr;
-        std::vector<std::string> texts(width ? 0 : count);
-        if (call.failed()) return;
-        for (std::size_t row = 0; row != count; ++row) {
-            json_t const* const value = found[row] ? lookup(documents[row], fields[field]) : nullptr;
-            conversion_t conversion = conversion_t::missing_k;
-            if (width) conversion = gather_cell(value, type, scalars + row * width);
-            else if (value && (value->is_object() || value->is_array())) conversion = conversion_t::collides_k;
-            else conversion = to_text(value, texts[row]);
-            bool const valid = conversion == conversion_t::exact_k || conversion == conversion_t::converted_k;
-            if (!valid && !width) texts[row].clear();
-            if (valid) set_bit(validities, row);
-            if (conversion == conversion_t::converted_k) set_bit(conversions, row);
-            if (conversion == conversion_t::collides_k) set_bit(collisions, row);
-        }
-        ustore_docs_column_view_t& column = columns[field];
-        column.validities = validities, column.conversions = conversions, column.collisions = collisions;
-        column.scalars = reinterpret_cast<ustore_byte_t const*>(scalars);
-        if (!width && count &&
-            !write_tape(call, *arena, texts, column.strings,
-                        type == ustore_docs_field_type_string_k ? string_end_t::terminated_k : string_end_t::open_k))
-            return;
-    }
-    if (call.failed()) return;
+    ustore_docs_column_view_t* const columns = write_columns(call, *arena, stored, fields.items,
+                                                             arguments->outputs_types);
+    if (!columns) return;
     *arguments->columns = columns;
 }
 
@@ -1747,8 +1769,26 @@ void ustore_docs_cursor_init(ustore_docs_cursor_init_t* arguments) {
     if (!arguments->cursor)
         return call.refuse(ustore_status_invalid_argument_k, "The call needs an output for the cursor");
     if (refuse_direction(call, arguments->direction) || refuse_predicate(call, arguments->predicate)) return;
+    std::size_t const fields_count = arguments->fields_count;
+    strings_in_t fields;
+    if (!read_strings(call, arguments->fields, fields_count, fields)) return;
+    if (fields_count && (!fields.given || !arguments->columns_types))
+        return call.refuse(ustore_status_invalid_argument_k,
+                           "Need the fields to gather and the types of their columns");
+    for (std::size_t field = 0; field != fields_count; ++field)
+        if (!is_column_type(arguments->columns_types[field]))
+            return call.refuse(ustore_status_invalid_argument_k, "A column type is unknown");
     auto* const cursor = new (std::nothrow) ustore_docs_cursor_handle_t {};
     if (!cursor) return call.refuse(ustore_status_out_of_memory_k, "Failed to allocate the cursor");
+    try {
+        cursor->field_names.assign(fields.items.begin(), fields.items.end());
+        for (std::string const& name : cursor->field_names) cursor->fields.emplace_back(name);
+        cursor->types.assign(arguments->columns_types, arguments->columns_types + fields_count);
+    }
+    catch (std::bad_alloc const&) {
+        delete cursor;
+        return call.refuse(ustore_status_out_of_memory_k, "Failed to copy the cursor's columns");
+    }
     if (!compile_filter(call, arguments->filter, cursor->cursor.verdict) ||
         !open_keyed_cursor(call, arguments, ustore_modality_docs_k, cursor->cursor))
         return delete cursor;
@@ -1757,19 +1797,41 @@ void ustore_docs_cursor_init(ustore_docs_cursor_init_t* arguments) {
 
 void ustore_docs_cursor_next(ustore_docs_cursor_next_t* arguments) {
     call_t call(arguments->outcome);
-    keyed_cursor_t* const cursor = arguments->cursor ? &arguments->cursor->cursor : nullptr;
-    ustore_arena_handle_t* const arena = open_pull(call, arguments, cursor);
-    if (!arena) return;
+    if (arguments->batches) *arguments->batches = nullptr;
+    if (arguments->batches_count) *arguments->batches_count = 0;
+    if (refuse_database(call, arguments->database)) return;
+    if (!arguments->cursor || !arguments->arena || !arguments->batches || !arguments->batches_count)
+        return call.refuse(ustore_status_invalid_argument_k, "The call needs a cursor, an arena and outputs");
+    keyed_cursor_t& cursor = arguments->cursor->cursor;
+    if (cursor.database != arguments->database)
+        return call.refuse(ustore_status_invalid_argument_k, "The cursor walks another database");
+    call.name(&cursor.named_calls);
+    if (!call.hold_executor(arguments->executor)) return;
+    ustore_arena_handle_t* const arena = claim_arena(call, arguments->arena);
+    if (!arena || !call.claim(&cursor.claim, "Another call pulls the cursor")) return;
     std::vector<entry_t> listed;
-    if (!pull_keyed(call, arguments, *cursor, listed)) return;
-    ustore_strings_view_t values {};
-    if (arguments->values && !listed.empty()) {
-        std::vector<std::string_view> texts;
-        for (entry_t const& entry : listed) texts.push_back(entry.value);
-        if (!write_tape(call, *arena, texts, values)) return;
+    if (!pull_keyed(call, arguments, cursor, listed) || listed.empty()) return;
+    // The one batch of a pull holds every listed row, as the stub runs every call on
+    // the calling thread
+    std::vector<std::string> stored;
+    try {
+        for (entry_t const& entry : listed) stored.push_back(entry.value);
     }
-    if (!write_page_keys(call, arguments, *arena, listed)) return;
-    if (arguments->values) *arguments->values = values;
+    catch (std::bad_alloc const&) {
+        return call.refuse(ustore_status_out_of_memory_k, "Out of memory while pulling");
+    }
+    auto* const keys = carve<ustore_key_t>(call, *arena, listed.size());
+    auto* const batch = carve<ustore_docs_batch_view_t>(call, *arena, 1);
+    if (call.failed()) return;
+    for (std::size_t index = 0; index != listed.size(); ++index) keys[index] = entry_key(listed[index]);
+    ustore_docs_column_view_t const* columns = nullptr;
+    if (!arguments->cursor->fields.empty()) {
+        columns = write_columns(call, *arena, stored, arguments->cursor->fields, arguments->cursor->types.data());
+        if (!columns) return;
+    }
+    *batch = {listed.size(), keys, columns};
+    *arguments->batches = batch;
+    *arguments->batches_count = 1;
 }
 
 void ustore_docs_cursor_free(ustore_docs_cursor_t cursor) {

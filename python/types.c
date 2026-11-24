@@ -56,7 +56,7 @@ static struct {
     {ustore_status_unsupported_k, "ustore.UnsupportedError", &ErrorType, &PyExc_NotImplementedError,
      "The engine or this build does not implement what the call asks for."},
     {ustore_status_invalid_argument_k, "ustore.InvalidArgumentError", &ErrorType, &PyExc_ValueError,
-     "An argument is null, contradicts another one, or carries a choice the call does not accept."},
+     "An argument is null, contradicts another one, or holds a choice the call does not accept."},
     {ustore_status_not_found_k, "ustore.NotFoundError", &ErrorType, &PyExc_KeyError,
      "A collection, a directory, or a document a modification needs does not exist."},
     {ustore_status_already_exists_k, "ustore.AlreadyExistsError", &ErrorType, &PyExc_ValueError,
@@ -72,7 +72,7 @@ static struct {
 };
 
 int ustore_py_raise(ustore_status_t status, char const* format, ...) {
-    // A status this specific supersedes whatever the caller was carrying, and building the
+    // A status this specific supersedes whatever the caller was holding, and building the
     // instance below must not start with an exception already set.
     PyErr_Clear();
     PyObject* type = (size_t)status < ustore_py_table_size_(status_error_types) ? status_error_types[status] : NULL;
@@ -135,7 +135,7 @@ int ustore_py_raise_from_cause(PyObject* kind, char const* format, ...) {
 }
 
 static char const doc_Error[] =                                                                 //
-    "Every failure the engine reports, carrying the status shared with the C ABI.\n"            //
+    "Every failure the engine reports, holding the status shared with the C ABI.\n"             //
     "\n"                                                                                        //
     "Each failing status raises a subclass of its own, such as `NotFoundError`, which also\n"   //
     "derives the built-in naming the same fault where one exists, so `except KeyError` still\n" //
@@ -145,7 +145,7 @@ static char const doc_Error[] =                                                 
     "\n"                                                                                        //
     "Attributes:\n"                                                                             //
     "  status (Status): The status, such as `Status.WRITE_CONFLICT`.\n"                         //
-    "  args (tuple): The detail the status cannot carry, as on any exception.";
+    "  args (tuple): The detail the status cannot hold, as on any exception.";
 
 static char const doc_ConflictError[] =
     "A concurrent writer touched what this transaction wrote, read or scanned; retry the transaction.";
@@ -189,8 +189,8 @@ static char const doc_Arena[] =                                                 
     "so each deferred call in flight needs one of its own. Calls `ustore_arena_init`.\n"       //
     "\n"                                                                                       //
     "Args:\n"                                                                                  //
-    "  executor (Executor, optional): The executor whose calls it serves; None serves the\n"   //
-    "    calling thread.";
+    "  executor (Executor, optional): The executor whose calls it serves, closed only after\n" //
+    "    the arena is freed; None serves the calling thread.";
 
 /** A new arena of @p type made where @p executor computes, or NULL with an exception set. */
 static PyObject* arena_made(PyTypeObject* type, ustore_executor_t executor) {
@@ -315,20 +315,20 @@ typedef struct {
     uint64_t byte_offset;
 } DLTensor;
 
-/** The tensor a "dltensor" capsule carries, which its consumer deletes. */
+/** The tensor a "dltensor" capsule holds, which its consumer deletes. */
 typedef struct DLManagedTensor {
     DLTensor dl_tensor;
     void* manager_ctx;
     void (*deleter)(struct DLManagedTensor* self);
 } DLManagedTensor;
 
-/** The DLPack version a "dltensor_versioned" capsule carries. */
+/** The DLPack version a "dltensor_versioned" capsule holds. */
 typedef struct {
     uint32_t major;
     uint32_t minor;
 } DLPackVersion;
 
-/** The tensor a "dltensor_versioned" capsule carries, which its consumer deletes. */
+/** The tensor a "dltensor_versioned" capsule holds, which its consumer deletes. */
 typedef struct DLManagedTensorVersioned {
     DLPackVersion version;
     void* manager_ctx;
@@ -539,8 +539,7 @@ PyObject* ustore_py_dlpack_device(PyObject* arena) {
     if (ustore_py_raise_on_outcome(&outcome) != 0) return NULL;
     if (description.device < 0 || (ustore_size_t)description.device >= count ||
         (ustore_size_t)description.device >= listing.devices_capacity) {
-        ustore_py_raise(ustore_status_device_k, "No device carries the ordinal %d of the arena",
-                        (int)description.device);
+        ustore_py_raise(ustore_status_device_k, "No device holds the ordinal %d of the arena", (int)description.device);
         return NULL;
     }
     ustore_gpu_device_t const* const device = &devices[description.device];
@@ -696,7 +695,7 @@ int ustore_py_uuid_import(void) {
 PyObject* ustore_py_uuid_to_object(ustore_uuid_t const* uuid) {
     PyObject* const bytes = PyBytes_FromStringAndSize((char const*)uuid->bytes, (Py_ssize_t)sizeof(uuid->bytes));
     if (!bytes) return NULL;
-    // The slot before the arguments is scratch the callee may borrow, as the offset flag permits.
+    // The slot before the arguments is scratch the callee may view, as the offset flag permits.
     PyObject* arguments[2] = {NULL, bytes};
     PyObject* const object = PyObject_Vectorcall(UUIDType, arguments + 1, PY_VECTORCALL_ARGUMENTS_OFFSET,
                                                  uuid_bytes_keyword);
@@ -762,11 +761,12 @@ static int keys_from_integers(void const* data, size_t count, int is_signed, ust
     return 0;
 }
 
-/** Whether a batch of keys travels as a borrowed buffer, converts from one, or reads element by element. */
+/** Whether a batch of keys travels as a viewed buffer, converts from one, or reads
+ *  element by element. */
 typedef enum keys_route_t {
 
-    /** A contiguous run of 16-byte keys the batch borrows outright. */
-    keys_route_borrowed_k,
+    /** A contiguous run of 16-byte keys the batch views outright. */
+    keys_route_viewed_k,
 
     /** A contiguous run of 64-bit integers, converted into keys and released. */
     keys_route_converted_k,
@@ -778,7 +778,7 @@ typedef enum keys_route_t {
     keys_route_failed_k,
 } keys_route_t;
 
-/** Tries the DLPack routes: packed 16-byte keys are borrowed wherever they live, as the library
+/** Tries the DLPack routes: packed 16-byte keys are viewed wherever they live, as the library
  *  classifies the address, and packed 64-bit integers convert where the host reads them. */
 static keys_route_t keys_from_dlpack(PyObject* object, ustore_py_keys_t* batch) {
     DLTensor const* tensor = NULL;
@@ -793,7 +793,7 @@ static keys_route_t keys_from_dlpack(PyObject* object, ustore_py_keys_t* batch) 
         batch->dlpack = capsule;
         batch->count = (size_t)rows;
         batch->keys = rows ? (ustore_key_t*)data : NULL;
-        return keys_route_borrowed_k;
+        return keys_route_viewed_k;
     }
     int const readable = tensor->device.device_type == kDLCPU || tensor->device.device_type == kDLCUDAManaged;
     if (!readable || !integral || tensor->dtype.bits != 64 || tensor->ndim != 1 ||
@@ -818,24 +818,24 @@ static keys_route_t keys_from_buffer(PyObject* object, ustore_py_keys_t* batch) 
         PyErr_Clear();
         return keys_route_sequence_k;
     }
-    batch->borrowed = 1;
+    batch->viewed = 1;
     Py_buffer const* const buffer = &batch->buffer;
     if (buffer_holds_keys(buffer)) {
         batch->count = (size_t)buffer->shape[0];
         // The ABI spells an empty batch with no keys at all, and refuses an address for no tasks.
         batch->keys = batch->count ? (ustore_key_t*)buffer->buf : NULL;
-        return keys_route_borrowed_k;
+        return keys_route_viewed_k;
     }
     if (buffer_holds_integers(buffer)) {
         char const kind = buffer->format[0] == '@' || buffer->format[0] == '=' ? buffer->format[1] : buffer->format[0];
         int const is_signed = kind == 'q' || kind == 'l' || kind == 'n';
         int const converted = keys_from_integers(buffer->buf, (size_t)buffer->shape[0], is_signed, batch);
         PyBuffer_Release(&batch->buffer);
-        batch->borrowed = 0;
+        batch->viewed = 0;
         return converted == 0 ? keys_route_converted_k : keys_route_failed_k;
     }
     PyBuffer_Release(&batch->buffer);
-    batch->borrowed = 0;
+    batch->viewed = 0;
     return keys_route_sequence_k;
 }
 
@@ -850,7 +850,7 @@ int ustore_py_keys_from_object(PyObject* object, ustore_py_keys_t* batch) {
     keys_route_t route = keys_from_dlpack(object, batch);
     if (route == keys_route_sequence_k) route = keys_from_buffer(object, batch);
     switch (route) {
-    case keys_route_borrowed_k:
+    case keys_route_viewed_k:
     case keys_route_converted_k: return 0;
     case keys_route_failed_k: ustore_py_keys_release(batch); return -1;
     case keys_route_sequence_k: break;
@@ -884,10 +884,10 @@ int ustore_py_keys_from_subscript(PyObject* object, ustore_py_keys_t* batch) {
 }
 
 void ustore_py_keys_release(ustore_py_keys_t* batch) {
-    if (batch->borrowed) PyBuffer_Release(&batch->buffer);
+    if (batch->viewed) PyBuffer_Release(&batch->buffer);
     if (batch->dlpack) dlpack_import_release(batch->dlpack);
     if (batch->owned) PyMem_Free(batch->owned);
-    batch->borrowed = 0;
+    batch->viewed = 0;
     batch->dlpack = NULL;
     batch->owned = NULL;
     batch->keys = NULL;
@@ -934,7 +934,7 @@ ustore_bytes_view_t ustore_py_tape_string(ustore_strings_view_t const* tape, siz
         begin = tape->data.u32_tape.offsets[index], end = tape->data.u32_tape.offsets[index + 1];
     }
     else begin = tape->data.u64_tape.offsets[index], end = tape->data.u64_tape.offsets[index + 1];
-    // A tape of empty strings may carry no bytes at all, and no address may be offset from NULL.
+    // A tape of empty strings may hold no bytes at all, and no address may be offset from NULL.
     ustore_bytes_view_t const string = {data ? data + begin : data, end - begin};
     return string;
 }
@@ -976,12 +976,12 @@ int ustore_py_contents_reserve(ustore_py_contents_t* batch, size_t count, ustore
     return 0;
 }
 
-int ustore_py_contents_borrow(PyObject* object, ustore_py_contents_t* batch) {
-    Py_buffer* const buffer = &batch->buffers[batch->borrowed];
+int ustore_py_contents_view(PyObject* object, ustore_py_contents_t* batch) {
+    Py_buffer* const buffer = &batch->buffers[batch->viewed];
     if (PyObject_GetBuffer(object, buffer, PyBUF_SIMPLE) != 0)
         return ustore_py_raise_from_cause(PyExc_TypeError, "A value must be bytes-like, not %S; remove() removes keys",
                                           Py_TYPE(object));
-    ++batch->borrowed;
+    ++batch->viewed;
     batch->views[batch->count].data = (uint8_t const*)buffer->buf;
     batch->views[batch->count].length = (ustore_size_t)buffer->len;
     ++batch->count;
@@ -1020,7 +1020,7 @@ static int contents_from_pair(PyObject* object, ustore_py_contents_t* batch) {
         return ustore_py_raise_from_cause(PyExc_TypeError, "The data of a tape must be bytes-like, not %S",
                                           Py_TYPE(PyTuple_GET_ITEM(object, 0)));
     }
-    batch->borrowed = 2;
+    batch->viewed = 2;
     batch->count = (size_t)offsets->shape[0] - 1;
 
     // The engine reads every string as the difference of two neighbouring offsets, so they must climb within the data.
@@ -1078,7 +1078,7 @@ static int contents_from_arrow(PyObject* object, ustore_py_contents_t* batch) {
                      "An Arrow array of values is binary, large_binary, string or large_string, not of format '%s'",
                      format);
     else if (array->n_buffers != 3)
-        PyErr_Format(PyExc_TypeError, "An Arrow array of values carries three buffers, not %lld",
+        PyErr_Format(PyExc_TypeError, "An Arrow array of values holds three buffers, not %lld",
                      (long long)array->n_buffers);
     else if (arrow_holds_null(array))
         ustore_py_raise(ustore_status_invalid_argument_k,
@@ -1119,23 +1119,23 @@ int ustore_py_contents_from_tape(PyObject* object, ustore_py_contents_t* batch) 
 }
 
 void ustore_py_contents_release(ustore_py_contents_t* batch) {
-    for (size_t buffer_index = 0; buffer_index != batch->borrowed; ++buffer_index)
+    for (size_t buffer_index = 0; buffer_index != batch->viewed; ++buffer_index)
         PyBuffer_Release(&batch->buffers[buffer_index]);
-    batch->borrowed = 0;
+    batch->viewed = 0;
     if (batch->block) PyMem_Free(batch->block);
     batch->block = NULL;
     batch->count = 0;
     Py_CLEAR(batch->held);
 }
 
-/** Borrows one text into the next view of @p texts: a string as the UTF-8 bytes it caches, a bytes-like object as it
- *  is, None refused, and any other item through @p serializer where there is one. */
-static int text_borrow(PyObject* object, ustore_py_text_serializer_t serializer, void* state,
-                       ustore_py_texts_t* texts) {
+/** Views one text into the next view of @p texts: a string as the UTF-8 bytes it caches, a
+ *  bytes-like object as it is, None refused, and any other item through @p serializer where
+ *  there is one. */
+static int text_view(PyObject* object, ustore_py_text_serializer_t serializer, void* state, ustore_py_texts_t* texts) {
     ustore_py_contents_t* const batch = &texts->contents;
     if (!PyUnicode_Check(object)) {
         if (!serializer || object == Py_None || PyObject_CheckBuffer(object))
-            return ustore_py_contents_borrow(object, batch);
+            return ustore_py_contents_view(object, batch);
         return serializer(object, state);
     }
     Py_ssize_t length = 0;
@@ -1165,8 +1165,8 @@ int ustore_py_texts_from_object(PyObject* object, char const* argument, ustore_p
         return -1;
     }
     for (size_t task_index = 0; task_index != count; ++task_index)
-        if (text_borrow(one ? object : PyTuple_GET_ITEM(texts->held, (Py_ssize_t)task_index), serializer, state,
-                        texts) != 0) {
+        if (text_view(one ? object : PyTuple_GET_ITEM(texts->held, (Py_ssize_t)task_index), serializer, state, texts) !=
+            0) {
             ustore_py_texts_release(texts);
             return -1;
         }
@@ -1194,7 +1194,7 @@ int ustore_py_buffer_fill(Py_buffer* view, PyObject* owner, void const* data, ch
     Py_ssize_t items = 1;
     for (int dimension = 0; dimension != ndim; ++dimension) items *= shape[dimension];
 
-    // An empty run may carry no address at all, and a buffer must still point somewhere.
+    // An empty run may hold no address at all, and a buffer must still point somewhere.
     view->buf = data ? (void*)data : (void*)owner;
     view->obj = Py_NewRef(owner);
     view->len = items * itemsize;
@@ -1578,7 +1578,7 @@ static PyObject* Keys_get_counts(Keys* self, void* Py_UNUSED(closure)) {
 }
 
 static char const doc_Keys_scores[] =
-    "One BM25 score per key, in the order of the tape, when the scan's patterns carried weights, or None.";
+    "One BM25 score per key, in the order of the tape, when the scan's patterns held weights, or None.";
 
 static PyObject* Keys_get_scores(Keys* self, void* Py_UNUSED(closure)) {
     if (!self->scores) Py_RETURN_NONE;
@@ -1777,7 +1777,7 @@ static char const* const enum_names[ustore_py_enums_count_k] = {
 /** Every enumerator of every closed set fits a byte, as the C suite checks, so walks find all. */
 enum { enum_values_limit_k = 256 };
 
-/** What the C `_name` functions answer for a value no enumerator carries. */
+/** What the C <tt>_name</tt> functions answer for a value no enumerator holds. */
 static char const enum_unrecognized_k[] = "unrecognized";
 
 /** The canonical spelling of @p value as an enumerator of @p kind, or "unrecognized" where it is none. */
@@ -2026,9 +2026,10 @@ int ustore_py_progress_from_object(PyObject* object, PyObject** progress) {
 /**
  *  @brief Re-enters Python for one report of the call whose header is @p state, from whichever thread runs it.
  *
- *  Reports never overlap and never follow the final status, but nothing places them on the calling thread, so the
- *  interpreter is attached here rather than assumed. An answer of None carries on, as does a truthy one, while a
- *  falsy one cancels, and a raise reports through the unraisable hook and cancels.
+ *  Reports never overlap and never follow the final status, but nothing places them on the
+ *  calling thread, so the interpreter is attached here rather than assumed. An answer of None
+ *  continues, as does a truthy one, while a falsy one cancels, and a raise reports through the
+ *  unraisable hook and cancels.
  */
 static ustore_continuation_t progress_trampoline(ustore_size_t finished, ustore_size_t total, void* state) {
     ustore_py_call_t* const call = (ustore_py_call_t*)state;
@@ -2252,7 +2253,7 @@ static char const doc_Deferred[] =                                              
     "is final, re-polling `status` once per turn of the running loop and parking no thread, and\n"         //
     "`wait()` blocks the thread instead. Either answers what the blocking verb would have answered, or\n"  //
     "raises what it would have raised, as many times as it is asked. The object holds the outcome, the\n"  //
-    "keys and buffers the call borrows, its output slots and its arena until the call finishes, so\n"      //
+    "keys and buffers the call views, its output slots and its arena until the call finishes, so\n"        //
     "dropping it waits for that; meanwhile C refuses another call naming the arena with ContendedError.\n" //
     "\n"                                                                                                   //
     "Example:\n"                                                                                           //
@@ -2341,7 +2342,8 @@ static PyObject* Deferred_await(Deferred* self) {
 
 static void Deferred_dealloc(Deferred* self) {
     PyObject_GC_UnTrack(self);
-    // The library writes into the call this object holds, and reads the inputs it borrows, until the call finishes
+    // The library writes into the call this object holds, and reads the inputs it views, until
+    // the call finishes
     if (!atomic_load(&self->answering)) {
         deferred_block(self);
         call_release(self->verb, self->call);
@@ -2420,26 +2422,26 @@ PyTypeObject DeferredType = {
 
 #pragma region Executors
 
-static char const doc_Executor[] =                                                             //
-    "The threads that run calls, shared by any number of databases.\n"                         //
-    "\n"                                                                                       //
-    "Built through `Executor.for_ram()`, `on_pool()`, `for_nvme()` or `for_vram()`, never\n"   //
-    "by name. A receiver names it through `on(executor)`, whose calls block on it, or\n"       //
-    "`deferred(executor)`, whose calls its own first thread runs while the caller carries\n"   //
-    "on, so polling alone finishes them. It serves one call at a time: a second call while\n"  //
-    "one runs raises ContendedError once waited for. Progress callbacks run on its threads.\n" //
-    "\n"                                                                                       //
+static char const doc_Executor[] =                                                              //
+    "The threads that run calls, shared by any number of databases.\n"                          //
+    "\n"                                                                                        //
+    "Built through `Executor.for_ram()`, `for_nvme()` or `for_vram()`, never by name.\n"        //
+    "A receiver names it through `on(executor)`, whose calls block on it, or\n"                 //
+    "`deferred(executor)`, whose calls its own first thread runs while the caller continues,\n" //
+    "so polling alone finishes them. It serves one call at a time: a second call while one\n"   //
+    "runs raises ContendedError once waited for. Progress callbacks run on its threads.\n"      //
+    "\n"                                                                                        //
     "Used as a context manager, it waits for its calls and frees its threads on exit.";
 
 static PyObject* Executor_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNUSED(arguments),
                                  PyObject* Py_UNUSED(keywords)) {
-    PyErr_SetString(PyExc_TypeError,
-                    "An executor is built through Executor.for_ram(), .on_pool(), .for_nvme() or .for_vram()");
+    PyErr_SetString(PyExc_TypeError, "An executor is built through Executor.for_ram(), .for_nvme() or .for_vram()");
     return NULL;
 }
 
 /**
- *  @brief Reads the arguments of an executor factory into @p values, each left NULL when the call carried none.
+ *  @brief Reads the arguments of an executor factory into @p values, each left NULL when the
+ *      call held none.
  *  @param[in] names The names of the arguments, in the order they may come by position.
  *  @param[in] positional How many of @p names may come by position.
  *  @param[in] keyword The first of @p names that may come by name, so those before it come by position alone.
@@ -2523,7 +2525,8 @@ static PyObject* executor_made(PyObject* type, ustore_executor_t handle, ustore_
 }
 
 static char const doc_Executor_for_ram[] =                                                       //
-    "for_ram(threads=0, *, memory_domains=None) answers an executor of host threads.\n"          //
+    "for_ram(threads=0, *, memory_domains=None, scratch_limit=0) answers an executor of host\n"  //
+    "threads.\n"                                                                                 //
     "\n"                                                                                         //
     "Runs the calls of the RAM, RocksDB and LevelDB engines, keeping the scratch of every\n"     //
     "thread on its local memory domain and every arena it makes on the first one named. Calls\n" //
@@ -2531,10 +2534,12 @@ static char const doc_Executor_for_ram[] =                                      
     "\n"                                                                                         //
     "Args:\n"                                                                                    //
     "  threads (int, optional): Threads to spawn; zero takes 7/8 of the cores the memory\n"      //
-    "    domains carry, leaving the rest to blocking callers and the engines' own background\n"  //
+    "    domains hold, leaving the rest to blocking callers and the engines' own background\n"   //
     "    work.\n"                                                                                //
     "  memory_domains (Sequence[int], optional): NUMA nodes the threads stay near and keep\n"    //
     "    their memory on; None derives every node the process may allocate on.\n"                //
+    "  scratch_limit (int, optional): Bytes of scratch each thread's calls carve from, past\n"   //
+    "    which a call raises OutOfMemoryError; zero takes 16 GiB.\n"                             //
     "Returns:\n"                                                                                 //
     "  Executor: The new executor.\n"                                                            //
     "Raises:\n"                                                                                  //
@@ -2542,13 +2547,14 @@ static char const doc_Executor_for_ram[] =                                      
 
 static PyObject* Executor_for_ram(PyObject* type, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
                                   PyObject* keyword_names_tuple) {
-    static char const* const names[] = {"threads", "memory_domains"};
-    PyObject* values[2];
-    size_t threads = 0, memory_domains_count = 0;
+    static char const* const names[] = {"threads", "memory_domains", "scratch_limit"};
+    PyObject* values[3];
+    size_t threads = 0, scratch_limit = 0, memory_domains_count = 0;
     int32_t* memory_domains = NULL;
-    if (factory_arguments("for_ram", arguments, positional_arguments_count, keyword_names_tuple, names, values, 2, 1,
+    if (factory_arguments("for_ram", arguments, positional_arguments_count, keyword_names_tuple, names, values, 3, 1,
                           0) != 0 ||
         (values[0] && ustore_py_size_from_object(values[0], "threads", &threads) != 0) ||
+        (values[2] && ustore_py_size_from_object(values[2], "scratch_limit", &scratch_limit) != 0) ||
         identifiers_from_object(values[1], "memory_domains", &memory_domains, &memory_domains_count) != 0)
         return NULL;
 
@@ -2559,6 +2565,7 @@ static PyObject* Executor_for_ram(PyObject* type, PyObject* const* arguments, Py
         .outcome = &outcome,
         .ram = {memory_domains, (ustore_size_t)memory_domains_count},
         .threads = (ustore_size_t)threads,
+        .scratch_limit = (ustore_size_t)scratch_limit,
     };
     Py_BEGIN_ALLOW_THREADS;
     ustore_executor_for_ram(&made);
@@ -2567,103 +2574,109 @@ static PyObject* Executor_for_ram(PyObject* type, PyObject* const* arguments, Py
     return executor_made(type, handle, &outcome);
 }
 
-static char const doc_Executor_on_pool[] =                                                      //
-    "on_pool(pool, /, *, memory_domains=None) answers an executor over a ForkUnion pool\n"      //
-    "another library already runs.\n"                                                           //
-    "\n"                                                                                        //
-    "Runs the calls of the RAM, RocksDB and LevelDB engines on the borrowed threads, so one\n"  //
-    "process keeps one set of them, while the executor keeps its own scratch. The pool keeps\n" //
-    "its lender's mood. Calls `ustore_executor_on_pool`.\n"                                     //
-    "\n"                                                                                        //
-    "Args:\n"                                                                                   //
-    "  pool (int): The address of the `fu_pool_t` to borrow, as `ctypes` and `cffi` hand\n"     //
-    "    pointers over; the pool must outlive the executor.\n"                                  //
-    "  memory_domains (Sequence[int], optional): NUMA nodes the scratch and the arenas\n"       //
-    "    live on; None derives every node the process may allocate on.\n"                       //
-    "Returns:\n"                                                                                //
-    "  Executor: The new executor.\n"                                                           //
-    "Raises:\n"                                                                                 //
-    "  InvalidArgumentError: The address is null, or a memory domain names no NUMA node.\n"     //
-    "  ContendedError: The pool runs its lender's dispatch.";
-
-static PyObject* Executor_on_pool(PyObject* type, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
-                                  PyObject* keyword_names_tuple) {
-    static char const* const names[] = {"pool", "memory_domains"};
-    PyObject* values[2];
-    size_t memory_domains_count = 0;
-    if (factory_arguments("on_pool", arguments, positional_arguments_count, keyword_names_tuple, names, values, 2, 1,
-                          1) != 0)
-        return NULL;
-    if (!values[0]) {
-        PyErr_SetString(PyExc_TypeError, "on_pool() takes the address of the pool by position");
-        return NULL;
-    }
-    PyObject* const address = PyNumber_Index(values[0]);
-    void* const pool = address ? PyLong_AsVoidPtr(address) : NULL;
-    Py_XDECREF(address);
-    int32_t* memory_domains = NULL;
-    if (PyErr_Occurred() ||
-        identifiers_from_object(values[1], "memory_domains", &memory_domains, &memory_domains_count) != 0)
-        return NULL;
-
-    ustore_executor_t handle = NULL;
-    ustore_outcome_t outcome = {0};
-    ustore_executor_on_pool_t made = {
-        .executor = &handle,
-        .outcome = &outcome,
-        .ram = {memory_domains, (ustore_size_t)memory_domains_count},
-        .pool = pool,
-    };
-    Py_BEGIN_ALLOW_THREADS;
-    ustore_executor_on_pool(&made);
-    Py_END_ALLOW_THREADS;
-    PyMem_Free(memory_domains);
-    return executor_made(type, handle, &outcome);
-}
-
 static char const doc_Executor_for_nvme[] =                                                     //
-    "for_nvme(threads=0, *, transport=Transport.AUTOMATIC, **sizes) answers an executor of\n"   //
-    "I/O rings.\n"                                                                              //
+    "for_nvme(threads=0, *, transport=Transport.AUTOMATIC, paths=None, memory_domains=None,\n"  //
+    "scratch_limit=0, **sizes) answers an executor of I/O rings.\n"                             //
     "\n"                                                                                        //
     "Runs the calls of the NVMe engine, every thread submitting and polling a ring of its\n"    //
     "own, and tells every database Database.open_nvme() opens on it how to move bytes. Every\n" //
-    "size keyword names a field of ustore_nvme_options_t: shared_io_channels, queue_depth,\n"   //
-    "request_buffer_bytes, request_buffers_count, stream_buffer_bytes or\n"                     //
-    "stream_buffers_count, where zero keeps the engine's default. Calls\n"                      //
-    "`ustore_executor_for_nvme`.\n"                                                             //
+    "size keyword names a field of ustore_nvme_options_t: queue_depth, request_buffer_bytes,\n" //
+    "request_buffers_count, stream_buffer_bytes or stream_buffers_count, where zero keeps\n"    //
+    "the engine's default. Calls `ustore_executor_for_nvme`.\n"                                 //
     "\n"                                                                                        //
     "Args:\n"                                                                                   //
-    "  threads (int, optional): Threads to spawn; zero derives them from the cores.\n"          //
+    "  threads (int, optional): Threads to spawn; zero takes the fewest hardware queues of\n"   //
+    "    the disks under `paths`, capped by the cores.\n"                                       //
     "  transport (Transport, optional): How bytes move between the files and memory.\n"         //
+    "  paths (Sequence, optional): The data directories of the databases it will open, whose\n" //
+    "    shared NUMA node places the threads unless `memory_domains` names one.\n"              //
+    "  memory_domains (Sequence[int], optional): NUMA nodes the threads and their staging\n"    //
+    "    live on, the first placing the threads.\n"                                             //
+    "  scratch_limit (int, optional): Bytes of scratch each thread's calls carve from, past\n"  //
+    "    which a call raises OutOfMemoryError; zero takes 16 GiB.\n"                            //
     "Returns:\n"                                                                                //
-    "  Executor: The new executor.";
+    "  Executor: The new executor.\n"                                                           //
+    "Raises:\n"                                                                                 //
+    "  InvalidArgumentError: A memory domain names no NUMA node.";
+
+/**
+ *  @brief Encodes @p object, None or a sequence of paths, into views of their bytes.
+ *  @param[out] encoded The list the caller releases, which keeps the encoded bytes alive, or
+ *      NULL when @p object is None.
+ *  @param[out] views The views into @c encoded, or NULL for None, which the caller frees.
+ *  @param[out] count Entries of @c views.
+ *  @return 0 on success, -1 with an exception set otherwise.
+ */
+static int paths_from_object(PyObject* object, PyObject** encoded, ustore_bytes_view_t** views, size_t* count) {
+    *encoded = NULL;
+    *views = NULL;
+    *count = 0;
+    if (!object || object == Py_None) return 0;
+    PyObject* const items = PySequence_Fast(object, "The 'paths' option takes a sequence of paths");
+    if (!items) return -1;
+    Py_ssize_t const length = PySequence_Fast_GET_SIZE(items);
+    *encoded = PyList_New(length);
+    *views = PyMem_New(ustore_bytes_view_t, (size_t)length + 1);
+    int failed = !*encoded || !*views;
+    if (failed && !PyErr_Occurred()) PyErr_NoMemory();
+    for (Py_ssize_t index = 0; !failed && index != length; ++index) {
+        PyObject* bytes = NULL;
+        failed = !PyUnicode_FSConverter(PySequence_Fast_GET_ITEM(items, index), &bytes);
+        if (failed) break;
+        PyList_SET_ITEM(*encoded, index, bytes);
+        (*views)[index].data = (uint8_t const*)PyBytes_AS_STRING(bytes);
+        (*views)[index].length = (ustore_size_t)PyBytes_GET_SIZE(bytes);
+    }
+    Py_DECREF(items);
+    if (failed) {
+        Py_CLEAR(*encoded);
+        PyMem_Free(*views);
+        *views = NULL;
+        return -1;
+    }
+    *count = (size_t)length;
+    return 0;
+}
 
 /** The size keywords of @c Executor.for_nvme, in the order they follow its other arguments. */
-static char const* const nvme_size_names[] = {"shared_io_channels",    "queue_depth",         "request_buffer_bytes",
-                                              "request_buffers_count", "stream_buffer_bytes", "stream_buffers_count"};
+static char const* const nvme_size_names[] = {"queue_depth", "request_buffer_bytes", "request_buffers_count",
+                                              "stream_buffer_bytes", "stream_buffers_count"};
 
 static PyObject* Executor_for_nvme(PyObject* type, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
                                    PyObject* keyword_names_tuple) {
     static char const* const names[] = {"threads",
                                         "transport",
-                                        "shared_io_channels",
                                         "queue_depth",
                                         "request_buffer_bytes",
                                         "request_buffers_count",
                                         "stream_buffer_bytes",
-                                        "stream_buffers_count"};
-    PyObject* values[8];
-    size_t threads = 0, sizes[6] = {0};
+                                        "stream_buffers_count",
+                                        "paths",
+                                        "memory_domains",
+                                        "scratch_limit"};
+    PyObject* values[10];
+    size_t threads = 0, scratch_limit = 0, sizes[5] = {0};
     int transport = ustore_transport_automatic_k;
-    if (factory_arguments("for_nvme", arguments, positional_arguments_count, keyword_names_tuple, names, values, 8, 1,
+    if (factory_arguments("for_nvme", arguments, positional_arguments_count, keyword_names_tuple, names, values, 10, 1,
                           0) != 0 ||
         (values[0] && ustore_py_size_from_object(values[0], "threads", &threads) != 0) ||
+        (values[9] && ustore_py_size_from_object(values[9], "scratch_limit", &scratch_limit) != 0) ||
         (values[1] && ustore_py_enum_from_object(values[1], "transport", ustore_py_enum_transport_k, &transport) != 0))
         return NULL;
-    for (size_t index = 0; index != 6; ++index)
+    for (size_t index = 0; index != 5; ++index)
         if (values[2 + index] &&
             ustore_py_size_from_object(values[2 + index], nvme_size_names[index], &sizes[index]) != 0)
             return NULL;
+    PyObject* encoded_paths = NULL;
+    ustore_bytes_view_t* paths = NULL;
+    size_t paths_count = 0, memory_domains_count = 0;
+    int32_t* memory_domains = NULL;
+    if (paths_from_object(values[7], &encoded_paths, &paths, &paths_count) != 0) return NULL;
+    if (identifiers_from_object(values[8], "memory_domains", &memory_domains, &memory_domains_count) != 0) {
+        Py_XDECREF(encoded_paths);
+        PyMem_Free(paths);
+        return NULL;
+    }
 
     ustore_executor_t handle = NULL;
     ustore_outcome_t outcome = {0};
@@ -2673,18 +2686,24 @@ static PyObject* Executor_for_nvme(PyObject* type, PyObject* const* arguments, P
         .nvme =
             {
                 .transport = (ustore_transport_t)transport,
-                .shared_io_channels = (ustore_size_t)sizes[0],
-                .queue_depth = (ustore_size_t)sizes[1],
-                .request_buffer_bytes = (ustore_size_t)sizes[2],
-                .request_buffers_count = (ustore_size_t)sizes[3],
-                .stream_buffer_bytes = (ustore_size_t)sizes[4],
-                .stream_buffers_count = (ustore_size_t)sizes[5],
+                .queue_depth = (ustore_size_t)sizes[0],
+                .request_buffer_bytes = (ustore_size_t)sizes[1],
+                .request_buffers_count = (ustore_size_t)sizes[2],
+                .stream_buffer_bytes = (ustore_size_t)sizes[3],
+                .stream_buffers_count = (ustore_size_t)sizes[4],
+                .paths = paths,
+                .paths_count = (ustore_size_t)paths_count,
             },
+        .ram = {memory_domains, (ustore_size_t)memory_domains_count},
         .threads = (ustore_size_t)threads,
+        .scratch_limit = (ustore_size_t)scratch_limit,
     };
     Py_BEGIN_ALLOW_THREADS;
     ustore_executor_for_nvme(&made);
     Py_END_ALLOW_THREADS;
+    Py_XDECREF(encoded_paths);
+    PyMem_Free(paths);
+    PyMem_Free(memory_domains);
     return executor_made(type, handle, &outcome);
 }
 
@@ -2692,8 +2711,9 @@ static char const doc_Executor_for_vram[] =                                     
     "for_vram(device, *, scratch_limit=0, gds=Gds.AUTOMATIC) answers an executor of one GPU,\n" //
     "NVIDIA or AMD.\n"                                                                          //
     "\n"                                                                                        //
-    "Every call queues on one stream of the device, so one host thread keeps it fed, and\n"     //
-    "every arena it makes lives there; a multi-GPU caller makes one per device.\n"              //
+    "Every call queues on the one stream the executor creates on the device and destroys\n"     //
+    "with it, so one host thread keeps it fed, and every arena it makes lives there; a\n"       //
+    "multi-GPU caller makes one per device.\n"                                                  //
     "Database.open_nvme() takes one of an NVIDIA device as its `compactions`. Calls\n"          //
     "`ustore_executor_for_vram`.\n"                                                             //
     "\n"                                                                                        //
@@ -2705,7 +2725,7 @@ static char const doc_Executor_for_vram[] =                                     
     "Returns:\n"                                                                                //
     "  Executor: The new executor.\n"                                                           //
     "Raises:\n"                                                                                 //
-    "  DeviceError: No device carries the ordinal, or its driver refuses a stream.";
+    "  DeviceError: No device holds the ordinal, or its driver refuses a stream.";
 
 static PyObject* Executor_for_vram(PyObject* type, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
                                    PyObject* keyword_names_tuple) {
@@ -2826,8 +2846,6 @@ static PyObject* Executor_repr(Executor* self) {
 static PyMethodDef Executor_methods[] = {
     {"for_ram", (PyCFunction)(void (*)(void))Executor_for_ram, ustore_py_method_flags_k | METH_CLASS,
      doc_Executor_for_ram},
-    {"on_pool", (PyCFunction)(void (*)(void))Executor_on_pool, ustore_py_method_flags_k | METH_CLASS,
-     doc_Executor_on_pool},
     {"for_nvme", (PyCFunction)(void (*)(void))Executor_for_nvme, ustore_py_method_flags_k | METH_CLASS,
      doc_Executor_for_nvme},
     {"for_vram", (PyCFunction)(void (*)(void))Executor_for_vram, ustore_py_method_flags_k | METH_CLASS,
@@ -2975,7 +2993,7 @@ static PyMemberDef Changes_members[] = {
     {"keys", Py_T_OBJECT_EX, offsetof(Changes, keys_object), Py_READONLY,
      "The Page of the key of every change, oldest change first."},
     {"values", Py_T_OBJECT_EX, offsetof(Changes, values_object), Py_READONLY,
-     "The Values of the bytes every change carries when the pull asked for them, or None."},
+     "The Values of the bytes every change holds when the pull asked for them, or None."},
     {"stamps", Py_T_OBJECT_EX, offsetof(Changes, stamps_object), Py_READONLY,
      "The stamp every change was committed at."},
     {"kinds", Py_T_OBJECT_EX, offsetof(Changes, kinds_object), Py_READONLY, "What every change did, as a ChangeKind."},
@@ -3030,9 +3048,10 @@ static PyMemberDef Description_members[] = {
      "Bytes of memory the engine holds for the data, or zero where it keeps no estimate."},
     {"disk_bytes", Py_T_ULONGLONG, offsetof(Description, description.disk_bytes), Py_READONLY,
      "Bytes the files of the database take on disk."},
-    {"pin_refused_bytes", Py_T_ULONGLONG, offsetof(Description, description.pin_refused_bytes), Py_READONLY,
+    {"unpinned_staging_bytes", Py_T_ULONGLONG, offsetof(Description, description.unpinned_staging_bytes), Py_READONLY,
      "Bytes of the NVMe engine's io_uring arena the locked-memory cap refused to pin, so each request pins its own."},
-    {"crossing_requests", Py_T_ULONGLONG, offsetof(Description, description.crossing_requests), Py_READONLY,
+    {"requests_across_registered_slots", Py_T_ULONGLONG,
+     offsetof(Description, description.requests_across_registered_slots), Py_READONLY,
      "Requests the NVMe engine sent unpinned while its arena was pinned, as each crossed a gibibyte of it."},
     {NULL, 0, 0, 0, NULL},
 };
@@ -3051,7 +3070,7 @@ PyTypeObject DescriptionType = {
 /** One GPU this process can drive, as @c ustore_gpu_devices wrote it, and its place there. */
 typedef struct GPUDevice {
 
-    /** The object header every instance carries. */
+    /** The object header every instance holds. */
     PyObject ob_base;
 
     /** The ordinal <tt>Executor.for_vram()</tt> names the device by, its position in the listing. */

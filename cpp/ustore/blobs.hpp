@@ -105,8 +105,8 @@ one_off_result_of<verb_type_> in_one_off_arena(ustore_executor_t executor, verb_
  *  @brief Reads what @p answer_type_ asks of the values at @p places into @p arena: the values,
  *      their lengths, or only whether each is present.
  *  @param[in] receiver The database, executor, and transaction or snapshot the read sees.
- *  @param[in] places Collections and keys to read, borrowed until the call is final.
- *  @param[in] arena Memory the answer lands in, borrowed until the call is final, which
+ *  @param[in] places Collections and keys to read, owned by the caller until the call is final.
+ *  @param[in] arena Memory the answer lands in, owned by the caller until the call is final, which
  *      the answer views.
  *  @param[in] watch Whether a read inside a transaction records the keys for conflicts.
  */
@@ -134,7 +134,7 @@ deferrable<answer_type_, completion_> blobs_read_(receiver_t const& receiver, pl
 
 /**
  *  @brief Writes @p values to @p places pairwise, or one value to every place.
- *  @param[in] values Values to write, borrowed until the call is final.
+ *  @param[in] values Values to write, owned by the caller until the call is final.
  *  @param[in] durability Whether the call finishes only after the data reaches the disk.
  */
 template <ustore_completion_t completion_>
@@ -313,19 +313,22 @@ struct match_t {
     ustore_predicate_t predicate {};
 };
 
-/** A per-key predicate handler: answers whether one key is kept. */
+/** A per-key predicate handler: answers whether one key is kept, through a const call operator,
+ *  as the executor's threads may call it at once. */
 template <typename handler_type_>
-concept key_predicate_handler = std::is_nothrow_invocable_r_v<bool, handler_type_&, ustore_key_t>;
+concept key_predicate_handler = std::is_nothrow_invocable_r_v<bool, handler_type_ const&, ustore_key_t>;
 
-/** A batch predicate handler: given the keys of a page, it writes one admission per key. */
+/** A batch predicate handler: given the keys of a page, it writes one admission per key, through a
+ *  const call operator, as the executor's threads may call it at once. */
 template <typename handler_type_>
 concept keys_predicate_handler =
-    std::is_nothrow_invocable_r_v<void, handler_type_&, std::span<ustore_key_t const>, std::span<ustore_admission_t>>;
+    std::is_nothrow_invocable_r_v<void, handler_type_ const&, std::span<ustore_key_t const>,
+                                  std::span<ustore_admission_t>>;
 
 /** Answers the admissions of @p count keys one at a time through the handler @p state points to. */
 template <key_predicate_handler handler_type_>
 void admit_each_(ustore_key_t const* keys, ustore_admission_t* admissions, ustore_size_t count, void* state) noexcept {
-    handler_type_& handler = *static_cast<handler_type_*>(state);
+    handler_type_ const& handler = *static_cast<handler_type_ const*>(state);
     for (ustore_size_t position = 0; position != count; ++position)
         admissions[position] = handler(keys[position]) ? ustore_admit_k : ustore_reject_k;
 }
@@ -334,12 +337,12 @@ void admit_each_(ustore_key_t const* keys, ustore_admission_t* admissions, ustor
 template <keys_predicate_handler handler_type_>
 void admit_batch_(ustore_key_t const* keys, ustore_admission_t* admissions, ustore_size_t count, void* state) noexcept {
     std::size_t const size = static_cast<std::size_t>(count);
-    (*static_cast<handler_type_*>(state))(std::span<ustore_key_t const> {keys, size},
-                                          std::span<ustore_admission_t> {admissions, size});
+    (*static_cast<handler_type_ const*>(state))(std::span<ustore_key_t const> {keys, size},
+                                                std::span<ustore_admission_t> {admissions, size});
 }
 
-/** The predicate a scan calls as <tt>handler(key)</tt>, one key at a time and cheaply, so
- *  @p handler must outlive every scan and every cursor it is given to. */
+/** The predicate a scan calls as <tt>handler(key)</tt>, one key at a time and cheaply, as const from
+ *  the executor's threads, so @p handler must outlive every scan and cursor it is given to. */
 template <key_predicate_handler handler_type_>
     requires(!keys_predicate_handler<handler_type_>)
 ustore_predicate_t predicate_of(handler_type_& handler) noexcept {
@@ -347,7 +350,8 @@ ustore_predicate_t predicate_of(handler_type_& handler) noexcept {
 }
 
 /** The predicate a scan calls as <tt>handler(keys, admissions)</tt> over spans, once per page at
- *  @p cost, so @p handler must outlive every scan and every cursor it is given to. */
+ *  @p cost, as const from the executor's threads, so @p handler must outlive every scan and
+ *  cursor it is given to. */
 template <keys_predicate_handler handler_type_>
 ustore_predicate_t predicate_of(handler_type_& handler,
                                 ustore_predicate_cost_t cost = ustore_predicate_cost_expensive_k) noexcept {
@@ -387,8 +391,8 @@ void narrow(call_type_& call, match_t const& match) noexcept {
  *
  *  The explicit form of the streams below: every pull takes the caller's arena, which holds the
  *  page until its next call, so a binding hands the cursor any arena it keeps. It moves but never
- *  copies. One template serves the cursors of blobs, documents, pages and graph vertices, each
- *  spelled by its handle and calls.
+ *  copies. One template serves the cursors of blobs, pages and graph vertices, each spelled by its
+ *  handle and calls.
  */
 template <typename handle_type_, typename init_type_, typename next_type_, void (*init_)(init_type_*),
           void (*next_)(next_type_*), void (*free_)(handle_type_)>
@@ -607,7 +611,7 @@ class keys_stream_t {
         return {};
     }
 
-    /** Advances like @c advance, but a failed pull ends the stream since a reference carries no
+    /** Advances like @c advance, but a failed pull ends the stream since a reference holds no
      *  status. */
     keys_stream_t& operator++() noexcept {
         if (!advance().failed()) return *this;
@@ -721,7 +725,7 @@ class pairs_stream_t {
         return {};
     }
 
-    /** Advances like @c advance, but a failed pull ends the stream since a reference carries no
+    /** Advances like @c advance, but a failed pull ends the stream since a reference holds no
      *  status. */
     pairs_stream_t& operator++() noexcept {
         if (!advance().failed()) return *this;
@@ -884,7 +888,7 @@ struct outputs<size_estimates_t> {
 /**
  *  @brief Draws up to @p wanted keys of @p collection at random into @p arena through
  *      @p sample_, the sample of one modality keyed by UUIDs.
- *  @param[in] collection Collection to draw from, borrowed until the call is final.
+ *  @param[in] collection Collection to draw from, owned by the caller until the call is final.
  */
 template <ustore_completion_t completion_, typename sample_type_, void (*sample_)(sample_type_*)>
 deferrable<std::span<ustore_key_t const>, completion_> sample_keys_(receiver_t const& receiver,
@@ -913,9 +917,9 @@ deferrable<std::span<ustore_key_t const>, completion_> sample_keys_(receiver_t c
  *  @brief Estimates the entries and the space between @p start_key, inclusive, and @p end_key,
  *      exclusive, of @p collection into @p arena through @p measure_, the measure of one modality
  *      keyed by UUIDs.
- *  @param[in] collection Collection to measure, borrowed until the call is final.
- *  @param[in] start_key First key of the range, borrowed until the call is final.
- *  @param[in] end_key Key the range stops before, borrowed until the call is final.
+ *  @param[in] collection Collection to measure, owned by the caller until the call is final.
+ *  @param[in] start_key First key of the range, owned by the caller until the call is final.
+ *  @param[in] end_key Key the range stops before, owned by the caller until the call is final.
  */
 template <ustore_completion_t completion_, typename measure_type_, void (*measure_)(measure_type_*)>
 deferrable<size_estimates_t, completion_> measure_keys_(receiver_t const& receiver,
@@ -1024,9 +1028,9 @@ class blobs_range_t {
  *      @p completion_ says.
  *
  *  A blocking handle answers a @c status_t or an @c expected, while a deferred one answers a
- *  @c deferred call, borrowing the handle, its inputs and its arena until the call is final. A
- *  handle with @c collection_access_t::read_only_k only reads, as a snapshot hands out. It holds no
- *  state of its own, so any number of threads share it, and it never outlives its database.
+ *  @c deferred call, viewing the handle, its inputs and its arena until the call is final. A handle
+ *  with @c collection_access_t::read_only_k only reads, as a snapshot hands out. It holds no state
+ *  of its own, so any number of threads share it, and it never outlives its database.
  */
 template <ustore_completion_t completion_, collection_access_t access_>
 class blobs_collection_on {
@@ -1093,9 +1097,9 @@ class blobs_collection_on {
     /**
      *  @brief Reads the values of @p keys into @p arena, the verb that reuses one arena
      *      call after call.
-     *  @param[in] keys Keys to read, borrowed until the call is final.
-     *  @param[in] arena Memory the values land in, borrowed until the call is final, which
-     *      the answer views.
+     *  @param[in] keys Keys to read, owned by the caller until the call is final.
+     *  @param[in] arena Memory the values land in, owned by the caller until the call is final,
+     *      which the answer views.
      *  @param[in] watch Whether a read inside a transaction records the keys for conflicts.
      */
     deferrable<values_view_t> read(keys_view_t keys, arena_t& arena,
@@ -1105,8 +1109,8 @@ class blobs_collection_on {
 
     /**
      *  @brief Writes @p values to @p keys pairwise.
-     *  @param[in] keys Keys to write, borrowed until the call is final.
-     *  @param[in] values One value per key, borrowed until the call is final.
+     *  @param[in] keys Keys to write, owned by the caller until the call is final.
+     *  @param[in] values One value per key, owned by the caller until the call is final.
      *  @param[in] durability Whether the call finishes only after the data reaches the disk.
      *
      *  @par Statuses:
@@ -1125,7 +1129,7 @@ class blobs_collection_on {
 
     /**
      *  @brief Removes @p keys together with their values.
-     *  @param[in] keys Keys to remove, borrowed until the call is final.
+     *  @param[in] keys Keys to remove, owned by the caller until the call is final.
      *  @param[in] durability Whether the call finishes only after the data reaches the disk.
      */
     deferrable<> remove(keys_view_t keys, ustore_durability_t durability = ustore_durability_buffered_k) const noexcept
@@ -1134,7 +1138,7 @@ class blobs_collection_on {
         return blobs_remove_<completion_>(receiver_, places_in(collection_, keys), durability);
     }
 
-    /** Draws up to @p wanted keys at random into @p arena, borrowed until the call is final. */
+    /** Draws up to @p wanted keys at random into @p arena, viewed until the call is final. */
     deferrable<std::span<ustore_key_t const>> sample(std::size_t wanted, arena_t& arena,
                                                      ustore_watch_t watch = ustore_watch_keys_k) const noexcept {
         return sample_keys_<completion_, ustore_blobs_sample_t, &ustore_blobs_sample>(receiver_, collection_, wanted,

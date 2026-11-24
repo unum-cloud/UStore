@@ -1,6 +1,6 @@
 """Collections of pages: ordered trees of elements, edited in place by many authors and read back as markup.
 
-A page is an ordered tree of elements addressed by identity, where every element carries a key, a
+A page is an ordered tree of elements addressed by identity, where every element holds a key, a
 tag, attributes and text, and the order of siblings is the content. Edits are positional and small,
 one verb each: import whole pages, insert elements after a sibling, remove or move a subtree, splice
 bytes inside a text run, or set or remove an attribute. The page key doubles as the root's key.
@@ -101,10 +101,10 @@ struct EffectiveKeysWritten(Defaultable, ImplicitlyCopyable):
 @fieldwise_init
 struct EffectiveKeys[origin: MutOrigin](Deferrable, Sized):
     """The key every inserted element ended up with, minted or given, read in place from the arena an
-    insert borrows.
+    insert views.
 
     Parameters:
-        origin: The arena the keys live in, which this result borrows.
+        origin: The arena the keys live in, which this result views.
     """
 
     comptime Written = EffectiveKeysWritten
@@ -115,7 +115,7 @@ struct EffectiveKeys[origin: MutOrigin](Deferrable, Sized):
     var written: EffectiveKeysWritten
     """The views the engine wrote."""
     var count: Int
-    """Insertions the call carried."""
+    """Insertions the call held."""
 
     def __init__(out self, arena: Address, generation: Int, written: EffectiveKeysWritten, count: Int):
         self.arena = Pointer[Arena[ImmUntrackedOrigin], Self.origin](unsafe_from_address=arena)
@@ -124,7 +124,7 @@ struct EffectiveKeys[origin: MutOrigin](Deferrable, Sized):
         self.count = count
 
     def __len__(self) -> Int:
-        """The insertions the call carried."""
+        """The insertions the call held."""
         return self.count
 
     def keys(ref self) raises Error -> Span[Key, origin_of(self)]:
@@ -146,9 +146,9 @@ struct PagesInsertConfig[
     """Where inserted fragments land, the keys they take, and how they read.
 
     Parameters:
-        elements_origin: The borrowed element keys.
-        parents_origin: The borrowed parents.
-        anchors_origin: The borrowed anchors.
+        elements_origin: The viewed element keys.
+        parents_origin: The viewed parents.
+        anchors_origin: The viewed anchors.
     """
 
     var elements: KeysView[Self.elements_origin]
@@ -183,7 +183,7 @@ struct PagesReadConfig[elements_origin: ImmOrigin = ImmUntrackedOrigin](Implicit
     """Which subtrees a read renders, and into what.
 
     Parameters:
-        elements_origin: The borrowed element keys.
+        elements_origin: The viewed element keys.
     """
 
     var elements: KeysView[Self.elements_origin]
@@ -212,8 +212,8 @@ struct PagesScanConfig[end_origin: ImmOrigin = ImmUntrackedOrigin, filter_origin
     """The bounds, order and filter of a scan over page keys.
 
     Parameters:
-        end_origin: The borrowed end keys.
-        filter_origin: The borrowed filter.
+        end_origin: The viewed end keys.
+        filter_origin: The viewed filter.
     """
 
     var end_keys: KeysView[Self.end_origin]
@@ -252,7 +252,7 @@ struct PagesCursorConfig[filter_origin: ImmOrigin = ImmUntrackedOrigin](Implicit
     """The bound, order and filter of a walk over one collection's pages, the filter copied when it opens.
 
     Parameters:
-        filter_origin: The borrowed filter.
+        filter_origin: The viewed filter.
     """
 
     var end_key: Optional[Key]
@@ -1214,6 +1214,9 @@ trait PagesVerbs:
             config.direction,
             config.filter.arguments(),
             config.predicate,
+            0,
+            StringsViewArguments(),
+            NULL_ADDRESS,
             scope.library.symbols().pages_cursor_init,
             "ustore_pages_cursor_init",
         )

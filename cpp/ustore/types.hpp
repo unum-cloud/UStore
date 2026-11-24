@@ -140,7 +140,7 @@ class awaiter;
 
 /**
  *  @brief A submitted call: its outcome and its outputs, owned until the call is final, while the
- *      receiver, the inputs, the arena and the handlers it was handed stay borrowed until then.
+ *      receiver, the inputs, the arena and the handlers it was handed stay viewed until then.
  *
  *  It never moves, as the library writes into it, and its one owner polls @c status, blocks in
  *  @c wait or awaits @c wait on its own loop; destruction waits, so nothing the call writes into
@@ -244,7 +244,7 @@ struct answer_value<expected<value_type_>> {
 template <typename answer_type_>
 using answer_value_t = typename answer_value<answer_type_>::type;
 
-/** Answers @p answer_type_ from a verb's @p body: a deferred call lends C its own outcome and
+/** Answers @p answer_type_ from a verb's @p body: a deferred call hands C its own outcome and
  *  outputs; a blocking call writes its outputs in place, then takes the C outcome's two words once
  *  it is final. */
 template <typename answer_type_, typename body_type_>
@@ -322,9 +322,10 @@ struct owning {
     handle_type_* handle_field() noexcept { return owner_.handle_field(); }
 };
 
-/** A borrowed handle and the executor its verbs run on, completing as @p completion_ says. */
+/** A handle the caller owns and the executor its verbs run on, completing as @p completion_
+ *  says. */
 template <typename handle_type_, ustore_completion_t completion_>
-struct borrowing {
+struct caller_owned {
     static constexpr ustore_completion_t completion = completion_;
     handle_type_ handle_ = nullptr;
     ustore_executor_t executor_ = nullptr;
@@ -919,7 +920,7 @@ struct edges_span {
     edges_span(strided_span<id_type_> sources, strided_span<id_type_> targets, strided_span<id_type_> ids) noexcept
         : sources(sources), targets(targets), ids(ids) {}
 
-    /** Edges between @p sources and @p targets that all carry the default edge identifier. */
+    /** Edges between @p sources and @p targets that all hold the default edge identifier. */
     edges_span(strided_span<id_type_> sources, strided_span<id_type_> targets) noexcept
         : sources(sources), targets(targets) {
         static_assert(std::is_const_v<id_type_>,
@@ -1021,7 +1022,7 @@ concept key_location = std::same_as<std::remove_cvref_t<location_type_>, collect
 template <typename batch_type_>
 concept batch = requires { typename std::remove_cvref_t<batch_type_>::value_type; };
 
-/** A batch that carries its own byte stride instead of stepping by the size of its elements. */
+/** A batch that holds its own byte stride instead of stepping by the size of its elements. */
 template <typename batch_type_>
 concept strided_batch = batch<batch_type_> &&
                         requires(std::remove_cvref_t<batch_type_> const& elements) { elements.stride(); };
@@ -1144,7 +1145,7 @@ struct places_arg_extractor {
         return {&locations, 0};
     }
 
-    /** A batch that carries its stride steps by it. */
+    /** A batch that holds its stride steps by it. */
     static strided_iterator<element_t const> elements(location_t const& locations) noexcept
         requires(!is_one_k && strided_batch<location_t>)
     {
@@ -1263,8 +1264,8 @@ ustore_bytes_view_t bytes_of(text_type_ const& text) noexcept {
 }
 
 /**
- *  @brief Lends a strided run of string-like elements to a call through an accessor, where a zero
- *      stride repeats the first element for every task.
+ *  @brief Passes a strided run of string-like elements to a call through an accessor, where a
+ *      zero stride repeats the first element for every task.
  *
  *  The view it hands out points at the object itself, so the object outlives every call
  *  given the view.
@@ -1358,7 +1359,7 @@ ustore_strings_view_t repeated_view_of(strings_type_ const& strings) noexcept {
     return view;
 }
 
-/** A batch of strings a verb reads where it lies, so a deferred call borrows it: a tape, or values
+/** A batch of strings a verb reads where it lies, so a deferred call views it: a tape, or values
  *  laid out back to back. */
 template <typename strings_type_>
 concept strings_batch = requires(strings_type_ const& strings) {
@@ -1647,20 +1648,16 @@ class executor_t {
         return opened_<executor_t>(ustore_executor_for_ram, arguments, &ustore_executor_for_ram_t::executor);
     }
 
-    /** Borrows the thread pool @p arguments name for the RAM, RocksDB and LevelDB engines. */
-    static expected<executor_t> on_pool(ustore_executor_on_pool_t arguments) noexcept {
-        return opened_<executor_t>(ustore_executor_on_pool, arguments, &ustore_executor_on_pool_t::executor);
-    }
-
     /** Creates an executor for the NVMe engine, whose every thread submits and polls its own I/O
-     *  ring, which tells the databases opened on it how to move bytes and borrow the VRAM executor
-     *  @p arguments name for compactions. */
+     *  ring, which tells the databases opened on it how to move bytes. */
     static expected<executor_t> for_nvme(ustore_executor_for_nvme_t arguments = {}) noexcept {
         return opened_<executor_t>(ustore_executor_for_nvme, arguments, &ustore_executor_for_nvme_t::executor);
     }
 
-    /** Opens one submission stream on the NVIDIA or AMD device @p arguments name by its UStore
-     *  ordinal, fed by the calling thread; an NVMe database compacts on it on an NVIDIA device. */
+    /** Opens a stream of its own on the device @p arguments name by its UStore ordinal, created
+     *  and destroyed with the executor and fed by the calling thread; a caller's stream answers
+     *  @c status_code_t::unsupported_k, since the executor drives only its own. An NVMe database
+     *  compacts on it on NVIDIA. */
     static expected<executor_t> for_vram(ustore_executor_for_vram_t arguments = {}) noexcept {
         return opened_<executor_t>(ustore_executor_for_vram, arguments, &ustore_executor_for_vram_t::executor);
     }
@@ -1684,8 +1681,8 @@ expected<owner_type_> opened_(void (*verb)(arguments_type_*), arguments_type_ ar
     return opened_<owner_type_>(verb, arguments, field);
 }
 
-/** Owns one arena made where an executor computes, which calls fill with results; every call
- *  writing outputs into it rewinds it first. */
+/** Owns one arena made where an executor computes, which calls fill with results and which is
+ *  freed before the executor that made it; every call writing outputs into it rewinds it first. */
 class arena_t {
     owner<ustore_arena_t, ustore_arena_free> owner_;
 
@@ -1819,8 +1816,8 @@ template <typename handler_type_>
 concept progress_handler =
     std::is_nothrow_invocable_r_v<ustore_continuation_t, handler_type_&, ustore_size_t, ustore_size_t>;
 
-/** A progress handler borrowed for one call, a callback and the state it reads; empty hears
- *  nothing. */
+/** A progress handler the caller keeps for one call, a callback and the state it reads; empty
+ *  hears nothing. */
 class progress_t {
 
     template <progress_handler handler_type_>
@@ -1838,7 +1835,7 @@ class progress_t {
 
     progress_t() noexcept = default;
 
-    /** Lends @p handler, which answers @c ustore_cancel_k to stop the call. */
+    /** Views @p handler, which answers @c ustore_cancel_k to stop the call. */
     template <progress_handler handler_type_>
     progress_t(handler_type_& handler) noexcept : callback(&report_<handler_type_>), state(&handler) {}
 };

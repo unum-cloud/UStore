@@ -23,7 +23,7 @@
 #include <smashtable/basic_hash_table.hpp> // `st::assume_reserved`
 #include <smashtable/basic_vector.hpp>     // `st::vector`, `st::assume_uninitialized`
 
-#include "ustore/blobs/nvme_compaction.hpp"        // `host_compactor_t`, `compaction_output`, `compaction_kind_t`
+#include "ustore/blobs/nvme_compaction.hpp" // `host_compactor_t`, `compaction_output`, `compaction_kind_t`, `sorted_run_tree_view`
 #include "ustore/blobs/nvme_key_slot.hpp"          // `storage_limits_t`, `stored_value_size_t`, `value_layout_t`
 #include "ustore/blobs/nvme_lsm_level.hpp"         // `lsm_level`
 #include "ustore/blobs/nvme_schemas.hpp"           // `cancellation_state_t`
@@ -32,17 +32,17 @@
 #include "ustore/blobs/vram_apple_compaction.hpp"  // `metal_compactor_t`
 #include "ustore/blobs/vram_nvidia_compaction.hpp" // `cuda_compactor_t`
 #include "ustore/utilities/nvme_channels.hpp"      // `io_channel_t`, `basic_read_pipeline`
-#include "ustore/utilities/nvme_ring.hpp"          // `extent_t`, `ring_concept`
+#include "ustore/utilities/nvme_ring.hpp"          // `extent_t`, `disk_concept`
 #include "ustore/utilities/nvme_volume.hpp"        // `medium_extent_t`
 #include "ustore/utilities/types.hpp"              // `status_t`, `byte_t`, `uuid128_t`, `uuid_generator`
 
 namespace unum::ustore::blobs {
 
+using utilities::disk_concept;
 using utilities::load;
 using utilities::medium_reference_t;
 using utilities::memory_reference_t;
 using utilities::pooled_buffer_t;
-using utilities::ring_concept;
 using utilities::uuid_generator;
 
 #pragma region LSM Level Merger
@@ -55,7 +55,7 @@ enum class compaction_placement_t : std::uint8_t {
     /** A device when one is present and the merge is large enough, and the host otherwise. */
     automatic_k,
 
-    /** The host, whatever devices the machine carries. */
+    /** The host, whatever devices the machine holds. */
     host_k,
 
     /** A device, which a build without CUDA refuses rather than falling back. */
@@ -108,7 +108,7 @@ class compaction_cancellation {
 };
 
 /**
- *  @brief A borrowed fan-out of one merge's slices over threads, which <tt>src/</tt> builds over its
+ *  @brief A viewed fan-out of one merge's slices over threads, which <tt>src/</tt> builds over its
  *      executor, so the merge names no pool: @c run calls a slice once per index, each on a thread
  *      holding a reading and a writing channel of its own, and answers the first failure.
  *
@@ -117,7 +117,7 @@ class compaction_cancellation {
 class compaction_fan_out_t {
   public:
 
-    /** One slice to run, as @c run hands it to the borrowed fan-out. */
+    /** One slice to run, as @c run hands it to the viewed fan-out. */
     class slice_call_t {
       public:
 
@@ -131,7 +131,7 @@ class compaction_fan_out_t {
         using call_t = status_t (*)(void const*, std::size_t, io_channel_t&, io_channel_t&) noexcept;
         slice_call_t(void const* slice, call_t call) noexcept : slice_(slice), call_(call) {}
 
-        /** The merge's own slice, borrowed. */
+        /** The merge's own slice, viewed. */
         void const* slice_ = nullptr;
 
         /** Calls it as its own type. */
@@ -141,7 +141,7 @@ class compaction_fan_out_t {
     /** A fan-out of one slice, which the merge runs on its caller's channels. */
     compaction_fan_out_t() noexcept = default;
 
-    /** Borrows @p fan_out, which answers @c slices and runs a @c slice_call_t once per slice,
+    /** Views @p fan_out, which answers @c slices and runs a @c slice_call_t once per slice,
      *  outliving every merge handed this. */
     template <typename fan_out_type_>
     explicit compaction_fan_out_t(fan_out_type_& fan_out) noexcept
@@ -174,13 +174,13 @@ class compaction_fan_out_t {
         return {status_code_t::invalid_argument_k, "No threads serve this merge's slices"};
     }
 
-    /** The borrowed fan-out. */
+    /** The viewed fan-out. */
     void* context_ = nullptr;
 
     /** Slices one merge is cut into. */
     std::size_t slices_ = 1;
 
-    /** Calls the borrowed fan-out's @c run as its own type. */
+    /** Calls the viewed fan-out's @c run as its own type. */
     run_t run_ = &refuse_;
 };
 
@@ -220,7 +220,7 @@ inline status_t compaction_status(st::status_t status) noexcept {
 /** Drains a channel's queue pair before the pipelines above it hand their blocks back, which a
  *  failure needs too. */
 template <typename disk_type_>
-    requires ring_concept<disk_type_>
+    requires disk_concept<disk_type_>
 class channel_drain {
   public:
 
@@ -251,6 +251,10 @@ class channel_drain {
  *  below that overlap them; the new runs replace exactly those, so every source run is free once
  *  the merge is published and no run of either level outside the picked range is read or written.
  *
+ *  Both channels of a thread draw from one request pool and one stream pool, so a merge needs one
+ *  free block of each when it opens; every other block it takes comes back through its own I/O,
+ *  which every wait polls on both pipelines, or is taken only from what is free and never awaited.
+ *
  *  @tparam atomic_reference_ The reference a caller's cancellation word is read through.
  *  @tparam waiter_type_ What the core does while the merge waits for its reads and barriers.
  *  @tparam row_kit_type_ The SmashTable kit the runs it reads and writes search with.
@@ -274,7 +278,7 @@ class lsm_level_merger {
     /** One immutable run of a level. */
     using sorted_run_t = typename level_t::sorted_run_t;
 
-    /** The range tombstones one run carries. */
+    /** The range tombstones one run holds. */
     using range_tombstones_t = typename sorted_run_t::range_tombstones_t;
 
     /** The keys one range tombstone hides. */
@@ -312,7 +316,7 @@ class lsm_level_merger {
 
     /** A source run's tree of keys as a compaction reads it, by position alone, which
      *  no kit searches. */
-    using compaction_keys_t = st::immutable_splus_tree_view<stored_key_t>;
+    using compaction_keys_t = sorted_run_tree_view<stored_key_t>;
 
     /** How the values of these runs are stored. */
     static constexpr value_layout_t value_layout_k = key_slot_t::value_layout_k;
@@ -320,7 +324,7 @@ class lsm_level_merger {
     /** Whether the values sit in the key slots themselves, so a merge moves no value bytes. */
     static constexpr bool holds_values_inline_k = is_inline(value_layout_k);
 
-    /** One block of one source value's read, kept until its completion carries the block back. */
+    /** One block of one source value's read, kept until its completion holds the block back. */
     struct pending_piece_t {
 
         /** Where the bytes of this block land: in its source's window, which half they fill
@@ -330,8 +334,8 @@ class lsm_level_merger {
         /** Bytes of the block before the value's own bytes. */
         std::uint32_t skipped = 0;
 
-        /** Bytes of the value this block carries. */
-        std::uint32_t carried = 0;
+        /** Bytes of the value this block holds. */
+        std::uint32_t held = 0;
 
         /** The source run whose window this block refills, or the source count for a read into the
          *  block being gathered. */
@@ -440,7 +444,7 @@ class lsm_level_merger {
         /** The runs the last compaction was cut into, in key order. */
         st::vector<laid_out_run_t> laid_out_runs;
 
-        /** The block every source read in flight carries, by its tag. */
+        /** The block every source read in flight holds, by its tag. */
         st::vector<pending_piece_t> pending_pieces;
 
         /** The bytes of its extent every source run's window holds. */
@@ -470,7 +474,7 @@ class lsm_level_merger {
         /** The collection every new run's header names. */
         uuid128_t collection {};
 
-        /** The largest value the collection admits, which every new run's header carries. */
+        /** The largest value the collection admits, which every new run's header holds. */
         stored_value_size_t value_max_size = 0;
 
         /** Largest new run in bytes, which a run of one key slot may still exceed. */
@@ -807,14 +811,14 @@ class lsm_level_merger {
         if (choose_compactor(request.placement, devices, records) == compactor_choice_t::device_k) {
             if (devices == 0) return {status_code_t::unsupported_k, "No device compactor serves this database"};
             // The device reads every run's heads by position, as no kit searches them.
-            st::vector<st::immutable_splus_tree_view<st::key128_t>> heads;
+            st::vector<sorted_run_tree_view<st::key128_t>> heads;
             st::vector<strings_run_view> views;
             if (heads.resize(sources.size()) != st::status_t::success_k ||
                 views.resize(sources.size()) != st::status_t::success_k)
                 return {status_code_t::out_of_memory_k, "A merge could not track its source runs"};
             for (std::size_t index = 0; index != sources.size(); ++index) {
-                auto const [viewed, status] = st::immutable_splus_tree_view<st::key128_t>::make(
-                    runs[sources[index].index].keys_bytes());
+                auto const [viewed,
+                            status] = sorted_run_tree_view<st::key128_t>::make(runs[sources[index].index].keys_bytes());
                 if (st::failed(status)) return {status_code_t::internal_k, "A source run's heads read as no tree"};
                 heads[index] = viewed;
                 views[index] = strings_run_view {&heads[index],
@@ -1064,7 +1068,7 @@ class lsm_level_merger {
     }
 
     /** The pieces of @p ranges, stamped by @p stamps, that fall from @p lower up to @p upper,
-     *  exclusive: what one run of strings a merge writes carries, where an empty bound leaves
+     *  exclusive: what one run of strings a merge writes holds, where an empty bound leaves
      *  its side open. */
     static expected<range_tombstones_t> clipped_string_tombstones_(std::span<range_t const> ranges,
                                                                    std::span<std::uint64_t const> stamps,
@@ -1212,7 +1216,7 @@ class lsm_level_merger {
                 else if constexpr (device_folds_k)
                     return device->compact(kind, upper, lower, extents, bounds, stamps, fold, device_fold, read_value,
                                            output);
-                // One compaction compiled per key slot folds on the host through the borrowed fold
+                // One compaction compiled per key slot folds on the host through the viewed fold
                 else
                     return device->compact(kind, upper, lower, extents, bounds, stamps, fold_ref_t {fold},
                                            no_device_fold_t {}, read_value, output);
@@ -1223,13 +1227,14 @@ class lsm_level_merger {
 
     /** Takes a streaming block from @p writer, polling its completions when every block is out. */
     static expected<pooled_buffer_t> acquire_buffer_or_poll_(write_pipeline_t& writer) noexcept {
-        expected<pooled_buffer_t> block = writer.acquire_stream_buffer();
-        while (block == status_code_t::capacity_exhausted_k && writer.outstanding() != 0) {
+        for (;;) {
+            auto [block, acquire_status] = writer.acquire_stream_buffer();
+            if (acquire_status.succeeded()) return std::move(block);
+            if (!(acquire_status == status_code_t::capacity_exhausted_k) || writer.outstanding() == 0)
+                return acquire_status;
             if (status_t const flushed = writer.submit(); flushed.failed()) return flushed;
             if (status_t const polled = writer.poll_one_completion(); polled.failed()) return polled;
-            block = writer.acquire_stream_buffer();
         }
-        return block;
     }
 
     /** Whether @p cancellation has been raised, which every block boundary of a merge asks. */
@@ -1260,7 +1265,7 @@ class lsm_level_merger {
     }
 
     /** The pieces of @p ranges, stamped by @p stamps, that fall from @p lower up to @p upper,
-     *  exclusive: what one run of a merge carries, where the least and the greatest key of the type
+     *  exclusive: what one run of a merge holds, where the least and the greatest key of the type
      *  leave a side open. */
     static expected<range_tombstones_t> clipped_range_tombstones_(std::span<range_t const> ranges,
                                                                   std::span<std::uint64_t const> stamps,
@@ -1506,10 +1511,11 @@ class lsm_level_merger {
                                                                  portable_alignment_k);
         if (block_bytes < sorted_run_layout_t::header_bytes())
             return {status_code_t::capacity_exhausted_k, "The streaming block is under a run header"};
+        if (writing_channel.streams().available_buffers() == 0 || writing_channel.requests().available_buffers() == 0 ||
+            reading_channel.requests().available_buffers() == 0)
+            return {status_code_t::capacity_exhausted_k, "A merge needs a free block per pool"};
 
-        auto [writer_channel, writer_channel_status] = writing_channel.acquire();
-        if (writer_channel_status.failed()) return writer_channel_status;
-        write_pipeline_t writer {volume.disk(), std::move(writer_channel), blob.medium};
+        write_pipeline_t writer {volume.disk(), writing_channel, blob.medium};
         channel_drain<disk_t> const parked {volume.disk(), writing_channel};
         if (stopped_(cancellation)) return cancelled_status_();
 
@@ -1636,16 +1642,15 @@ class lsm_level_merger {
             return {status_code_t::out_of_memory_k, "No room to track reads in flight"};
 
         // Both the windows' blocks and the block being gathered outlive the drain of every read
-        // landing in them
+        // landing in them; the first block is taken before the windows split the shared pool
         st::vector<pooled_buffer_t> window_blocks;
-        pooled_buffer_t block;
+        auto [block, acquire_first_status] = acquire_buffer_or_poll_(writer);
+        if (acquire_first_status.failed()) return acquire_first_status;
         std::span<byte_t> room;
         auto [window_bytes, place_windows_status] = place_windows_(reading_channel, read_block, buffers, window_blocks);
         if (place_windows_status.failed()) return place_windows_status;
 
-        auto [reader_channel, reader_channel_status] = reading_channel.acquire();
-        if (reader_channel_status.failed()) return reader_channel_status;
-        read_pipeline_t reader {volume.disk(), std::move(reader_channel), medium_reference_t {}};
+        read_pipeline_t reader {volume.disk(), reading_channel, medium_reference_t {}};
         channel_drain<disk_t> const parked {volume.disk(), reading_channel};
 
         std::uint64_t const half_bytes = round_down_to_multiple(window_bytes / 2, portable_alignment_k);
@@ -1660,19 +1665,23 @@ class lsm_level_merger {
             }
             if (piece.source_run == sources.size()) --block_reads;
             else --windows[piece.source_run].halves[piece.destination < half_bytes ? 0 : 1].outstanding;
-            if (piece.carried == 0) return;
+            if (piece.held == 0) return;
             byte_t* const into = piece.source_run != sources.size() ? windows[piece.source_run].bytes.data()
                                                                     : room.data();
-            std::memcpy(into + piece.destination, completed.bytes.data() + piece.skipped, piece.carried);
+            std::memcpy(into + piece.destination, completed.bytes.data() + piece.skipped, piece.held);
         };
 
         request_tag_t tag = 0;
-        // Submits what is queued and lands whatever completed, which frees room for
-        // the next read
+        // Submits what is queued and lands whatever completed on both pipelines, as a retired
+        // write frees room for the next read too
         auto make_room = [&]() noexcept -> status_t {
             if (status_t const flushed = reader.submit(); flushed.failed()) return flushed;
+            if (status_t const written = writer.submit(); written.failed()) return written;
+            if (reader.outstanding() == 0 && writer.outstanding() == 0)
+                return {status_code_t::capacity_exhausted_k, "No read or write can free a block"};
             auto [polled, poll_completions_status] = reader.poll_completions(sink);
             if (poll_completions_status.failed()) return poll_completions_status;
+            if (status_t const retired = writer.poll_completions(); retired.failed()) return retired;
             return first;
         };
 
@@ -1756,17 +1765,16 @@ class lsm_level_merger {
             std::uint64_t const section_end = round_up_to_multiple(
                 sorted_run_layout_t::stamps_offset(source.population_count(), source.header().stored_values_bytes),
                 portable_alignment_k);
-            for (std::uint64_t carried = 0; carried != taken;) {
-                std::uint64_t const at = from + carried;
+            for (std::uint64_t held = 0; held != taken;) {
+                std::uint64_t const at = from + held;
                 auto [index, half_status] = half_holding(copied.source_run, at, section_end);
                 if (half_status.failed()) return half_status;
                 window_half_t const& half = window.halves[index];
                 if (status_t const settled = settle(half); settled.failed()) return settled;
-                std::uint64_t const bytes = fu::min_of(taken - carried, half.end - at);
-                std::memcpy(room.data() + gathered + carried,
-                            window.bytes.data() + index * half_bytes + (at - half.begin),
+                std::uint64_t const bytes = fu::min_of(taken - held, half.end - at);
+                std::memcpy(room.data() + gathered + held, window.bytes.data() + index * half_bytes + (at - half.begin),
                             static_cast<std::size_t>(bytes));
-                carried += bytes;
+                held += bytes;
             }
             return {};
         };
@@ -1775,25 +1783,25 @@ class lsm_level_merger {
         // block it lands in, at @p gathered
         auto read_into_block = [&](sorted_run_t const& source, std::uint64_t from, std::uint64_t taken,
                                    std::uint64_t gathered) noexcept -> status_t {
-            for (std::uint64_t carried = 0; carried != taken;) {
+            for (std::uint64_t held = 0; held != taken;) {
                 if (!reader.can_enqueue()) {
                     if (status_t const made = make_room(); made.failed()) return made;
                     continue;
                 }
-                std::uint64_t const aligned = round_down_to_multiple(from + carried, portable_alignment_k);
-                std::uint64_t const skipped = from + carried - aligned;
-                std::uint64_t const bytes = fu::min_of(taken - carried, read_block - skipped);
+                std::uint64_t const aligned = round_down_to_multiple(from + held, portable_alignment_k);
+                std::uint64_t const skipped = from + held - aligned;
+                std::uint64_t const bytes = fu::min_of(taken - held, read_block - skipped);
                 std::uint64_t const length = round_up_to_multiple(skipped + bytes, portable_alignment_k);
                 extent_t const piece = source.extent().slice(aligned, length);
                 if (piece.length != length)
                     return {status_code_t::malformed_k, "A source run ends inside copied values"};
                 pending[tag % depth] = pending_piece_t {
-                    static_cast<std::uint32_t>(gathered + carried), static_cast<std::uint32_t>(skipped),
+                    static_cast<std::uint32_t>(gathered + held), static_cast<std::uint32_t>(skipped),
                     static_cast<std::uint32_t>(bytes), static_cast<std::uint32_t>(sources.size())};
                 if (status_t const queued = reader.enqueue_read(source.extent().medium, piece, tag); queued.failed())
                     return queued;
                 ++tag, ++block_reads;
-                carried += bytes;
+                held += bytes;
             }
             return {};
         };
@@ -1826,9 +1834,11 @@ class lsm_level_merger {
                 return cancelled_status_();
             }
             std::uint64_t const chunk = block_bytes < section - written ? block_bytes : section - written;
-            auto [acquired, acquire_buffer_or_poll_status] = acquire_buffer_or_poll_(writer);
-            if (acquire_buffer_or_poll_status.failed()) return acquire_buffer_or_poll_status;
-            block = std::move(acquired);
+            if (!block.held()) {
+                auto [acquired, acquire_buffer_or_poll_status] = acquire_buffer_or_poll_(writer);
+                if (acquire_buffer_or_poll_status.failed()) return acquire_buffer_or_poll_status;
+                block = std::move(acquired);
+            }
             room = block.bytes().first(static_cast<std::size_t>(chunk));
 
             std::uint64_t gathered = 0;

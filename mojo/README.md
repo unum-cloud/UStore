@@ -117,13 +117,14 @@ print(len(page.keys()))
 Handlers are compile-time parameters, since a capturing closure cannot cross into C, and their state crosses beside them as a pointer that must outlive the call.
 A progress handler answering `Continuation.CANCEL` stops the call, which raises `Status.CANCELLED`, and a predicate admits or rejects every key a scan meets.
 `Predicate.each` asks a cheap handler about one key at a time, before patterns or filters read any value, and `Predicate.batch` hands a handler a page of keys to write one `Admission` apiece, asked about the keys patterns and filters kept unless passed `PredicateCost.CHEAP`.
+The executor's threads may call a predicate concurrently, so its handler reads its state through an immutable pointer and never writes it.
 
 ```mojo
 def stop_at_once(finished: Int, total: Int, seen: Pointer[Int, MutAnyOrigin]) -> Continuation:
     seen[] = finished
     return Continuation.CANCEL
 
-def is_even(key: Key, state: Pointer[Int, MutAnyOrigin]) -> Bool:
+def is_even(key: Key, state: Pointer[Int, ImmUntrackedOrigin]) -> Bool:
     return key.uuid.bytes[15] % 2 == 0
 
 var seen = 0
@@ -210,7 +211,7 @@ print(Int(leaving.degrees()[1]))  # 0, as vertex 2 leaves by no edge
 The receiver chooses where a verb runs, what it sees and how it completes, and the verb stays the same, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#receivers--deferred-calls) describe in full.
 A database, transaction or snapshot runs a verb on the calling thread, `handle.on(executor)` blocks on an executor, and `handle.deferred(executor)` submits there and answers a `Deferred`.
 A `Deferred` keeps its outcome and outputs inline and never moves: the receiver builds it in your variable and submits it there, so it allocates nothing.
-It borrows the receiver, and through it the handle and the executor, along with its arena and inputs, which Mojo's origins keep alive for as long as it is.
+It views the receiver, and through it the handle and the executor, along with its arena and inputs, which Mojo's origins keep alive for as long as it is.
 `wait` blocks in `ustore_outcome_wait` and answers the result or raises, `status` polls, and destroying an unfinished one waits for it.
 
 ```mojo
@@ -229,7 +230,7 @@ from std.runtime._asyncrt import create_raising_task  # Mojo's runtime entry poi
 
 async def read_both(east: Database, west: Database, east_executor: Executor, west_executor: Executor,
                     east_people: CollectionID, west_people: CollectionID, keys: KeysView) raises -> Bool:
-    var east_arena = Arena(east_executor)  # borrows east_executor until it is freed
+    var east_arena = Arena(east_executor)  # views east_executor until it is freed
     var west_arena = Arena(west_executor)
     var east_call = east.deferred(east_executor).read(CollectionsView.repeating(east_people), keys, east_arena)  # running now
     var west_call = west.deferred(west_executor).read(CollectionsView.repeating(west_people), keys, west_arena)
@@ -246,8 +247,8 @@ Mojo still calls async experimental and reaches its runtime through underscored 
 ## Executors
 
 An executor owns the threads or rings calls run on, and serves one call at a time, so a call on one serving another raises `Status.CONTENDED`.
-`Executor(library)` owns nothing and runs every verb on the calling thread, `Executor.for_ram` spawns host threads near the NUMA nodes its `RamOptions` name, `Executor.for_nvme` spawns the NVMe engine's rings, and `Executor.for_vram` drives one GPU.
-An executor is freed once it goes out of scope, after every arena it made, since each arena borrows it, and freeing it waits for the calls naming it, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#executors) describe.
+`Executor(library)` owns nothing and runs every verb on the calling thread, `Executor.for_ram` spawns host threads near the NUMA nodes its `RamOptions` name, `Executor.for_nvme` spawns the NVMe engine's rings, placed on the memory domains its `RamOptions` name or the one the `paths` of its `NvmeOptions` share, and `Executor.for_vram` drives one GPU through a stream it creates and destroys with itself.
+An executor is freed once it goes out of scope, after every arena it made, since each arena views it, and freeing it waits for the calls naming it, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#executors) describe.
 
 ```mojo
 var domains: List[Int32] = [0]
@@ -260,7 +261,7 @@ executor.drain(Mood.SPINNING)  # waits, then keeps its threads hot
 
 ## Batches and Arenas
 
-Every verb takes a batch, and its shortest packed input sets how many tasks it carries, so the library never reads past a view.
+Every verb takes a batch, and its shortest packed input sets how many tasks it holds, so the library never reads past a view.
 Fixed-width inputs are strided views, `KeysView`, `CollectionsView`, `LengthsView` and `VertexRolesView`, made from a span with `.of(...)` or from one element repeated for every task with `.repeating(...)`, and ragged inputs are `StringsView` tapes of 32-bit or 64-bit offsets.
 Every output whose length only the call knows lands in an `Arena`, and each call rewinds it, so the previous call's views die and reading one raises `Status.INVALID_ARGUMENT`, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#batches-and-arenas) describe.
 
@@ -273,11 +274,11 @@ _ = db.read(CollectionsView.repeating(people), KeysView.of(keys), arena)
 _ = first.present(0)  # raises: its arena served a later call
 ```
 
-Every view tracks the origin of what it borrows, so the data outlives the call that reads it, and every deferred call takes an arena of its own.
+Every view tracks the origin of what it views, so the data outlives the call that reads it, and every deferred call takes an arena of its own.
 
 ## Errors
 
-Every fallible entry point raises `Error` and nothing else, since Mojo allows one error type per function, and an `Error` carries a `Status` shared with the C interface.
+Every fallible entry point raises `Error` and nothing else, since Mojo allows one error type per function, and an `Error` holds a `Status` shared with the C interface.
 An `Error` keeps the engine mapped while it lives, since its name and message are the engine's own static text.
 
 ```mojo
@@ -310,10 +311,10 @@ _ = years^
 
 ### Engines
 
-`Database.init_ram` starts a database in memory alone, and `Database.open_ram`, `open_rocksdb`, `open_leveldb` and `open_nvme` serve a directory or a manifest, each opening blocking on the executor it is handed.
+`Database.init_ram` starts a database in memory alone, `Database.open_ram`, `open_rocksdb`, `open_leveldb` and `open_nvme` serve a directory or a manifest, and `view_rocksdb` and `view_nvme` serve one read-only, each opening blocking on the executor it is handed.
 The RAM and NVMe opens take a `cpu_class_ceiling`, the newest `CPUClass` the database's kernels may run as, intersected with the machine.
-`describe`, `clear`, `compact` and `flush` act on the whole database through any receiver, and a `DatabaseCompactPlan` keeps a cancelled compaction open until `compact_plan_finish`.
-On Linux the engine builds against conda-forge's glibc 2.39 sysroot, whose kernel headers carry the `io_uring` flags the NVMe engine needs.
+`describe`, `clear`, `compact` and `flush` act on the whole database through any receiver; durability comes only from `flush` and flushed commits, since closing a database does no I/O, and a `DatabaseCompactPlan` keeps a cancelled compaction open until `compact_plan_finish`.
+On Linux the engine builds against conda-forge's glibc 2.39 sysroot, whose kernel headers hold the `io_uring` flags the NVMe engine needs.
 
 ### Left Unbound
 

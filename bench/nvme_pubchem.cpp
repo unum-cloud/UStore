@@ -7,7 +7,7 @@
  *
  *  Every row of the input becomes a blob keyed by the molecule's InChIKey UUID, holding its
  *  fingerprints back to back, and a string, its SMILES, mapping onto that UUID. The input is one
- *  Arrow IPC stream whose batches carry @c key as 16-byte fixed-size binary, @c smiles as binary,
+ *  Arrow IPC stream whose batches hold @c key as 16-byte fixed-size binary, @c smiles as binary,
  *  and @c fingerprints as fixed-size binary, read through the project's own codec. The database is
  *  opened through the C ABI alone, so one source measures every layout the library has shipped.
  *
@@ -341,8 +341,8 @@ int main(int argc, char** argv) {
     fmt::println("- loaded {} rows, {:.2f} GB of keys, SMILES and fingerprints", rows,
                  static_cast<double>(ingested_bytes) / 1e9);
 
-    auto [executor, executor_status] = executor_t::make(static_cast<std::size_t>(settings.threads.value),
-                                                        caller_exclusivity_t::caller_inclusive_k);
+    auto [executor, executor_status] = util::ram_executor_t::make(static_cast<std::size_t>(settings.threads.value),
+                                                                  util::caller_exclusivity_t::caller_inclusive_k);
     if (st::failed(executor_status)) {
         fmt::println(stderr, "Failed to spawn {} threads", settings.threads.value);
         return 1;
@@ -383,7 +383,7 @@ int main(int argc, char** argv) {
 
     std::atomic<std::uint64_t> retries {0};
     std::size_t const batch = static_cast<std::size_t>(settings.batch_size.value);
-    std::size_t const batches = divide_round_up(rows, batch);
+    std::size_t const batches = util::divide_round_up(rows, batch);
     time_point_t const ingest_started = steady_clock_t::now();
     row_t const ingest = run_pass(executor, "pubchem_ingest", batches, [&](loop_t& loop, std::size_t) noexcept {
         st::vector<std::uint32_t> offsets;
@@ -447,7 +447,12 @@ int main(int argc, char** argv) {
     print(ingest);
     fmt::println("- pubchem_ingest: {} calls retried while every shared channel was out", retries.exchange(0));
 
-    // Closing flushes the memory runs, which the ingest is charged as well.
+    // Freeing writes nothing, so the flush lands the memory runs, charged to the ingest as well
+    ustore_outcome_t flushed {};
+    ustore_database_flush_t flush {.database = database, .outcome = &flushed};
+    ustore_database_flush(&flush);
+    if (flushed.status != ustore_status_success_k)
+        fmt::println(stderr, "Failed to flush the ingest: {}", ustore_status_name(flushed.status));
     ustore_database_free(database);
     database = nullptr;
     double const ingest_seconds = std::chrono::duration<double>(steady_clock_t::now() - ingest_started).count();
@@ -473,7 +478,7 @@ int main(int argc, char** argv) {
     ustore_database_describe(&describe);
 
     // Point reads of random keys of the ingest, while a sampler reads the depth the drives see.
-    auto blobs_reads = [&](executor_t& readers, std::string const& name, std::size_t batch) {
+    auto blobs_reads = [&](util::ram_executor_t& readers, std::string const& name, std::size_t batch) {
         if (!settings.regex_filter.selects(name)) return;
         std::atomic<bool> reading {true}, reported {false};
         std::uint64_t depth_sum = 0, depth_samples = 0, depth_peak = 0;
@@ -517,7 +522,7 @@ int main(int argc, char** argv) {
     };
     for (std::size_t const batch : {std::size_t {32}, std::size_t {1024}})
         blobs_reads(executor, fmt::format("pubchem_blobs_read_batch{}", batch), batch);
-    auto [readers, readers_status] = executor_t::make(32, caller_exclusivity_t::caller_inclusive_k);
+    auto [readers, readers_status] = util::ram_executor_t::make(32, util::caller_exclusivity_t::caller_inclusive_k);
     if (!st::failed(readers_status)) blobs_reads(readers, "pubchem_blobs_read_single_32_threads", 1);
     for (std::size_t const depth : {std::size_t {32}, std::size_t {1024}}) {
         std::string const strings_name = fmt::format("pubchem_strings_read_batch{}", depth);

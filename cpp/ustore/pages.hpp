@@ -51,8 +51,8 @@ status_t pages_strings_(strings_type_ const& strings, std::size_t count, ustore_
  *  A page is an ordered tree of elements addressed by key, where the page key doubles as the key of
  *  its root, and every edit names its page, then its element, parent or anchor, one task each. A
  *  blocking handle answers a @c status_t or an @c expected, while a deferred one answers a
- *  @c deferred call, borrowing the handle, its inputs and its arena until the call is final. A
- *  handle with @c collection_access_t::read_only_k only reads, as a snapshot hands out.
+ *  @c deferred call, viewing the handle, its inputs and its arena until the call is final. A handle
+ *  with @c collection_access_t::read_only_k only reads, as a snapshot hands out.
  */
 template <ustore_completion_t completion_, collection_access_t access_>
 class pages_collection_on {
@@ -97,11 +97,11 @@ class pages_collection_on {
     /**
      *  @brief Replaces the pages of @p keys pairwise with the parsed @p markups, minting a new
      *      key for every element.
-     *  @param[in] keys Keys of the pages, borrowed until the call is final.
-     *  @param[in] markups One markup per page, borrowed until the call is final.
+     *  @param[in] keys Keys of the pages, owned by the caller until the call is final.
+     *  @param[in] markups One markup per page, owned by the caller until the call is final.
      *  @param[in] encoding Encoding of the markups.
      *  @param[in] durability Whether the call finishes only after the data reaches the disk.
-     *  @param[in] progress Hears the bytes parsed and may cancel the call, borrowed until the
+     *  @param[in] progress Hears the bytes parsed and may cancel the call, viewed until the
      *      call is final.
      *
      *  @par Statuses:
@@ -138,16 +138,16 @@ class pages_collection_on {
     /**
      *  @brief Parses one fragment per task into elements under a parent after an anchor of the page
      *      @p keys names, answering the key every first element ended up with, given or minted.
-     *  @param[in] keys Keys of the pages, borrowed until the call is final.
-     *  @param[in] fragments One fragment per task, borrowed until the call is final.
-     *  @param[in] arena Memory the keys land in, which the answer views, borrowed until the
+     *  @param[in] keys Keys of the pages, owned by the caller until the call is final.
+     *  @param[in] fragments One fragment per task, owned by the caller until the call is final.
+     *  @param[in] arena Memory the keys land in, which the answer views, viewed until the
      *      call is final.
      *  @param[in] parents The element every fragment lands under, or none for the root in every
-     *      task, borrowed until the call is final.
+     *      task, owned by the caller until the call is final.
      *  @param[in] anchors The sibling every fragment lands after, or none for the front in every
-     *      task, borrowed until the call is final.
+     *      task, owned by the caller until the call is final.
      *  @param[in] elements The key of the first element of every fragment, or none to mint them,
-     *      borrowed until the call is final.
+     *      owned by the caller until the call is final.
      *  @param[in] encoding Encoding of the fragments.
      *  @param[in] durability Whether the call finishes only after the data reaches the disk.
      *
@@ -198,12 +198,12 @@ class pages_collection_on {
     /**
      *  @brief Removes one element per task with its subtree, or every page from each of @p keys to
      *      its entry of @p end_keys when they are given.
-     *  @param[in] keys Keys of the pages, or the inclusive starts of the ranges, borrowed until the
+     *  @param[in] keys Keys of the pages, or the inclusive starts of the ranges, viewed until the
      *      call is final.
-     *  @param[in] elements Elements to remove, none when @p end_keys are given, borrowed until the
+     *  @param[in] elements Elements to remove, none when @p end_keys are given, viewed until the
      *      call is final.
      *  @param[in] end_keys Exclusive ends of the ranges of whole pages, or none to remove
-     *      @p elements alone, borrowed until the call is final.
+     *      @p elements alone, owned by the caller until the call is final.
      *  @param[in] durability Whether the call finishes only after the data reaches the disk.
      *
      *  @par Statuses:
@@ -238,12 +238,12 @@ class pages_collection_on {
     /**
      *  @brief Moves one element per task with its subtree under a parent after an anchor, and
      *      keeps the key it had.
-     *  @param[in] keys Keys of the pages, borrowed until the call is final.
-     *  @param[in] elements Elements to move, borrowed until the call is final.
+     *  @param[in] keys Keys of the pages, owned by the caller until the call is final.
+     *  @param[in] elements Elements to move, owned by the caller until the call is final.
      *  @param[in] parents The element every move lands under, or none for the root in every task,
-     *      borrowed until the call is final.
+     *      owned by the caller until the call is final.
      *  @param[in] anchors The sibling every move lands after, or none for the front in every task,
-     *      borrowed until the call is final.
+     *      owned by the caller until the call is final.
      *  @param[in] durability Whether the call finishes only after the data reaches the disk.
      *
      *  @par Statuses:
@@ -280,13 +280,14 @@ class pages_collection_on {
 
     /**
      *  @brief Replaces one run of text per task inside an element with new bytes.
-     *  @param[in] keys Keys of the pages, borrowed until the call is final.
-     *  @param[in] elements Elements whose text is spliced, borrowed until the call is final.
-     *  @param[in] text_starts Byte into the text of every element where its splice starts, borrowed
+     *  @param[in] keys Keys of the pages, owned by the caller until the call is final.
+     *  @param[in] elements Elements whose text is spliced, owned by the caller until the
+     *      call is final.
+     *  @param[in] text_starts Byte into the text of every element where its splice starts, viewed
      *      until the call is final.
      *  @param[in] text_lengths Bytes of text every splice replaces, where zero only inserts,
-     *      borrowed until the call is final.
-     *  @param[in] texts New bytes of every splice, where an empty run only removes, borrowed until
+     *      owned by the caller until the call is final.
+     *  @param[in] texts New bytes of every splice, where an empty run only removes, viewed until
      *      the call is final.
      *  @param[in] durability Whether the call finishes only after the data reaches the disk.
      *
@@ -331,10 +332,11 @@ class pages_collection_on {
 
     /**
      *  @brief Sets one attribute per task of an element, adding the ones it lacks.
-     *  @param[in] keys Keys of the pages, borrowed until the call is final.
-     *  @param[in] elements Elements whose attributes are set, borrowed until the call is final.
-     *  @param[in] fields Names of the attributes, borrowed until the call is final.
-     *  @param[in] values Values of the attributes, borrowed until the call is final.
+     *  @param[in] keys Keys of the pages, owned by the caller until the call is final.
+     *  @param[in] elements Elements whose attributes are set, owned by the caller until the
+     *      call is final.
+     *  @param[in] fields Names of the attributes, owned by the caller until the call is final.
+     *  @param[in] values Values of the attributes, owned by the caller until the call is final.
      *  @param[in] durability Whether the call finishes only after the data reaches the disk.
      *
      *  @par Statuses:
@@ -374,9 +376,10 @@ class pages_collection_on {
 
     /**
      *  @brief Removes one attribute per task of an element.
-     *  @param[in] keys Keys of the pages, borrowed until the call is final.
-     *  @param[in] elements Elements whose attributes are removed, borrowed until the call is final.
-     *  @param[in] fields Names of the attributes, borrowed until the call is final.
+     *  @param[in] keys Keys of the pages, owned by the caller until the call is final.
+     *  @param[in] elements Elements whose attributes are removed, owned by the caller until the
+     *      call is final.
+     *  @param[in] fields Names of the attributes, owned by the caller until the call is final.
      *  @param[in] durability Whether the call finishes only after the data reaches the disk.
      *
      *  @par Statuses:
@@ -413,10 +416,10 @@ class pages_collection_on {
     /**
      *  @brief Renders the pages of @p keys, or the subtrees of @p elements inside them, into
      *      @p arena, where a missing page or element reads as a missing view.
-     *  @param[in] keys Keys of the pages, borrowed until the call is final.
-     *  @param[in] arena Memory the renderings land in, which the answer views, borrowed until the
+     *  @param[in] keys Keys of the pages, owned by the caller until the call is final.
+     *  @param[in] arena Memory the renderings land in, which the answer views, viewed until the
      *      call is final.
-     *  @param[in] elements Elements to render, or none for whole pages, borrowed until the
+     *  @param[in] elements Elements to render, or none for whole pages, viewed until the
      *      call is final.
      *  @param[in] encoding Encoding the renderings come in.
      *  @param[in] watch Whether a read inside a transaction records the pages for conflicts.
@@ -454,7 +457,7 @@ class pages_collection_on {
     /**
      *  @brief Draws up to @p wanted page keys at random into @p arena, rendering no pages, so a
      *      read follows the sample.
-     *  @param[in] arena Memory the keys land in, which the answer views, borrowed until the
+     *  @param[in] arena Memory the keys land in, which the answer views, viewed until the
      *      call is final.
      *  @param[in] watch Whether a read inside a transaction records the keys for conflicts.
      */
@@ -467,9 +470,9 @@ class pages_collection_on {
     /**
      *  @brief Estimates the pages and the space from @p start_key, inclusive, to @p end_key,
      *      exclusive, into @p arena.
-     *  @param[in] start_key First key of the range, borrowed until the call is final.
-     *  @param[in] end_key Key the range stops before, borrowed until the call is final.
-     *  @param[in] arena Memory the bounds land in, borrowed until the call is final.
+     *  @param[in] start_key First key of the range, owned by the caller until the call is final.
+     *  @param[in] end_key Key the range stops before, owned by the caller until the call is final.
+     *  @param[in] arena Memory the bounds land in, owned by the caller until the call is final.
      *  @param[in] watch Whether a read inside a transaction records the range for conflicts.
      */
     deferrable<size_estimates_t> measure(ustore_key_t const& start_key, ustore_key_t const& end_key, arena_t& arena,

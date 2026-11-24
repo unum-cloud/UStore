@@ -46,7 +46,7 @@ rocksdb = []
 serde = ["dep:serde", "jsontape/serde"]
 
 [dependencies]
-# The siblings' crates carry the trees `build.rs` hands CMake, and ForkUnion and StringZilla link their own archives.
+# The siblings' crates hold the trees `build.rs` hands CMake, and ForkUnion and StringZilla link their own archives.
 forkunion = { version = "4.0.0-rc.1", git = "https://github.com/ashvardanian/ForkUnion", rev = "59662d01e66ee40a87d8f5b28387a29d16c78ddd", default-features = false }
 jsontape = "0.1.4"
 serde = { version = "1", optional = true }

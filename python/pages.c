@@ -7,7 +7,7 @@
  *  Every argument of a pages verb is one item for every task or one item per task, so a batch of
  *  edits on one page names the page once, and the tasks of a call are agreed across its arguments
  *  as they are gathered. Every verb fills a call the driver keeps on the stack or inside a
- *  @c Deferred, holding the keys, markup and names it borrows until the call finishes, and a read
+ *  @c Deferred, holding the keys, markup and names it views until the call finishes, and a read
  *  writes into the arena it is given and answers a tape viewing it. An insert answers the key every
  *  element ended up with, copied out of a one-off arena.
  */
@@ -15,10 +15,10 @@
 
 #pragma region Spread Arguments
 
-/** The tasks one call carries, agreed across its arguments as they are gathered. */
+/** The tasks one call holds, agreed across its arguments as they are gathered. */
 typedef struct tasks_t {
 
-    /** Tasks the call carries, one until an argument of one item per task decides it. */
+    /** Tasks the call holds, one until an argument of one item per task decides it. */
     size_t count;
 
     /** Whether an argument of one item per task decided @c count. */
@@ -145,7 +145,8 @@ static ustore_lengths_view_t spread_lengths_view(spread_lengths_t const* lengths
     return view;
 }
 
-/** The keywords a pages verb may take beside the shared ones, every object borrowed, NULL where absent or None. */
+/** The keywords a pages verb may take beside the shared ones, every object viewed, NULL where
+ *  absent or None. */
 typedef struct page_keywords_t {
 
     /** The elements every task addresses, for verbs whose elements are optional. */
@@ -239,7 +240,7 @@ typedef struct edit_call_t {
     /** What the call keeps until it finishes. */
     ustore_py_call_t call;
 
-    /** The tasks the call carries. */
+    /** The tasks the call holds. */
     tasks_t tasks;
 
     /** The page every task edits. */
@@ -361,7 +362,7 @@ char const doc_pages_import[] =                                                 
     "             durability=Durability.BUFFERED, progress=None) answers None.\n"                 //
     "\n"                                                                                          //
     "Replaces whole pages with parsed markup, minting a key for every element. Every markup is\n" //
-    "borrowed for the length of the call rather than copied.\n"                                   //
+    "viewed for the length of the call rather than copied.\n"                                     //
     "\n"                                                                                          //
     "Args:\n"                                                                                     //
     "  keys (KeyLike | Sequence[KeyLike] | buffer): The pages, one per markup.\n"                 //
@@ -456,7 +457,7 @@ PyObject* ustore_py_api_pages_insert(PyObject* self, PyObject* const* arguments,
         spread_keys_from_object(keywords.parents, "parents", &call->tasks, &call->parents) != 0 ||
         spread_keys_from_object(keywords.anchors, "anchors", &call->tasks, &call->anchors) != 0)
         return ustore_py_call_discard(&context, &insert_verb, call);
-    // The arena only carries the effective keys out, so it dies with the call that named it.
+    // The arena only holds the effective keys out, so it dies with the call that named it.
     PyObject* const arena = ustore_py_arena_new(ustore_py_context_executor(&context));
     int const claimed = arena ? ustore_py_arena_from_object(arena, &call->call.arena) : -1;
     Py_XDECREF(arena);
@@ -758,7 +759,7 @@ typedef struct read_call_t {
     /** What the call keeps until it finishes. */
     ustore_py_call_t call;
 
-    /** The tasks the call carries. */
+    /** The tasks the call holds. */
     tasks_t tasks;
 
     /** The page every task renders. */

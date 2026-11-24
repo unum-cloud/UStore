@@ -33,7 +33,7 @@ using namespace unum::ustore::blobs;
 #pragma region Shape
 
 /** The numbers every case mounts with. */
-constexpr fixture_config_t ingest_config_k {.shared_io_channels = 8};
+constexpr fixture_config_t ingest_config_k {.queues_threads = 8};
 
 /** The keys every case of this suite drives, and the two ways a collection is named. */
 using stored_key_t = std::uint64_t;
@@ -46,7 +46,6 @@ using row_t = keyed_delta<stored_key_t>;
 template <typename fixture_type_>
 struct database_types {
     using fixture_t = fixture_type_;
-    using guard_t = typename fixture_t::guard_t;
     using volume_t = typename fixture_t::volume_t;
     template <value_layout_t value_layout_>
     using blobs_store_of = nvme_store<key_slot<stored_key_t, value_layout_>, volume_t, atomic_reference, waiter_t,
@@ -71,7 +70,7 @@ struct database_types {
         /** The volume of the database, which every reopen mounts again. */
         volume_t volume;
 
-        /** The database, destroyed before the mount it borrows. */
+        /** The database, destroyed before the mount it views. */
         std::unique_ptr<database_t> store;
 
         /** The database this stack opens, which a reopen opens again. */
@@ -97,15 +96,16 @@ struct database_types {
     return config;
 }
 
-/** Creates the collection @p name in @p store under an ID minted for it, answering the ID or why it was refused. */
+/** Creates the collection @p name in @p store on @p queues under an ID minted for it, answering
+ *  the ID or why it was refused. */
 template <typename store_type_>
-util::expected<collection_id_t> create_named(store_type_& store, util::string_view_t name,
-                                             collection_config_t const& config) noexcept {
+util::expected<collection_id_t> create_named(store_type_& store, util::nvme_queues_ref_t queues,
+                                             util::string_view_t name, collection_config_t const& config) noexcept {
     collection_id_t collection_id;
     std::memcpy(collection_id.uuid.bytes, util::uuid_generator().bytes, sizeof(collection_id.uuid.bytes));
     value_layout_t const layout = resolve_value_layout(config.lsm_tree.lsm_level_0.sorted_run.value_size);
     if (util::status_t const created = store.create_collection(collection_id, name, static_cast<std::uint16_t>(layout),
-                                                               config);
+                                                               config, collection_invalid_id_k, queues);
         created.failed())
         return created;
     return collection_id;
@@ -126,7 +126,7 @@ util::expected<collection_id_t> create_named(store_type_& store, util::string_vi
     return bytes;
 }
 
-/** The number @p bytes carries, which is zero for a span of another width. */
+/** The number @p bytes holds, which is zero for a span of another width. */
 [[nodiscard]] std::uint64_t counter_of(std::span<util::byte_t const> bytes) noexcept {
     std::uint64_t value = 0;
     if (bytes.size() == sizeof(value)) std::memcpy(&value, bytes.data(), sizeof(value));
@@ -138,9 +138,9 @@ util::expected<collection_id_t> create_named(store_type_& store, util::string_vi
 template <typename stack_type_>
 util::status_t remount_volume(stack_type_& stack) noexcept {
     stack.volume = typename stack_type_::database_t::volume_t {};
-    auto [guard, acquire_status] = stack.fixture->channels.acquire();
+    auto [guard, acquire_status] = stack.fixture->channel(0);
     if (acquire_status.failed()) return acquire_status;
-    auto [volume, mount_status] = stack.fixture->mount_volume(guard.channel());
+    auto [volume, mount_status] = stack.fixture->mount_volume(*guard);
     if (mount_status.failed()) return mount_status;
     stack.volume = std::move(volume);
     return {};
@@ -153,7 +153,8 @@ util::expected<std::unique_ptr<typename stack_type_::database_t>> open_database(
     if (util::status_t const remounted = remount_volume(stack); remounted.failed()) return remounted;
     auto store = std::unique_ptr<database_t> {new (std::nothrow) database_t {stack.fixture->resources}};
     if (!store) return util::status_t {util::status_code_t::out_of_memory_k, "The database did not fit"};
-    if (util::status_t const mounted = store->mount(stack.volume, stack.fixture->channels, test_database_config());
+    if (util::status_t const mounted = store->mount(stack.volume, util::nvme_queues_ref_t {&stack.fixture->queues, 0},
+                                                    test_database_config());
         mounted.failed())
         return mounted;
     return store;
@@ -182,7 +183,7 @@ util::expected<std::unique_ptr<typename database_types<typename mount_type_::fix
 
 #pragma region Rows
 
-/** The counters every row of a case carries, one per key, which outlive the rows viewing them. */
+/** The counters every row of a case holds, one per key, which outlive the rows viewing them. */
 struct counted_rows_t {
     st::vector<std::array<util::byte_t, 8>> values;
     st::vector<row_t> rows;
@@ -209,38 +210,40 @@ struct counted_rows_t {
     return keys;
 }
 
-/** Ingests @p rows into @p collection of @p store in appends of @p batch rows, as an engine hands over the batches of
- *  a stream, at @p durability. */
+/** Ingests @p rows into @p collection of @p store on @p queues in appends of @p batch rows, as an
+ *  engine hands over the batches of a stream, at @p durability. */
 template <typename database_type_>
-util::expected<transaction_stamp_t> ingest_rows(database_type_& store, collection_id_t collection,
-                                                counted_rows_t const& rows, ustore_durability_t durability,
-                                                std::size_t batch = 7) noexcept {
+util::expected<transaction_stamp_t> ingest_rows(database_type_& store, util::nvme_queues_ref_t queues,
+                                                collection_id_t collection, counted_rows_t const& rows,
+                                                ustore_durability_t durability, std::size_t batch = 7) noexcept {
     typename database_type_::ingest_t ingest;
     if (util::status_t const begun = store.begin_ingest(any_collection_id_t {collection}, ingest); begun.failed())
         return begun;
     std::span<row_t const> const rows_view {rows.rows};
     for (std::size_t first = 0; first < rows_view.size(); first += batch) {
         util::status_t const written = store.write_ingest(
-            ingest, rows_view.subspan(first, fu::min_of(batch, rows_view.size() - first)));
+            ingest, rows_view.subspan(first, fu::min_of(batch, rows_view.size() - first)), queues);
         if (written.failed()) {
             store.drop_ingest(ingest);
             return written;
         }
     }
-    ingest_outcome_t const published = store.publish_ingest(ingest, durability);
+    ingest_outcome_t const published = store.publish_ingest(ingest, durability, queues);
     if (published.status.failed()) return published.status;
     return published.stamp;
 }
 
-/** Keys of @p keys @p store answers @p value for. */
-template <typename reader_type_>
-[[nodiscard]] std::size_t count_valued(reader_type_& reader, collection_id_t collection,
-                                       std::span<stored_key_t const> keys, std::uint64_t value) noexcept {
+/** Keys of @p keys @p store answers @p value for at @p stamp, reading on @p queues. */
+template <typename database_type_>
+[[nodiscard]] std::size_t count_valued(database_type_& store, util::nvme_queues_ref_t queues,
+                                       collection_id_t collection, std::span<stored_key_t const> keys,
+                                       std::uint64_t value, transaction_stamp_t stamp = head_stamp_k) noexcept {
     std::size_t found = 0;
     for (stored_key_t const key : keys) {
         std::array<util::byte_t, 8> into {};
         stored_value_size_t size = 0;
-        if (reader.select(any_collection_id_t {collection}, key, std::span<util::byte_t> {into}, size).failed())
+        if (store.select(any_collection_id_t {collection}, key, std::span<util::byte_t> {into}, size, stamp, queues)
+                .failed())
             continue;
         found += counter_of(std::span<util::byte_t const> {into.data(), size}) == value;
     }
@@ -251,7 +254,7 @@ template <typename reader_type_>
 template <typename database_type_>
 util::status_t level_runs(database_type_& store, collection_id_t collection, st::vector<std::size_t>& into) noexcept {
     return store.visit_store(any_collection_id_t {collection},
-                             [&]<typename held_type_>(held_type_ const& held) noexcept -> status_t {
+                             [&]<typename held_type_>(held_type_ const& held) noexcept -> util::status_t {
                                  typename held_type_::level_set_t const& levels = held.tree().levels();
                                  if (into.resize(levels.size()) != st::status_t::success_k)
                                      return {util::status_code_t::out_of_memory_k, "No room to count the levels"};
@@ -273,13 +276,14 @@ void test_empty_collection_lands_on_a_sorted_level(mount_type_ const& mount) {
     auto [stack, make_status] = make_stack(mount);
     expect_status(make_status, util::status_code_t::success_k);
     if (make_status.failed()) return;
-    auto const [fresh, create_status] = create_named(*stack->store, "fresh", test_config(8, 0));
+    util::nvme_queues_ref_t const queues {&stack->fixture->queues, 0};
+    auto const [fresh, create_status] = create_named(*stack->store, queues, "fresh", test_config(8, 0));
     expect_true(create_status.succeeded());
     if (create_status.failed()) return;
 
     st::vector<stored_key_t> const keys = keys_between(0, 300);
     auto const [landed, ingest_status] = ingest_rows(
-        *stack->store, fresh, rows_of(std::span<stored_key_t const> {keys}, 9), ustore_durability_buffered_k);
+        *stack->store, queues, fresh, rows_of(std::span<stored_key_t const> {keys}, 9), ustore_durability_buffered_k);
     expect_true(ingest_status.succeeded());
     st::vector<std::size_t> runs;
     expect_true(level_runs(*stack->store, fresh, runs).succeeded());
@@ -287,7 +291,7 @@ void test_empty_collection_lands_on_a_sorted_level(mount_type_ const& mount) {
     if (runs.size() <= 1) return;
     expect_equal(runs[0], std::size_t {0});
     expect_equal(runs[runs.size() - 1], std::size_t {1});
-    expect_equal(count_valued(*stack->store, fresh, std::span<stored_key_t const> {keys}, 9), keys.size());
+    expect_equal(count_valued(*stack->store, queues, fresh, std::span<stored_key_t const> {keys}, 9), keys.size());
 }
 
 /** Keys a run on level one already holds take an ingest on level zero, above it, so the ingest answers them. */
@@ -298,8 +302,9 @@ void test_overlap_at_level_one_lands_on_level_zero(mount_type_ const& mount) {
     auto [stack, make_status] = make_stack(mount);
     expect_status(make_status, util::status_code_t::success_k);
     if (make_status.failed()) return;
+    util::nvme_queues_ref_t const queues {&stack->fixture->queues, 0};
     typename types_t::database_t& store = *stack->store;
-    auto const [deep, create_status] = create_named(store, "deep", test_config(8, 0));
+    auto const [deep, create_status] = create_named(store, queues, "deep", test_config(8, 0));
     expect_true(create_status.succeeded());
     if (create_status.failed()) return;
 
@@ -308,21 +313,22 @@ void test_overlap_at_level_one_lands_on_level_zero(mount_type_ const& mount) {
     for (std::uint64_t round = 0; round != 4; ++round) {
         for (stored_key_t const key : keys) {
             std::array<util::byte_t, 8> const counter = counted(round);
-            expect_true(store.insert(any_collection_id_t {deep}, key, stored_value_view_t {counter}).succeeded());
+            expect_true(
+                store.insert(any_collection_id_t {deep}, key, stored_value_view_t {counter}, queues).succeeded());
         }
-        expect_true(store.flush().succeeded());
+        expect_true(store.flush(queues).succeeded());
     }
-    expect_true(store.compact().succeeded());
+    expect_true(store.compact({}, queues).succeeded());
     st::vector<std::size_t> runs;
     expect_true(level_runs(store, deep, runs).succeeded());
     expect_true(runs.size() > 1 && runs[0] == 0 && runs[1] != 0);
 
-    expect_true(
-        ingest_rows(store, deep, rows_of(std::span<stored_key_t const> {keys}, 42), ustore_durability_buffered_k)
-            .has_value());
+    expect_true(ingest_rows(store, queues, deep, rows_of(std::span<stored_key_t const> {keys}, 42),
+                            ustore_durability_buffered_k)
+                    .has_value());
     expect_true(level_runs(store, deep, runs).succeeded());
     expect_true(!runs.empty() && runs[0] == 1);
-    expect_equal(count_valued(store, deep, std::span<stored_key_t const> {keys}, 42), keys.size());
+    expect_equal(count_valued(store, queues, deep, std::span<stored_key_t const> {keys}, 42), keys.size());
 }
 
 /** Appends far smaller than a run land together in one run, not one run each. */
@@ -333,12 +339,13 @@ void test_appends_share_one_run(mount_type_ const& mount) {
     auto [stack, make_status] = make_stack(mount);
     expect_status(make_status, util::status_code_t::success_k);
     if (make_status.failed()) return;
-    auto const [coalesced, create_status] = create_named(*stack->store, "coalesced", test_config(8, 0));
+    util::nvme_queues_ref_t const queues {&stack->fixture->queues, 0};
+    auto const [coalesced, create_status] = create_named(*stack->store, queues, "coalesced", test_config(8, 0));
     expect_true(create_status.succeeded());
     if (create_status.failed()) return;
 
     st::vector<stored_key_t> const keys = keys_between(0, 8000);
-    expect_true(ingest_rows(*stack->store, coalesced, rows_of(std::span<stored_key_t const> {keys}, 3),
+    expect_true(ingest_rows(*stack->store, queues, coalesced, rows_of(std::span<stored_key_t const> {keys}, 3),
                             ustore_durability_buffered_k, 1000)
                     .has_value());
     st::vector<std::size_t> runs;
@@ -346,7 +353,7 @@ void test_appends_share_one_run(mount_type_ const& mount) {
     std::size_t total_runs = 0;
     for (std::size_t const level : runs) total_runs += level;
     expect_equal(total_runs, std::size_t {1});
-    expect_equal(count_valued(*stack->store, coalesced, std::span<stored_key_t const> {keys}, 3), keys.size());
+    expect_equal(count_valued(*stack->store, queues, coalesced, std::span<stored_key_t const> {keys}, 3), keys.size());
 }
 
 #pragma endregion Placement Cases
@@ -362,12 +369,13 @@ void crash_after_ingest(mount_type_ const& mount, ustore_durability_t durability
     auto [stack, make_status] = make_stack(mount);
     expect_status(make_status, util::status_code_t::success_k);
     if (make_status.failed()) return;
-    auto const [landed, create_status] = create_named(*stack->store, "landed", test_config(8, 0));
+    util::nvme_queues_ref_t const queues {&stack->fixture->queues, 0};
+    auto const [landed, create_status] = create_named(*stack->store, queues, "landed", test_config(8, 0));
     expect_true(create_status.succeeded());
     if (create_status.failed()) return;
     st::vector<stored_key_t> const keys = keys_between(0, 200);
-    expect_true(
-        ingest_rows(*stack->store, landed, rows_of(std::span<stored_key_t const> {keys}, 5), durability).has_value());
+    expect_true(ingest_rows(*stack->store, queues, landed, rows_of(std::span<stored_key_t const> {keys}, 5), durability)
+                    .has_value());
 
     expect_true(capture_data_directory(*stack->fixture).succeeded());
     stack->store.reset();
@@ -376,7 +384,7 @@ void crash_after_ingest(mount_type_ const& mount, ustore_durability_t durability
     auto [reopened, reopen_status] = open_database(*stack);
     expect_true(reopen_status.succeeded());
     if (reopen_status.failed()) return;
-    std::size_t const kept = count_valued(*reopened, landed, std::span<stored_key_t const> {keys}, 5);
+    std::size_t const kept = count_valued(*reopened, queues, landed, std::span<stored_key_t const> {keys}, 5);
     if (durability == ustore_durability_flushed_k) expect_equal(kept, keys.size());
     else expect_true(kept == 0 || kept == keys.size());
 }
@@ -415,22 +423,26 @@ void test_snapshot_reads_the_older_value(mount_type_ const& mount) {
     auto [stack, make_status] = make_stack(mount);
     expect_status(make_status, util::status_code_t::success_k);
     if (make_status.failed()) return;
+    util::nvme_queues_ref_t const queues {&stack->fixture->queues, 0};
     database_t& store = *stack->store;
-    auto const [held, create_status] = create_named(store, "held", test_config(8, 0));
+    auto const [held, create_status] = create_named(store, queues, "held", test_config(8, 0));
     expect_true(create_status.succeeded());
     if (create_status.failed()) return;
 
     std::array<util::byte_t, 8> const older = counted(1);
-    expect_true(store.insert(any_collection_id_t {held}, stored_key_t {5}, stored_value_view_t {older}).succeeded());
+    expect_true(
+        store.insert(any_collection_id_t {held}, stored_key_t {5}, stored_value_view_t {older}, queues).succeeded());
     auto [taken, pin_status] = store.pin_stamp();
     expect_true(pin_status.succeeded());
     if (pin_status.failed()) return;
     std::array<stored_key_t, 1> const key {5};
-    expect_true(ingest_rows(store, held, rows_of(std::span<stored_key_t const> {key}, 2), ustore_durability_buffered_k)
-                    .has_value());
+    expect_true(
+        ingest_rows(store, queues, held, rows_of(std::span<stored_key_t const> {key}, 2), ustore_durability_buffered_k)
+            .has_value());
 
-    expect_equal(count_valued(taken, held, std::span<stored_key_t const> {key}, 1), std::size_t {1});
-    expect_equal(count_valued(store, held, std::span<stored_key_t const> {key}, 2), std::size_t {1});
+    expect_equal(count_valued(store, queues, held, std::span<stored_key_t const> {key}, 1, taken.stamp()),
+                 std::size_t {1});
+    expect_equal(count_valued(store, queues, held, std::span<stored_key_t const> {key}, 2), std::size_t {1});
 }
 
 /** A transaction that started before an ingest and wrote one of its keys fails at commit. */
@@ -442,8 +454,9 @@ void test_older_transaction_conflicts(mount_type_ const& mount) {
     auto [stack, make_status] = make_stack(mount);
     expect_status(make_status, util::status_code_t::success_k);
     if (make_status.failed()) return;
+    util::nvme_queues_ref_t const queues {&stack->fixture->queues, 0};
     database_t& store = *stack->store;
-    auto const [contested, create_status] = create_named(store, "contested", test_config(8, 0));
+    auto const [contested, create_status] = create_named(store, queues, "contested", test_config(8, 0));
     expect_true(create_status.succeeded());
     if (create_status.failed()) return;
 
@@ -454,11 +467,11 @@ void test_older_transaction_conflicts(mount_type_ const& mount) {
     expect_true(
         older->insert(any_collection_id_t {contested}, stored_key_t {5}, stored_value_view_t {mine}).succeeded());
     std::array<stored_key_t, 1> const key {5};
-    expect_true(
-        ingest_rows(store, contested, rows_of(std::span<stored_key_t const> {key}, 2), ustore_durability_buffered_k)
-            .has_value());
-    expect_status(older->commit(), util::status_code_t::write_conflict_k);
-    expect_equal(count_valued(store, contested, std::span<stored_key_t const> {key}, 2), std::size_t {1});
+    expect_true(ingest_rows(store, queues, contested, rows_of(std::span<stored_key_t const> {key}, 2),
+                            ustore_durability_buffered_k)
+                    .has_value());
+    expect_status(older->commit(queues), util::status_code_t::write_conflict_k);
+    expect_equal(count_valued(store, queues, contested, std::span<stored_key_t const> {key}, 2), std::size_t {1});
 }
 
 #pragma endregion Isolation Cases
@@ -473,16 +486,19 @@ void test_descending_key_is_refused(mount_type_ const& mount) {
     auto [stack, make_status] = make_stack(mount);
     expect_status(make_status, util::status_code_t::success_k);
     if (make_status.failed()) return;
-    auto const [refused, create_status] = create_named(*stack->store, "refused", test_config(8, 0));
+    util::nvme_queues_ref_t const queues {&stack->fixture->queues, 0};
+    auto const [refused, create_status] = create_named(*stack->store, queues, "refused", test_config(8, 0));
     expect_true(create_status.succeeded());
     if (create_status.failed()) return;
 
     st::vector<stored_key_t> keys = keys_between(0, 20);
     keys[19] = 3;
     counted_rows_t const rows = rows_of(std::span<stored_key_t const> {keys}, 7);
-    auto const [landed, ingest_status] = ingest_rows(*stack->store, refused, rows, ustore_durability_buffered_k);
+    auto const [landed, ingest_status] = ingest_rows(*stack->store, queues, refused, rows,
+                                                     ustore_durability_buffered_k);
     expect_status(ingest_status, util::status_code_t::invalid_argument_k);
-    expect_equal(count_valued(*stack->store, refused, std::span<stored_key_t const> {keys}, 7), std::size_t {0});
+    expect_equal(count_valued(*stack->store, queues, refused, std::span<stored_key_t const> {keys}, 7),
+                 std::size_t {0});
     expect_equal(run_count_of(*stack->fixture), std::size_t {0});
     expect_equal(run_files_of(*stack->fixture), std::size_t {0});
 }

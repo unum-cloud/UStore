@@ -8,12 +8,13 @@ Both are checked here rather than argued about in review: Spin checks a Promela 
 - `nvme_ring_ownership.pml`: one issuing thread per ring, and the queue pairs that move between them.
 - `epoch_domain.cpp`: the reader epochs a writer waits out before it frees a replaced view of a collection, under GenMC, which finds the freed view once either fence is dropped.
 - `epoch_claim/`: the parking claim a database's maintenance, catalog and blob writes run under, in Spin and GenMC: no maintenance lost, one holder at a time, and no committer starved by a holder retaking it.
+- `collection_drop.pml`: the dropping mark a collection drop claims on the readers' count, against snapshot and transaction opens that back out.
 - `transaction_commit.pml`: staging and committing across collections at both isolation levels.
 - `snapshot_lifetime.pml`: snapshots created, exported and dropped while writers publish.
 - `engine_ram.cpp`: the in-memory engine's commit path under GenMC, against its real header.
 - `nvme_compaction.pml`: LSM compaction against concurrent readers, with a crash at every step.
 
-The first five exist; the rest name what belongs here as the engines that need them arrive.
+The first six exist; the rest name what belongs here as the engines that need them arrive.
 
 ## Running
 

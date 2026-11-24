@@ -81,7 +81,7 @@ bool open_listing(call_t& call, arguments_type_ const& arguments, ustore_modalit
 }
 
 /** Implements the scans of keyed collections: up to @c wanted keys of every range, through the
- *  predicate, the patterns a blobs scan carries, and @p verdict, a documents or pages filter. */
+ *  predicate, the patterns a blobs scan holds, and @p verdict, a documents or pages filter. */
 template <typename arguments_type_>
 void scan_keyed(call_t& call, arguments_type_* arguments, ustore_modality_t modality, matcher_t const* matcher,
                 verdict_t const& verdict) {
@@ -117,7 +117,7 @@ void scan_keyed(call_t& call, arguments_type_* arguments, ustore_modality_t moda
                               scores))
                 return call.refuse(ustore_status_not_found_k, "A collection was dropped meanwhile");
             offsets[task + 1] = listed.size();
-            if (!carries_on(arguments->progress, arguments->progress_state, task + 1, count))
+            if (!keeps_going(arguments->progress, arguments->progress_state, task + 1, count))
                 return call.refuse(ustore_status_cancelled_k, "The progress callback cancelled the scan");
         }
     }
@@ -375,7 +375,7 @@ bool pull_keyed(call_t& call, arguments_type_ const* arguments, keyed_cursor_t& 
     }
     if (!hold_view(call, cursor.spec)) return false;
     if (cursor.exhausted)
-        return carries_on(arguments->progress, arguments->progress_state, 1, 1) ||
+        return keeps_going(arguments->progress, arguments->progress_state, 1, 1) ||
                call.fail(ustore_status_cancelled_k, "The progress callback cancelled the pull");
     read_pin_t pin;
     reader_t const reader = reader_of(cursor.database, cursor.spec,
@@ -391,7 +391,7 @@ bool pull_keyed(call_t& call, arguments_type_ const* arguments, keyed_cursor_t& 
     catch (std::bad_alloc const&) {
         return call.fail(ustore_status_out_of_memory_k, "Out of memory while pulling");
     }
-    if (!carries_on(arguments->progress, arguments->progress_state, 1, 1))
+    if (!keeps_going(arguments->progress, arguments->progress_state, 1, 1))
         return call.fail(ustore_status_cancelled_k, "The progress callback cancelled the pull");
     // A page of fewer than wanted exhausts the walk, and a full one resumes past its last key
     if (!listed.empty()) cursor.walk.position = listed.back().key, cursor.walk.kind = bound_t::exclusive_k;

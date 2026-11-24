@@ -140,18 +140,18 @@ type DocsWriteConfig struct {
 // DocsWrite writes one document or field per value, keyed by keys or, without them, by the
 // [DocsWriteConfig] IDField of every document.
 func (on writes[Handle]) DocsWrite(collections Collections, keys []Key, values Tape, config *DocsWriteConfig) error {
-	var lent lent[struct{}]
-	_, err := block(&lent, on.docsWrite(&lent, C.ustore_completion_blocking_k, collections, keys, values, config))
+	var call callWithResult[struct{}]
+	_, err := block(&call, on.docsWrite(&call, C.ustore_completion_blocking_k, collections, keys, values, config))
 	return err
 }
 
 // DocsWrite submits [DatabaseOn.DocsWrite].
 func (on deferredWrites[Handle]) DocsWrite(collections Collections, keys []Key, values Tape, config *DocsWriteConfig) (*Deferred[struct{}], error) {
 	deferred := new(Deferred[struct{}])
-	return submitted(deferred, on.docsWrite(&deferred.lent, C.ustore_completion_deferred_k, collections, keys, values, config))
+	return submitted(deferred, on.docsWrite(&deferred.call, C.ustore_completion_deferred_k, collections, keys, values, config))
 }
 
-func (receiver storeReceiver[Handle]) docsWrite(lent *lent[struct{}], completion C.ustore_completion_t, collections Collections, keys []Key, values Tape, config *DocsWriteConfig) error {
+func (receiver storeReceiver[Handle]) docsWrite(call *callWithResult[struct{}], completion C.ustore_completion_t, collections Collections, keys []Key, values Tape, config *DocsWriteConfig) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
@@ -161,19 +161,19 @@ func (receiver storeReceiver[Handle]) docsWrite(lent *lent[struct{}], completion
 	if err := shape(collections, count, len(keys), int(options.Fields.Len())); err != nil {
 		return err
 	}
-	arguments, inputs := stage[C.ustore_docs_write_t](lent)
+	arguments, inputs := stage[C.ustore_docs_write_t](call)
 	*arguments = C.ustore_docs_write_t{
 		database:     database,
 		executor:     executor,
-		outcome:      lent.outcome(),
+		outcome:      call.outcome(),
 		completion:   completion,
 		transaction:  receiver.transaction(),
 		count:        C.ustore_size_t(count),
-		collections:  lent.collections(inputs, collections),
-		keys:         lent.keys(keys),
-		id_field:     lent.text(options.IDField),
-		fields:       lent.strings(options.Fields),
-		values:       lent.strings(values),
+		collections:  call.collections(inputs, collections),
+		keys:         call.keys(keys),
+		id_field:     call.text(options.IDField),
+		fields:       call.strings(options.Fields),
+		values:       call.strings(values),
 		_type:        C.ustore_docs_field_type_t(options.Type),
 		modification: C.ustore_docs_modification_t(options.Modification),
 		durability:   C.ustore_durability_t(options.Durability),
@@ -185,18 +185,18 @@ func (receiver storeReceiver[Handle]) docsWrite(lent *lent[struct{}], completion
 
 // DocsRemove removes whole documents, or every document of a range per task given end keys.
 func (on writes[Handle]) DocsRemove(collections Collections, keys []Key, config *RemoveConfig) error {
-	var lent lent[struct{}]
-	_, err := block(&lent, on.docsRemove(&lent, C.ustore_completion_blocking_k, collections, keys, config))
+	var call callWithResult[struct{}]
+	_, err := block(&call, on.docsRemove(&call, C.ustore_completion_blocking_k, collections, keys, config))
 	return err
 }
 
 // DocsRemove submits [DatabaseOn.DocsRemove].
 func (on deferredWrites[Handle]) DocsRemove(collections Collections, keys []Key, config *RemoveConfig) (*Deferred[struct{}], error) {
 	deferred := new(Deferred[struct{}])
-	return submitted(deferred, on.docsRemove(&deferred.lent, C.ustore_completion_deferred_k, collections, keys, config))
+	return submitted(deferred, on.docsRemove(&deferred.call, C.ustore_completion_deferred_k, collections, keys, config))
 }
 
-func (receiver storeReceiver[Handle]) docsRemove(lent *lent[struct{}], completion C.ustore_completion_t, collections Collections, keys []Key, config *RemoveConfig) error {
+func (receiver storeReceiver[Handle]) docsRemove(call *callWithResult[struct{}], completion C.ustore_completion_t, collections Collections, keys []Key, config *RemoveConfig) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
@@ -205,17 +205,17 @@ func (receiver storeReceiver[Handle]) docsRemove(lent *lent[struct{}], completio
 	if err := shape(collections, len(keys), len(options.EndKeys)); err != nil {
 		return err
 	}
-	arguments, inputs := stage[C.ustore_docs_remove_t](lent)
+	arguments, inputs := stage[C.ustore_docs_remove_t](call)
 	*arguments = C.ustore_docs_remove_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		completion:  completion,
 		transaction: receiver.transaction(),
 		count:       C.ustore_size_t(len(keys)),
-		collections: lent.collections(inputs, collections),
-		keys:        lent.keys(keys),
-		end_keys:    lent.keys(options.EndKeys),
+		collections: call.collections(inputs, collections),
+		keys:        call.keys(keys),
+		end_keys:    call.keys(options.EndKeys),
 		durability:  C.ustore_durability_t(options.Durability),
 		watch:       C.ustore_watch_t(receiver.watch),
 	}
@@ -238,17 +238,17 @@ type DocsReadConfig struct {
 
 // DocsRead reads whole documents or fields inside them into arena, a missing one reading as absent.
 func (on reads[Handle]) DocsRead(collections Collections, keys []Key, arena *Arena, config *DocsReadConfig) (Values, error) {
-	var lent lent[Values]
-	return block(&lent, on.docsRead(&lent, C.ustore_completion_blocking_k, collections, keys, arena, config))
+	var call callWithResult[Values]
+	return block(&call, on.docsRead(&call, C.ustore_completion_blocking_k, collections, keys, arena, config))
 }
 
 // DocsRead submits [DatabaseOn.DocsRead].
 func (on deferredReads[Handle]) DocsRead(collections Collections, keys []Key, arena *Arena, config *DocsReadConfig) (*Deferred[Values], error) {
 	deferred := new(Deferred[Values])
-	return submitted(deferred, on.docsRead(&deferred.lent, C.ustore_completion_deferred_k, collections, keys, arena, config))
+	return submitted(deferred, on.docsRead(&deferred.call, C.ustore_completion_deferred_k, collections, keys, arena, config))
 }
 
-func (receiver storeReceiver[Handle]) docsRead(lent *lent[Values], completion C.ustore_completion_t, collections Collections, keys []Key, arena *Arena, config *DocsReadConfig) error {
+func (receiver storeReceiver[Handle]) docsRead(call *callWithResult[Values], completion C.ustore_completion_t, collections Collections, keys []Key, arena *Arena, config *DocsReadConfig) error {
 	database, executor, outputs, err := receiver.lowerInto(arena)
 	if err != nil {
 		return err
@@ -257,20 +257,20 @@ func (receiver storeReceiver[Handle]) docsRead(lent *lent[Values], completion C.
 	if err := shape(collections, len(keys), int(options.Fields.Len())); err != nil {
 		return err
 	}
-	arguments, inputs := stage[C.ustore_docs_read_t](lent)
-	lent.result.count = uint(len(keys))
+	arguments, inputs := stage[C.ustore_docs_read_t](call)
+	call.result.count = uint(len(keys))
 	*arguments = C.ustore_docs_read_t{
 		database:     database,
 		executor:     executor,
-		outcome:      lent.outcome(),
+		outcome:      call.outcome(),
 		completion:   completion,
 		view:         receiver.view(),
 		count:        C.ustore_size_t(len(keys)),
-		collections:  lent.collections(inputs, collections),
-		keys:         lent.keys(keys),
-		fields:       lent.strings(options.Fields),
-		presences:    &lent.result.presences,
-		values:       &lent.result.values.raw,
+		collections:  call.collections(inputs, collections),
+		keys:         call.keys(keys),
+		fields:       call.strings(options.Fields),
+		presences:    &call.result.presences,
+		values:       &call.result.values.raw,
 		arena:        outputs,
 		outputs_type: C.ustore_docs_field_type_t(options.OutputsType),
 	}
@@ -288,22 +288,22 @@ type Paths struct {
 // Len reports how many unique paths the call found.
 func (paths Paths) Len() uint { return uint(paths.written) }
 
-// Get borrows path index from the arena.
+// Get views path index in the arena.
 func (paths Paths) Get(index uint) []byte { return paths.fields.sized(uint(paths.written)).Get(index) }
 
 // DocsGist lists the unique paths to the leaves of the documents keys name into arena.
 func (on reads[Handle]) DocsGist(collections Collections, keys []Key, arena *Arena) (Paths, error) {
-	var lent lent[Paths]
-	return block(&lent, on.docsGist(&lent, C.ustore_completion_blocking_k, collections, keys, arena))
+	var call callWithResult[Paths]
+	return block(&call, on.docsGist(&call, C.ustore_completion_blocking_k, collections, keys, arena))
 }
 
 // DocsGist submits [DatabaseOn.DocsGist].
 func (on deferredReads[Handle]) DocsGist(collections Collections, keys []Key, arena *Arena) (*Deferred[Paths], error) {
 	deferred := new(Deferred[Paths])
-	return submitted(deferred, on.docsGist(&deferred.lent, C.ustore_completion_deferred_k, collections, keys, arena))
+	return submitted(deferred, on.docsGist(&deferred.call, C.ustore_completion_deferred_k, collections, keys, arena))
 }
 
-func (receiver storeReceiver[Handle]) docsGist(lent *lent[Paths], completion C.ustore_completion_t, collections Collections, keys []Key, arena *Arena) error {
+func (receiver storeReceiver[Handle]) docsGist(call *callWithResult[Paths], completion C.ustore_completion_t, collections Collections, keys []Key, arena *Arena) error {
 	database, executor, outputs, err := receiver.lowerInto(arena)
 	if err != nil {
 		return err
@@ -311,18 +311,18 @@ func (receiver storeReceiver[Handle]) docsGist(lent *lent[Paths], completion C.u
 	if err := shape(collections, len(keys)); err != nil {
 		return err
 	}
-	arguments, inputs := stage[C.ustore_docs_gist_t](lent)
+	arguments, inputs := stage[C.ustore_docs_gist_t](call)
 	*arguments = C.ustore_docs_gist_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		completion:  completion,
 		view:        receiver.view(),
 		count:       C.ustore_size_t(len(keys)),
-		collections: lent.collections(inputs, collections),
-		keys:        lent.keys(keys),
-		fields:      &lent.result.fields.raw,
-		written:     &lent.result.written,
+		collections: call.collections(inputs, collections),
+		keys:        call.keys(keys),
+		fields:      &call.result.fields.raw,
+		written:     &call.result.written,
 		arena:       outputs,
 	}
 	C.ustore_docs_gist(arguments)
@@ -371,7 +371,7 @@ func (column DocsColumn) Converted(row uint) bool { return present(column.raw.co
 // Colliding reports whether a value of an inconvertible type sits under row's field.
 func (column DocsColumn) Colliding(row uint) bool { return present(column.raw.collisions, row) }
 
-// Strings borrows the rows of a string, binary or JSON column from the arena, and nothing for a
+// Strings views the rows of a string, binary or JSON column in the arena, and nothing for a
 // scalar column.
 func (column DocsColumn) Strings() Strings {
 	return Strings{raw: column.raw.strings}.sized(column.rows)
@@ -383,7 +383,7 @@ type DocsScalar interface {
 	~bool | ~int8 | ~int16 | ~int32 | ~int64 | ~uint8 | ~uint16 | ~uint32 | ~uint64 | ~float32 | ~float64 | ~[16]byte
 }
 
-// DocsColumnScalars borrows the scalars of a column gathered as the type Value spells, in place; a
+// DocsColumnScalars views the scalars of a column gathered as the type Value spells, in place; a
 // Value of another width than the column's type reads garbage, as the column does not record it.
 func DocsColumnScalars[Value DocsScalar](column DocsColumn) []Value {
 	if column.raw.scalars == nil || column.rows == 0 {
@@ -395,17 +395,17 @@ func DocsColumnScalars[Value DocsScalar](column DocsColumn) []Value {
 // DocsGather reads, type-checks and converts one column per field of the documents keys name into
 // arena, converting field i into outputsTypes[i].
 func (on reads[Handle]) DocsGather(collections Collections, keys []Key, fields Tape, outputsTypes []DocsFieldType, arena *Arena) (Columns, error) {
-	var lent lent[Columns]
-	return block(&lent, on.docsGather(&lent, C.ustore_completion_blocking_k, collections, keys, fields, outputsTypes, arena))
+	var call callWithResult[Columns]
+	return block(&call, on.docsGather(&call, C.ustore_completion_blocking_k, collections, keys, fields, outputsTypes, arena))
 }
 
 // DocsGather submits [DatabaseOn.DocsGather].
 func (on deferredReads[Handle]) DocsGather(collections Collections, keys []Key, fields Tape, outputsTypes []DocsFieldType, arena *Arena) (*Deferred[Columns], error) {
 	deferred := new(Deferred[Columns])
-	return submitted(deferred, on.docsGather(&deferred.lent, C.ustore_completion_deferred_k, collections, keys, fields, outputsTypes, arena))
+	return submitted(deferred, on.docsGather(&deferred.call, C.ustore_completion_deferred_k, collections, keys, fields, outputsTypes, arena))
 }
 
-func (receiver storeReceiver[Handle]) docsGather(lent *lent[Columns], completion C.ustore_completion_t, collections Collections, keys []Key, fields Tape, outputsTypes []DocsFieldType, arena *Arena) error {
+func (receiver storeReceiver[Handle]) docsGather(call *callWithResult[Columns], completion C.ustore_completion_t, collections Collections, keys []Key, fields Tape, outputsTypes []DocsFieldType, arena *Arena) error {
 	database, executor, outputs, err := receiver.lowerInto(arena)
 	if err != nil {
 		return err
@@ -416,22 +416,22 @@ func (receiver storeReceiver[Handle]) docsGather(lent *lent[Columns], completion
 	if uint(len(outputsTypes)) != fields.Len() {
 		return fail(StatusInvalidArgument, "pass one output type per field")
 	}
-	arguments, inputs := stage[C.ustore_docs_gather_t](lent)
-	lent.result.fields, lent.result.rows = fields.Len(), uint(len(keys))
+	arguments, inputs := stage[C.ustore_docs_gather_t](call)
+	call.result.fields, call.result.rows = fields.Len(), uint(len(keys))
 	*arguments = C.ustore_docs_gather_t{
 		database:      database,
 		executor:      executor,
-		outcome:       lent.outcome(),
+		outcome:       call.outcome(),
 		completion:    completion,
 		view:          receiver.view(),
 		count:         C.ustore_size_t(len(keys)),
-		collections:   lent.collections(inputs, collections),
-		keys:          lent.keys(keys),
+		collections:   call.collections(inputs, collections),
+		keys:          call.keys(keys),
 		fields_count:  C.ustore_size_t(fields.Len()),
-		fields:        lent.strings(fields),
-		columns:       &lent.result.columns,
+		fields:        call.strings(fields),
+		columns:       &call.result.columns,
 		arena:         outputs,
-		outputs_types: (*C.ustore_docs_field_type_t)(lent.lend(unsafe.Pointer(unsafe.SliceData(outputsTypes)), len(outputsTypes))),
+		outputs_types: (*C.ustore_docs_field_type_t)(call.pinSlice(unsafe.Pointer(unsafe.SliceData(outputsTypes)), len(outputsTypes))),
 	}
 	C.ustore_docs_gather(arguments)
 	return nil
@@ -463,17 +463,17 @@ type DocsScanConfig struct {
 // DocsScan lists up to wanted document keys of a range per task into arena, one task per collection
 // collections names.
 func (on reads[Handle]) DocsScan(collections Collections, wanted uint, arena *Arena, config *DocsScanConfig) (Scanned, error) {
-	var lent lent[Scanned]
-	return block(&lent, on.docsScan(&lent, C.ustore_completion_blocking_k, collections, wanted, arena, config))
+	var call callWithResult[Scanned]
+	return block(&call, on.docsScan(&call, C.ustore_completion_blocking_k, collections, wanted, arena, config))
 }
 
 // DocsScan submits [DatabaseOn.DocsScan].
 func (on deferredReads[Handle]) DocsScan(collections Collections, wanted uint, arena *Arena, config *DocsScanConfig) (*Deferred[Scanned], error) {
 	deferred := new(Deferred[Scanned])
-	return submitted(deferred, on.docsScan(&deferred.lent, C.ustore_completion_deferred_k, collections, wanted, arena, config))
+	return submitted(deferred, on.docsScan(&deferred.call, C.ustore_completion_deferred_k, collections, wanted, arena, config))
 }
 
-func (receiver storeReceiver[Handle]) docsScan(lent *lent[Scanned], completion C.ustore_completion_t, collections Collections, wanted uint, arena *Arena, config *DocsScanConfig) error {
+func (receiver storeReceiver[Handle]) docsScan(call *callWithResult[Scanned], completion C.ustore_completion_t, collections Collections, wanted uint, arena *Arena, config *DocsScanConfig) error {
 	database, executor, outputs, err := receiver.lowerInto(arena)
 	if err != nil {
 		return err
@@ -483,24 +483,24 @@ func (receiver storeReceiver[Handle]) docsScan(lent *lent[Scanned], completion C
 	if err := shape(collections, count, len(options.StartKeys), len(options.EndKeys)); err != nil {
 		return err
 	}
-	arguments, inputs := stage[C.ustore_docs_scan_t](lent)
-	lent.result.count = uint(count)
-	progress, state := lent.progress(options.Progress)
+	arguments, inputs := stage[C.ustore_docs_scan_t](call)
+	call.result.count = uint(count)
+	progress, state := call.progress(options.Progress)
 	*arguments = C.ustore_docs_scan_t{
 		database:       database,
 		executor:       executor,
-		outcome:        lent.outcome(),
+		outcome:        call.outcome(),
 		completion:     completion,
 		view:           receiver.view(),
 		count:          C.ustore_size_t(count),
-		collections:    lent.collections(inputs, collections),
-		start_keys:     lent.keys(options.StartKeys),
-		end_keys:       lent.keys(options.EndKeys),
+		collections:    call.collections(inputs, collections),
+		start_keys:     call.keys(options.StartKeys),
+		end_keys:       call.keys(options.EndKeys),
 		direction:      C.ustore_scan_direction_t(options.Direction),
-		filter:         lent.text(options.Filter),
-		predicate:      lent.predicate(options.Predicate),
-		offsets:        &lent.result.offsets,
-		keys:           &lent.result.keys,
+		filter:         call.text(options.Filter),
+		predicate:      call.predicate(options.Predicate),
+		offsets:        &call.result.offsets,
+		keys:           &call.result.keys,
 		arena:          outputs,
 		wanted:         C.ustore_size_t(wanted),
 		mode:           C.ustore_scan_mode_t(options.Mode),
@@ -525,10 +525,15 @@ type DocsCursorConfig struct {
 	Filter string
 	// Predicate admits or passes over the keys of every page.
 	Predicate Admitter
+	// Fields are the fields every pull gathers into the columns of its batches, the empty field
+	// being the whole document, or none for keys alone.
+	Fields Tape
+	// ColumnsTypes holds the type every field converts into, one per field.
+	ColumnsTypes []DocsFieldType
 }
 
-// DocsCursor walks the documents of one collection page by page, every pull resuming past the last
-// key the pull before it handed out.
+// DocsCursor walks the documents of one collection in batches of rows, every pull resuming past
+// the last key the pull before it handed out.
 type DocsCursor struct {
 	DocsCursorOn
 	walk
@@ -539,6 +544,7 @@ type DocsCursor struct {
 // goroutine when embedded in a [DocsCursor], and on an executor when [DocsCursorOn.On] makes it.
 type DocsCursorOn struct {
 	childReceiver[C.ustore_docs_cursor_t, C.ustore_database_t]
+	fields uint
 }
 
 // On is the receiver whose pulls block on executor.
@@ -555,73 +561,89 @@ func (on reads[Handle]) DocsCursorInit(collection CollectionID, startKey Key, co
 		return nil, err
 	}
 	options := configOf(config)
+	if uint(len(options.ColumnsTypes)) != options.Fields.Len() {
+		return nil, fail(StatusInvalidArgument, "pass one column type per field")
+	}
 	cursor := new(DocsCursor)
-	var lent lent[C.ustore_docs_cursor_t]
-	arguments, inputs := stage[C.ustore_docs_cursor_init_t](&lent)
+	var call callWithResult[C.ustore_docs_cursor_t]
+	arguments, inputs := stage[C.ustore_docs_cursor_init_t](&call)
 	*arguments = C.ustore_docs_cursor_init_t{
-		cursor:     lent.result,
-		database:   database,
-		executor:   executor,
-		outcome:    lent.outcome(),
-		view:       on.view(),
-		collection: rawCollection(collection),
-		start_key:  raw(startKey),
-		end_key:    lent.key(inputs, options.EndKey),
-		direction:  C.ustore_scan_direction_t(options.Direction),
-		filter:     lent.text(options.Filter),
-		predicate:  cursor.admits(options.Predicate),
+		cursor:        call.result,
+		database:      database,
+		executor:      executor,
+		outcome:       call.outcome(),
+		view:          on.view(),
+		collection:    rawCollection(collection),
+		start_key:     raw(startKey),
+		end_key:       call.key(inputs, options.EndKey),
+		direction:     C.ustore_scan_direction_t(options.Direction),
+		filter:        call.text(options.Filter),
+		predicate:     cursor.admits(options.Predicate),
+		fields_count:  C.ustore_size_t(options.Fields.Len()),
+		fields:        call.strings(options.Fields),
+		columns_types: (*C.ustore_docs_field_type_t)(call.pinSlice(unsafe.Pointer(unsafe.SliceData(options.ColumnsTypes)), len(options.ColumnsTypes))),
 	}
 	C.ustore_docs_cursor_init(arguments)
-	if cursor.handle, err = block(&lent, nil); err != nil {
+	if cursor.handle, err = block(&call, nil); err != nil {
 		cursor.end()
 		return nil, err
 	}
 	cursor.database = database
 	cursor.childReceiver = childReceiver[C.ustore_docs_cursor_t, C.ustore_database_t]{receiver: receiver[C.ustore_docs_cursor_t]{handle: &cursor.handle}, parent: &cursor.database}
+	cursor.fields = options.Fields.Len()
 	return cursor, nil
 }
 
-// NextKeys pulls up to wanted document keys of the walk into arena.
-func (on DocsCursorOn) NextKeys(wanted uint, arena *Arena) (Page, error) {
-	var lent lent[Page]
-	arguments, err := on.next(&lent, wanted, arena)
-	if err != nil {
-		return Page{}, err
-	}
-	C.ustore_docs_cursor_next(arguments)
-	return block(&lent, nil)
+// DocsBatches is what one pull of a [DocsCursor] wrote into its arena in walk order, one batch per
+// executor task that found rows, readable until the arena serves another call.
+type DocsBatches struct {
+	batches *C.ustore_docs_batch_view_t
+	count   C.ustore_size_t
+	fields  uint
 }
 
-// NextPairs pulls up to wanted document keys of the walk with their documents into arena.
-func (on DocsCursorOn) NextPairs(wanted uint, arena *Arena) (Page, error) {
-	var lent lent[Page]
-	arguments, err := on.next(&lent, wanted, arena)
-	if err != nil {
-		return Page{}, err
-	}
-	arguments.values = &lent.result.values.raw
-	C.ustore_docs_cursor_next(arguments)
-	return block(&lent, nil)
+// Len reports how many batches the pull handed out, none once the walk is exhausted.
+func (batches DocsBatches) Len() uint { return uint(batches.count) }
+
+// Keys views the keys of batch index in the arena, one per row.
+func (batches DocsBatches) Keys(index uint) []Key {
+	batch := batches.at(index)
+	return keysAt(batch.keys, 0, uint64(batch.count))
 }
 
-// next opens a pull and fills every argument but the optional values.
-func (on DocsCursorOn) next(lent *lent[Page], wanted uint, arena *Arena) (*C.ustore_docs_cursor_next_t, error) {
+// Columns views the columns of batch index in the arena, one per field the cursor gathers.
+func (batches DocsBatches) Columns(index uint) Columns {
+	batch := batches.at(index)
+	return Columns{columns: batch.columns, fields: batches.fields, rows: uint(batch.count)}
+}
+
+// at addresses batch index of the pull.
+func (batches DocsBatches) at(index uint) *C.ustore_docs_batch_view_t {
+	return (*C.ustore_docs_batch_view_t)(unsafe.Add(unsafe.Pointer(batches.batches), uintptr(index)*unsafe.Sizeof(*batches.batches)))
+}
+
+// Next pulls batches of up to wanted rows in all into arena, each row a key and a cell of every
+// column the cursor gathers.
+func (on DocsCursorOn) Next(wanted uint, arena *Arena) (DocsBatches, error) {
 	cursor, database, executor, outputs, err := on.lowerInto(arena)
 	if err != nil {
-		return nil, err
+		return DocsBatches{}, err
 	}
-	arguments := open[C.ustore_docs_cursor_next_t](lent)
+	var call callWithResult[DocsBatches]
+	arguments := open[C.ustore_docs_cursor_next_t](&call)
+	call.result.fields = on.fields
 	*arguments = C.ustore_docs_cursor_next_t{
-		database: database,
-		executor: executor,
-		outcome:  lent.outcome(),
-		cursor:   cursor,
-		keys:     &lent.result.keys,
-		written:  &lent.result.written,
-		arena:    outputs,
-		wanted:   C.ustore_size_t(wanted),
+		database:      database,
+		executor:      executor,
+		outcome:       call.outcome(),
+		cursor:        cursor,
+		batches:       &call.result.batches,
+		batches_count: &call.result.count,
+		arena:         outputs,
+		wanted:        C.ustore_size_t(wanted),
 	}
-	return arguments, nil
+	C.ustore_docs_cursor_next(arguments)
+	return block(&call, nil)
 }
 
 // Close frees the walk, giving back the holds it kept. It is idempotent.
@@ -642,34 +664,34 @@ func (cursor *DocsCursor) Close() error {
 // DocsSample draws up to wanted document keys uniformly at random into arena, one task per
 // collection collections names.
 func (on reads[Handle]) DocsSample(collections Collections, wanted uint, arena *Arena) (Scanned, error) {
-	var lent lent[Scanned]
-	return block(&lent, on.docsSample(&lent, C.ustore_completion_blocking_k, collections, wanted, arena))
+	var call callWithResult[Scanned]
+	return block(&call, on.docsSample(&call, C.ustore_completion_blocking_k, collections, wanted, arena))
 }
 
 // DocsSample submits [DatabaseOn.DocsSample].
 func (on deferredReads[Handle]) DocsSample(collections Collections, wanted uint, arena *Arena) (*Deferred[Scanned], error) {
 	deferred := new(Deferred[Scanned])
-	return submitted(deferred, on.docsSample(&deferred.lent, C.ustore_completion_deferred_k, collections, wanted, arena))
+	return submitted(deferred, on.docsSample(&deferred.call, C.ustore_completion_deferred_k, collections, wanted, arena))
 }
 
-func (receiver storeReceiver[Handle]) docsSample(lent *lent[Scanned], completion C.ustore_completion_t, collections Collections, wanted uint, arena *Arena) error {
+func (receiver storeReceiver[Handle]) docsSample(call *callWithResult[Scanned], completion C.ustore_completion_t, collections Collections, wanted uint, arena *Arena) error {
 	database, executor, outputs, err := receiver.lowerInto(arena)
 	if err != nil {
 		return err
 	}
 	count := tasks(collections)
-	arguments, inputs := stage[C.ustore_docs_sample_t](lent)
-	lent.result.count = uint(count)
+	arguments, inputs := stage[C.ustore_docs_sample_t](call)
+	call.result.count = uint(count)
 	*arguments = C.ustore_docs_sample_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		completion:  completion,
 		view:        receiver.view(),
 		count:       C.ustore_size_t(count),
-		collections: lent.collections(inputs, collections),
-		offsets:     &lent.result.offsets,
-		keys:        &lent.result.keys,
+		collections: call.collections(inputs, collections),
+		offsets:     &call.result.offsets,
+		keys:        &call.result.keys,
 		arena:       outputs,
 		wanted:      C.ustore_size_t(wanted),
 	}
@@ -680,17 +702,17 @@ func (receiver storeReceiver[Handle]) docsSample(lent *lent[Scanned], completion
 // DocsMeasure estimates the documents and the space inside a range per task into arena, one task
 // per collection collections names.
 func (on reads[Handle]) DocsMeasure(collections Collections, arena *Arena, config *MeasureConfig) (Measurement, error) {
-	var lent lent[Measurement]
-	return block(&lent, on.docsMeasure(&lent, C.ustore_completion_blocking_k, collections, arena, config))
+	var call callWithResult[Measurement]
+	return block(&call, on.docsMeasure(&call, C.ustore_completion_blocking_k, collections, arena, config))
 }
 
 // DocsMeasure submits [DatabaseOn.DocsMeasure].
 func (on deferredReads[Handle]) DocsMeasure(collections Collections, arena *Arena, config *MeasureConfig) (*Deferred[Measurement], error) {
 	deferred := new(Deferred[Measurement])
-	return submitted(deferred, on.docsMeasure(&deferred.lent, C.ustore_completion_deferred_k, collections, arena, config))
+	return submitted(deferred, on.docsMeasure(&deferred.call, C.ustore_completion_deferred_k, collections, arena, config))
 }
 
-func (receiver storeReceiver[Handle]) docsMeasure(lent *lent[Measurement], completion C.ustore_completion_t, collections Collections, arena *Arena, config *MeasureConfig) error {
+func (receiver storeReceiver[Handle]) docsMeasure(call *callWithResult[Measurement], completion C.ustore_completion_t, collections Collections, arena *Arena, config *MeasureConfig) error {
 	database, executor, outputs, err := receiver.lowerInto(arena)
 	if err != nil {
 		return err
@@ -700,25 +722,25 @@ func (receiver storeReceiver[Handle]) docsMeasure(lent *lent[Measurement], compl
 	if err := shape(collections, count, len(options.StartKeys), len(options.EndKeys)); err != nil {
 		return err
 	}
-	arguments, inputs := stage[C.ustore_docs_measure_t](lent)
-	lent.result.count = uint(count)
+	arguments, inputs := stage[C.ustore_docs_measure_t](call)
+	call.result.count = uint(count)
 	*arguments = C.ustore_docs_measure_t{
 		database:          database,
 		executor:          executor,
-		outcome:           lent.outcome(),
+		outcome:           call.outcome(),
 		completion:        completion,
 		view:              receiver.view(),
 		count:             C.ustore_size_t(count),
-		collections:       lent.collections(inputs, collections),
-		start_keys:        lent.keys(options.StartKeys),
-		end_keys:          lent.keys(options.EndKeys),
+		collections:       call.collections(inputs, collections),
+		start_keys:        call.keys(options.StartKeys),
+		end_keys:          call.keys(options.EndKeys),
 		direction:         C.ustore_scan_direction_t(options.Direction),
-		min_cardinalities: &lent.result.minCardinalities,
-		max_cardinalities: &lent.result.maxCardinalities,
-		min_value_bytes:   &lent.result.minValueBytes,
-		max_value_bytes:   &lent.result.maxValueBytes,
-		min_space_usages:  &lent.result.minSpaceUsages,
-		max_space_usages:  &lent.result.maxSpaceUsages,
+		min_cardinalities: &call.result.minCardinalities,
+		max_cardinalities: &call.result.maxCardinalities,
+		min_value_bytes:   &call.result.minValueBytes,
+		max_value_bytes:   &call.result.maxValueBytes,
+		min_space_usages:  &call.result.minSpaceUsages,
+		max_space_usages:  &call.result.maxSpaceUsages,
 		arena:             outputs,
 	}
 	C.ustore_docs_measure(arguments)

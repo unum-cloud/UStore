@@ -10,6 +10,7 @@
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 #define _POSIX_C_SOURCE 200809L
+#define _DARWIN_C_SOURCE 1 // `mkdtemp` on macOS, which strict POSIX mode hides
 
 #include <stdio.h>  // `printf`, `snprintf`, `fflush`, `remove`
 #include <stdlib.h> // `getenv`, `exit`, `strtod`, `strtoull`, `mkdtemp`
@@ -164,7 +165,7 @@ static void read_test_settings(int argc, char** argv) {
 
 #define expect_(condition) expect_at((condition), __FILE__, __LINE__, #condition)
 
-/** Holds when @p outcome carries @p wanted ; otherwise counts a failed check at @p file : @p
+/** Holds when @p outcome holds @p wanted ; otherwise counts a failed check at @p file : @p
  *  line naming both. */
 static bool expect_status_at(ustore_outcome_t outcome, ustore_status_t wanted, char const* file, int line) {
     if (outcome.status == wanted) return true;
@@ -751,7 +752,7 @@ static void test_every_modality_round_trips(void) {
     expect_(presences && presences[0] == 12);
     ustore_collection_drop_t drop = {.database = database, .outcome = &outcome, .collection = blobs};
     ustore_collection_drop(&drop);
-    expect_status_at(outcome, ustore_status_invalid_argument_k, __FILE__, __LINE__);
+    expect_status_at(outcome, ustore_status_contended_k, __FILE__, __LINE__);
     ustore_snapshot_free(snapshot);
 
     // A feed opened at the head hands out the changes after it

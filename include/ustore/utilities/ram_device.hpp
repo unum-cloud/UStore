@@ -4,9 +4,9 @@
  *  @date September 15, 2026
  *  @brief The one owner of threads and topology, over ForkUnion's C ABI.
  *
- *  Engines, tools, tests and benchmarks dispatch through @c executor_t, a pool spawned here,
- *  or @c lent_pool_t, a pool another library lends, both through their @c pool_view_t, and
- *  only the arenas of @c utilities/ram_buffers.hpp call @c fu_* directly besides.
+ *  Engines, tools, tests and benchmarks dispatch through @c ram_executor_t, a pool spawned here or
+ *  the calling thread, by its @c pool_view_t, and besides it only the arenas of
+ *  @c utilities/ram_buffers.hpp call @c fu_* directly.
  */
 #pragma once
 
@@ -14,7 +14,8 @@
 #include <cstdint> // `std::uint8_t`, `std::uint32_t`
 
 #include <type_traits> // `std::is_nothrow_invocable_v`, `std::remove_reference_t`
-#include <utility>     // `std::exchange`, `std::forward`, `std::swap`
+#include <utility>     // `std::exchange`, `std::forward`, `std::swap`, `std::in_place_type`
+#include <variant>     // `std::variant`, `std::get_if`, `std::get` - a pool or the calling thread
 
 #include <forkunion/forkunion.h>
 
@@ -22,13 +23,15 @@
 
 #include "ustore/utilities/types.hpp" // `st::status_t`, `st::expected`
 
-/** Whether one call holds a word that every other call finds contended, global like the arena handle carrying it. */
+/** Whether one call holds a word that every other call finds contended, global like the arena
+ *  handle holding it. */
 enum class claim_t : std::uint32_t {
     free_k,
     held_k,
 };
 
-/** Where an executor computes, and so where the arenas it makes live, global like the arena handle carrying it. */
+/** Where an executor computes, and so where the arenas it makes live, global like the arena handle
+ *  holding it. */
 enum class residency_t : std::uint8_t {
 
     /** Host threads over host pages, as every executor of the RAM, RocksDB, LevelDB and NVMe engines computes. */
@@ -76,19 +79,48 @@ enum class caller_exclusivity_t : std::uint8_t {
     caller_exclusive_k,
 };
 
+/** The threads an executor dispatches on: a ForkUnion pool it spawned and deletes, or the
+ *  calling thread alone. */
+using threads_t = std::variant<fu_pool_t, fu::dummy_pool_t>;
+
+/** Hands what the calling thread runs to a UStore callback, which takes plain indices. */
+template <typename callback_type_>
+struct calling_thread_fork_ {
+    callback_type_& callback;
+
+    void operator()(fu::thread_in_domain<std::size_t> pinned) const noexcept {
+        if constexpr (std::is_nothrow_invocable_v<callback_type_&, std::size_t, std::size_t>)
+            callback(pinned.thread, pinned.compute_domain);
+        else callback(pinned.thread);
+    }
+
+    void operator()(std::size_t task, fu::thread_in_domain<std::size_t> pinned) const noexcept {
+        callback(task, pinned.thread);
+    }
+};
+
 /**
- *  @brief Dispatches on a ForkUnion pool owned elsewhere; copying it copies the right to dispatch, never the pool.
+ *  @brief Dispatches on the threads of an executor owned elsewhere; copying it copies the right to
+ *      dispatch, never the pool.
  *
- *  A dispatch claims the pool itself, so one finding the pool running another dispatch, its own or another caller's,
- *  runs nothing and answers @c st::status_t::operation_would_block_k.
+ *  A dispatch claims the pool itself, so one finding the pool running another dispatch, its own or
+ *  another caller's, runs nothing and answers @c st::status_t::operation_would_block_k. On the
+ *  calling thread every dispatch runs before it returns.
  */
 class pool_view_t {
   public:
-    explicit constexpr pool_view_t(fu_pool_t pool) noexcept : pool_(pool) {}
+    explicit constexpr pool_view_t(threads_t threads) noexcept : threads_(threads) {}
 
     /** Runs @p callback once on every thread, with the thread index and, when it takes one, the compute domain. */
     template <thread_callback_concept callback_type_>
     [[nodiscard]] st::status_t for_threads(callback_type_&& callback) const noexcept {
+        using fork_t = calling_thread_fork_<std::remove_reference_t<callback_type_>>;
+        fu_pool_t const* const pool = std::get_if<fu_pool_t>(&threads_);
+        if (!pool) {
+            fu::dummy_pool_t calling = std::get<fu::dummy_pool_t>(threads_);
+            calling.for_threads(fork_t {callback});
+            return st::status_t::success_k;
+        }
         fu_for_threads_t const trampoline = [](fu_lambda_context_t context, std::size_t thread,
                                                [[maybe_unused]] std::size_t compute_domain) noexcept {
             auto& target = *static_cast<std::remove_reference_t<callback_type_>*>(context);
@@ -96,51 +128,88 @@ class pool_view_t {
                 target(thread, compute_domain);
             else target(thread);
         };
-        return status_from_(fu_pool_for_threads(pool_, trampoline, &callback));
+        return status_from_(fu_pool_for_threads(*pool, trampoline, &callback));
+    }
+
+    /** Runs @p callback over @p count similar-cost tasks split evenly across the threads. */
+    template <task_callback_concept callback_type_>
+    [[nodiscard]] st::status_t for_n(std::size_t count, callback_type_&& callback) const noexcept {
+        using fork_t = calling_thread_fork_<std::remove_reference_t<callback_type_>>;
+        fu_pool_t const* const pool = std::get_if<fu_pool_t>(&threads_);
+        if (!pool) {
+            fu::dummy_pool_t calling = std::get<fu::dummy_pool_t>(threads_);
+            calling.for_n(count, fork_t {callback});
+            return st::status_t::success_k;
+        }
+        return status_from_(fu_pool_for_n(*pool, count, task_trampoline_<callback_type_>, &callback));
     }
 
     /** Runs @p callback over @p count tasks of uneven cost, each thread taking the next task as it finishes one. */
     template <task_callback_concept callback_type_>
     [[nodiscard]] st::status_t for_n_dynamic(std::size_t count, callback_type_&& callback) const noexcept {
-        fu_for_task_t const trampoline = [](fu_lambda_context_t context, std::size_t task, std::size_t thread,
-                                            std::size_t) noexcept {
-            (*static_cast<std::remove_reference_t<callback_type_>*>(context))(task, thread);
-        };
-        return status_from_(fu_pool_for_n_dynamic(pool_, count, trampoline, &callback));
+        using fork_t = calling_thread_fork_<std::remove_reference_t<callback_type_>>;
+        fu_pool_t const* const pool = std::get_if<fu_pool_t>(&threads_);
+        if (!pool) {
+            fu::dummy_pool_t calling = std::get<fu::dummy_pool_t>(threads_);
+            calling.for_n_dynamic(count, fork_t {callback});
+            return st::status_t::success_k;
+        }
+        return status_from_(fu_pool_for_n_dynamic(*pool, count, task_trampoline_<callback_type_>, &callback));
     }
 
     /** The number of threads every dispatch runs on, the caller included when it is a worker. */
     [[nodiscard]] std::size_t threads_count() const noexcept {
+        fu_pool_t const* const pool = std::get_if<fu_pool_t>(&threads_);
+        if (!pool) return 1;
         std::size_t threads = 0;
-        return fu_pool_threads_count(pool_, &threads) == fu_success_k ? threads : 0;
+        return fu_pool_threads_count(*pool, &threads) == fu_success_k ? threads : 0;
     }
 
-    /** What the thread that spawned or lent the pool does on every dispatch it makes. */
+    /** What the thread that spawned the pool does on every dispatch it makes; the calling thread is
+     *  its own worker. */
     [[nodiscard]] caller_exclusivity_t caller_exclusivity() const noexcept {
+        fu_pool_t const* const pool = std::get_if<fu_pool_t>(&threads_);
+        if (!pool) return caller_exclusivity_t::caller_inclusive_k;
         fu_caller_exclusivity_t exclusivity = fu_caller_inclusive_k;
-        fu_pool_caller_exclusivity(pool_, &exclusivity);
+        fu_pool_caller_exclusivity(*pool, &exclusivity);
         return exclusivity == fu_caller_exclusive_k ? caller_exclusivity_t::caller_exclusive_k
                                                     : caller_exclusivity_t::caller_inclusive_k;
     }
 
     /** Starts @p callback over @p context on every thread and returns while it runs, writing the
-     *  token @c unsafe_join takes into @p generation; a busy pool refuses as would-block. */
+     *  token @c unsafe_join takes into @p generation; a busy pool refuses as would-block, and the
+     *  calling thread runs it before returning. */
     [[nodiscard]] st::status_t unsafe_for_threads(fu_for_threads_t callback, void* context,
                                                   fu_generation_t& generation) const noexcept {
-        return status_from_(fu_pool_unsafe_for_threads(pool_, callback, context, &generation));
+        fu_pool_t const* const pool = std::get_if<fu_pool_t>(&threads_);
+        if (!pool) {
+            callback(context, 0, 0);
+            generation = 1;
+            return st::status_t::success_k;
+        }
+        return status_from_(fu_pool_unsafe_for_threads(*pool, callback, context, &generation));
     }
 
     /** Waits until every thread returned from the dispatch @p generation names; on a
      *  caller-exclusive pool a zero token waits for whatever dispatch is in flight. */
-    void unsafe_join(fu_generation_t generation) const noexcept { fu_pool_unsafe_join(pool_, generation); }
+    void unsafe_join(fu_generation_t generation) const noexcept {
+        if (fu_pool_t const* const pool = std::get_if<fu_pool_t>(&threads_)) fu_pool_unsafe_join(*pool, generation);
+    }
 
-    /** The ForkUnion pool itself, for lending it to a library that borrows pools. */
-    [[nodiscard]] fu_pool_t pool() const noexcept { return pool_; }
+    /** Puts the idle threads to sleep in the kernel until the next dispatch wakes them. */
+    void sleep() const noexcept {
+        if (fu_pool_t const* const pool = std::get_if<fu_pool_t>(&threads_)) fu_pool_sleep(*pool, 0);
+    }
 
   private:
+    template <typename callback_type_>
+    static void task_trampoline_(fu_lambda_context_t context, std::size_t task, std::size_t thread,
+                                 std::size_t) noexcept {
+        (*static_cast<std::remove_reference_t<callback_type_>*>(context))(task, thread);
+    }
 
-    /** The pool every dispatch runs on, owned elsewhere. */
-    fu_pool_t pool_;
+    /** The pool every dispatch runs on, owned elsewhere, or the calling thread. */
+    threads_t threads_;
 };
 
 /** The machine as ForkUnion harvests it, its cores, compute domains and memory domains, owned and deleted here. */
@@ -181,6 +250,13 @@ class topology_t {
         return fu_memory_domain_id_at_index(topology_, index, &identifier) == fu_success_k ? identifier : -1;
     }
 
+    /** The identifier of the memory domain nearest the PCI function at @p bus_id, spelled
+     *  @c domain:bus:device.function, or -1 off PCI or where the system ties it to none. */
+    [[nodiscard]] static fu_memory_domain_id_t memory_domain_of_pci(char const* bus_id) noexcept {
+        fu_memory_domain_id_t identifier = -1;
+        return fu_memory_domain_id_of_pci(bus_id, &identifier) == fu_success_k ? identifier : -1;
+    }
+
     /** Counts the compute domains, the clusters of cores a pool spreads its threads over. */
     [[nodiscard]] std::size_t compute_domains_count() const noexcept {
         std::size_t count = 0;
@@ -215,31 +291,37 @@ class topology_t {
 };
 
 /**
- *  @brief A ForkUnion pool spawned and deleted here, the only kind an executor parks.
+ *  @brief A ForkUnion pool spawned and deleted here, or the calling thread alone.
  *
  *  A worker caller counts as one of the threads and runs its share of every dispatch, while a
  *  coordinator only waits. Every dispatch blocks until all threads return, and refuses while
- *  another one runs.
+ *  another one runs. A default or moved-from executor is the calling thread, which spawns nothing.
  */
-class executor_t {
+class ram_executor_t {
   public:
 
-    /** The label the pool's threads carry in the OS. */
+    /** The label the pool's threads hold in the OS. */
     static constexpr char const pool_name_k[] = "ustore";
 
-    /** Holds nothing, as a moved-from executor does. */
-    constexpr executor_t() noexcept = default;
-    executor_t(executor_t&& other) noexcept : pool_(std::exchange(other.pool_, nullptr)) {}
+    /** The calling thread, as a moved-from executor is. */
+    constexpr ram_executor_t() noexcept = default;
+    ram_executor_t(ram_executor_t&& other) noexcept
+        : threads_(std::exchange(other.threads_, threads_t {std::in_place_type<fu::dummy_pool_t>})) {}
 
-    executor_t& operator=(executor_t&& other) noexcept {
-        std::swap(pool_, other.pool_);
+    ram_executor_t& operator=(ram_executor_t&& other) noexcept {
+        std::swap(threads_, other.threads_);
         return *this;
     }
 
-    executor_t(executor_t const&) = delete;
-    executor_t& operator=(executor_t const&) = delete;
+    ram_executor_t(ram_executor_t const&) = delete;
+    ram_executor_t& operator=(ram_executor_t const&) = delete;
 
-    ~executor_t() noexcept { fu_pool_delete(pool_); }
+    ~ram_executor_t() noexcept {
+        if (fu_pool_t const* pool = std::get_if<fu_pool_t>(&threads_); pool && *pool) fu_pool_delete(*pool);
+    }
+
+    /** The calling thread alone: no pool, no thread, no topology probe. */
+    [[nodiscard]] static ram_executor_t on_calling_thread() noexcept { return ram_executor_t {}; }
 
     /**
      *  @brief Harvests the topology and spawns @p threads threads across the whole machine, the caller among them
@@ -247,7 +329,8 @@ class executor_t {
      *  @param[in] threads Thread count, at least one; see @c logical_cores_count for the machine's.
      *  @param[in] exclusivity Whether the caller is one of the @p threads or only coordinates them.
      */
-    [[nodiscard]] static st::expected<executor_t> make(std::size_t threads, caller_exclusivity_t exclusivity) noexcept {
+    [[nodiscard]] static st::expected<ram_executor_t> make(std::size_t threads,
+                                                           caller_exclusivity_t exclusivity) noexcept {
         auto [topology, topology_status] = topology_t::make();
         if (topology_status != st::status_t::success_k) return topology_status;
         return make(topology, threads, exclusivity, fu_capabilities_all_k);
@@ -255,13 +338,15 @@ class executor_t {
 
     /** Spawns @p threads threads interleaved across every compute domain of @p topology, using only the ForkUnion
      *  capabilities in @p allowed. */
-    [[nodiscard]] static st::expected<executor_t> make(topology_t const& topology, std::size_t threads,
-                                                       caller_exclusivity_t exclusivity,
-                                                       fu_capabilities_t allowed) noexcept {
-        executor_t executor;
-        if (fu_status_t const status = fu_pool_new(pool_name_k, allowed, &executor.pool_); status != fu_success_k)
+    [[nodiscard]] static st::expected<ram_executor_t> make(topology_t const& topology, std::size_t threads,
+                                                           caller_exclusivity_t exclusivity,
+                                                           fu_capabilities_t allowed) noexcept {
+        ram_executor_t executor;
+        fu_pool_t pool = nullptr;
+        if (fu_status_t const status = fu_pool_new(pool_name_k, allowed, &pool); status != fu_success_k)
             return status_from_(status);
-        if (fu_status_t const status = fu_pool_spawn(topology.get(), executor.pool_, threads, spawned_(exclusivity));
+        executor.threads_ = pool;
+        if (fu_status_t const status = fu_pool_spawn(topology.get(), pool, threads, spawned_(exclusivity));
             status != fu_success_k)
             return status_from_(status);
         return executor;
@@ -270,17 +355,20 @@ class executor_t {
     /** Spawns @p threads threads the OS may run on any core, for a thread coordinating a pinned pool, which would
      *  otherwise share a core with that pool's first thread and wait out a scheduler slice behind it, using only the
      *  ForkUnion capabilities in @p allowed. */
-    [[nodiscard]] static st::expected<executor_t> make_unpinned(std::size_t threads, caller_exclusivity_t exclusivity,
-                                                                fu_capabilities_t allowed) noexcept {
+    [[nodiscard]] static st::expected<ram_executor_t> make_unpinned(std::size_t threads,
+                                                                    caller_exclusivity_t exclusivity,
+                                                                    fu_capabilities_t allowed) noexcept {
         auto [topology, topology_status] = topology_t::make();
         if (topology_status != st::status_t::success_k) return topology_status;
-        executor_t executor;
         // Without memory placement ForkUnion spawns a flat pool of plain threads, which pins nothing
         fu_capabilities_t const unplaced = static_cast<fu_capabilities_t>(allowed &
                                                                           ~fu_capability_place_memory_on_domain_k);
-        if (fu_status_t const status = fu_pool_new(pool_name_k, unplaced, &executor.pool_); status != fu_success_k)
+        ram_executor_t executor;
+        fu_pool_t pool = nullptr;
+        if (fu_status_t const status = fu_pool_new(pool_name_k, unplaced, &pool); status != fu_success_k)
             return status_from_(status);
-        if (fu_status_t const status = fu_pool_spawn(topology.get(), executor.pool_, threads, spawned_(exclusivity));
+        executor.threads_ = pool;
+        if (fu_status_t const status = fu_pool_spawn(topology.get(), pool, threads, spawned_(exclusivity));
             status != fu_success_k)
             return status_from_(status);
         return executor;
@@ -288,15 +376,17 @@ class executor_t {
 
     /** Spawns @p threads threads interleaved across the compute domains of @p topology local to @p memory_domain,
      *  using only the ForkUnion capabilities in @p allowed. */
-    [[nodiscard]] static st::expected<executor_t> make_near(topology_t const& topology,
-                                                            fu_memory_domain_id_t memory_domain, std::size_t threads,
-                                                            caller_exclusivity_t exclusivity,
-                                                            fu_capabilities_t allowed) noexcept {
-        executor_t executor;
-        if (fu_status_t const status = fu_pool_new(pool_name_k, allowed, &executor.pool_); status != fu_success_k)
+    [[nodiscard]] static st::expected<ram_executor_t> make_near(topology_t const& topology,
+                                                                fu_memory_domain_id_t memory_domain,
+                                                                std::size_t threads, caller_exclusivity_t exclusivity,
+                                                                fu_capabilities_t allowed) noexcept {
+        ram_executor_t executor;
+        fu_pool_t pool = nullptr;
+        if (fu_status_t const status = fu_pool_new(pool_name_k, allowed, &pool); status != fu_success_k)
             return status_from_(status);
-        if (fu_status_t const status = fu_pool_spawn_near_memory_domain(topology.get(), executor.pool_, memory_domain,
-                                                                        threads, spawned_(exclusivity));
+        executor.threads_ = pool;
+        if (fu_status_t const status = fu_pool_spawn_near_memory_domain(topology.get(), pool, memory_domain, threads,
+                                                                        spawned_(exclusivity));
             status != fu_success_k)
             return status_from_(status);
         return executor;
@@ -317,11 +407,11 @@ class executor_t {
     /** The number of threads every dispatch runs on, the caller included when it is a worker. */
     [[nodiscard]] std::size_t threads_count() const noexcept { return view().threads_count(); }
 
-    /** The right to dispatch on the pool, which stays owned here. */
-    [[nodiscard]] pool_view_t view() const noexcept { return pool_view_t {pool_}; }
+    /** The right to dispatch on the threads, which stay owned here. */
+    [[nodiscard]] pool_view_t view() const noexcept { return pool_view_t {threads_}; }
 
     /** Puts the idle threads to sleep in the kernel until the next dispatch wakes them. */
-    void park() noexcept { fu_pool_sleep(pool_, 0); }
+    void park() noexcept { view().sleep(); }
 
     /**
      *  @brief Starts @c loop_ over @p context on every thread and returns while it runs.
@@ -334,14 +424,14 @@ class executor_t {
             loop_(*static_cast<context_type_*>(erased));
         };
         fu_generation_t generation = 0;
-        if (fu_status_t const status = fu_pool_unsafe_for_threads(pool_, trampoline, &context, &generation);
-            status != fu_success_k)
-            return status_from_(status);
+        if (st::status_t const status = view().unsafe_for_threads(trampoline, &context, generation);
+            status != st::status_t::success_k)
+            return status;
         return generation;
     }
 
     /** Waits until every loop @c start began as @p generation returns. */
-    void join(fu_generation_t generation) noexcept { fu_pool_unsafe_join(pool_, generation); }
+    void join(fu_generation_t generation) noexcept { view().unsafe_join(generation); }
 
     /** Runs @p callback once on every thread, with the thread index and, when it takes one, the compute domain. */
     template <thread_callback_concept callback_type_>
@@ -352,11 +442,7 @@ class executor_t {
     /** Runs @p callback over @p count similar-cost tasks split evenly across the threads. */
     template <task_callback_concept callback_type_>
     [[nodiscard]] st::status_t for_n(std::size_t count, callback_type_&& callback) noexcept {
-        fu_for_task_t const trampoline = [](fu_lambda_context_t context, std::size_t task, std::size_t thread,
-                                            std::size_t) noexcept {
-            (*static_cast<std::remove_reference_t<callback_type_>*>(context))(task, thread);
-        };
-        return status_from_(fu_pool_for_n(pool_, count, trampoline, &callback));
+        return view().for_n(count, std::forward<callback_type_>(callback));
     }
 
   private:
@@ -366,29 +452,8 @@ class executor_t {
     }
 
     /** The pool every dispatch runs on, owned and deleted here, which retains nothing of the topology it spawned
-     *  over. */
-    fu_pool_t pool_ = nullptr;
-};
-
-/** A pool lent by another library: dispatched on unless its lender's dispatch runs, and never
- *  deleted or parked. */
-class lent_pool_t {
-  public:
-
-    /** Borrows @p pool, refusing a null pool or one holding no threads. */
-    [[nodiscard]] static st::expected<lent_pool_t> borrow(fu_pool_t pool) noexcept {
-        if (!pool || pool_view_t {pool}.threads_count() == 0) return st::status_t::invalid_argument_k;
-        return lent_pool_t {pool};
-    }
-
-    /** The right to dispatch on the pool, which stays with its lender. */
-    [[nodiscard]] pool_view_t view() const noexcept { return pool_view_t {pool_}; }
-
-  private:
-    explicit constexpr lent_pool_t(fu_pool_t pool) noexcept : pool_(pool) {}
-
-    /** The pool every dispatch runs on, which its lender deletes. */
-    fu_pool_t pool_;
+     *  over, or the calling thread. */
+    threads_t threads_ {std::in_place_type<fu::dummy_pool_t>};
 };
 
 #pragma endregion Executor

@@ -7,7 +7,7 @@
  *
  *  A strings run is the twin of @c blobs::memory_run with a key tape in place of the fixed-width
  *  keys column. Deltas ascend by string in unsigned byte order, the versions of one string newest
- *  first, and every delta carries the @c head_of its string, so a search compares heads and reads
+ *  first, and every delta holds the @c head_of its string, so a search compares heads and reads
  *  the tape only between equal ones:
  *
  *  @code{.c}
@@ -156,9 +156,9 @@ expected<std::size_t> sort_unique_strings(std::span<delta_type_> deltas, sz_kern
  *  @brief The deltas one transaction wrote to one strings collection, sorted by string and copied into columns, not
  *      yet stamped.
  *
- *  Sealing runs on the committing thread before the commit is ordered, as @c blobs::sealed_deltas does, so the sort
- *  and the copies of the strings and their values never sit on a path another commit waits on. Every write carries
- *  one 16-byte value, the key its string maps onto.
+ *  Sealing runs on the committing thread before the commit is ordered, as @c blobs::sealed_deltas
+ *  does, so the sort and the copies of the strings and their values never sit on a path another
+ *  commit waits on. Every write holds one 16-byte value, the key its string maps onto.
  */
 template <typename allocator_type_ = st::default_allocator<byte_t>>
 class sealed_deltas {
@@ -168,7 +168,7 @@ class sealed_deltas {
     using keyed_delta_t = keyed_delta<stored_key_t>;
     using stamped_delta_t = stamped_delta<stored_key_t>;
 
-    /** The range tombstones the deltas carry beside them, stamped with the deltas. */
+    /** The range tombstones the deltas hold beside them, stamped with the deltas. */
     using range_tombstones_t = blobs::range_tombstones<std::string_view, allocator_t>;
 
     /** The strings one range tombstone hides. */
@@ -196,7 +196,7 @@ class sealed_deltas {
      *
      *  @par Statuses:
      *  - @c invalid_argument_k No delta and no range, two deltas of one string, a removal
-     *    carrying bytes, a write carrying anything but one 16-byte value, or a range ending at or
+     *    holding bytes, a write holding anything but one 16-byte value, or a range ending at or
      *    before its start.
      *  - @c capacity_exhausted_k More string and value bytes than one sorted run file holds.
      *  - @c out_of_memory_k A column could not be allocated.
@@ -212,8 +212,8 @@ class sealed_deltas {
                 return status_t {status_code_t::invalid_argument_k, "A seal takes one delta per string"};
         }
         for (std::size_t index = 0; index != deltas.size(); ++index) {
-            std::size_t const carried = deltas[index].delta.kind == delta_kind_t::remove_k ? 0 : value_bytes_k;
-            if (deltas[index].delta.bytes.size() != carried)
+            std::size_t const held = deltas[index].delta.kind == delta_kind_t::remove_k ? 0 : value_bytes_k;
+            if (deltas[index].delta.bytes.size() != held)
                 return status_t {status_code_t::invalid_argument_k, "A write holds a key, a removal none"};
         }
         auto [sealed, sealed_status] = columns_of_<keyed_delta_t>(deltas, allocator);
@@ -429,12 +429,14 @@ class memory_run {
 
     /**
      *  @brief Stamps every delta of @p deltas with the commit's @p stamp, which only the leader ordering it draws.
-     *  @retval invalid_argument_k An unwritten stamp, which no commit carries.
+     *
+     *  @par Statuses:
+     *  - @c status_code_t::invalid_argument_k An unwritten stamp, which no commit holds.
      */
     static expected<memory_run> stamped(sealed_deltas_t&& deltas, transaction_stamp_t stamp,
                                         allocator_t allocator = {}) noexcept {
         if (stamp == unwritten_stamp_k)
-            return status_t {status_code_t::invalid_argument_k, "No commit carries the unwritten stamp"};
+            return status_t {status_code_t::invalid_argument_k, "No commit holds the unwritten stamp"};
         auto [stamps, status] = stamps_t::make(deltas.size(), stamp, typename stamps_t::allocator_t(allocator));
         if (st::failed(status))
             return status_t {status_code_t::out_of_memory_k, "No room to stamp the deltas of strings"};
@@ -524,13 +526,13 @@ class memory_run {
     /** The first sorted position past every string starting with @p prefix. */
     [[nodiscard]] std::size_t prefix_end(std::string_view prefix) const noexcept { return deltas_.prefix_end(prefix); }
 
-    /** The range tombstones the run carries beside its deltas, every one stamped. */
+    /** The range tombstones the run holds beside its deltas, every one stamped. */
     [[nodiscard]] range_tombstones_t const& range_tombstones() const noexcept { return deltas_.range_tombstones(); }
 
-    /** The newest stamp any delta or range tombstone carries. */
+    /** The newest stamp any delta or range tombstone holds. */
     [[nodiscard]] transaction_stamp_t newest_stamp() const noexcept { return newest_stamp_; }
 
-    /** The oldest stamp any delta carries, which the stamps column is based at. */
+    /** The oldest stamp any delta holds, which the stamps column is based at. */
     [[nodiscard]] transaction_stamp_t oldest_stamp() const noexcept { return stamps_.base(); }
 
   private:
@@ -565,10 +567,11 @@ struct string_version_t {
  *  @brief Lists the strings of one view in order, from a start string on and within one prefix, each with its newest
  *      version at or below a stamp.
  *
- *  Each run's window is cut by binary searches over its heads, so a prefix shared by every string of a run costs two
- *  searches, and the walk compares heads across runs, reading tails only where two heads tie. A removal is listed as
- *  any version is, since it hides older versions the levels below may hold. A cursor borrows its view, so a scan
- *  takes a page inside one epoch and resumes the next from a later start string.
+ *  Each run's window is cut by binary searches over its heads, so a prefix shared by every string
+ *  of a run costs two searches, and the walk compares heads across runs, reading tails only where
+ *  two heads tie. A removal is listed as any version is, since it hides older versions the levels
+ *  below may hold. A cursor views its view, so a scan takes a page inside one epoch and resumes the
+ *  next from a later start string.
  */
 template <typename view_type_, typename allocator_type_ = st::default_allocator<byte_t>>
 class memory_run_cursor {
@@ -648,7 +651,7 @@ class memory_run_cursor {
         : view_(&view), at_(at), positions_(typename positions_t::allocator_t(allocator)),
           ends_(typename positions_t::allocator_t(allocator)) {}
 
-    /** The view walked, borrowed while the cursor lives. */
+    /** The view walked, viewed while the cursor lives. */
     view_t const* view_ = nullptr;
 
     /** The stamp the cursor reads at. */

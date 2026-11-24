@@ -25,7 +25,7 @@
 
 #include "ustore/ustore.hpp"
 
-#include "ustore/utilities/ram_device.hpp" // `caller_exclusivity_t`, `executor_t`
+#include "ustore/utilities/ram_device.hpp" // `caller_exclusivity_t`, `ram_executor_t`
 
 #include "abi/fixture.hpp" // `write_text`, `held_scan_t`, `wait_held`, `open_cursor`, `pull_of`, `expect_page`
 #include "harness.hpp"     // `finish_test_run`, `expect_true`, `expect_equal`, `expect_near`, `expect_status`
@@ -216,7 +216,8 @@ case_result_t test_cursor_free_waits(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     if (!expect_true(!open_status.failed())) return {};
     auto [executor, spawn_status] = spawn_executor();
-    auto [freeing_thread, thread_status] = util::executor_t::make(1, util::caller_exclusivity_t::caller_exclusive_k);
+    auto [freeing_thread, thread_status] = util::ram_executor_t::make(1,
+                                                                      util::caller_exclusivity_t::caller_exclusive_k);
     auto [collection, create_status] = create_collection(database.handle(), "cursor.free", ustore_modality_blobs_k);
     if (!expect_true(!spawn_status.failed() && !st::failed(thread_status) && !create_status.failed())) return {};
     auto [arena, arena_status] = arena_t::make({.executor = executor});
@@ -435,7 +436,8 @@ void test_cursors_per_modality(config_t const& config) {
     ustore_pages_import(&import);
     if (!expect_success(outcome)) return;
 
-    // Keys 2400 to 2404 hold three even ones, which pages of two hand out as two and then one
+    // Keys 2400 to 2404 hold three even ones, which pages of two hand out as two and then one, and
+    // docs pulls one each
     auto walk = [&]<typename init_type_, typename next_type_, typename cursor_type_>(
                     void (*init)(init_type_*), void (*next)(next_type_*), void (*free)(cursor_type_),
                     ustore_collection_id_t collection) {
@@ -447,18 +449,29 @@ void test_cursors_per_modality(config_t const& config) {
         opened.predicate = {&admit_even_keys, &counted, ustore_predicate_cost_expensive_k};
         init(&opened);
         if (!expect_success(outcome)) return;
-        std::array<std::size_t, 3> const pulled {2, 1, 0};
+        // A docs pull hands out what its listing kept without listing further, so each of
+        // three holds one
+        std::array<std::size_t, 4> const pulled = std::is_same_v<next_type_, ustore_docs_cursor_next_t>
+                                                      ? std::array<std::size_t, 4> {1, 1, 1, 0}
+                                                      : std::array<std::size_t, 4> {2, 1, 0, 0};
         for (std::size_t const expected_count : pulled) {
             ustore_key_t const* found = nullptr;
             ustore_strings_view_t values {};
             ustore_size_t written = 0;
             next_type_ pull {};
-            pull.database = database.handle(), pull.outcome = &outcome, pull.cursor = cursor, pull.keys = &found;
-            pull.written = &written, pull.arena = arena.handle(), pull.wanted = 2;
+            pull.database = database.handle(), pull.outcome = &outcome, pull.cursor = cursor;
+            pull.arena = arena.handle(), pull.wanted = 2;
+            // A docs pull answers batches, which a pull without an executor fills one of
+            ustore_docs_batch_view_t const* batches = nullptr;
+            ustore_size_t batches_count = 0;
+            if constexpr (requires { pull.batches; }) pull.batches = &batches, pull.batches_count = &batches_count;
+            else pull.keys = &found, pull.written = &written;
             if constexpr (requires { pull.values; }) pull.values = &values;
             if constexpr (requires { pull.outputs_encoding; }) pull.outputs_encoding = ustore_page_encoding_xml_k;
             next(&pull);
             expect_success(outcome);
+            if constexpr (requires { pull.batches; })
+                if (batches_count) found = batches[0].keys, written = batches[0].count;
             expect_equal(written, expected_count);
             if (written) expect_true(found[0].uuid.bytes[15] % 2 == 0);
             if constexpr (requires { pull.values; })

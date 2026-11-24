@@ -4,7 +4,8 @@
  *  @date June 5, 2023
  *  @brief Command-line tool over collections, snapshots and datasets, one command per invocation.
  *
- *  Status lines go to standard error, so an export to @c - leaves standard output carrying only Arrow bytes.
+ *  Status lines go to standard error, so an export to @c - leaves standard output holding
+ *  only Arrow bytes.
  *
  *  The @c manifest and @c recover commands read the files of an NVMe database directly and open
  *  no engine: one prints the manifest a database is opened by, the other writes a fresh one from
@@ -49,6 +50,7 @@
 #include "ustore/db.h"                         // `ustore_database_t`, `ustore_outcome_t`
 #include "ustore/utilities/blocking_files.hpp" // `read_file`, `replace_file_durably`, `open_native_file` & kin
 #include "ustore/utilities/nvme_disks.hpp"     // `medium_bytes_of`
+#include "ustore/utilities/nvme_queues.hpp"    // `nvme_queues_t`, `io_transport_t`
 #include "ustore/utilities/nvme_manifest.hpp"  // `manifest_t`, `default_reserved_record`, `collections_record_t`
 #include "ustore/utilities/nvme_slots.hpp"     // `slot_owner_block_t`, `slot_bytes_k`, `slot_payload_offset_k`
 #include "ustore/utilities/nvme_volume.hpp"    // `parse_data_address`, `manifest_suffix_k`, `basic_slotted_volume`
@@ -57,7 +59,6 @@
 
 #include "arguments.hpp" // `parse_arguments`, `grammar`, `ustore_variable`, `read_engine_names`
 #include "dataset.h"     // `ustore_docs_import`, `ustore_docs_export`
-#include "dataset.hpp"   // `task_arena_t`
 
 namespace unum::ustore::tools {
 
@@ -257,6 +258,12 @@ struct command_line_t {
         return command == command_t::manifest_print_k || command == command_t::database_recover_k;
     }
 
+    /** Whether the command changes the database, which then flushes before it closes. */
+    [[nodiscard]] bool writes() const noexcept {
+        return command == command_t::collection_create_k || command == command_t::collection_drop_k ||
+               command == command_t::collection_import_k || command == command_t::snapshot_import_k;
+    }
+
     /** The format the input or output resolves to, through its extension unless @c --format names one. */
     [[nodiscard]] ustore_dataset_format_t format_of(std::string_view path) const noexcept {
         return ustore_dataset_format_of(util::bytes_of(path), dataset_formats_k[format.selected]);
@@ -353,21 +360,42 @@ struct command_line_t {
     return outcome.status != ustore_status_success_k;
 }
 
+/** The arena the tasks of one command fill, made where @p executor computes,
+ *  freed on destruction. */
+class task_arena_t {
+    ustore_arena_t arena_ = nullptr;
+
+  public:
+
+    /** Makes the arena unless @p outcome already holds a failure, reporting its own into it. */
+    task_arena_t(ustore_executor_t executor, ustore_outcome_t* outcome) noexcept {
+        if (failed(*outcome)) return;
+        ustore_arena_init_t init {.arena = &arena_, .executor = executor, .outcome = outcome};
+        ustore_arena_init(&init);
+    }
+    task_arena_t(task_arena_t const&) = delete;
+    task_arena_t& operator=(task_arena_t const&) = delete;
+    ~task_arena_t() noexcept { ustore_arena_free(arena_); }
+
+    [[nodiscard]] ustore_arena_t get() const noexcept { return arena_; }
+};
+
 /** Prints a red failure line with the database outcome. */
 void print_failure(char const* what, ustore_outcome_t const& outcome) noexcept {
     fmt::println(stderr, style_of(tone_t::failure_k, stderr), "{}: {}", what, outcome.message);
 }
 
 /** Resolves @p name to a collection ID through a one-off arena. */
-void find_collection(ustore_database_t database, std::string_view name, ustore_collection_id_t& id,
-                     ustore_outcome_t* outcome) noexcept {
-    task_arena_t const arena {nullptr, outcome};
+void find_collection(ustore_database_t database, ustore_executor_t executor, std::string_view name,
+                     ustore_collection_id_t& id, ustore_outcome_t* outcome) noexcept {
+    task_arena_t const arena {executor, outcome};
     if (failed(*outcome)) return;
     std::uint64_t const offsets[2] {0, name.size()};
     ustore_octet_t const* presences = nullptr;
     ustore_collection_id_t const* ids = nullptr;
     ustore_collection_find_t find {};
     find.database = database;
+    find.executor = executor;
     find.outcome = outcome;
     find.count = 1;
     find.names = util::u64_tape(name.data(), offsets);
@@ -381,12 +409,14 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
 }
 
 /** Creates a collection under @p name holding what @p line names, documents unless it names a modality. */
-[[nodiscard]] bool create_collection(ustore_database_t database, command_line_t const& line) noexcept {
+[[nodiscard]] bool create_collection(ustore_database_t database, ustore_executor_t executor,
+                                     command_line_t const& line) noexcept {
     std::string_view const name = line.collection;
     ustore_outcome_t outcome {};
     ustore_collection_id_t id {};
     ustore_collection_create_t create {};
     create.database = database;
+    create.executor = executor;
     create.outcome = &outcome;
     create.name = util::bytes_of(name);
     create.modality = ustore_modality_docs_k;
@@ -402,13 +432,15 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
 }
 
 /** Drops the collection @p name addresses, which takes the name with it. */
-[[nodiscard]] bool drop_collection(ustore_database_t database, std::string_view name) noexcept {
+[[nodiscard]] bool drop_collection(ustore_database_t database, ustore_executor_t executor,
+                                   std::string_view name) noexcept {
     ustore_outcome_t outcome {};
     ustore_collection_drop_t drop {};
     drop.database = database;
+    drop.executor = executor;
     drop.outcome = &outcome;
     drop.mode = ustore_drop_collection_k;
-    find_collection(database, name, drop.collection, &outcome);
+    find_collection(database, executor, name, drop.collection, &outcome);
     if (!failed(outcome)) ustore_collection_drop(&drop);
     if (failed(outcome)) {
         print_failure("Failed to drop the collection", outcome);
@@ -419,15 +451,16 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
 }
 
 /** Prints every collection with its identifier, its name and what it holds. */
-[[nodiscard]] bool list_collections(ustore_database_t database) noexcept {
+[[nodiscard]] bool list_collections(ustore_database_t database, ustore_executor_t executor) noexcept {
     ustore_outcome_t outcome {};
-    task_arena_t const arena {nullptr, &outcome};
+    task_arena_t const arena {executor, &outcome};
     ustore_size_t written = 0;
     ustore_collection_id_t const* ids = nullptr;
     ustore_modality_t const* modalities = nullptr;
     ustore_strings_view_t names {};
     ustore_collection_list_t list {};
     list.database = database;
+    list.executor = executor;
     list.outcome = &outcome;
     list.collections = &ids;
     list.modalities = &modalities;
@@ -451,23 +484,37 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
 }
 
 /** Imports the Arrow input @p line names, creating the collection it names when missing. */
-[[nodiscard]] bool import_arrow(ustore_database_t database, command_line_t const& line) noexcept {
+[[nodiscard]] bool import_arrow(ustore_database_t database, ustore_executor_t executor,
+                                command_line_t const& line) noexcept {
     ustore_outcome_t outcome {};
+    task_arena_t const arena {executor, &outcome};
+    // Several inputs come as one comma-separated list, laid out as a tape of paths
+    sz::string_t paths;
+    st::vector<std::uint64_t> offsets;
+    if (!failed(outcome) && st::failed(offsets.push_back(std::uint64_t {0})))
+        outcome = {ustore_status_out_of_memory_k, "Failed to list the inputs"};
+    for (sz::string_view_t const path : sz::split(sz::string_view_t {line.input}, sz::string_view_t {","}))
+        if (!failed(outcome) && (paths.append(path.data(), path.size()) != sz::status_t::success_k ||
+                                 st::failed(offsets.push_back(std::uint64_t {paths.size()}))))
+            outcome = {ustore_status_out_of_memory_k, "Failed to list the inputs"};
     ustore_size_t written = 0;
     ustore_dataset_import_t importing {};
     importing.database = database;
+    importing.executor = executor;
     importing.outcome = &outcome;
+    importing.arena = arena.get();
     importing.collection_name = util::bytes_of(line.collection);
     importing.modality = ustore_modality_t {};
     if (!line.modality.empty()) ustore_modality_from_name(util::bytes_of(line.modality), &importing.modality);
-    importing.path = util::bytes_of(line.input);
+    importing.paths = util::u64_tape(paths.data(), offsets.data());
+    importing.paths_count = offsets.size() - 1;
     importing.format = dataset_formats_k[line.format.selected];
     importing.ingestion = static_cast<ustore_dataset_ingestion_t>(line.ingest.selected);
     importing.written = &written;
     verb_phase_t phase {.name = "import", .unit = "bytes"};
     importing.progress = verb_progress;
     importing.progress_state = &phase;
-    ustore_dataset_import(&importing);
+    if (!failed(outcome)) ustore_dataset_import(&importing);
     if (stopped(outcome)) {
         verb_stopped(phase);
         return true;
@@ -481,16 +528,20 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
 }
 
 /** Exports the collection @p line names as Arrow into the file it names, or standard output. */
-[[nodiscard]] bool export_arrow(ustore_database_t database, command_line_t const& line) noexcept {
+[[nodiscard]] bool export_arrow(ustore_database_t database, ustore_executor_t executor,
+                                command_line_t const& line) noexcept {
     ustore_outcome_t outcome {};
     ustore_size_t written = 0;
     verb_phase_t phase {.name = "export", .unit = "rows"};
     ustore_collection_id_t collection {};
-    find_collection(database, line.collection, collection, &outcome);
+    find_collection(database, executor, line.collection, collection, &outcome);
+    task_arena_t const arena {executor, &outcome};
     if (!failed(outcome)) {
         ustore_dataset_export_t exporting {};
         exporting.database = database;
+        exporting.executor = executor;
         exporting.outcome = &outcome;
+        exporting.arena = arena.get();
         exporting.collection = collection;
         exporting.path = util::bytes_of(line.output);
         exporting.format = dataset_formats_k[line.format.selected];
@@ -514,15 +565,19 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
 }
 
 /** Imports the documents of the file @p line names into the collection it names. */
-[[nodiscard]] bool import_documents(ustore_database_t database, command_line_t const& line) noexcept {
+[[nodiscard]] bool import_documents(ustore_database_t database, ustore_executor_t executor,
+                                    command_line_t const& line) noexcept {
     ustore_outcome_t outcome {};
     verb_phase_t phase {.name = "import", .unit = "bytes"};
     ustore_collection_id_t collection {};
-    find_collection(database, line.collection, collection, &outcome);
+    find_collection(database, executor, line.collection, collection, &outcome);
+    task_arena_t const arena {executor, &outcome};
     if (!failed(outcome)) {
         ustore_docs_import_t importing {};
         importing.database = database;
+        importing.executor = executor;
         importing.outcome = &outcome;
+        importing.arena = arena.get();
         importing.collection = collection;
         importing.path = util::bytes_of(line.input);
         importing.max_batch_size = line.memory_limit.value;
@@ -544,15 +599,19 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
 }
 
 /** Exports the collection @p line names into the file it names. */
-[[nodiscard]] bool export_documents(ustore_database_t database, command_line_t const& line) noexcept {
+[[nodiscard]] bool export_documents(ustore_database_t database, ustore_executor_t executor,
+                                    command_line_t const& line) noexcept {
     ustore_outcome_t outcome {};
     verb_phase_t phase {.name = "export", .unit = "documents"};
     ustore_collection_id_t collection {};
-    find_collection(database, line.collection, collection, &outcome);
+    find_collection(database, executor, line.collection, collection, &outcome);
+    task_arena_t const arena {executor, &outcome};
     if (!failed(outcome)) {
         ustore_docs_export_t exporting {};
         exporting.database = database;
+        exporting.executor = executor;
         exporting.outcome = &outcome;
+        exporting.arena = arena.get();
         exporting.collection = collection;
         exporting.path = util::bytes_of(line.output);
         exporting.max_batch_size = line.memory_limit.value;
@@ -573,11 +632,13 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
 }
 
 /** Takes a snapshot of the head and writes it to @p path. */
-[[nodiscard]] bool save_snapshot(ustore_database_t database, std::string_view path) noexcept {
+[[nodiscard]] bool save_snapshot(ustore_database_t database, ustore_executor_t executor,
+                                 std::string_view path) noexcept {
     ustore_outcome_t outcome {};
     ustore_snapshot_t snapshot = nullptr;
     ustore_snapshot_init_t init {};
     init.database = database;
+    init.executor = executor;
     init.outcome = &outcome;
     init.snapshot = &snapshot;
     ustore_snapshot_init(&init);
@@ -585,6 +646,7 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
     if (!failed(outcome)) {
         ustore_snapshot_save_t saving {};
         saving.snapshot = snapshot;
+        saving.executor = executor;
         saving.outcome = &outcome;
         saving.path = util::bytes_of(path);
         saving.progress = verb_progress;
@@ -628,7 +690,8 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
  *  Each file lands whole from a temporary beside it, and a stop or a failure removes every file
  *  the export landed, so no partial export stays behind.
  */
-[[nodiscard]] bool export_snapshot(ustore_database_t database, std::string_view path) noexcept {
+[[nodiscard]] bool export_snapshot(ustore_database_t database, ustore_executor_t executor,
+                                   std::string_view path) noexcept {
     std::error_code error;
     std::filesystem::path const directory {path};
     std::filesystem::create_directories(directory, error);
@@ -637,11 +700,14 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
                      path);
         return false;
     }
+    // The export rewinds its own arena, while the listing's names stay readable in the other
     ustore_outcome_t outcome {};
-    task_arena_t const arena {nullptr, &outcome};
+    task_arena_t const arena {executor, &outcome};
+    task_arena_t const exported_arena {executor, &outcome};
     ustore_snapshot_t snapshot = nullptr;
     ustore_snapshot_init_t init {};
     init.database = database;
+    init.executor = executor;
     init.outcome = &outcome;
     init.snapshot = &snapshot;
     if (!failed(outcome)) ustore_snapshot_init(&init);
@@ -651,6 +717,7 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
     ustore_strings_view_t names {};
     ustore_collection_list_t list {};
     list.database = database;
+    list.executor = executor;
     list.outcome = &outcome;
     list.snapshot = snapshot;
     list.collections = &ids;
@@ -685,7 +752,9 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
         }
         ustore_dataset_export_t exporting {};
         exporting.database = database;
+        exporting.executor = executor;
         exporting.outcome = &outcome;
+        exporting.arena = exported_arena.get();
         exporting.view = ustore_snapshot_view(snapshot);
         exporting.collection = ids[index];
         exporting.collection_name = util::bytes_of(name);
@@ -724,7 +793,8 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
 /** Imports every <tt>.arrow</tt> file of the directory @p path into the collection its schema names, created when
  *  missing, as one sorted ingest where the engine ingests, since an export writes keys in order, and in batches
  *  otherwise. A stop keeps the collections imported before it. */
-[[nodiscard]] bool import_snapshot(ustore_database_t database, std::string_view path) noexcept {
+[[nodiscard]] bool import_snapshot(ustore_database_t database, ustore_executor_t executor,
+                                   std::string_view path) noexcept {
     std::error_code error;
     st::vector<sz::string_t> files;
     bool held = true;
@@ -742,6 +812,11 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
         return false;
     }
     ustore_outcome_t outcome {};
+    task_arena_t const arena {executor, &outcome};
+    if (failed(outcome)) {
+        print_failure("Failed to import the snapshot", outcome);
+        return false;
+    }
     std::size_t imported = 0;
     verb_phase_t collections {.name = "import", .unit = "files"};
     verb_phase_t bytes {.name = "import", .unit = "bytes"};
@@ -753,8 +828,12 @@ void find_collection(ustore_database_t database, std::string_view name, ustore_c
         sz::string_t const& file = files[position];
         ustore_dataset_import_t importing {};
         importing.database = database;
+        importing.executor = executor;
         importing.outcome = &outcome;
-        importing.path = util::bytes_of(std::string_view {file});
+        importing.arena = arena.get();
+        std::uint64_t const offsets[2] {0, file.size()};
+        importing.paths = util::u64_tape(file.data(), offsets);
+        importing.paths_count = 1;
         importing.format = ustore_dataset_format_arrow_file_k;
         importing.ingestion = ustore_dataset_ingestion_sorted_k;
         importing.progress = verb_progress;
@@ -940,7 +1019,7 @@ util::expected<std::uint64_t> run_bytes_of(blobs::sorted_run_header_t const& hea
         return run_bytes_as<key_slot<st::key128_t, value_layout_t::variable_width_k>>(header);
     case value_layout_t::uuid_k: {
         using layout_t =
-            blobs::strings_run_layout<key_slot<st::key128_t, value_layout_t::uuid_k, blobs::key_tails_t::carried_k>>;
+            blobs::strings_run_layout<key_slot<st::key128_t, value_layout_t::uuid_k, blobs::key_tails_t::present_k>>;
         if (header.key_slot_bytes != sizeof(typename layout_t::key_slot_t) ||
             header.branching != layout_t::keys_per_row_k)
             return util::status_t {util::status_code_t::malformed_k, "A run's cells match no key slot of this build"};
@@ -1166,15 +1245,10 @@ util::status_t read_collections_records(recovery_t const& recovery, std::span<ut
     auto [disk, disk_status] = recovery_disk_t::make(std::move(device), config, budget);
     if (disk_status.failed()) return disk_status;
     util::io_channel_config_t const channels_config;
-    util::memory_arena_config_t arena_config;
-    arena_config.bytes = channels_config.arena_bytes();
-    auto [arena, arena_status] = util::registered_memory_arena<fu::standard_atomic_ref>::make(disk, budget,
-                                                                                              arena_config);
-    if (arena_status.failed()) return arena_status;
-    auto [channels, channels_status] =
-        util::basic_io_channel_pool<recovery_disk_t, fu::standard_atomic_ref, fu::standard_yield_t>::make(
-            disk, arena.registration(), 0, 1, channels_config);
-    util::status_t result = channels_status;
+    std::array<fu_memory_domain_id_t, 1> const anywhere {-1};
+    auto [queues, queues_status] = util::nvme_queues_t::make(util::io_transport_t::blocking_k, channels_config,
+                                                             anywhere);
+    util::status_t result = queues_status;
     recovery_volume_t volume {&disk};
     for (std::size_t index = 0; result.succeeded() && index != recovery.runs.size(); ++index) {
         if (verb_progress(index, recovery.runs.size(), &phase) == ustore_cancel_k) {
@@ -1198,21 +1272,19 @@ util::status_t read_collections_records(recovery_t const& recovery, std::span<ut
         request.access = util::medium_access_t::read_only_k;
         auto [medium, register_status] = disk.register_medium(request);
         if ((result = register_status).failed()) break;
-        auto [guard, acquire_status] = channels.acquire();
-        result = acquire_status;
+        auto [channel, media_status] = queues.reading_channel_with_disk_media(0, disk);
+        result = media_status;
         if (result.succeeded()) {
             util::medium_extent_t extent;
             extent.medium = medium.reference();
             extent.extent = util::extent_t {found.file.offset,
                                             util::round_up_to_multiple(found.file.bytes, util::portable_alignment_k)};
-            result = read_collections_run(volume, guard.channel(), extent, newest);
+            result = read_collections_run(volume, *channel, extent, newest);
+            [[maybe_unused]] util::status_t const drained = disk.drain(channel->queue_pair());
         }
-        guard = {};
         if (util::status_t const closed = disk.unregister_medium(medium); closed.failed() && result.succeeded())
             result = closed;
     }
-    [[maybe_unused]] util::status_t const released = channels.release_all();
-    [[maybe_unused]] util::status_t const unpinned = arena.unregister(disk);
     return result;
 }
 
@@ -1401,19 +1473,22 @@ util::status_t publish_raw_manifest(util::data_address_t const& address, std::sp
 #pragma endregion Recovery
 
 /** Runs the command of @p line and answers whether it succeeded. */
-[[nodiscard]] bool execute(ustore_database_t database, command_line_t const& line) noexcept {
+[[nodiscard]] bool execute(ustore_database_t database, ustore_executor_t executor,
+                           command_line_t const& line) noexcept {
     switch (line.command) {
     case command_t::none_k: return false;
-    case command_t::collection_create_k: return create_collection(database, line);
-    case command_t::collection_drop_k: return drop_collection(database, line.collection);
-    case command_t::collection_list_k: return list_collections(database);
+    case command_t::collection_create_k: return create_collection(database, executor, line);
+    case command_t::collection_drop_k: return drop_collection(database, executor, line.collection);
+    case command_t::collection_list_k: return list_collections(database, executor);
     case command_t::collection_import_k:
-        return is_text(line.format_of(line.input)) ? import_documents(database, line) : import_arrow(database, line);
+        return is_text(line.format_of(line.input)) ? import_documents(database, executor, line)
+                                                   : import_arrow(database, executor, line);
     case command_t::collection_export_k:
-        return is_text(line.format_of(line.output)) ? export_documents(database, line) : export_arrow(database, line);
-    case command_t::snapshot_save_k: return save_snapshot(database, line.snapshot_path);
-    case command_t::snapshot_export_k: return export_snapshot(database, line.snapshot_path);
-    case command_t::snapshot_import_k: return import_snapshot(database, line.snapshot_path);
+        return is_text(line.format_of(line.output)) ? export_documents(database, executor, line)
+                                                    : export_arrow(database, executor, line);
+    case command_t::snapshot_save_k: return save_snapshot(database, executor, line.snapshot_path);
+    case command_t::snapshot_export_k: return export_snapshot(database, executor, line.snapshot_path);
+    case command_t::snapshot_import_k: return import_snapshot(database, executor, line.snapshot_path);
     case command_t::manifest_print_k: return print_manifest(line);
     case command_t::database_recover_k: return recover_database(line);
     }
@@ -1429,13 +1504,16 @@ int main(int argc, char* argv[]) {
     using namespace unum::ustore::tools;
 
     command_line_t line;
-    std::array<flag_t, 15> const flags {{
+    std::array<flag_t, 16> const flags {{
         {"--directory", "path", "database directory, required", &line.directory},
         {"--engine", "name", "engine to open: ram, rocksdb, leveldb or nvme", &line.engine.name},
         {"--isolation", "name", "isolation of ram: strict-serializable or snapshot", &line.engine.isolation},
         {"--engine-transport", "name", "transport of nvme, like blocking or linux-uring", &line.engine.transport},
+        {"--threads", "count", "threads every call runs on, 0 for the cores of the affinity mask",
+         &line.engine.threads},
         {"--collection", "name", "collection a command acts on", &line.collection},
-        {"--input", "file", "file a collection import reads, or '-' for standard input", &line.input},
+        {"--input", "files", "files a collection import reads, comma-separated, or '-' for standard input",
+         &line.input},
         {"--output", "file", "file a collection export writes, or '-' for standard output", &line.output},
         {"--id-field", "field", "field holding the keys of imported documents", &line.id_field},
         {"--memory-limit", "bytes", "bytes an import or export buffers per batch, like 64M", &line.memory_limit},
@@ -1485,18 +1563,29 @@ int main(int argc, char* argv[]) {
     std::signal(SIGINT, request_stop);
     std::signal(SIGTERM, request_stop);
     bool succeeded = false;
-    if (line.opens_no_engine()) succeeded = execute(nullptr, line);
+    if (line.opens_no_engine()) succeeded = execute(nullptr, nullptr, line);
     else {
+        ustore_executor_t executor = nullptr;
         ustore_database_t database = nullptr;
         ustore_outcome_t outcome {};
         line.engine.locate(line.directory.data());
-        open_engine(line.engine, &database, &outcome);
+        spawn_executor(line.engine, &executor, &outcome);
+        if (!failed(outcome)) open_engine(line.engine, executor, &database, &outcome);
         if (failed(outcome)) {
             print_failure("Failed to open the database", outcome);
+            ustore_executor_free(executor);
             return 1;
         }
-        succeeded = execute(database, line);
+        succeeded = execute(database, executor, line);
+        // Freeing writes nothing, so the commits of a changing command reach the disk here
+        if (succeeded && line.writes()) {
+            ustore_database_flush_t flush {.database = database, .executor = executor, .outcome = &outcome};
+            ustore_database_flush(&flush);
+            if (failed(outcome)) print_failure("Failed to flush the database", outcome);
+            succeeded = !failed(outcome);
+        }
         ustore_database_free(database);
+        ustore_executor_free(executor);
     }
     if (!succeeded) return 1;
     return stop_requested ? exit_stopped_k : 0;

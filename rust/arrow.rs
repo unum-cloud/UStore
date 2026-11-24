@@ -102,7 +102,7 @@ pub struct ArrowArray {
 /// An Arrow array and the device holding its buffers, as `struct ArrowDeviceArray` lays them out.
 ///
 /// The buffers of an array on a device are addresses there, which only the raw pointers of
-/// [`ArrowArray`] carry, so no safe host slice ever reads them.
+/// [`ArrowArray`] hold, so no safe host slice ever reads them.
 #[repr(C)]
 #[derive(Debug)]
 pub struct ArrowDeviceArray {
@@ -186,12 +186,12 @@ impl ArrowDeviceArray {
     }
 }
 
-/// One column exported as Arrow in place, borrowing the arena it sits in until dropped.
+/// One column exported as Arrow in place, viewing the arena it sits in until dropped.
 #[derive(Debug)]
 pub struct ArrowExport<'arena> {
     pub(crate) schema: ArrowSchema,
     pub(crate) array: ArrowDeviceArray,
-    pub(crate) marker: PhantomData<&'arena Arena<'arena>>,
+    pub(crate) arena: PhantomData<&'arena Arena<'arena>>,
 }
 
 impl ArrowExport<'_> {
@@ -205,12 +205,12 @@ impl ArrowExport<'_> {
         &self.array
     }
 
-    /// Hands the column over past the arena's borrow, for a consumer that takes the structures by
+    /// Hands the column over past the arena's lifetime, for a consumer that takes the structures by
     /// value.
     ///
     /// # Safety
     ///
-    /// The arena must outlive the release of both, which no borrow checks any more.
+    /// The arena must outlive the release of both, which no lifetime checks any more.
     pub unsafe fn into_parts(self) -> (ArrowSchema, ArrowDeviceArray) {
         (self.schema, self.array)
     }
@@ -354,7 +354,7 @@ struct Columns {
 /// Matches the children of `schema` to the columns of `modality` by name, refusing a missing, repeated or unknown one.
 fn resolve_columns(schema: &ArrowSchema, modality: Modality) -> Result<Columns> {
     let unknown =
-        fail(Status::InvalidArgument, "the stream carries a column its modality does not name, or names one twice");
+        fail(Status::InvalidArgument, "the stream holds a column its modality does not name, or names one twice");
     let mut columns = Columns::default();
     for index in 0..schema.n_children.max(0) as usize {
         // SAFETY: a live schema holds `n_children` live children, each named or not.
@@ -753,6 +753,10 @@ impl ExportStream {
                         direction: ScanDirection::Ascending,
                         filter: Default::default(),
                         predicate: Default::default(),
+                        // Documents export whole, as the one JSON column of the empty field
+                        fields_count: 1,
+                        fields: ustore_strings_view_t::u32_tape(c"".as_ptr().cast(), [0u32; 2].as_ptr()),
+                        columns_types: &(crate::docs::FieldType::Json as ustore_enum_t),
                     })
                 }
                 ExportCursor::Pages(cursor) => {
@@ -863,20 +867,27 @@ impl ExportStream {
                     return Ok(Some(batch.into_array(rows, arena)));
                 }
                 ExportCursor::Docs(cursor) => {
+                    // A pull without an executor fills one batch, which becomes one array of the
+                    // stream
+                    let mut batches: *const docs_ffi::ustore_docs_batch_view_t = ptr::null();
+                    let mut count: ustore_size_t = 0;
                     docs_ffi::ustore_docs_cursor_next(&mut docs_ffi::ustore_docs_cursor_next_t {
                         database: self.database,
                         executor: ptr::null_mut(),
                         outcome: &mut outcome,
                         completion: ustore_completion_t::Blocking,
                         cursor,
-                        keys: &mut keys,
-                        values: &mut values,
-                        written: &mut rows,
+                        batches: &mut batches,
+                        batches_count: &mut count,
                         arena: arena.handle,
                         wanted: EXPORT_BATCH_ROWS,
                         progress: None,
                         progress_state: ptr::null_mut(),
-                    })
+                    });
+                    if count != 0 {
+                        let batch = &*batches;
+                        (keys, values, rows) = (batch.keys, (*batch.columns).strings, batch.count);
+                    }
                 }
                 ExportCursor::Pages(cursor) => {
                     pages_ffi::ustore_pages_cursor_next(&mut pages_ffi::ustore_pages_cursor_next_t {
@@ -1275,8 +1286,15 @@ pub(crate) fn ingest(
     let columns = resolve_columns(&schema, modality)?;
     let mut ingest = Ingest(ptr::null_mut());
     let mut outcome = ustore_outcome_t::default();
-    let mut init =
-        ffi::ustore_ingest_init_t { ingest: &mut ingest.0, database, outcome: &mut outcome, collection, order };
+    let mut init = ffi::ustore_ingest_init_t {
+        ingest: &mut ingest.0,
+        database,
+        executor: ptr::null_mut(),
+        outcome: &mut outcome,
+        completion: ustore_completion_t::Blocking,
+        collection,
+        order,
+    };
     // SAFETY: every pointer in `init` outlives the call, which is final on return.
     unsafe { ffi::ustore_ingest_init(&mut init) };
     check(outcome)?;
@@ -1285,7 +1303,9 @@ pub(crate) fn ingest(
         let rows = rows_of(&schema, &batch, &columns)?;
         let mut append = ffi::ustore_ingest_append_t {
             ingest: ingest.0,
+            executor: ptr::null_mut(),
             outcome: &mut outcome,
+            completion: ustore_completion_t::Blocking,
             count: rows.count as ustore_size_t,
             keys: rows.keys,
             values: rows.strings,
@@ -1300,7 +1320,9 @@ pub(crate) fn ingest(
     }
     let mut finish = ffi::ustore_ingest_finish_t {
         ingest: ingest.0,
+        executor: ptr::null_mut(),
         outcome: &mut outcome,
+        completion: ustore_completion_t::Blocking,
         durability,
         commit_stamp: ptr::null_mut(),
     };
@@ -1322,9 +1344,9 @@ pub(crate) mod ffi {
 
     use super::{ArrowArray, ArrowDeviceArray, ArrowSchema, IngestOrder};
     use crate::db::ffi::{
-        ustore_arena_t, ustore_bytes_view_t, ustore_collection_id_t, ustore_database_t, ustore_durability_t,
-        ustore_enum_t, ustore_keys_view_t, ustore_outcome_t, ustore_size_t, ustore_stamp_t, ustore_status_t,
-        ustore_strings_view_t,
+        ustore_arena_t, ustore_bytes_view_t, ustore_collection_id_t, ustore_completion_t, ustore_database_t,
+        ustore_durability_t, ustore_enum_t, ustore_executor_t, ustore_keys_view_t, ustore_outcome_t, ustore_size_t,
+        ustore_stamp_t, ustore_status_t, ustore_strings_view_t,
     };
     use crate::docs::ffi::ustore_docs_column_view_t;
 
@@ -1339,7 +1361,9 @@ pub(crate) mod ffi {
     pub struct ustore_ingest_init_t {
         pub ingest: *mut ustore_ingest_t,
         pub database: ustore_database_t,
+        pub executor: ustore_executor_t,
         pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
         pub collection: ustore_collection_id_t,
         pub order: IngestOrder,
     }
@@ -1347,7 +1371,9 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct ustore_ingest_append_t {
         pub ingest: ustore_ingest_t,
+        pub executor: ustore_executor_t,
         pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
         pub count: ustore_size_t,
         pub keys: ustore_keys_view_t,
         pub values: ustore_strings_view_t,
@@ -1359,7 +1385,9 @@ pub(crate) mod ffi {
     #[repr(C)]
     pub struct ustore_ingest_finish_t {
         pub ingest: ustore_ingest_t,
+        pub executor: ustore_executor_t,
         pub outcome: *mut ustore_outcome_t,
+        pub completion: ustore_completion_t,
         pub durability: ustore_durability_t,
         pub commit_stamp: *mut ustore_stamp_t,
     }
@@ -1429,7 +1457,8 @@ mod tests {
         assert_eq!(formats, [c"w:16", c"z"]);
         let mut rows = Vec::new();
         while let Some(batch) = stream.next_batch().unwrap() {
-            // SAFETY: the batch carries a keys child of two buffers and a values child of three, as its schema says.
+            // SAFETY: the batch holds a keys child of two buffers and a values child of three, as
+            // its schema says.
             unsafe {
                 let keys = &**batch.children;
                 let values = &**batch.children.add(1);
@@ -1503,19 +1532,15 @@ mod tests {
 
     #[test]
     #[cfg(feature = "rocksdb")]
-    fn arrow_ingest_is_unsupported_and_takes_the_stream() {
+    fn arrow_ingest_lands_every_row_on_rocksdb() {
         let directory = crate::testing::ScratchDirectory::new("arrow_ingest_rocksdb");
         let options = crate::db::RocksDBOptions::at(directory.path().to_str().unwrap());
-        let database = Database::open_rocksdb(&options).unwrap();
-        let mut posters = posters(&database);
-        let exported = posters.export_arrow().unwrap();
-        let refused = posters.ingest_arrow(exported, IngestOrder::Sorted, Durability::Buffered);
-        assert_eq!(refused.unwrap_err().status, Status::Unsupported);
+        ingests_every_row(&Database::open_rocksdb(&options).unwrap());
     }
 
     #[test]
     #[cfg(not(feature = "rocksdb"))]
-    fn arrow_ingest_is_unsupported_and_takes_the_stream() {
+    fn arrow_ingest_lands_every_row_on_rocksdb() {
         crate::testing::skipped("built without the rocksdb feature");
     }
 }

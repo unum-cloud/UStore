@@ -30,8 +30,6 @@ import (
 #cgo nocallback ustore_outcome_wait
 #cgo noescape ustore_executor_for_ram
 #cgo nocallback ustore_executor_for_ram
-#cgo noescape ustore_executor_on_pool
-#cgo nocallback ustore_executor_on_pool
 #cgo noescape ustore_executor_for_nvme
 #cgo nocallback ustore_executor_for_nvme
 #cgo noescape ustore_executor_for_vram
@@ -471,10 +469,10 @@ const (
 
 // region: Strings
 
-// Tape lends a ragged batch of byte strings as Apache Arrow lays one out: the bytes end to end, and
-// one more offset than strings around them, string i spanning offsets[i] up to offsets[i+1].
+// Tape passes a ragged batch of byte strings as Apache Arrow lays one out: the bytes end to end,
+// and one more offset than strings around them, string i spanning offsets[i] up to offsets[i+1].
 //
-// A Tape borrows and never owns, and the binding pins both slices until each call it crosses is
+// A Tape views and never owns, and the binding pins both slices until each call it crosses is
 // final. The zero Tape is the empty batch, which a verb reads as its input's default.
 type Tape struct {
 	data    []byte
@@ -565,7 +563,7 @@ func (strings Strings) span(index uint) (uint64, uint64) {
 	return uint64(offsets[index]), uint64(offsets[index+1])
 }
 
-// Get borrows string index from the arena; index must be below [Strings.Len].
+// Get views string index in the arena; index must be below [Strings.Len].
 func (strings Strings) Get(index uint) []byte {
 	begin, end := strings.span(index)
 	if begin == end {
@@ -584,7 +582,7 @@ func (strings Strings) sized(count uint) Strings {
 	return strings
 }
 
-// Tape lends the strings back as an input, so a tape one call wrote is written again as it is,
+// Tape passes the strings back as an input, so a tape one call wrote is written again as it is,
 // valid while the arena holds it.
 func (strings Strings) Tape() Tape {
 	if strings.count == 0 {
@@ -637,7 +635,7 @@ func ustoreContinues(finished, total C.ustore_size_t, state unsafe.Pointer) C.us
 	return C.ustore_cancel_k
 }
 
-// progress lends an optional handler as the callback and state a reporting verb takes.
+// progress passes an optional handler as the callback and state a reporting verb takes.
 func (call *call) progress(progress ProgressCallback) (C.ustore_progress_callback_t, unsafe.Pointer) {
 	if progress == nil {
 		return nil, nil
@@ -645,7 +643,7 @@ func (call *call) progress(progress ProgressCallback) (C.ustore_progress_callbac
 	return C.ustore_go_continues(), call.callback(1, progress)
 }
 
-// callback lends a handler to its C trampoline as an opaque handle in the frame rather than a Go
+// callback passes a handler to its C trampoline as an opaque handle in the frame rather than a Go
 // pointer, since the closure holds Go pointers the cgo rules forbid handing to C.
 func (call *call) callback(slot int, handler any) unsafe.Pointer {
 	call.slots.handles[slot] = cgo.NewHandle(handler)
@@ -669,35 +667,21 @@ type Executor struct {
 // ExecutorForRam spawns host threads for the RAM, RocksDB and LevelDB engines, interleaved across
 // the compute domains local to memoryDomains, every domain the process may allocate on for an
 // empty list. Zero threads takes seven eighths of the cores those domains carry, and a
-// cpuClassCeiling the CPU lacks narrows the pick rather than refusing it.
-func ExecutorForRam(memoryDomains []int32, threads uint, cpuClassCeiling CPUClass) (*Executor, error) {
-	var lent lent[C.ustore_executor_t]
-	arguments := open[C.ustore_executor_for_ram_t](&lent)
+// cpuClassCeiling the CPU lacks narrows the pick rather than refusing it. Every call's staging
+// carves from each thread's scratch, capped at scratchLimit, where zero takes 16 GiB.
+func ExecutorForRam(memoryDomains []int32, threads uint, cpuClassCeiling CPUClass, scratchLimit uint64) (*Executor, error) {
+	var call callWithResult[C.ustore_executor_t]
+	arguments := open[C.ustore_executor_for_ram_t](&call)
 	*arguments = C.ustore_executor_for_ram_t{
-		executor:          lent.result,
-		outcome:           lent.outcome(),
-		ram:               lent.ram(memoryDomains),
+		executor:          call.result,
+		outcome:           call.outcome(),
+		ram:               call.ram(memoryDomains),
 		threads:           C.ustore_size_t(threads),
 		cpu_class_ceiling: C.ustore_cpu_class_t(cpuClassCeiling),
+		scratch_limit:     C.ustore_size_t(scratchLimit),
 	}
 	C.ustore_executor_for_ram(arguments)
-	return executorOf(block(&lent, nil))
-}
-
-// ExecutorOnPool creates a RAM executor over a ForkUnion fu_pool_t the caller lends, so several
-// libraries in one process share one set of threads. The pool must outlive the executor, and keeps
-// its lender's mood.
-func ExecutorOnPool(memoryDomains []int32, pool unsafe.Pointer) (*Executor, error) {
-	var lent lent[C.ustore_executor_t]
-	arguments := open[C.ustore_executor_on_pool_t](&lent)
-	*arguments = C.ustore_executor_on_pool_t{
-		executor: lent.result,
-		outcome:  lent.outcome(),
-		ram:      lent.ram(memoryDomains),
-		pool:     pool,
-	}
-	C.ustore_executor_on_pool(arguments)
-	return executorOf(block(&lent, nil))
+	return executorOf(block(&call, nil))
 }
 
 // NvmeOptions is how the threads of an NVMe executor move bytes between the drives and memory,
@@ -705,8 +689,6 @@ func ExecutorOnPool(memoryDomains []int32, pool unsafe.Pointer) (*Executor, erro
 type NvmeOptions struct {
 	// Transport is how bytes move between the files and memory.
 	Transport Transport
-	// SharedIOChannels counts the I/O channels the threads outside the executor share.
-	SharedIOChannels uint64
 	// QueueDepth counts the submissions a channel holds at once.
 	QueueDepth uint64
 	// RequestBufferBytes sizes each request buffer of a channel.
@@ -717,36 +699,46 @@ type NvmeOptions struct {
 	StreamBufferBytes uint64
 	// StreamBuffersCount counts the streaming buffers of each channel.
 	StreamBuffersCount uint64
+	// Paths are the data directories, raw media or SPDK namespaces of the databases the executor
+	// will open, read only during the call: the memory domain they share places the threads when no
+	// memory domain is named, and their fewest hardware queues give the default thread count.
+	Paths []string
 }
 
 // ExecutorForNvme spawns threads for the NVMe engine, each submitting and polling its own I/O ring,
-// where zero threads derives them from the cores.
-func ExecutorForNvme(nvme NvmeOptions, threads uint, cpuClassCeiling CPUClass) (*Executor, error) {
-	var lent lent[C.ustore_executor_t]
-	arguments := open[C.ustore_executor_for_nvme_t](&lent)
+// placed with their staging on memoryDomains, the first placing the threads, or on the domain
+// nvme.Paths share for an empty list. Zero threads takes the fewest hardware queues of the disks
+// under the paths, capped by the cores, and a zero scratchLimit takes 16 GiB per thread.
+func ExecutorForNvme(memoryDomains []int32, nvme NvmeOptions, threads uint, cpuClassCeiling CPUClass, scratchLimit uint64) (*Executor, error) {
+	var call callWithResult[C.ustore_executor_t]
+	arguments := open[C.ustore_executor_for_nvme_t](&call)
 	*arguments = C.ustore_executor_for_nvme_t{
-		executor: lent.result,
-		outcome:  lent.outcome(),
+		executor: call.result,
+		outcome:  call.outcome(),
 		nvme: C.ustore_nvme_options_t{
 			transport:             C.ustore_transport_t(nvme.Transport),
-			shared_io_channels:    C.ustore_size_t(nvme.SharedIOChannels),
 			queue_depth:           C.ustore_size_t(nvme.QueueDepth),
 			request_buffer_bytes:  C.ustore_size_t(nvme.RequestBufferBytes),
 			request_buffers_count: C.ustore_size_t(nvme.RequestBuffersCount),
 			stream_buffer_bytes:   C.ustore_size_t(nvme.StreamBufferBytes),
 			stream_buffers_count:  C.ustore_size_t(nvme.StreamBuffersCount),
+			paths:                 call.paths(nvme.Paths),
+			paths_count:           C.ustore_size_t(len(nvme.Paths)),
 		},
+		ram:               call.ram(memoryDomains),
 		threads:           C.ustore_size_t(threads),
 		cpu_class_ceiling: C.ustore_cpu_class_t(cpuClassCeiling),
+		scratch_limit:     C.ustore_size_t(scratchLimit),
 	}
 	C.ustore_executor_for_nvme(arguments)
-	return executorOf(block(&lent, nil))
+	return executorOf(block(&call, nil))
 }
 
 // ExecutorForVramConfig carries the optional arguments of [ExecutorForVram].
 type ExecutorForVramConfig struct {
-	// Stream is a borrowed cudaStream_t, hipStream_t or id<MTLCommandQueue> on the device, which must
-	// outlive the executor; nil creates one.
+	// Stream stays nil: the executor creates and destroys a stream of its own, and a caller's
+	// cudaStream_t, hipStream_t or id<MTLCommandQueue> answers [StatusUnsupported], since the
+	// executor drives only its own.
 	Stream unsafe.Pointer
 	// ScratchLimit caps the device scratch a call or a merge takes; zero lets scratch grow.
 	ScratchLimit uint64
@@ -756,16 +748,16 @@ type ExecutorForVramConfig struct {
 	GPUClassCeiling GPUClass
 }
 
-// ExecutorForVram opens one submission stream on device, its position in the listing of
-// [GPUDevices], fed by the goroutine that calls the verbs, so that a deferred call on it is final
-// once it returns.
+// ExecutorForVram opens a stream of its own on device, its position in the listing of [GPUDevices],
+// created and destroyed with the executor and fed by the goroutine that calls the verbs, so that a
+// deferred call on it is final once it returns.
 func ExecutorForVram(device int32, config *ExecutorForVramConfig) (*Executor, error) {
 	options := configOf(config)
-	var lent lent[C.ustore_executor_t]
-	arguments := open[C.ustore_executor_for_vram_t](&lent)
+	var call callWithResult[C.ustore_executor_t]
+	arguments := open[C.ustore_executor_for_vram_t](&call)
 	*arguments = C.ustore_executor_for_vram_t{
-		executor:          lent.result,
-		outcome:           lent.outcome(),
+		executor:          call.result,
+		outcome:           call.outcome(),
 		device:            C.int32_t(device),
 		stream:            options.Stream,
 		scratch_limit:     C.ustore_size_t(options.ScratchLimit),
@@ -773,7 +765,7 @@ func ExecutorForVram(device int32, config *ExecutorForVramConfig) (*Executor, er
 		gpu_class_ceiling: C.ustore_gpu_class_t(options.GPUClassCeiling),
 	}
 	C.ustore_executor_for_vram(arguments)
-	return executorOf(block(&lent, nil))
+	return executorOf(block(&call, nil))
 }
 
 // executorOf wraps the handle an executor factory wrote.
@@ -791,15 +783,15 @@ func (executor *Executor) Drain(mood Mood) error {
 	if err != nil {
 		return err
 	}
-	var lent lent[struct{}]
-	arguments := open[C.ustore_executor_drain_t](&lent)
+	var call callWithResult[struct{}]
+	arguments := open[C.ustore_executor_drain_t](&call)
 	*arguments = C.ustore_executor_drain_t{
 		executor: handle,
-		outcome:  lent.outcome(),
+		outcome:  call.outcome(),
 		mood:     C.ustore_mood_t(mood),
 	}
 	C.ustore_executor_drain(arguments)
-	_, err = block(&lent, nil)
+	_, err = block(&call, nil)
 	return err
 }
 
@@ -823,7 +815,7 @@ type GPUDevice struct {
 // GPUDevices lists every GPU this process can drive, NVIDIA devices first, then AMD, then Apple,
 // and nothing on a machine without GPUs.
 func GPUDevices() ([]GPUDevice, error) {
-	var counted lent[C.ustore_size_t]
+	var counted callWithResult[C.ustore_size_t]
 	counting := open[C.ustore_gpu_devices_t](&counted)
 	*counting = C.ustore_gpu_devices_t{
 		outcome:       counted.outcome(),
@@ -835,11 +827,11 @@ func GPUDevices() ([]GPUDevice, error) {
 		return nil, err
 	}
 	raw := make([]C.ustore_gpu_device_t, count)
-	var listed lent[C.ustore_size_t]
+	var listed callWithResult[C.ustore_size_t]
 	listing := open[C.ustore_gpu_devices_t](&listed)
 	*listing = C.ustore_gpu_devices_t{
 		outcome:          listed.outcome(),
-		devices:          (*C.ustore_gpu_device_t)(listed.lend(unsafe.Pointer(unsafe.SliceData(raw)), len(raw))),
+		devices:          (*C.ustore_gpu_device_t)(listed.pinSlice(unsafe.Pointer(unsafe.SliceData(raw)), len(raw))),
 		devices_capacity: count,
 		devices_count:    listed.result,
 	}
@@ -873,7 +865,7 @@ func GPUDevices() ([]GPUDevice, error) {
 // Every call given an arena rewinds and refills it, so the views of its previous call and every
 // slice they handed out end there, as they do once it is closed; to keep one call's views past the
 // next, give that call another arena. An arena serves one call at a time, and a second overlapping
-// it fails with [StatusContended]. Deferred verbs borrow it as blocking ones do, since Close waits
+// it fails with [StatusContended]. Deferred verbs view it as blocking ones do, since Close waits
 // for every deferred call naming it.
 type Arena struct {
 	handle C.ustore_arena_t
@@ -889,15 +881,15 @@ func NewArena(executor *Executor) (*Arena, error) {
 	if err != nil {
 		return nil, err
 	}
-	var lent lent[C.ustore_arena_t]
-	arguments := open[C.ustore_arena_init_t](&lent)
+	var call callWithResult[C.ustore_arena_t]
+	arguments := open[C.ustore_arena_init_t](&call)
 	*arguments = C.ustore_arena_init_t{
-		arena:    lent.result,
+		arena:    call.result,
 		executor: handle,
-		outcome:  lent.outcome(),
+		outcome:  call.outcome(),
 	}
 	C.ustore_arena_init(arguments)
-	arena, err := block(&lent, nil)
+	arena, err := block(&call, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -923,15 +915,15 @@ func (arena *Arena) Describe() (ArenaDescription, error) {
 	if err != nil {
 		return ArenaDescription{}, err
 	}
-	var lent lent[ArenaDescription]
-	arguments := open[C.ustore_arena_describe_t](&lent)
+	var call callWithResult[ArenaDescription]
+	arguments := open[C.ustore_arena_describe_t](&call)
 	*arguments = C.ustore_arena_describe_t{
 		arena:       handle,
-		outcome:     lent.outcome(),
-		description: (*C.ustore_arena_description_t)(unsafe.Pointer(lent.result)),
+		outcome:     call.outcome(),
+		description: (*C.ustore_arena_description_t)(unsafe.Pointer(call.result)),
 	}
 	C.ustore_arena_describe(arguments)
-	return block(&lent, nil)
+	return block(&call, nil)
 }
 
 // endregion: Arenas
@@ -965,8 +957,8 @@ type call struct {
 	arguments []byte
 }
 
-// lent is a call and the slot its result lands in, which the library writes in place.
-type lent[Result any] struct {
+// callWithResult is a call and the slot its result lands in, which the library writes in place.
+type callWithResult[Result any] struct {
 	call
 	result *Result
 }
@@ -974,11 +966,11 @@ type lent[Result any] struct {
 // open pins a fresh frame and hands back its argument structure, which a verb fills and passes to
 // C; verbs refuse before opening, so a refusal pins and allocates nothing. The arguments live in
 // the frame because cgo moves to the heap whatever a C function that may call back into Go reaches.
-func open[Arguments, Result any](lent *lent[Result]) *Arguments {
+func open[Arguments, Result any](opened *callWithResult[Result]) *Arguments {
 	frame := new(frame[Arguments, Result])
-	lent.pinner.Pin(frame)
-	lent.slots, lent.result = &frame.slots, &frame.result
-	lent.arguments = unsafe.Slice((*byte)(unsafe.Pointer(&frame.arguments)), unsafe.Sizeof(frame.arguments))
+	opened.pinner.Pin(frame)
+	opened.slots, opened.result = &frame.slots, &frame.result
+	opened.arguments = unsafe.Slice((*byte)(unsafe.Pointer(&frame.arguments)), unsafe.Sizeof(frame.arguments))
 	return &frame.arguments
 }
 
@@ -990,7 +982,7 @@ func (call *call) status() Status {
 	return Status(C.ustore_outcome_status(call.outcome()))
 }
 
-// settle waits until the call is final, releases everything it lent, and reports its failure, the
+// settle waits until the call is final, releases everything it call, and reports its failure, the
 // same every time it is asked.
 func (call *call) settle() error {
 	if call.status() == StatusDeferred {
@@ -1008,15 +1000,15 @@ func (call *call) settle() error {
 }
 
 // block settles the call a verb opened and hands back its result, or the verb's refusal.
-func block[Result any](lent *lent[Result], refusal error) (Result, error) {
+func block[Result any](call *callWithResult[Result], refusal error) (Result, error) {
 	var none Result
 	if refusal != nil {
 		return none, refusal
 	}
-	if err := lent.settle(); err != nil {
+	if err := call.settle(); err != nil {
 		return none, err
 	}
-	return *lent.result, nil
+	return *call.result, nil
 }
 
 // configOf reads a nil config as the zero one, by value, so generic verbs allocate nothing for it.
@@ -1030,22 +1022,22 @@ func configOf[Config any](config *Config) Config {
 
 // pin keeps a Go object in place until the call is final and hands back its address. It takes no
 // type parameter, since a generic call inlined into a generic verb reaches its callee through a
-// dictionary, and escape analysis then moves the verb's lent to the heap.
+// dictionary, and escape analysis then moves the verb's call to the heap.
 func (call *call) pin(pointer unsafe.Pointer) unsafe.Pointer {
 	call.pinner.Pin(pointer)
 	return pointer
 }
 
-// lend pins the backing array of a slice of length elements at data until the call is final, and
-// lends an empty slice as nil.
-func (call *call) lend(data unsafe.Pointer, length int) unsafe.Pointer {
+// pinSlice pins the backing array of a slice of length elements at data until the call is final,
+// and passes an empty slice as nil.
+func (call *call) pinSlice(data unsafe.Pointer, length int) unsafe.Pointer {
 	if length == 0 {
 		return nil
 	}
 	return call.pin(data)
 }
 
-// view lends a string to a call that only reads it before returning.
+// view passes a string to a call that only reads it before returning.
 func view(text string) C.ustore_bytes_view_t {
 	view := C.ustore_bytes_view_t{data: (*C.uint8_t)(unsafe.Pointer(unsafe.StringData(text)))}
 	// cgo names the length's typedef apart from size_t, though the two are as wide.
@@ -1059,7 +1051,7 @@ func view(text string) C.ustore_bytes_view_t {
 // dropped without Wait or Close is released by the collector once the call is final, never
 // blocking on it: until then every later collection checks it again.
 type Deferred[Result any] struct {
-	lent    lent[Result]
+	call    callWithResult[Result]
 	cleanup runtime.Cleanup
 }
 
@@ -1069,7 +1061,7 @@ func submitted[Result any](deferred *Deferred[Result], refusal error) (*Deferred
 	if refusal != nil {
 		return nil, refusal
 	}
-	deferred.cleanup = runtime.AddCleanup(deferred, release, deferred.lent.call)
+	deferred.cleanup = runtime.AddCleanup(deferred, release, deferred.call.call)
 	return deferred, nil
 }
 
@@ -1084,20 +1076,20 @@ func release(call call) {
 }
 
 // Status reports StatusDeferred until the call is final, then its final status, without blocking.
-func (deferred *Deferred[Result]) Status() Status { return deferred.lent.status() }
+func (deferred *Deferred[Result]) Status() Status { return deferred.call.status() }
 
 // Wait blocks until the call is final, releases its pins, then hands back its result, the same
 // every time it is asked.
 func (deferred *Deferred[Result]) Wait() (Result, error) {
 	deferred.cleanup.Stop()
-	return block(&deferred.lent, nil)
+	return block(&deferred.call, nil)
 }
 
 // Close blocks until the call is final, releases its pins, and reports the call's failure. It is
 // idempotent and safe after Wait.
 func (deferred *Deferred[Result]) Close() error {
 	deferred.cleanup.Stop()
-	return deferred.lent.settle()
+	return deferred.call.settle()
 }
 
 // endregion: Calls
@@ -1181,7 +1173,7 @@ func (arena *Arena) Close() error {
 
 // region: Helpers
 
-// inputs is what a verb lends the library by address but holds by value: the collection and the
+// inputs is what a verb passes the library by address but holds by value: the collection and the
 // role every task shares, and the end key of a walk.
 type inputs struct {
 	collection C.ustore_collection_id_t
@@ -1195,21 +1187,21 @@ type staged[Arguments any] struct {
 	inputs    inputs
 }
 
-// stage opens a call whose argument structure lends inputs by address from its own frame.
-func stage[Arguments, Result any](lent *lent[Result]) (*Arguments, *inputs) {
-	frame := open[staged[Arguments]](lent)
+// stage opens a call whose argument structure passes inputs by address from its own frame.
+func stage[Arguments, Result any](call *callWithResult[Result]) (*Arguments, *inputs) {
+	frame := open[staged[Arguments]](call)
 	return &frame.arguments, &frame.inputs
 }
 
-// ram lends the memory domains of a RAM executor, copied by the call.
+// ram pins the memory domains of an executor, copied by the call.
 func (call *call) ram(memoryDomains []int32) C.ustore_ram_options_t {
 	return C.ustore_ram_options_t{
-		memory_domains:       (*C.int32_t)(call.lend(unsafe.Pointer(unsafe.SliceData(memoryDomains)), len(memoryDomains))),
+		memory_domains:       (*C.int32_t)(call.pinSlice(unsafe.Pointer(unsafe.SliceData(memoryDomains)), len(memoryDomains))),
 		memory_domains_count: C.ustore_size_t(len(memoryDomains)),
 	}
 }
 
-// text lends a Go string as the pointer-and-length pair a path or a name takes. The string is never
+// text pins a Go string as the pointer-and-length pair a path or a name takes. The string is never
 // terminated, by contract, so nothing is copied and nothing is freed.
 func (call *call) text(text string) C.ustore_bytes_view_t {
 	if len(text) == 0 {
@@ -1221,29 +1213,41 @@ func (call *call) text(text string) C.ustore_bytes_view_t {
 	}
 }
 
-// strings lends a tape as the view a verb reads, zeroed for the empty batch.
+// paths pins the views of the media paths an NVMe executor reads during its creation.
+func (call *call) paths(paths []string) *C.ustore_bytes_view_t {
+	if len(paths) == 0 {
+		return nil
+	}
+	views := make([]C.ustore_bytes_view_t, len(paths))
+	for index, path := range paths {
+		views[index] = call.text(path)
+	}
+	return (*C.ustore_bytes_view_t)(call.pinSlice(unsafe.Pointer(unsafe.SliceData(views)), len(views)))
+}
+
+// strings pins a tape as the view a verb reads, zeroed for the empty batch.
 func (call *call) strings(tape Tape) C.ustore_strings_view_t {
 	var view C.ustore_strings_view_t
 	lowered := (*stringsTape)(unsafe.Pointer(&view.data))
 	switch {
 	case len(tape.wide) != 0:
 		view.layout = C.ustore_strings_u64_tape_k
-		lowered.data, lowered.offsets = call.lend(unsafe.Pointer(unsafe.SliceData(tape.data)), len(tape.data)), call.lend(unsafe.Pointer(unsafe.SliceData(tape.wide)), len(tape.wide))
+		lowered.data, lowered.offsets = call.pinSlice(unsafe.Pointer(unsafe.SliceData(tape.data)), len(tape.data)), call.pinSlice(unsafe.Pointer(unsafe.SliceData(tape.wide)), len(tape.wide))
 	case len(tape.offsets) != 0:
 		view.layout = C.ustore_strings_u32_tape_k
-		lowered.data, lowered.offsets = call.lend(unsafe.Pointer(unsafe.SliceData(tape.data)), len(tape.data)), call.lend(unsafe.Pointer(unsafe.SliceData(tape.offsets)), len(tape.offsets))
+		lowered.data, lowered.offsets = call.pinSlice(unsafe.Pointer(unsafe.SliceData(tape.data)), len(tape.data)), call.pinSlice(unsafe.Pointer(unsafe.SliceData(tape.offsets)), len(tape.offsets))
 	}
 	return view
 }
 
-// patterns lends the patterns a scan or a walk matches, zeroed to match everything.
+// patterns pins the patterns a scan or a walk matches, zeroed to match everything.
 func (call *call) patterns(patterns Patterns) C.ustore_patterns_t {
 	return C.ustore_patterns_t{
 		patterns:    call.strings(patterns.Patterns),
 		count:       C.ustore_size_t(patterns.Patterns.Len()),
 		kind:        C.ustore_pattern_kind_t(patterns.Kind),
 		sensitivity: C.ustore_case_sensitivity_t(patterns.Sensitivity),
-		weights:     (*C.float)(call.lend(unsafe.Pointer(unsafe.SliceData(patterns.Weights)), len(patterns.Weights))),
+		weights:     (*C.float)(call.pinSlice(unsafe.Pointer(unsafe.SliceData(patterns.Weights)), len(patterns.Weights))),
 	}
 }
 

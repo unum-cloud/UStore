@@ -4,8 +4,9 @@
  *  @date January 9, 2023
  *  @brief Embedded persistent key-value store on RocksDB, with two-phase transactions and snapshots.
  *
- *  Every collection is a column family of its own, so no key carries its collection. Every column family keeps
- *  RocksDB's bytewise comparator, which orders 16-byte keys and strings alike, so an open needs no modality:
+ *  Every collection is a column family of its own, so no key holds its collection. Every column
+ *  family keeps RocksDB's bytewise comparator, which orders 16-byte keys and strings alike, so an
+ *  open needs no modality:
  *
  *      Collection                      Column family name     Key bytes              Value bytes
  *      any UUIDs-to-bytes collection   its UUID text          uuid key[16]           bytes
@@ -29,7 +30,7 @@
  *  through @c GetUpdatesSince, keeping the log files alive while it is open.
  */
 
-#include "docs_layer.hpp"   // `docs_write_over_blobs`, `docs_read_over_blobs`, `docs_gist_over_blobs`
+#include "docs_layer.hpp"   // `docs_write_over_blobs`, `docs_read_over_blobs`, `docs_scan_over_blobs`
 #include "graph_layer.hpp"  // `graph_read_edges_over_blobs`, `graph_write_edges_over_blobs`
 #include "pages_layer.hpp"  // `pages_import_over_blobs`, `pages_read_over_blobs`
 #include "engine.hpp"       // `engine_t`, `guarded`, `remove_over_blobs`, `scan_over_blobs`, `measure_over_blobs`
@@ -40,6 +41,7 @@
 #include "blobs.hpp"    // `blobs_write`, `blobs_remove`, `blobs_read`, `blobs_scan`, `blobs_sample`
 #include "strings.hpp"  // `strings_write`, `strings_remove`, `strings_scan`, `strings_sample`, `strings_measure`
 #include "changes.hpp"  // `changes_cursor_init`, `changes_cursor_next`, `changes_cursor_free`
+#include "ingest.hpp"   // `ingest_init`, `ingest_append`, `ingest_finish`, `ingest_free`
 
 namespace unum::ustore::oracles::rocksdb {
 
@@ -60,6 +62,10 @@ database_verbs_t const database_verbs_k {
     .collection_create = &guarded<&collection_create>,
     .collection_find = &guarded<&collection_find>,
     .collection_drop = &guarded<&collection_drop>,
+    .ingest_init = &ingest_init,
+    .ingest_append = &ingest_append,
+    .ingest_finish = &ingest_finish,
+    .ingest_free = &ingest_free,
     .transaction_init = &guarded<&transaction_init>,
     .transaction_stage = &guarded<&transaction_stage>,
     .transaction_commit = &guarded<&transaction_commit>,
@@ -110,7 +116,7 @@ docs_verbs<vendored_residency_t::host_k> const docs_verbs_k {
     .gist = &docs_gist_over_blobs<values_verbs_k, &resolve_modality>,
     .gather = &docs_gather_over_blobs<strings_kit_t, values_verbs_k, &resolve_modality>,
     .remove = &remove_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_docs_k>,
-    .scan = &scan_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_docs_k>,
+    .scan = &docs_scan_over_blobs<strings_kit_t, values_verbs_k, &resolve_modality>,
     .sample = &sample_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_docs_k>,
     .measure = &measure_over_blobs<values_verbs_k, &resolve_modality, ustore_modality_docs_k>,
 };

@@ -60,10 +60,10 @@ type PathLikeOrStr = str | bytes | PathLike[str]
 type DataDirectory = PathLikeOrStr | tuple[PathLikeOrStr, int]
 type Progress = Callable[[int, int], bool | None]
 """Called with the units a call finished and the units it finishes in all, from whichever thread runs it but never two
-at once; None or a truthy answer carries on, any other falsy one cancels, and a raise cancels and re-raises."""
+at once; None or a truthy answer continues, any other falsy one cancels, and a raise cancels and re-raises."""
 type Predicate = Callable[[UUID], bool] | Batch
-"""Called with each key a scan or a pull listed, from whichever thread runs it, keeping it when truthy, or a `Batch`
-asked once per page; a raise reports through `sys.unraisablehook` and rejects the rest of the page."""
+"""Called with each key a scan or a pull listed, from the threads running it and maybe several at once, keeping it when
+truthy, or a `Batch` asked once per page; a raise reports through `sys.unraisablehook` and rejects the rest of the page."""
 
 __version__: str
 edge_id_default: UUID
@@ -72,7 +72,7 @@ def version() -> str:
     """The version of the library this module runs against, like "1.0.0". Calls `ustore_version_name`."""
 
 def engines_compiled() -> tuple[str, ...]:
-    """The engines this build carries: some of "ram", "rocksdb", "leveldb" and "nvme", in that order."""
+    """The engines this build holds: some of "ram", "rocksdb", "leveldb" and "nvme", in that order."""
 
 def gpu_devices() -> tuple[GPUDevice, ...]:
     """Every GPU this process can drive, NVIDIA devices first, then AMD, then Apple, each at the ordinal
@@ -316,7 +316,7 @@ class OutOfMemoryError(Error, MemoryError):
     """An allocation could not be satisfied."""
 
 class InvalidArgumentError(Error, ValueError):
-    """An argument is null, contradicts another one, or carries a choice the call does not accept, like a collection
+    """An argument is null, contradicts another one, or holds a choice the call does not accept, like a collection
     of another modality."""
 
 class UninitializedError(Error):
@@ -382,7 +382,8 @@ class Arena:
     """
 
     def __init__(self, executor: Executor | None = None, /) -> None:
-        """Makes an arena where `executor` computes, or host pages for calls on the calling thread without one."""
+        """Makes an arena where `executor` computes, or host pages for calls on the calling thread without one; the
+        arena is freed before its executor closes."""
 
 class Values:
     """The values one batch read or cursor pull wrote into an `Arena`, viewing it until it rewinds, and a tape a write
@@ -469,9 +470,15 @@ class Cursor:
     out, so a key written behind the walk never comes and one written ahead of it does. A page shorter than `wanted`
     exhausts the walk for good, whatever is written since."""
 
-    def next(self, wanted: int, arena: Arena, /, *, values: bool = False, progress: Progress | None = None) -> Page:
-        """The next page of up to `wanted` keys in `arena`, with their values when asked, blocking on the executor the
-        cursor was opened through. Calls `ustore_blobs_cursor_next`."""
+    def next(
+        self, wanted: int, arena: Arena, /, *, values: bool = False, progress: Progress | None = None
+    ) -> Page | list[tuple[Page, Columns]]:
+        """The next page of up to `wanted` keys in `arena`, with their values when asked, pulled on the calling thread,
+        or for a walk over documents its batches of up to `wanted` rows in all, each its keys and the columns the
+        cursor gathers. Calls `ustore_blobs_cursor_next`."""
+
+    def on(self, executor: Executor) -> CursorOn:
+        """The cursor's pulls blocking on `executor`, since the cursor keeps no executor of its own."""
 
     def close(self) -> None:
         """Frees the walk with the holds it kept on its database and the transaction or snapshot it reads through."""
@@ -485,12 +492,21 @@ class Cursor:
     ) -> None: ...
 
 @final
+class CursorOn:
+    """A `Cursor` whose pulls block on one executor, answered by `Cursor.on`."""
+
+    def next(
+        self, wanted: int, arena: Arena, /, *, values: bool = False, progress: Progress | None = None
+    ) -> Page | list[tuple[Page, Columns]]:
+        """What `Cursor.next` answers, pulled on the executor."""
+
+@final
 class ChangesCursor:
     """A feed of the changes committed to one collection after a stamp, oldest first, which pins that stamp and
     resumes every pull past the last change the pull before it handed out."""
 
     def next(self, wanted: int, arena: Arena, /, *, values: bool = False) -> Changes:
-        """The next up to `wanted` changes in `arena`, with the bytes every one carries when asked; an empty pull
+        """The next up to `wanted` changes in `arena`, with the bytes every one holds when asked; an empty pull
         reached the newest commit."""
 
     def close(self) -> None:
@@ -645,14 +661,12 @@ class Executor:
     """The threads that run calls, shared by any number of databases."""
 
     @classmethod
-    def for_ram(cls, threads: int = 0, *, memory_domains: Sequence[int] | None = None) -> Self:
+    def for_ram(
+        cls, threads: int = 0, *, memory_domains: Sequence[int] | None = None, scratch_limit: int = 0
+    ) -> Self:
         """Host threads for the RAM, RocksDB and LevelDB engines near `memory_domains`, every NUMA node for None, where
-        zero threads take 7/8 of the cores those nodes carry. Calls `ustore_executor_for_ram`."""
-
-    @classmethod
-    def on_pool(cls, pool: int, /, *, memory_domains: Sequence[int] | None = None) -> Self:
-        """The threads of a ForkUnion `fu_pool_t` at address `pool`, which another library runs and which must outlive
-        the executor. Calls `ustore_executor_on_pool`."""
+        zero threads take 7/8 of the cores those nodes hold, each carving its calls' scratch from at most
+        `scratch_limit` bytes, 16 GiB for zero. Calls `ustore_executor_for_ram`."""
 
     @classmethod
     def for_nvme(
@@ -660,15 +674,20 @@ class Executor:
         threads: int = 0,
         *,
         transport: Transport = Transport.AUTOMATIC,
-        shared_io_channels: int = 0,
         queue_depth: int = 0,
         request_buffer_bytes: int = 0,
         request_buffers_count: int = 0,
         stream_buffer_bytes: int = 0,
         stream_buffers_count: int = 0,
+        paths: Sequence[PathLikeOrStr] | None = None,
+        memory_domains: Sequence[int] | None = None,
+        scratch_limit: int = 0,
     ) -> Self:
         """Threads each driving an I/O ring for the NVMe engine, telling every database `Database.open_nvme` opens on
-        it how to move bytes, where every zero size keeps the engine's default. Calls `ustore_executor_for_nvme`."""
+        it how to move bytes, where every zero size keeps the engine's default. The threads and their staging live on
+        the first of `memory_domains`, or with none named on the NUMA node the data directories `paths` share, and zero
+        threads take the fewest hardware queues of their disks, capped by the cores, each carving its calls' scratch
+        from at most `scratch_limit` bytes, 16 GiB for zero. Calls `ustore_executor_for_nvme`."""
 
     @classmethod
     def for_vram(
@@ -678,10 +697,10 @@ class Executor:
         scratch_limit: int = 0,
         gds: Gds = Gds.AUTOMATIC,
     ) -> Self:
-        """One stream on `device`, a `GPUDevice.ordinal` of any vendor, every call queues on, fed by one host thread,
-        which `Database.open_nvme` takes as its `compactions` on an NVIDIA device, refused with `DeviceError` for an
-        ordinal no device carries; zero `scratch_limit` lets scratch grow as calls ask. Calls
-        `ustore_executor_for_vram`."""
+        """One stream the executor creates on `device`, a `GPUDevice.ordinal` of any vendor, and destroys with it, which
+        every call queues on, fed by one host thread, and which `Database.open_nvme` takes as its `compactions` on an
+        NVIDIA device, refused with `DeviceError` for an ordinal no device holds; zero `scratch_limit` lets scratch grow
+        as calls ask. Calls `ustore_executor_for_vram`."""
 
     def drain(self, mood: Mood = Mood.PARKED) -> None:
         """Waits until no call holds the executor, then parks its threads or keeps them spinning."""
@@ -766,7 +785,7 @@ class Changes:
 
     @property
     def values(self) -> Values | None:
-        """The Values of the bytes every change carries when the pull asked for them, or None."""
+        """The Values of the bytes every change holds when the pull asked for them, or None."""
 
     @property
     def stamps(self) -> tuple[int, ...]:
@@ -870,12 +889,12 @@ class Description:
         """Bytes the files of the database take on disk."""
 
     @property
-    def pin_refused_bytes(self) -> int:
+    def unpinned_staging_bytes(self) -> int:
         """Bytes of the NVMe engine's io_uring arena the locked-memory cap refused to pin, so each request
         pins its own."""
 
     @property
-    def crossing_requests(self) -> int:
+    def requests_across_registered_slots(self) -> int:
         """Requests the NVMe engine sent unpinned while its arena was pinned, as each crossed a gibibyte of it."""
 
 @type_check_only
@@ -934,7 +953,7 @@ class _Reads:
         predicate: Predicate | None = None,
     ) -> Cursor:
         """A walk over the keys of one collection from `start`, reading nothing until its first pull, whose every pull
-        blocks as this receiver's calls do. Calls `ustore_blobs_cursor_init`."""
+        runs on the calling thread unless `Cursor.on` names an executor. Calls `ustore_blobs_cursor_init`."""
 
     def docs_cursor(
         self,
@@ -946,8 +965,11 @@ class _Reads:
         direction: ScanDirection = ScanDirection.ASCENDING,
         filter: str | bytes | None = None,
         predicate: Predicate | None = None,
+        fields: Sequence[str] | None = None,
+        columns_types: FieldType | Sequence[FieldType] | None = None,
     ) -> Cursor:
-        """A walk over documents, keeping those `filter` matches. Calls `ustore_docs_cursor_init`."""
+        """A walk over documents, keeping those `filter` matches, whose every pull answers a list of `(Page, Columns)`
+        batches gathering `fields`, the empty one being the whole document. Calls `ustore_docs_cursor_init`."""
 
     def pages_cursor(
         self,
@@ -1356,7 +1378,7 @@ class _Writes(_Reads):
         collection: CollectionLike,
         durability: Durability = Durability.BUFFERED,
     ) -> None:
-        """Upserts a batch of binary values in one call. Every value is borrowed for the
+        """Upserts a batch of binary values in one call. Every value is viewed for the
         length of the call rather than copied, so a memory-mapped buffer reaches the engine
         untouched.
 
@@ -1386,7 +1408,7 @@ class _Writes(_Reads):
 
         Args:
           key (KeyLike): The key to write.
-          value (bytes-like): The bytes to store, borrowed rather than copied.
+          value (bytes-like): The bytes to store, viewed rather than copied.
           collection (UUID | str): The collection, by identifier or by name.
           durability (Durability, optional): `Durability.FLUSHED` reaches the drive before
             returning.
@@ -1415,7 +1437,7 @@ class _Writes(_Reads):
         durability: Durability = Durability.BUFFERED,
     ) -> None:
         """Writes a batch of JSON documents, or one field inside each of them. Every document is
-        borrowed for the length of the call rather than copied.
+        viewed for the length of the call rather than copied.
 
         Args:
           keys (Sequence[KeyLike] | buffer | None): The keys to write; None reads every key from
@@ -1651,9 +1673,11 @@ class Database(_Writes, _Receivers):
         isolation: Isolation = Isolation.STRICT_SERIALIZABLE,
         executor: Executor | None = None,
         cpu_class_ceiling: CPUClass = CPUClass.UNKNOWN,
+        memory_limit: int = 0,
     ) -> Self:
-        """An in-memory database, persisted as one image when it names a directory, opened blocking on `executor`
-        and confined to the newest class the CPU runs at or under `cpu_class_ceiling`."""
+        """An in-memory database, persisted as one image when it names a directory, opened blocking on `executor`,
+        confined to the newest class the CPU runs at or under `cpu_class_ceiling` and holding at most `memory_limit`
+        bytes of keys and values, past which a write raises `CapacityExhaustedError`; zero takes 16 GiB."""
 
     @classmethod
     def open_rocksdb(
@@ -1662,8 +1686,12 @@ class Database(_Writes, _Receivers):
         *,
         data_directories: Sequence[DataDirectory] = (),
         executor: Executor | None = None,
+        memory_limit: int = 0,
+        background_threads: int = 0,
     ) -> Self:
-        """A database on RocksDB, whose table files may spread over data directories, opened blocking on `executor`."""
+        """A database on RocksDB, whose table files may spread over data directories, opened blocking on `executor`,
+        caching and buffering in `memory_limit` bytes, 1 GiB for zero, and flushing and compacting on a pool of its own
+        of `background_threads`, 2 for zero."""
 
     @classmethod
     def view_rocksdb(
@@ -1672,13 +1700,23 @@ class Database(_Writes, _Receivers):
         *,
         data_directories: Sequence[DataDirectory] = (),
         executor: Executor | None = None,
+        memory_limit: int = 0,
+        background_threads: int = 0,
     ) -> Self:
         """A read-only database on RocksDB, refusing every change with `ReadOnlyError` while snapshots and their saves
-        still serve, opened blocking on `executor`."""
+        still serve, opened blocking on `executor` with the budgets `open_rocksdb` takes."""
 
     @classmethod
-    def open_leveldb(cls, directory: PathLikeOrStr, *, executor: Executor | None = None) -> Self:
-        """A database on LevelDB, opened blocking on `executor`."""
+    def open_leveldb(
+        cls,
+        directory: PathLikeOrStr,
+        *,
+        executor: Executor | None = None,
+        memory_limit: int = 0,
+        background_threads: int = 0,
+    ) -> Self:
+        """A database on LevelDB, opened blocking on `executor`, caching and buffering in `memory_limit` bytes, 1 GiB
+        for zero, and compacting on one thread, so more `background_threads` raise `UnsupportedError`."""
 
     @classmethod
     def open_nvme(
@@ -1705,6 +1743,22 @@ class Database(_Writes, _Receivers):
         `executor`, which tells it how to move bytes when `Executor.for_nvme` made it, merging on the device of
         `compactions` when `Executor.for_vram` made it, and confined to the newest class the CPU runs at or under
         `cpu_class_ceiling`."""
+
+    @classmethod
+    def view_nvme(
+        cls,
+        manifest: PathLikeOrStr,
+        *,
+        executor: Executor | None = None,
+        data_directories: Sequence[DataDirectory] = (),
+        cpu_class_ceiling: CPUClass = CPUClass.UNKNOWN,
+        memory_limit: int = 0,
+        collection_concurrency_limit: int = 0,
+        collection_cache_limit: int = 0,
+    ) -> Self:
+        """A read-only database on the NVMe engine, named by the `manifest` of an existing database, which writes
+        nothing to its data directories and refuses every change with `ReadOnlyError`, opened blocking on
+        `executor`."""
     def __enter__(self) -> Self: ...
     def __exit__(
         self,
@@ -1713,8 +1767,9 @@ class Database(_Writes, _Receivers):
         traceback: TracebackType | None = None,
     ) -> None: ...
     def close(self) -> None:
-        """Closes the database once every deferred call on it finished, while its open transactions and snapshots
-        keep working, each holding the database open until it closes too."""
+        """Closes the database once every deferred call on it finished, writing nothing, so a commit reaches the disk
+        only through `flush` or `Durability.FLUSHED`, while its open transactions and snapshots keep working, each
+        holding the database open until it closes too."""
 
     def clear(self, mode: DropMode, /) -> None:
         """Empties every collection at once: its pairs, every collection with its name, or its values."""
@@ -1740,7 +1795,7 @@ class Database(_Writes, _Receivers):
         """The collection ID the name addresses."""
 
     def collection_contains(self, name: str) -> bool:
-        """Whether a collection carries the name, read into a one-off arena."""
+        """Whether a collection holds the name, read into a one-off arena."""
 
     def collection_list(self, arena: Arena, /) -> tuple[UUID, ...]:
         """The IDs of every collection, never a system one."""
@@ -2400,7 +2455,7 @@ class DeferredOn:
         Returns:
           UUID: The identifier addressing the collection.
         Raises:
-          NotFoundError: No collection carries the name.
+          NotFoundError: No collection holds the name.
         """
 
     def collection_list(self, arena: Arena, /) -> Deferred[tuple[UUID, ...]]:
@@ -2447,7 +2502,7 @@ class DeferredOn:
             collections, `DropMode.COLLECTION` drops every collection with its name, and
             `DropMode.VALUES` empties every value and keeps the keys.
         Raises:
-          InvalidArgumentError: The RAM and RocksDB engines drop no collection while a
+          ContendedError: The RAM, RocksDB and NVMe engines drop no collection while a
             snapshot is open, since the snapshot belongs to its holder.
           ReadOnlyError: The database was opened read-only.
         """
@@ -2505,7 +2560,7 @@ class DeferredOn:
 
         Returns:
           Description: The `capabilities`, `engine`, `isolation`, `keys`, `memory_bytes`,
-          `disk_bytes`, `pin_refused_bytes` and `crossing_requests` of the database.
+          `disk_bytes`, `unpinned_staging_bytes` and `requests_across_registered_slots` of the database.
         """
 
     def write(
@@ -2518,7 +2573,7 @@ class DeferredOn:
     ) -> Deferred[None]:
         """write(keys, values, *, collection, durability=Durability.BUFFERED) answers None.
 
-        Upserts a batch of binary values in one call. Every value is borrowed for the
+        Upserts a batch of binary values in one call. Every value is viewed for the
         length of the call rather than copied, so a memory-mapped buffer reaches the engine
         untouched.
 
@@ -2551,7 +2606,7 @@ class DeferredOn:
 
         Args:
           key (KeyLike): The key to write.
-          value (bytes-like): The bytes to store, borrowed rather than copied.
+          value (bytes-like): The bytes to store, viewed rather than copied.
           collection (UUID | str): The collection, by identifier or by name.
           durability (Durability, optional): `Durability.FLUSHED` reaches the drive before
             returning.
@@ -2599,7 +2654,7 @@ class DeferredOn:
                    type=FieldType.JSON, id_field=None, durability=Durability.BUFFERED) answers None.
 
         Writes a batch of JSON documents, or one field inside each of them. Every document is
-        borrowed for the length of the call rather than copied.
+        viewed for the length of the call rather than copied.
 
         Args:
           keys (Sequence[KeyLike] | buffer | None): The keys to write; None reads every key from

@@ -8,10 +8,10 @@
  *  orders the commit stamps the sealed columns into a @c memory_run, which no one changes
  *  afterwards. A delta is a key, a kind, a size and a location in one of the byte buffers the run
  *  views, so a removal and an empty value differ by kind and neither needs a sentinel. A
- *  transaction writing one collection lends its own buffer, which the run takes over once stamped,
- *  and a merge views its sources' buffers and takes them over once they retire, so a value byte is
- *  copied into memory once. The stamps and the kinds are packed columns, which spend no bits at
- *  all on a run of one commit's writes.
+ *  transaction writing one collection seals over its own buffer, which the run takes over once
+ *  stamped, and a merge views its sources' buffers and takes them over once they retire, so a value
+ *  byte is copied into memory once. The stamps and the kinds are packed columns, which spend no
+ *  bits at all on a run of one commit's writes.
  */
 
 #pragma once
@@ -63,11 +63,12 @@ struct keyed_delta {
     /** The key the delta is filed under. */
     stored_key_type_ stored_key {};
 
-    /** What the delta does to the key's value, and the bytes it carries, empty for a removal. */
+    /** What the delta does to the key's value, and the bytes it holds, empty for a removal. */
     delta_view_t delta;
 };
 
-/** One delta as a merge carries it over: the key, the stamp of the commit that wrote it, its kind and its bytes. */
+/** One delta as a merge holds it over: the key, the stamp of the commit that wrote it, its kind
+ *  and its bytes. */
 template <typename stored_key_type_>
 struct stamped_delta {
 
@@ -77,7 +78,8 @@ struct stamped_delta {
     /** The stamp of the commit that wrote it. */
     transaction_stamp_t stamp = unwritten_stamp_k;
 
-    /** What it does to the key's value, and the bytes it carries, owned by the run it is carried from. */
+    /** What it does to the key's value, and the bytes it holds, owned by the run it
+     *  is held from. */
     delta_view_t delta;
 
     /** Where its run holds those bytes, counting the buffers of the runs merged before it, which
@@ -101,7 +103,7 @@ class sealed_deltas {
     using allocator_t = allocator_type_;
     using keyed_delta_t = keyed_delta<stored_key_t>;
 
-    /** The range tombstones the deltas carry beside them, stamped with the deltas. */
+    /** The range tombstones the deltas hold beside them, stamped with the deltas. */
     using range_tombstones_t = blobs::range_tombstones<stored_key_t, allocator_t>;
 
     /** The keys one range tombstone hides. */
@@ -125,19 +127,20 @@ class sealed_deltas {
      *  @brief Sorts @p deltas by key in place and seals them and @p ranges into columns on
      *      @p allocator; a delta inside a range lands with the commit that removes the range, so
      *      the range hides none of them.
-     *  @param[in] lent The bytes a transaction wrote into its buffer, which every delta views and
-     *      @c adopt takes over once the commit is stamped, or none, which copies the bytes once in
-     *      key order into a buffer of the deltas' own.
+     *  @param[in] caller_bytes The bytes a transaction wrote into its buffer, which every delta
+     *      views and @c adopt takes over once the commit is stamped, or none, which copies the
+     *      bytes once in key order into a buffer of the deltas' own.
      *
      *  @par Statuses:
-     *  - @c invalid_argument_k No delta and no range, two deltas of one key, a removal carrying
-     *    bytes, a delta's bytes outside @p lent, or a range ending at or before its start.
+     *  - @c invalid_argument_k No delta and no range, two deltas of one key, a removal holding
+     *    bytes, a delta's bytes outside @p caller_bytes, or a range ending at or before its start.
      *  - @c capacity_exhausted_k More bytes than one sorted run file holds, which every offset
      *    is bounded by.
      *  - @c out_of_memory_k A column could not be allocated.
      */
     static expected<sealed_deltas> seal(std::span<keyed_delta_t> deltas, std::span<range_t const> ranges = {},
-                                        allocator_t allocator = {}, std::span<byte_t const> lent = {}) noexcept {
+                                        allocator_t allocator = {},
+                                        std::span<byte_t const> caller_bytes = {}) noexcept {
         if (deltas.empty() && ranges.empty())
             return status_t {status_code_t::invalid_argument_k, "A seal needs a delta or range"};
         utilities::sort_by_stored_key(deltas);
@@ -149,13 +152,13 @@ class sealed_deltas {
             if (index != 0 && deltas[index - 1].stored_key == deltas[index].stored_key)
                 return status_t {status_code_t::invalid_argument_k, "A seal takes one delta per key"};
             if (delta.kind == delta_kind_t::remove_k && !delta.bytes.empty())
-                return status_t {status_code_t::invalid_argument_k, "A removal carries no bytes"};
+                return status_t {status_code_t::invalid_argument_k, "A removal holds no bytes"};
             if (delta.kind == delta_kind_t::remove_range_k)
                 return status_t {status_code_t::invalid_argument_k, "A range removal seals as a range"};
-            if (!lent.empty() && !delta.bytes.empty() &&
-                (delta.bytes.data() < lent.data() ||
-                 delta.bytes.data() + delta.bytes.size() > lent.data() + lent.size()))
-                return status_t {status_code_t::invalid_argument_k, "A lent buffer holds every delta"};
+            if (!caller_bytes.empty() && !delta.bytes.empty() &&
+                (delta.bytes.data() < caller_bytes.data() ||
+                 delta.bytes.data() + delta.bytes.size() > caller_bytes.data() + caller_bytes.size()))
+                return status_t {status_code_t::invalid_argument_k, "A caller buffer holds every delta"};
             total_bytes += delta.bytes.size();
             least_kind = fu::min_of(least_kind, static_cast<std::uint8_t>(delta.kind));
             greatest_kind = fu::max_of(greatest_kind, static_cast<std::uint8_t>(delta.kind));
@@ -165,7 +168,7 @@ class sealed_deltas {
             return status_t {status_code_t::capacity_exhausted_k, "The sealed deltas outgrow one run file"};
         sealed_deltas sealed(allocator);
         // Empty values view nothing, so a buffer of overwritten values alone stays with its owner.
-        bool const lends = !lent.empty() && total_bytes != 0;
+        bool const views_caller_bytes = !caller_bytes.empty() && total_bytes != 0;
         buffer_t copied {typename buffer_t::allocator_t(allocator)};
         if (sealed.locations_.resize(st::assume_uninitialized, deltas.size()) != st::status_t::success_k)
             return status_t {status_code_t::out_of_memory_k, "No room for the sealed run's locations"};
@@ -175,16 +178,16 @@ class sealed_deltas {
             return status_t {status_code_t::out_of_memory_k, "No room for the sealed run's base"};
         if (sealed.buffers_.reserve(1) != st::status_t::success_k)
             return status_t {status_code_t::out_of_memory_k, "No room for the sealed run's buffer slot"};
-        if (!lends &&
+        if (!views_caller_bytes &&
             copied.resize(st::assume_uninitialized, static_cast<std::size_t>(total_bytes)) != st::status_t::success_k)
             return status_t {status_code_t::out_of_memory_k, "No room for the sealed run's copied bytes"};
         stored_value_offset_t copied_offset = 0;
         for (std::size_t index = 0; index != deltas.size(); ++index) {
             std::span<byte_t const> const bytes = deltas[index].delta.bytes;
             sealed.sizes_[index] = static_cast<stored_value_size_t>(bytes.size());
-            if (lends) {
+            if (views_caller_bytes) {
                 stored_value_offset_t const offset =
-                    bytes.empty() ? 0 : static_cast<stored_value_offset_t>(bytes.data() - lent.data());
+                    bytes.empty() ? 0 : static_cast<stored_value_offset_t>(bytes.data() - caller_bytes.data());
                 sealed.locations_[index] = value_location_t {0, offset};
                 continue;
             }
@@ -194,11 +197,12 @@ class sealed_deltas {
         }
         if (total_bytes != 0) {
             [[maybe_unused]] st::status_t const based = sealed.bases_.push_back(
-                st::assume_reserved, lends ? lent.data() : static_cast<byte_t const*>(copied.data()));
-            if (!lends) [[maybe_unused]]
+                st::assume_reserved,
+                views_caller_bytes ? caller_bytes.data() : static_cast<byte_t const*>(copied.data()));
+            if (!views_caller_bytes) [[maybe_unused]]
                 st::status_t const owned = sealed.buffers_.push_back(st::assume_reserved, std::move(copied));
         }
-        sealed.held_bytes_ = lends ? lent.size() : total_bytes;
+        sealed.held_bytes_ = views_caller_bytes ? caller_bytes.size() : total_bytes;
         if (status_t const indexed = sealed.index_<keyed_delta_t>(deltas, least_kind, greatest_kind, allocator);
             indexed.failed())
             return indexed;
@@ -314,7 +318,7 @@ class sealed_deltas {
     /** The key at sorted @p position. */
     [[nodiscard]] stored_key_t stored_key(std::size_t position) const noexcept { return stored_keys_.select(position); }
 
-    /** The delta at sorted @p position: its kind and the bytes it carries. */
+    /** The delta at sorted @p position: its kind and the bytes it holds. */
     [[nodiscard]] delta_view_t delta(std::size_t position) const noexcept {
         delta_kind_t const kind = static_cast<delta_kind_t>(kinds_[position]);
         std::size_t const size = sizes_[position];
@@ -385,15 +389,15 @@ class sealed_deltas {
     /** Where every delta's bytes sit, in key order. */
     column<value_location_t> locations_;
 
-    /** Bytes every delta carries, in key order, none for a removal. */
+    /** Bytes every delta holds, in key order, none for a removal. */
     column<stored_value_size_t> sizes_;
 
     /** The first byte of every buffer the locations name, which readers resolve through, so a
      *  buffer handed from run to run moves no byte. */
     column<byte_t const*> bases_;
 
-    /** The buffers the deltas own, which trail @c bases_ until @c adopt takes a lent one, or until
-     *  @c inherit takes the buffers of a merged run's sources. */
+    /** The buffers the deltas own, which trail @c bases_ until @c adopt takes a transaction's, or
+     *  until @c inherit takes the buffers of a merged run's sources. */
     column<buffer_t> buffers_;
 
     /** Bytes written into the buffers the deltas view, as @c values_bytes reports them. */
@@ -432,15 +436,17 @@ class memory_run {
 
     /**
      *  @brief Stamps every delta of @p deltas with the commit's @p stamp, which only the leader ordering it draws.
-     *  @retval invalid_argument_k An unwritten stamp, which no commit carries.
      *
-     *  Every delta carries the one stamp, whose column packs into no words, so nothing is allocated and a stamp
-     *  drawn for a commit never fails to land.
+     *  @par Statuses:
+     *  - @c status_code_t::invalid_argument_k An unwritten stamp, which no commit holds.
+     *
+     *  Every delta holds the one stamp, whose column packs into no words, so nothing is allocated
+     *  and a stamp drawn for a commit never fails to land.
      */
     static expected<memory_run> stamped(sealed_deltas_t&& deltas, transaction_stamp_t stamp,
                                         allocator_t allocator = {}) noexcept {
         if (stamp == unwritten_stamp_k)
-            return status_t {status_code_t::invalid_argument_k, "No commit carries the unwritten stamp"};
+            return status_t {status_code_t::invalid_argument_k, "No commit holds the unwritten stamp"};
         auto [stamps, status] = stamps_t::make(deltas.size(), stamp, typename stamps_t::allocator_t(allocator));
         if (st::failed(status)) return status_t {status_code_t::out_of_memory_k, "No room to stamp the sealed deltas"};
         memory_run run;
@@ -514,7 +520,7 @@ class memory_run {
     /** The key at sorted @p position. */
     [[nodiscard]] stored_key_t stored_key(std::size_t position) const noexcept { return deltas_.stored_key(position); }
 
-    /** The delta at sorted @p position: its kind and the bytes it carries. */
+    /** The delta at sorted @p position: its kind and the bytes it holds. */
     [[nodiscard]] delta_view_t delta(std::size_t position) const noexcept { return deltas_.delta(position); }
 
     /** The stamp of the commit that wrote the delta at sorted @p position. */
@@ -525,13 +531,13 @@ class memory_run {
         return deltas_.lower_bound(stored_key);
     }
 
-    /** The range tombstones the run carries beside its deltas, every one stamped. */
+    /** The range tombstones the run holds beside its deltas, every one stamped. */
     [[nodiscard]] range_tombstones_t const& range_tombstones() const noexcept { return deltas_.range_tombstones(); }
 
-    /** The newest stamp any delta or range tombstone carries. */
+    /** The newest stamp any delta or range tombstone holds. */
     [[nodiscard]] transaction_stamp_t newest_stamp() const noexcept { return newest_stamp_; }
 
-    /** The oldest stamp any delta carries, which the stamps column is based at. */
+    /** The oldest stamp any delta holds, which the stamps column is based at. */
     [[nodiscard]] transaction_stamp_t oldest_stamp() const noexcept { return stamps_.base(); }
 
   private:
@@ -564,7 +570,7 @@ bool hidden_by_range(std::span<run_type_ const* const> runs, typename run_type_:
            !keeps_older_version(survival, nearest, stamp);
 }
 
-/** Every range tombstone @p runs carry, with its stamp, as one column set on @p allocator, which a
+/** Every range tombstone @p runs hold, with its stamp, as one column set on @p allocator, which a
  *  merge or a flush of memory runs keeps whole since nothing they hold is durable. */
 template <typename run_type_, typename allocator_type_>
 expected<range_tombstones<typename run_type_::stored_key_t, allocator_type_>> gathered_range_tombstones(

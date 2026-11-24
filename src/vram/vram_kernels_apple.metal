@@ -11,7 +11,7 @@
  *  every record laid out as its host struct and every pointer, embedded ones too, a host address,
  *  which @ref ustore_metal_pointer reaches through the block table the launch binds beside it.
  *  Rows, counts and indices are 32-bit, and byte offsets into a tape or a page stay 64-bit, as they
- *  pass 4 GiB. The host splices @c vram_apple_shared.h ahead of this source.
+ *  pass 4 GiB. The host splices @c vram_apple_shared.hpp ahead of this source.
  *
  *  Metal has no 64-bit atomics, so the chained scan of the CUDA compactor becomes the two-pass
  *  select: a count per threadgroup tile, one threadgroup scanning the counts, and a write at each
@@ -260,15 +260,15 @@ inline ushort half_of(uint bits) {
     uint mantissa = bits & 0x7fffffu;
     if (((bits >> 23) & 0xffu) == 0xffu) return ushort(sign | 0x7c00u | (mantissa ? 0x200u : 0u));
     if (exponent >= 1) {
-        ushort const half = ushort(sign | (uint(exponent) << 10) | (mantissa >> 13));
-        return ushort(half + ((mantissa >> 12) & 1u));
+        ushort const encoded = ushort(sign | (uint(exponent) << 10) | (mantissa >> 13));
+        return ushort(encoded + ((mantissa >> 12) & 1u));
     }
     if (exponent < -10) return sign;
     // Subnormal halves shift the implicit leading bit into the mantissa
     mantissa |= 0x800000u;
     uint const shift = uint(14 - exponent);
-    ushort const half = ushort(sign | (mantissa >> shift));
-    return ushort(half + ((mantissa >> (shift - 1)) & 1u));
+    ushort const encoded = ushort(sign | (mantissa >> shift));
+    return ushort(encoded + ((mantissa >> (shift - 1)) & 1u));
 }
 
 /** How a decimal reads, as @c decimal_reading_t . */
@@ -435,9 +435,9 @@ inline ulong round_wide(wide_t value, ulong remainder, uint digits, thread int& 
     }
     uint const shift = bits - digits;
     ulong kept = shift_right(value, shift).low;
-    bool const half = bit_of(value, shift - 1);
+    bool const halfway = bit_of(value, shift - 1);
     bool const rest = remainder != 0 || any_below(value, shift - 1);
-    if (half && (rest || (kept & 1ul))) ++kept;
+    if (halfway && (rest || (kept & 1ul))) ++kept;
     scale += int(shift);
     if (kept >> digits) kept >>= 1, ++scale;
     return kept;
@@ -907,13 +907,13 @@ inline conversion_t cell_scalar(token_t token, scalar_kind_t kind, thread ulong&
 }
 
 /** Converts the cell @p token into a half as @c cell_half , where a magnitude past it collides. */
-inline conversion_t cell_half(token_t token, thread ushort& half, thread uint& refused) {
+inline conversion_t cell_half(token_t token, thread ushort& encoded, thread uint& refused) {
     ulong single = 0;
     conversion_t conversion = cell_scalar(token, {scalar_family_t::real_k, 32}, single, refused);
     // A cell's float is finite: JSON spells no infinity, and a string spelling one reads on host
     if (is_valid(conversion) && (uint(single) & 0x7FFFFFFFu) >= half_overflow_bits_k)
         conversion = conversion_t::collides_k;
-    half = is_valid(conversion) ? half_of(uint(single)) : ushort(0);
+    encoded = is_valid(conversion) ? half_of(uint(single)) : ushort(0);
     return conversion;
 }
 
@@ -1238,9 +1238,9 @@ inline uint gather_scalar_rows(thread page_view_t const& page, thread scalars_vi
                 column.scalars[row * uuid_bytes_k + index] = uuid[index];
         }
         else if (column.type == field_type_f16_k) {
-            ushort half = 0;
-            conversion = cell_half(token, half, refused);
-            put_scalar(column.scalars, row, half, 2);
+            ushort encoded = 0;
+            conversion = cell_half(token, encoded, refused);
+            put_scalar(column.scalars, row, encoded, 2);
         }
         else {
             ulong raw = 0;

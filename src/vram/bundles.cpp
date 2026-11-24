@@ -6,7 +6,11 @@
  *      beside this unit by the stubs of @c ustore_gpu_bundle, or, for an Apple class, as the MSL
  *      source its class unit embeds, and whether a device loads one.
  */
-#include "vram/classes.hpp" // `gpu_class_bundle`, `gpu_class_serves`
+#include <cstring> // `std::memcpy`
+
+#include <stringzilla/regex/metal.h> // `sz_regex_arguments_metal_t`, `sz_regex_stride_metal_`
+
+#include "vram/classes.hpp" // `gpu_class_bundle`, `gpu_class_serves`, `metal_regex_walk_t`
 
 namespace unum::ustore {
 
@@ -111,6 +115,33 @@ static std::uint32_t family_of_apple_class(gpu_class_t gpu_class) noexcept {
     default: return 0;
     }
 }
+
+#if USTORE_ARCH_METAL_
+
+static_assert(sizeof(sz_regex_arguments_metal_t) == sizeof(metal_regex_walk_t) &&
+                  alignof(sz_regex_arguments_metal_t) <= alignof(metal_regex_walk_t),
+              "The walk record holds StringZilla's record byte for byte");
+
+metal_regex_walk_t metal_regex_walk(sz_regex_engine_t const& engine) noexcept {
+    sz_regex_arguments_metal_t record {};
+    for (std::size_t kind = 0; kind != 4; ++kind)
+        record.forward_starts[kind] = engine.forward_starts[kind],
+        record.reverse_starts[kind] = engine.reverse_starts[kind];
+    record.forward_accepts_begin = engine.forward_accepts_begin;
+    record.reverse_accepts_begin = engine.reverse_accepts_begin;
+    record.classes_count = engine.classes_count;
+    record.case_sensitivity = static_cast<sz_u32_t>(engine.case_sensitivity);
+    record.stride = static_cast<sz_u32_t>(sz_regex_stride_metal_(&engine));
+    metal_regex_walk_t walk;
+    std::memcpy(walk.bytes, &record, sizeof(record));
+    return walk;
+}
+
+#else
+
+metal_regex_walk_t metal_regex_walk(sz_regex_engine_t const&) noexcept { return {}; }
+
+#endif
 
 bool gpu_class_serves(gpu_drivers_t& drivers, gpu_class_t gpu_class, gpu_device_t const& device) noexcept {
     std::span<byte_t const> const bundle = gpu_class_bundle(gpu_class);

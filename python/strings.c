@@ -5,7 +5,7 @@
  *  @brief Collection names, resolved onto identifiers and listed in text order, plus strings verbs.
  *
  *  Names resolve in two phases: a name maps onto a collection identifier once here, and every
- *  other verb addresses that collection by the identifier, so no other call carries a name. Each
+ *  other verb addresses that collection by the identifier, so no other call holds a name. Each
  *  engine keeps the names apart from every collection, so no identifier reaches them.
  */
 // Python.h must precede every system header, and brings `qsort` and `memcmp` along
@@ -137,7 +137,7 @@ PyObject* ustore_py_collection_names(ustore_py_context_t const* context, char co
     while (first != named && ustore_py_name_view_order(&views[first], &start) < 0) ++first;
     size_t const found = named - first < limit ? named - first : limit;
 
-    // The names are copied out here rather than borrowed: every one is a `str`, which owns its own
+    // The names are copied out here rather than viewed: every one is a `str`, which owns its own
     // bytes whatever the arena does, so the arena serves the next call at once.
     PyObject* listed = PyTuple_New((Py_ssize_t)found);
     for (size_t name_index = 0; listed && name_index != found; ++name_index) {
@@ -159,7 +159,7 @@ PyObject* ustore_py_collection_names(ustore_py_context_t const* context, char co
 
 #pragma region Verbs
 
-/** One strings call: the batch or bounds it borrows until it finishes, and its verb's outputs. */
+/** One strings call: the batch or bounds it views until it finishes, and its verb's outputs. */
 typedef struct strings_call_t {
 
     /** What the call keeps until it finishes. */
@@ -201,7 +201,7 @@ static void strings_release(void* erased) {
     ustore_py_call_release(&call->call);
 }
 
-/** Holds the text or bytes @p object as the view it lends the library, empty for None. */
+/** Holds the text or bytes @p object as the view the library reads, empty for None. */
 static int strings_bound_from_object(PyObject* object, char const* field, PyObject** held, ustore_bytes_view_t* view) {
     if (!object) return 0;
     Py_ssize_t length = 0;
@@ -292,7 +292,7 @@ char const doc_strings_write[] =                                                
     "strings_write(strings, keys, *, collection, durability=Durability.BUFFERED) answers None.\n" //
     "\n"                                                                                          //
     "Upserts a batch of strings and the keys they map onto, one key per string. Every string\n"   //
-    "is borrowed for the length of the call rather than copied.\n"                                //
+    "is viewed for the length of the call rather than copied.\n"                                  //
     "\n"                                                                                          //
     "Args:\n"                                                                                     //
     "  strings (Sequence[str | bytes-like] | str | bytes-like | tape): One string per key, a\n"   //

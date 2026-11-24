@@ -23,7 +23,7 @@ typedef struct single_batch_stream_t {
     struct ArrowArray batch;
 } single_batch_stream_t;
 
-/** Lets go of nothing, as the schema a single-batch stream answers borrows the one it owns. */
+/** Lets go of nothing, as the schema a single-batch stream answers views the one it owns. */
 static void single_schema_release(struct ArrowSchema* schema) { schema->release = NULL; }
 
 static int single_get_schema(struct ArrowArrayStream* stream, struct ArrowSchema* out) {
@@ -49,7 +49,8 @@ static void single_release(struct ArrowArrayStream* stream) {
     stream->release = NULL;
 }
 
-/** The pointer @p capsule carries under @p name, or NULL with a TypeError naming the protocol @p method broke. */
+/** The pointer @p capsule holds under @p name, or NULL with a TypeError naming the protocol
+ *  @p method broke. */
 static void* capsule_pointer(PyObject* capsule, char const* name, char const* method) {
     void* const pointer = PyCapsule_IsValid(capsule, name) ? PyCapsule_GetPointer(capsule, name) : NULL;
     if (!pointer) PyErr_Format(PyExc_TypeError, "%s must answer a capsule named '%s'", method, name);
@@ -471,18 +472,20 @@ static int export_get_next(struct ArrowArrayStream* stream, struct ArrowArray* o
             export_keys(owned, 1, (ustore_keys_view_t) {values, sizeof(ustore_key_t)}, rows, arena, &outcome);
         } break;
         case ustore_modality_docs_k: {
-            ustore_key_t const* keys = NULL;
-            ustore_strings_view_t values = {0};
+            // A pull without an executor fills one batch, which becomes one array of the stream
+            ustore_docs_batch_view_t const* batches = NULL;
+            ustore_size_t batches_count = 0;
             ustore_docs_cursor_next_t next = {.database = state->database,
                                               .outcome = &outcome,
                                               .cursor = state->cursor.docs,
-                                              .keys = &keys,
-                                              .values = &values,
-                                              .written = &rows,
+                                              .batches = &batches,
+                                              .batches_count = &batches_count,
                                               .arena = arena,
                                               .wanted = export_batch_rows_k};
             ustore_docs_cursor_next(&next);
-            export_keyed(owned, keys, values, rows, arena, &outcome);
+            if (outcome.status != ustore_status_success_k || !batches_count) break;
+            rows = batches[0].count;
+            export_keyed(owned, batches[0].keys, batches[0].columns[0].strings, rows, arena, &outcome);
         } break;
         case ustore_modality_pages_k: {
             ustore_key_t const* keys = NULL;
@@ -559,11 +562,20 @@ static void export_release(struct ArrowArrayStream* stream) {
 static void export_open(export_stream_t* state, ustore_outcome_t* outcome) {
     switch (state->modality) {
     case ustore_modality_docs_k: {
+        // Documents export whole, as the one JSON column of the empty field
+        static uint32_t const whole_document_offsets[2] = {0, 0};
+        static ustore_docs_field_type_t const whole_document_type = ustore_docs_field_type_json_k;
+        ustore_strings_view_t whole_document = {.layout = ustore_strings_u32_tape_k};
+        whole_document.data.u32_tape.data = (ustore_byte_t const*)"";
+        whole_document.data.u32_tape.offsets = whole_document_offsets;
         ustore_docs_cursor_init_t init = {.cursor = &state->cursor.docs,
                                           .database = state->database,
                                           .outcome = outcome,
                                           .view = state->view,
-                                          .collection = state->collection};
+                                          .collection = state->collection,
+                                          .fields_count = 1,
+                                          .fields = whole_document,
+                                          .columns_types = &whole_document_type};
         ustore_docs_cursor_init(&init);
     } break;
     case ustore_modality_pages_k: {
@@ -680,9 +692,8 @@ static void resolve_columns(struct ArrowSchema const* schema, ustore_modality_t 
         else if (strcmp(name, "key") == 0) slot = strings ? &columns->strings : &columns->keys;
         else if (strcmp(name, "value") == 0) slot = strings ? &columns->keys : &columns->strings;
         if (!slot || *slot != absent_column_k) {
-            *outcome = (ustore_outcome_t) {
-                ustore_status_invalid_argument_k,
-                "The stream carries a column its modality does not name, or names one twice"};
+            *outcome = (ustore_outcome_t) {ustore_status_invalid_argument_k,
+                                           "The stream holds a column its modality does not name, or names one twice"};
             return;
         }
         *slot = (size_t)index;

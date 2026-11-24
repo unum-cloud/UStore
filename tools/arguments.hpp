@@ -6,7 +6,7 @@
  *      variables, prints the usage and echoes the values.
  *
  *  Flags are long kebab-case words whose value follows as the next argument or after @c =. Byte
- *  counts carry a binary suffix, durations carry @c ms or @c s, counts are plain integers, and
+ *  counts hold a binary suffix, durations hold @c ms or @c s, counts are plain integers, and
  *  lists are comma-separated. A text value views the tail of its @c argv entry, so it is
  *  null-terminated; list items are not. A value that does not parse prints @c --flag="value"
  *  @c does @c not @c parse, @c expected @c <grammar>.
@@ -33,6 +33,12 @@
 #include <cstdlib> // `std::exit`, `std::strtod`, `std::getenv`
 #include <cstring> // `std::strlen`
 
+#include "ustore/types.h" // `USTORE_OS_LINUX_`
+
+#if USTORE_OS_LINUX_
+#include <sched.h> // `sched_getaffinity`, `CPU_COUNT`
+#endif
+
 #include <array>        // `std::array`
 #include <charconv>     // `std::from_chars`
 #include <chrono>       // `std::chrono::milliseconds`
@@ -43,6 +49,7 @@
 #include <span>         // `std::span`
 #include <string_view>  // `std::string_view`
 #include <system_error> // `std::errc`
+#include <thread>       // `std::thread::hardware_concurrency`
 #include <utility>      // `std::forward`
 #include <variant>      // `std::variant`
 
@@ -52,9 +59,10 @@
 
 #include <stringzilla/stringzilla.hpp> // `sz::string_t`
 
-#include "ustore/db.h"                      // the init call of every engine and the spellings flags name
-#include "ustore/utilities/nvme_volume.hpp" // `parse_data_address`, `manifest_suffix_k`
-#include "ustore/utilities/types.hpp"       // `sz`
+#include "ustore/db.h"                         // the init call of every engine and the spellings flags name
+#include "ustore/utilities/blocking_files.hpp" // `read_file`, `path_max_bytes_k`
+#include "ustore/utilities/nvme_volume.hpp"    // `parse_data_address`, `manifest_suffix_k`
+#include "ustore/utilities/types.hpp"          // `sz`
 
 /** Prints an owning StringZilla string as the text it holds, never as a range of characters. */
 template <>
@@ -237,12 +245,12 @@ struct arguments_t {
     return argument_status_t::parsed_k;
 }
 
-/** Parses a plain integer within the bounds @p count already carries. */
+/** Parses a plain integer within the bounds @p count already holds. */
 [[nodiscard]] inline argument_status_t parse_count(std::string_view text, count_t& count) noexcept {
     return parse_bounded_(text, count.minimum, count.maximum, count.value);
 }
 
-/** Parses comma-separated counts within the bounds @p counts carries, replacing the items it
+/** Parses comma-separated counts within the bounds @p counts holds, replacing the items it
  *  held. */
 [[nodiscard]] inline argument_status_t parse_counts(std::string_view text, counts_t& counts) noexcept {
     std::size_t const maximum_size = counts.maximum_size < counts_t::capacity_k ? counts.maximum_size
@@ -333,7 +341,7 @@ inline std::optional<double> parse_real(std::string_view text) noexcept {
     return argument_status_t::unknown_name_k;
 }
 
-/** The bytes of @p text as the C interface borrows a path or a name. */
+/** The bytes of @p text as the C interface views a path or a name. */
 inline ustore_bytes_view_t bytes_view(std::string_view text) noexcept {
     return {reinterpret_cast<ustore_byte_t const*>(text.data()), text.size()};
 }
@@ -669,6 +677,9 @@ struct engine_options_t {
     /** The manifest @c nvme opens in @c directory, kept here so a deferred open still reads it. */
     std::array<char, nvme_manifest_capacity_k> nvme_manifest {};
 
+    /** Threads of the executor @c spawn_executor makes, zero for the cores of the affinity mask. */
+    count_t threads {.value = 0, .minimum = 0};
+
     /** Points the engine at @p path, a directory or null, and spells the manifest
      *  @c nvme opens there. */
     void locate(char const* path) noexcept {
@@ -693,7 +704,7 @@ struct unnamed_flag_t {
     std::string_view grammar;
 };
 
-/** Reads the names @p options carries into @p names through the C interface's own spellings,
+/** Reads the names of @p options into @p names through the C interface's own spellings,
  *  answering the first that names nothing, or an empty flag when every one parses. */
 [[nodiscard]] inline unnamed_flag_t read_engine_names(engine_options_t const& options, engine_names_t& names) noexcept {
     if (assign_named_(options.name, names.engine, &ustore_engine_from_name) != argument_status_t::parsed_k)
@@ -705,15 +716,86 @@ struct unnamed_flag_t {
     return {};
 }
 
-/** Opens the engine @p options name into @p database, running the open on @p executor with @p completion as every
- *  call does, where NVMe borrows @p executor until close; the one place binaries tell the engines apart. The in-memory
- *  engine starts empty without a directory, and persists in one otherwise. */
-inline void open_engine(engine_options_t const& options, ustore_database_t* database, ustore_outcome_t* outcome,
-                        ustore_executor_t executor = nullptr,
+/** Cores of the process's affinity mask, at least one, each a thread of a binary's executor. */
+inline std::size_t affinity_cores() noexcept {
+#if USTORE_OS_LINUX_
+    cpu_set_t mask;
+    if (sched_getaffinity(0, sizeof(mask), &mask) == 0 && CPU_COUNT(&mask) > 0)
+        return static_cast<std::size_t>(CPU_COUNT(&mask));
+#endif
+    unsigned const cores = std::thread::hardware_concurrency();
+    return cores ? cores : 1;
+}
+
+/** Bytes of memory the process's cgroup and its ancestors allow, the smallest @c memory.max among
+ *  them, or zero where none sets one or none can be read, as off Linux. */
+inline std::size_t cgroup_memory_limit() noexcept {
+    std::size_t limit = 0;
+#if USTORE_OS_LINUX_
+    st::vector<char> membership;
+    if (util::read_file("/proc/self/cgroup", membership).failed()) return 0;
+    std::string_view const text {membership.begin(), membership.end()};
+    std::size_t const unified = text.find("0::");
+    if (unified == std::string_view::npos) return 0;
+    std::string_view group = text.substr(unified + 3);
+    group = group.substr(0, group.find('\n'));
+    for (;;) {
+        char path[util::path_max_bytes_k];
+        auto const written = fmt::format_to_n(path, sizeof(path) - 1, "/sys/fs/cgroup{}/memory.max", group);
+        *written.out = '\0';
+        st::vector<char> value;
+        std::size_t bytes = 0;
+        if (util::read_file(path, value).succeeded() &&
+            std::from_chars(value.data(), value.data() + value.size(), bytes).ec == std::errc {} &&
+            (!limit || bytes < limit))
+            limit = bytes;
+        if (group.empty() || group == "/") break;
+        group = group.substr(0, group.rfind('/'));
+    }
+#endif
+    return limit;
+}
+
+/** Spawns into @p executor the one queue set a binary runs every call on: an executor of
+ *  @c ustore_executor_for_nvme moving bytes as @p options name for @c nvme, one of
+ *  @c ustore_executor_for_ram for every other engine, with @c threads threads, whose scratch
+ *  together takes a quarter of the cgroup's memory, or the library's default without one. */
+inline void spawn_executor(engine_options_t const& options, ustore_executor_t* executor,
+                           ustore_outcome_t* outcome) noexcept {
+    engine_names_t names;
+    if (unnamed_flag_t const unnamed = read_engine_names(options, names); !unnamed.flag.empty()) {
+        *outcome = {ustore_status_invalid_argument_k, "Unknown engine, isolation or transport name"};
+        return;
+    }
+    std::size_t const threads = options.threads.value ? options.threads.value : affinity_cores();
+    // Every pool thread and the call itself keep a scratch
+    std::size_t const scratch_limit = cgroup_memory_limit() / 4 / (threads + 1);
+    if (names.engine == ustore_engine_nvme_k) {
+        ustore_executor_for_nvme_t spawn {.executor = executor,
+                                          .outcome = outcome,
+                                          .nvme = {.transport = names.transport},
+                                          .threads = threads,
+                                          .scratch_limit = scratch_limit};
+        return ustore_executor_for_nvme(&spawn);
+    }
+    ustore_executor_for_ram_t spawn {.executor = executor,
+                                     .outcome = outcome,
+                                     .threads = threads,
+                                     .scratch_limit = scratch_limit};
+    ustore_executor_for_ram(&spawn);
+}
+
+/** Opens the engine @p options name into @p database, running the open on @p executor with
+ *  @p completion as every call does; the one place binaries tell the engines apart. The in-memory
+ *  engine starts empty without a directory, and persists in one otherwise. NVMe moves bytes as the
+ *  executor @c spawn_executor made for it names, so a transport named without one is refused. Every
+ *  engine may hold half the cgroup's memory, or the library's default without a cgroup limit. */
+inline void open_engine(engine_options_t const& options, ustore_executor_t executor, ustore_database_t* database,
+                        ustore_outcome_t* outcome,
                         ustore_completion_t completion = ustore_completion_blocking_k) noexcept {
     engine_names_t names;
     if (unnamed_flag_t const unnamed = read_engine_names(options, names); !unnamed.flag.empty()) {
-        *outcome = {ustore_status_invalid_argument_k, "An engine, isolation or transport has no such name"};
+        *outcome = {ustore_status_invalid_argument_k, "Unknown engine, isolation or transport name"};
         return;
     }
     ustore_bytes_view_t const directory {reinterpret_cast<ustore_byte_t const*>(options.directory),
@@ -728,6 +810,7 @@ inline void open_engine(engine_options_t const& options, ustore_database_t* data
         *outcome = {ustore_status_invalid_argument_k, "Only nvme and rocksdb fill data directories"};
         return;
     }
+    std::size_t const memory_limit = cgroup_memory_limit() / 2;
     switch (names.engine) {
     case ustore_engine_ram_k: {
         if (!directory.length) {
@@ -735,7 +818,8 @@ inline void open_engine(engine_options_t const& options, ustore_database_t* data
                                              .executor = executor,
                                              .outcome = outcome,
                                              .completion = completion,
-                                             .isolation = names.isolation};
+                                             .isolation = names.isolation,
+                                             .memory_limit = memory_limit};
             return ustore_database_init_ram(&init);
         }
         ustore_database_open_ram_t open {.database = database,
@@ -743,7 +827,8 @@ inline void open_engine(engine_options_t const& options, ustore_database_t* data
                                          .outcome = outcome,
                                          .completion = completion,
                                          .directory = directory,
-                                         .isolation = names.isolation};
+                                         .isolation = names.isolation,
+                                         .memory_limit = memory_limit};
         return ustore_database_open_ram(&open);
     }
     case ustore_engine_rocksdb_k: {
@@ -753,7 +838,8 @@ inline void open_engine(engine_options_t const& options, ustore_database_t* data
                                              .completion = completion,
                                              .directory = directory,
                                              .data_directories = listed,
-                                             .data_directories_count = options.directories.size};
+                                             .data_directories_count = options.directories.size,
+                                             .memory_limit = memory_limit};
         return ustore_database_open_rocksdb(&open);
     }
     case ustore_engine_leveldb_k: {
@@ -761,7 +847,8 @@ inline void open_engine(engine_options_t const& options, ustore_database_t* data
                                              .executor = executor,
                                              .outcome = outcome,
                                              .completion = completion,
-                                             .directory = directory};
+                                             .directory = directory,
+                                             .memory_limit = memory_limit};
         return ustore_database_open_leveldb(&open);
     }
     case ustore_engine_nvme_k: {
@@ -772,23 +859,13 @@ inline void open_engine(engine_options_t const& options, ustore_database_t* data
                                           .completion = completion,
                                           .directory = bytes_view(located),
                                           .data_directories = listed,
-                                          .data_directories_count = options.directories.size};
-        if (executor || names.transport == ustore_transport_automatic_k) return ustore_database_open_nvme(&open);
-
-        // The transport is the placement of an NVMe executor, which the open reads once, so one made for it alone
-        // may go as soon as the open is final
-        ustore_executor_t moving = nullptr;
-        ustore_executor_for_nvme_t spawn {.executor = &moving,
-                                          .outcome = outcome,
-                                          .nvme = {.transport = names.transport},
-                                          .threads = 1};
-        ustore_executor_for_nvme(&spawn);
-        if (outcome->status != ustore_status_success_k) return;
-        open.executor = moving;
-        open.completion = ustore_completion_blocking_k;
-        ustore_database_open_nvme(&open);
-        ustore_executor_free(moving);
-        return;
+                                          .data_directories_count = options.directories.size,
+                                          .memory_limit = memory_limit};
+        if (!executor && names.transport != ustore_transport_automatic_k) {
+            *outcome = {ustore_status_invalid_argument_k, "A transport needs an NVMe executor"};
+            return;
+        }
+        return ustore_database_open_nvme(&open);
     }
     default: *outcome = {ustore_status_invalid_argument_k, "No engine has that name"};
     }

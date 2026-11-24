@@ -528,7 +528,6 @@ def test_await_documents_under_asyncio(view, docs, later, arena):
             lambda view: view.docs_gather([1], ["a", "b"], [FieldType.I64], ustore.Arena(), collection="docs"),
             ValueError,
         ),
-        (lambda view: view.docs_gather([1], ["a"], FieldType.JSON, ustore.Arena(), collection="docs"), ValueError),
         (lambda view: view.docs_gather([1], ["a"], 999, ustore.Arena(), collection="docs"), ValueError),
         (lambda view: view.docs_gather([1], [3], FieldType.I64, ustore.Arena(), collection="docs"), TypeError),
     ],
@@ -544,13 +543,13 @@ def test_await_documents_under_asyncio(view, docs, later, arena):
         "keyword",
         "fields-as-string",
         "types-width",
-        "gather-json",
         "gather-type",
         "field-name-type",
     ],
 )
 def test_binding_refusals(view, docs, call, failure: type):
-    """Mismatched widths, keyless broadcasts, unknown modes and types, and misspelled keywords raise."""
+    """Mismatched widths, keyless broadcasts, unknown modes and types, and misspelled keywords
+    raise, while gathers produce JSON too."""
     with pytest.raises(failure):
         call(view)
 
@@ -559,14 +558,15 @@ def test_binding_refusals(view, docs, call, failure: type):
 
 
 def test_docs_filters_narrow_scans_and_cursors(view, docs, arena):
-    """A JSONPath root filter narrows a scan, and a documents cursor keeps the documents its filter matched, page by
-    page, with their bodies when asked."""
+    """A JSONPath root filter narrows a scan, and a documents cursor keeps the documents its filter matched, batch by
+    batch, with their bodies as the JSON column of the empty field."""
     view.docs_write([1, 2, 3, 4], ['{"age": 25}', '{"age": 40}', '{"name": "x"}', '{"age": 31}'], collection=docs)
     older = view.docs_scan(0, 8, arena, collection=docs, filter="?@.age > 30")
     assert [key.int for key in older[0]] == [2, 4]
-    with view.docs_cursor(collection=docs, filter="?@.age > 30") as cursor:
-        page = cursor.next(1, arena, values=True)
-        assert [key.int for key in page] == [2]
-        assert json.loads(bytes(page.values[0])) == {"age": 40}
-        assert [key.int for key in cursor.next(1, arena)] == [4]
+    with view.docs_cursor(collection=docs, filter="?@.age > 30", fields=[""]) as cursor:
+        [(keys, columns)] = cursor.next(1, arena)
+        assert [key.int for key in keys] == [2]
+        assert json.loads(bytes(columns[0][0])) == {"age": 40}
+        [(keys, _)] = cursor.next(1, arena)
+        assert [key.int for key in keys] == [4]
         assert not cursor.next(1, arena)

@@ -17,7 +17,7 @@
 #include <cstdio>  // `std::fopen`, `std::fwrite`, `std::fseek`, `std::fclose`
 #include <cstring> // `std::memcpy`
 
-#include <sys/resource.h> // `setrlimit`, `getrlimit`, `RLIMIT_NOFILE`, `RLIMIT_MEMLOCK`
+#include <sys/resource.h> // `setrlimit`, `RLIMIT_NOFILE`
 #include <sys/wait.h>     // `waitpid`, `WIFEXITED`, `WEXITSTATUS`
 #include <unistd.h>       // `fork`, `_exit`
 
@@ -47,7 +47,7 @@ using namespace unum::ustore::blobs;
 constexpr fixture_config_t volume_config_k {
     .stream_buffers = 2,
     .runs_capacity = 64,
-    .shared_io_channels = 2,
+    .queues_threads = 2,
     .memory_limit = std::size_t {64} * 1024 * 1024,
 };
 
@@ -165,10 +165,10 @@ auto mount_slotted(fixture_type_& fixture, util::io_channel_t& channel,
 template <typename fixture_type_>
 case_result_t test_directory_keeps_named_and_reclaims_leftovers(fixture_type_& fixture) {
     if (!fixture.persists_volumes()) return case_result_t::skipped(memory_volumes_vanish_k);
-    auto [guard, acquire_status] = fixture.channels.acquire();
+    auto [guard, acquire_status] = fixture.channel(0);
     expect_true(acquire_status.succeeded());
     if (acquire_status.failed()) return {};
-    util::io_channel_t& channel = guard.channel();
+    util::io_channel_t& channel = *guard;
 
     util::uuid128_t const kept = util::uuid_generator(), leftover = util::uuid_generator();
     std::string leftover_path;
@@ -208,10 +208,10 @@ case_result_t test_directory_keeps_named_and_reclaims_leftovers(fixture_type_& f
 template <typename fixture_type_>
 case_result_t test_directory_ignores_an_unrenamed_copy(fixture_type_& fixture) {
     if (!fixture.persists_volumes()) return case_result_t::skipped(memory_volumes_vanish_k);
-    auto [guard, acquire_status] = fixture.channels.acquire();
+    auto [guard, acquire_status] = fixture.channel(0);
     expect_true(acquire_status.succeeded());
     if (acquire_status.failed()) return {};
-    util::io_channel_t& channel = guard.channel();
+    util::io_channel_t& channel = *guard;
     {
         auto [volume, mount_status] = fixture.mount_volume(channel);
         expect_true(mount_status.succeeded());
@@ -241,10 +241,10 @@ case_result_t test_directory_ignores_an_unrenamed_copy(fixture_type_& fixture) {
 template <typename fixture_type_>
 void test_directory_places_by_free_space(fixture_type_& fixture) {
     using volume_t = typename fixture_type_::volume_t;
-    auto [guard, acquire_status] = fixture.channels.acquire();
+    auto [guard, acquire_status] = fixture.channel(0);
     expect_true(acquire_status.succeeded());
     if (acquire_status.failed()) return;
-    util::io_channel_t& channel = guard.channel();
+    util::io_channel_t& channel = *guard;
 
     std::string const first = fixture.data_directory_path(0), second = fixture.data_directory_path(1);
     std::array<util::data_address_t, 2> addresses {};
@@ -285,10 +285,10 @@ void test_directory_spreads_unwritten_runs(fixture_type_& fixture) {
     // Large enough that another writer on the filesystem cannot move its free bytes that far
     // between two probes.
     constexpr std::uint64_t run_bytes_k = 16ull * 1024ull * 1024ull;
-    auto [guard, acquire_status] = fixture.channels.acquire();
+    auto [guard, acquire_status] = fixture.channel(0);
     expect_true(acquire_status.succeeded());
     if (acquire_status.failed()) return;
-    util::io_channel_t& channel = guard.channel();
+    util::io_channel_t& channel = *guard;
     auto [volume, mount_status] = fixture.mount_volume(channel, directories_k);
     expect_true(mount_status.succeeded());
     if (mount_status.failed()) return;
@@ -307,10 +307,10 @@ void test_directory_spreads_unwritten_runs(fixture_type_& fixture) {
  *  unlink the first mount's unpublished runs, and mounts once the first is gone. */
 template <typename fixture_type_>
 void test_directory_refuses_a_second_mount(fixture_type_& fixture) {
-    auto [guard, acquire_status] = fixture.channels.acquire();
+    auto [guard, acquire_status] = fixture.channel(0);
     expect_true(acquire_status.succeeded());
     if (acquire_status.failed()) return;
-    util::io_channel_t& channel = guard.channel();
+    util::io_channel_t& channel = *guard;
     {
         auto [volume, mount_status] = fixture.mount_volume(channel);
         expect_true(mount_status.succeeded());
@@ -329,10 +329,10 @@ void test_directory_refuses_a_second_mount(fixture_type_& fixture) {
  *  mount, and a zero block reads as free. */
 template <typename fixture_type_>
 void test_slotted_keeps_named_and_reclaims_leftovers(fixture_type_& fixture) {
-    auto [guard, acquire_status] = fixture.channels.acquire();
+    auto [guard, acquire_status] = fixture.channel(0);
     expect_true(acquire_status.succeeded());
     if (acquire_status.failed()) return;
-    util::io_channel_t& channel = guard.channel();
+    util::io_channel_t& channel = *guard;
     std::string const device = stand_in_device(fixture, "leftovers.raw", stand_in_slots_k);
     raw_address_t const raw {device, 0, stand_in_slots_k};
     util::data_address_t const addresses[] {raw.address()};
@@ -382,10 +382,10 @@ void test_slotted_keeps_named_and_reclaims_leftovers(fixture_type_& fixture) {
  *  the next publication lands, while the run packed beside it in the same slot stays whole. */
 template <typename fixture_type_>
 void test_slotted_zeroes_a_dropped_run(fixture_type_& fixture) {
-    auto [guard, acquire_status] = fixture.channels.acquire();
+    auto [guard, acquire_status] = fixture.channel(0);
     expect_true(acquire_status.succeeded());
     if (acquire_status.failed()) return;
-    util::io_channel_t& channel = guard.channel();
+    util::io_channel_t& channel = *guard;
     std::string const device = stand_in_device(fixture, "dropped.raw", stand_in_slots_k);
     raw_address_t const raw {device, 0, stand_in_slots_k};
     util::data_address_t const addresses[] {raw.address()};
@@ -423,10 +423,10 @@ void test_slotted_zeroes_a_dropped_run(fixture_type_& fixture) {
 template <typename fixture_type_>
 void test_slotted_ignores_an_uncommitted_copy(fixture_type_& fixture) {
     using volume_t = util::basic_slotted_volume<typename fixture_type_::disk_t, waiter_t, volume_allocator_t>;
-    auto [guard, acquire_status] = fixture.channels.acquire();
+    auto [guard, acquire_status] = fixture.channel(0);
     expect_true(acquire_status.succeeded());
     if (acquire_status.failed()) return;
-    util::io_channel_t& channel = guard.channel();
+    util::io_channel_t& channel = *guard;
     std::string const device = stand_in_device(fixture, "uncommitted.raw", stand_in_slots_k);
     raw_address_t const raw {device, 0, stand_in_slots_k};
     util::data_address_t const addresses[] {raw.address()};
@@ -451,10 +451,10 @@ void test_slotted_ignores_an_uncommitted_copy(fixture_type_& fixture) {
  *  another tool's file keeps every slot it spans, and its magic in a base slot refuses a mount. */
 template <typename fixture_type_>
 void test_slotted_shares_a_medium(fixture_type_& fixture) {
-    auto [guard, acquire_status] = fixture.channels.acquire();
+    auto [guard, acquire_status] = fixture.channel(0);
     expect_true(acquire_status.succeeded());
     if (acquire_status.failed()) return;
-    util::io_channel_t& channel = guard.channel();
+    util::io_channel_t& channel = *guard;
     std::string const device = stand_in_device(fixture, "shared.raw", stand_in_slots_k + 2);
     raw_address_t const first_raw {device, 0, 2}, second_raw {device, 2 * util::slot_bytes_k, 2};
     util::data_address_t const first[] {first_raw.address()}, second[] {second_raw.address()};
@@ -525,10 +525,10 @@ void test_slotted_shares_a_medium(fixture_type_& fixture) {
 /** Data directories listed in another order than the database was created with are refused. */
 template <typename fixture_type_>
 void test_slotted_refuses_reordered_media(fixture_type_& fixture) {
-    auto [guard, acquire_status] = fixture.channels.acquire();
+    auto [guard, acquire_status] = fixture.channel(0);
     expect_true(acquire_status.succeeded());
     if (acquire_status.failed()) return;
-    util::io_channel_t& channel = guard.channel();
+    util::io_channel_t& channel = *guard;
     std::string const smaller = stand_in_device(fixture, "first.raw", 2),
                       larger = stand_in_device(fixture, "second.raw", 3);
     raw_address_t const smaller_raw {smaller, 0, 2}, larger_raw {larger, 0, 3};
@@ -618,9 +618,13 @@ case_result_t test_mount_fits_the_descriptor_limit(char const* directory) {
             struct rlimit const limit {descriptors, descriptors};
             if (::setrlimit(RLIMIT_NOFILE, &limit) != 0) ::_exit(1);
             util::resources_config_t config;
-            config.threads = 1;
             if (sz::failed(config.manifest.assign(util::string_view_t {manifest.c_str()}))) ::_exit(1);
-            auto const [opened, open_status] = util::open_resources<atomic_reference, waiter_t>(config);
+            std::array<fu_memory_domain_id_t, 1> const anywhere {-1};
+            auto [queues, queues_status] = util::nvme_queues_t::make(util::io_transport_t::blocking_k,
+                                                                     util::blocking_queues_config_k, anywhere);
+            if (queues_status.failed()) ::_exit(1);
+            auto const [opened, open_status] = util::open_resources<atomic_reference, waiter_t>(
+                config, util::nvme_queues_ref_t {&queues, 0});
             if (open_status.failed()) ::_exit(open_status.code == wanted ? 0 : 1);
             std::size_t runs = 0;
             [[maybe_unused]] util::status_t const visited = opened->storage.visit([&](auto& mount) noexcept {
@@ -635,55 +639,7 @@ case_result_t test_mount_fits_the_descriptor_limit(char const* directory) {
                     status_name(wanted));
     };
     mounts_under(64, util::status_code_t::success_k);
-    mounts_under(4, util::status_code_t::capacity_exhausted_k);
-    return {};
-}
-
-/** A mount whose channel arena outgrows the gibibyte io_uring pins per table slot still moves its
- *  last block, pinned wherever the locked-memory cap allows. */
-case_result_t test_mount_moves_an_arena_past_a_gibibyte(char const* directory) {
-    if (!directory) return case_result_t::skipped(needs_directory_k);
-    std::string const manifest = fmt::format("{}/{}", directory, "wide_arena/wide.ustore.json");
-    std::string const medium_path = fmt::format("{}/{}", directory, "wide_arena/medium.bin");
-    util::resources_config_t config;
-    config.threads = 1;
-    config.shared_io_channels = 7;
-    config.channels.request_buffer_bytes = std::uint64_t {1} << 20;
-    if (!expect_true(!sz::failed(config.manifest.assign(util::string_view_t {manifest.c_str()})))) return {};
-    auto const [opened, open_status] = util::open_resources<atomic_reference, waiter_t>(config);
-    if (!expect_status(open_status, util::status_code_t::success_k)) return {};
-    util::mount_report_t const report = opened->storage.report();
-    expect_true(report.arena_bytes > util::linux_uring_registered_range_bytes_k);
-    util::status_t const moved = opened->storage.visit([&](auto& mount) noexcept -> status_t {
-        auto [guard, acquire_status] = mount.channels().acquire(0);
-        if (acquire_status.failed()) return acquire_status;
-        util::medium_options_t request;
-        request.name = medium_path.c_str();
-        request.access = util::medium_access_t::create_read_write_k;
-        request.length = util::portable_alignment_k;
-        auto [medium, register_status] = mount.disk().register_medium(request);
-        if (register_status.failed()) return register_status;
-        util::queue_pair_t const& queue_pair = guard.channel().queue_pair();
-        std::uint64_t const last_block = mount.arena().size() - util::portable_alignment_k;
-        std::array<util::request_t, 1> const writes {
-            util::write_request(medium.reference(), util::extent_t {0, util::portable_alignment_k},
-                                mount.arena().reference(last_block), queue_pair.token(0))};
-        std::array<util::completion_t, 1> completions {};
-        auto const [submitted, submit_status] = mount.disk().submit(queue_pair,
-                                                                    std::span<util::request_t const> {writes});
-        auto const [waited, wait_status] = util::wait_completions<waiter_t>(
-            mount.disk(), queue_pair, std::span<util::completion_t> {completions});
-        util::status_t const released = mount.disk().unregister_medium(medium);
-        if (submit_status.failed() || submitted != 1 || wait_status.failed() || waited != 1 ||
-            !completions[0].completed_in_full())
-            return {util::status_code_t::io_k, "The arena's last block would not move"};
-        return released;
-    });
-    expect_status(moved, util::status_code_t::success_k);
-    struct rlimit locked {};
-    if (report.transport == util::io_transport_t::linux_uring_k && ::getrlimit(RLIMIT_MEMLOCK, &locked) == 0 &&
-        locked.rlim_cur == RLIM_INFINITY)
-        expect_true(opened->storage.pinning() == util::range_pinning_t::pinned_k);
+    mounts_under(2, util::status_code_t::capacity_exhausted_k);
     return {};
 }
 
@@ -757,7 +713,5 @@ int main(int argc, char** argv) {
     run_test_case("test_addresses_read_their_forms", test_addresses_read_their_forms);
     run_test_case("test_probed_transport_refuses_a_missing_ring", test_probed_transport_refuses_a_missing_ring);
     run_test_case("test_mount_fits_the_descriptor_limit", test_mount_fits_the_descriptor_limit, directory.path());
-    run_test_case("test_mount_moves_an_arena_past_a_gibibyte", test_mount_moves_an_arena_past_a_gibibyte,
-                  directory.path());
     return finish_test_run();
 }

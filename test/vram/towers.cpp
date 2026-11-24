@@ -46,6 +46,9 @@ constexpr std::size_t entries_k = 96;
 /** The reason a case counting what a call costs reports without the HIP stand-in. */
 constexpr char const* needs_hip_stand_in_k = "needs the HIP stand-in";
 
+/** The reason a device of a vendor this build compiled no class for reports. */
+constexpr char const* needs_gpu_class_k = "needs a GPU class this build compiled for the device";
+
 /** A tape of strings the suite owns, written as the C ABI reads one. */
 struct tape_t {
     std::string bytes;
@@ -94,7 +97,7 @@ class mover_t {
                                                           metal_kernels_);
             opened.failed())
             return opened;
-        return spawn_gpu_executor(drivers_, cuda_kernels_, hip_kernels_, metal_kernels_, device, gpu_class, nullptr, 0,
+        return spawn_gpu_executor(drivers_, cuda_kernels_, hip_kernels_, metal_kernels_, device, gpu_class, 0,
                                   ustore_gds_automatic_k, executor_);
     }
 
@@ -132,13 +135,21 @@ class mover_t {
         return reinterpret_cast<element_type_*>(address);
     }
 
-    /** Whether @p pointer lies on this mover's device. */
-    bool holds(void const* pointer) noexcept {
-        bool held = false;
-        visit([&](auto& executor) noexcept {
-            held = executor.device_of(pointer) == static_cast<int>(executor.device().vendor_ordinal);
-        });
-        return held;
+    /** Names @p arena, which the calls under test write into, and the UStore @p ordinal of the
+     *  device it must describe, as every output check reads it. */
+    void lands_in(ustore_arena_t arena, std::size_t ordinal) noexcept {
+        outputs_arena_ = arena;
+        outputs_device_ = static_cast<std::int32_t>(ordinal);
+    }
+
+    /** Whether the arena the calls write into describes as the expected device's memory. */
+    bool outputs_on_device() noexcept {
+        ustore_arena_description_t description {};
+        ustore_outcome_t outcome {};
+        ustore_arena_describe_t describe {.arena = outputs_arena_, .outcome = &outcome, .description = &description};
+        ustore_arena_describe(&describe);
+        return outcome.status == ustore_status_success_k && description.residency == ustore_residency_vram_k &&
+               description.device == outputs_device_;
     }
 
     /** The first failure of a copy, sticky until the mover dies. */
@@ -167,6 +178,8 @@ class mover_t {
     }
 
     util::gpu_drivers_t drivers_;
+    ustore_arena_t outputs_arena_ = nullptr;
+    std::int32_t outputs_device_ = -1;
     kernel_tables<util::cuda_module_t> cuda_kernels_;
     kernel_tables<util::hip_module_t> hip_kernels_;
     kernel_tables<util::metal_module_t> metal_kernels_;
@@ -301,8 +314,8 @@ struct fixture_t {
     }
 };
 
-/** Holds when the @p count elements at device @p device equal those at host @p host, and live on
- *  the device of @p mover ; otherwise fails a check at the caller's line. */
+/** Holds when the @p count elements at device @p device equal those at host @p host, and the arena
+ *  @p mover names describes as its device; otherwise fails a check at the caller's line. */
 template <typename element_type_>
 bool expect_column(mover_t& mover, element_type_ const* host, element_type_ const* device, std::size_t count,
                    std::source_location const where = std::source_location::current()) {
@@ -318,7 +331,7 @@ bool expect_column(mover_t& mover, element_type_ const* host, element_type_ cons
     bool const same = differing == host_bytes.size();
     unsigned const device_byte = same ? 0 : std::to_integer<unsigned>(fetched_bytes[differing]);
     unsigned const host_byte = same ? 0 : std::to_integer<unsigned>(host_bytes[differing]);
-    bool const on_device = expect_true(mover.holds(device), where);
+    bool const on_device = expect_true(mover.outputs_on_device(), where);
     bool const fetched_whole = expect_true(mover.status().succeeded(), where);
     located_format<std::size_t, std::size_t, unsigned, unsigned> unequal {
         "byte {} of {} is {:#x} on the device, {:#x} on the host"};
@@ -433,7 +446,9 @@ void test_vram_exports(std::size_t ordinal, ustore_gpu_device_t listed, config_t
     ArrowDeviceArray array {};
     expect_true(ustore_strings_view_to_arrow(values, 1, values.layout, call.arena, &schema, &array) ==
                 ustore_status_success_k);
-    ArrowDeviceType const vendor = listed.vendor == ustore_gpu_vendor_amd_k ? ARROW_DEVICE_ROCM : ARROW_DEVICE_CUDA;
+    ArrowDeviceType const vendor = listed.vendor == ustore_gpu_vendor_amd_k     ? ARROW_DEVICE_ROCM
+                                   : listed.vendor == ustore_gpu_vendor_apple_k ? ARROW_DEVICE_METAL
+                                                                                : ARROW_DEVICE_CUDA;
     expect_true(array.device_type == vendor);
     expect_true(array.device_id == static_cast<std::int64_t>(listed.vendor_ordinal));
     expect_true(array.sync_event == nullptr);
@@ -467,6 +482,7 @@ void test_vram_cursors(std::size_t ordinal, ustore_gpu_device_t listed, config_t
     if (!expect_true(mover.open(listed).succeeded())) return;
     device_call_t call {ordinal};
     if (!expect_true(call.status.succeeded())) return;
+    mover.lands_in(call.arena, ordinal);
     fixture_t fixture {config, "cursors"};
     if (!fixture.filled) return;
     ustore_outcome_t outcome {};
@@ -514,6 +530,7 @@ void test_vram_reads(std::size_t ordinal, ustore_gpu_device_t listed, config_t c
     if (!expect_true(mover.open(listed).succeeded())) return;
     device_call_t call {ordinal};
     if (!expect_true(call.status.succeeded())) return;
+    mover.lands_in(call.arena, ordinal);
     fixture_t fixture {config, "reads"};
     if (!fixture.filled) return;
     std::size_t const count = entries_k + 4;
@@ -663,7 +680,7 @@ void test_vram_reads(std::size_t ordinal, ustore_gpu_device_t listed, config_t c
         ustore_docs_gather(&host), ustore_docs_gather(&device);
         expect_success(host_outcome);
         expect_success(device_outcome);
-        if (host_columns && expect_true(device_columns && mover.holds(device_columns))) {
+        if (host_columns && expect_true(device_columns && mover.outputs_on_device())) {
             std::vector<ustore_docs_column_view_t> const columns = mover.fetch(device_columns, 3);
             for (std::size_t field = 0; field != 3; ++field) {
                 ustore_docs_column_view_t const &on_host = host_columns[field], &on_device = columns[field];
@@ -706,6 +723,7 @@ void test_vram_staging(std::size_t ordinal, ustore_gpu_device_t listed, std::vec
     if (!expect_true(mover.open(listed).succeeded())) return;
     device_call_t call {ordinal};
     if (!expect_true(call.status.succeeded())) return;
+    mover.lands_in(call.arena, ordinal);
     fixture_t fixture {config, "staging"};
     if (!fixture.filled) return;
     host_arena_t const kept;
@@ -879,6 +897,7 @@ case_result_t test_vram_matching(std::size_t ordinal, ustore_gpu_device_t listed
     if (!expect_true(mover.open(listed).succeeded())) return {};
     device_call_t call {ordinal};
     if (!expect_true(call.status.succeeded())) return {};
+    mover.lands_in(call.arena, ordinal);
     fixture_t fixture {config, "matching"};
     if (!fixture.filled) return {};
     // Every device matches values through the library's kernels, but the stand-in HIP driver
@@ -1101,6 +1120,11 @@ int main(int argc, char** argv) {
         ustore_gpu_device_t const& listed = devices[ordinal];
         fmt::println("device {}: {}, vendor ordinal {}", ordinal, listed.name, listed.vendor_ordinal);
         std::string const prefix = fmt::format("test_vram_{}{}_", ustore_gpu_vendor_name(listed.vendor), ordinal);
+        // A device of a class this build left out still lists, and every executor on it is refused
+        if (listed.gpu_class == ustore_gpu_class_unknown_k) {
+            run_test_case((prefix + "classes").c_str(), [] { return case_result_t::skipped(needs_gpu_class_k); });
+            continue;
+        }
         run_test_case((prefix + "listing").c_str(), test_vram_listing, listed);
         run_test_case((prefix + "class_ceiling").c_str(), test_vram_class_ceiling, ordinal, listed);
         run_test_case((prefix + "arenas").c_str(), test_vram_arenas, ordinal, config);

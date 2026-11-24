@@ -30,7 +30,8 @@ typedef enum ustore_dataset_format_t {
     /** An Apache Arrow IPC stream, @c .arrows. */
     ustore_dataset_format_arrow_stream_k = 3,
 
-    /** An Apache Arrow IPC file, @c .arrow or @c .feather, read sequentially so a pipe carries it too. */
+    /** An Apache Arrow IPC file, @c .arrow or @c .feather, read sequentially so a pipe
+     *  holds it too. */
     ustore_dataset_format_arrow_file_k = 4,
 
 } ustore_dataset_format_t;
@@ -59,10 +60,18 @@ typedef struct ustore_dataset_import_t {
     /** Already open database instance. */
     ustore_database_t database;
 
+    /** Executor every call of the task blocks on, or @c NULL to run them on the calling thread. */
+    ustore_executor_t executor;
+
     /** Receives the outcome of the import. */
     ustore_outcome_t* outcome;
 
-    /** How durable the import is once final. */
+    /** Memory every call of the task fills and rewinds, made on its executor, which also holds
+     *  each row while it is parsed; @c NULL is refused. */
+    ustore_arena_t arena;
+
+    /** How durable the import is once final, where a buffered one reaches the disk at the next
+     *  @c ustore_database_flush, as freeing the database writes nothing. */
     ustore_durability_t durability;
 
     /** Name of the collection to write, created when missing, where empty takes the schema's @c ustore.collection. */
@@ -72,10 +81,16 @@ typedef struct ustore_dataset_import_t {
      *  collection that already exists must hold what is named here. */
     ustore_modality_t modality;
 
-    /** The file to import, mapped whole, or @c - for standard input, read in the byte counts each message names. */
-    ustore_bytes_view_t path;
+    /** The files to import in order, each mapped whole, or one @c - for standard input, read in the
+     *  byte counts each message names. Under @c ustore_dataset_ingestion_sorted_k several inputs,
+     *  each sorted, merge into one key order, and a key several inputs hold lands from the last of
+     *  them, as every other ingestion lands it. */
+    ustore_strings_view_t paths;
 
-    /** How the input is spelled, where @c ustore_dataset_format_automatic_k reads the extension. */
+    /** Entries of @c paths, at least one. */
+    ustore_size_t paths_count;
+
+    /** How each input is spelled, @c ustore_dataset_format_automatic_k reading its extension. */
     ustore_dataset_format_t format;
 
     /** How the rows land, where a bulk ingest that fails drops the collection it created. */
@@ -101,8 +116,15 @@ typedef struct ustore_dataset_export_t {
     /** Already open database instance. */
     ustore_database_t database;
 
+    /** Executor every call of the task blocks on, or @c NULL to run them on the calling thread. */
+    ustore_executor_t executor;
+
     /** Receives the outcome of the export. */
     ustore_outcome_t* outcome;
+
+    /** Memory every call of the task fills and rewinds, made on its executor, which also holds
+     *  each row while it is parsed; @c NULL is refused. */
+    ustore_arena_t arena;
 
     /** What the export sees, where @c NULL takes a snapshot of the head. */
     ustore_view_t view;
@@ -147,10 +169,18 @@ typedef struct ustore_docs_import_t {
     /** Already open database instance. */
     ustore_database_t database;
 
+    /** Executor every call of the task blocks on, or @c NULL to run them on the calling thread. */
+    ustore_executor_t executor;
+
     /** Receives the outcome of the import. */
     ustore_outcome_t* outcome;
 
-    /** How durable the document writes are once the import is final. */
+    /** Memory every call of the task fills and rewinds, made on its executor, which also holds
+     *  each row while it is parsed; @c NULL is refused. */
+    ustore_arena_t arena;
+
+    /** How durable the document writes are once the import is final, where buffered ones reach the
+     *  disk at the next @c ustore_database_flush, as freeing the database writes nothing. */
     ustore_durability_t durability;
 
     /** Collection receiving the documents. */
@@ -187,10 +217,14 @@ typedef struct ustore_docs_export_t {
     /** Already open database instance. */
     ustore_database_t database;
 
+    /** Executor every call of the task blocks on, or @c NULL to run them on the calling thread. */
+    ustore_executor_t executor;
+
     /** Receives the outcome of the export. */
     ustore_outcome_t* outcome;
 
-    /** Memory every read of documents rewinds and reuses, or @c NULL for a private one. */
+    /** Memory every call of the task fills and rewinds, made on its executor, which also holds
+     *  each row while it is parsed; @c NULL is refused. */
     ustore_arena_t arena;
 
     /** What the scans and reads see, where @c NULL is the head. */
@@ -228,10 +262,18 @@ typedef struct ustore_graph_import_t {
     /** Already open database instance. */
     ustore_database_t database;
 
+    /** Executor every call of the task blocks on, or @c NULL to run them on the calling thread. */
+    ustore_executor_t executor;
+
     /** Receives the outcome of the import. */
     ustore_outcome_t* outcome;
 
-    /** How durable the edge upserts are once the import is final. */
+    /** Memory every call of the task fills and rewinds, made on its executor, which also holds
+     *  each row while it is parsed; @c NULL is refused. */
+    ustore_arena_t arena;
+
+    /** How durable the edge upserts are once the import is final, where buffered ones reach the
+     *  disk at the next @c ustore_database_flush, as freeing the database writes nothing. */
     ustore_durability_t durability;
 
     /** Collection receiving the edges. */
@@ -268,10 +310,14 @@ typedef struct ustore_graph_export_t {
     /** Already open database instance. */
     ustore_database_t database;
 
+    /** Executor every call of the task blocks on, or @c NULL to run them on the calling thread. */
+    ustore_executor_t executor;
+
     /** Receives the outcome of the export. */
     ustore_outcome_t* outcome;
 
-    /** Memory every lookup of edges rewinds and reuses, or @c NULL for a private one. */
+    /** Memory every call of the task fills and rewinds, made on its executor, which also holds
+     *  each row while it is parsed; @c NULL is refused. */
     ustore_arena_t arena;
 
     /** What the scans and edge lookups see, where @c NULL is the head. */

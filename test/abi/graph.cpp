@@ -444,7 +444,8 @@ void test_database_graph_degrees(config_t const& config) {
     expect_equal(degrees.size(), graph_vertices_count_k);
 }
 
-/** Neighbors of a vertex include itself through a self-loop and both directions of its edges. */
+/** Neighbors of a vertex are viewed in the order @c ustore_graph_read_edges lists its edges:
+ *  outgoing by target, then incoming by source, so a self-loop shows up from both ends. */
 void test_database_graph_neighbors(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     if (!expect_true(!open_status.failed())) return;
@@ -460,15 +461,16 @@ void test_database_graph_neighbors(config_t const& config) {
     if (!expect_true(!arena_status.failed())) return;
     auto const [first_neighbors, first_status] = graph.neighbors(key_from_integer(1), arena);
     expect_true(!first_status.failed());
-    expect_equal(first_neighbors.size(), 2u);
+    if (!expect_equal(first_neighbors.size(), 3u)) return;
     expect_equal(first_neighbors[0], key_from_integer(1));
     expect_equal(first_neighbors[1], key_from_integer(2));
+    expect_equal(first_neighbors[2], key_from_integer(1));
 
     auto const [second_neighbors, second_status] = graph.neighbors(key_from_integer(2), arena);
     expect_true(!second_status.failed());
-    expect_equal(second_neighbors.size(), 2u);
-    expect_equal(second_neighbors[0], key_from_integer(1));
-    expect_equal(second_neighbors[1], key_from_integer(3));
+    if (!expect_equal(second_neighbors.size(), 2u)) return;
+    expect_equal(second_neighbors[0], key_from_integer(3));
+    expect_equal(second_neighbors[1], key_from_integer(1));
 }
 
 #pragma endregion Graph Modality

@@ -79,10 +79,10 @@ struct StringRunsWritten(Defaultable, ImplicitlyCopyable):
 
 @fieldwise_init
 struct StringRuns[origin: MutOrigin](Deferrable, Sized):
-    """The strings a scan or a sample listed into the arena it borrows, run after run, one run per task.
+    """The strings a scan or a sample listed into the arena it views, run after run, one run per task.
 
     Parameters:
-        origin: The arena the strings live in, which this result borrows.
+        origin: The arena the strings live in, which this result views.
     """
 
     comptime Written = StringRunsWritten
@@ -137,10 +137,10 @@ struct StringKeysWritten(Defaultable, ImplicitlyCopyable):
 
 @fieldwise_init
 struct StringKeys[origin: MutOrigin](Deferrable, Sized):
-    """The keys a batch of strings map onto, read in place from the arena a strings read borrows.
+    """The keys a batch of strings map onto, read in place from the arena a strings read views.
 
     Parameters:
-        origin: The arena the keys live in, which this result borrows.
+        origin: The arena the keys live in, which this result views.
     """
 
     comptime Written = StringKeysWritten
@@ -151,7 +151,7 @@ struct StringKeys[origin: MutOrigin](Deferrable, Sized):
     var written: StringKeysWritten
     """The views the engine wrote."""
     var count: Int
-    """Strings the read carried."""
+    """Strings the read held."""
 
     def __init__(out self, arena: Address, generation: Int, written: StringKeysWritten, count: Int):
         self.arena = Pointer[Arena[ImmUntrackedOrigin], Self.origin](unsafe_from_address=arena)
@@ -160,7 +160,7 @@ struct StringKeys[origin: MutOrigin](Deferrable, Sized):
         self.count = count
 
     def __len__(self) -> Int:
-        """The strings the read carried."""
+        """The strings the read held."""
         return self.count
 
     def present(self, index: Int) raises Error -> Bool:
@@ -190,10 +190,10 @@ struct StringsPulledWritten(Defaultable, ImplicitlyCopyable):
 
 @fieldwise_init
 struct StringsPulled[origin: MutOrigin](Deferrable, Sized):
-    """One page of a strings cursor's walk, read in place from the arena the pull borrows.
+    """One page of a strings cursor's walk, read in place from the arena the pull views.
 
     Parameters:
-        origin: The arena the page lives in, which this result borrows.
+        origin: The arena the page lives in, which this result views.
     """
 
     comptime Written = StringsPulledWritten
@@ -236,9 +236,9 @@ struct StringsScanConfig[
     """The bounds, order and filters of a prefix scan.
 
     Parameters:
-        start_origin: The borrowed start strings.
-        end_origin: The borrowed end strings.
-        patterns_origin: The borrowed patterns.
+        start_origin: The viewed start strings.
+        end_origin: The viewed end strings.
+        patterns_origin: The viewed patterns.
     """
 
     var start_strings: StringsView[Self.start_origin]
@@ -256,7 +256,7 @@ struct StringsScanConfig[
     var progress: Progress
     """Reports the scans finished, and stops the call where it says to."""
     var scores: Bool
-    """Whether one score per listed string comes too, when the patterns carry weights."""
+    """Whether one score per listed string comes too, when the patterns hold weights."""
 
     def __init__(
         out self,
@@ -289,9 +289,9 @@ struct StringsCursorConfig[
     """The bounds, order and filters of a walk over one prefix, every string copied when the walk opens.
 
     Parameters:
-        start_origin: The borrowed start string.
-        end_origin: The borrowed end string.
-        patterns_origin: The borrowed patterns.
+        start_origin: The viewed start string.
+        end_origin: The viewed end string.
+        patterns_origin: The viewed patterns.
     """
 
     var start_string: BytesView[Self.start_origin]

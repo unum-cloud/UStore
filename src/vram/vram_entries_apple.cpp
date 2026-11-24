@@ -26,7 +26,7 @@ namespace unum::ustore {
 
 /** The vocabulary of slots and extents the host binds by. */
 constexpr char metal_shared_source_k[] = {
-#embed "ustore/utilities/vram_apple_shared.h" suffix(, 0) if_empty(0)
+#embed "ustore/utilities/vram_apple_shared.hpp" suffix(, 0) if_empty(0)
 };
 
 /** StringZilla's MSL: its vocabulary, case folding tables and folding, and the substrings, regex

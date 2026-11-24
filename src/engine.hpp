@@ -19,10 +19,11 @@
 #include <array>       // `std::array`
 #include <memory>      // `std::unique_ptr`
 #include <new>         // `std::bad_alloc`, `std::nothrow`
+#include <span>        // `std::span`
 #include <string_view> // `std::string_view` - a pinned class checked against its spelling
 #include <thread>      // `std::thread::id`
 #include <type_traits> // `std::is_same_v`, `std::conditional_t`
-#include <utility>     // `std::forward`
+#include <utility>     // `std::forward`, `std::in_range`
 #include <variant>     // `std::variant`, `std::monostate`
 
 #include <forkunion/atomics.hpp>       // `fu::standard_atomic_ref` & kin - the classes' atomic references
@@ -40,6 +41,7 @@
 
 #include "ustore/utilities/types.hpp" // `expected`, `status_t`
 
+#include "ustore/utilities/nvme_queues.hpp" // `nvme_queues_t`
 #include "ustore/utilities/ram_buffers.hpp" // `host_blocks_t`, `cuda_blocks_t`, `hip_blocks_t`, `metal_blocks_t`
 #include "ustore/utilities/ram_device.hpp"  // `claim_t`
 #include "ustore/utilities/vram_device.hpp" // `cuda_executor_t`, `hip_executor_t`, `metal_executor_t`
@@ -50,18 +52,19 @@
 
 namespace unum::ustore {
 
+using util::arena_allocate;
 using util::cuda_blocks_t;
 using util::cuda_executor_t;
 using util::hip_blocks_t;
 using util::hip_executor_t;
 using util::host_blocks_t;
-using util::lent_pool_t;
 using util::metal_blocks_t;
 using util::metal_executor_t;
+using util::ram_executor_t;
 using util::strings_arg_t;
 
-/** What a call reads through, decoded once by the router from its view, or from the transaction a write carries, and
- *  the scratch and the executor thread it works on. */
+/** What a call reads through, decoded once by the router from its view, or from the transaction a
+ *  write holds, and the scratch and the executor thread it works on. */
 struct view_t {
 
     /** Transaction the call reads or writes through, or null. */
@@ -79,6 +82,12 @@ struct view_t {
 
     /** The executor whose thread runs the call, or null for a call run alone. */
     ustore_executor_t executor = nullptr;
+
+    /** The queues of a call naming no NVMe executor: a VRAM executor's own blocking queues, or
+     *  for a call without an executor queues empty in the router's frame until an NVMe path
+     *  first reads or writes, which makes them blocking queues that pin nothing; null on RAM
+     *  and NVMe executors. */
+    util::nvme_queues_t* queues = nullptr;
 
     /** Which thread of @c executor serves the work: a pool thread's index for a slice of a call,
      *  or the pool's size for the call's body, which runs on its caller or on pool thread 0. */
@@ -300,6 +309,16 @@ struct strings_verbs<residency_> {
 template <vendored_residency_t>
 struct docs_verbs;
 
+/** The columns a docs cursor gathers from every row it hands out: its fields, the empty one being
+ *  the whole document, and the type of each, copied at the cursor's init. */
+struct docs_columns_t {
+    std::span<std::string_view const> fields;
+    std::span<ustore_docs_field_type_t const> types;
+};
+
+/** The batches one pull of a docs cursor fills, defined in <tt>src/docs_layer.hpp</tt>. */
+struct docs_batches_t;
+
 /** The verbs of documents collections on host threads. */
 template <>
 struct docs_verbs<vendored_residency_t::host_k> {
@@ -309,7 +328,10 @@ struct docs_verbs<vendored_residency_t::host_k> {
     util::status_t (*gist)(ustore_docs_gist_t const&, view_t const&) noexcept;
     util::status_t (*gather)(ustore_docs_gather_t const&, strings_arg_t const& fields, view_t const&) noexcept;
     util::status_t (*remove)(ustore_docs_remove_t const&, view_t const&) noexcept;
-    util::status_t (*scan)(ustore_docs_scan_t const&, view_t const&) noexcept;
+
+    /** Lists keys, or fills @p batches where it is not null with the rows of the one task of a
+     *  cursor's pull, so a pull pays one call and one reading for its keys and columns. */
+    util::status_t (*scan)(ustore_docs_scan_t const&, docs_batches_t* batches, view_t const&) noexcept;
     util::status_t (*sample)(ustore_docs_sample_t const&, view_t const&) noexcept;
     util::status_t (*measure)(ustore_docs_measure_t const&, view_t const&) noexcept;
 };
@@ -493,6 +515,22 @@ enum class access_t : std::uint8_t {
     read_only_k,
 };
 
+/** Which executors calls on a database admit, by how its engine reaches its data. */
+enum class executor_admission_t : std::uint8_t {
+
+    /** Any executor, or none, as on the RAM, RocksDB and LevelDB engines. */
+    any_executor_k,
+
+    /** An NVMe executor, or a call naming none or a VRAM one over queues @c src/ builds for it, as
+     *  NVMe on files admits; a RAM executor holds none, so it answers @c ustore_status_device_k. */
+    no_ram_executor_k,
+
+    /** An NVMe executor alone, as NVMe on SPDK admits, since no blocking queue reaches a namespace:
+     *  a call naming none answers @c ustore_status_invalid_argument_k, and any other executor
+     *  @c ustore_status_device_k. */
+    nvme_executor_k,
+};
+
 /** The engine's own state behind @p handle, a database, transaction or snapshot handle, which only the entries of
  *  the engine that made it cast back to their type, or null for a null @p handle. */
 template <typename state_type_, typename handle_type_>
@@ -614,15 +652,11 @@ util::status_t remove_over_blobs(arguments_type_ const& arguments, view_t const&
     return values_verbs_.remove(remove, view);
 }
 
-/** Scans the keys of collections holding @p modality_ through @p values_verbs_, after @p resolve_ refuses every
- *  collection holding another modality: the documents, vertices and pages of the scans of those modalities. */
-template <blobs_verbs<vendored_residency_t::host_k> const& values_verbs_, auto resolve_, ustore_modality_t modality_,
-          typename arguments_type_>
-util::status_t scan_over_blobs(arguments_type_ const& arguments, view_t const& view) noexcept {
-    util::status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count, modality_,
-                                             view);
-    if (resolved.failed()) return resolved;
-    ustore_blobs_scan_t const scan {
+/** The scan of keys @p arguments ask for, as a scan of the blobs their documents, vertices or
+ *  pages are kept as. */
+template <typename arguments_type_>
+ustore_blobs_scan_t blobs_scan_of(arguments_type_ const& arguments) noexcept {
+    return {
         .database = arguments.database,
         .executor = arguments.executor,
         .outcome = arguments.outcome,
@@ -641,7 +675,33 @@ util::status_t scan_over_blobs(arguments_type_ const& arguments, view_t const& v
         .progress = arguments.progress,
         .progress_state = arguments.progress_state,
     };
-    return values_verbs_.scan(scan, view);
+}
+
+/** Scans the keys of collections holding @p modality_ through @p values_verbs_, after @p resolve_
+ *  refuses every collection holding another modality: the documents, vertices and pages of the
+ *  scans of those modalities. */
+template <blobs_verbs<vendored_residency_t::host_k> const& values_verbs_, auto resolve_, ustore_modality_t modality_,
+          typename arguments_type_>
+util::status_t scan_over_blobs(arguments_type_ const& arguments, view_t const& view) noexcept {
+    util::status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count, modality_,
+                                             view);
+    if (resolved.failed()) return resolved;
+    return values_verbs_.scan(blobs_scan_of(arguments), view);
+}
+
+/** The collection of every key the finished scan @p arguments listed, in their order, carved in
+ *  @p scratch, as the read of their values names them. */
+template <typename arguments_type_>
+util::expected<std::span<ustore_collection_id_t>> scanned_collections(arguments_type_ const& arguments,
+                                                                      ustore_arena_t scratch) noexcept {
+    std::size_t const listed = (*arguments.offsets)[arguments.count];
+    auto [collections, collections_status] = arena_allocate<ustore_collection_id_t>(scratch, listed);
+    if (collections_status.failed()) return collections_status;
+    util::strided_iterator<ustore_collection_id_t const> const walked = util::strided(arguments.collections);
+    for (std::size_t task = 0; task != arguments.count; ++task)
+        for (std::size_t index = (*arguments.offsets)[task]; index != (*arguments.offsets)[task + 1]; ++index)
+            collections[index] = walked[static_cast<std::ptrdiff_t>(task)];
+    return collections;
 }
 
 /** Samples the keys of collections holding @p modality_ through @p values_verbs_, after @p resolve_
@@ -703,23 +763,15 @@ util::status_t measure_over_blobs(arguments_type_ const& arguments, view_t const
 /** Mints a UUIDv7 for a new collection, refusing when the system gives no entropy. */
 util::expected<ustore_collection_id_t> mint_collection_id() noexcept;
 
-/** What an executor tells the NVMe databases it opens: how they move bytes, and on which threads. */
-struct nvme_placement_t {
-
-    /** How the databases move bytes, zeroed for the engine's defaults. */
-    ustore_nvme_options_t nvme {};
-
-    /** Threads the executor runs, each keeping an I/O channel of its own, or zero for the engine's default. */
-    std::size_t threads = 0;
-
-    /** The executor whose pool threads and holding call keep a channel and an epoch slot of their
-     *  own in the databases it opens, or null for an executor of no NVMe placement. */
-    ustore_executor_handle_t const* executor = nullptr;
-};
-
-/** The placement @p executor carries when @c ustore_executor_for_nvme made it, and the defaults for any other and for
- *  none. */
-nvme_placement_t nvme_placement_of(ustore_executor_t executor) noexcept;
+/** Replaces @p value with @p requested unless it is zero, answering whether @p requested
+ *  fits @p value. */
+template <typename value_type_>
+bool take_unless_zero(value_type_& value, ustore_size_t requested) noexcept {
+    if (requested == 0) return true;
+    if (!std::in_range<value_type_>(requested)) return false;
+    value = static_cast<value_type_>(requested);
+    return true;
+}
 
 /** Serves @p serve_ of an oracle, whose library may throw, turning whatever it throws into a
  *  status; each argument binds as the verb takes it, so a plan the verb fills stays writable. */
@@ -754,6 +806,10 @@ constexpr entry_layout_t entry_layout_of(ustore_modality_t modality) noexcept {
 
 #pragma region Executors
 
+/** Bytes each thread's scratch of an executor spans at most when its caller names no
+ *  @c scratch_limit. */
+inline constexpr std::size_t scratch_limit_default_k = std::size_t {16} << 30;
+
 /** Every argument struct that names an executor, the inits, opens and views of the engines
  *  included, so a delegated call keeps its arguments by value. */
 using deferred_arguments_t = std::variant<
@@ -772,9 +828,10 @@ using deferred_arguments_t = std::variant<
     ustore_pages_read_t, ustore_pages_scan_t, ustore_strings_write_t, ustore_strings_remove_t, ustore_strings_read_t,
     ustore_strings_scan_t, ustore_blobs_cursor_next_t, ustore_strings_cursor_next_t, ustore_docs_cursor_next_t,
     ustore_pages_cursor_next_t, ustore_graph_vertices_cursor_next_t, ustore_changes_cursor_init_t,
-    ustore_changes_cursor_next_t, ustore_database_init_ram_t, ustore_database_open_ram_t,
-    ustore_database_open_rocksdb_t, ustore_database_view_rocksdb_t, ustore_database_open_leveldb_t,
-    ustore_database_open_nvme_t>;
+    ustore_changes_cursor_next_t, ustore_ingest_init_t, ustore_ingest_append_t, ustore_ingest_finish_t,
+    ustore_database_init_ram_t, ustore_database_open_ram_t, ustore_database_open_rocksdb_t,
+    ustore_database_view_rocksdb_t, ustore_database_open_leveldb_t, ustore_database_open_nvme_t,
+    ustore_database_view_nvme_t>;
 
 /** The one call that holds a UStore executor, from its claim to its end. */
 struct holding_call_t {
@@ -803,11 +860,6 @@ struct holding_call_t {
     std::thread::id body_thread;
 };
 
-/** The right to dispatch on @p pool, owned or lent. */
-inline util::pool_view_t view_of(std::variant<util::executor_t, util::lent_pool_t> const& pool) noexcept {
-    return std::visit([](auto const& alternative) noexcept { return alternative.view(); }, pool);
-}
-
 /** What one handle may use: the masks this machine runs, narrowed by a requested ceiling's, as
  *  @c pick_cpu_ceiling picks them once at open. */
 struct cpu_ceiling_t {
@@ -822,14 +874,14 @@ struct cpu_ceiling_t {
 /** The CPU families UStore ships variants for, named as USearch names them. Each class bundles the
  *  wait instruction and the atomics its silicon generation guarantees, and the StringZilla kernels
  *  its calls dispatch to; only a class whose strings kit, waiter or atomic reference differs from
- *  its parent's carries a variant. */
+ *  its parent's holds a variant. */
 enum class cpu_class_t : std::uint32_t {
 
     /** The zero value, which picks the newest class this machine runs. */
     unknown_k = ustore_cpu_class_unknown_k,
 
     /** The portable floor: standard atomics, spinning on the hint every core of its architecture
-     *  carries, @c PAUSE or @c YIELD, and yielding to the scheduler elsewhere. */
+     *  holds, @c PAUSE or @c YIELD, and yielding to the scheduler elsewhere. */
     serial_k = ustore_cpu_class_serial_k,
 
     /** The one class of a monoversioned build: the waiter, atomic reference and
@@ -1028,7 +1080,7 @@ struct atomic_ref_for_cpu_class<cpu_class_t::monoversioned_k> {
 template <cpu_class_t cpu_class_, typename value_type_>
 using atomic_ref_of = typename atomic_ref_for_cpu_class<cpu_class_>::template type<value_type_>;
 
-/** The spin hints every core of an architecture carries - PAUSE, YIELD, Zihintpause and Power's
+/** The spin hints every core of an architecture holds - PAUSE, YIELD, Zihintpause and Power's
  *  priority nops: the runtime confirms nothing about them. */
 inline constexpr fu::capabilities_t baseline_hints_k = fu::capability_x86_pause_k | fu::capability_arm64_yield_k |
                                                        fu::capability_riscv64_pause_k | fu::capability_ppc64_yield_k;
@@ -1193,7 +1245,7 @@ constexpr fu_capabilities_t forkunion_allowed_of(cpu_ceiling_t ceiling) noexcept
 template <cpu_class_t... classes_>
 struct cpu_ladder {};
 
-/** The classes carrying variants, each lineage newest first and the serial floor last, or the
+/** The classes holding variants, each lineage newest first and the serial floor last, or the
  *  one class of a monoversioned build; a rung the build left out is skipped by the walk, never
  *  by the list. */
 #if USTORE_TARGET_MONOVERSIONED
@@ -1363,6 +1415,10 @@ struct ustore_database_handle_t {
     /** Whether calls may change the database, as an open or a view set it. */
     access_t access = access_t::read_write_k;
 
+    /** The executors calls on the database admit, which its engine's open sets, refused by the
+     *  router before it claims anything. */
+    executor_admission_t admitted_executors = executor_admission_t::any_executor_k;
+
     /** The kernels and waits every call on the database may use, picked once at open. */
     cpu_ceiling_t ceiling;
 
@@ -1382,8 +1438,8 @@ struct ustore_database_handle_t {
     std::uint32_t open_ingests = 0;
 };
 
-/** What @c ustore_database_compact_plan_t points to: the engine plan, the database and executor
- *  every call naming it must name, and the count of those calls, which its free waits out. */
+/** What @c ustore_database_compact_plan_t points to: the engine plan, the database every call
+ *  naming it must name, and the count of those calls, which its free waits out. */
 struct ustore_database_compact_plan_handle_t {
 
     /** The engine's plan, opened by the call that made the handle and freed with it. */
@@ -1392,9 +1448,6 @@ struct ustore_database_compact_plan_handle_t {
     /** The database the plan compacts, whose compaction claim it holds until its finish, only ever
      *  compared with the one each call passes. */
     ustore_database_t opened_on = nullptr;
-
-    /** The executor the plan was opened with, which every call naming the plan names. */
-    ustore_executor_t opened_with = nullptr;
 
     /** Executor calls naming the plan that have not ended, through the floor reference. */
     std::uint32_t named_calls = 0;
@@ -1417,13 +1470,16 @@ struct ustore_transaction_handle_t {
 };
 
 /** What @c ustore_ingest_t points to: its engine and state, null once finished, the database it
- *  keeps open, the scratch every call on it runs in, as the @c view_t the router hands its engine
- *  names it, and the claim that refuses a second call on it as contended. */
+ *  keeps open, the arena holding the engine's state for the ingest's life, and the claim that
+ *  refuses a second call on it as contended. */
 struct ustore_ingest_handle_t {
     engine_t const* engine = nullptr;
     void* state = nullptr;
     ustore_database_t database = nullptr;
-    ustore_arena_handle_t scratch {};
+
+    /** Host pages on the memory domain of the init's executor, freed with the ingest. */
+    ustore_arena_handle_t kept {};
+
     claim_t claim = claim_t::free_k;
 
     /** Appends and finishes on the ingest that have not ended. */
@@ -1448,8 +1504,8 @@ struct ustore_snapshot_handle_t {
  *  the one call holding it, and what the executor computes with. */
 struct ustore_executor_handle_t {
 
-    /** The pool every call forks on, owned or lent; an exclusive one also runs delegated calls. */
-    std::variant<util::executor_t, lent_pool_t> pool;
+    /** The pool every call forks on; an exclusive one also runs delegated calls. */
+    ram_executor_t pool;
 
     /** One scratch per pool thread and one for the call at index @c threads, each kept local. */
     st::vector<ustore_arena_handle_t> scratches;
@@ -1460,11 +1516,23 @@ struct ustore_executor_handle_t {
     /** The memory domain of pool thread 0, holding the call's scratch and every arena made here. */
     fu_memory_domain_id_t memory_domain = 0;
 
-    /** Nothing beyond the pool on RAM, the rings' options on NVMe, the device's stream on VRAM of
-     *  any vendor; the variant is the kind tag, so no second word can disagree. */
-    std::variant<std::monostate, ustore_nvme_options_t, cuda_executor_t, hip_executor_t, metal_executor_t> device;
+    /** Nothing beyond the pool on RAM, one reading and one writing ring per pool thread and the
+     *  holding call on NVMe, the device's stream on VRAM of any vendor; the variant is the kind
+     *  tag, so no second word can disagree. */
+    std::variant<std::monostate, util::nvme_queues_t, cuda_executor_t, hip_executor_t, metal_executor_t> device;
+
+    /** The blocking queues a VRAM executor's call and its slices read drives through, one
+     *  per scratch, made with the executor so a warm call allocates none; empty on RAM
+     *  and NVMe executors. */
+    util::nvme_queues_t blocking_queues;
 
     /** The class a VRAM executor's device was opened for, which every executor an engine spawns
      *  there takes too; @c unknown_k on RAM and NVMe. */
     gpu_class_t gpu_class = gpu_class_t::unknown_k;
 };
+
+/** The queues @p executor holds when @c ustore_executor_for_nvme made it, which the databases it
+ *  opens take their transport and blocks from, or null for any other executor and for none. */
+inline util::nvme_queues_t* nvme_queues_of(ustore_executor_t executor) noexcept {
+    return executor ? std::get_if<util::nvme_queues_t>(&executor->device) : nullptr;
+}

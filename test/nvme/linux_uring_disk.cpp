@@ -60,7 +60,8 @@ using namespace unum::ustore::blobs;
     return static_cast<std::uint64_t>(sectors) * 512ull;
 }
 
-/** Registers @p request on @p disk and answers the capacity the registered medium carries, giving the medium back. */
+/** Registers @p request on @p disk and answers the capacity the registered medium holds, giving
+ *  the medium back. */
 template <typename disk_type_>
 util::expected<std::uint64_t> registered_capacity(disk_type_& disk, util::medium_options_t const& request) {
     auto [registered, register_medium_status] = disk.register_medium(request);
@@ -73,8 +74,9 @@ util::expected<std::uint64_t> registered_capacity(disk_type_& disk, util::medium
 #pragma endregion Fixtures
 
 /**
- *  @brief Leases the ring, registers @p bytes of aligned memory, runs @p body and gives both back.
- *  @param[in,out] disk The mounted ring the queue pair and the range come from.
+ *  @brief Makes a queue holding @p disk, registers @p bytes of aligned memory, runs @p body and
+ *      gives both back.
+ *  @param[in,out] disk The mounted disk the range is registered on.
  *  @param[in] bytes Bytes of buffer to register, which the body addresses through the registered_memory.
  *  @param[in] body Called with the queue pair, the registered memory and the buffer it covers.
  */
@@ -84,22 +86,20 @@ void on_queue_pair(linux_uring_files_disk_t& disk, std::size_t bytes, body_type_
     expect_equal(buffer.size(), bytes);
     if (buffer.size() != bytes) return;
 
-    auto [queue_pair, acquire_status] = disk.acquire_queue_pair(queue_pair_depth_k);
-    expect_true(acquire_status.succeeded());
-    if (acquire_status.failed()) return;
+    auto [queue, make_queue_status] = util::linux_uring_queue_t::make(queue_pair_depth_k, {});
+    expect_true(make_queue_status.succeeded());
+    if (make_queue_status.failed()) return;
+    util::queue_ref_t queue_pair {queue, util::queue_id_t {0}};
+    expect_true(disk.register_media(queue_pair).succeeded());
 
     auto [registered_memory, register_status] = disk.register_memory(whole(buffer), util::memory_space_t::host_k);
     expect_true(register_status.succeeded());
-    if (register_status.failed()) {
-        expect_true(disk.release_queue_pair(queue_pair).succeeded());
-        return;
-    }
+    if (register_status.failed()) return;
 
     body(queue_pair, registered_memory, whole(buffer));
 
     expect_true(disk.drain(queue_pair).succeeded());
     expect_true(disk.unregister_memory(registered_memory).succeeded());
-    expect_true(disk.release_queue_pair(queue_pair).succeeded());
 }
 
 #pragma region Cases
@@ -108,7 +108,7 @@ void on_queue_pair(linux_uring_files_disk_t& disk, std::size_t bytes, body_type_
 void test_uring_fails_one_request_of_a_batch(linux_uring_files_disk_t& disk, util::medium_reference_t medium) {
     on_queue_pair(
         disk, 2 * block_bytes_k,
-        [&](util::queue_pair_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
+        [&](util::queue_ref_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
             util::memory_reference_t stale = registered_memory.reference(0);
             stale.generation = static_cast<std::uint16_t>(registered_memory.generation() + 1);
 
@@ -143,7 +143,7 @@ void test_uring_cuts_a_chain_on_a_short_read(linux_uring_files_disk_t& disk, uti
     constexpr std::uint64_t reachable_k = 1024;
     on_queue_pair(
         disk, 3 * block_bytes_k,
-        [&](util::queue_pair_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
+        [&](util::queue_ref_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
             std::array<util::request_t, 3> chain {};
             chain[0] = util::read_request(medium, util::extent_t {volume_bytes_k - reachable_k, block_bytes_k},
                                           registered_memory.reference(0), queue_pair.token(0));
@@ -171,7 +171,7 @@ void test_uring_cuts_a_chain_on_a_short_read(linux_uring_files_disk_t& disk, uti
 void test_uring_counts_completions_after_a_cancel(linux_uring_files_disk_t& disk, util::medium_reference_t medium) {
     on_queue_pair(
         disk, queue_pair_depth_k * block_bytes_k,
-        [&](util::queue_pair_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
+        [&](util::queue_ref_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
             std::array<util::request_t, queue_pair_depth_k> batch {};
             for (std::size_t index = 0; index != queue_pair_depth_k; ++index)
                 batch[index] = util::read_request(medium, util::extent_t {index * block_bytes_k, block_bytes_k},
@@ -213,7 +213,7 @@ void test_uring_polls_an_overflowed_queue(linux_uring_files_disk_t& disk, util::
     constexpr std::size_t cancels_k = 64;
     on_queue_pair(
         disk, queue_pair_depth_k * block_bytes_k,
-        [&](util::queue_pair_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
+        [&](util::queue_ref_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
             std::array<util::request_t, queue_pair_depth_k> batch {};
             for (std::size_t index = 0; index != queue_pair_depth_k; ++index)
                 batch[index] = util::read_request(medium, util::extent_t {index * block_bytes_k, block_bytes_k},
@@ -247,7 +247,7 @@ void test_uring_polls_an_overflowed_queue(linux_uring_files_disk_t& disk, util::
 void test_uring_polls_through_a_narrow_window(linux_uring_files_disk_t& disk, util::medium_reference_t medium) {
     on_queue_pair(
         disk, queue_pair_depth_k * block_bytes_k,
-        [&](util::queue_pair_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
+        [&](util::queue_ref_t& queue_pair, util::registered_memory_t& registered_memory, std::span<util::byte_t>) {
             std::size_t retired = 0;
             for (std::size_t round = 0; round != 4; ++round) {
                 std::array<util::request_t, queue_pair_depth_k> batch {};
@@ -272,7 +272,7 @@ void test_uring_polls_through_a_narrow_window(linux_uring_files_disk_t& disk, ut
 
 /** What the disk reports is what @c statx says the filesystem under the volume demands. */
 void test_uring_reports_the_alignment_statx_reports(linux_uring_files_disk_t& disk, char const* path) {
-    util::ring_capabilities_t const limits = disk.capabilities();
+    util::disk_capabilities_t const limits = disk.capabilities();
 
     util::native_file_t const file = ::open(path, O_RDONLY | O_DIRECT);
     expect_true(file != util::invalid_native_file_k);
@@ -291,52 +291,111 @@ void test_uring_reports_the_alignment_statx_reports(linux_uring_files_disk_t& di
     expect_equal(limits.memory_alignment, memory);
     expect_equal(limits.offset_alignment, offset);
     expect_equal(limits.length_granularity, offset);
-    expect_equal(limits.depth_limit, queue_pair_depth_k);
 }
 
-/** A range past one gibibyte pins as a run of table slots: a transfer inside the second slot moves
- *  through it, and one across the boundary moves unpinned, which the disk counts. */
+/** A queue's blocks past one gibibyte pin as a run of table slots: a transfer inside the second
+ *  slot moves through it, and one across the boundary moves unpinned, which the disk counts. */
 void test_uring_pins_a_range_past_a_gibibyte(linux_uring_files_disk_t& disk, util::medium_reference_t medium) {
     std::size_t const boundary = util::linux_uring_registered_range_bytes_k;
-    on_queue_pair(
-        disk, boundary + 2 * block_bytes_k,
-        [&](util::queue_pair_t& queue_pair, util::registered_memory_t& registered_memory,
-            std::span<util::byte_t> buffer) {
-            test_buffer_t expected = make_buffer(2 * block_bytes_k);
-            paint(whole(expected), 3);
-            std::span<util::byte_t> const across = buffer.subspan(boundary - block_bytes_k, 2 * block_bytes_k);
-            paint(across, 3);
+    test_buffer_t blocks = make_buffer(boundary + 2 * block_bytes_k);
+    expect_equal(blocks.size(), boundary + 2 * block_bytes_k);
+    if (blocks.size() != boundary + 2 * block_bytes_k) return;
+    std::span<util::byte_t> const buffer = whole(blocks);
+    auto [queue, make_queue_status] = util::linux_uring_queue_t::make(queue_pair_depth_k, buffer);
+    expect_true(make_queue_status.succeeded());
+    if (make_queue_status.failed()) return;
+    util::queue_ref_t const queue_pair {queue, util::queue_id_t {0}};
+    expect_true(disk.register_media(queue_pair).succeeded());
+    auto const own = [](std::size_t offset) noexcept {
+        return util::memory_reference_t {util::registered_memory_id_t::queue_range_k, 0, offset};
+    };
 
-            std::array<util::completion_t, polling_room_k> completions {};
-            auto const moved_in_full = [&](std::array<util::request_t, 2> const& batch) {
-                expect_true(disk.submit(queue_pair, std::span<util::request_t const> {batch}) == std::size_t {2});
-                expect_true(util::poll_completions_at_least<waiter_t>(
-                                disk, queue_pair, std::span<util::completion_t> {completions}, 2) == std::size_t {2});
-                expect_true(completions[0].completed_in_full() && completions[1].completed_in_full());
-            };
-            moved_in_full({
-                util::write_request(medium, util::extent_t {block_bytes_k, 2 * block_bytes_k},
-                                    registered_memory.reference(boundary - block_bytes_k), queue_pair.token(0)),
-                util::write_request(medium, util::extent_t {0, block_bytes_k}, registered_memory.reference(boundary),
-                                    queue_pair.token(1)),
-            });
-            std::memset(buffer.data() + boundary - block_bytes_k, 0, 3 * block_bytes_k);
-            moved_in_full({
-                util::read_request(medium, util::extent_t {block_bytes_k, 2 * block_bytes_k},
-                                   registered_memory.reference(boundary - block_bytes_k), queue_pair.token(2)),
-                util::read_request(medium, util::extent_t {0, block_bytes_k},
-                                   registered_memory.reference(boundary + block_bytes_k), queue_pair.token(3)),
-            });
-            expect_true(std::memcmp(across.data(), expected.data(), 2 * block_bytes_k) == 0);
-            expect_true(std::memcmp(buffer.data() + boundary + block_bytes_k, expected.data() + block_bytes_k,
-                                    block_bytes_k) == 0);
+    test_buffer_t expected = make_buffer(2 * block_bytes_k);
+    paint(whole(expected), 3);
+    std::span<util::byte_t> const across = buffer.subspan(boundary - block_bytes_k, 2 * block_bytes_k);
+    paint(across, 3);
 
-            struct rlimit locked {};
-            if (::getrlimit(RLIMIT_MEMLOCK, &locked) == 0 && locked.rlim_cur == RLIM_INFINITY)
-                expect_true(disk.pinning() == util::range_pinning_t::pinned_k);
-            std::uint64_t const crossed = disk.pinning() == util::range_pinning_t::pinned_k ? 2 : 0;
-            expect_equal(disk.crossing_requests(), crossed);
-        });
+    std::array<util::completion_t, polling_room_k> completions {};
+    auto const moved_in_full = [&](std::array<util::request_t, 2> const& batch) {
+        expect_true(disk.submit(queue_pair, std::span<util::request_t const> {batch}) == std::size_t {2});
+        expect_true(util::poll_completions_at_least<waiter_t>(
+                        disk, queue_pair, std::span<util::completion_t> {completions}, 2) == std::size_t {2});
+        expect_true(completions[0].completed_in_full() && completions[1].completed_in_full());
+    };
+    moved_in_full({
+        util::write_request(medium, util::extent_t {block_bytes_k, 2 * block_bytes_k}, own(boundary - block_bytes_k),
+                            queue_pair.token(0)),
+        util::write_request(medium, util::extent_t {0, block_bytes_k}, own(boundary), queue_pair.token(1)),
+    });
+    std::memset(buffer.data() + boundary - block_bytes_k, 0, 3 * block_bytes_k);
+    moved_in_full({
+        util::read_request(medium, util::extent_t {block_bytes_k, 2 * block_bytes_k}, own(boundary - block_bytes_k),
+                           queue_pair.token(2)),
+        util::read_request(medium, util::extent_t {0, block_bytes_k}, own(boundary + block_bytes_k),
+                           queue_pair.token(3)),
+    });
+    expect_true(std::memcmp(across.data(), expected.data(), 2 * block_bytes_k) == 0);
+    expect_true(std::memcmp(buffer.data() + boundary + block_bytes_k, expected.data() + block_bytes_k, block_bytes_k) ==
+                0);
+
+    struct rlimit locked {};
+    if (::getrlimit(RLIMIT_MEMLOCK, &locked) == 0 && locked.rlim_cur == RLIM_INFINITY)
+        expect_true(queue.pinning() == util::staging_pinning_t::pinned_k);
+    std::uint64_t const crossed = queue.pinning() == util::staging_pinning_t::pinned_k ? 2 : 0;
+    expect_equal(queue.requests_across_registered_slots(), crossed);
+    expect_true(disk.drain(queue_pair).succeeded());
+}
+
+/** A warm hold writes nothing: holding the same disk again leaves the queue's file table as it
+ *  was, and only a medium registered in between makes the next registration rewrite it. */
+void test_uring_registers_a_disk_once(linux_uring_files_disk_t& disk, char const* path) {
+    auto [queue, make_queue_status] = util::linux_uring_queue_t::make(queue_pair_depth_k, {});
+    expect_true(make_queue_status.succeeded());
+    if (make_queue_status.failed()) return;
+    util::queue_ref_t const queue_pair {queue, util::queue_id_t {0}};
+    expect_true(disk.register_media(queue_pair).succeeded());
+    util::media_list_key_t const first = queue.media_list_key();
+    expect_true(first.identity % 2 == 1);
+    expect_true(disk.register_media(queue_pair).succeeded());
+    expect_true(queue.media_list_key() == first);
+
+    auto [registered, register_status] = disk.register_medium(volume_request(path));
+    expect_true(register_status.succeeded());
+    if (register_status.failed()) return;
+    expect_true(disk.register_media(queue_pair).succeeded());
+    expect_true(queue.media_list_key().identity == first.identity);
+    expect_true(queue.media_list_key().epoch != first.epoch);
+    expect_true(disk.unregister_medium(registered).succeeded());
+}
+
+/** A blocking queue, which a call without an executor reads through, moves bytes on an io_uring
+ *  disk with positioned transfers and no ring. */
+void test_uring_serves_a_blocking_queue(linux_uring_files_disk_t& disk, util::medium_reference_t medium) {
+    test_buffer_t blocks = make_buffer(2 * block_bytes_k);
+    expect_equal(blocks.size(), 2 * block_bytes_k);
+    if (blocks.size() != 2 * block_bytes_k) return;
+    auto [queue, make_queue_status] = util::blocking_queue_t::make(queue_pair_depth_k, whole(blocks));
+    expect_true(make_queue_status.succeeded());
+    if (make_queue_status.failed()) return;
+    util::queue_ref_t const queue_pair {queue, util::queue_id_t {0}};
+    expect_true(disk.register_media(queue_pair).succeeded());
+
+    paint(whole(blocks).first(block_bytes_k), 5);
+    std::array<util::request_t, 2> batch {
+        util::write_request(medium, util::extent_t {0, block_bytes_k},
+                            util::memory_reference_t {util::registered_memory_id_t::queue_range_k, 0, 0},
+                            queue_pair.token(0)),
+        util::read_request(medium, util::extent_t {0, block_bytes_k},
+                           util::memory_reference_t {util::registered_memory_id_t::queue_range_k, 0, block_bytes_k},
+                           queue_pair.token(1)),
+    };
+    batch[0].chaining = util::request_chaining_t::chained_k;
+    expect_true(disk.submit(queue_pair, std::span<util::request_t const> {batch}) == std::size_t {2});
+    std::array<util::completion_t, polling_room_k> completions {};
+    expect_true(util::poll_completions_at_least<waiter_t>(disk, queue_pair, std::span<util::completion_t> {completions},
+                                                          2) == std::size_t {2});
+    expect_true(completions[0].completed_in_full() && completions[1].completed_in_full());
+    expect_true(std::memcmp(blocks.data(), blocks.data() + block_bytes_k, block_bytes_k) == 0);
 }
 
 /** Both file transports report the medium behind a block device, which @c fstat alone sizes at zero. */
@@ -388,8 +447,6 @@ void test_device_reports_its_capacity(std::string_view device) {
 /** Mounts the io_uring transport on a preallocated volume and runs the suite on it. */
 void uring_transport(char const* directory) {
     util::linux_uring_disk_config_t config;
-    config.queue_pairs_limit = 4;
-    config.depth_limit = queue_pair_depth_k;
     config.registered_memory_limit = 4;
     config.media_limit = 4;
     config.buffering = util::file_buffering_t::unbuffered_k;
@@ -399,6 +456,7 @@ void uring_transport(char const* directory) {
     if (status.failed()) return;
 
     std::string const path = fmt::format("{}/{}", directory, "volume.bin");
+    std::string const kept_path = fmt::format("{}/{}", directory, "volume_kept.bin");
     on_medium("linux_uring_files_disk_t::register_medium", disk, volume_request(path.c_str()),
               [&](util::medium_reference_t medium) {
                   ring_cases("linux_uring_files_disk_t", disk, medium);
@@ -414,14 +472,17 @@ void uring_transport(char const* directory) {
                                 medium);
                   run_test_case("test_uring_pins_a_range_past_a_gibibyte", test_uring_pins_a_range_past_a_gibibyte,
                                 disk, medium);
+                  run_test_case("test_uring_registers_a_disk_once", test_uring_registers_a_disk_once, disk,
+                                kept_path.c_str());
+                  run_test_case("test_uring_serves_a_blocking_queue", test_uring_serves_a_blocking_queue, disk, medium);
                   run_test_case("test_uring_reports_the_alignment_statx_reports",
                                 test_uring_reports_the_alignment_statx_reports, disk, path.c_str());
               });
 
-    std::string const borrowed_path = fmt::format("{}/{}", directory, "volume_borrowed.bin");
+    std::string const viewed_path = fmt::format("{}/{}", directory, "volume_viewed.bin");
     run_test_case("test_ring_holds_a_medium_in_flight<linux_uring_files_disk_t>",
                   test_ring_holds_a_medium_in_flight<linux_uring_files_disk_t>, disk,
-                  volume_request(borrowed_path.c_str()));
+                  volume_request(viewed_path.c_str()));
     std::string const deallocated_path = fmt::format("{}/{}", directory, "volume_deallocated.bin");
     run_test_case("test_ring_deallocates_a_file_extent<linux_uring_files_disk_t>",
                   test_ring_deallocates_a_file_extent<linux_uring_files_disk_t>, disk,

@@ -35,7 +35,7 @@ using blobs::sorted_run_bounds_t;
 using st::key128_t;
 
 util::expected<cuda_compactor_t> cuda_compactor_t::make(util::cuda_executor_t&, device_sections_reader_t) noexcept {
-    return util::status_t {util::status_code_t::unsupported_k, "The suite's host build carries no device compactor"};
+    return util::status_t {util::status_code_t::unsupported_k, "The suite's host build holds no device compactor"};
 }
 
 cuda_compactor_t::~cuda_compactor_t() noexcept {}
@@ -52,7 +52,7 @@ st::status_t cuda_compactor_t::compact(compaction_kind_t, std::span<sorted_run_i
 }
 
 util::expected<hip_compactor_t> hip_compactor_t::make(util::hip_executor_t&, device_sections_reader_t) noexcept {
-    return util::status_t {util::status_code_t::unsupported_k, "The suite's host build carries no device compactor"};
+    return util::status_t {util::status_code_t::unsupported_k, "The suite's host build holds no device compactor"};
 }
 
 hip_compactor_t::~hip_compactor_t() noexcept {}

@@ -27,7 +27,7 @@ from ustore.types import (
     StringsView,
     StringsViewArguments,
     Tape,
-    _borrowed,
+    _viewed,
 )
 
 # region Layouts
@@ -49,7 +49,9 @@ struct ArrowSchema(Defaultable, ImplicitlyCopyable):
 
     def __init__(out self):
         """A released schema, which is what a failed export leaves."""
-        self = Self(NULL_ADDRESS, NULL_ADDRESS, NULL_ADDRESS, 0, 0, NULL_ADDRESS, NULL_ADDRESS, NULL_ADDRESS, NULL_ADDRESS)
+        self = Self(
+            NULL_ADDRESS, NULL_ADDRESS, NULL_ADDRESS, 0, 0, NULL_ADDRESS, NULL_ADDRESS, NULL_ADDRESS, NULL_ADDRESS
+        )
 
 
 @fieldwise_init
@@ -107,9 +109,9 @@ comptime KeysFromArrow = def(_Schema, _Array, Pointer[StridedArguments, MutAnyOr
 
 Typed pointers rather than `Address` for every output, as `VersionOf` records."""
 
-comptime StringsFromArrow = def(
-    _Schema, _Array, Pointer[StringsViewArguments, MutAnyOrigin], _Count
-) thin abi("C") -> c_int
+comptime StringsFromArrow = def(_Schema, _Array, Pointer[StringsViewArguments, MutAnyOrigin], _Count) thin abi(
+    "C"
+) -> c_int
 """`ustore_strings_view_from_arrow`: a schema, an array, then the strings view and the count it writes."""
 
 comptime KeysToArrow = def(StridedArguments, c_size_t, Address, _Schema, _DeviceArray) thin abi("C") -> c_int
@@ -216,8 +218,10 @@ def tape_to_arrow(tape: Tape) raises Error -> ArrowExport:
     schema[] = ArrowSchema()
     var array = stack_allocation[1, ArrowDeviceArray]().unsafe_origin_cast[MutAnyOrigin]()
     array[] = ArrowDeviceArray()
-    var status = tape.arena[]._library.symbols().strings_view_to_arrow(
-        copied, c_size_t(len(tape)), tape.view.layout, tape.arena[]._address, schema, array
+    var status = (
+        tape.arena[]
+        ._library.symbols()
+        .strings_view_to_arrow(copied, c_size_t(len(tape)), tape.view.layout, tape.arena[]._address, schema, array)
     )
     _exported(status, "ustore_strings_view_to_arrow")
     return ArrowExport(tape.arena[]._library, schema[], array[])
@@ -232,8 +236,10 @@ def column_to_arrow(column: Column, type: FieldType) raises Error -> ArrowExport
     schema[] = ArrowSchema()
     var array = stack_allocation[1, ArrowDeviceArray]().unsafe_origin_cast[MutAnyOrigin]()
     array[] = ArrowDeviceArray()
-    var status = column.arena[]._library.symbols().docs_column_view_to_arrow(
-        view, c_size_t(len(column)), type.code, column.arena[]._address, schema, array
+    var status = (
+        column.arena[]
+        ._library.symbols()
+        .docs_column_view_to_arrow(view, c_size_t(len(column)), type.code, column.arena[]._address, schema, array)
     )
     _exported(status, "ustore_docs_column_view_to_arrow")
     return ArrowExport(column.arena[]._library, schema[], array[])
@@ -257,7 +263,7 @@ def keys_from_arrow(arena: Arena, schema: Address, array: Address) raises Error 
         ),
         "ustore_keys_view_from_arrow",
     )
-    return KeysView(_borrowed[Key, ImmUntrackedOrigin](keys[].data), Int(keys[].stride), Int(count[]))
+    return KeysView(_viewed[Key, ImmUntrackedOrigin](keys[].data), Int(keys[].stride), Int(count[]))
 
 
 def strings_from_arrow(arena: Arena, schema: Address, array: Address) raises Error -> StringsView[ImmUntrackedOrigin]:
@@ -273,7 +279,7 @@ def strings_from_arrow(arena: Arena, schema: Address, array: Address) raises Err
     )
     _exported(status, "ustore_strings_view_from_arrow")
     var view = strings[]
-    return StringsView(_borrowed[UInt8, ImmUntrackedOrigin](view.data), view.offsets, view.layout, Int(count[]))
+    return StringsView(_viewed[UInt8, ImmUntrackedOrigin](view.data), view.offsets, view.layout, Int(count[]))
 
 
 # endregion Imports

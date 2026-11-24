@@ -26,8 +26,8 @@ use crate::db::ffi::{
 use crate::db::sealed::{Accepts, Calling, Completion, Handles, Writable};
 use crate::db::{
     Address, Arena, CollectionID, Collections, CursorOn, Deferrable, Deferring, Durability, Error, Executor, Key,
-    KeyRange, Matching, On, Progress, Result, ScanMode, Status, Strings, ViewVerbs, check, exported_slice, fail,
-    lowered_progress, read_spelling, spelling, string_views,
+    KeyRange, Matching, On, Progress, Result, ScanMode, Status, Strings, ViewVerbs, check, executor_handle,
+    exported_slice, fail, lowered_progress, read_spelling, spelling, string_views,
 };
 
 /// The encoding pages render in, as `ustore_page_encoding_t` spells it.
@@ -856,7 +856,7 @@ impl<'arena, 'texts, Keys: AsRef<[Key]>, Fragments: AsRef<[&'texts str]>> Callin
 
     fn finish(self) -> Result<&'arena [Key]> {
         self.arena.host()?;
-        // SAFETY: the insertion succeeded, writing a key per task into the arena borrowed for
+        // SAFETY: the insertion succeeded, writing a key per task into the arena held for
         // `'arena`.
         Ok(unsafe { exported_slice(self.effective.0, self.keys.as_ref().len()) })
     }
@@ -1187,7 +1187,7 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for PagesRead<'arena, '_, '_, Keys> {
 
     fn finish(self) -> Result<Values<'arena>> {
         self.arena.host()?;
-        // SAFETY: the read succeeded over every key, and the arena stays borrowed for `'arena`.
+        // SAFETY: the read succeeded over every key, and the arena stays held for `'arena`.
         unsafe { Values::exported(self.keys.as_ref().len(), self.presences, self.values) }
     }
 }
@@ -1246,7 +1246,7 @@ impl<'arena> Calling for PagesScan<'arena, '_> {
 
     fn finish(self) -> Result<&'arena [Key]> {
         self.arena.host()?;
-        // SAFETY: the scan succeeded, and the arena stays borrowed for `'arena`.
+        // SAFETY: the scan succeeded, and the arena stays held for `'arena`.
         Ok(unsafe { self.found.keys() })
     }
 }
@@ -1291,7 +1291,7 @@ impl<'arena> Calling for PagesSample<'arena> {
 
     fn finish(self) -> Result<&'arena [Key]> {
         self.arena.host()?;
-        // SAFETY: the sample succeeded, and the arena stays borrowed for `'arena`.
+        // SAFETY: the sample succeeded, and the arena stays held for `'arena`.
         Ok(unsafe { self.found.keys() })
     }
 }
@@ -1368,7 +1368,7 @@ impl Calling for PagesMeasure<'_> {
 pub struct PagesCursor<'view> {
     handle: ffi::ustore_pages_cursor_t,
     database: ustore_database_t,
-    marker: PhantomData<&'view ()>,
+    view: PhantomData<&'view ()>,
 }
 
 impl<'view, Parent> On<'view, Parent> {
@@ -1384,7 +1384,7 @@ impl<'view, Parent> On<'view, Parent> {
     ) -> Result<PagesCursor<'view>> {
         let range: KeyRange = range.into();
         let matching = config.into().matching;
-        let mut cursor = PagesCursor { handle: ptr::null_mut(), database: self.database(), marker: PhantomData };
+        let mut cursor = PagesCursor { handle: ptr::null_mut(), database: self.database(), view: PhantomData };
         let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_pages_cursor_init_t {
             cursor: &mut cursor.handle,
@@ -1474,7 +1474,7 @@ impl CursorOn<'_, PagesCursor<'_>> {
         let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_pages_cursor_next_t {
             database: self.cursor.database,
-            executor: self.executor,
+            executor: executor_handle(self.executor),
             outcome: &mut outcome,
             completion: ustore_completion_t::Blocking,
             cursor: self.cursor.handle,
@@ -1491,7 +1491,7 @@ impl CursorOn<'_, PagesCursor<'_>> {
         unsafe { ffi::ustore_pages_cursor_next(&mut arguments) };
         check(outcome)?;
         arena.host()?;
-        // SAFETY: a successful pull wrote `written` keys into the arena the result borrows.
+        // SAFETY: a successful pull wrote `written` keys into the arena the result views.
         Ok(unsafe { exported_slice(keys, written as usize) })
     }
 }

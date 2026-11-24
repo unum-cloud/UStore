@@ -6,7 +6,7 @@ Date: September 18, 2026
 """
 
 import pytest
-from base import NEEDS_SAVED_SNAPSHOTS, NEEDS_SNAPSHOTS, NEEDS_TRANSACTIONS, keys, location, open_engine
+from base import NEEDS_SAVED_SNAPSHOTS, NEEDS_SNAPSHOTS, NEEDS_TRANSACTIONS, executor_for, keys, location, open_engine
 
 import ustore
 
@@ -133,7 +133,7 @@ def test_a_deferred_save_writes_a_database_that_opens(database, blobs, engine: s
     directory = tmp_path / "saved"
     directory.mkdir()
 
-    with database.snapshot() as snapshot, ustore.Executor.for_ram(1) as executor:
+    with database.snapshot() as snapshot, executor_for(engine, 1) as executor:
         saving = snapshot.deferred(executor).save(
             location(engine, directory), progress=lambda finished, total: finished <= total
         )
@@ -157,15 +157,11 @@ def test_a_cancelled_save_leaves_nothing_behind(database, blobs, engine: str, tm
         assert reopened.get(255, collection=blobs) == b"v" * 256
 
 
-def test_a_snapshot_keeps_its_collections_from_a_drop(database, engine: str):
-    """A snapshot belongs to its holder, so the RAM and RocksDB engines drop no collection under it."""
+def test_a_snapshot_keeps_its_collections_from_a_drop(database):
+    """A snapshot belongs to its holder, so no engine drops a collection under it."""
     people = database.collection_create("people", modality=ustore.Modality.BLOBS)
-    with database.snapshot():
-        if engine in ("ram", "rocksdb"):
-            with pytest.raises(ustore.InvalidArgumentError):
-                database.collection_drop(people)
-        else:
-            database.collection_drop(people)
+    with database.snapshot(), pytest.raises(ustore.ContendedError):
+        database.collection_drop(people)
 
 
 def test_save_needs_a_view_of_a_snapshot(database, tmp_path):

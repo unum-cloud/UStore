@@ -2,10 +2,9 @@
  *  @file tools/dataset.hpp
  *  @author Ash Vardanian
  *  @date November 1, 2026
- *  @brief What the dataset units share: the format a path names, the arena a task brought or made,
- *      the placement of one field into a JSON document, the progress report between batches, the
- *      temporary an export writes before it lands, and the checks every step of a task makes
- *      before it runs.
+ *  @brief What the dataset units share: the format a path names, the placement of one field into a
+ *      JSON document, the progress report between batches, the temporary an export writes before
+ *      it lands, and the checks every step of a task makes before it runs.
  */
 
 #pragma once
@@ -17,7 +16,7 @@
 
 #include <stringzilla/stringzilla.hpp> // `sz::string_t`
 
-#include "ustore/db.h"                         // `ustore_arena_t`, `ustore_outcome_t`, `ustore_arena_init`
+#include "ustore/db.h"                         // `ustore_outcome_t`, `ustore_bytes_view_t`
 #include "ustore/utilities/blocking_files.hpp" // `temporary_path_of`, `rename_file`, `sync_directory`
 
 #include "dataset.h" // `ustore_dataset_format_t`
@@ -38,7 +37,7 @@ namespace unum::ustore::tools {
     return {code, status.note ? status.note : ustore_status_name(code)};
 }
 
-/** Reports @p completed of @p total to the progress callback @p task carries, answering whether the
+/** Reports @p completed of @p total to the progress callback @p task holds, answering whether the
  *  task goes on; a cancel writes @c ustore_status_cancelled_k into the task's outcome. */
 template <typename task_type_>
 [[nodiscard]] bool advance(task_type_ const& task, ustore_size_t completed, ustore_size_t total) noexcept {
@@ -105,29 +104,6 @@ class staged_output_t {
         if (util::status_t const synced = util::sync_directory(directory_); synced.failed())
             *outcome = outcome_of(synced);
     }
-};
-
-/** Takes the arena a task brought, or makes a private one on host pages when it brought none, which
- *  it frees on destruction. */
-class task_arena_t {
-    ustore_arena_t private_arena_ = nullptr;
-    ustore_arena_t chosen_ = nullptr;
-
-  public:
-
-    /** Takes @p given, or makes a private arena, reporting a failure to make one
-     *  into @p outcome. */
-    task_arena_t(ustore_arena_t given, ustore_outcome_t* outcome) noexcept : chosen_(given) {
-        if (given) return;
-        ustore_arena_init_t init {.arena = &private_arena_, .executor = nullptr, .outcome = outcome};
-        ustore_arena_init(&init);
-        chosen_ = private_arena_;
-    }
-    task_arena_t(task_arena_t const&) = delete;
-    task_arena_t& operator=(task_arena_t const&) = delete;
-    ~task_arena_t() noexcept { ustore_arena_free(private_arena_); }
-
-    [[nodiscard]] ustore_arena_t get() const noexcept { return chosen_; }
 };
 
 } // namespace unum::ustore::tools

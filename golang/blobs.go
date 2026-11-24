@@ -55,7 +55,7 @@ type Values struct {
 // Len reports how many values the call read.
 func (values Values) Len() uint { return values.count }
 
-// Get borrows value index from the arena, and false for a missing key.
+// Get views value index in the arena, and false for a missing key.
 func (values Values) Get(index uint) ([]byte, bool) {
 	if !present(values.presences, index) {
 		return nil, false
@@ -63,7 +63,7 @@ func (values Values) Get(index uint) ([]byte, bool) {
 	return values.values.sized(values.count).Get(index), true
 }
 
-// Tape lends every value back as an input, a missing key as an empty value, so a read's tape is
+// Tape passes every value back as an input, a missing key as an empty value, so a read's tape is
 // written again as it is.
 func (values Values) Tape() Tape { return values.values.sized(values.count).Tape() }
 
@@ -79,12 +79,12 @@ type Scanned struct {
 // Len reports how many scans or samples the call ran.
 func (scanned Scanned) Len() uint { return scanned.count }
 
-// Keys borrows the keys scan task found from the arena.
+// Keys views the keys scan task found in the arena.
 func (scanned Scanned) Keys(task uint) []Key {
 	return keysAt(scanned.keys, uint64(at(scanned.offsets, task)), uint64(at(scanned.offsets, task+1)))
 }
 
-// Scores borrows the BM25 score of every key scan task found, and nothing unless the patterns
+// Scores views the BM25 score of every key scan task found, and nothing unless the patterns
 // carried weights.
 func (scanned Scanned) Scores(task uint) []float32 {
 	begin, end := at(scanned.offsets, task), at(scanned.offsets, task+1)
@@ -145,18 +145,18 @@ func (measurement Measurement) Get(index uint) Measured {
 
 // BlobsWrite upserts one value per key, an empty value still being a value.
 func (on writes[Handle]) BlobsWrite(collections Collections, keys []Key, values Tape, config *WriteConfig) error {
-	var lent lent[struct{}]
-	_, err := block(&lent, on.blobsWrite(&lent, C.ustore_completion_blocking_k, collections, keys, values, config))
+	var call callWithResult[struct{}]
+	_, err := block(&call, on.blobsWrite(&call, C.ustore_completion_blocking_k, collections, keys, values, config))
 	return err
 }
 
 // BlobsWrite submits [DatabaseOn.BlobsWrite].
 func (on deferredWrites[Handle]) BlobsWrite(collections Collections, keys []Key, values Tape, config *WriteConfig) (*Deferred[struct{}], error) {
 	deferred := new(Deferred[struct{}])
-	return submitted(deferred, on.blobsWrite(&deferred.lent, C.ustore_completion_deferred_k, collections, keys, values, config))
+	return submitted(deferred, on.blobsWrite(&deferred.call, C.ustore_completion_deferred_k, collections, keys, values, config))
 }
 
-func (receiver storeReceiver[Handle]) blobsWrite(lent *lent[struct{}], completion C.ustore_completion_t, collections Collections, keys []Key, values Tape, config *WriteConfig) error {
+func (receiver storeReceiver[Handle]) blobsWrite(call *callWithResult[struct{}], completion C.ustore_completion_t, collections Collections, keys []Key, values Tape, config *WriteConfig) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
@@ -165,17 +165,17 @@ func (receiver storeReceiver[Handle]) blobsWrite(lent *lent[struct{}], completio
 		return err
 	}
 	options := configOf(config)
-	arguments, inputs := stage[C.ustore_blobs_write_t](lent)
+	arguments, inputs := stage[C.ustore_blobs_write_t](call)
 	*arguments = C.ustore_blobs_write_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		completion:  completion,
 		transaction: receiver.transaction(),
 		count:       C.ustore_size_t(len(keys)),
-		collections: lent.collections(inputs, collections),
-		keys:        lent.keys(keys),
-		values:      lent.strings(values),
+		collections: call.collections(inputs, collections),
+		keys:        call.keys(keys),
+		values:      call.strings(values),
 		durability:  C.ustore_durability_t(options.Durability),
 		watch:       C.ustore_watch_t(receiver.watch),
 	}
@@ -185,18 +185,18 @@ func (receiver storeReceiver[Handle]) blobsWrite(lent *lent[struct{}], completio
 
 // BlobsRemove removes keys with their values, or every key of a range per task given end keys.
 func (on writes[Handle]) BlobsRemove(collections Collections, keys []Key, config *RemoveConfig) error {
-	var lent lent[struct{}]
-	_, err := block(&lent, on.blobsRemove(&lent, C.ustore_completion_blocking_k, collections, keys, config))
+	var call callWithResult[struct{}]
+	_, err := block(&call, on.blobsRemove(&call, C.ustore_completion_blocking_k, collections, keys, config))
 	return err
 }
 
 // BlobsRemove submits [DatabaseOn.BlobsRemove].
 func (on deferredWrites[Handle]) BlobsRemove(collections Collections, keys []Key, config *RemoveConfig) (*Deferred[struct{}], error) {
 	deferred := new(Deferred[struct{}])
-	return submitted(deferred, on.blobsRemove(&deferred.lent, C.ustore_completion_deferred_k, collections, keys, config))
+	return submitted(deferred, on.blobsRemove(&deferred.call, C.ustore_completion_deferred_k, collections, keys, config))
 }
 
-func (receiver storeReceiver[Handle]) blobsRemove(lent *lent[struct{}], completion C.ustore_completion_t, collections Collections, keys []Key, config *RemoveConfig) error {
+func (receiver storeReceiver[Handle]) blobsRemove(call *callWithResult[struct{}], completion C.ustore_completion_t, collections Collections, keys []Key, config *RemoveConfig) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
@@ -205,17 +205,17 @@ func (receiver storeReceiver[Handle]) blobsRemove(lent *lent[struct{}], completi
 	if err := shape(collections, len(keys), len(options.EndKeys)); err != nil {
 		return err
 	}
-	arguments, inputs := stage[C.ustore_blobs_remove_t](lent)
+	arguments, inputs := stage[C.ustore_blobs_remove_t](call)
 	*arguments = C.ustore_blobs_remove_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		completion:  completion,
 		transaction: receiver.transaction(),
 		count:       C.ustore_size_t(len(keys)),
-		collections: lent.collections(inputs, collections),
-		keys:        lent.keys(keys),
-		end_keys:    lent.keys(options.EndKeys),
+		collections: call.collections(inputs, collections),
+		keys:        call.keys(keys),
+		end_keys:    call.keys(options.EndKeys),
 		durability:  C.ustore_durability_t(options.Durability),
 		watch:       C.ustore_watch_t(receiver.watch),
 	}
@@ -238,17 +238,17 @@ type BlobsReadConfig struct {
 
 // BlobsRead reads one value per key into arena, a missing key reading as absent.
 func (on reads[Handle]) BlobsRead(collections Collections, keys []Key, arena *Arena, config *BlobsReadConfig) (Values, error) {
-	var lent lent[Values]
-	return block(&lent, on.blobsRead(&lent, C.ustore_completion_blocking_k, collections, keys, arena, config))
+	var call callWithResult[Values]
+	return block(&call, on.blobsRead(&call, C.ustore_completion_blocking_k, collections, keys, arena, config))
 }
 
 // BlobsRead submits [DatabaseOn.BlobsRead].
 func (on deferredReads[Handle]) BlobsRead(collections Collections, keys []Key, arena *Arena, config *BlobsReadConfig) (*Deferred[Values], error) {
 	deferred := new(Deferred[Values])
-	return submitted(deferred, on.blobsRead(&deferred.lent, C.ustore_completion_deferred_k, collections, keys, arena, config))
+	return submitted(deferred, on.blobsRead(&deferred.call, C.ustore_completion_deferred_k, collections, keys, arena, config))
 }
 
-func (receiver storeReceiver[Handle]) blobsRead(lent *lent[Values], completion C.ustore_completion_t, collections Collections, keys []Key, arena *Arena, config *BlobsReadConfig) error {
+func (receiver storeReceiver[Handle]) blobsRead(call *callWithResult[Values], completion C.ustore_completion_t, collections Collections, keys []Key, arena *Arena, config *BlobsReadConfig) error {
 	database, executor, outputs, err := receiver.lowerInto(arena)
 	if err != nil {
 		return err
@@ -257,21 +257,21 @@ func (receiver storeReceiver[Handle]) blobsRead(lent *lent[Values], completion C
 	if err := shape(collections, len(keys), len(options.Offsets), len(options.Limits)); err != nil {
 		return err
 	}
-	arguments, inputs := stage[C.ustore_blobs_read_t](lent)
-	lent.result.count = uint(len(keys))
+	arguments, inputs := stage[C.ustore_blobs_read_t](call)
+	call.result.count = uint(len(keys))
 	*arguments = C.ustore_blobs_read_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		completion:  completion,
 		view:        receiver.view(),
 		count:       C.ustore_size_t(len(keys)),
-		collections: lent.collections(inputs, collections),
-		keys:        lent.keys(keys),
-		offsets:     lent.lengths(options.Offsets),
-		limits:      lent.lengths(options.Limits),
-		presences:   &lent.result.presences,
-		values:      &lent.result.values.raw,
+		collections: call.collections(inputs, collections),
+		keys:        call.keys(keys),
+		offsets:     call.lengths(options.Offsets),
+		limits:      call.lengths(options.Limits),
+		presences:   &call.result.presences,
+		values:      &call.result.values.raw,
 		arena:       outputs,
 	}
 	C.ustore_blobs_read(arguments)
@@ -304,17 +304,17 @@ type BlobsScanConfig struct {
 // BlobsScan lists up to wanted keys of a range per task into arena, one task per collection
 // collections names.
 func (on reads[Handle]) BlobsScan(collections Collections, wanted uint, arena *Arena, config *BlobsScanConfig) (Scanned, error) {
-	var lent lent[Scanned]
-	return block(&lent, on.blobsScan(&lent, C.ustore_completion_blocking_k, collections, wanted, arena, config))
+	var call callWithResult[Scanned]
+	return block(&call, on.blobsScan(&call, C.ustore_completion_blocking_k, collections, wanted, arena, config))
 }
 
 // BlobsScan submits [DatabaseOn.BlobsScan].
 func (on deferredReads[Handle]) BlobsScan(collections Collections, wanted uint, arena *Arena, config *BlobsScanConfig) (*Deferred[Scanned], error) {
 	deferred := new(Deferred[Scanned])
-	return submitted(deferred, on.blobsScan(&deferred.lent, C.ustore_completion_deferred_k, collections, wanted, arena, config))
+	return submitted(deferred, on.blobsScan(&deferred.call, C.ustore_completion_deferred_k, collections, wanted, arena, config))
 }
 
-func (receiver storeReceiver[Handle]) blobsScan(lent *lent[Scanned], completion C.ustore_completion_t, collections Collections, wanted uint, arena *Arena, config *BlobsScanConfig) error {
+func (receiver storeReceiver[Handle]) blobsScan(call *callWithResult[Scanned], completion C.ustore_completion_t, collections Collections, wanted uint, arena *Arena, config *BlobsScanConfig) error {
 	database, executor, outputs, err := receiver.lowerInto(arena)
 	if err != nil {
 		return err
@@ -327,24 +327,24 @@ func (receiver storeReceiver[Handle]) blobsScan(lent *lent[Scanned], completion 
 	if err := options.Patterns.check(); err != nil {
 		return err
 	}
-	arguments, inputs := stage[C.ustore_blobs_scan_t](lent)
-	lent.result.count = uint(count)
-	progress, state := lent.progress(options.Progress)
+	arguments, inputs := stage[C.ustore_blobs_scan_t](call)
+	call.result.count = uint(count)
+	progress, state := call.progress(options.Progress)
 	*arguments = C.ustore_blobs_scan_t{
 		database:       database,
 		executor:       executor,
-		outcome:        lent.outcome(),
+		outcome:        call.outcome(),
 		completion:     completion,
 		view:           receiver.view(),
 		count:          C.ustore_size_t(count),
-		collections:    lent.collections(inputs, collections),
-		start_keys:     lent.keys(options.StartKeys),
-		end_keys:       lent.keys(options.EndKeys),
+		collections:    call.collections(inputs, collections),
+		start_keys:     call.keys(options.StartKeys),
+		end_keys:       call.keys(options.EndKeys),
 		direction:      C.ustore_scan_direction_t(options.Direction),
-		patterns:       lent.patterns(options.Patterns),
-		predicate:      lent.predicate(options.Predicate),
-		offsets:        &lent.result.offsets,
-		keys:           &lent.result.keys,
+		patterns:       call.patterns(options.Patterns),
+		predicate:      call.predicate(options.Predicate),
+		offsets:        &call.result.offsets,
+		keys:           &call.result.keys,
 		arena:          outputs,
 		wanted:         C.ustore_size_t(wanted),
 		mode:           C.ustore_scan_mode_t(options.Mode),
@@ -352,7 +352,7 @@ func (receiver storeReceiver[Handle]) blobsScan(lent *lent[Scanned], completion 
 		progress_state: state,
 	}
 	if len(options.Patterns.Weights) != 0 {
-		arguments.scores = &lent.result.scores
+		arguments.scores = &call.result.scores
 	}
 	C.ustore_blobs_scan(arguments)
 	return nil
@@ -407,23 +407,23 @@ func (on reads[Handle]) BlobsCursorInit(collection CollectionID, startKey Key, c
 		return nil, err
 	}
 	cursor := new(BlobsCursor)
-	var lent lent[C.ustore_blobs_cursor_t]
-	arguments, inputs := stage[C.ustore_blobs_cursor_init_t](&lent)
+	var call callWithResult[C.ustore_blobs_cursor_t]
+	arguments, inputs := stage[C.ustore_blobs_cursor_init_t](&call)
 	*arguments = C.ustore_blobs_cursor_init_t{
-		cursor:     lent.result,
+		cursor:     call.result,
 		database:   database,
 		executor:   executor,
-		outcome:    lent.outcome(),
+		outcome:    call.outcome(),
 		view:       on.view(),
 		collection: rawCollection(collection),
 		start_key:  raw(startKey),
-		end_key:    lent.key(inputs, options.EndKey),
+		end_key:    call.key(inputs, options.EndKey),
 		direction:  C.ustore_scan_direction_t(options.Direction),
-		patterns:   lent.patterns(options.Patterns),
+		patterns:   call.patterns(options.Patterns),
 		predicate:  cursor.admits(options.Predicate),
 	}
 	C.ustore_blobs_cursor_init(arguments)
-	if cursor.handle, err = block(&lent, nil); err != nil {
+	if cursor.handle, err = block(&call, nil); err != nil {
 		cursor.end()
 		return nil, err
 	}
@@ -434,41 +434,41 @@ func (on reads[Handle]) BlobsCursorInit(collection CollectionID, startKey Key, c
 
 // NextKeys pulls up to wanted keys of the walk into arena.
 func (on BlobsCursorOn) NextKeys(wanted uint, arena *Arena) (Page, error) {
-	var lent lent[Page]
-	arguments, err := on.next(&lent, wanted, arena)
+	var call callWithResult[Page]
+	arguments, err := on.next(&call, wanted, arena)
 	if err != nil {
 		return Page{}, err
 	}
 	C.ustore_blobs_cursor_next(arguments)
-	return block(&lent, nil)
+	return block(&call, nil)
 }
 
 // NextPairs pulls up to wanted keys of the walk with their values into arena, in one call.
 func (on BlobsCursorOn) NextPairs(wanted uint, arena *Arena) (Page, error) {
-	var lent lent[Page]
-	arguments, err := on.next(&lent, wanted, arena)
+	var call callWithResult[Page]
+	arguments, err := on.next(&call, wanted, arena)
 	if err != nil {
 		return Page{}, err
 	}
-	arguments.values = &lent.result.values.raw
+	arguments.values = &call.result.values.raw
 	C.ustore_blobs_cursor_next(arguments)
-	return block(&lent, nil)
+	return block(&call, nil)
 }
 
 // next opens a pull and fills every argument but the optional values.
-func (on BlobsCursorOn) next(lent *lent[Page], wanted uint, arena *Arena) (*C.ustore_blobs_cursor_next_t, error) {
+func (on BlobsCursorOn) next(call *callWithResult[Page], wanted uint, arena *Arena) (*C.ustore_blobs_cursor_next_t, error) {
 	cursor, database, executor, outputs, err := on.lowerInto(arena)
 	if err != nil {
 		return nil, err
 	}
-	arguments := open[C.ustore_blobs_cursor_next_t](lent)
+	arguments := open[C.ustore_blobs_cursor_next_t](call)
 	*arguments = C.ustore_blobs_cursor_next_t{
 		database: database,
 		executor: executor,
-		outcome:  lent.outcome(),
+		outcome:  call.outcome(),
 		cursor:   cursor,
-		keys:     &lent.result.keys,
-		written:  &lent.result.written,
+		keys:     &call.result.keys,
+		written:  &call.result.written,
 		arena:    outputs,
 		wanted:   C.ustore_size_t(wanted),
 	}
@@ -493,34 +493,34 @@ func (cursor *BlobsCursor) Close() error {
 // BlobsSample draws up to wanted keys uniformly at random into arena, one task per collection
 // collections names.
 func (on reads[Handle]) BlobsSample(collections Collections, wanted uint, arena *Arena) (Scanned, error) {
-	var lent lent[Scanned]
-	return block(&lent, on.blobsSample(&lent, C.ustore_completion_blocking_k, collections, wanted, arena))
+	var call callWithResult[Scanned]
+	return block(&call, on.blobsSample(&call, C.ustore_completion_blocking_k, collections, wanted, arena))
 }
 
 // BlobsSample submits [DatabaseOn.BlobsSample].
 func (on deferredReads[Handle]) BlobsSample(collections Collections, wanted uint, arena *Arena) (*Deferred[Scanned], error) {
 	deferred := new(Deferred[Scanned])
-	return submitted(deferred, on.blobsSample(&deferred.lent, C.ustore_completion_deferred_k, collections, wanted, arena))
+	return submitted(deferred, on.blobsSample(&deferred.call, C.ustore_completion_deferred_k, collections, wanted, arena))
 }
 
-func (receiver storeReceiver[Handle]) blobsSample(lent *lent[Scanned], completion C.ustore_completion_t, collections Collections, wanted uint, arena *Arena) error {
+func (receiver storeReceiver[Handle]) blobsSample(call *callWithResult[Scanned], completion C.ustore_completion_t, collections Collections, wanted uint, arena *Arena) error {
 	database, executor, outputs, err := receiver.lowerInto(arena)
 	if err != nil {
 		return err
 	}
 	count := tasks(collections)
-	arguments, inputs := stage[C.ustore_blobs_sample_t](lent)
-	lent.result.count = uint(count)
+	arguments, inputs := stage[C.ustore_blobs_sample_t](call)
+	call.result.count = uint(count)
 	*arguments = C.ustore_blobs_sample_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		completion:  completion,
 		view:        receiver.view(),
 		count:       C.ustore_size_t(count),
-		collections: lent.collections(inputs, collections),
-		offsets:     &lent.result.offsets,
-		keys:        &lent.result.keys,
+		collections: call.collections(inputs, collections),
+		offsets:     &call.result.offsets,
+		keys:        &call.result.keys,
 		arena:       outputs,
 		wanted:      C.ustore_size_t(wanted),
 	}
@@ -531,17 +531,17 @@ func (receiver storeReceiver[Handle]) blobsSample(lent *lent[Scanned], completio
 // BlobsMeasure estimates the entries and the space inside a range per task into arena, one task per
 // collection collections names, without walking them.
 func (on reads[Handle]) BlobsMeasure(collections Collections, arena *Arena, config *MeasureConfig) (Measurement, error) {
-	var lent lent[Measurement]
-	return block(&lent, on.blobsMeasure(&lent, C.ustore_completion_blocking_k, collections, arena, config))
+	var call callWithResult[Measurement]
+	return block(&call, on.blobsMeasure(&call, C.ustore_completion_blocking_k, collections, arena, config))
 }
 
 // BlobsMeasure submits [DatabaseOn.BlobsMeasure].
 func (on deferredReads[Handle]) BlobsMeasure(collections Collections, arena *Arena, config *MeasureConfig) (*Deferred[Measurement], error) {
 	deferred := new(Deferred[Measurement])
-	return submitted(deferred, on.blobsMeasure(&deferred.lent, C.ustore_completion_deferred_k, collections, arena, config))
+	return submitted(deferred, on.blobsMeasure(&deferred.call, C.ustore_completion_deferred_k, collections, arena, config))
 }
 
-func (receiver storeReceiver[Handle]) blobsMeasure(lent *lent[Measurement], completion C.ustore_completion_t, collections Collections, arena *Arena, config *MeasureConfig) error {
+func (receiver storeReceiver[Handle]) blobsMeasure(call *callWithResult[Measurement], completion C.ustore_completion_t, collections Collections, arena *Arena, config *MeasureConfig) error {
 	database, executor, outputs, err := receiver.lowerInto(arena)
 	if err != nil {
 		return err
@@ -551,25 +551,25 @@ func (receiver storeReceiver[Handle]) blobsMeasure(lent *lent[Measurement], comp
 	if err := shape(collections, count, len(options.StartKeys), len(options.EndKeys)); err != nil {
 		return err
 	}
-	arguments, inputs := stage[C.ustore_blobs_measure_t](lent)
-	lent.result.count = uint(count)
+	arguments, inputs := stage[C.ustore_blobs_measure_t](call)
+	call.result.count = uint(count)
 	*arguments = C.ustore_blobs_measure_t{
 		database:          database,
 		executor:          executor,
-		outcome:           lent.outcome(),
+		outcome:           call.outcome(),
 		completion:        completion,
 		view:              receiver.view(),
 		count:             C.ustore_size_t(count),
-		collections:       lent.collections(inputs, collections),
-		start_keys:        lent.keys(options.StartKeys),
-		end_keys:          lent.keys(options.EndKeys),
+		collections:       call.collections(inputs, collections),
+		start_keys:        call.keys(options.StartKeys),
+		end_keys:          call.keys(options.EndKeys),
 		direction:         C.ustore_scan_direction_t(options.Direction),
-		min_cardinalities: &lent.result.minCardinalities,
-		max_cardinalities: &lent.result.maxCardinalities,
-		min_value_bytes:   &lent.result.minValueBytes,
-		max_value_bytes:   &lent.result.maxValueBytes,
-		min_space_usages:  &lent.result.minSpaceUsages,
-		max_space_usages:  &lent.result.maxSpaceUsages,
+		min_cardinalities: &call.result.minCardinalities,
+		max_cardinalities: &call.result.maxCardinalities,
+		min_value_bytes:   &call.result.minValueBytes,
+		max_value_bytes:   &call.result.maxValueBytes,
+		min_space_usages:  &call.result.minSpaceUsages,
+		max_space_usages:  &call.result.maxSpaceUsages,
 		arena:             outputs,
 	}
 	C.ustore_blobs_measure(arguments)

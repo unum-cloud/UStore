@@ -144,7 +144,7 @@ inline sz_strings_view_t strings_of(sz_string_view_t const* views, std::size_t c
 
 #pragma region XML Tokenizer
 
-/** Whether @p code is a character XML 1.0 allows a document to carry. */
+/** Whether @p code is a character XML 1.0 allows a document to hold. */
 constexpr bool xml_character(std::uint32_t code) noexcept {
     return code == 0x9 || code == 0xA || code == 0xD || (code >= 0x20 && code <= 0xD7FF) ||
            (code >= 0xE000 && code <= 0xFFFD) || (code >= 0x10000 && code <= 0x10FFFF);

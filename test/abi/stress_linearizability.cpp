@@ -26,7 +26,7 @@
 
 #include "ustore/ustore.hpp"
 
-#include "ustore/utilities/ram_device.hpp" // `caller_exclusivity_t`, `executor_t`
+#include "ustore/utilities/ram_device.hpp" // `caller_exclusivity_t`, `ram_executor_t`
 
 #include "harness.hpp" // `run_test_case`, `expect_true`, `expect_equal`, `split_mix_generator_t`
 
@@ -204,10 +204,13 @@ bool prepare_run(linearizability_run_t& run, linearizability_options_t const& op
 }
 
 /** Reopens the database of @p run and begins one transaction per slot, freeing the
- *  previous ones first. */
+ *  previous ones and flushing what they committed first, as closing writes nothing. */
 bool reopen_run(linearizability_run_t& run) {
     for (writer_slot_t& slot : run.slots) slot.transaction = transaction_t {};
-    if (run.database.handle()) run.database.close();
+    if (run.database.handle()) {
+        expect_true(!run.database.flush().failed());
+        run.database.close();
+    }
     auto [database, open_status] = open_database<database_t>(*run.config);
     if (!expect_true(!open_status.failed())) return false;
     run.database = std::move(database);
@@ -307,7 +310,7 @@ void verify_round(linearizability_run_t& run, std::span<operation_t const*> late
 
 /** Runs one round: threads commit their transactions, then the main thread replays their logs,
  *  checks and clears. */
-void run_round(linearizability_run_t& run, util::executor_t& executor, workload_t const& workload) {
+void run_round(linearizability_run_t& run, util::ram_executor_t& executor, workload_t const& workload) {
     std::size_t const per_thread = workload.operations_per_thread();
     std::span<operation_t> const operations {run.operations.data(), workload.threads_count * per_thread};
     std::span<writer_slot_t> const slots {run.slots.data(), workload.threads_count};
@@ -320,7 +323,7 @@ void run_round(linearizability_run_t& run, util::executor_t& executor, workload_
     std::span<operation_t const*> const latest {run.latest.data(), static_cast<std::size_t>(workload.max_key) + 1};
     replay_round(operations, latest);
     verify_round(run, latest);
-    expect_true(!run.database.clear(ustore_drop_pairs_k).failed());
+    expect_status(run.database.clear(ustore_drop_pairs_k), status_code_t::success_k);
 }
 
 #pragma endregion Round
@@ -341,7 +344,7 @@ void run_round(linearizability_run_t& run, util::executor_t& executor, workload_
  *  @param[in] checkpoints Most rounds to run.
  *  @param[in] slice Time after which no further round starts; the first round always runs.
  */
-void linear_writes(linearizability_run_t& run, util::executor_t& executor, workload_t const& workload,
+void linear_writes(linearizability_run_t& run, util::ram_executor_t& executor, workload_t const& workload,
                    std::size_t checkpoints, std::chrono::nanoseconds slice) {
     auto const deadline = std::chrono::steady_clock::now() + slice;
     std::size_t const failed_before = test_run.failed_checks.load();
@@ -354,7 +357,7 @@ void linear_writes(linearizability_run_t& run, util::executor_t& executor, workl
 
 /** Runs every mix of inserts and removes at @p threads threads committing
  *  @p transactions per round. */
-void linear_writes_mixes(linearizability_run_t& run, util::executor_t& executor,
+void linear_writes_mixes(linearizability_run_t& run, util::ram_executor_t& executor,
                          linearizability_options_t const& options, std::size_t threads, std::size_t transactions,
                          std::chrono::nanoseconds slice) {
     for (operations_mix_t const mix : mixes_k) {
@@ -369,7 +372,7 @@ void linear_writes_mixes(linearizability_run_t& run, util::executor_t& executor,
  *  when the pool would not start, over a freshly opened database whose writers draw from the
  *  streams of this case. */
 void test_linear_writes(linearizability_run_t& run, linearizability_options_t const& options,
-                        util::executor_t* executor, std::size_t threads, std::size_t transactions,
+                        util::ram_executor_t* executor, std::size_t threads, std::size_t transactions,
                         std::chrono::nanoseconds slice) {
     if (!expect_true(executor != nullptr) || !reopen_run(run)) return;
     for (std::size_t index = 0; index != run.slots.size(); ++index)
@@ -380,8 +383,8 @@ void test_linear_writes(linearizability_run_t& run, linearizability_options_t co
 /** Runs every transaction count on one pool of @p threads threads, each as a case of its own. */
 void linear_writes_on_threads(linearizability_run_t& run, linearizability_options_t const& options, std::size_t threads,
                               std::chrono::nanoseconds slice) {
-    auto [pool, pool_status] = util::executor_t::make(threads, util::caller_exclusivity_t::caller_inclusive_k);
-    util::executor_t* const executor = !st::failed(pool_status) ? std::addressof(pool) : nullptr;
+    auto [pool, pool_status] = util::ram_executor_t::make(threads, util::caller_exclusivity_t::caller_inclusive_k);
+    util::ram_executor_t* const executor = !st::failed(pool_status) ? std::addressof(pool) : nullptr;
     for (std::size_t const transactions : options.transactions.view()) {
         char label[96];
         auto const written = fmt::format_to_n(label, sizeof(label) - 1, "test_linear_writes({}, {})", threads,

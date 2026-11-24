@@ -67,7 +67,7 @@ func arrowed(status C.ustore_status_t) error {
 }
 
 // KeysViewFromArrow views the 16-byte keys of a fixed_size_binary(16) column in place, tagged
-// arrow.uuid or not, borrowing the column's buffers.
+// arrow.uuid or not, viewing the column's buffers.
 func KeysViewFromArrow(schema *ArrowSchema, array *ArrowArray) ([]Key, error) {
 	var keys C.ustore_keys_view_t
 	var count C.ustore_size_t
@@ -78,7 +78,7 @@ func KeysViewFromArrow(schema *ArrowSchema, array *ArrowArray) ([]Key, error) {
 }
 
 // StringsViewFromArrow views the byte strings of a binary, utf8, large binary or large utf8 column
-// in place as a [Tape], borrowing the column's buffers.
+// in place as a [Tape], viewing the column's buffers.
 func StringsViewFromArrow(schema *ArrowSchema, array *ArrowArray) (Tape, error) {
 	var strings Strings
 	var count C.ustore_size_t

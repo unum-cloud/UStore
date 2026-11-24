@@ -3,7 +3,8 @@
  *  @author Ash Vardanian
  *  @date October 29, 2026
  *  @brief The values an ingest lands for its keyed rows, as an engine keeping every document and page as one value
- *      files them: blobs as given, documents once they parse as JSON, and pages as the trees their XML parses into.
+ *      files them: blobs as given, documents once they parse as JSON, and pages as the trees their
+ *      XML parses into, parsed over the threads of the call's executor.
  */
 
 #pragma once
@@ -17,10 +18,11 @@
 
 #include "ustore/docs/json_values.hpp"      // `json_parse`
 #include "ustore/pages/element_tree.hpp"    // `placement_t`
-#include "ustore/utilities/ram_buffers.hpp" // `arena_rewind`, `arena_copy`, `arena_free_blocks`
+#include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`
 
-#include "pages_layer.hpp"       // `import_page_tree`, `element_key_of`, `clock_stamp`, `page_allocator_t`
+#include "pages_layer.hpp"       // `import_page_tree`, `element_key_of`, `page_allocator_t`
 #include "utilities/batches.hpp" // `keyed_rows_t`
+#include "utilities/slices.hpp"  // `for_task_slices`
 
 namespace unum::ustore {
 
@@ -44,54 +46,43 @@ inline ingest_values_t ingest_values_of(ustore_modality_t modality) noexcept {
     return ingest_values_t::bytes_k;
 }
 
-/** The bytes an ingest files for the value of every keyed row, parsing documents and pages, and keeping every page
- *  tree until @c rewind, unescaping pages through @p strings_kit_type_. */
+/**
+ *  @brief The value of every row of @p rows as the engine files it, carved in the scratch of
+ *      @p view and parsed over the slices of its executor, readable until the call ends.
+ *
+ *  Blobs land as given, documents once they parse as JSON, and pages as the trees their XML parses
+ *  into, unescaped through @p strings_kit_type_, the page of row @c r placed at @p placement with
+ *  its sequence advanced by @c r.
+ */
 template <strings_kit_concept strings_kit_type_>
-class ingest_value_parser {
-  public:
-    explicit ingest_value_parser(ingest_values_t values) noexcept : values_(values), placement_ {clock_stamp(), 0} {}
-    ingest_value_parser(ingest_value_parser const&) = delete;
-    ingest_value_parser& operator=(ingest_value_parser const&) = delete;
-    ~ingest_value_parser() noexcept {
-        util::arena_free_blocks(parsing_);
-        util::arena_free_blocks(trees_);
-    }
-
-    /** Forgets every page tree laid out so far, whose rows the engine has copied or written. */
-    void rewind() noexcept { util::arena_rewind(&trees_); }
-
-    /** The value of row @p row of @p rows as the engine files it, readable until @c rewind. */
-    expected<std::span<byte_t const>> operator()(util::keyed_rows_t const& rows, std::size_t row) noexcept {
-        ustore_bytes_view_t const given = rows.values[row];
-        std::span<byte_t const> const bytes = bytes_of(given.data, static_cast<std::size_t>(given.length));
-        if (values_ == ingest_values_t::bytes_k) return bytes;
-        util::arena_rewind(&parsing_);
-        if (values_ == ingest_values_t::documents_k) {
-            status_t const parsed = docs::json_parse(value_view_t {bytes}, &parsing_).status();
-            if (parsed.failed()) return parsed;
-            return bytes;
-        }
-        auto [tree, tree_status] = import_page_tree<strings_kit_type_>(pages::page_encoding_t::xml_k, chars_of(given),
-                                                                       element_key_of(rows.keys[row]), placement_,
-                                                                       page_allocator_t {&parsing_});
-        if (tree_status.failed()) return tree_status;
-        ++placement_.sequence;
-        auto [kept, kept_status] = util::arena_copy<byte_t>(&trees_, tree);
-        if (kept_status.failed()) return kept_status;
-        return std::span<byte_t const> {kept};
-    }
-
-  private:
-    ingest_values_t values_ = ingest_values_t::bytes_k;
-
-    /** Where every page of the ingest is placed, its sequence counting the pages parsed so far. */
-    pages::placement_t placement_;
-
-    /** Where every value parses, rewound before each. */
-    ustore_arena_handle_t parsing_ {};
-
-    /** Where every page tree waits until @c rewind. */
-    ustore_arena_handle_t trees_ {};
-};
+expected<std::span<std::span<byte_t const>>> parse_ingest_values(ingest_values_t values, util::keyed_rows_t const& rows,
+                                                                 pages::placement_t placement,
+                                                                 view_t const& view) noexcept {
+    auto [parsed, parsed_status] = util::arena_allocate<std::span<byte_t const>>(view.scratch, rows.size());
+    if (parsed_status.failed()) return parsed_status;
+    for (std::size_t row = 0; row != rows.size(); ++row)
+        parsed[row] = bytes_of(rows.values[row].data, static_cast<std::size_t>(rows.values[row].length));
+    if (values == ingest_values_t::bytes_k) return parsed;
+    status_t const status = util::for_task_slices(
+        view, rows.size(),
+        [&](std::size_t first, std::size_t length, std::size_t, view_t const& slice) noexcept -> status_t {
+            for (std::size_t row = first; row != first + length; ++row) {
+                if (values == ingest_values_t::documents_k) {
+                    auto [document, document_status] = docs::json_parse(value_view_t {parsed[row]}, slice.scratch);
+                    if (document_status.failed()) return document_status;
+                    continue;
+                }
+                pages::placement_t const placed {placement.stamp, static_cast<std::uint32_t>(placement.sequence + row)};
+                auto [tree, tree_status] = import_page_tree<strings_kit_type_>(
+                    pages::page_encoding_t::xml_k, chars_of(rows.values[row]), element_key_of(rows.keys[row]), placed,
+                    page_allocator_t {slice.scratch});
+                if (tree_status.failed()) return tree_status;
+                parsed[row] = tree;
+            }
+            return {};
+        });
+    if (status.failed()) return status;
+    return parsed;
+}
 
 } // namespace unum::ustore

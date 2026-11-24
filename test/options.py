@@ -123,7 +123,7 @@ def test_only_a_transaction_watches(database):
     ids=["shared-memory", "dont-discard-memory", "bulk", "snapshot", "watch", "executor", "flush"],
 )
 def test_keywords_outside_the_verb_are_refused(database, blobs, arena, keyword: str):
-    """Receivers carry the view, the watch and the executor, and the arena's own options stay inside the ABI."""
+    """Receivers hold the view, the watch and the executor, and the arena's own options stay inside the ABI."""
     with database.transaction() as staged, pytest.raises(TypeError):
         staged.read([1], arena, **{keyword: True}, collection=blobs)
 

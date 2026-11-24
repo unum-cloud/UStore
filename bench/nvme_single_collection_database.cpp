@@ -46,6 +46,7 @@
 #include "ustore/blobs/nvme_single_collection_database.hpp" // `basic_single_collection_database`
 #include "ustore/blobs/nvme_store.hpp"                      // `nvme_store`, `nvme_store_cursor`
 #include "ustore/utilities/folds.hpp"                       // `last_write_fold_t`
+#include "ustore/utilities/nvme_queues.hpp"                 // `nvme_queues_t`, `nvme_queues_ref_t`
 #include "ustore/utilities/nvme_mounts.hpp"                 // `open_resources`, `resources_config_t`, `io_transport_t`
 
 #include "harness.hpp"
@@ -179,10 +180,11 @@ status_t settle(database_type_& database) noexcept {
     return {};
 }
 
-/** Runs every row of @p workload over the volume and the channels of @p mount, with the database
- *  of @p layout_. */
+/** Runs every row of @p workload over the volume of @p mount, with the database of @p layout_, on
+ *  @p queues: thread @c t of the workload reads on thread @c t, and the database writes and
+ *  merges on the last thread for its whole life. */
 template <value_layout_t layout_, typename mount_type_>
-status_t run_rows(mount_type_& mount, resources_ptr_t const& resources,
+status_t run_rows(mount_type_& mount, resources_ptr_t const& resources, util::nvme_queues_t& queues,
                   nvme_single_collection_database_settings_t const& settings, workload_t const& workload) noexcept {
     using volume_t = typename mount_type_::volume_t;
     using slot_t = key_slot<stored_key_t, layout_>;
@@ -191,16 +193,14 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources,
         nvme_store_cursor<slot_t, volume_t, atomic_reference, waiter_t, util::last_write_fold_t, no_device_fold_t>;
     using database_t = basic_single_collection_database<stored_key_t, volume_t, atomic_reference, waiter_t, store_t>;
 
-    auto [writing, writing_status] = mount.channels().acquire();
-    if (writing_status.failed()) return writing_status;
-    auto [merging, merging_status] = mount.channels().acquire();
-    if (merging_status.failed()) return merging_status;
+    auto [held, media_status] = queues.both_channels_with_disk_media(workload.threads, mount.disk());
+    if (media_status.failed()) return media_status;
     volume_t& volume = mount.volume();
-    auto [database, open_status] = database_t::open(volume, writing.channel(), merging.channel(),
-                                                    database_config(workload), resources);
+    auto [database, open_status] = database_t::open(volume, *held.writing, *held.reading, database_config(workload),
+                                                    resources);
     if (open_status.failed()) return open_status;
-    auto [executor, executor_status] = util::executor_t::make(workload.threads,
-                                                              util::caller_exclusivity_t::caller_inclusive_k);
+    auto [executor, executor_status] = util::ram_executor_t::make(workload.threads,
+                                                                  util::caller_exclusivity_t::caller_inclusive_k);
     if (st::failed(executor_status)) return {status_code_t::out_of_memory_k, "The executor did not start"};
 
     // Inline and fixed layouts write values of their whole width, and the variable one draws a
@@ -244,14 +244,14 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources,
     std::string const select_name = name_of("select");
     if (settings.regex_filter.selects(select_name))
         print(run_threads(executor, settings, select_name, [&](loop_t& loop, std::size_t thread) noexcept {
-            auto [reading, reading_status] = mount.channels().acquire(thread);
+            auto [reading, reading_status] = queues.reading_channel_with_disk_media(thread, mount.disk());
             st::vector<byte_t> value;
             if (reading_status.failed() || st::failed(value.resize(value_max_size)))
                 return loop.skip("no channel or no memory for a value");
             split_mix_generator_t random {stream_key(settings.seed, select_name, thread)};
             for ([[maybe_unused]] std::size_t call : loop) {
                 stored_value_size_t size = 0;
-                status_t const completed = database->select(reading.channel(), random.below(population),
+                status_t const completed = database->select(*reading, random.below(population),
                                                             std::span<byte_t> {value}, size);
                 if (completed.failed()) loop.fail();
                 else loop.count(1, size);
@@ -261,7 +261,7 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources,
     std::string const batch_name = name_of(fmt::format("select_batch/{}", batch_keys_k));
     if (settings.regex_filter.selects(batch_name))
         print(run_threads(executor, settings, batch_name, [&](loop_t& loop, std::size_t thread) noexcept {
-            auto [reading, reading_status] = mount.channels().acquire(thread);
+            auto [reading, reading_status] = queues.reading_channel_with_disk_media(thread, mount.disk());
             std::array<stored_key_t, batch_keys_k> keys {};
             std::array<lookup_result_t, batch_keys_k> results {};
             if (reading_status.failed()) return loop.skip("no channel");
@@ -270,7 +270,7 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources,
                 for (stored_key_t& key : keys) key = random.below(population);
                 std::size_t bytes = 0;
                 status_t const completed = database->select(
-                    reading.channel(), std::span<stored_key_t const> {keys}, std::span<lookup_result_t> {results},
+                    *reading, std::span<stored_key_t const> {keys}, std::span<lookup_result_t> {results},
                     [&bytes](auto, auto, std::span<byte_t const> piece) noexcept { bytes += piece.size(); });
                 if (completed.failed()) loop.fail();
                 else loop.count(batch_keys_k, bytes);
@@ -282,7 +282,7 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources,
     std::string const scan_name = name_of("scan");
     if (settings.regex_filter.selects(scan_name))
         print(run_threads(executor, settings, scan_name, [&](loop_t& loop, std::size_t thread) noexcept {
-            auto [reading, reading_status] = mount.channels().acquire(thread);
+            auto [reading, reading_status] = queues.reading_channel_with_disk_media(thread, mount.disk());
             st::vector<byte_t> value;
             if (reading_status.failed() || st::failed(value.resize(value_max_size)))
                 return loop.skip("no channel or no memory for a value");
@@ -293,8 +293,8 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources,
                 if (cursor->reached_end()) cursor = cursor_t::over(database->records(), walk.allocator().arena);
                 if (!cursor) return loop.skip("the cursor did not reopen");
                 stored_value_size_t size = 0;
-                status_t const completed = database->select(reading.channel(), cursor->stored_key(),
-                                                            std::span<byte_t> {value}, size);
+                status_t const completed = database->select(*reading, cursor->stored_key(), std::span<byte_t> {value},
+                                                            size);
                 if (completed.failed() || cursor->advance().failed()) loop.fail();
                 else loop.count(1, size);
             }
@@ -323,8 +323,6 @@ status_t run_workload(nvme_single_collection_database_settings_t const& settings
     std::string const manifest = fmt::format("{}/bench.ustore.json", directory);
 
     resources_config_t config;
-    config.threads = workload.threads;
-    config.shared_io_channels = 3;
     config.io_transport = static_cast<util::io_transport_t>(settings.transport.selected);
     util::data_directory_config_t data;
     data.max_size = settings.volume_size.value;
@@ -333,17 +331,30 @@ status_t run_workload(nvme_single_collection_database_settings_t const& settings
         st::failed(config.data_directories.push_back(std::move(data))))
         return {status_code_t::out_of_memory_k, "No memory for the directories"};
 
+    // Every file disk serves a blocking queue, so the open reads the manifest on one before the
+    // probe settles the transport the rows' queue set takes
+    st::vector<fu_memory_domain_id_t> anywhere;
+    if (st::failed(anywhere.resize(workload.threads + 1, fu_memory_domain_id_t {-1})))
+        return {status_code_t::out_of_memory_k, "No memory for the queue domains"};
+    std::array<fu_memory_domain_id_t, 1> const opening_anywhere {-1};
+    auto [opening, opening_status] = util::nvme_queues_t::make(util::io_transport_t::blocking_k, config.channels,
+                                                               opening_anywhere);
+    if (opening_status.failed()) return opening_status;
     status_t ran;
     {
-        auto const [resources, open_status] = open_resources<atomic_reference, waiter_t>(config);
+        auto const [resources, open_status] = open_resources<atomic_reference, waiter_t>(
+            config, util::nvme_queues_ref_t {&opening, 0});
         if (open_status.failed()) return open_status;
+        auto [queues, queues_status] = util::nvme_queues_t::make(resources->storage.report().transport, config.channels,
+                                                                 anywhere);
+        if (queues_status.failed()) return queues_status;
         fmt::println("- {}: {} transport, {} threads, {} keys", workload.name,
                      storage_transport_names_k[static_cast<std::size_t>(resources->storage.report().transport)],
                      workload.threads, workload.population_count);
         ran = resources->storage.visit(
-            [&](auto& mount) noexcept { return run_rows<layout_>(mount, resources, settings, workload); });
-        fmt::println("- {}: pin_refused_bytes {} crossing_requests {}", workload.name,
-                     resources->storage.pin_refused_bytes(), resources->storage.crossing_requests());
+            [&](auto& mount) noexcept { return run_rows<layout_>(mount, resources, queues, settings, workload); });
+        fmt::println("- {}: unpinned_staging_bytes {} requests_across_registered_slots {}", workload.name,
+                     queues.unpinned_staging_bytes(), queues.requests_across_registered_slots());
     }
     std::filesystem::remove_all(directory, error);
     return ran;

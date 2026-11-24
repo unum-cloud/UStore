@@ -10,7 +10,6 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`, `std::uintptr_t`
 #include <cstdio>  // `stderr`
-#include <cstring> // `std::strcmp`
 
 #include <algorithm>    // `std::equal`
 #include <array>        // `std::array`
@@ -27,9 +26,10 @@
 #include <fmt/format.h>
 
 #include "ustore/ustore.hpp"
+#include "ustore/utilities/blocking_files.hpp" // `read_file`
 
 #include "abi/fixture.hpp" // `write_text`, `create_collection`, `read_of`, `open_cursor`, `pull_of`, `expect_page`
-#include "harness.hpp"     // `finish_test_run`, `expect_true`, `expect_status`, `open_engine`
+#include "harness.hpp"     // `finish_test_run`, `expect_true`, `expect_status`, `open_on_own_executor`
 
 using namespace unum::ustore;
 using namespace unum::ustore::test;
@@ -46,13 +46,13 @@ constexpr char const* needs_transactions_and_snapshots_k = "needs transactions a
  *  without a directory. */
 void test_database_init_refusals(config_t const& config) {
     ustore_outcome_t outcome {};
-    open_engine(config.options(), nullptr, &outcome);
+    open_on_own_executor(config.options(), nullptr, &outcome);
     expect_status(outcome, status_code_t::invalid_argument_k);
 
     engine_options_t without_directory = config.options();
     without_directory.directory = nullptr;
     ustore_database_t database = nullptr;
-    open_engine(without_directory, &database, &outcome);
+    open_on_own_executor(without_directory, &database, &outcome);
     config.engine() == "ram" ? expect_success(outcome) : expect_status(outcome, status_code_t::invalid_argument_k);
     ustore_database_free(database);
 }
@@ -179,12 +179,10 @@ void test_database_validation(config_t const& config) {
     expect_success(outcome);
     if (tape_written(columns.values)) expect_equal(columns.value(2).size(), sizeof(std::uint64_t));
 
-    // A read of collections nobody created carries the engine's note, never the status's own name
+    // A read of collections nobody created finds none of them
     ustore_blobs_read_t read_unnamed = read;
     read_unnamed.collections = {collections.data(), sizeof(ustore_collection_id_t)};
     ustore_blobs_read(&read_unnamed);
-    if (config.engine() == "ram")
-        expect_true(outcome.message && std::strcmp(outcome.message, ustore_status_name(outcome.status)) != 0);
     expect_status(outcome, status_code_t::not_found_k);
 
     if (transaction) {
@@ -476,7 +474,7 @@ void test_database_failed_reports_zeroed(config_t const& config) {
     expect_status(outcome, status_code_t::already_exists_k);
     expect_true(collection == ustore_collection_id_t {});
 
-    // An executor capped at a value no CPU class takes, here amd-genoa's retired id, is never made
+    // An executor capped at a value no CPU class takes, here a reserved one, is never made
     ustore_executor_t executor = reinterpret_cast<ustore_executor_t>(stale_handle);
     ustore_executor_for_ram_t spawn {.executor = &executor,
                                      .outcome = &outcome,
@@ -1265,8 +1263,9 @@ case_result_t test_database_free_holds(config_t const& config) {
     return {};
 }
 
-/** A snapshot opened before its collection is dropped still reads that collection's values,
- *  where the engine lets the drop go ahead, while the collection is gone at the head. */
+/** A drop of a collection an open snapshot reads answers contended and moves nothing, so the
+ *  collection stays listed and readable at the head and in the snapshot, and the same drop goes
+ *  through once the snapshot is freed. */
 case_result_t test_snapshot_reads_collection_dropped_after_open(config_t const& config) {
     auto [database, open_status] = open_raw(config);
     auto [arena, arena_status] = arena_t::make();
@@ -1295,8 +1294,14 @@ case_result_t test_snapshot_reads_collection_dropped_after_open(config_t const& 
                                    .collection = blobs,
                                    .mode = ustore_drop_collection_k};
     ustore_collection_drop(&drop);
-    bool const dropped = outcome.status == ustore_status_success_k;
-    if (!dropped) expect_status(outcome, status_code_t::invalid_argument_k);
+    expect_status(outcome, status_code_t::contended_k);
+    expect_status(collection_named(database, "snapshot_dropped.blobs"), status_code_t::success_k);
+
+    read_columns_t head_columns;
+    ustore_blobs_read_t head_read = read_of(database, blobs, {&key, 1}, head_columns, arena.handle(), outcome);
+    ustore_blobs_read(&head_read);
+    expect_success(outcome);
+    expect_true(head_columns.presences && (head_columns.presences[0] & 1) == 1 && head_columns.value(0) == "kept");
 
     read_columns_t columns;
     ustore_blobs_read_t read = read_of(database, blobs, {&key, 1}, columns, arena.handle(), outcome);
@@ -1304,8 +1309,10 @@ case_result_t test_snapshot_reads_collection_dropped_after_open(config_t const& 
     ustore_blobs_read(&read);
     expect_success(outcome);
     expect_true(columns.presences && (columns.presences[0] & 1) == 1 && columns.value(0) == "kept");
-    if (dropped) expect_status(collection_named(database, "snapshot_dropped.blobs"), status_code_t::not_found_k);
     ustore_snapshot_free(snapshot);
+    ustore_collection_drop(&drop);
+    expect_success(outcome);
+    expect_status(collection_named(database, "snapshot_dropped.blobs"), status_code_t::not_found_k);
     ustore_database_free(database);
     return {};
 }
@@ -1365,13 +1372,13 @@ case_result_t test_database_find_at_snapshot(config_t const& config) {
 }
 
 /** Fails unless exactly @p count values of a byte have a spelling, each reading back as its value,
- *  while a name no enumerator carries is refused and leaves the output as it was. */
+ *  while a name no enumerator holds is refused and leaves the output as it was. */
 template <typename enum_type_>
 void expect_spellings(char const* (*name_of)(enum_type_),
                       ustore_status_t (*from_name)(ustore_bytes_view_t, enum_type_*), std::size_t count) {
     std::size_t spelled = 0;
     enum_type_ read {};
-    // Values no enumerator carries reach the library as a C caller passes them, never loaded as
+    // Values no enumerator holds reach the library as a C caller passes them, never loaded as
     // the enum here
     for (int value = 0; value != 256; ++value) {
         std::string_view const name = name_of(static_cast<enum_type_>(value));
@@ -1387,7 +1394,7 @@ void expect_spellings(char const* (*name_of)(enum_type_),
     expect_true(from_name(bytes_of(std::string_view {"bogus"}), nullptr) == ustore_status_invalid_argument_k);
 }
 
-/** Every status spelling reads back as its status, while a name no status carries is refused. */
+/** Every status spelling reads back as its status, while a name no status holds is refused. */
 void test_status_names(config_t const&) {
     expect_spellings(ustore_status_name, ustore_status_from_name, 19);
     expect_true(std::string_view {ustore_status_name(ustore_status_deferred_k)} == "deferred");
@@ -1486,7 +1493,7 @@ void test_database_clear_modes(config_t const& config) {
     expect_true(columns.presences && columns.presences[0] == 0);
     expect_true(!collection_named(database, "clear.kept").status.failed());
 
-    // A snapshot belongs to its holder, so the RAM and RocksDB engines drop no collection under it
+    // A snapshot belongs to its holder, so no engine drops a collection under it
     auto [pinned, pinned_status] = create_collection(database, "clear.pinned", ustore_modality_blobs_k);
     expect_true(!pinned_status.failed());
     ustore_snapshot_t snapshot = nullptr;
@@ -1498,8 +1505,7 @@ void test_database_clear_modes(config_t const& config) {
                                        .collection = pinned,
                                        .mode = ustore_drop_collection_k};
         ustore_collection_drop(&drop);
-        bool const refuses = config.engine() == "ram" || config.engine() == "rocksdb";
-        refuses ? expect_status(outcome, status_code_t::invalid_argument_k) : expect_success(outcome);
+        expect_status(outcome, status_code_t::contended_k);
         ustore_snapshot_free(snapshot);
     }
 
@@ -1595,6 +1601,123 @@ case_result_t test_database_view_refusals(config_t const& config) {
     expect_status(status_of(outcome), status_code_t::read_only_k);
     expect_true(plan == nullptr && phase.phase == ustore_phase_none_k);
     ustore_executor_free(executor);
+    ustore_database_free(database);
+    return {};
+}
+
+/** A view of an NVMe database reads what its manifest names and refuses writes, while its open and
+ *  its close leave the manifest's bytes and modification time as they were. */
+case_result_t test_database_view_nvme(config_t const& config) {
+    if (config.engine() != "nvme") return case_result_t::skipped("needs the nvme engine");
+    if (!config.directory()) return case_result_t::skipped(needs_directory_k);
+    std::string const directory = fmt::format("{}/{}", config.directory(), "viewed");
+    expect_true(scratch_directory_t::recreate(directory.c_str()));
+    engine_options_t options = config.options();
+    options.locate(directory.c_str());
+    char const* const manifest = options.nvme_manifest.data();
+    ustore_key_t const key = key_from_integer(5);
+    ustore_outcome_t outcome {};
+    ustore_database_t database = nullptr;
+    open_on_own_executor(options, &database, &outcome);
+    if (!expect_success(outcome)) return {};
+    auto [blobs, blobs_status] = create_collection(database, "view.blobs", ustore_modality_blobs_k);
+    expect_true(blobs_status.succeeded());
+    write_text(database, blobs, {&key, 1}, "viewed");
+    ustore_database_flush_t landed {.database = database, .outcome = &outcome};
+    ustore_database_flush(&landed);
+    expect_success(outcome);
+    ustore_database_free(database);
+
+    st::vector<char> before, after;
+    expect_true(util::read_file(manifest, before).succeeded());
+    std::error_code error;
+    std::filesystem::file_time_type const modified = std::filesystem::last_write_time(manifest, error);
+    expect_true(!error);
+
+    database = nullptr;
+    ustore_database_view_nvme_t view {.database = &database,
+                                      .outcome = &outcome,
+                                      .directory = bytes_of(std::string_view {manifest})};
+    ustore_database_view_nvme(&view);
+    if (!expect_success(outcome)) return {};
+    auto [arena, arena_status] = arena_t::make();
+    if (!expect_true(arena_status.succeeded())) return {};
+    read_columns_t columns;
+    ustore_blobs_read_t read = read_of(database, blobs, {&key, 1}, columns, arena.handle(), outcome);
+    ustore_blobs_read(&read);
+    expect_success(outcome);
+    expect_true(tape_written(columns.values) && columns.value(0) == "viewed");
+    ustore_blobs_write_t write {.database = database,
+                                .outcome = &outcome,
+                                .count = 1,
+                                .collections = {&blobs, 0},
+                                .keys = {&key, 0},
+                                .values = stored_values_k.view()};
+    ustore_blobs_write(&write);
+    expect_status(outcome, status_code_t::read_only_k);
+    ustore_database_flush_t flush {.database = database, .outcome = &outcome};
+    ustore_database_flush(&flush);
+    expect_status(outcome, status_code_t::read_only_k);
+    ustore_database_free(database);
+
+    expect_true(util::read_file(manifest, after).succeeded());
+    expect_true(before.size() == after.size() && std::equal(before.begin(), before.end(), after.begin()));
+    expect_true(std::filesystem::last_write_time(manifest, error) == modified && !error);
+
+    std::string const missing = fmt::format("{}/absent.ustore.json", directory);
+    view.directory = bytes_of(std::string_view {missing.c_str()});
+    ustore_database_view_nvme(&view);
+    expect_status(outcome, status_code_t::not_found_k);
+    expect_true(!std::filesystem::exists(missing, error));
+    return {};
+}
+
+/** A RAM database refuses with capacity_exhausted the write that would pass its memory limit,
+ *  keeps what it landed before, and takes writes again after a clear, while LevelDB refuses to
+ *  open with a second background thread. */
+case_result_t test_database_open_budgets(config_t const& config) {
+    if (config.engine() == "leveldb") {
+        if (!config.directory()) return case_result_t::skipped(needs_directory_k);
+        ustore_database_t database = nullptr;
+        ustore_outcome_t outcome {};
+        ustore_database_open_leveldb_t open {.database = &database,
+                                             .outcome = &outcome,
+                                             .directory = bytes_of(std::string_view {config.directory()}),
+                                             .background_threads = 2};
+        ustore_database_open_leveldb(&open);
+        expect_status(outcome, status_code_t::unsupported_k);
+        expect_true(database == nullptr);
+        return {};
+    }
+    if (config.engine() != "ram") return case_result_t::skipped(needs_ram_engine_k);
+    ustore_database_t database = nullptr;
+    ustore_outcome_t outcome {};
+    ustore_database_init_ram_t init {.database = &database, .outcome = &outcome, .memory_limit = 64 * 1024};
+    ustore_database_init_ram(&init);
+    if (!expect_success(outcome)) return {};
+    auto [blobs, blobs_status] = create_collection(database, "budgets.blobs", ustore_modality_blobs_k);
+    expect_true(blobs_status.succeeded());
+    std::string const kilobyte(1024, 'k');
+    std::array<ustore_key_t, 32> keys {};
+    for (std::size_t index = 0; index != keys.size(); ++index) keys[index] = key_from_integer(index);
+    expect_true(write_text(database, blobs, keys, kilobyte));
+    std::array<ustore_key_t, 48> more {};
+    for (std::size_t index = 0; index != more.size(); ++index) more[index] = key_from_integer(1000 + index);
+    std::string_view const kilobyte_view {kilobyte};
+    strided_strings<std::string_view> const values {{&kilobyte_view, 0}};
+    ustore_blobs_write_t write {.database = database,
+                                .outcome = &outcome,
+                                .count = more.size(),
+                                .collections = {&blobs, 0},
+                                .keys = {more.data(), sizeof(ustore_key_t)},
+                                .values = values.view()};
+    ustore_blobs_write(&write);
+    expect_status(outcome, status_code_t::capacity_exhausted_k);
+    ustore_database_clear_t clear {.database = database, .outcome = &outcome, .mode = ustore_drop_pairs_k};
+    ustore_database_clear(&clear);
+    expect_success(outcome);
+    ustore_blobs_write(&write);
+    expect_success(outcome);
     ustore_database_free(database);
     return {};
 }
@@ -1760,7 +1883,7 @@ expected<ustore_database_t> open_saved(config_t const& config, char const* path)
     options.locate(path);
     ustore_database_t database = nullptr;
     ustore_outcome_t outcome {};
-    open_engine(options, &database, &outcome);
+    open_on_own_executor(options, &database, &outcome);
     if (status_t const status = status_of<status_t, status_code_t>(outcome); status.failed()) return {{}, status};
     return {std::move(database)};
 }
@@ -1960,9 +2083,9 @@ void finish_compact_plan(ustore_database_t database, ustore_executor_t executor,
 
 /** A plan a cancel leaves live continues at least one phase per call to its end, each barrier
  *  ticking that phase's own units, the phase output naming where each call stopped, and a finish
- *  frees it after its end as after a stop. Meanwhile the database admits no second compaction,
- *  and a plan without an executor, or one named with another database or executor, is refused
- *  before anything runs. */
+ *  on any executor or none frees it after its end as after a stop. Meanwhile the database admits
+ *  no second compaction, and a plan without an executor, or one named with another database, is
+ *  refused before anything runs. */
 case_result_t test_compact_plan_resumes(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     auto [executor, spawn_status] = spawn_executor();
@@ -2022,17 +2145,13 @@ case_result_t test_compact_plan_resumes(config_t const& config) {
     expect_status(status_of(outcome), status_code_t::contended_k);
     expect_true(phase.phase == ustore_phase_none_k);
 
-    // A plan names the database and the executor it was opened with, checked before the database
+    // A plan names the database it was opened with, checked before the database
     ustore_database_t other = nullptr;
     ustore_database_init_ram_t init_other {.database = &other, .outcome = &outcome};
     ustore_database_init_ram(&init_other);
     expect_success(outcome);
     ustore_database_compact_t elsewhere = compact;
     elsewhere.database = other;
-    ustore_database_compact(&elsewhere);
-    expect_status(status_of(outcome), status_code_t::invalid_argument_k);
-    elsewhere.database = database.handle();
-    elsewhere.executor = other_executor;
     ustore_database_compact(&elsewhere);
     expect_status(status_of(outcome), status_code_t::invalid_argument_k);
     elsewhere.database = nullptr;
@@ -2063,7 +2182,8 @@ case_result_t test_compact_plan_resumes(config_t const& config) {
     expect_success(outcome);
     expect_true(phase.phase == ustore_phase_done_k);
 
-    // A plan finished after a stop frees the database too, as does one finished naming another
+    // A plan finished after a stop frees the database too, on any executor or none, as does one
+    // finished naming another database, which is refused
     record = {.cancelling_report = 1};
     ustore_database_compact(&compact);
     expect_status(status_of(outcome), status_code_t::cancelled_k);
@@ -2075,8 +2195,12 @@ case_result_t test_compact_plan_resumes(config_t const& config) {
     record = {.cancelling_report = 1};
     ustore_database_compact(&compact);
     expect_status(status_of(outcome), status_code_t::cancelled_k);
-    finish_compact_plan(database.handle(), other_executor, plan, status_code_t::invalid_argument_k);
-    finish_compact_plan(database.handle(), nullptr, plan, status_code_t::invalid_argument_k);
+    finish_compact_plan(database.handle(), other_executor, plan, status_code_t::success_k);
+    record = {.cancelling_report = 1};
+    ustore_database_compact(&compact);
+    expect_status(status_of(outcome), status_code_t::cancelled_k);
+    finish_compact_plan(database.handle(), nullptr, plan, status_code_t::success_k);
+    finish_compact_plan(database.handle(), executor, plan, status_code_t::invalid_argument_k);
     finish_compact_plan(nullptr, nullptr, plan, status_code_t::uninitialized_k);
     ustore_database_compact(&one_shot);
     expect_success(outcome);
@@ -2118,7 +2242,7 @@ case_result_t test_compact_plan_resumes(config_t const& config) {
     return {};
 }
 
-/** Every phase a plan runs spells its name and reads it back, while a name no phase carries is
+/** Every phase a plan runs spells its name and reads it back, while a name no phase holds is
  *  refused. */
 void test_compact_phase_names(config_t const&) {
     expect_spellings(ustore_phase_name, ustore_phase_from_name, 5);
@@ -2232,7 +2356,7 @@ void test_progress_serialized(config_t const& config) {
 #pragma endregion Progress
 
 /** A save copies exactly the collections and names its snapshot recorded: one created after the
- *  snapshot stays behind, and one dropped after it comes along with its pairs. */
+ *  snapshot stays behind, and one whose drop the snapshot refused comes along with its pairs. */
 case_result_t test_snapshot_save_recorded(config_t const& config) {
     if (!config.directory()) return case_result_t::skipped(needs_directory_k);
     auto [database, open_status] = open_database<database_t>(config);
@@ -2252,8 +2376,7 @@ case_result_t test_snapshot_save_recorded(config_t const& config) {
     expect_true(!create_collection(database.handle(), "save.created", ustore_modality_blobs_k).status.failed());
     ustore_collection_drop_t drop {.database = database.handle(), .outcome = &outcome, .collection = dropped};
     ustore_collection_drop(&drop);
-    bool const refuses_drop = config.engine() == "ram" || config.engine() == "rocksdb";
-    refuses_drop ? expect_status(outcome, status_code_t::invalid_argument_k) : expect_success(outcome);
+    expect_status(outcome, status_code_t::contended_k);
 
     std::string const saved = fmt::format("{}/{}", config.directory(), "save.recorded");
     expect_true(ready_save_path(config, saved.c_str()));
@@ -2281,7 +2404,7 @@ case_result_t test_snapshot_save_recorded(config_t const& config) {
 
 #pragma region Change Feeds
 
-/** One change a test committed, as a feed must hand it back: a write carries its round. */
+/** One change a test committed, as a feed must hand it back: a write holds its round. */
 struct logged_change_t {
     ustore_stamp_t stamp = 0;
     ustore_key_t key {};
@@ -2561,6 +2684,8 @@ int main(int argc, char** argv) {
     run_test_case(engine_label_t {"test_database_flush_durable"}.c_str(), test_database_flush_durable, config);
     run_test_case(engine_label_t {"test_database_clear_modes"}.c_str(), test_database_clear_modes, config);
     run_test_case(engine_label_t {"test_database_view_refusals"}.c_str(), test_database_view_refusals, config);
+    run_test_case(engine_label_t {"test_database_view_nvme"}.c_str(), test_database_view_nvme, config);
+    run_test_case(engine_label_t {"test_database_open_budgets"}.c_str(), test_database_open_budgets, config);
     run_test_case(engine_label_t {"test_progress_cancel_scans"}.c_str(), test_progress_cancel_scans, config);
     run_test_case(engine_label_t {"test_progress_cancel_cursor"}.c_str(), test_progress_cancel_cursor, config);
     run_test_case(engine_label_t {"test_database_relative_directory"}.c_str(), test_database_relative_directory,

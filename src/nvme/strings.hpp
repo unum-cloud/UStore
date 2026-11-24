@@ -157,10 +157,10 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
     call_access<cpu_class_> access = access_of(state, view);
     collection_reading_of<cpu_class_> held;
     if (status_t const one = read_at_one_state(access, collections, arguments.count, held); one.failed()) return one;
-    auto read_slice = [&](std::size_t begin, std::size_t length, view_t const& slice) noexcept -> status_t {
-        call_access<cpu_class_> const sliced {state,          access.transaction, access.schedule,
-                                              slice.scratch,  access.stamp,       thread_index_of(state, slice),
-                                              access.strings, access.reading};
+    auto read_slice = [&](std::size_t begin, std::size_t length, std::size_t,
+                          view_t const& slice) noexcept -> status_t {
+        call_access<cpu_class_> const sliced {state,        access.transaction,    access.schedule, slice.scratch,
+                                              access.stamp, nvme_queues_of(slice), access.strings,  access.reading};
         for (std::size_t first = begin; first != begin + length;) {
             std::size_t const last = run_end(collections, first, begin + length);
             if (status_t const read = read_strings(sliced, collections[first], texts, first, last, outputs);
@@ -171,7 +171,7 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
         return {};
     };
     // A transaction's reads join its watch set, so only a read at one stamp splits the batch
-    status_t const read = access.transaction ? read_slice(0, arguments.count, view)
+    status_t const read = access.transaction ? read_slice(0, arguments.count, 0, view)
                                              : util::for_task_slices(view, arguments.count, read_slice);
     if (read.failed()) return read;
     outputs.finish(arguments);
@@ -200,11 +200,12 @@ status_t strings_scan(ustore_strings_scan_t const& arguments, strings_arg_t cons
     call_access<cpu_class_> access = access_of(state, view);
     collection_reading_of<cpu_class_> held;
     if (status_t const one = read_at_one_state(access, collections, arguments.count, held); one.failed()) return one;
-    auto scan_slice = [&](std::size_t first_task, std::size_t length, view_t const& slice) noexcept -> status_t {
-        util::strings_scan_slice_t& sliced = slices[slice.thread_index];
+    auto scan_slice = [&](std::size_t first_task, std::size_t length, std::size_t run,
+                          view_t const& slice) noexcept -> status_t {
+        util::strings_scan_slice_t& sliced = slices[run];
         sliced = {first_task, length, outputs.slice_in(slice.scratch)};
         call_access<cpu_class_> const sliced_access {state,          access.transaction, access.schedule,
-                                                     slice.scratch,  access.stamp,       thread_index_of(state, slice),
+                                                     slice.scratch,  access.stamp,       nvme_queues_of(slice),
                                                      access.strings, access.reading};
         for (std::size_t task = first_task; task != first_task + length; ++task) {
             strings_window_t const window {
@@ -223,7 +224,7 @@ status_t strings_scan(ustore_strings_scan_t const& arguments, strings_arg_t cons
         return {};
     };
     // A transaction's reads join its watch set, so only a read at one stamp splits the batch
-    status_t const scanned = access.transaction ? scan_slice(0, arguments.count, view)
+    status_t const scanned = access.transaction ? scan_slice(0, arguments.count, 0, view)
                                                 : util::for_task_slices(view, arguments.count, scan_slice);
     if (scanned.failed()) return scanned;
     for (util::strings_scan_slice_t const& slice : slices)
@@ -233,7 +234,8 @@ status_t strings_scan(ustore_strings_scan_t const& arguments, strings_arg_t cons
 }
 
 /** Implements @c ustore_strings_sample as a reservoir filled from a walk of each collection's
- *  strings, every kept one copied, as a walk's strings live only until it moves on. */
+ *  strings, every kept one copied into the call's scratch, as a walk's strings live only until
+ *  the walk moves on to the next. */
 template <cpu_class_t cpu_class_>
 status_t strings_sample(ustore_strings_sample_t const& arguments, view_t const& view) noexcept {
     if (!arguments.count) return {};
@@ -252,7 +254,7 @@ status_t strings_sample(ustore_strings_sample_t const& arguments, view_t const& 
     collection_reading_of<cpu_class_> held;
     if (status_t const one = read_at_one_state(access, samples.collections, arguments.count, held); one.failed())
         return one;
-    st::vector<kept_string_t> kept;
+    st::vector<std::string_view, arena_allocator<std::string_view>> kept {{view.scratch}};
     for (std::size_t task = 0; task != samples.size(); ++task) {
         util::sample_task_t const sample = samples[task];
         outputs.open_task(task);
@@ -266,17 +268,21 @@ status_t strings_sample(ustore_strings_sample_t const& arguments, view_t const& 
                         std::size_t const slot = seen < sample.limit ? seen : st::draw_below(generator, seen + 1);
                         ++seen;
                         if (slot >= sample.limit) return true;
-                        if (slot == kept.size()) room = growth_status(kept.push_back(kept_string_t {}));
-                        if (room.succeeded()) room = keep_string(kept[slot], text);
+                        auto [copy, copy_status] = util::arena_copy<char>(view.scratch, std::span<char const> {text});
+                        room = copy_status;
+                        std::string_view const copied {copy.begin(), copy.end()};
+                        if (room.succeeded() && slot == kept.size())
+                            room = growth_status(kept.push_back(std::string_view {copied}));
+                        else if (room.succeeded()) kept[slot] = copied;
                         return room.succeeded();
                     });
                 walked.failed() || room.failed())
                 return walked.failed() ? walked : room;
         transaction_stamp_t const watch_stamp = watch_stamp_of(access);
-        for (kept_string_t const& text : kept) {
-            if (status_t const pushed = outputs.push(kept_text(text)); pushed.failed()) return pushed;
+        for (std::string_view const text : kept) {
+            if (status_t const pushed = outputs.push(text); pushed.failed()) return pushed;
             if (watch_stamp != invalid_transaction_stamp_k)
-                if (status_t const watched = access.strings->watch(sample.collection, kept_text(text), watch_stamp);
+                if (status_t const watched = access.strings->watch(sample.collection, text, watch_stamp);
                     watched.failed())
                     return watched;
         }

@@ -94,8 +94,8 @@ util::status_t export_edge_tuples( //
     ustore_length_t const** edges_offsets, ustore_key_t const** neighborships_per_vertex, ustore_arena_t arena,
     view_t const& view) noexcept {
 
-    edges_batch_t const read_edges {util::strided(collections), util::strided(vertices), util::strided(roles),
-                                    vertices_count};
+    util::edges_batch_t const read_edges {util::strided(collections), util::strided(vertices), util::strided(roles),
+                                          vertices_count};
     auto [values, values_status] = read_vertices(values_verbs, database, vertices_count, collections, vertices, view);
     if (values_status.failed()) return values_status;
     constexpr std::size_t ids_per_neighborship_k = ids_per_neighborship(export_kind_);
@@ -120,7 +120,7 @@ util::status_t export_edge_tuples( //
     std::size_t exported_edges = 0;
     for (std::size_t index = 0; index != vertices_count; ++index) {
         util::value_view_t const value = values[index];
-        edges_task_t const read_edge = read_edges[index];
+        util::edges_task_t const read_edge = read_edges[index];
         if (edges_offsets) offsets[index] = static_cast<ustore_length_t>(exported_edges);
 
         if (!value) {

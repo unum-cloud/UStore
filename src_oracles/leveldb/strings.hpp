@@ -135,7 +135,7 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
 
     auto [outputs, outputs_status] = strings_read_outputs_t::make(arguments);
     if (outputs_status.failed()) return outputs_status;
-    auto read_slice = [&](std::size_t first, std::size_t length, view_t const&) noexcept -> status_t {
+    auto read_slice = [&](std::size_t first, std::size_t length, std::size_t, view_t const&) noexcept -> status_t {
         std::string key;
         std::string value;
         for (std::size_t index = first; index != first + length; ++index) {

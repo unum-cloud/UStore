@@ -91,7 +91,7 @@ struct model_key_t {
     }
 };
 
-/** What a half-edge carries besides its name. */
+/** What a half-edge holds besides its name. */
 struct model_payload_t {
     float weight = 0;
     std::int32_t label = 0;

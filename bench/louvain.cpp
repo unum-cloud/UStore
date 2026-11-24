@@ -90,7 +90,7 @@ struct louvain_settings_t : bench_settings_t {
     /** Edges kept from the dataset, counted before repeats collapse. */
     count_t max_edges {(std::numeric_limits<std::size_t>::max)()};
 
-    /** Edges every upsert batch carries into the graph collection. */
+    /** Edges every upsert batch writes into the graph collection. */
     count_t batch_size_upsert {.value = 1024, .minimum = 1};
 
     /** Least modularity growth, in billionths, that justifies coarsening once more. */
@@ -198,7 +198,7 @@ void canonicalize_edges(st::vector<input_edge_t>& edges) noexcept {
     [[maybe_unused]] st::status_t const shrunk = edges.resize(static_cast<std::size_t>(unique_end - begin));
 }
 
-/** Lays out @p edges as the C ABI's triples, all carrying the default edge identifier. */
+/** Lays out @p edges as the C ABI's triples, all holding the default edge identifier. */
 status_t stage_edges(std::span<input_edge_t const> edges, st::vector<edge_t>& staged) noexcept {
     if (st::failed(staged.reserve(edges.size()))) return status_code_t::out_of_memory_k;
     for (input_edge_t const& edge : edges) {
@@ -231,7 +231,7 @@ struct weighted_entry_t {
     /** Key of the vertex the entry enters. */
     ustore_key_t target;
 
-    /** Weight the entry carries. */
+    /** Weight the entry holds. */
     double weight;
 };
 
@@ -364,7 +364,7 @@ class stored_graph_t {
     /** Vertices the collection holds. */
     [[nodiscard]] std::size_t vertices_count() const noexcept { return keys_.size(); }
 
-    /** Hands @p visit every distinct neighbor of @p vertex_index, each carrying unit weight. */
+    /** Hands @p visit every distinct neighbor of @p vertex_index, each holding unit weight. */
     template <typename visitor_type_>
     status_t for_each_neighbor(std::size_t vertex_index, visitor_type_&& visit) noexcept {
         auto [neighbors, neighbors_status] = collection_->neighbors(keys_[vertex_index], arena_);
@@ -649,7 +649,7 @@ int run_louvain(int argc, char** argv) {
                                                  "USTORE_MAX_LEVELS"};
 
     read_bench_settings(argc, argv, settings, flags, variables);
-    auto [executor, executor_status] = util::executor_t::make(1, util::caller_exclusivity_t::caller_inclusive_k);
+    auto [executor, executor_status] = util::ram_executor_t::make(1, util::caller_exclusivity_t::caller_inclusive_k);
     if (st::failed(executor_status)) {
         fmt::println(stderr, "Failed to pin the calling thread");
         return 1;
@@ -692,7 +692,7 @@ int run_louvain(int argc, char** argv) {
     ustore_database_t handle = nullptr;
     ustore_outcome_t outcome {};
     settings.engine.locate(settings.directory.data());
-    open_engine(settings.engine, &handle, &outcome);
+    open_engine(settings.engine, nullptr, &handle, &outcome);
     if (outcome.status != ustore_status_success_k) {
         fmt::println(stderr, "Failed to open the database: {}", outcome.message ? outcome.message : "unknown");
         return 1;

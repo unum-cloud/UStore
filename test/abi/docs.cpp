@@ -12,12 +12,18 @@
 #include <cstdlib> // `std::free`
 #include <cstring> // `std::memcpy`
 
+#include <algorithm>   // `std::reverse`
 #include <array>       // `std::array`
 #include <span>        // `std::span`
+#include <string>      // `std::string`
 #include <string_view> // `std::string_view`
+#include <utility>     // `std::move`
+#include <vector>      // `std::vector`
 
 #include <fmt/format.h>
 #include <yyjson.h>
+
+#include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/ustore.hpp"
 
@@ -557,6 +563,112 @@ void test_database_docs_table(config_t const& config) {
     }
 }
 
+/** A gather of more documents than one flight, on an executor of two threads, lands every cell in
+ *  its own row: numbers, escaped texts, booleans, collisions, and missing fields and documents. */
+void test_docs_gather_in_flights(config_t const& config) {
+    auto [database, open_status] = open_database<database_t>(config);
+    if (!expect_true(open_status.succeeded())) return;
+    auto [docs, docs_status] = create_collection(database.handle(), "gather_in_flights.docs", ustore_modality_docs_k);
+    if (!expect_true(docs_status.succeeded())) return;
+    auto [executor, executor_status] = spawn_executor();
+    if (!expect_true(executor_status.succeeded())) return;
+    auto [arena, arena_status] = arena_t::make();
+    if (!expect_true(arena_status.succeeded())) return;
+
+    // Three flights of a two-thread executor; every fifth document is missing, every seventh has no
+    // "f", every eleventh escapes a quote
+    constexpr std::size_t count_k = 3 * 64 * 64 + 960;
+    st::vector<ustore_key_t> keys, written_keys;
+    st::vector<std::array<char, 96>> texts;
+    st::vector<std::string_view> documents;
+    if (!expect_true(st::succeeded(keys.resize(count_k)) && st::succeeded(written_keys.resize(count_k)) &&
+                     st::succeeded(texts.resize(count_k)) && st::succeeded(documents.resize(count_k))))
+        return ustore_executor_free(executor);
+    std::size_t written = 0;
+    for (std::size_t row = 0; row != count_k; ++row) {
+        keys[row] = key_from_integer(row);
+        if (row % 5 == 4) continue;
+        char const* const quote = row % 11 == 0 ? "\\\"" : "";
+        auto const end = row % 7 == 0
+                             ? fmt::format_to_n(texts[row].data(), texts[row].size(),
+                                                R"({{"i":{},"s":"t{}{}","b":{}}})", row, quote, row, row % 3 == 0)
+                             : fmt::format_to_n(texts[row].data(), texts[row].size(),
+                                                R"({{"i":{},"s":"t{}{}","f":{}.5,"b":{}}})", row, quote, row, row,
+                                                row % 3 == 0);
+        written_keys[written] = keys[row];
+        documents[written++] = {texts[row].data(), end.size};
+    }
+    strided_strings<std::string_view> const values {{documents.data(), sizeof(std::string_view)}};
+    ustore_outcome_t outcome {};
+    ustore_docs_write_t write {
+        .database = database.handle(),
+        .outcome = &outcome,
+        .count = written,
+        .collections = {&docs, 0},
+        .keys = {written_keys.data(), sizeof(ustore_key_t)},
+        .values = values.view(),
+    };
+    ustore_docs_write(&write);
+    expect_success(outcome);
+
+    std::array<std::string_view, 5> const fields {"i", "s", "f", "b", "s"};
+    strided_strings<std::string_view> const fields_strings {strided(fields).begin()};
+    std::array<ustore_docs_field_type_t, 5> const types {ustore_docs_field_type_i64_k, ustore_docs_field_type_string_k,
+                                                         ustore_docs_field_type_f64_k, ustore_docs_field_type_bool_k,
+                                                         ustore_docs_field_type_i32_k};
+    ustore_docs_column_view_t const* columns = nullptr;
+    ustore_docs_gather_t gather {
+        .database = database.handle(),
+        .executor = executor,
+        .outcome = &outcome,
+        .count = count_k,
+        .collections = {&docs, 0},
+        .keys = {keys.data(), sizeof(ustore_key_t)},
+        .fields_count = fields.size(),
+        .fields = fields_strings.view(),
+        .columns = &columns,
+        .arena = arena.handle(),
+        .outputs_types = types.data(),
+    };
+    auto const bit = [](ustore_octet_t const* bits, std::size_t row) noexcept {
+        return (bits[row / 8] >> (row % 8)) & 1;
+    };
+    auto const expect_columns = [&] {
+        auto const* const numbers = reinterpret_cast<std::int64_t const*>(columns[0].scalars);
+        auto const* const halves = reinterpret_cast<double const*>(columns[2].scalars);
+        auto const* const flags = reinterpret_cast<bool const*>(columns[3].scalars);
+        for (std::size_t row = 0; row != count_k; ++row) {
+            bool const present = row % 5 != 4;
+            expect_equal(bit(columns[0].validities, row), int {present}, "row {}", row);
+            expect_equal(bit(columns[2].validities, row), int {present && row % 7 != 0}, "row {}", row);
+            expect_equal(bit(columns[4].collisions, row), int {present}, "row {}", row);
+            if (!present) continue;
+            expect_equal(numbers[row], static_cast<std::int64_t>(row), "row {}", row);
+            expect_equal(flags[row], row % 3 == 0, "row {}", row);
+            if (row % 7 != 0) expect_equal(halves[row], static_cast<double>(row) + 0.5, "row {}", row);
+            std::array<char, 32> wanted {};
+            auto const wanted_end = fmt::format_to_n(wanted.data(), wanted.size(), "t{}{}", row % 11 == 0 ? "\"" : "",
+                                                     row);
+            std::string_view const text = util::chars_of(util::tape_string(columns[1].strings, row));
+            expect_equal(text, std::string_view {wanted.data(), wanted_end.size + 1}, "row {}", row);
+        }
+    };
+    ustore_docs_gather(&gather);
+    expect_success(outcome);
+    if (!expect_true(columns != nullptr)) return ustore_executor_free(executor);
+    expect_columns();
+
+    // A watching transaction gathers every flight as the head does
+    auto [transaction, transaction_status] = database.transaction();
+    if (transaction_status.succeeded()) {
+        gather.view = ustore_transaction_view(transaction.handle(), ustore_watch_keys_k);
+        ustore_docs_gather(&gather);
+        expect_success(outcome);
+        if (expect_true(columns != nullptr)) expect_columns();
+    }
+    ustore_executor_free(executor);
+}
+
 #pragma endregion Documents Modality
 
 #pragma region Bounded Ranges
@@ -623,6 +735,339 @@ void test_docs_range_measure(config_t const& config) {
 
 #pragma endregion Bounded Ranges
 
+#pragma region Cursor Batches
+
+/** One row a docs cursor handed out: its key, its whole document, and its "age" field where
+ *  valid. */
+struct pulled_row_t {
+    ustore_key_t key {};
+    std::string document;
+    std::int64_t age = 0;
+    std::uint8_t age_valid = 0;
+};
+
+/** The fields every cursor of these cases gathers: the whole document as JSON and "age" as an
+ *  i64. */
+constexpr std::array<std::uint32_t, 3> rows_field_offsets_k {0, 0, 3};
+constexpr std::array<ustore_docs_field_type_t, 2> rows_field_types_k {ustore_docs_field_type_json_k,
+                                                                      ustore_docs_field_type_i64_k};
+
+/** Opens a docs cursor over @p collection gathering the whole document and its age, from @p start
+ *  in @p direction, through @p view with @p predicate, or null with the failure recorded. */
+ustore_docs_cursor_t open_rows_cursor(ustore_database_t database, ustore_executor_t executor,
+                                      ustore_collection_id_t collection, ustore_key_t start,
+                                      ustore_scan_direction_t direction = ustore_scan_ascending_k,
+                                      ustore_view_t view = nullptr, ustore_predicate_t predicate = {},
+                                      std::string_view filter = {}) {
+    ustore_docs_cursor_t cursor = nullptr;
+    ustore_outcome_t outcome {};
+    ustore_docs_cursor_init_t init {};
+    init.cursor = &cursor, init.database = database, init.executor = executor, init.outcome = &outcome;
+    init.view = view, init.collection = collection, init.start_key = start, init.direction = direction;
+    init.predicate = predicate, init.filter = bytes_of(filter);
+    init.fields_count = rows_field_types_k.size();
+    init.fields = util::u32_tape("age", rows_field_offsets_k.data());
+    init.columns_types = rows_field_types_k.data();
+    ustore_docs_cursor_init(&init);
+    expect_success(outcome);
+    return cursor;
+}
+
+/** Pulls batches of up to @p wanted rows of @p cursor into @p arena, appending their rows to @p
+ *  rows, and answers the batches written, checking they hold no more than @p wanted rows and at
+ *  least one unless none came. */
+std::size_t pull_rows(ustore_database_t database, ustore_executor_t executor, ustore_docs_cursor_t cursor,
+                      ustore_arena_t arena, std::size_t wanted, st::vector<pulled_row_t>& rows) {
+    ustore_outcome_t outcome {};
+    ustore_docs_batch_view_t const* batches = nullptr;
+    ustore_size_t count = 0;
+    ustore_docs_cursor_next_t next {};
+    next.database = database, next.executor = executor, next.outcome = &outcome, next.cursor = cursor;
+    next.batches = &batches, next.batches_count = &count, next.arena = arena, next.wanted = wanted;
+    ustore_docs_cursor_next(&next);
+    if (!expect_success(outcome)) return 0;
+    std::size_t pulled = 0;
+    for (ustore_docs_batch_view_t const& batch : std::span<ustore_docs_batch_view_t const> {batches, count}) {
+        expect_true(batch.count != 0, "a batch holds rows");
+        ustore_docs_column_view_t const& documents = batch.columns[0];
+        ustore_docs_column_view_t const& ages = batch.columns[1];
+        for (std::size_t row = 0; row != batch.count; ++row) {
+            pulled_row_t pulled_row;
+            pulled_row.key = batch.keys[row];
+            pulled_row.document = std::string {util::chars_of(util::tape_string(documents.strings, row))};
+            pulled_row.age_valid = (ages.validities[row / 8] >> (row % 8)) & 1u;
+            std::memcpy(&pulled_row.age, ages.scalars + row * sizeof(std::int64_t), sizeof(std::int64_t));
+            expect_true(st::succeeded(rows.push_back(std::move(pulled_row))));
+        }
+        pulled += batch.count;
+    }
+    expect_true(pulled <= wanted, "a pull holds at most what it wanted");
+    expect_true(count == 0 || pulled != 0);
+    return count;
+}
+
+/** Every row a walk handed out, and the most batches one of its pulls wrote. */
+struct walked_rows_t {
+    st::vector<pulled_row_t> rows;
+    std::size_t widest = 0;
+};
+
+/** Pulls @p cursor to its end in pulls of @p wanted rows. */
+walked_rows_t pull_all_rows(ustore_database_t database, ustore_executor_t executor, ustore_docs_cursor_t cursor,
+                            ustore_arena_t arena, std::size_t wanted) {
+    walked_rows_t walked;
+    for (std::size_t batches = 1; batches;) {
+        batches = pull_rows(database, executor, cursor, arena, wanted, walked.rows);
+        walked.widest = fu::max_of(walked.widest, batches);
+    }
+    return walked;
+}
+
+/** Writes under every key from @p first up to @p last, exclusive, of @p collection a document whose
+ *  age is the key plus @p shift, through @p transaction when given. */
+void write_ages(ustore_database_t database, ustore_collection_id_t collection, std::size_t first, std::size_t last,
+                std::size_t shift = 0, ustore_transaction_t transaction = nullptr) {
+    std::vector<std::string> texts;
+    std::vector<ustore_key_t> keys;
+    for (std::size_t index = first; index != last; ++index) {
+        texts.push_back(fmt::format(R"({{"age":{}}})", index + shift));
+        keys.push_back(key_from_integer(index));
+    }
+    strided_strings<std::string> const documents {{texts.data(), sizeof(std::string)}};
+    ustore_outcome_t outcome {};
+    ustore_docs_write_t write {};
+    write.database = database, write.outcome = &outcome, write.transaction = transaction, write.count = keys.size();
+    write.collections = {&collection, 0}, write.keys = {keys.data(), sizeof(ustore_key_t)};
+    write.values = documents.view();
+    ustore_docs_write(&write);
+    expect_success(outcome);
+}
+
+/** Removes every key from @p first up to @p last, exclusive, of @p collection, through @p
+ *  transaction when given. */
+void remove_ages(ustore_database_t database, ustore_collection_id_t collection, std::size_t first, std::size_t last,
+                 ustore_transaction_t transaction = nullptr) {
+    std::vector<ustore_key_t> keys;
+    for (std::size_t index = first; index != last; ++index) keys.push_back(key_from_integer(index));
+    ustore_outcome_t outcome {};
+    ustore_docs_remove_t remove {};
+    remove.database = database, remove.outcome = &outcome, remove.transaction = transaction, remove.count = keys.size();
+    remove.collections = {&collection, 0}, remove.keys = {keys.data(), sizeof(ustore_key_t)};
+    ustore_docs_remove(&remove);
+    expect_success(outcome);
+}
+
+/** Flushes @p database, so the writes before it land in a run of their own. */
+void flush_runs(ustore_database_t database) {
+    ustore_outcome_t outcome {};
+    ustore_database_flush_t flush {.database = database, .outcome = &outcome};
+    ustore_database_flush(&flush);
+    expect_success(outcome);
+}
+
+/** Checks @p rows hold exactly the keys @p expected names in its order, each with the age it
+ *  maps to. */
+template <typename expected_type_>
+void expect_rows(st::vector<pulled_row_t> const& rows, std::span<std::size_t const> keys, expected_type_&& age_of) {
+    if (!expect_equal(rows.size(), keys.size())) return;
+    for (std::size_t index = 0; index != keys.size(); ++index) {
+        pulled_row_t const& row = rows[index];
+        std::int64_t const age = static_cast<std::int64_t>(age_of(keys[index]));
+        expect_true(row.key == key_from_integer(keys[index]), "row {} holds key {}", index, keys[index]);
+        expect_true(row.age_valid && row.age == age, "row {} holds age {}", index, age);
+        expect_true(json_equal(row.document, fmt::format(R"({{"age":{}}})", age)), "row {} holds its document", index);
+    }
+}
+
+/** Writes keys 0 to 199 in four flushed runs of fifty, rewrites 45 to 54 across the first fence in
+ *  a fifth run, and removes 95 to 104 across the second fence and 160 to 169 in memory runs,
+ *  answering the keys left. */
+std::vector<std::size_t> write_fenced_runs(ustore_database_t database, ustore_collection_id_t collection) {
+    for (std::size_t first = 0; first != 200; first += 50) {
+        write_ages(database, collection, first, first + 50);
+        flush_runs(database);
+    }
+    write_ages(database, collection, 45, 55, 1000);
+    flush_runs(database);
+    remove_ages(database, collection, 95, 105);
+    write_ages(database, collection, 160, 170, 2000);
+    remove_ages(database, collection, 160, 170);
+    std::vector<std::size_t> left;
+    for (std::size_t index = 0; index != 200; ++index)
+        if (!(index >= 95 && index < 105) && !(index >= 160 && index < 170)) left.push_back(index);
+    return left;
+}
+
+/** The age a fenced key maps to, the rewritten ones shifted by a thousand. */
+std::size_t fenced_age(std::size_t key) noexcept { return key >= 45 && key < 55 ? key + 1000 : key; }
+
+/** A cursor on an executor of four threads splits each pull into batches cut across the fences of
+ *  the runs, over rewritten versions and removals straddling them, and walks every key left once,
+ *  in order, with its columns; a pull wanting more than is left ends the walk, and the next
+ *  answers no batch. */
+void test_docs_cursor_batches_cross_run_fences(config_t const& config) {
+    auto [database, open_status] = open_database<database_t>(config);
+    auto [arena, arena_status] = arena_t::make();
+    auto [executor, executor_status] = spawn_executor(4);
+    if (!expect_true(open_status.succeeded() && arena_status.succeeded() && executor_status.succeeded())) return;
+    auto [collection, collection_status] = create_collection(database.handle(), "batches.docs", ustore_modality_docs_k);
+    if (!expect_true(collection_status.succeeded())) return;
+    std::vector<std::size_t> const left = write_fenced_runs(database.handle(), collection);
+
+    ustore_docs_cursor_t cursor = open_rows_cursor(database.handle(), executor, collection, key_from_integer(0));
+    walked_rows_t const walked = pull_all_rows(database.handle(), executor, cursor, arena.handle(), 64);
+    expect_rows(walked.rows, left, fenced_age);
+    engine_names_t names;
+    [[maybe_unused]] unnamed_flag_t const unnamed = read_engine_names(test_run.settings.engine, names);
+    if (names.engine == ustore_engine_nvme_k) expect_true(walked.widest > 1, "the tasks cut a pull");
+    ustore_docs_cursor_free(cursor);
+
+    // A pull wanting every key left takes them at once and exhausts the walk
+    cursor = open_rows_cursor(database.handle(), executor, collection, key_from_integer(0));
+    st::vector<pulled_row_t> all;
+    expect_true(pull_rows(database.handle(), executor, cursor, arena.handle(), 1000, all) != 0);
+    expect_rows(all, left, fenced_age);
+    st::vector<pulled_row_t> none;
+    expect_equal(pull_rows(database.handle(), executor, cursor, arena.handle(), 1000, none), std::size_t {0});
+    ustore_docs_cursor_free(cursor);
+    ustore_executor_free(executor);
+}
+
+/** A descending cursor walks the fenced runs from the largest key down, every key left once. */
+void test_docs_cursor_batches_descend(config_t const& config) {
+    auto [database, open_status] = open_database<database_t>(config);
+    auto [arena, arena_status] = arena_t::make();
+    auto [executor, executor_status] = spawn_executor(4);
+    if (!expect_true(open_status.succeeded() && arena_status.succeeded() && executor_status.succeeded())) return;
+    auto [collection, collection_status] = create_collection(database.handle(), "descending.docs",
+                                                             ustore_modality_docs_k);
+    if (!expect_true(collection_status.succeeded())) return;
+    std::vector<std::size_t> left = write_fenced_runs(database.handle(), collection);
+    std::reverse(left.begin(), left.end());
+    ustore_docs_cursor_t cursor = open_rows_cursor(database.handle(), executor, collection, largest_key_k,
+                                                   ustore_scan_descending_k);
+    expect_rows(pull_all_rows(database.handle(), executor, cursor, arena.handle(), 48).rows, left, fenced_age);
+    ustore_docs_cursor_free(cursor);
+    ustore_executor_free(executor);
+}
+
+/** Counts the calls of a predicate admitting even keys, which the executor's threads
+ *  ask concurrently. */
+struct counted_predicate_t {
+    std::size_t calls = 0;
+    std::size_t asked = 0;
+};
+
+void admit_even_rows(ustore_key_t const* keys, ustore_admission_t* admissions, ustore_size_t count, void* state) {
+    auto& counted = *static_cast<counted_predicate_t*>(state);
+    fu::standard_atomic_ref<std::size_t> {counted.calls}.fetch_add(1, std::memory_order_relaxed);
+    fu::standard_atomic_ref<std::size_t> {counted.asked}.fetch_add(count, std::memory_order_relaxed);
+    for (std::size_t index = 0; index != count; ++index)
+        admissions[index] = keys[index].uuid.bytes[15] % 2 == 0 ? ustore_admit_k : ustore_reject_k;
+}
+
+/** A cheap and an expensive predicate, asked from the tasks of each pull, keep the even keys alone,
+ *  every one once. */
+void test_docs_cursor_predicates_run_in_tasks(config_t const& config) {
+    auto [database, open_status] = open_database<database_t>(config);
+    auto [arena, arena_status] = arena_t::make();
+    auto [executor, executor_status] = spawn_executor(4);
+    if (!expect_true(open_status.succeeded() && arena_status.succeeded() && executor_status.succeeded())) return;
+    auto [collection, collection_status] = create_collection(database.handle(), "predicates.docs",
+                                                             ustore_modality_docs_k);
+    if (!expect_true(collection_status.succeeded())) return;
+    std::vector<std::size_t> const left = write_fenced_runs(database.handle(), collection);
+    std::vector<std::size_t> even;
+    for (std::size_t key : left)
+        if (key % 2 == 0) even.push_back(key);
+    for (ustore_predicate_cost_t const cost : {ustore_predicate_cost_cheap_k, ustore_predicate_cost_expensive_k}) {
+        counted_predicate_t counted;
+        ustore_docs_cursor_t cursor = open_rows_cursor(database.handle(), executor, collection, key_from_integer(0),
+                                                       ustore_scan_ascending_k, nullptr,
+                                                       {&admit_even_rows, &counted, cost});
+        expect_rows(pull_all_rows(database.handle(), executor, cursor, arena.handle(), 40).rows, even, fenced_age);
+        expect_true(counted.calls != 0 && counted.asked >= even.size());
+        ustore_docs_cursor_free(cursor);
+    }
+    ustore_executor_free(executor);
+}
+
+/** A cursor through a watching transaction walks the transaction's own writes and removals merged
+ *  into the store, its tasks recording what they listed, so a commit landing in the walked range
+ *  before the transaction's own conflicts. */
+case_result_t test_docs_cursor_transaction_watches_its_tasks(config_t const& config) {
+    auto [database, open_status] = open_database<database_t>(config);
+    auto [arena, arena_status] = arena_t::make();
+    auto [executor, executor_status] = spawn_executor(4);
+    if (!expect_true(open_status.succeeded() && arena_status.succeeded() && executor_status.succeeded())) return {};
+    if (!probed(database.supports_transactions())) {
+        ustore_executor_free(executor);
+        return case_result_t::skipped(needs_transactions_k);
+    }
+    auto [collection, collection_status] = create_collection(database.handle(), "watches.docs", ustore_modality_docs_k);
+    if (!expect_true(collection_status.succeeded())) return {};
+    write_ages(database.handle(), collection, 0, 100);
+    flush_runs(database.handle());
+
+    ustore_outcome_t outcome {};
+    ustore_transaction_t transaction = nullptr;
+    ustore_transaction_init_t begin {.transaction = &transaction, .database = database.handle(), .outcome = &outcome};
+    ustore_transaction_init(&begin);
+    if (!expect_success(outcome)) return {};
+    write_ages(database.handle(), collection, 10, 11, 500, transaction);
+    write_ages(database.handle(), collection, 150, 151, 0, transaction);
+    remove_ages(database.handle(), collection, 20, 21, transaction);
+    ustore_docs_cursor_t cursor = open_rows_cursor(database.handle(), executor, collection, key_from_integer(0),
+                                                   ustore_scan_ascending_k,
+                                                   ustore_transaction_view(transaction, ustore_watch_keys_k));
+    walked_rows_t const walked = pull_all_rows(database.handle(), executor, cursor, arena.handle(), 32);
+    std::vector<std::size_t> merged;
+    for (std::size_t index = 0; index != 100; ++index)
+        if (index != 20) merged.push_back(index);
+    merged.push_back(150);
+    expect_rows(walked.rows, merged, [](std::size_t key) noexcept { return key == 10 ? key + 500 : key; });
+    ustore_docs_cursor_free(cursor);
+
+    write_ages(database.handle(), collection, 30, 31, 7);
+    ustore_transaction_commit_t commit {.database = database.handle(), .outcome = &outcome, .transaction = transaction};
+    ustore_transaction_commit(&commit);
+    expect_true(outcome.status != ustore_status_success_k, "the commit conflicts with a watched key, status {}",
+                static_cast<int>(outcome.status));
+    ustore_transaction_free(transaction);
+    ustore_executor_free(executor);
+    return {};
+}
+
+/** A docs cursor narrowed by a filter that reads every document hands out, batch by batch, the
+ *  documents the filter kept with their keys, the same on the engine and on the reference, over two
+ *  flushed runs that overlap and a memory run holding one document's newest version, every pull
+ *  holding at least one row until the walk ends. */
+void test_docs_cursor_values_follow_their_keys(config_t const& config) {
+    auto [compared, compared_status] = open_compared(config, ustore_modality_docs_k);
+    if (!expect_true(compared_status.succeeded())) return;
+    std::array<st::vector<pulled_row_t>, 2> rows;
+    for (std::size_t side = 0; side != 2; ++side) {
+        ustore_database_t const database = compared.databases[side].handle();
+        ustore_collection_id_t const collection = compared.collections[side];
+        write_ages(database, collection, 0, 12);
+        flush_runs(database);
+        write_ages(database, collection, 8, 20);
+        flush_runs(database);
+        write_ages(database, collection, 13, 14, 100);
+        ustore_docs_cursor_t cursor = open_rows_cursor(database, nullptr, collection, key_from_integer(0),
+                                                       ustore_scan_ascending_k, nullptr, {}, "?@.age > 7");
+        rows[side] = pull_all_rows(database, nullptr, cursor, compared.arenas[side].handle(), 5).rows;
+        ustore_docs_cursor_free(cursor);
+    }
+    std::array<std::size_t, 12> kept {};
+    for (std::size_t index = 0; index != kept.size(); ++index) kept[index] = index + 8;
+    auto const age_of = [](std::size_t key) noexcept { return key == 13 ? key + 100 : key; };
+    expect_rows(rows[0], kept, age_of);
+    expect_rows(rows[1], kept, age_of);
+}
+
+#pragma endregion Cursor Batches
+
 int main(int argc, char** argv) {
     start_test_run(argc, argv);
 
@@ -641,9 +1086,20 @@ int main(int argc, char** argv) {
     run_test_case(engine_label_t {"test_database_docs_merge_and_patch"}.c_str(), test_database_docs_merge_and_patch,
                   config);
     run_test_case(engine_label_t {"test_database_docs_table"}.c_str(), test_database_docs_table, config);
+    run_test_case(engine_label_t {"test_docs_gather_in_flights"}.c_str(), test_docs_gather_in_flights, config);
     run_test_case(engine_label_t {"test_docs_range_end_bound"}.c_str(), test_docs_range_end_bound, config);
     run_test_case(engine_label_t {"test_docs_range_descending"}.c_str(), test_docs_range_descending, config);
     run_test_case(engine_label_t {"test_docs_range_remove"}.c_str(), test_docs_range_remove, config);
     run_test_case(engine_label_t {"test_docs_range_measure"}.c_str(), test_docs_range_measure, config);
+    run_test_case(engine_label_t {"test_docs_cursor_values_follow_their_keys"}.c_str(),
+                  test_docs_cursor_values_follow_their_keys, config);
+    run_test_case(engine_label_t {"test_docs_cursor_batches_cross_run_fences"}.c_str(),
+                  test_docs_cursor_batches_cross_run_fences, config);
+    run_test_case(engine_label_t {"test_docs_cursor_batches_descend"}.c_str(), test_docs_cursor_batches_descend,
+                  config);
+    run_test_case(engine_label_t {"test_docs_cursor_predicates_run_in_tasks"}.c_str(),
+                  test_docs_cursor_predicates_run_in_tasks, config);
+    run_test_case(engine_label_t {"test_docs_cursor_transaction_watches_its_tasks"}.c_str(),
+                  test_docs_cursor_transaction_watches_its_tasks, config);
     return finish_test_run();
 }

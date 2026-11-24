@@ -1,9 +1,10 @@
 //! Binary values - the Rust twin of `c/ustore/blobs.h`.
 //!
-//! Every verb takes a batch, and one operation is a batch of one. Keys cross as strided runs the ABI reads in place,
-//! and values as a tape or through an accessor over the entries carrying them, so nothing is staged on the way in;
-//! outputs land in the [`Arena`] the call borrows, so nothing is copied on the way out. A blocking view takes borrowed
-//! or owned inputs, while a deferred one takes only owned ones, and both borrow the arena.
+//! Every verb takes a batch, and one operation is a batch of one. Keys cross as strided runs the
+//! ABI reads in place, and values as a tape or through an accessor over the entries holding them,
+//! so nothing is staged on the way in; outputs land in the [`Arena`] the call holds, so nothing
+//! is copied on the way out. A blocking view takes viewed or owned inputs, while a deferred one
+//! takes only owned ones, and both hold the arena.
 //!
 //! File: rust/blobs.rs
 //! Author: Ash Vardanian
@@ -26,8 +27,8 @@ use crate::db::ffi::{
 use crate::db::sealed::{Accepts, Calling, Completion, Handles, TapeOffset, Writable};
 use crate::db::{
     Address, Arena, CollectionID, Collections, CursorOn, Deferrable, Deferring, Durability, Executor, Key, KeyRange,
-    Matching, On, Progress, Result, Rows, ScanMode, Status, Strings, Tape, ViewVerbs, check, exported_slice, fail,
-    lowered_progress,
+    Matching, On, Progress, Result, Rows, ScanMode, Status, Strings, Tape, ViewVerbs, check, executor_handle,
+    exported_slice, fail, lowered_progress,
 };
 use crate::docs::Bitmap;
 
@@ -209,13 +210,13 @@ pub(crate) mod ffi {
 pub struct Entry<'value> {
     key: Key,
     value: ustore_bytes_view_t,
-    marker: PhantomData<&'value [u8]>,
+    caller_bytes: PhantomData<&'value [u8]>,
 }
 
 impl<'value> Entry<'value> {
     /// Pairs a key with the bytes to store under it.
     pub fn new(key: Key, value: &'value [u8]) -> Self {
-        Entry { key, value: value.into(), marker: PhantomData }
+        Entry { key, value: value.into(), caller_bytes: PhantomData }
     }
 
     /// The key this entry stores under.
@@ -225,7 +226,7 @@ impl<'value> Entry<'value> {
 
     /// The bytes this entry stores.
     pub fn value(&self) -> &'value [u8] {
-        // SAFETY: the view came from one borrowed slice alive for `'value`.
+        // SAFETY: the view came from one slice the caller keeps alive for `'value`.
         unsafe { exported_slice(self.value.data, self.value.length as usize) }
     }
 }
@@ -234,7 +235,8 @@ impl<'value> Entry<'value> {
 mod sealed {
     use super::*;
 
-    /// The keys and values one write carries: borrowed entries, or owned keys beside an owned tape of their values.
+    /// The keys and values one write holds: viewed entries, or owned keys beside an owned tape
+    /// of their values.
     pub trait Pairs {
         /// The keys and the values of the pairs, pointing into `self`, or `None` for no pairs at all.
         fn pairs(&self) -> Result<Option<PairsView>>;
@@ -341,8 +343,8 @@ impl Accepts<BlobsScanConfig<'static>> for Deferring {}
 
 /// The values one read exported, addressed by the position of their key in the batch.
 ///
-/// The presences, the offsets and the bytes all live in the arena, so the run borrows it, and the next call through it
-/// cannot overwrite them while the run lives.
+/// The presences, the offsets and the bytes all live in the arena, so the run views it, and the
+/// next call through it cannot overwrite them while the run lives.
 #[derive(Clone, Copy, Debug)]
 pub struct Values<'arena> {
     presences: Bitmap<'arena>,
@@ -454,10 +456,11 @@ pub trait BlobsVerbs<'view>: ViewVerbs<'view> {
     /// Upserts a batch of values, where an empty value is still a value; [`BlobsVerbs::remove`]
     /// is what removes keys.
     ///
-    /// The entries are borrowed [`Entry`] values, or owned keys beside a `stringtape::BytesTape` of their values with
-    /// 32-bit or 64-bit offsets, which a deferred write needs, and the call hands them back. The batch spans as many
-    /// collections as it has entries, and a bare [`CollectionID`] gives every entry the same one. A transaction
-    /// flushes at its commit, so [`Durability::Flushed`] is refused inside one.
+    /// The entries are viewed [`Entry`] values, or owned keys beside a `stringtape::BytesTape` of
+    /// their values with 32-bit or 64-bit offsets, which a deferred write needs, and the call hands
+    /// them back. The batch spans as many collections as it has entries, and a bare
+    /// [`CollectionID`] gives every entry the same one. A transaction flushes at its commit, so
+    /// [`Durability::Flushed`] is refused inside one.
     ///
     /// Calls `ustore_blobs_write`.
     fn write<'collections, Entries: Pairs>(
@@ -647,7 +650,7 @@ impl<'view, Parent> On<'view, Parent> {
     ) -> Result<Cursor<'view>> {
         let range: KeyRange = range.into();
         let matching = config.into().matching;
-        let mut cursor = Cursor { handle: ptr::null_mut(), database: self.database(), marker: PhantomData };
+        let mut cursor = Cursor { handle: ptr::null_mut(), database: self.database(), view: PhantomData };
         let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_blobs_cursor_init_t {
             cursor: &mut cursor.handle,
@@ -696,7 +699,8 @@ impl<'view, Parent> On<'view, Parent> {
         unsafe { ffi::ustore_blobs_read(&mut arguments) };
         check(outcome)?;
         arena.host()?;
-        // SAFETY: a successful read exported a presence bit per key into the arena, which stays borrowed for `'arena`.
+        // SAFETY: a successful read exported a presence bit per key into the arena, which stays
+        // held for `'arena`.
         let presences = unsafe { exported_slice(presences, keys.len().div_ceil(8)) };
         Ok(Bitmap::new(presences, keys.len()))
     }
@@ -891,7 +895,7 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for Read<'arena, '_, Keys> {
 
     fn finish(self) -> Result<Values<'arena>> {
         self.arena.host()?;
-        // SAFETY: the read succeeded over every key, and the arena stays borrowed for `'arena`.
+        // SAFETY: the read succeeded over every key, and the arena stays held for `'arena`.
         unsafe { Values::exported(self.keys.as_ref().len(), self.presences, self.values) }
     }
 }
@@ -932,13 +936,13 @@ pub struct Scan<'arena, 'matching> {
     scores: Address<f32>,
 }
 
-/// The keys one scan listed, and their BM25 scores when its patterns carried weights; see
+/// The keys one scan listed, and their BM25 scores when its patterns held weights; see
 /// [`BlobsVerbs::scan`].
 #[derive(Clone, Copy, Debug)]
 pub struct Scanned<'arena> {
     /// The keys, in the order of the scan's direction.
     pub keys: &'arena [Key],
-    /// One score per key when the patterns carried weights.
+    /// One score per key when the patterns held weights.
     pub scores: Option<&'arena [f32]>,
 }
 
@@ -986,7 +990,7 @@ impl<'arena> Calling for Scan<'arena, '_> {
 
     fn finish(self) -> Result<Scanned<'arena>> {
         self.arena.host()?;
-        // SAFETY: the scan succeeded, and the arena stays borrowed for `'arena`.
+        // SAFETY: the scan succeeded, and the arena stays held for `'arena`.
         let keys = unsafe { self.found.keys() };
         // SAFETY: a scan with weighted patterns wrote one score per key into the same arena.
         let scores = self.matched.scores().then(|| unsafe { exported_slice(self.scores.0, keys.len()) });
@@ -1034,7 +1038,7 @@ impl<'arena> Calling for Sample<'arena> {
 
     fn finish(self) -> Result<&'arena [Key]> {
         self.arena.host()?;
-        // SAFETY: the sample succeeded, and the arena stays borrowed for `'arena`.
+        // SAFETY: the sample succeeded, and the arena stays held for `'arena`.
         Ok(unsafe { self.found.keys() })
     }
 }
@@ -1140,7 +1144,7 @@ impl Bounds {
 pub struct Cursor<'view> {
     handle: ffi::ustore_blobs_cursor_t,
     database: ustore_database_t,
-    marker: PhantomData<&'view ()>,
+    view: PhantomData<&'view ()>,
 }
 
 impl Cursor<'_> {
@@ -1201,7 +1205,7 @@ impl CursorOn<'_, Cursor<'_>> {
         let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_blobs_cursor_next_t {
             database: self.cursor.database,
-            executor: self.executor,
+            executor: executor_handle(self.executor),
             outcome: &mut outcome,
             completion: ustore_completion_t::Blocking,
             cursor: self.cursor.handle,
@@ -1217,7 +1221,7 @@ impl CursorOn<'_, Cursor<'_>> {
         unsafe { ffi::ustore_blobs_cursor_next(&mut arguments) };
         check(outcome)?;
         arena.host()?;
-        // SAFETY: a successful pull wrote `written` keys into the arena the result borrows.
+        // SAFETY: a successful pull wrote `written` keys into the arena the result views.
         Ok(unsafe { exported_slice(keys, written as usize) })
     }
 }
@@ -1299,7 +1303,7 @@ mod tests {
         assert_eq!(read, vec![Some(b"gamma".as_slice()), Some(b"alpha".as_slice()), Some(b"beta".as_slice())]);
         // A key past the batch is absent rather than a panic.
         assert_eq!(values.get(3), None);
-        // The rows also walk backwards, know their count, and serve a `for` loop over a borrow.
+        // The rows also walk backwards, know their count, and serve a `for` loop over a reference.
         assert_eq!(values.iter().len(), 3);
         assert_eq!(values.iter().next_back(), Some(Some(b"beta".as_slice())));
         let mut lengths = 0;
@@ -1385,7 +1389,7 @@ mod tests {
         let removed = deferred.remove(blobs, removed, Durability::Buffered).unwrap().wait().unwrap();
         assert_eq!(removed, keys([3]));
 
-        // Reads borrow one arena on either view, and each call rewinds it for the next.
+        // Reads hold one arena on either view, and each call rewinds it for the next.
         let mut arena = Arena::new_in(&executor).unwrap();
         let read = blocking.read(blobs, keys([1, 3]), &mut arena).unwrap();
         assert_eq!(read.get(0), Some(b"alpha".as_slice()));
@@ -1423,7 +1427,7 @@ mod tests {
     }
 
     #[test]
-    fn entries_borrow_what_they_carry() {
+    fn entries_view_what_they_hold() {
         let value = [1u8, 2, 3];
         let entry = Entry::new(key(42), &value);
         assert_eq!(entry.key(), key(42));

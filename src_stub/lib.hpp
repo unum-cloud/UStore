@@ -113,7 +113,7 @@ inline bool directory_exists(std::string const& path) noexcept {
     return ::stat(path.c_str(), &info) == 0 && S_ISDIR(info.st_mode);
 }
 
-/** Whether @p text carries a NUL byte, which no path the system opens may hold. */
+/** Whether @p text holds a NUL byte, which no path the system opens may hold. */
 inline bool holds_nul(std::string_view text) noexcept { return text.find('\0') != std::string_view::npos; }
 
 #pragma endregion Bytes
@@ -125,11 +125,11 @@ inline void wait_named(named_calls_t const& named) noexcept {
     while (named.load(std::memory_order_acquire)) std::this_thread::yield();
 }
 
-/** Stores @p status into @p outcome with release ordering, the message first, so a waiter
+/** Stores @p status into @p outcome with release ordering, the note first, so a waiter
  *  reading the status with acquire ordering reads every output too. */
-inline void publish(ustore_outcome_t* outcome, ustore_status_t status, char const* message) noexcept {
+inline void publish(ustore_outcome_t* outcome, ustore_status_t status, char const* note) noexcept {
     if (!outcome) return;
-    outcome->message = status == ustore_status_success_k ? nullptr : message;
+    outcome->message = status == ustore_status_success_k ? nullptr : note;
     std::atomic_ref<ustore_status_t>(outcome->status).store(status, std::memory_order_release);
 }
 
@@ -168,23 +168,23 @@ class call_t {
             executor_->body_thread.store(std::thread::id {}, std::memory_order_relaxed);
             executor_->claim.release();
         }
-        publish(outcome_, recorded_.code, recorded_.message);
+        publish(outcome_, recorded_.code, recorded_.note);
     }
 
     /** Records @p status unless an earlier refusal stands. */
-    void refuse(ustore_status_t status, char const* message) noexcept {
-        if (!recorded_.failed()) recorded_ = {status, message};
+    void refuse(ustore_status_t status, char const* note) noexcept {
+        if (!recorded_.failed()) recorded_ = {status, note};
     }
 
     /** Records @p status and answers false, for a guard that answers whether its call may go on. */
-    bool fail(ustore_status_t status, char const* message) noexcept { return refuse(status, message), false; }
+    bool fail(ustore_status_t status, char const* note) noexcept { return refuse(status, note), false; }
 
     /** Records @p status and answers true, for a guard that answers whether it refused the call. */
-    bool stop(ustore_status_t status, char const* message) noexcept { return refuse(status, message), true; }
+    bool stop(ustore_status_t status, char const* note) noexcept { return refuse(status, note), true; }
 
     /** Records @p status when it failed, answering whether it did. */
     bool failed_with(status_t status) noexcept {
-        if (status.failed()) refuse(status.code, status.message);
+        if (status.failed()) refuse(status.code, status.note);
         return status.failed();
     }
 
@@ -201,10 +201,10 @@ class call_t {
         named_[named_count_++] = named;
     }
 
-    /** Takes @p claim for the call, or refuses it contended with @p message. */
-    bool claim(claim_t* claim, char const* message) noexcept {
+    /** Takes @p claim for the call, or refuses it contended with @p note. */
+    bool claim(claim_t* claim, char const* note) noexcept {
         if (!claim) return true;
-        if (!claim->take(owner())) return fail(ustore_status_contended_k, message);
+        if (!claim->take(owner())) return fail(ustore_status_contended_k, note);
         claims_[claims_count_++] = claim;
         return true;
     }
@@ -234,7 +234,7 @@ inline ustore_arena_handle_t* claim_arena(call_t& call, ustore_arena_t arena,
     if (!call.claim(&arena->claim, "Another call holds the arena")) return nullptr;
     for (void const* input : inputs)
         if (input && arena->contains(input)) {
-            call.refuse(ustore_status_invalid_argument_k, "An input lies inside the arena the call rewinds");
+            call.refuse(ustore_status_invalid_argument_k, "Input lies inside the arena the call rewinds");
             return nullptr;
         }
     arena->rewind();
@@ -466,7 +466,7 @@ inline void prune(std::vector<version_t>& history, stamp_t oldest) {
 
 #pragma region Views
 
-/** The tags a view carries in the low bits of its parent's pointer. */
+/** The tags a view holds in the low bits of its parent's pointer. */
 enum class view_tag_t : std::uintptr_t { snapshot_k = 1, watching_k = 2, unwatched_k = 3 };
 
 /** The parent a view names, decoded: the head, a snapshot, or a transaction and its watch. */
@@ -1280,7 +1280,7 @@ inline bool refuse_write_keys(call_t& call, ustore_keys_view_t keys, std::size_t
     return false;
 }
 
-/** Refuses a name or a path carrying a length without bytes, which is never read through null. */
+/** Refuses a name or a path holding a length without bytes, which is never read through null. */
 inline bool refuse_unbacked(call_t& call, ustore_bytes_view_t bytes) noexcept {
     if (bytes.length && !bytes.data)
         return call.stop(ustore_status_invalid_argument_k, "A run of bytes with a length needs its bytes");
@@ -1293,9 +1293,9 @@ inline bool refuse_collections(call_t& call, ustore_collections_view_t collectio
     return false;
 }
 
-/** Gives @p progress one report, answering whether the call carries on. */
-inline bool carries_on(ustore_progress_callback_t progress, void* state, std::size_t finished,
-                       std::size_t total) noexcept {
+/** Gives @p progress one report, answering whether the call continues. */
+inline bool keeps_going(ustore_progress_callback_t progress, void* state, std::size_t finished,
+                        std::size_t total) noexcept {
     return !progress || progress(finished, total, state) == ustore_continue_k;
 }
 

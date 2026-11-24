@@ -61,8 +61,8 @@ use crate::db::ffi::{
 use crate::db::sealed::{Accepts, Calling, Completion, Handles, Writable};
 use crate::db::{
     Address, Arena, CollectionID, Collections, CursorOn, Deferrable, Deferring, Durability, Error, Executor, Key,
-    KeyRange, Matching, On, Progress, Result, ScanMode, Status, ViewVerbs, check, exported_slice, fail, key_unknown,
-    lowered_progress, read_spelling, spelling,
+    KeyRange, Matching, On, Progress, Result, ScanMode, Status, ViewVerbs, check, executor_handle, exported_slice,
+    fail, key_unknown, lowered_progress, read_spelling, spelling,
 };
 
 // region: Raw Declarations
@@ -268,7 +268,7 @@ pub const fn degree_missing() -> Degree {
     Degree::MAX
 }
 
-/// The identifier an edge carries when it was given none, every bit of it set like [`key_unknown`].
+/// The identifier an edge holds when it was given none, every bit of it set like [`key_unknown`].
 pub const fn default_edge_id() -> Key {
     key_unknown()
 }
@@ -361,12 +361,12 @@ pub struct Edge {
 }
 
 impl Edge {
-    /// An edge carrying the default identifier.
+    /// An edge holding the default identifier.
     pub fn new(source: Key, target: Key) -> Self {
         Edge { source, target, id: default_edge_id() }
     }
 
-    /// An edge carrying its own identifier.
+    /// An edge holding its own identifier.
     pub fn with_id(source: Key, target: Key, id: Key) -> Self {
         Edge { source, target, id }
     }
@@ -1019,7 +1019,7 @@ impl<'arena> Calling for GraphScanVertices<'arena, '_> {
 
     fn finish(self) -> Result<&'arena [Key]> {
         self.arena.host()?;
-        // SAFETY: the scan succeeded, and the arena stays borrowed for `'arena`.
+        // SAFETY: the scan succeeded, and the arena stays held for `'arena`.
         Ok(unsafe { self.found.keys() })
     }
 }
@@ -1064,7 +1064,7 @@ impl<'arena> Calling for GraphSampleVertices<'arena> {
 
     fn finish(self) -> Result<&'arena [Key]> {
         self.arena.host()?;
-        // SAFETY: the sample succeeded, and the arena stays borrowed for `'arena`.
+        // SAFETY: the sample succeeded, and the arena stays held for `'arena`.
         Ok(unsafe { self.found.keys() })
     }
 }
@@ -1201,7 +1201,7 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for GraphDegrees<'arena, '_, Keys> {
 
     fn finish(self) -> Result<&'arena [Degree]> {
         self.arena.host()?;
-        // SAFETY: the lookup succeeded over every vertex, and the arena stays borrowed for `'arena`.
+        // SAFETY: the lookup succeeded over every vertex, and the arena stays held for `'arena`.
         Ok(unsafe { exported_slice(self.degrees.0, self.vertices.as_ref().len()) })
     }
 }
@@ -1248,7 +1248,7 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for GraphReadEdges<'arena, '_, Keys> {
 
     fn finish(self) -> Result<Neighborhoods<'arena>> {
         self.arena.host()?;
-        // SAFETY: the lookup succeeded over every vertex, and the arena stays borrowed for `'arena`.
+        // SAFETY: the lookup succeeded over every vertex, and the arena stays held for `'arena`.
         Ok(unsafe { Neighborhoods::exported(self.vertices.as_ref().len(), self.degrees, self.offsets, self.tape) })
     }
 }
@@ -1536,7 +1536,7 @@ mod tests {
         let vertices = deferred.graph_write_vertices(graph, vertices, buffered).unwrap().wait().unwrap();
         assert_eq!(vertices, keys([7]));
 
-        // Lookups borrow one arena on either view, and each call rewinds it for the next.
+        // Lookups hold one arena on either view, and each call rewinds it for the next.
         let found = blocking.graph_read_edges(graph, keys([3]), source, &mut arena).unwrap();
         assert_eq!(found.edges(), &[Edge::new(key(3), key(4))]);
         let found = deferred.graph_read_edges(graph, vec![key(1), key(7)], any, &mut arena).unwrap().wait().unwrap();
@@ -1554,7 +1554,7 @@ mod tests {
     }
 
     #[test]
-    fn edges_carry_the_default_identifier_and_name_their_neighbors() {
+    fn edges_hold_the_default_identifier_and_name_their_neighbors() {
         assert_eq!(Edge::new(key(1), key(2)).id, default_edge_id());
         assert_eq!(Edge::new(key(1), key(2)).neighbor_of(key(2)), Some(key(1)));
         assert_eq!(Edge::new(key(1), key(2)).neighbor_of(key(3)), None);
@@ -1574,7 +1574,7 @@ mod tests {
 pub struct GraphVerticesCursor<'view> {
     handle: ffi::ustore_graph_vertices_cursor_t,
     database: ustore_database_t,
-    marker: PhantomData<&'view ()>,
+    view: PhantomData<&'view ()>,
 }
 
 impl<'view, Parent> On<'view, Parent> {
@@ -1590,8 +1590,7 @@ impl<'view, Parent> On<'view, Parent> {
     ) -> Result<GraphVerticesCursor<'view>> {
         let range: KeyRange = range.into();
         let matching = config.into().matching;
-        let mut cursor =
-            GraphVerticesCursor { handle: ptr::null_mut(), database: self.database(), marker: PhantomData };
+        let mut cursor = GraphVerticesCursor { handle: ptr::null_mut(), database: self.database(), view: PhantomData };
         let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_graph_vertices_cursor_init_t {
             cursor: &mut cursor.handle,
@@ -1642,7 +1641,7 @@ impl CursorOn<'_, GraphVerticesCursor<'_>> {
         let mut outcome = ustore_outcome_t::default();
         let mut arguments = ffi::ustore_graph_vertices_cursor_next_t {
             database: self.cursor.database,
-            executor: self.executor,
+            executor: executor_handle(self.executor),
             outcome: &mut outcome,
             completion: ustore_completion_t::Blocking,
             cursor: self.cursor.handle,
@@ -1657,7 +1656,7 @@ impl CursorOn<'_, GraphVerticesCursor<'_>> {
         unsafe { ffi::ustore_graph_vertices_cursor_next(&mut arguments) };
         check(outcome)?;
         arena.host()?;
-        // SAFETY: a successful pull wrote `written` keys into the arena the result borrows.
+        // SAFETY: a successful pull wrote `written` keys into the arena the result views.
         Ok(unsafe { exported_slice(keys, written as usize) })
     }
 }

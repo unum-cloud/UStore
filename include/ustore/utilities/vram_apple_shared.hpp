@@ -1,5 +1,5 @@
 /**
- *  @file include/ustore/utilities/vram_apple_shared.h
+ *  @file include/ustore/utilities/vram_apple_shared.hpp
  *  @author Ash Vardanian
  *  @date November 16, 2026
  *  @brief The vocabulary every Apple launch and its Metal kernels share: where a launch binds its

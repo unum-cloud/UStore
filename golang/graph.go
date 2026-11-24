@@ -91,7 +91,7 @@ type VertexRoles []VertexRole
 
 func (VertexRoles) roles() {}
 
-// roles lends the role every vertex shares from the frame's inputs, or one per vertex in place.
+// roles passes the role every vertex shares from the frame's inputs, or one per vertex in place.
 func (call *call) roles(inputs *inputs, roles Roles) C.ustore_vertex_roles_view_t {
 	switch roles := roles.(type) {
 	case VertexRole:
@@ -99,7 +99,7 @@ func (call *call) roles(inputs *inputs, roles Roles) C.ustore_vertex_roles_view_
 		return C.ustore_vertex_roles_view_t{data: &inputs.role}
 	case VertexRoles:
 		return C.ustore_vertex_roles_view_t{
-			data:   (*C.ustore_vertex_role_t)(call.lend(unsafe.Pointer(unsafe.SliceData(roles)), len(roles))),
+			data:   (*C.ustore_vertex_role_t)(call.pinSlice(unsafe.Pointer(unsafe.SliceData(roles)), len(roles))),
 			stride: C.ustore_size_t(unsafe.Sizeof(VertexRole(0))),
 		}
 	}
@@ -112,13 +112,13 @@ func perVertex(roles Roles) int {
 	return len(each)
 }
 
-// edges lends a slice of edges as the identifiers, sources and targets columns, each strided by
+// edges passes a slice of edges as the identifiers, sources and targets columns, each strided by
 // three keys.
 func (call *call) edges(edges []Edge) (identifiers, sources, targets C.ustore_keys_view_t) {
 	if len(edges) == 0 {
 		return
 	}
-	first := (*Edge)(call.lend(unsafe.Pointer(unsafe.SliceData(edges)), len(edges)))
+	first := (*Edge)(call.pinSlice(unsafe.Pointer(unsafe.SliceData(edges)), len(edges)))
 	stride := C.ustore_size_t(unsafe.Sizeof(Edge{}))
 	identifiers = C.ustore_keys_view_t{data: (*C.ustore_key_t)(unsafe.Pointer(&first.ID)), stride: stride}
 	sources = C.ustore_keys_view_t{data: (*C.ustore_key_t)(unsafe.Pointer(&first.Source)), stride: stride}
@@ -148,7 +148,7 @@ func (neighborhoods Neighborhoods) Degree(index uint) (uint32, bool) {
 	return uint32(degree), degree != C.ustore_vertex_degree_missing_k
 }
 
-// Edges borrows the edges of vertex index from the arena: with both roles the outgoing ones first,
+// Edges views the edges of vertex index in the arena: with both roles the outgoing ones first,
 // sorted by target, then the incoming ones, sorted by source.
 func (neighborhoods Neighborhoods) Edges(index uint) []Edge {
 	begin, end := at(neighborhoods.offsets, index), at(neighborhoods.offsets, index+1)
@@ -160,17 +160,17 @@ func (neighborhoods Neighborhoods) Edges(index uint) []Edge {
 
 // GraphReadEdges reads the degree and the edges of every vertex in its roles into arena.
 func (on reads[Handle]) GraphReadEdges(collections Collections, vertices []Key, roles Roles, arena *Arena) (Neighborhoods, error) {
-	var lent lent[Neighborhoods]
-	return block(&lent, on.graphReadEdges(&lent, C.ustore_completion_blocking_k, collections, vertices, roles, arena))
+	var call callWithResult[Neighborhoods]
+	return block(&call, on.graphReadEdges(&call, C.ustore_completion_blocking_k, collections, vertices, roles, arena))
 }
 
 // GraphReadEdges submits [DatabaseOn.GraphReadEdges].
 func (on deferredReads[Handle]) GraphReadEdges(collections Collections, vertices []Key, roles Roles, arena *Arena) (*Deferred[Neighborhoods], error) {
 	deferred := new(Deferred[Neighborhoods])
-	return submitted(deferred, on.graphReadEdges(&deferred.lent, C.ustore_completion_deferred_k, collections, vertices, roles, arena))
+	return submitted(deferred, on.graphReadEdges(&deferred.call, C.ustore_completion_deferred_k, collections, vertices, roles, arena))
 }
 
-func (receiver storeReceiver[Handle]) graphReadEdges(lent *lent[Neighborhoods], completion C.ustore_completion_t, collections Collections, vertices []Key, roles Roles, arena *Arena) error {
+func (receiver storeReceiver[Handle]) graphReadEdges(call *callWithResult[Neighborhoods], completion C.ustore_completion_t, collections Collections, vertices []Key, roles Roles, arena *Arena) error {
 	database, executor, outputs, err := receiver.lowerInto(arena)
 	if err != nil {
 		return err
@@ -178,21 +178,21 @@ func (receiver storeReceiver[Handle]) graphReadEdges(lent *lent[Neighborhoods], 
 	if err := shape(collections, len(vertices), perVertex(roles)); err != nil {
 		return err
 	}
-	arguments, inputs := stage[C.ustore_graph_read_edges_t](lent)
-	lent.result.count = uint(len(vertices))
+	arguments, inputs := stage[C.ustore_graph_read_edges_t](call)
+	call.result.count = uint(len(vertices))
 	*arguments = C.ustore_graph_read_edges_t{
 		database:           database,
 		executor:           executor,
-		outcome:            lent.outcome(),
+		outcome:            call.outcome(),
 		completion:         completion,
 		view:               receiver.view(),
 		count:              C.ustore_size_t(len(vertices)),
-		collections:        lent.collections(inputs, collections),
-		vertices:           lent.keys(vertices),
-		roles:              lent.roles(inputs, roles),
-		degrees_per_vertex: &lent.result.degrees,
-		edges_offsets:      &lent.result.offsets,
-		edges_per_vertex:   &lent.result.edges,
+		collections:        call.collections(inputs, collections),
+		vertices:           call.keys(vertices),
+		roles:              call.roles(inputs, roles),
+		degrees_per_vertex: &call.result.degrees,
+		edges_offsets:      &call.result.offsets,
+		edges_per_vertex:   &call.result.edges,
 		arena:              outputs,
 	}
 	C.ustore_graph_read_edges(arguments)
@@ -201,18 +201,18 @@ func (receiver storeReceiver[Handle]) graphReadEdges(lent *lent[Neighborhoods], 
 
 // GraphWriteEdges inserts edges, and their vertices where missing.
 func (on writes[Handle]) GraphWriteEdges(collections Collections, edges []Edge, config *WriteConfig) error {
-	var lent lent[struct{}]
-	_, err := block(&lent, on.graphWriteEdges(&lent, C.ustore_completion_blocking_k, collections, edges, config))
+	var call callWithResult[struct{}]
+	_, err := block(&call, on.graphWriteEdges(&call, C.ustore_completion_blocking_k, collections, edges, config))
 	return err
 }
 
 // GraphWriteEdges submits [DatabaseOn.GraphWriteEdges].
 func (on deferredWrites[Handle]) GraphWriteEdges(collections Collections, edges []Edge, config *WriteConfig) (*Deferred[struct{}], error) {
 	deferred := new(Deferred[struct{}])
-	return submitted(deferred, on.graphWriteEdges(&deferred.lent, C.ustore_completion_deferred_k, collections, edges, config))
+	return submitted(deferred, on.graphWriteEdges(&deferred.call, C.ustore_completion_deferred_k, collections, edges, config))
 }
 
-func (receiver storeReceiver[Handle]) graphWriteEdges(lent *lent[struct{}], completion C.ustore_completion_t, collections Collections, edges []Edge, config *WriteConfig) error {
+func (receiver storeReceiver[Handle]) graphWriteEdges(call *callWithResult[struct{}], completion C.ustore_completion_t, collections Collections, edges []Edge, config *WriteConfig) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
@@ -221,16 +221,16 @@ func (receiver storeReceiver[Handle]) graphWriteEdges(lent *lent[struct{}], comp
 		return err
 	}
 	options := configOf(config)
-	arguments, inputs := stage[C.ustore_graph_write_edges_t](lent)
-	identifiers, sources, targets := lent.edges(edges)
+	arguments, inputs := stage[C.ustore_graph_write_edges_t](call)
+	identifiers, sources, targets := call.edges(edges)
 	*arguments = C.ustore_graph_write_edges_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		completion:  completion,
 		transaction: receiver.transaction(),
 		count:       C.ustore_size_t(len(edges)),
-		collections: lent.collections(inputs, collections),
+		collections: call.collections(inputs, collections),
 		edges:       identifiers,
 		sources:     sources,
 		targets:     targets,
@@ -243,18 +243,18 @@ func (receiver storeReceiver[Handle]) graphWriteEdges(lent *lent[struct{}], comp
 
 // GraphRemoveEdges removes edges, keeping their vertices.
 func (on writes[Handle]) GraphRemoveEdges(collections Collections, edges []Edge, config *WriteConfig) error {
-	var lent lent[struct{}]
-	_, err := block(&lent, on.graphRemoveEdges(&lent, C.ustore_completion_blocking_k, collections, edges, config))
+	var call callWithResult[struct{}]
+	_, err := block(&call, on.graphRemoveEdges(&call, C.ustore_completion_blocking_k, collections, edges, config))
 	return err
 }
 
 // GraphRemoveEdges submits [DatabaseOn.GraphRemoveEdges].
 func (on deferredWrites[Handle]) GraphRemoveEdges(collections Collections, edges []Edge, config *WriteConfig) (*Deferred[struct{}], error) {
 	deferred := new(Deferred[struct{}])
-	return submitted(deferred, on.graphRemoveEdges(&deferred.lent, C.ustore_completion_deferred_k, collections, edges, config))
+	return submitted(deferred, on.graphRemoveEdges(&deferred.call, C.ustore_completion_deferred_k, collections, edges, config))
 }
 
-func (receiver storeReceiver[Handle]) graphRemoveEdges(lent *lent[struct{}], completion C.ustore_completion_t, collections Collections, edges []Edge, config *WriteConfig) error {
+func (receiver storeReceiver[Handle]) graphRemoveEdges(call *callWithResult[struct{}], completion C.ustore_completion_t, collections Collections, edges []Edge, config *WriteConfig) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
@@ -263,16 +263,16 @@ func (receiver storeReceiver[Handle]) graphRemoveEdges(lent *lent[struct{}], com
 		return err
 	}
 	options := configOf(config)
-	arguments, inputs := stage[C.ustore_graph_remove_edges_t](lent)
-	identifiers, sources, targets := lent.edges(edges)
+	arguments, inputs := stage[C.ustore_graph_remove_edges_t](call)
+	identifiers, sources, targets := call.edges(edges)
 	*arguments = C.ustore_graph_remove_edges_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		completion:  completion,
 		transaction: receiver.transaction(),
 		count:       C.ustore_size_t(len(edges)),
-		collections: lent.collections(inputs, collections),
+		collections: call.collections(inputs, collections),
 		edges:       identifiers,
 		sources:     sources,
 		targets:     targets,
@@ -289,18 +289,18 @@ func (receiver storeReceiver[Handle]) graphRemoveEdges(lent *lent[struct{}], com
 
 // GraphWriteVertices inserts vertices unless present.
 func (on writes[Handle]) GraphWriteVertices(collections Collections, vertices []Key, config *WriteConfig) error {
-	var lent lent[struct{}]
-	_, err := block(&lent, on.graphWriteVertices(&lent, C.ustore_completion_blocking_k, collections, vertices, config))
+	var call callWithResult[struct{}]
+	_, err := block(&call, on.graphWriteVertices(&call, C.ustore_completion_blocking_k, collections, vertices, config))
 	return err
 }
 
 // GraphWriteVertices submits [DatabaseOn.GraphWriteVertices].
 func (on deferredWrites[Handle]) GraphWriteVertices(collections Collections, vertices []Key, config *WriteConfig) (*Deferred[struct{}], error) {
 	deferred := new(Deferred[struct{}])
-	return submitted(deferred, on.graphWriteVertices(&deferred.lent, C.ustore_completion_deferred_k, collections, vertices, config))
+	return submitted(deferred, on.graphWriteVertices(&deferred.call, C.ustore_completion_deferred_k, collections, vertices, config))
 }
 
-func (receiver storeReceiver[Handle]) graphWriteVertices(lent *lent[struct{}], completion C.ustore_completion_t, collections Collections, vertices []Key, config *WriteConfig) error {
+func (receiver storeReceiver[Handle]) graphWriteVertices(call *callWithResult[struct{}], completion C.ustore_completion_t, collections Collections, vertices []Key, config *WriteConfig) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
@@ -309,16 +309,16 @@ func (receiver storeReceiver[Handle]) graphWriteVertices(lent *lent[struct{}], c
 		return err
 	}
 	options := configOf(config)
-	arguments, inputs := stage[C.ustore_graph_write_vertices_t](lent)
+	arguments, inputs := stage[C.ustore_graph_write_vertices_t](call)
 	*arguments = C.ustore_graph_write_vertices_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		completion:  completion,
 		transaction: receiver.transaction(),
 		count:       C.ustore_size_t(len(vertices)),
-		collections: lent.collections(inputs, collections),
-		vertices:    lent.keys(vertices),
+		collections: call.collections(inputs, collections),
+		vertices:    call.keys(vertices),
 		durability:  C.ustore_durability_t(options.Durability),
 		watch:       C.ustore_watch_t(receiver.watch),
 	}
@@ -340,18 +340,18 @@ type GraphRemoveVerticesConfig struct {
 // GraphRemoveVertices removes vertices with every edge they connect to, or every vertex of a range
 // per task given end vertices.
 func (on writes[Handle]) GraphRemoveVertices(collections Collections, vertices []Key, config *GraphRemoveVerticesConfig) error {
-	var lent lent[struct{}]
-	_, err := block(&lent, on.graphRemoveVertices(&lent, C.ustore_completion_blocking_k, collections, vertices, config))
+	var call callWithResult[struct{}]
+	_, err := block(&call, on.graphRemoveVertices(&call, C.ustore_completion_blocking_k, collections, vertices, config))
 	return err
 }
 
 // GraphRemoveVertices submits [DatabaseOn.GraphRemoveVertices].
 func (on deferredWrites[Handle]) GraphRemoveVertices(collections Collections, vertices []Key, config *GraphRemoveVerticesConfig) (*Deferred[struct{}], error) {
 	deferred := new(Deferred[struct{}])
-	return submitted(deferred, on.graphRemoveVertices(&deferred.lent, C.ustore_completion_deferred_k, collections, vertices, config))
+	return submitted(deferred, on.graphRemoveVertices(&deferred.call, C.ustore_completion_deferred_k, collections, vertices, config))
 }
 
-func (receiver storeReceiver[Handle]) graphRemoveVertices(lent *lent[struct{}], completion C.ustore_completion_t, collections Collections, vertices []Key, config *GraphRemoveVerticesConfig) error {
+func (receiver storeReceiver[Handle]) graphRemoveVertices(call *callWithResult[struct{}], completion C.ustore_completion_t, collections Collections, vertices []Key, config *GraphRemoveVerticesConfig) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
@@ -360,18 +360,18 @@ func (receiver storeReceiver[Handle]) graphRemoveVertices(lent *lent[struct{}], 
 	if err := shape(collections, len(vertices), len(options.EndVertices), perVertex(options.Roles)); err != nil {
 		return err
 	}
-	arguments, inputs := stage[C.ustore_graph_remove_vertices_t](lent)
+	arguments, inputs := stage[C.ustore_graph_remove_vertices_t](call)
 	*arguments = C.ustore_graph_remove_vertices_t{
 		database:     database,
 		executor:     executor,
-		outcome:      lent.outcome(),
+		outcome:      call.outcome(),
 		completion:   completion,
 		transaction:  receiver.transaction(),
 		count:        C.ustore_size_t(len(vertices)),
-		collections:  lent.collections(inputs, collections),
-		vertices:     lent.keys(vertices),
-		end_vertices: lent.keys(options.EndVertices),
-		roles:        lent.roles(inputs, options.Roles),
+		collections:  call.collections(inputs, collections),
+		vertices:     call.keys(vertices),
+		end_vertices: call.keys(options.EndVertices),
+		roles:        call.roles(inputs, options.Roles),
 		durability:   C.ustore_durability_t(options.Durability),
 		watch:        C.ustore_watch_t(receiver.watch),
 	}
@@ -403,17 +403,17 @@ type GraphScanConfig struct {
 // GraphScanVertices lists up to wanted vertices of a range per task into arena, one task per
 // collection collections names.
 func (on reads[Handle]) GraphScanVertices(collections Collections, wanted uint, arena *Arena, config *GraphScanConfig) (Scanned, error) {
-	var lent lent[Scanned]
-	return block(&lent, on.graphScanVertices(&lent, C.ustore_completion_blocking_k, collections, wanted, arena, config))
+	var call callWithResult[Scanned]
+	return block(&call, on.graphScanVertices(&call, C.ustore_completion_blocking_k, collections, wanted, arena, config))
 }
 
 // GraphScanVertices submits [DatabaseOn.GraphScanVertices].
 func (on deferredReads[Handle]) GraphScanVertices(collections Collections, wanted uint, arena *Arena, config *GraphScanConfig) (*Deferred[Scanned], error) {
 	deferred := new(Deferred[Scanned])
-	return submitted(deferred, on.graphScanVertices(&deferred.lent, C.ustore_completion_deferred_k, collections, wanted, arena, config))
+	return submitted(deferred, on.graphScanVertices(&deferred.call, C.ustore_completion_deferred_k, collections, wanted, arena, config))
 }
 
-func (receiver storeReceiver[Handle]) graphScanVertices(lent *lent[Scanned], completion C.ustore_completion_t, collections Collections, wanted uint, arena *Arena, config *GraphScanConfig) error {
+func (receiver storeReceiver[Handle]) graphScanVertices(call *callWithResult[Scanned], completion C.ustore_completion_t, collections Collections, wanted uint, arena *Arena, config *GraphScanConfig) error {
 	database, executor, outputs, err := receiver.lowerInto(arena)
 	if err != nil {
 		return err
@@ -423,23 +423,23 @@ func (receiver storeReceiver[Handle]) graphScanVertices(lent *lent[Scanned], com
 	if err := shape(collections, count, len(options.StartKeys), len(options.EndKeys)); err != nil {
 		return err
 	}
-	arguments, inputs := stage[C.ustore_graph_scan_vertices_t](lent)
-	lent.result.count = uint(count)
-	progress, state := lent.progress(options.Progress)
+	arguments, inputs := stage[C.ustore_graph_scan_vertices_t](call)
+	call.result.count = uint(count)
+	progress, state := call.progress(options.Progress)
 	*arguments = C.ustore_graph_scan_vertices_t{
 		database:       database,
 		executor:       executor,
-		outcome:        lent.outcome(),
+		outcome:        call.outcome(),
 		completion:     completion,
 		view:           receiver.view(),
 		count:          C.ustore_size_t(count),
-		collections:    lent.collections(inputs, collections),
-		start_keys:     lent.keys(options.StartKeys),
-		end_keys:       lent.keys(options.EndKeys),
+		collections:    call.collections(inputs, collections),
+		start_keys:     call.keys(options.StartKeys),
+		end_keys:       call.keys(options.EndKeys),
 		direction:      C.ustore_scan_direction_t(options.Direction),
-		predicate:      lent.predicate(options.Predicate),
-		offsets:        &lent.result.offsets,
-		keys:           &lent.result.keys,
+		predicate:      call.predicate(options.Predicate),
+		offsets:        &call.result.offsets,
+		keys:           &call.result.keys,
 		arena:          outputs,
 		wanted:         C.ustore_size_t(wanted),
 		mode:           C.ustore_scan_mode_t(options.Mode),
@@ -494,22 +494,22 @@ func (on reads[Handle]) GraphVerticesCursorInit(collection CollectionID, startKe
 	}
 	options := configOf(config)
 	cursor := new(GraphVerticesCursor)
-	var lent lent[C.ustore_graph_vertices_cursor_t]
-	arguments, inputs := stage[C.ustore_graph_vertices_cursor_init_t](&lent)
+	var call callWithResult[C.ustore_graph_vertices_cursor_t]
+	arguments, inputs := stage[C.ustore_graph_vertices_cursor_init_t](&call)
 	*arguments = C.ustore_graph_vertices_cursor_init_t{
-		cursor:     lent.result,
+		cursor:     call.result,
 		database:   database,
 		executor:   executor,
-		outcome:    lent.outcome(),
+		outcome:    call.outcome(),
 		view:       on.view(),
 		collection: rawCollection(collection),
 		start_key:  raw(startKey),
-		end_key:    lent.key(inputs, options.EndKey),
+		end_key:    call.key(inputs, options.EndKey),
 		direction:  C.ustore_scan_direction_t(options.Direction),
 		predicate:  cursor.admits(options.Predicate),
 	}
 	C.ustore_graph_vertices_cursor_init(arguments)
-	if cursor.handle, err = block(&lent, nil); err != nil {
+	if cursor.handle, err = block(&call, nil); err != nil {
 		cursor.end()
 		return nil, err
 	}
@@ -524,20 +524,20 @@ func (on GraphVerticesCursorOn) NextKeys(wanted uint, arena *Arena) (Page, error
 	if err != nil {
 		return Page{}, err
 	}
-	var lent lent[Page]
-	arguments := open[C.ustore_graph_vertices_cursor_next_t](&lent)
+	var call callWithResult[Page]
+	arguments := open[C.ustore_graph_vertices_cursor_next_t](&call)
 	*arguments = C.ustore_graph_vertices_cursor_next_t{
 		database: database,
 		executor: executor,
-		outcome:  lent.outcome(),
+		outcome:  call.outcome(),
 		cursor:   cursor,
-		keys:     &lent.result.keys,
-		written:  &lent.result.written,
+		keys:     &call.result.keys,
+		written:  &call.result.written,
 		arena:    outputs,
 		wanted:   C.ustore_size_t(wanted),
 	}
 	C.ustore_graph_vertices_cursor_next(arguments)
-	return block(&lent, nil)
+	return block(&call, nil)
 }
 
 // Close frees the walk, giving back the holds it kept. It is idempotent.
@@ -558,34 +558,34 @@ func (cursor *GraphVerticesCursor) Close() error {
 // GraphSampleVertices draws up to wanted vertices uniformly at random into arena, one task per
 // collection collections names.
 func (on reads[Handle]) GraphSampleVertices(collections Collections, wanted uint, arena *Arena) (Scanned, error) {
-	var lent lent[Scanned]
-	return block(&lent, on.graphSampleVertices(&lent, C.ustore_completion_blocking_k, collections, wanted, arena))
+	var call callWithResult[Scanned]
+	return block(&call, on.graphSampleVertices(&call, C.ustore_completion_blocking_k, collections, wanted, arena))
 }
 
 // GraphSampleVertices submits [DatabaseOn.GraphSampleVertices].
 func (on deferredReads[Handle]) GraphSampleVertices(collections Collections, wanted uint, arena *Arena) (*Deferred[Scanned], error) {
 	deferred := new(Deferred[Scanned])
-	return submitted(deferred, on.graphSampleVertices(&deferred.lent, C.ustore_completion_deferred_k, collections, wanted, arena))
+	return submitted(deferred, on.graphSampleVertices(&deferred.call, C.ustore_completion_deferred_k, collections, wanted, arena))
 }
 
-func (receiver storeReceiver[Handle]) graphSampleVertices(lent *lent[Scanned], completion C.ustore_completion_t, collections Collections, wanted uint, arena *Arena) error {
+func (receiver storeReceiver[Handle]) graphSampleVertices(call *callWithResult[Scanned], completion C.ustore_completion_t, collections Collections, wanted uint, arena *Arena) error {
 	database, executor, outputs, err := receiver.lowerInto(arena)
 	if err != nil {
 		return err
 	}
 	count := tasks(collections)
-	arguments, inputs := stage[C.ustore_graph_sample_vertices_t](lent)
-	lent.result.count = uint(count)
+	arguments, inputs := stage[C.ustore_graph_sample_vertices_t](call)
+	call.result.count = uint(count)
 	*arguments = C.ustore_graph_sample_vertices_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		completion:  completion,
 		view:        receiver.view(),
 		count:       C.ustore_size_t(count),
-		collections: lent.collections(inputs, collections),
-		offsets:     &lent.result.offsets,
-		keys:        &lent.result.keys,
+		collections: call.collections(inputs, collections),
+		offsets:     &call.result.offsets,
+		keys:        &call.result.keys,
 		arena:       outputs,
 		wanted:      C.ustore_size_t(wanted),
 	}
@@ -596,17 +596,17 @@ func (receiver storeReceiver[Handle]) graphSampleVertices(lent *lent[Scanned], c
 // GraphMeasureVertices estimates the vertices and the space inside a range per task into arena, one
 // task per collection collections names.
 func (on reads[Handle]) GraphMeasureVertices(collections Collections, arena *Arena, config *MeasureConfig) (Measurement, error) {
-	var lent lent[Measurement]
-	return block(&lent, on.graphMeasureVertices(&lent, C.ustore_completion_blocking_k, collections, arena, config))
+	var call callWithResult[Measurement]
+	return block(&call, on.graphMeasureVertices(&call, C.ustore_completion_blocking_k, collections, arena, config))
 }
 
 // GraphMeasureVertices submits [DatabaseOn.GraphMeasureVertices].
 func (on deferredReads[Handle]) GraphMeasureVertices(collections Collections, arena *Arena, config *MeasureConfig) (*Deferred[Measurement], error) {
 	deferred := new(Deferred[Measurement])
-	return submitted(deferred, on.graphMeasureVertices(&deferred.lent, C.ustore_completion_deferred_k, collections, arena, config))
+	return submitted(deferred, on.graphMeasureVertices(&deferred.call, C.ustore_completion_deferred_k, collections, arena, config))
 }
 
-func (receiver storeReceiver[Handle]) graphMeasureVertices(lent *lent[Measurement], completion C.ustore_completion_t, collections Collections, arena *Arena, config *MeasureConfig) error {
+func (receiver storeReceiver[Handle]) graphMeasureVertices(call *callWithResult[Measurement], completion C.ustore_completion_t, collections Collections, arena *Arena, config *MeasureConfig) error {
 	database, executor, outputs, err := receiver.lowerInto(arena)
 	if err != nil {
 		return err
@@ -616,25 +616,25 @@ func (receiver storeReceiver[Handle]) graphMeasureVertices(lent *lent[Measuremen
 	if err := shape(collections, count, len(options.StartKeys), len(options.EndKeys)); err != nil {
 		return err
 	}
-	arguments, inputs := stage[C.ustore_graph_measure_vertices_t](lent)
-	lent.result.count = uint(count)
+	arguments, inputs := stage[C.ustore_graph_measure_vertices_t](call)
+	call.result.count = uint(count)
 	*arguments = C.ustore_graph_measure_vertices_t{
 		database:          database,
 		executor:          executor,
-		outcome:           lent.outcome(),
+		outcome:           call.outcome(),
 		completion:        completion,
 		view:              receiver.view(),
 		count:             C.ustore_size_t(count),
-		collections:       lent.collections(inputs, collections),
-		start_keys:        lent.keys(options.StartKeys),
-		end_keys:          lent.keys(options.EndKeys),
+		collections:       call.collections(inputs, collections),
+		start_keys:        call.keys(options.StartKeys),
+		end_keys:          call.keys(options.EndKeys),
 		direction:         C.ustore_scan_direction_t(options.Direction),
-		min_cardinalities: &lent.result.minCardinalities,
-		max_cardinalities: &lent.result.maxCardinalities,
-		min_value_bytes:   &lent.result.minValueBytes,
-		max_value_bytes:   &lent.result.maxValueBytes,
-		min_space_usages:  &lent.result.minSpaceUsages,
-		max_space_usages:  &lent.result.maxSpaceUsages,
+		min_cardinalities: &call.result.minCardinalities,
+		max_cardinalities: &call.result.maxCardinalities,
+		min_value_bytes:   &call.result.minValueBytes,
+		max_value_bytes:   &call.result.maxValueBytes,
+		min_space_usages:  &call.result.minSpaceUsages,
+		max_space_usages:  &call.result.maxSpaceUsages,
 		arena:             outputs,
 	}
 	C.ustore_graph_measure_vertices(arguments)

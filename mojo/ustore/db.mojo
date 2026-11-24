@@ -49,7 +49,7 @@ from ustore.types import (
     Verb,
     _address_of,
     _anchor,
-    _borrowed,
+    _viewed,
     _bit,
     _block,
     _created,
@@ -195,11 +195,11 @@ struct StridedArguments(Defaultable, ImplicitlyCopyable, TrivialRegisterPassable
 
 @fieldwise_init
 struct StridedView[T: Copyable, origin: ImmOrigin = ImmUntrackedOrigin](ImplicitlyCopyable, Sized):
-    """A borrowed strided run of fixed-width elements, one per task, where a zero stride repeats the first.
+    """A viewed strided run of fixed-width elements, one per task, where a zero stride repeats the first.
 
     Parameters:
         T: The element, laid out as the ABI declares it.
-        origin: The borrowed elements, which the view keeps alive for as long as it is used.
+        origin: The viewed elements, which the view keeps alive for as long as it is used.
     """
 
     var data: Optional[Pointer[Self.T, Self.origin]]
@@ -223,18 +223,18 @@ struct StridedView[T: Copyable, origin: ImmOrigin = ImmUntrackedOrigin](Implicit
 
     @staticmethod
     def of[items_origin: ImmOrigin, //](items: Span[Self.T, items_origin]) -> StridedView[Self.T, items_origin]:
-        """Borrows elements packed one after another."""
+        """Views elements packed one after another."""
         return StridedView[Self.T, items_origin](
-            _borrowed[Self.T, items_origin](Int(items.unsafe_ptr())), size_of[Self.T](), len(items)
+            _viewed[Self.T, items_origin](Int(items.unsafe_ptr())), size_of[Self.T](), len(items)
         )
 
     @staticmethod
     def repeating[item_origin: ImmOrigin, //](ref[item_origin] item: Self.T) -> StridedView[Self.T, item_origin]:
-        """Borrows one element, repeated for every task."""
-        return StridedView[Self.T, item_origin](_borrowed[Self.T, item_origin](Int(Pointer(to=item))), 0, 1)
+        """Views one element, repeated for every task."""
+        return StridedView[Self.T, item_origin](_viewed[Self.T, item_origin](Int(Pointer(to=item))), 0, 1)
 
     def arguments(self) -> StridedArguments:
-        """The C layout, erased only inside a verb so the borrow lives through the call."""
+        """The C layout, erased only inside a verb so the view lives through the call."""
         return StridedArguments(_address_of(self.data), c_size_t(self.stride))
 
 
@@ -364,7 +364,7 @@ struct Modality(Equatable, ImplicitlyCopyable, TrivialRegisterPassable):
     var code: c_int
     """The raw `ustore_modality_t` value the ABI exchanges."""
     comptime NONE = Self(0)
-    """No modality, as a name no collection carries finds."""
+    """No modality, as a name no collection holds finds."""
     comptime BLOBS = Self(1)
     """Binary values."""
     comptime DOCS = Self(2)
@@ -433,14 +433,15 @@ struct PredicateCost(Equatable, ImplicitlyCopyable, TrivialRegisterPassable):
 
 
 def _each_predicate[
-    T: AnyType, judge: def(Key, Pointer[T, MutAnyOrigin]) thin -> Bool
+    T: AnyType, judge: def(Key, Pointer[T, ImmUntrackedOrigin]) thin -> Bool
 ](
     keys: Pointer[Key, MutAnyOrigin],
     admissions: Pointer[Admission, MutAnyOrigin],
     count: c_size_t,
-    state: Pointer[T, MutAnyOrigin],
+    state: Pointer[T, ImmUntrackedOrigin],
 ) abi("C"):
-    """The C callback of one per-key handler, asking it about every key of the page in turn."""
+    """The C callback of one per-key handler, asking it about every key of the page in turn; it reads `state` only,
+    since the executor's threads may call it concurrently."""
     for position in range(Int(count)):
         admissions[unsafe_offset=position] = Admission.ADMIT if judge(
             keys[unsafe_offset=position], state
@@ -449,14 +450,15 @@ def _each_predicate[
 
 def _batch_predicate[
     T: AnyType,
-    judge: def(Span[Key, MutAnyOrigin], Span[Admission, MutAnyOrigin], Pointer[T, MutAnyOrigin]) thin -> None,
+    judge: def(Span[Key, MutAnyOrigin], Span[Admission, MutAnyOrigin], Pointer[T, ImmUntrackedOrigin]) thin -> None,
 ](
     keys: Pointer[Key, MutAnyOrigin],
     admissions: Pointer[Admission, MutAnyOrigin],
     count: c_size_t,
-    state: Pointer[T, MutAnyOrigin],
+    state: Pointer[T, ImmUntrackedOrigin],
 ) abi("C"):
-    """The C callback of one batch handler, instantiated per handler since a capturing closure cannot cross."""
+    """The C callback of one batch handler, instantiated per handler since a capturing closure cannot cross; it
+    reads `state` only, since the executor's threads may call it concurrently."""
     judge(
         Span[Key, MutAnyOrigin](unsafe_ptr=keys, length=Int(count)),
         Span[Admission, MutAnyOrigin](unsafe_ptr=admissions, length=Int(count)),
@@ -467,7 +469,11 @@ def _batch_predicate[
 @fieldwise_init
 struct Predicate(Defaultable, ImplicitlyCopyable):
     """The caller's verdict on the keys a scan lists, `ustore_predicate_t`, always asked on the host, as a
-    scan on a device executor lists its pages there too."""
+    scan on a device executor lists its pages there too.
+
+    It fills each admission with `Admission.REJECT` first, and may be called concurrently from the executor's
+    threads, so a handler reads its state and never writes it.
+    """
 
     var callback: Address
     """The handler's C entry point; `NULL_ADDRESS` admits every key."""
@@ -482,14 +488,14 @@ struct Predicate(Defaultable, ImplicitlyCopyable):
 
     @staticmethod
     def each[
-        T: AnyType, origin: MutOrigin, //, judge: def(Key, Pointer[T, MutAnyOrigin]) thin -> Bool
+        T: AnyType, origin: Origin, //, judge: def(Key, Pointer[T, ImmUntrackedOrigin]) thin -> Bool
     ](state: Pointer[T, origin]) -> Self:
         """Asks the cheap `judge` about every listed key, one at a time, before patterns or filters read any value.
 
         Parameters:
             T: What `state` points at, inferred from it.
             origin: The state's origin, inferred with it.
-            judge: Whether one key is admitted, called with the key and `state`.
+            judge: Whether one key is admitted, called with the key and `state`, which it only reads.
 
         Args:
             state: Forwarded into every call; it must outlive the scan.
@@ -500,9 +506,9 @@ struct Predicate(Defaultable, ImplicitlyCopyable):
     @staticmethod
     def batch[
         T: AnyType,
-        origin: MutOrigin,
+        origin: Origin,
         //,
-        judge: def(Span[Key, MutAnyOrigin], Span[Admission, MutAnyOrigin], Pointer[T, MutAnyOrigin]) thin -> None,
+        judge: def(Span[Key, MutAnyOrigin], Span[Admission, MutAnyOrigin], Pointer[T, ImmUntrackedOrigin]) thin -> None,
     ](state: Pointer[T, origin], cost: PredicateCost = PredicateCost.EXPENSIVE) -> Self:
         """Asks `judge` about every page of listed keys, which writes one admission per key; an expensive
         one is asked about the keys patterns and filters kept, unless told it is cheap.
@@ -510,7 +516,7 @@ struct Predicate(Defaultable, ImplicitlyCopyable):
         Parameters:
             T: What `state` points at, inferred from it.
             origin: The state's origin, inferred with it.
-            judge: Called with the page's keys, their admissions to write, and `state`.
+            judge: Called with the page's keys, their admissions to write, and `state`, which it only reads.
 
         Args:
             state: Forwarded into every call; it must outlive the scan.
@@ -556,7 +562,7 @@ struct DataDirectory[origin: ImmOrigin = ImmUntrackedOrigin](ImplicitlyCopyable)
     """A directory the data files may occupy, with the bytes they may take there, `ustore_data_directory_t`.
 
     Parameters:
-        origin: The borrowed path, kept alive for as long as the entry is used.
+        origin: The viewed path, kept alive for as long as the entry is used.
     """
 
     var path: BytesView[Self.origin]
@@ -607,6 +613,7 @@ struct DatabaseInitRamArguments(ImplicitlyCopyable):
     var completion: Completion
     var isolation: Isolation
     var cpu_class_ceiling: CPUClass
+    var memory_limit: c_size_t
 
 
 @fieldwise_init
@@ -620,6 +627,7 @@ struct DatabaseOpenRamArguments(ImplicitlyCopyable):
     var directory: BytesViewArguments
     var isolation: Isolation
     var cpu_class_ceiling: CPUClass
+    var memory_limit: c_size_t
 
 
 @fieldwise_init
@@ -633,6 +641,8 @@ struct DatabaseOpenRocksdbArguments(ImplicitlyCopyable):
     var directory: BytesViewArguments
     var data_directories: Address
     var data_directories_count: c_size_t
+    var memory_limit: c_size_t
+    var background_threads: c_size_t
 
 
 @fieldwise_init
@@ -644,6 +654,8 @@ struct DatabaseOpenLeveldbArguments(ImplicitlyCopyable):
     var outcome: Optional[Pointer[Outcome, MutUntrackedOrigin]]
     var completion: Completion
     var directory: BytesViewArguments
+    var memory_limit: c_size_t
+    var background_threads: c_size_t
 
 
 @fieldwise_init
@@ -668,6 +680,23 @@ struct DatabaseOpenNvmeArguments(ImplicitlyCopyable):
     var collection_level_enlarge_factor: c_size_t
     var collection_value_size: c_size_t
     var collection_value_max_size: c_size_t
+    var cpu_class_ceiling: CPUClass
+
+
+@fieldwise_init
+struct DatabaseViewNvmeArguments(ImplicitlyCopyable):
+    """`ustore_database_view_nvme_t`."""
+
+    var database: Optional[Pointer[Address, MutUntrackedOrigin]]
+    var executor: Address
+    var outcome: Optional[Pointer[Outcome, MutUntrackedOrigin]]
+    var completion: Completion
+    var directory: BytesViewArguments
+    var data_directories: Address
+    var data_directories_count: c_size_t
+    var memory_limit: c_size_t
+    var collection_concurrency_limit: c_size_t
+    var collection_cache_limit: c_size_t
     var cpu_class_ceiling: CPUClass
 
 
@@ -706,9 +735,9 @@ struct DatabaseDescription(Defaultable, Deferrable, ImplicitlyCopyable):
     """Bytes of memory the engine holds for the data."""
     var disk_bytes: c_size_t
     """Bytes the files of the database take on disk."""
-    var pin_refused_bytes: c_size_t
+    var unpinned_staging_bytes: c_size_t
     """Bytes of the NVMe engine's io_uring arena the locked-memory cap refused to pin, so each request pins its own."""
-    var crossing_requests: c_size_t
+    var requests_across_registered_slots: c_size_t
     """Requests the NVMe engine sent unpinned while its arena was pinned, as each crossed a gibibyte of it."""
 
     def __init__(out self):
@@ -811,7 +840,7 @@ struct DatabaseCompactArguments(Arguments):
         plan: Optional[Pointer[DatabaseCompactPlan, plan_origin]],
         phase: Optional[Pointer[PhaseProgress, phase_origin]],
     ) -> Self:
-        """The arguments with the plan's handle slot and the phase slot lent, either one absent."""
+        """The arguments with the plan's handle slot and the phase slot the caller owns, either one absent."""
         var plan_slot: Optional[Pointer[Address, MutUntrackedOrigin]] = None
         if plan:
             plan_slot = Pointer(to=plan.value()[].address).unsafe_origin_cast[MutUntrackedOrigin]()
@@ -824,7 +853,7 @@ struct DatabaseCompactArguments(Arguments):
 struct DatabaseCompactPlan(Movable):
     """One compaction in flight, `ustore_database_compact_plan_t`. Binding-only.
 
-    Lent to `compact`, it opens on the first call, stays live past a cancel, continues from the unit
+    Owned by the caller and passed to `compact`, it opens on the first call, stays live past a cancel, continues from the unit
     it stopped at on every later call, and closes with `compact_plan_finish`. The database and the
     executor it was opened with must outlive that finish.
     """
@@ -999,10 +1028,10 @@ struct CollectionListArguments(Arguments):
 
 @fieldwise_init
 struct CollectionList[origin: MutOrigin](Deferrable, Sized):
-    """The collections of a database, read in place from the arena a listing borrows.
+    """The collections of a database, read in place from the arena a listing views.
 
     Parameters:
-        origin: The arena the listing lives in, which this result borrows.
+        origin: The arena the listing lives in, which this result views.
     """
 
     comptime Written = CollectionListWritten
@@ -1126,10 +1155,10 @@ struct CollectionFindArguments(Arguments):
 
 @fieldwise_init
 struct CollectionsFound[origin: MutOrigin](Deferrable, Sized):
-    """The collections a batch of names address, read in place from the arena a find borrows.
+    """The collections a batch of names address, read in place from the arena a find views.
 
     Parameters:
-        origin: The arena the answers live in, which this result borrows.
+        origin: The arena the answers live in, which this result views.
     """
 
     comptime Written = CollectionFindWritten
@@ -1153,7 +1182,7 @@ struct CollectionsFound[origin: MutOrigin](Deferrable, Sized):
         return self.count
 
     def present(self, index: Int) raises Error -> Bool:
-        """Whether a collection carries name `index`."""
+        """Whether a collection holds name `index`."""
         _readable(self.arena, self.generation, "CollectionsFound.present")
         return _bit(self.written.presences, index)
 
@@ -1412,10 +1441,10 @@ struct ChangesCursorNextArguments(Arguments):
 
 @fieldwise_init
 struct Changes[origin: MutOrigin](Deferrable, Sized):
-    """The changes one pull of a feed yielded, oldest first, read in place from the arena it borrows.
+    """The changes one pull of a feed yielded, oldest first, read in place from the arena it views.
 
     Parameters:
-        origin: The arena the changes live in, which this result borrows.
+        origin: The arena the changes live in, which this result views.
     """
 
     comptime Written = ChangesWritten
@@ -1451,7 +1480,7 @@ struct Changes[origin: MutOrigin](Deferrable, Sized):
         return _in_arena[ChangeKind, origin_of(self)](self.written.kinds, len(self))
 
     def values(self) -> Tape[Self.origin]:
-        """The bytes every change carries, empty for a removal or when the pull skipped them."""
+        """The bytes every change holds, empty for a removal or when the pull skipped them."""
         return Tape[Self.origin](self.arena, self.generation, self.written.values, len(self))
 
 
@@ -1481,9 +1510,9 @@ struct ChangesCursor(Movable):
 
         Args:
             executor: The executor the pull runs on.
-            arena: The arena to rewind and refill, which the result borrows.
+            arena: The arena to rewind and refill, which the result views.
             wanted: Most changes the pull yields.
-            values: Whether the bytes every change carries come too.
+            values: Whether the bytes every change holds come too.
 
         Raises:
             `Error` if the collection was dropped meanwhile.
@@ -1522,7 +1551,9 @@ struct IngestInitArguments(ImplicitlyCopyable):
 
     var ingest: Optional[Pointer[Address, MutUntrackedOrigin]]
     var database: Address
+    var executor: Address
     var outcome: Optional[Pointer[Outcome, MutUntrackedOrigin]]
+    var completion: Completion
     var collection: CollectionID
     var order: IngestOrder
 
@@ -1532,7 +1563,9 @@ struct IngestAppendArguments(ImplicitlyCopyable):
     """`ustore_ingest_append_t`."""
 
     var ingest: Address
+    var executor: Address
     var outcome: Optional[Pointer[Outcome, MutUntrackedOrigin]]
+    var completion: Completion
     var count: c_size_t
     var keys: StridedArguments
     var values: StringsViewArguments
@@ -1546,7 +1579,9 @@ struct IngestFinishArguments(ImplicitlyCopyable):
     """`ustore_ingest_finish_t`."""
 
     var ingest: Address
+    var executor: Address
     var outcome: Optional[Pointer[Outcome, MutUntrackedOrigin]]
+    var completion: Completion
     var durability: Durability
     var commit_stamp: Optional[Pointer[Stamp, MutUntrackedOrigin]]
 
@@ -1599,7 +1634,9 @@ struct Ingest(Movable):
         _cross(
             IngestAppendArguments(
                 self.address,
+                NULL_ADDRESS,
                 outcome,
+                Completion.BLOCKING,
                 c_size_t(count),
                 keys.arguments(),
                 values.arguments(),
@@ -1621,7 +1658,10 @@ struct Ingest(Movable):
         outcome[] = Outcome()
         var stamp = stack_allocation[1, Stamp]().unsafe_origin_cast[MutUntrackedOrigin]()
         stamp[] = Stamp()
-        _cross(IngestFinishArguments(self.address, outcome, durability, stamp), self.library.symbols().ingest_finish)
+        _cross(
+            IngestFinishArguments(self.address, NULL_ADDRESS, outcome, Completion.BLOCKING, durability, stamp),
+            self.library.symbols().ingest_finish,
+        )
         self.library._check(outcome.unsafe_origin_cast[MutAnyOrigin]()[], "ustore_ingest_finish")
         return stamp.unsafe_origin_cast[MutAnyOrigin]()[]
 
@@ -1632,7 +1672,8 @@ struct Ingest(Movable):
 
 
 struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, PagesVerbs, StringsVerbs):
-    """An open database, closed when it goes out of scope while its data persists on disk.
+    """An open database, closed when it goes out of scope; only `flush` and flushed commits make data durable,
+    since closing does no I/O.
 
     Verbs called on the database run on the calling thread and address its head; `db.on(executor)`
     runs the same verbs blocking on an executor, and `db.deferred(executor)` submits them there. A
@@ -1658,7 +1699,7 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         """Starts an empty database of the in-memory engine, which persists nowhere. Calls `ustore_database_init_ram`.
 
         Args:
-            executor: The executor the open runs on; it also lends its engine.
+            executor: The executor the open runs on; it also supplies its engine.
             isolation: How transactions see each other.
             cpu_class_ceiling: The newest class the database may confine its kernels to, narrowed to what the CPU runs, so a class it lacks is never refused; `UNKNOWN` sets none.
 
@@ -1672,7 +1713,7 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         outcome[] = Outcome()
         _cross(
             DatabaseInitRamArguments(
-                created, executor.address, outcome, Completion.BLOCKING, isolation, cpu_class_ceiling
+                created, executor.address, outcome, Completion.BLOCKING, isolation, cpu_class_ceiling, c_size_t(0)
             ),
             executor.library.symbols().database_init_ram,
         )
@@ -1690,7 +1731,7 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         cpu_class_ceiling: CPUClass = CPUClass.UNKNOWN,
     ) raises Error -> Self:
         """Serves a directory through the in-memory engine, loading its image and rewriting it on flushed
-        commits and on close. Calls `ustore_database_open_ram`.
+        commits and on `flush`, never on close. Calls `ustore_database_open_ram`.
 
         Raises:
             `Error` with `NOT_FOUND` if the directory does not exist, or `MALFORMED` for a corrupt image.
@@ -1708,6 +1749,7 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
                 BytesView.of(directory).arguments(),
                 isolation,
                 cpu_class_ceiling,
+                c_size_t(0),
             ),
             executor.library.symbols().database_open_ram,
         )
@@ -1779,6 +1821,8 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
             directory,
             directories if count else NULL_ADDRESS,
             c_size_t(count),
+            c_size_t(0),
+            c_size_t(0),
         )
         if read_only:
             _cross(arguments, executor.library.symbols().database_view_rocksdb)
@@ -1808,7 +1852,13 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         outcome[] = Outcome()
         _cross(
             DatabaseOpenLeveldbArguments(
-                created, executor.address, outcome, Completion.BLOCKING, BytesView.of(directory).arguments()
+                created,
+                executor.address,
+                outcome,
+                Completion.BLOCKING,
+                BytesView.of(directory).arguments(),
+                c_size_t(0),
+                c_size_t(0),
             ),
             executor.library.symbols().database_open_leveldb,
         )
@@ -1875,8 +1925,58 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
             library=executor.library, address=_created(executor.library, outcome, created, "ustore_database_open_nvme")
         )
 
+    @staticmethod
+    def view_nvme[
+        directory_origin: ImmOrigin, paths_origin: ImmOrigin, directories_origin: ImmOrigin, //
+    ](
+        executor: Executor,
+        directory: StringSlice[directory_origin],
+        options: DatabaseNvmeOptions = DatabaseNvmeOptions(),
+        data_directories: Span[DataDirectory[paths_origin], directories_origin] = Span[
+            DataDirectory[paths_origin], directories_origin
+        ](),
+    ) raises Error -> Self:
+        """Serves the database a manifest names through the NVMe engine, read-only, refusing every call that would
+        change it with `READ_ONLY`. Calls `ustore_database_view_nvme`.
+
+        Args:
+            executor: The executor the open runs on, whose transport the database reads once.
+            directory: The manifest of an existing database.
+            options: The sizes the view opens with, of which it reads the memory and collection limits and the class
+                ceiling.
+            data_directories: Further directories, as the database was opened with.
+
+        Raises:
+            `Error` with `UNSUPPORTED` in a build without the engine, or `NOT_FOUND` for a missing manifest.
+        """
+        var created = stack_allocation[1, Address]().unsafe_origin_cast[MutUntrackedOrigin]()
+        created[] = NULL_ADDRESS
+        var outcome = stack_allocation[1, Outcome]().unsafe_origin_cast[MutUntrackedOrigin]()
+        outcome[] = Outcome()
+        var count = len(data_directories)
+        _cross(
+            DatabaseViewNvmeArguments(
+                created,
+                executor.address,
+                outcome,
+                Completion.BLOCKING,
+                BytesView.of(directory).arguments(),
+                Int(data_directories.unsafe_ptr()) if count else NULL_ADDRESS,
+                c_size_t(count),
+                options.memory_limit,
+                options.collection_concurrency_limit,
+                options.collection_cache_limit,
+                options.cpu_class_ceiling,
+            ),
+            executor.library.symbols().database_view_nvme,
+        )
+        return Self(
+            library=executor.library, address=_created(executor.library, outcome, created, "ustore_database_view_nvme")
+        )
+
     def __deinit__(deinit self):
-        """Closes the database once nothing holds it open. Calls `ustore_database_free`.
+        """Closes the database once nothing holds it open, writing nothing: commits not yet flushed are lost.
+        Calls `ustore_database_free`.
 
         The loader reference is surrendered only after the call, so Mojo cannot `dlclose` the engine
         between the load of the entry point and the branch to it.
@@ -1955,7 +2055,8 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         var outcome = stack_allocation[1, Outcome]().unsafe_origin_cast[MutUntrackedOrigin]()
         outcome[] = Outcome()
         _cross(
-            IngestInitArguments(created, self.address, outcome, collection, order), self.library.symbols().ingest_init
+            IngestInitArguments(created, self.address, NULL_ADDRESS, outcome, Completion.BLOCKING, collection, order),
+            self.library.symbols().ingest_init,
         )
         return Ingest(library=self.library, address=_created(self.library, outcome, created, "ustore_ingest_init"))
 
@@ -2015,7 +2116,7 @@ struct Snapshot(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
     """A point-in-time state of the whole database, released when it goes out of scope. It pins the
     versions its reads need and holds its database open.
 
-    Verbs called on it read at its state on the calling thread; writes, carrying no transaction, land
+    Verbs called on it read at its state on the calling thread; writes, holding no transaction, land
     at the head. `snap.on(executor)` and `snap.deferred(executor)` route the same verbs to an executor.
     """
 
@@ -2065,7 +2166,7 @@ struct On[origin: ImmOrigin](
     """A database, transaction or snapshot bound to the executor its verbs block on. Binding-only.
 
     Parameters:
-        origin: The handle and the executor, which this receiver borrows.
+        origin: The handle and the executor, which this receiver views.
     """
 
     var scope: Scope
@@ -2087,12 +2188,12 @@ struct DeferredOn[origin: ImmOrigin](
     StringsDeferredVerbs,
 ):
     """A database, transaction or snapshot bound to the executor its verbs are submitted to: every verb
-    answers a `Deferred` at once, borrowing its arena and inputs until final. Binding-only.
+    answers a `Deferred` at once, viewing its arena and inputs until final. Binding-only.
 
     The verbs and their arguments are those of the blocking receivers.
 
     Parameters:
-        origin: The handle and the executor, which this receiver borrows.
+        origin: The handle and the executor, which this receiver views.
     """
 
     var scope: Scope
@@ -2150,8 +2251,8 @@ trait DatabaseVerbs:
         time. Calls `ustore_database_compact`.
 
         Parameters:
-            plan_origin: The lent plan's origin, inferred where one is lent.
-            phase_origin: The lent phase slot's origin, inferred where one is lent.
+            plan_origin: The caller's plan origin, inferred where one is passed.
+            phase_origin: The caller's phase slot origin, inferred where one is passed.
 
         Args:
             progress: Hears each unit; a cancel stops between units, keeping what it compacted.
@@ -2159,7 +2260,7 @@ trait DatabaseVerbs:
             phase: Receives where this call stopped, `Phase.DONE` once the compaction ended.
 
         Raises:
-            `Error` with `CANCELLED` once `progress` stops it, leaving a lent plan live, or
+            `Error` with `CANCELLED` once `progress` stops it, leaving the caller's plan live, or
             `CONTENDED` while another live plan compacts the database.
         """
         _ = _block(
@@ -2244,7 +2345,7 @@ trait DatabaseVerbs:
         """Creates an empty collection, unnamed for an empty `name`. Calls `ustore_collection_create`.
 
         Raises:
-            `Error` with `ALREADY_EXISTS` when another collection carries the name.
+            `Error` with `ALREADY_EXISTS` when another collection holds the name.
         """
         var view = BytesView.of(name).arguments() if name.byte_length() else BytesViewArguments.empty()
         return _block(
@@ -2285,7 +2386,7 @@ trait DatabaseVerbs:
         """Removes or clears a collection. Calls `ustore_collection_drop`.
 
         Raises:
-            `Error` with `NOT_FOUND` when no collection carries the identifier.
+            `Error` with `NOT_FOUND` when no collection holds the identifier.
         """
         _ = _block(
             self._scope(),
@@ -2423,7 +2524,7 @@ trait DatabaseDeferredVerbs:
         ],
         ImmOrigin(origin_of(self)),
     ]:
-        """Submits `DatabaseVerbs.compact`; the plan and phase slots stay borrowed until final.
+        """Submits `DatabaseVerbs.compact`; the plan and phase slots stay owned by the caller until final.
         Calls `ustore_database_compact`."""
         return {
             self._scope(),

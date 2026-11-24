@@ -6,10 +6,10 @@
  *      and slide decks, edited concurrently by many authors.
  *
  *  A JSON document of @c docs.h is a map addressed by field, replaced or patched as a whole value. A
- *  page is an ordered tree of elements addressed by identity, where every element carries a key, a
+ *  page is an ordered tree of elements addressed by identity, where every element holds a key, a
  *  tag, attributes and text, and where the order of siblings is the content. A paragraph is an
  *  element whose text is a run of characters, a spreadsheet row is an element whose children are its
- *  cells, and a slide is an element whose children carry geometry in their attributes.
+ *  cells, and a slide is an element whose children hold geometry in their attributes.
  *
  *  Edits are positional and small, one verb each: insert elements after a sibling, remove or move a
  *  subtree, splice bytes inside a text run, or set or remove an attribute. An element inserted without
@@ -132,7 +132,7 @@ typedef struct ustore_pages_import_t {
  *  4 Gi tasks, or a collection holds another modality.
  *
  *  - @c ustore_status_unsupported_k The executor computes on a device, the @c encoding is HTML,
- *    Markdown or JSON, or a DOCTYPE carries an internal subset.
+ *    Markdown or JSON, or a DOCTYPE holds an internal subset.
  *  - @c ustore_status_not_found_k A collection does not exist or was dropped meanwhile.
  *  - @c ustore_status_malformed_k A markup does not parse, or a page outgrows what its NVMe
  *    collection admits.
@@ -216,7 +216,7 @@ typedef struct ustore_pages_insert_t {
  *  - @c ustore_status_uninitialized_k The @c database is @c NULL or an NVMe transfer was cancelled.
  *  - @c ustore_status_read_only_k The database was opened read-only.
  *  - @c ustore_status_unsupported_k The executor computes on a device, the @c encoding is HTML,
- *    Markdown or JSON, or a DOCTYPE carries an internal subset.
+ *    Markdown or JSON, or a DOCTYPE holds an internal subset.
  *  - @c ustore_status_not_found_k A collection or an edited page does not exist, or a collection
  *    was dropped meanwhile.
  *  - @c ustore_status_malformed_k A fragment does not parse, a stored page does not decode, or a page

@@ -28,8 +28,8 @@
 #include <memory>      // `std::unique_ptr`, `std::make_shared`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
-#include <string_view> // `std::string_view`
 #include <type_traits> // `std::is_same_v`
+#include <string_view> // `std::string_view`
 #include <utility>     // `std::move`
 
 #include <forkunion/atomics.hpp>       // `fu::standard_atomic_ref`
@@ -40,7 +40,7 @@
 #include "ustore/utilities/nvme_linux_aio_disk.hpp"   // `linux_aio_files_disk`, `linux_aio_probe_t`
 #include "ustore/utilities/nvme_linux_uring_disk.hpp" // `linux_uring_files_disk`, `linux_uring_probe_t`
 
-#include "ustore/utilities/nvme_channels.hpp"  // `registered_memory_arena`, `memory_arena_config_t`
+#include "ustore/utilities/nvme_queues.hpp"    // `nvme_queues_t`, `io_transport_t`
 #include "ustore/blobs/nvme_store.hpp"         // `lookup_result_t`, `commit_ledger`, `stamp_pin`
 #include "ustore/utilities/nvme_mounts.hpp"    // `shared_resources`, `resources_shared_ptr`
 #include "ustore/utilities/blocking_files.hpp" // `read_file`, `file_buffering_t`
@@ -68,7 +68,6 @@ using blocking_files_disk_t = util::blocking_files_disk<atomic_reference, waiter
 using linux_uring_files_disk_t = util::linux_uring_files_disk<atomic_reference, waiter_t>;
 using linux_aio_files_disk_t = util::linux_aio_files_disk<atomic_reference, waiter_t>;
 using resource_constraint_t = util::resource_constraint<atomic_reference>;
-using registered_memory_arena_t = util::registered_memory_arena<atomic_reference>;
 using resources_t = util::shared_resources<atomic_reference, waiter_t>;
 using resources_shared_ptr_t = util::resources_shared_ptr<atomic_reference, waiter_t>;
 using commit_ledger_t = commit_ledger<atomic_reference, waiter_t>;
@@ -294,7 +293,8 @@ struct fixture_config_t {
     /** Blocks one channel's request pool holds, kept above the depth so credit runs out first. */
     std::uint32_t request_buffers = 32;
 
-    /** Bytes of one streaming block, which carries a whole index; the sorted run suite quadruples it. */
+    /** Bytes of one streaming block, which holds a whole index; the sorted run
+     *  suite quadruples it. */
     std::uint64_t stream_buffer_bytes = 256ull * 1024ull;
 
     /** Streaming blocks one channel holds, which is the depth a merge writes at. */
@@ -310,13 +310,11 @@ struct fixture_config_t {
      *  are sized by. */
     std::size_t runs_capacity = 256;
 
-    /** Spare channels the mount opens: one per channel a case holds at once, plus one per thread it spawns. */
-    std::size_t shared_io_channels = 4;
+    /** Threads of the queue set a fixture opens, two channels each: enough for every channel a case
+     *  holds at once, plus one per thread it spawns. */
+    std::size_t queues_threads = 2;
 
-    /** Executor channels the mount opens, one per thread, which only the channels suite raises above none. */
-    std::size_t executor_threads = 0;
-
-    /** Memory ranges the disk pins at once, which is the arena and one more for a case's own buffer. */
+    /** Memory ranges the disk records at once, one for a case's own buffer and one spare. */
     std::uint16_t registered_memory_limit = 2;
 
     /** Bytes the budget every allocation of a fixture is charged to. */
@@ -336,8 +334,6 @@ struct fixture_config_t {
     /** The ring config a disk of @p media volumes mounts with. */
     [[nodiscard]] constexpr util::disk_config_t disk(std::size_t media) const noexcept {
         util::disk_config_t config;
-        config.queue_pairs_limit = static_cast<std::uint16_t>(executor_threads + shared_io_channels);
-        config.depth_limit = queue_depth;
         config.registered_memory_limit = registered_memory_limit;
         config.media_limit = static_cast<std::uint16_t>(media + runs_capacity);
         return config;
@@ -346,8 +342,6 @@ struct fixture_config_t {
     /** The same ring config for io_uring, which always runs unbuffered. */
     [[nodiscard]] constexpr util::linux_uring_disk_config_t linux_uring(std::size_t media) const noexcept {
         util::linux_uring_disk_config_t config;
-        config.queue_pairs_limit = static_cast<std::uint16_t>(executor_threads + shared_io_channels);
-        config.depth_limit = queue_depth;
         config.registered_memory_limit = registered_memory_limit;
         config.media_limit = static_cast<std::uint16_t>(media + runs_capacity);
         config.buffering = util::file_buffering_t::unbuffered_k;
@@ -357,8 +351,6 @@ struct fixture_config_t {
     /** The same ring config for Linux AIO, which always runs unbuffered too. */
     [[nodiscard]] constexpr util::linux_aio_disk_config_t linux_aio(std::size_t media) const noexcept {
         util::linux_aio_disk_config_t config;
-        config.queue_pairs_limit = static_cast<std::uint16_t>(executor_threads + shared_io_channels);
-        config.depth_limit = queue_depth;
         config.registered_memory_limit = registered_memory_limit;
         config.media_limit = static_cast<std::uint16_t>(media + runs_capacity);
         config.buffering = util::file_buffering_t::unbuffered_k;
@@ -373,15 +365,23 @@ struct fixture_config_t {
 /** Most volumes, and most data directories of one volume, one fixture holds. */
 constexpr std::size_t fixture_volumes_capacity_k = 16;
 
-/** A mounted disk, its arena, its channels and the media the volumes of a case occupy, torn down in order. */
+/** The transport of the queues a queue set makes for @p disk_type_, which names its queue type. */
 template <typename disk_type_>
-    requires util::ring_concept<disk_type_>
+[[nodiscard]] constexpr util::io_transport_t queues_transport_of() noexcept {
+    using queue_t = typename disk_type_::queue_t;
+    if constexpr (std::is_same_v<queue_t, util::linux_uring_queue_t>) return util::io_transport_t::linux_uring_k;
+    else if constexpr (std::is_same_v<queue_t, util::linux_aio_queue_t>) return util::io_transport_t::linux_aio_k;
+    else if constexpr (std::is_same_v<queue_t, util::linux_spdk_queue_t>) return util::io_transport_t::linux_spdk_k;
+    else return util::io_transport_t::blocking_k;
+}
+
+/** A mounted disk, its channels and the media the volumes of a case occupy, torn down in order. */
+template <typename disk_type_>
+    requires util::disk_concept<disk_type_>
 struct basic_fixture {
 
     using disk_t = disk_type_;
     using volume_t = util::basic_directory_volume<disk_type_, waiter_t, volume_allocator_t>;
-    using channel_pool_t = util::basic_io_channel_pool<disk_type_, atomic_reference, waiter_t>;
-    using guard_t = typename channel_pool_t::guard_t;
 
     /** The budgets every allocation is charged to, shared so a case can hold them past the fixture's death. */
     resources_shared_ptr_t resources;
@@ -389,11 +389,8 @@ struct basic_fixture {
     /** The ring every channel queue pairs from. */
     disk_type_ disk;
 
-    /** The one registered range every block comes from. */
-    registered_memory_arena_t arena;
-
-    /** Every queue pair the mount opened. */
-    channel_pool_t channels;
+    /** The queue set every channel of a case comes from, dying before the disk its queues hold. */
+    util::nvme_queues_t queues;
 
     /** One medium per volume, closed in the destructor. */
     st::vector<util::registered_medium_t> media;
@@ -435,11 +432,19 @@ struct basic_fixture {
             std::size_t const held = resources->memory_constraint.used();
             expect_true(held == mounted_bytes, "the budgets hold {} bytes past the mount's {}", held, mounted_bytes);
         }
-        [[maybe_unused]] util::status_t const parked = channels.release_all();
-        [[maybe_unused]] util::status_t const unpinned = arena.unregister(disk);
+        queues = util::nvme_queues_t {};
         for (std::size_t index = 0; index != media.size(); ++index)
             if (media[index].held()) [[maybe_unused]]
                 util::status_t const closed = disk.unregister_medium(media[index]);
+    }
+
+    /** Channel @p index of the queue set, holding the disk: the reading channel of thread @p
+     *  index / 2 for an even index and its writing one for an odd index, so every pipeline a case
+     *  holds at once names its own. */
+    util::expected<util::io_channel_t*> channel(std::size_t index) noexcept {
+        auto [channels, media_status] = queues.both_channels_with_disk_media(index / 2, disk);
+        if (media_status.failed()) return media_status;
+        return index % 2 == 0 ? channels.reading : channels.writing;
     }
 
     /** Mounts the directory volume of the suite's database over @p data_directories directories,
@@ -511,9 +516,7 @@ util::expected<disk_type_> open_disk(fixture_config_t const& config, std::size_t
 template <typename disk_type_>
 util::status_t blank_head(disk_type_& disk, util::io_channel_t& channel, util::medium_reference_t medium,
                           std::uint64_t page_bytes) noexcept {
-    auto [writer_channel, writer_channel_status] = channel.acquire();
-    if (writer_channel_status.failed()) return writer_channel_status;
-    util::basic_write_pipeline<disk_type_, waiter_t> writer {disk, std::move(writer_channel), medium};
+    util::basic_write_pipeline<disk_type_, waiter_t> writer {disk, channel, medium};
     auto [block, acquire_buffer_status] = writer.acquire_buffer();
     if (acquire_buffer_status.failed()) return acquire_buffer_status;
     if (block.size() < page_bytes)
@@ -532,7 +535,7 @@ util::status_t blank_head(disk_type_& disk, util::io_channel_t& channel, util::m
  *  no case inherits the catalog its predecessor left; a volume in memory is blank by construction.
  */
 template <typename disk_type_>
-    requires util::ring_concept<disk_type_>
+    requires util::disk_concept<disk_type_>
 struct basic_mount {
 
     using fixture_t = basic_fixture<disk_type_>;
@@ -547,7 +550,7 @@ struct basic_mount {
     /** The ring every fixture mounts. */
     transport_t transport = transport_t::memory_k;
 
-    /** The suite's name, which every file medium carries. */
+    /** The suite's name, which every file medium holds. */
     char const* suite = "";
 
     /** Volumes a fixture holds unless a case asks for its own capacities. */
@@ -591,19 +594,13 @@ struct basic_mount {
                     return util::status_t {util::status_code_t::io_k,
                                            "A fixture's data directory would not be emptied"};
 
-        util::io_channel_config_t const channels = reshaped.channels();
-        util::memory_arena_config_t arena;
-        arena.bytes = channels.arena_bytes() * (reshaped.executor_threads + reshaped.shared_io_channels);
-        auto [pinned, make_arena_status] = registered_memory_arena_t::make(
-            fixture->disk, fixture->resources->memory_constraint, arena);
-        if (make_arena_status.failed()) return make_arena_status;
-        fixture->arena = std::move(pinned);
-
-        auto [pool, make_status] = fixture_t::channel_pool_t::make(fixture->disk, fixture->arena.registration(),
-                                                                   reshaped.executor_threads,
-                                                                   reshaped.shared_io_channels, channels);
+        st::vector<fu_memory_domain_id_t> anywhere;
+        if (anywhere.resize(reshaped.queues_threads, fu_memory_domain_id_t {-1}) != st::status_t::success_k)
+            return util::status_t {util::status_code_t::out_of_memory_k, "The fixture could not size its queues"};
+        auto [queues, make_status] = util::nvme_queues_t::make(queues_transport_of<disk_type_>(), reshaped.channels(),
+                                                               anywhere);
         if (make_status.failed()) return make_status;
-        fixture->channels = std::move(pool);
+        fixture->queues = std::move(queues);
 
         for (std::size_t index = 0; index != capacities.size(); ++index) {
             auto [registered, register_volume_status] = register_volume_(fixture->disk, index, capacities[index]);
@@ -614,9 +611,9 @@ struct basic_mount {
         }
 
         if (transport == transport_t::device_k) {
-            auto [guard, acquire_status] = fixture->channels.acquire();
-            if (acquire_status.failed()) return acquire_status;
-            if (util::status_t const blanked = blank_head(fixture->disk, guard.channel(), fixture->media[0].reference(),
+            auto [channel, media_status] = fixture->channel(0);
+            if (media_status.failed()) return media_status;
+            if (util::status_t const blanked = blank_head(fixture->disk, *channel, fixture->media[0].reference(),
                                                           reshaped.page_bytes);
                 blanked.failed())
                 return blanked;
@@ -873,7 +870,7 @@ void run_on_transport(transport_t transport, char const* directory, fixture_conf
     return true;
 }
 
-/** One key of a model: what a lookup of it should answer, and the value it should carry. */
+/** One key of a model: what a lookup of it should answer, and the value it should hold. */
 struct expectation_t {
 
     /** The key itself. */

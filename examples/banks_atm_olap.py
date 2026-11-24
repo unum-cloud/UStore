@@ -20,6 +20,10 @@ Run with `python examples/banks_atm_olap.py`, then open the printed port.
 
 Row to columnar conversion in Arrow:
 https://arrow.apache.org/docs/cpp/examples/row_columnar_conversion.html
+
+File: examples/banks_atm_olap.py
+Author: Ash Vardanian
+Date: September 16, 2026
 """
 
 import struct
@@ -128,7 +132,7 @@ def pack_rows(measurements: pd.DataFrame) -> bytearray:
 
 
 def dump_rows(measurements: pd.DataFrame) -> pa.FixedSizeBinaryArray:
-    """Wraps the packed rows as an Arrow array, which borrows the buffer instead of copying it."""
+    """Wraps the packed rows as an Arrow array, which views the buffer instead of copying it."""
     packed = pack_rows(measurements)
     datatype = pa.binary(struct.calcsize(MEASUREMENT_FORMAT))
     buffers = [None, pa.py_buffer(packed)]

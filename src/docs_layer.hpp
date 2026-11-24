@@ -36,17 +36,18 @@
 #include "ustore/docs.h"               // `ustore_docs_write_t`, `ustore_docs_read_t`
 #include "ustore/utilities/ranges.hpp" // `place_batch_t`, `values_view_t`
 
-#include "ustore/docs/json_fold.hpp"        // `json_delta_t`, `apply_delta`, `modifier_text`, `document_state_t`
-#include "ustore/docs/json_patch.hpp"       // `modify`, `modification_t`
-#include "ustore/docs/json_paths.hpp"       // `extract_fields`, `json_documents_t`, `field_cell_t`, `json_text_of`
-#include "ustore/docs/json_values.hpp"      // `json_parse`, `gather_scalar`, `field_size_bytes`, `extract_keys`
-#include "ustore/utilities/algorithm.hpp"   // `offset_in_sorted`, `heap_sort`, `radix_sort`, `word_byte`
-#include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `growing_strings`
+#include "ustore/docs/json_fold.hpp"      // `json_delta_t`, `apply_delta`, `modifier_text`, `document_state_t`
+#include "ustore/docs/json_patch.hpp"     // `modify`, `modification_t`
+#include "ustore/docs/json_paths.hpp"     // `extract_fields`, `json_documents_t`, `field_cell_t`, `json_text_of`
+#include "ustore/docs/json_values.hpp"    // `json_parse`, `gather_scalar`, `field_size_bytes`, `extract_keys`
+#include "ustore/utilities/algorithm.hpp" // `offset_in_sorted`, `heap_sort`, `radix_sort`, `word_byte`
+#include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `arena_copy`, `arena_rewind`, `growing_strings`
 
-#include "engine.hpp"            // `blobs_verbs<vendored_residency_t::host_k>`, `view_t`
+#include "engine.hpp"            // `blobs_verbs<vendored_residency_t::host_k>`, `view_t`, `docs_columns_t`
+#include "match.hpp"             // `compiled_match`, `candidates_t`, `exhausted_t`
 #include "utilities/batches.hpp" // `strings_arg_t`, `places_of`
 #include "utilities/outputs.hpp" // `read_outputs_t`
-#include "utilities/slices.hpp"  // `for_task_slices`, `slice_slots`
+#include "utilities/slices.hpp"  // `for_task_slices`, `slice_slots`, `tasks_per_word_k`
 
 namespace unum::ustore {
 using namespace unum::ustore::docs;
@@ -543,7 +544,8 @@ util::status_t read_document_fields(documents_type_ const& source, ustore_docs_r
             view.scratch, values);
         extracted.failed())
         return extracted;
-    auto export_slice = [&](std::size_t first, std::size_t length, view_t const& slice) noexcept -> status_t {
+    auto export_slice = [&](std::size_t first, std::size_t length, std::size_t,
+                            view_t const& slice) noexcept -> status_t {
         for (std::size_t task = first; task != first + length; ++task)
             if (util::status_t const status = export_one(values[task], task, slice.scratch); status.failed())
                 return status;
@@ -589,7 +591,190 @@ util::status_t gist_documents(documents_type_ const& documents, ustore_docs_gist
     return {};
 }
 
-/** Implements @c ustore_docs_gather over @p source. */
+/**
+ *  @brief Reads the documents at @p places from @p source in flights, staged in the scratch of
+ *      the first slice, and hands each to @p visit on the calling thread as
+ *      <tt>visit(documents, flight_begin)</tt>.
+ *
+ *  A flight is a word of words of keys per slice of @p view, read by one fork of the slices.
+ *  After each flight the scratch of every slice rewinds, but the call's own, so a document lives
+ *  only until its flight is visited, a warm flight allocates nothing, and the call's arena
+ *  receives nothing but its outputs. A call without an executor stages in its own scratch.
+ */
+template <typename documents_type_, typename visit_type_>
+util::status_t read_in_flights(documents_type_ const& source, util::place_batch_t const& places, view_t const& view,
+                               visit_type_&& visit) noexcept {
+    // A slice drains its ring once a flight, so a share of the default ring depth squared, a word
+    // of words, spends one round in every depth of rounds on that drain
+    std::size_t const flight = util::slice_slots(view) * util::tasks_per_word_k * util::tasks_per_word_k;
+    view_t staged = view;
+    staged.scratch = view.executor ? &view.executor->scratches[0] : view.scratch;
+    for (std::size_t begin = 0; begin < places.count; begin += flight) {
+        auto const signed_begin = static_cast<std::ptrdiff_t>(begin);
+        util::place_batch_t flight_places = places;
+        flight_places.collections_begin = places.collections_begin ? places.collections_begin + signed_begin
+                                                                   : places.collections_begin;
+        flight_places.keys_begin = places.keys_begin + signed_begin;
+        flight_places.count = static_cast<ustore_size_t>(fu::min_of<std::size_t>(flight, places.count - begin));
+        auto [documents, read_status] = source.read(flight_places, staged);
+        if (read_status.failed()) return read_status;
+        if (util::status_t const visited = visit(documents, begin); visited.failed()) return visited;
+        for (std::size_t thread = 0; view.executor && thread != view.executor->scratches.size(); ++thread)
+            if (&view.executor->scratches[thread] != view.scratch)
+                util::arena_rewind(&view.executor->scratches[thread]);
+    }
+    return {};
+}
+
+/** The cells of one gathered field, staged in the call's scratch until the last flight is read:
+ *  the three bitmaps one stride apart, the scalars, and every text. */
+struct column_fragments_t {
+    std::span<ustore_octet_t> bitmaps;
+    std::span<ustore_byte_t> scalars;
+    std::span<std::string_view> texts;
+};
+
+/** Views @p value as JSON text in @p text: as its document spells it, or a string quoted and
+ *  escaped again into @p scratch, as its cell holds the body unescaped. */
+inline conversion_t json_text(json_cell_t const& value, ustore_arena_t scratch, std::string_view& text) noexcept {
+    if (value.token == json_token_t::missing_k) return conversion_t::missing_k;
+    if (value.token != json_token_t::string_k) {
+        text = value.bytes;
+        return conversion_t::exact_k;
+    }
+    auto const escape_of = [](char character) noexcept -> char {
+        switch (character) {
+        case '"': return '"';
+        case '\\': return '\\';
+        case '\b': return 'b';
+        case '\f': return 'f';
+        case '\n': return 'n';
+        case '\r': return 'r';
+        case '\t': return 't';
+        default: return static_cast<unsigned char>(character) < 0x20 ? 'u' : 0;
+        }
+    };
+    std::size_t length = 2;
+    for (char const character : value.bytes) {
+        char const escape = escape_of(character);
+        length += escape == 'u' ? 6 : escape ? 2 : 1;
+    }
+    auto [quoted, quoted_status] = util::arena_allocate<char>(scratch, length);
+    if (quoted_status.failed()) return conversion_t::collides_k;
+    char constexpr hex_digits_k[] = "0123456789abcdef";
+    std::size_t at = 0;
+    quoted[at++] = '"';
+    for (char const character : value.bytes) {
+        char const escape = escape_of(character);
+        if (!escape) {
+            quoted[at++] = character;
+            continue;
+        }
+        quoted[at++] = '\\';
+        quoted[at++] = escape;
+        if (escape != 'u') continue;
+        auto const code = static_cast<unsigned char>(character);
+        quoted[at++] = '0', quoted[at++] = '0', quoted[at++] = hex_digits_k[code >> 4],
+        quoted[at++] = hex_digits_k[code & 0xF];
+    }
+    quoted[at++] = '"';
+    text = std::string_view {quoted.data(), at};
+    return conversion_t::exact_k;
+}
+
+/** Converts @p value into row @p row of the @p scalars of a column of @p type, or views the
+ *  text of a string, binary or JSON column in @p text, which may point into @p print_buffer or
+ *  into @p scratch. */
+inline conversion_t gather_cell(ustore_docs_field_type_t type, json_cell_t const& value, ustore_byte_t* scalars,
+                                std::size_t row, printed_number_buffer_t& print_buffer, std::string_view& text,
+                                ustore_arena_t scratch) noexcept {
+    switch (type) {
+    case ustore_docs_field_type_json_k: return json_text(value, scratch, text);
+    case ustore_docs_field_type_bool_k: return gather_scalar<bool>(value, scalars, row);
+    case ustore_docs_field_type_uuid_k: return gather_uuid(value, scalars, row);
+    case ustore_docs_field_type_f64_k: return gather_scalar<double>(value, scalars, row);
+    case ustore_docs_field_type_f32_k: return gather_scalar<float>(value, scalars, row);
+    case ustore_docs_field_type_f16_k: return gather_half(value, scalars, row);
+    case ustore_docs_field_type_i64_k: return gather_scalar<std::int64_t>(value, scalars, row);
+    case ustore_docs_field_type_i32_k: return gather_scalar<std::int32_t>(value, scalars, row);
+    case ustore_docs_field_type_i16_k: return gather_scalar<std::int16_t>(value, scalars, row);
+    case ustore_docs_field_type_i8_k: return gather_scalar<std::int8_t>(value, scalars, row);
+    case ustore_docs_field_type_u64_k: return gather_scalar<std::uint64_t>(value, scalars, row);
+    case ustore_docs_field_type_u32_k: return gather_scalar<std::uint32_t>(value, scalars, row);
+    case ustore_docs_field_type_u16_k: return gather_scalar<std::uint16_t>(value, scalars, row);
+    case ustore_docs_field_type_u8_k: return gather_scalar<std::uint8_t>(value, scalars, row);
+    case ustore_docs_field_type_string_k:
+    case ustore_docs_field_type_binary_k: return json_to_string(value, print_buffer, text);
+    default: return conversion_t::collides_k;
+    }
+}
+
+/** Copies the staged cells of every field into the columns of @p arguments in their arena, each
+ *  staged row landing at the task @p tasks names for it: the bitmaps, the scalars, and the texts
+ *  once, a text column spanning a null after every text. */
+inline util::status_t fragments_into_columns(std::span<column_fragments_t const> fragments,
+                                             std::span<std::size_t const> tasks, ustore_docs_gather_t const& arguments,
+                                             ustore_arena_t scratch) noexcept {
+    std::size_t const docs_count = arguments.count;
+    auto [rows_of_tasks, rows_status] = util::arena_allocate<std::size_t>(scratch, docs_count);
+    if (rows_status.failed()) return rows_status;
+    for (std::size_t row = 0; row != docs_count; ++row) rows_of_tasks[tasks[row]] = row;
+    auto [columns, columns_status] = util::arena_allocate<ustore_docs_column_view_t>(arguments.arena, fragments.size());
+    if (columns_status.failed()) return columns_status;
+    for (std::size_t field_index = 0; field_index != fragments.size(); ++field_index) {
+        column_fragments_t const& staged = fragments[field_index];
+        std::size_t const bitmap_stride = staged.bitmaps.size() / 3;
+        std::size_t const scalar_bytes = staged.scalars.size() / docs_count;
+        auto [bitmaps, bitmaps_status] = util::arena_allocate<ustore_octet_t>(arguments.arena, staged.bitmaps.size());
+        if (bitmaps_status.failed()) return bitmaps_status;
+        std::memset(bitmaps.data(), 0, bitmaps.size());
+        auto [scalars, scalars_status] = util::arena_allocate<ustore_byte_t>(arguments.arena, staged.scalars.size());
+        if (scalars_status.failed()) return scalars_status;
+        for (std::size_t task = 0; task != docs_count; ++task) {
+            std::size_t const row = rows_of_tasks[task];
+            for (std::size_t bitmap = 0; bitmap != 3; ++bitmap)
+                bitmaps[bitmap * bitmap_stride + task / util::bits_in_byte_k] |= static_cast<ustore_octet_t>(
+                    ((staged.bitmaps[bitmap * bitmap_stride + row / util::bits_in_byte_k] >>
+                      (row % util::bits_in_byte_k)) &
+                     1u)
+                    << (task % util::bits_in_byte_k));
+            if (scalar_bytes)
+                std::memcpy(scalars.data() + task * scalar_bytes, staged.scalars.data() + row * scalar_bytes,
+                            scalar_bytes);
+        }
+        util::string_end_t const end = arguments.outputs_types[field_index] == ustore_docs_field_type_string_k
+                                           ? util::string_end_t::null_terminated_k
+                                           : util::string_end_t::bare_k;
+        std::size_t texts_bytes = 0;
+        for (std::string_view const text : staged.texts)
+            texts_bytes += text.size() + (end == util::string_end_t::null_terminated_k);
+        ustore_strings_view_t column_strings {};
+        auto const text_of = [&](std::size_t task) noexcept { return staged.texts[rows_of_tasks[task]]; };
+        if (!staged.texts.empty())
+            if (util::status_t const status = export_texts(arguments.arena, docs_count, texts_bytes, end, text_of,
+                                                           column_strings);
+                status.failed())
+                return status;
+        columns[field_index] = {
+            .validities = bitmaps.data(),
+            .conversions = bitmaps.data() + bitmap_stride,
+            .collisions = bitmaps.data() + 2 * bitmap_stride,
+            .scalars = scalars.data(),
+            .strings = column_strings,
+        };
+    }
+    *arguments.columns = columns.data();
+    return {};
+}
+
+/**
+ *  @brief Implements @c ustore_docs_gather over @p source, extracting the fields of each flight of
+ *      documents as it lands.
+ *
+ *  One flight of documents is staged at a time, and every slice extracts the cells of its share of
+ *  the flight into the fragments of each field, staged in the call's scratch, so only the cells
+ *  outlive their documents and reach the arena once the last flight is read.
+ */
 template <util::strings_kit_concept strings_kit_type_, typename documents_type_>
 util::status_t gather_documents(documents_type_ const& source, ustore_docs_gather_t const& arguments,
                                 strings_arg_t const& fields, view_t const& view) noexcept {
@@ -603,143 +788,440 @@ util::status_t gather_documents(documents_type_ const& source, ustore_docs_gathe
     std::size_t const docs_count = arguments.count;
     util::place_batch_t const places = util::places_of(arguments);
     if (util::status_t const status = validate_read(places); status.failed()) return status;
-    auto [documents, documents_status] = source.read(places, view);
-    if (documents_status.failed()) return documents_status;
+    // Flights cut from the places sorted once read neighbours, and rows stage in that order
+    auto [sorted, sorted_status] = sort_places(places, view.scratch);
+    if (sorted_status.failed()) return sorted_status;
 
-    // One subdocuments pass extracts every cell, field after field
     auto [field_names, names_status] = util::arena_allocate<std::string_view>(view.scratch, fields_count);
     if (names_status.failed()) return names_status;
     for (std::size_t field_index = 0; field_index != fields_count; ++field_index)
         field_names[field_index] = util::chars_of(fields[field_index]);
-    auto const cell_of = [docs_count](std::size_t cell) noexcept {
-        return field_cell_t {cell % docs_count, cell / docs_count};
-    };
-    json_cells_t values;
-    if (util::status_t const extracted = extract_fields<strings_kit_type_>(
-            documents, field_names, docs_count * fields_count, cell_of, arguments.database->ceiling.strings,
-            view.scratch, values);
-        extracted.failed())
-        return extracted;
-
-    auto [columns, columns_status] = util::arena_allocate<ustore_docs_column_view_t>(arguments.arena, fields_count);
-    if (columns_status.failed()) return columns_status;
     // The three bitmaps of a column share one allocation, each starting aligned as every output does
     std::size_t const bitmap_stride = util::round_up_to_multiple(
         util::divide_round_up(docs_count, util::bits_in_byte_k), util::arena_alignment_k);
-    auto [texts_bytes_of_slices, slots_status] = util::arena_allocate<std::size_t>(view.scratch,
-                                                                                   util::slice_slots(view));
-    if (slots_status.failed()) return slots_status;
-    printed_number_buffer_t print_buffer;
+    auto [fragments, fragments_status] = util::arena_allocate<column_fragments_t>(view.scratch, fields_count);
+    if (fragments_status.failed()) return fragments_status;
     for (std::size_t field_index = 0; field_index != fields_count; ++field_index) {
         ustore_docs_field_type_t const type = arguments.outputs_types[field_index];
-        bool const holds_strings = type == ustore_docs_field_type_string_k || type == ustore_docs_field_type_binary_k;
-        auto [bitmaps, bitmaps_status] = util::arena_allocate<ustore_octet_t>(arguments.arena, 3 * bitmap_stride);
+        bool const holds_strings = !field_size_bytes(type);
+        auto [bitmaps, bitmaps_status] = util::arena_allocate<ustore_octet_t>(view.scratch, 3 * bitmap_stride);
         if (bitmaps_status.failed()) return bitmaps_status;
         std::memset(bitmaps.data(), 0, bitmaps.size());
-        auto [scalars, scalars_status] = util::arena_allocate<ustore_byte_t>(arguments.arena,
+        auto [scalars, scalars_status] = util::arena_allocate<ustore_byte_t>(view.scratch,
                                                                              docs_count * field_size_bytes(type));
         if (scalars_status.failed()) return scalars_status;
-        // A text column spans a null after every text, and a binary one does not
-        util::string_end_t const end = type == ustore_docs_field_type_string_k ? util::string_end_t::null_terminated_k
-                                                                               : util::string_end_t::bare_k;
-        auto convert_slice = [&](std::size_t first, std::size_t length, view_t const& slice) noexcept -> status_t {
-            printed_number_buffer_t print_buffer;
-            std::size_t& slice_texts_bytes = texts_bytes_of_slices[slice.thread_index];
-            for (std::size_t document_index = first; document_index != first + length; ++document_index) {
-                json_cell_t const value = values[field_index * docs_count + document_index];
-                ustore_byte_t* const scalar_column = scalars.data();
-                conversion_t conversion = conversion_t::collides_k;
-
-                switch (type) {
-                case ustore_docs_field_type_bool_k:
-                    conversion = gather_scalar<bool>(value, scalar_column, document_index);
-                    break;
-                case ustore_docs_field_type_uuid_k:
-                    conversion = gather_uuid(value, scalar_column, document_index);
-                    break;
-                case ustore_docs_field_type_f64_k:
-                    conversion = gather_scalar<double>(value, scalar_column, document_index);
-                    break;
-                case ustore_docs_field_type_f32_k:
-                    conversion = gather_scalar<float>(value, scalar_column, document_index);
-                    break;
-                case ustore_docs_field_type_f16_k:
-                    conversion = gather_half(value, scalar_column, document_index);
-                    break;
-                case ustore_docs_field_type_i64_k:
-                    conversion = gather_scalar<std::int64_t>(value, scalar_column, document_index);
-                    break;
-                case ustore_docs_field_type_i32_k:
-                    conversion = gather_scalar<std::int32_t>(value, scalar_column, document_index);
-                    break;
-                case ustore_docs_field_type_i16_k:
-                    conversion = gather_scalar<std::int16_t>(value, scalar_column, document_index);
-                    break;
-                case ustore_docs_field_type_i8_k:
-                    conversion = gather_scalar<std::int8_t>(value, scalar_column, document_index);
-                    break;
-                case ustore_docs_field_type_u64_k:
-                    conversion = gather_scalar<std::uint64_t>(value, scalar_column, document_index);
-                    break;
-                case ustore_docs_field_type_u32_k:
-                    conversion = gather_scalar<std::uint32_t>(value, scalar_column, document_index);
-                    break;
-                case ustore_docs_field_type_u16_k:
-                    conversion = gather_scalar<std::uint16_t>(value, scalar_column, document_index);
-                    break;
-                case ustore_docs_field_type_u8_k:
-                    conversion = gather_scalar<std::uint8_t>(value, scalar_column, document_index);
-                    break;
-                case ustore_docs_field_type_string_k:
-                case ustore_docs_field_type_binary_k: {
-                    std::string_view text;
-                    conversion = json_to_string(value, print_buffer, text);
-                    slice_texts_bytes += text.size() + (end == util::string_end_t::null_terminated_k);
-                    break;
-                }
-                default: break;
-                }
-
-                std::size_t const slot = document_index / util::bits_in_byte_k;
-                ustore_octet_t const mask = static_cast<ustore_octet_t>(1u << (document_index % util::bits_in_byte_k));
-                record_conversion(conversion, mask, bitmaps[slot], bitmaps[bitmap_stride + slot],
-                                  bitmaps[2 * bitmap_stride + slot]);
-            }
-            return {};
-        };
-        for (std::size_t& slice_bytes : texts_bytes_of_slices) slice_bytes = 0;
-        if (util::status_t const converted = util::for_task_slices(view, docs_count, convert_slice); converted.failed())
-            return converted;
-        std::size_t texts_bytes = 0;
-        for (std::size_t const slice_bytes : texts_bytes_of_slices) texts_bytes += slice_bytes;
-
-        // The texts are sized first, so a second conversion copies each straight into the arena
-        ustore_strings_view_t column_strings {};
-        auto const text_of = [&](std::size_t document_index) noexcept {
-            std::string_view text;
-            [[maybe_unused]] conversion_t const converted = json_to_string(
-                values[field_index * docs_count + document_index], print_buffer, text);
-            return text;
-        };
-        if (holds_strings)
-            if (util::status_t const status = export_texts(arguments.arena, docs_count, texts_bytes, end, text_of,
-                                                           column_strings);
-                status.failed())
-                return status;
-        columns[field_index] = {
-            .validities = bitmaps.data(),
-            .conversions = bitmaps.data() + bitmap_stride,
-            .collisions = bitmaps.data() + 2 * bitmap_stride,
-            .scalars = scalars.data(),
-            .strings = column_strings,
-        };
+        auto [texts, texts_status] = util::arena_allocate<std::string_view>(view.scratch,
+                                                                            holds_strings ? docs_count : 0);
+        if (texts_status.failed()) return texts_status;
+        fragments[field_index] = {bitmaps, scalars, texts};
     }
 
-    *arguments.columns = columns.data();
-    return {};
+    // A slice copies its texts out of the documents into its scratch, which each flight rewinds
+    auto extract_slice = [&](json_documents_t const& documents, std::size_t flight_begin, std::size_t first,
+                             std::size_t length, view_t const& slice) noexcept -> status_t {
+        auto const cell_of = [first, length](std::size_t cell) noexcept {
+            return field_cell_t {first + cell % length, cell / length};
+        };
+        json_cells_t values;
+        if (util::status_t const extracted = extract_fields<strings_kit_type_>(
+                documents, field_names, length * fields_count, cell_of, arguments.database->ceiling.strings,
+                slice.scratch, values);
+            extracted.failed())
+            return extracted;
+        printed_number_buffer_t print_buffer;
+        for (std::size_t field_index = 0; field_index != fields_count; ++field_index) {
+            column_fragments_t const& staged = fragments[field_index];
+            for (std::size_t offset = 0; offset != length; ++offset) {
+                std::size_t const row = flight_begin + first + offset;
+                std::string_view text;
+                conversion_t const conversion = gather_cell(
+                    arguments.outputs_types[field_index], values[field_index * length + offset], staged.scalars.data(),
+                    row, print_buffer, text, slice.scratch);
+                std::size_t const slot = row / util::bits_in_byte_k;
+                ustore_octet_t const mask = static_cast<ustore_octet_t>(1u << (row % util::bits_in_byte_k));
+                record_conversion(conversion, mask, staged.bitmaps[slot], staged.bitmaps[bitmap_stride + slot],
+                                  staged.bitmaps[2 * bitmap_stride + slot]);
+                if (staged.texts.empty()) continue;
+                auto [copied, copied_status] = util::arena_copy<char>(slice.scratch, std::span<char const> {text});
+                if (copied_status.failed()) return copied_status;
+                staged.texts[row] = std::string_view {copied.begin(), copied.end()};
+            }
+        }
+        return {};
+    };
+    // The flight's texts move into the call's scratch before the slices' scratches rewind
+    auto keep_texts = [&](std::size_t flight_begin, std::size_t flight_count) noexcept -> status_t {
+        for (column_fragments_t const& staged : fragments) {
+            std::span<std::string_view> const texts = staged.texts.empty()
+                                                          ? staged.texts
+                                                          : staged.texts.subspan(flight_begin, flight_count);
+            std::size_t bytes = 0;
+            for (std::string_view const text : texts) bytes += text.size();
+            auto [kept, kept_status] = util::arena_allocate<char>(view.scratch, bytes);
+            if (kept_status.failed()) return kept_status;
+            for (std::size_t index = 0, at = 0; index != texts.size(); at += texts[index].size(), ++index) {
+                if (!texts[index].empty()) std::memcpy(kept.data() + at, texts[index].data(), texts[index].size());
+                texts[index] = {kept.data() + at, texts[index].size()};
+            }
+        }
+        return {};
+    };
+    auto visit_flight = [&](json_documents_t const& documents, std::size_t flight_begin) noexcept -> status_t {
+        auto flight_slice = [&](std::size_t first, std::size_t length, std::size_t, view_t const& slice) noexcept {
+            return extract_slice(documents, flight_begin, first, length, slice);
+        };
+        if (util::status_t const extracted = util::for_task_slices(view, documents.count, flight_slice);
+            extracted.failed())
+            return extracted;
+        return keep_texts(flight_begin, documents.count);
+    };
+    if (util::status_t const read = read_in_flights(source, sorted.places, view, visit_flight); read.failed())
+        return read;
+    return fragments_into_columns(std::span<column_fragments_t const> {fragments},
+                                  std::span<std::size_t const> {sorted.tasks}, arguments, view.scratch);
 }
 
 #pragma endregion Document Calls
+
+#pragma region Cursor Batches
+
+/** One task's batch of a docs cursor's pull, carved at the bounds of its task before the tasks
+ *  run. */
+struct docs_batch_t {
+    std::span<ustore_key_t> keys;
+    ustore_docs_column_view_t* columns = nullptr;
+    std::size_t rows = 0;
+};
+
+/** The room one column of one batch was carved with, writable where its view only reads, and the
+ *  text bytes it holds of how many it may. */
+struct docs_column_room_t {
+    ustore_octet_t* bitmaps = nullptr;
+    std::size_t bitmap_stride = 0;
+    ustore_byte_t* scalars = nullptr;
+    util::byte_t* texts = nullptr;
+    std::uint32_t* narrow_offsets = nullptr;
+    std::uint64_t* wide_offsets = nullptr;
+    std::size_t used = 0;
+    std::size_t capacity = 0;
+};
+
+/**
+ *  @brief The batches one pull of a docs cursor fills, one per task, with a row per key the match
+ *      keeps and a cell of every column the cursor gathers.
+ *
+ *  The calling thread carves every batch from the pull's arena at its task's bounds, once, before
+ *  the tasks run; then each task narrows and appends its rounds of keys to its own batch alone, so
+ *  no thread grows the arena.
+ */
+struct docs_batches_t {
+
+    /** The columns every row gathers. */
+    docs_columns_t columns;
+
+    /** The host match the rounds ask, or null for one a device pull asked already. */
+    compiled_match<vendored_residency_t::host_k> const* match = nullptr;
+
+    /** The arena holding every output of the pull. */
+    ustore_arena_t arena = nullptr;
+
+    /** The StringZilla capabilities the fields are extracted with. */
+    sz_capability_t strings {};
+
+    /** Where the walk after this pull starts, which the engine sets. */
+    std::variant<ustore_key_t, exhausted_t> resume;
+
+    /** The batches, one per task. */
+    std::span<docs_batch_t> batches;
+
+    /** The room of every column of every batch, batch after batch. */
+    std::span<docs_column_room_t> rooms;
+
+    /** The views the pull hands out, in the arena. */
+    std::span<ustore_docs_batch_view_t> views;
+
+    /** Whether the match reads values, so its engine serves one task at a time. */
+    bool reads_values() const noexcept { return match && match->reads_values(); }
+
+    /** Rows batch @p task may still take below @p limit, its share of the pull. */
+    std::size_t room(std::size_t task, std::size_t limit) const noexcept { return limit - batches[task].rows; }
+
+    /** Whether field @p field is the whole document, copied as it is. */
+    bool whole(std::size_t field) const noexcept {
+        return columns.fields[field].empty() && columns.types[field] == ustore_docs_field_type_json_k;
+    }
+
+    /**
+     *  @brief Carves one batch per entry of @p max_rows from the arena, each room for that
+     *      many rows and for the texts of documents of @p max_bytes bytes in all, its
+     *      bookkeeping in @p scratch.
+     *
+     *  A whole document's text is its bytes, and a field's at most its document's or
+     *  a printed number.
+     */
+    util::status_t carve(std::span<std::uint64_t const> max_rows, std::span<std::uint64_t const> max_bytes,
+                         ustore_arena_t scratch) noexcept {
+        std::size_t const count = max_rows.size();
+        std::size_t const fields = columns.fields.size();
+        auto [carved, carved_status] = util::arena_allocate<docs_batch_t>(scratch, count);
+        if (carved_status.failed()) return carved_status;
+        auto [carved_rooms, rooms_status] = util::arena_allocate<docs_column_room_t>(scratch, count * fields);
+        if (rooms_status.failed()) return rooms_status;
+        auto [carved_views, views_status] = util::arena_allocate<ustore_docs_batch_view_t>(arena, count);
+        if (views_status.failed()) return views_status;
+        batches = carved, rooms = carved_rooms, views = carved_views;
+        for (std::size_t task = 0; task != count; ++task) {
+            std::size_t const rows = static_cast<std::size_t>(max_rows[task]);
+            docs_batch_t& batch = batches[task];
+            batch = {};
+            if (!rows) continue;
+            auto [keys, keys_status] = util::arena_allocate<ustore_key_t>(arena, rows);
+            if (keys_status.failed()) return keys_status;
+            auto [views_of_columns, columns_status] = util::arena_allocate<ustore_docs_column_view_t>(arena, fields);
+            if (columns_status.failed()) return columns_status;
+            batch.keys = keys, batch.columns = views_of_columns.data();
+            std::size_t const bitmap_stride = util::round_up_to_multiple(
+                util::divide_round_up(rows, util::bits_in_byte_k), util::arena_alignment_k);
+            for (std::size_t field = 0; field != fields; ++field) {
+                ustore_docs_field_type_t const type = columns.types[field];
+                auto [bitmaps, bitmaps_status] = util::arena_allocate<ustore_octet_t>(arena, 3 * bitmap_stride);
+                if (bitmaps_status.failed()) return bitmaps_status;
+                std::memset(bitmaps.data(), 0, bitmaps.size());
+                auto [scalars, scalars_status] = util::arena_allocate<ustore_byte_t>(arena,
+                                                                                     rows * field_size_bytes(type));
+                if (scalars_status.failed()) return scalars_status;
+                ustore_docs_column_view_t& column = batch.columns[field];
+                column = {.validities = bitmaps.data(),
+                          .conversions = bitmaps.data() + bitmap_stride,
+                          .collisions = bitmaps.data() + 2 * bitmap_stride,
+                          .scalars = scalars.data(),
+                          .strings = {}};
+                docs_column_room_t& room = rooms[task * fields + field];
+                room = {.bitmaps = bitmaps.data(), .bitmap_stride = bitmap_stride, .scalars = scalars.data()};
+                if (field_size_bytes(type)) continue;
+                std::size_t const capacity = static_cast<std::size_t>(max_bytes[task]) +
+                                             (whole(field) ? 0 : rows * (printed_number_length_limit_k + 1));
+                if (util::status_t const status = carve_texts_(rows, capacity, room, column); status.failed())
+                    return status;
+            }
+        }
+        return {};
+    }
+
+    /** Carves the texts of one column of @p rows rows into @p room, @p capacity bytes and their
+     *  offsets, as narrow as the bytes allow, which @p column views. */
+    util::status_t carve_texts_(std::size_t rows, std::size_t capacity, docs_column_room_t& room,
+                                ustore_docs_column_view_t& column) noexcept {
+        auto [bytes, bytes_status] = util::arena_allocate<util::byte_t>(arena, capacity);
+        if (bytes_status.failed()) return bytes_status;
+        room.texts = bytes.data(), room.capacity = capacity;
+        if (capacity > (std::numeric_limits<std::uint32_t>::max)()) {
+            auto [offsets, offsets_status] = util::arena_allocate<std::uint64_t>(arena, rows + 1);
+            if (offsets_status.failed()) return offsets_status;
+            offsets[0] = 0;
+            room.wide_offsets = offsets.data();
+            column.strings = util::u64_tape(bytes.data(), offsets.data());
+            return {};
+        }
+        auto [offsets, offsets_status] = util::arena_allocate<std::uint32_t>(arena, rows + 1);
+        if (offsets_status.failed()) return offsets_status;
+        offsets[0] = 0;
+        room.narrow_offsets = offsets.data();
+        column.strings = util::u32_tape(bytes.data(), offsets.data());
+        return {};
+    }
+
+    /**
+     *  @brief Keeps among one round's @p keys those the match admits: the cheap predicate first,
+     *      then a filter over the documents read through @p read, then the expensive predicate.
+     *  @param[in] read Called as <tt>read(picked, documents)</tt> when the match or a column reads
+     *      the documents, reading those of the keys at the indices @p picked into a tape in
+     *      @p scratch, in that order.
+     *  @param[out] kept The indices of the kept keys, in their order.
+     *  @param[out] document_of The index into @p documents of the document of every key read.
+     */
+    template <typename read_type_>
+    util::status_t narrow(std::span<ustore_key_t const> keys, read_type_&& read, ustore_arena_t scratch,
+                          candidates_t& kept, json_documents_t& documents,
+                          std::span<std::uint32_t>& document_of) const noexcept {
+        auto [indices, indices_status] = util::arena_allocate<std::uint32_t>(scratch, keys.size());
+        if (indices_status.failed()) return indices_status;
+        for (std::size_t index = 0; index != keys.size(); ++index) indices[index] = static_cast<std::uint32_t>(index);
+        kept = {indices, {}, keys.size()};
+        documents = {};
+        if (match)
+            if (util::status_t const asked = match->ask(ustore_predicate_cost_cheap_k, keys, kept, scratch);
+                asked.failed())
+                return asked;
+        if (kept.count && (!columns.fields.empty() || reads_values())) {
+            auto [of, of_status] = util::arena_allocate<std::uint32_t>(scratch, keys.size());
+            if (of_status.failed()) return of_status;
+            document_of = of;
+            for (std::size_t index = 0; index != kept.count; ++index)
+                document_of[kept.indices[index]] = static_cast<std::uint32_t>(index);
+            if (util::status_t const status = read(std::span<std::uint32_t const> {indices.data(), kept.count},
+                                                   documents);
+                status.failed())
+                return status;
+            if (reads_values())
+                if (util::status_t const selected = match->select(strings_arg_t {documents.tape}, kept, scratch);
+                    selected.failed())
+                    return selected;
+        }
+        if (match)
+            if (util::status_t const asked = match->ask(ustore_predicate_cost_expensive_k, keys, kept, scratch);
+                asked.failed())
+                return asked;
+        return {};
+    }
+
+    /** Appends to batch @p task a row per key of @p keys that @p kept names, with the cells of
+     *  every column, extracted from @p documents in one pass in @p scratch, where @p document_of
+     *  finds each key's document. */
+    template <util::strings_kit_concept strings_kit_type_>
+    util::status_t append(std::size_t task, std::span<ustore_key_t const> keys, candidates_t const& kept,
+                          json_documents_t const& documents, std::span<std::uint32_t const> document_of,
+                          ustore_arena_t scratch) noexcept {
+        docs_batch_t& batch = batches[task];
+        std::size_t const count = kept.count;
+        if (!count) return {};
+        if (batch.rows + count > batch.keys.size())
+            return {util::status_code_t::internal_k, "A task kept more rows than its runs"};
+        std::size_t const first_row = batch.rows;
+        for (std::size_t index = 0; index != count; ++index) batch.keys[first_row + index] = keys[kept.indices[index]];
+
+        // Every field but the whole documents comes out of one extraction pass
+        std::size_t const fields = columns.fields.size();
+        std::size_t extracted_count = 0;
+        for (std::size_t field = 0; field != fields; ++field) extracted_count += !whole(field);
+        auto [extracted, extracted_status] = util::arena_allocate<std::string_view>(scratch, extracted_count);
+        if (extracted_status.failed()) return extracted_status;
+        for (std::size_t field = 0, at = 0; field != fields; ++field)
+            if (!whole(field)) extracted[at++] = columns.fields[field];
+        auto const document_of_row = [&](std::size_t row) noexcept { return document_of[kept.indices[row]]; };
+        json_cells_t values;
+        if (extracted_count) {
+            auto const cell_of = [&](std::size_t cell) noexcept {
+                return field_cell_t {document_of_row(cell % count), cell / count};
+            };
+            if (util::status_t const status = extract_fields<strings_kit_type_>(
+                    documents, std::span<std::string_view const> {extracted}, count * extracted_count, cell_of, strings,
+                    scratch, values);
+                status.failed())
+                return status;
+        }
+
+        printed_number_buffer_t print_buffer;
+        for (std::size_t field = 0, extracted_index = 0; field != fields; ++field) {
+            ustore_docs_field_type_t const type = columns.types[field];
+            docs_column_room_t& room = rooms[task * fields + field];
+            std::size_t const width = field_size_bytes(type);
+            if (width) std::memset(room.scalars + first_row * width, 0, count * width);
+            std::size_t const terminator = type == ustore_docs_field_type_string_k;
+            for (std::size_t index = 0; index != count; ++index) {
+                std::size_t const row = first_row + index;
+                std::string_view text;
+                if (whole(field)) text = documents[document_of_row(index)];
+                conversion_t const conversion = whole(field)
+                                                    ? (text.empty() ? conversion_t::missing_k : conversion_t::exact_k)
+                                                    : gather_cell(type, values[extracted_index * count + index],
+                                                                  room.scalars, row, print_buffer, text, scratch);
+                std::size_t const slot = row / util::bits_in_byte_k;
+                ustore_octet_t const mask = static_cast<ustore_octet_t>(1u << (row % util::bits_in_byte_k));
+                std::size_t const stride = room.bitmap_stride;
+                record_conversion(conversion, mask, room.bitmaps[slot], room.bitmaps[stride + slot],
+                                  room.bitmaps[2 * stride + slot]);
+                if (width) continue;
+                if (!is_valid(conversion)) text = {};
+                if (room.used + text.size() + terminator > room.capacity)
+                    return {util::status_code_t::capacity_exhausted_k, "A folded document outgrew its runs"};
+                if (!text.empty()) std::memcpy(room.texts + room.used, text.data(), text.size());
+                room.used += text.size();
+                if (terminator) room.texts[room.used++] = util::byte_t {0};
+                if (room.wide_offsets) room.wide_offsets[row + 1] = room.used;
+                else room.narrow_offsets[row + 1] = static_cast<std::uint32_t>(room.used);
+            }
+            extracted_index += !whole(field);
+        }
+        batch.rows += count;
+        return {};
+    }
+
+    /** Rows every batch holds together. */
+    std::size_t rows() const noexcept {
+        std::size_t total = 0;
+        for (docs_batch_t const& batch : batches) total += batch.rows;
+        return total;
+    }
+
+    /** Hands the batches holding rows out through @p output and @p count, in task order. */
+    void finish(ustore_docs_batch_view_t const** output, ustore_size_t* count) const noexcept {
+        std::size_t written = 0;
+        for (docs_batch_t const& batch : batches)
+            if (batch.rows) views[written++] = {batch.rows, batch.keys.data(), batch.columns};
+        *output = written ? views.data() : nullptr;
+        *count = written;
+    }
+
+    /** Fills one batch on the calling thread from the @p listed keys, narrowing them and reading
+     *  the documents of those left through @p read, as @c narrow reads. */
+    template <util::strings_kit_concept strings_kit_type_, typename read_type_>
+    util::status_t fill_one(std::span<ustore_key_t const> listed, read_type_&& read, ustore_arena_t scratch) noexcept {
+        candidates_t kept;
+        json_documents_t documents;
+        std::span<std::uint32_t> document_of;
+        if (util::status_t const status = narrow(listed, read, scratch, kept, documents, document_of); status.failed())
+            return status;
+        std::uint64_t bytes = 0;
+        for (std::size_t index = 0; documents.count && index != kept.count; ++index)
+            bytes += documents[document_of[kept.indices[index]]].size();
+        std::uint64_t const rows = kept.count;
+        if (util::status_t const status = carve({&rows, 1}, {&bytes, 1}, scratch); status.failed()) return status;
+        return append<strings_kit_type_>(0, listed, kept, documents, document_of, scratch);
+    }
+};
+
+/** Fills @p batches, where it is not null, with the one batch of the one task of a cursor's pull @p
+ *  arguments on the calling thread, listing its keys through @p scan and reading the whole
+ *  documents of those the match lets through @p read, the verbs of one engine called as
+ *  <tt>scan(listing, view)</tt> and <tt>read(reading, view)</tt>. */
+template <util::strings_kit_concept strings_kit_type_, typename scan_type_, typename read_type_>
+util::status_t fill_one_batch(ustore_docs_scan_t const& arguments, docs_batches_t& batches, scan_type_&& scan,
+                              read_type_&& read, view_t const& view) noexcept {
+    ustore_length_t const* offsets = nullptr;
+    ustore_key_t const* keys = nullptr;
+    ustore_docs_scan_t listing = arguments;
+    listing.offsets = &offsets, listing.keys = &keys, listing.arena = view.scratch;
+    if (util::status_t const status = scan(listing, view); status.failed()) return status;
+    std::span<ustore_key_t const> const listed {keys, offsets ? static_cast<std::size_t>(offsets[1]) : 0};
+    util::strided_iterator<ustore_collection_id_t const> const collections = util::strided(arguments.collections);
+    auto read_documents = [&](std::span<std::uint32_t const> picked, json_documents_t& documents) noexcept {
+        auto [picked_keys, picked_status] = util::arena_allocate<ustore_key_t>(view.scratch, picked.size());
+        if (picked_status.failed()) return picked_status;
+        for (std::size_t index = 0; index != picked.size(); ++index) picked_keys[index] = listed[picked[index]];
+        documents = {};
+        documents.count = picked.size();
+        ustore_docs_read_t const reading {.database = arguments.database,
+                                          .count = picked.size(),
+                                          .collections = {&collections[0], 0},
+                                          .keys = {picked_keys.data(), sizeof(ustore_key_t)},
+                                          .presences = &documents.presences,
+                                          .values = &documents.tape,
+                                          .arena = view.scratch};
+        return read(reading, view);
+    };
+    if (util::status_t const status = batches.fill_one<strings_kit_type_>(listed, read_documents, view.scratch);
+        status.failed())
+        return status;
+    // A listing short of what it wanted reached the range's end, as did one ending at the last key
+    bool const descending = arguments.direction == ustore_scan_descending_k;
+    ustore_key_t const& edge = descending ? util::smallest_key_k : util::largest_key_k;
+    if (listed.size() < arguments.wanted || listed.empty() || listed.back() == edge) batches.resume = exhausted_t {};
+    else batches.resume = descending ? util::key_before(listed.back()) : util::key_after(listed.back());
+    return {};
+}
+
+#pragma endregion Cursor Batches
 
 #pragma region Documents over Blobs
 
@@ -831,6 +1313,25 @@ util::status_t docs_gather_over_blobs(ustore_docs_gather_t const& arguments, str
     if (resolved.failed()) return resolved;
     return gather_documents<strings_kit_type_>(documents_in_values_t {values_verbs_, arguments.database}, arguments,
                                                fields, view);
+}
+
+/** The docs scan of an engine keeping every document as one whole value, which lists keys alone, or
+ *  fills the one batch of a cursor's pull serially when @p batches is not null. */
+template <util::strings_kit_concept strings_kit_type_, blobs_verbs<vendored_residency_t::host_k> const& values_verbs_,
+          auto resolve_>
+util::status_t docs_scan_over_blobs(ustore_docs_scan_t const& arguments, docs_batches_t* batches,
+                                    view_t const& view) noexcept {
+    if (!batches) return scan_over_blobs<values_verbs_, resolve_, ustore_modality_docs_k>(arguments, view);
+    return fill_one_batch<strings_kit_type_>(
+        arguments, *batches,
+        [](ustore_docs_scan_t const& listing, view_t const& listing_view) noexcept {
+            return scan_over_blobs<values_verbs_, resolve_, ustore_modality_docs_k>(listing, listing_view);
+        },
+        [](ustore_docs_read_t const& reading, view_t const& reading_view) noexcept {
+            return docs_read_over_blobs<strings_kit_type_, values_verbs_, resolve_>(reading, strings_arg_t {},
+                                                                                    reading_view);
+        },
+        view);
 }
 
 #pragma endregion Documents over Blobs

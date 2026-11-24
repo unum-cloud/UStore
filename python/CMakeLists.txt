@@ -32,8 +32,8 @@ set_target_properties(
 
 target_include_directories(ustore_python PRIVATE ${PROJECT_SOURCE_DIR}/c ${CMAKE_CURRENT_SOURCE_DIR})
 
-# The one library carries every engine the build enables, with the `USTORE_WITH_*` switches `engines_compiled` reads,
-# and documents convert to and from Python objects through the yyjson it already carries.
+# The one library holds every engine the build enables, with the `USTORE_WITH_*` switches `engines_compiled` reads,
+# and documents convert to and from Python objects through the yyjson it already holds.
 target_link_libraries(ustore_python PRIVATE ustore::static yyjson::yyjson ustore_warnings)
 # The module's one export is its init function; the archives linked inside, UStore's own and its siblings', fmt and
 # yyjson among them, keep their symbols to themselves.

@@ -6,7 +6,7 @@ Date: September 18, 2026
 """
 
 import pytest
-from base import BATCH_SIZES, NEEDS_TRANSACTIONS, keys
+from base import BATCH_SIZES, NEEDS_TRANSACTIONS, executor_for, keys
 
 import ustore
 
@@ -226,9 +226,9 @@ def test_closing_a_transaction_twice_is_safe(database):
 # region Deferred Calls
 
 
-def test_deferred_calls_stage_and_commit(database, blobs):
+def test_deferred_calls_stage_and_commit(database, blobs, engine: str):
     """Deferred writes, reads and the commit of a transaction each answer once waited."""
-    with ustore.Executor.for_ram(2) as executor:
+    with executor_for(engine, 2) as executor:
         staged = database.transaction()
         try:
             later = staged.deferred(executor)
@@ -240,9 +240,9 @@ def test_deferred_calls_stage_and_commit(database, blobs):
     assert database.get(2, collection=blobs) == b"bb"
 
 
-def test_a_transaction_serves_one_call_at_a_time(database, blobs):
+def test_a_transaction_serves_one_call_at_a_time(database, blobs, engine: str):
     """A call on a transaction while a deferred one holds it raises ContendedError, while closing it waits."""
-    with ustore.Executor.for_ram(1) as executor:
+    with executor_for(engine, 1) as executor:
         staged = database.transaction()
         writing = staged.deferred(executor).write(list(range(4096)), b"v" * 1024, collection=blobs)
         with pytest.raises(ustore.ContendedError):

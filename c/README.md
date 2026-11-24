@@ -338,7 +338,7 @@ Roles matter only in directed graphs, and roles with `NULL` data stand for `usto
 
 The receiver of a call is what its argument struct puts before its inputs: the view it reads, the executor it runs on, and its `completion`.
 A call blocks by default and returns with its outcome final, while `ustore_completion_deferred_k` returns once the call is submitted, with the same struct.
-Submission copies the argument struct, so the caller may reuse it at once, while everything it points to, the outcome, inputs, outputs and arena, stays borrowed until the call is final.
+Submission copies the argument struct, so the caller may reuse it at once, while everything it points to, the outcome, inputs, outputs and arena, stays owned by the caller until the call is final.
 A deferred call's status reads `ustore_status_deferred_k` until it finishes; the library then stores the message and final status with release ordering and touches nothing the struct points to after that.
 The caller reads the status with acquire ordering, polling through `ustore_outcome_status` or waiting through `ustore_outcome_wait`, and never loads the field itself.
 A call ends in one order: it releases its arena, cursor, transaction and its counts on the handles it names, then the executor, and stores its status last, so a caller seeing it final may submit again or free at once.
@@ -364,9 +364,8 @@ An executor owns the threads that run calls and the scratch they use, and a `NUL
 It serves one call at a time, and nothing queues: a call on an executor serving another, from any thread, finishes at once with `ustore_status_contended_k`, as does a call whose arena, transaction or cursor serves another call.
 A blocking call on an executor runs on the calling thread, a deferred one is delegated to the executor's first thread, which serves it in the caller's place, and every fork splits the call's batch over the other threads.
 
-- `ustore_executor_for_ram` spawns caller-exclusive threads near the NUMA nodes its `ram` options name, every node the process may allocate on for `NULL`, where zero threads take 7/8 of the cores those nodes carry.
-- `ustore_executor_on_pool` borrows a ForkUnion pool another library owns, which must outlive the executor, and refuses a dispatch over its lender's with `ustore_status_contended_k`.
-- `ustore_executor_for_nvme` spawns the threads of the NVMe engine, and its `nvme` options tell every database opened on it how to move bytes.
+- `ustore_executor_for_ram` spawns caller-exclusive threads near the NUMA nodes its `ram` options name, every node the process may allocate on for `NULL`, where zero threads take 7/8 of the cores those nodes hold.
+- `ustore_executor_for_nvme` spawns the threads of the NVMe engine near its `ram` domains or the drives its `nvme` paths name, and its `nvme` options tell every database opened on it how to move bytes; an NVMe database refuses a RAM executor with `ustore_status_device_k`.
 - `ustore_executor_for_vram` queues every call on one stream of a CUDA device, and serves the reads and scans an engine computes there, refusing changes with `ustore_status_unsupported_k`.
 
 ```c
@@ -385,7 +384,7 @@ ustore_executor_free(executor);
 
 ### Inclusive and Exclusive Executors
 
-A pool is caller-inclusive when the thread that spawned or lent it counts as one of its threads, and caller-exclusive when it only dispatches and waits.
+A pool is caller-inclusive when the thread that spawned it counts as one of its threads, and caller-exclusive when it only dispatches and waits.
 An inclusive pool needs its caller to run anything, so a deferred call on it runs at submission and is final when it returns.
 An exclusive pool, which every executor UStore spawns is, delegates a deferred call to its own first thread.
 So one manager thread in `int main()` can overlap a USearch RAM executor, a UStore NVMe executor and a UForm VRAM executor, giving each one deferred call and polling the three statuses, with no thread of its own per engine.
@@ -394,9 +393,9 @@ So one manager thread in `int main()` can overlap a USearch RAM executor, a USto
 
 Every call is a batch of `count` tasks, and each input takes one of three shapes:
 
-- __One run of bytes__, a `ustore_bytes_view_t` of a pointer and a length, carries a path or a name, never null-terminated by contract.
-- __A strided run__ of fixed-width elements, such as a `ustore_keys_view_t` of a pointer and a stride in bytes, carries one element per task, and a zero stride repeats the first element for every task.
-- __A ragged batch__, a `ustore_strings_view_t`, carries one string per task as an Apache Arrow tape of 32-bit or 64-bit offsets, or through an accessor callback.
+- __One run of bytes__, a `ustore_bytes_view_t` of a pointer and a length, holds a path or a name, never null-terminated by contract.
+- __A strided run__ of fixed-width elements, such as a `ustore_keys_view_t` of a pointer and a stride in bytes, holds one element per task, and a zero stride repeats the first element for every task.
+- __A ragged batch__, a `ustore_strings_view_t`, holds one string per task as an Apache Arrow tape of 32-bit or 64-bit offsets, or through an accessor callback.
 
 Keys are `ustore_key_t`, 16 bytes compared bytewise, and a non-negative integer spells as its 128-bit big-endian bytes, so keys made from integers order as the integers.
 Every output whose length scales with the call lands packed in the arena the call is given, and only fixed-size reports, such as descriptions, stamps and created handles, stay caller fields.
@@ -420,7 +419,7 @@ An accessor runs on the thread that runs the call, in blocks of up to 64 indices
 Every call reports through a `ustore_outcome_t` whose `status` names the result and whose static `message` is never freed.
 Statuses read `ustore_status_<name>_k`, and `ustore_status_name` and `ustore_status_from_name` spell them both ways, like `not-found`.
 A call refuses in one order, invalid arguments first, then read-only, unsupported and contended, and a refusal changes nothing.
-Every closed set a binding spells has a pair of functions, such as `ustore_isolation_name` answering `strict-serializable`, or `unrecognized` for a value no enumerator carries, and `ustore_isolation_from_name` reading it back.
+Every closed set a binding spells has a pair of functions, such as `ustore_isolation_name` answering `strict-serializable`, or `unrecognized` for a value no enumerator holds, and `ustore_isolation_from_name` reading it back.
 
 ```c
 ustore_database_open_rocksdb(&(ustore_database_open_rocksdb_t){
@@ -441,10 +440,11 @@ The opens of an engine the build lacks answer `ustore_status_unsupported_k`, so 
 
 Each engine opens through its own call, whose arguments hold what that engine can be asked, and a zero field keeps its default:
 
-- `ustore_database_init_ram` starts an empty database in memory alone, while `ustore_database_open_ram` serves a directory as one image, loading it at open and rewriting it whole on a flushed commit and on close.
+- `ustore_database_init_ram` starts an empty database in memory alone, while `ustore_database_open_ram` serves a directory as one image, loading it at open and rewriting it whole on a flushed commit and on `ustore_database_flush`, never on free.
 - `ustore_database_open_rocksdb` and `ustore_database_open_leveldb` serve a directory in place, creating the database when it holds none.
 - `ustore_database_open_nvme` serves the database its manifest names, `<database>.ustore.json` in an existing directory or the raw address of its first slot, such as `/dev/nvme0n1@64GiB`.
 - `ustore_database_view_rocksdb` serves an existing RocksDB directory read-only, refusing every change with `ustore_status_read_only_k`, while snapshots and their saves still serve.
+- `ustore_database_view_nvme` serves the state an NVMe manifest names the same way, and writes nothing to any data directory, at open or at close.
 
 The RAM and NVMe opens take a `cpu_class_ceiling`, the newest CPU class the database's kernels may run as, intersected with the machine, and the description reports the class picked as `cpu_class`.
 
@@ -463,4 +463,4 @@ The RAM and NVMe opens take a `cpu_class_ceiling`, the newest CPU class the data
 - __Three shapes in, three out.__
   Inputs are runs of bytes, strided runs or Arrow tapes, and outputs are packed arrays, tapes or packed keys split by offsets, so Arrow arrays and a runtime's own objects pass without copies.
 - __No life of its own.__
-  Threads live only in executors, each serving one call at a time, arenas are lent and rewound, and only a progress callback stops a running call.
+  Threads live only in executors, each serving one call at a time, an arena is the caller's and each call rewinds it, and only a progress callback stops a running call.

@@ -43,8 +43,8 @@
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```
 //!
-//! A batch read through a collection borrows the arena it landed in, so the next read into that arena does not compile
-//! while the values live:
+//! A batch read through a collection views the arena it landed in, so the next read into that arena
+//! does not compile while the values live:
 //!
 //! ```compile_fail,E0499
 //! use ustore::{Arena, Database, Key, Modality, RAMOptions};
@@ -58,7 +58,7 @@
 //! # Ok::<(), ustore::Error>(())
 //! ```
 //!
-//! A collection of a transaction borrows the transaction, so no call goes through it after the commit:
+//! A collection of a transaction holds the transaction, so no call goes through it after commit:
 //!
 //! ```compile_fail
 //! use ustore::{Database, Durability, Key, Modality, RAMOptions};
@@ -121,7 +121,7 @@ impl<'db> Transaction<'db> {
     /// The collection `name` addresses, resolved at the head, inside this transaction, which
     /// watches what it touches.
     ///
-    /// The collection borrows the transaction, so no call reaches it past [`Transaction::commit`].
+    /// The collection holds the transaction, so no call reaches it past [`Transaction::commit`].
     pub fn collection(&self, name: &str) -> Result<Collection<'_, Transaction<'db>>> {
         Collection::find(self.view(Watch::Keys), name)
     }
@@ -132,7 +132,7 @@ impl<'db> Transaction<'db> {
 ///
 /// Every verb goes through a view of one modality: [`Collection::blobs`], [`Collection::docs`] or
 /// [`Collection::graph`]. A call with no arena to pass reads through a one-off arena that the
-/// [`Owned`] value it answers keeps, while a batch read borrows the [`Arena`] it is given.
+/// [`Owned`] value it answers keeps, while a batch read views the [`Arena`] it is given.
 /// Writes land [`Durability::Buffered`].
 #[derive(Debug)]
 pub struct Collection<'view, Parent = Database> {

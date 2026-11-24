@@ -272,7 +272,7 @@ void ustore_strings_scan(ustore_strings_scan_t* arguments) {
                               listed, scores))
                 return call.refuse(ustore_status_not_found_k, "A collection was dropped meanwhile");
             offsets[task + 1] = listed.size();
-            if (!carries_on(arguments->progress, arguments->progress_state, task + 1, count))
+            if (!keeps_going(arguments->progress, arguments->progress_state, task + 1, count))
                 return call.refuse(ustore_status_cancelled_k, "The progress callback cancelled the scan");
         }
     }
@@ -363,7 +363,7 @@ void ustore_strings_cursor_next(ustore_strings_cursor_next_t* arguments) {
     catch (std::bad_alloc const&) {
         return call.refuse(ustore_status_out_of_memory_k, "Out of memory while pulling");
     }
-    if (!carries_on(arguments->progress, arguments->progress_state, 1, 1))
+    if (!keeps_going(arguments->progress, arguments->progress_state, 1, 1))
         return call.refuse(ustore_status_cancelled_k, "The progress callback cancelled the pull");
     std::vector<std::string_view> texts;
     for (entry_t const& entry : listed) texts.push_back(entry.key);

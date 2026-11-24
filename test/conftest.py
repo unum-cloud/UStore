@@ -14,7 +14,17 @@ from pathlib import Path
 from uuid import UUID
 
 import pytest
-from base import BACKEND_AXES, ENGINES, ISOLATIONS, MAX_CASES_PER_TEST, SETTINGS, SUPPORTS, open_engine, stream_key
+from base import (
+    BACKEND_AXES,
+    ENGINES,
+    ISOLATIONS,
+    MAX_CASES_PER_TEST,
+    SETTINGS,
+    SUPPORTS,
+    executor_for,
+    open_engine,
+    stream_key,
+)
 
 import ustore
 
@@ -177,7 +187,7 @@ def arena() -> ustore.Arena:
 
 
 @pytest.fixture
-def later(view: ustore.Database | ustore.Transaction) -> Iterator[ustore.DeferredOn]:
+def later(view: ustore.Database | ustore.Transaction, engine: str) -> Iterator[ustore.DeferredOn]:
     """A deferred view of `view`, whose executor waits for every call it ran once the case is done."""
-    with ustore.Executor.for_ram(2) as executor:
+    with executor_for(engine, 2) as executor:
         yield view.deferred(executor)

@@ -151,7 +151,7 @@ The C ABI and its argument structs are described in [`c/README.md`](https://gith
 
 ## Why Hyper-Converged
 
-Disaggregated storage puts a network between every query and its data, and a server full of PCIe 5.0 NVMe drives reads faster than the links in front of it carry.
+Disaggregated storage puts a network between every query and its data, and a server full of PCIe 5.0 NVMe drives reads faster than the links in front of it hold.
 Compaction then turns into a remote copy, and a GPU that could merge sorted runs waits on bytes crossing the network twice.
 UStore argues for the opposite design: storage, compute and accelerators in one box, each device reached through the most direct path its platform offers.
 Kernel bypass removes the system calls and page-cache copies between the drive and the engine, GPUDirect Storage reads data from drives into GPU memory without staging it in host memory, and SIMD kits keep point lookups on the CPU, where a single lookup is too small to ship anywhere.
@@ -204,7 +204,7 @@ Modifications follow open RFCs rather than a proprietary query language, and eac
 
 ## Graphs
 
-A graph collection stores a directed multigraph, where every edge carries a source, a target and its own identifier.
+A graph collection stores a directed multigraph, where every edge holds a source, a target and its own identifier.
 
 ```cpp
 auto [friends, friends_status] = db.find_or_create<graph_collection_t>("friends");
@@ -221,7 +221,7 @@ The neighbors land in the arena the call is given, while `degree` and `present` 
 Upserting an edge upserts its vertices, removing an edge keeps them, and removing a vertex removes every edge that touches it.
 The C ABI behind these calls is six functions: `ustore_graph_read_edges`, `ustore_graph_write_edges`, `ustore_graph_remove_edges`, `ustore_graph_write_vertices`, `ustore_graph_remove_vertices` and `ustore_graph_scan_vertices`.
 
-Documents and graphs share one key type, so a user's profile and a user's vertex carry the same key, in one box, inside one transaction.
+Documents and graphs share one key type, so a user's profile and a user's vertex hold the same key, in one box, inside one transaction.
 
 ## Transactions
 
@@ -280,7 +280,7 @@ Every engine implements the same C ABI of `c/ustore/db.h`, `c/ustore/blobs.h` an
 | `rocksdb` | baseline, third-party | LSM tree on a filesystem       | yes          | yes       | yes         |
 | `leveldb` | baseline, third-party | LSM tree on a filesystem       | no           | yes       | yes         |
 
-Each carries a limit worth knowing before choosing it.
+Each holds a limit worth knowing before choosing it.
 The `ram` engine rewrites its whole image on a flush and keeps no log, so a crash loses everything written since the last one.
 NVMe keeps no write-ahead log, so a crash loses the commits its memory runs held, a suffix of them and never half of one.
 RocksDB takes a transaction's snapshot at its first read or write rather than when it began, and stages by locking and validating every watched read and buffered write against that snapshot, then preparing the writes into its log.
@@ -314,7 +314,7 @@ UStore compiles in one of two shapes, picked by `USTORE_MULTIVERSIONED`.
   One binary runs well across diverse machines, because each CPU and each GPU picks its own class at runtime.
   This is the default, and the shape of the Python wheels and the Rust crate.
 - __Monoversioned builds are for throughput.__
-  For common hardware and data-center deployments, the binary carries only the best code for one machine.
+  For common hardware and data-center deployments, the binary holds only the best code for one machine.
   These are the leanest binaries: they start fast and take little memory and disk.
   Outside that machine they refuse cleanly with `ustore_status_unsupported_k`, never crashing and never falling back to slower code in silence.
 - __The switches.__
@@ -322,7 +322,7 @@ UStore compiles in one of two shapes, picked by `USTORE_MULTIVERSIONED`.
   The `xeon4_hopper`, `xeon6_blackwell`, `grace_hopper`, `vera_rubin` and `venice_mi450` presets spell whole machines.
 
 A monoversioned build compiles the single `monoversioned` CPU class in place of the ladder of named ones.
-It needs no monoversioned GPU class, as a preset's one GPU architecture already matches a named class, and CMake builds only the class units carrying code for it.
+It needs no monoversioned GPU class, as a preset's one GPU architecture already matches a named class, and CMake builds only the class units holding code for it.
 
 ## Compatibility
 

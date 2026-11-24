@@ -129,9 +129,9 @@ err = database.CollectionDrop(people, ustore.DropCollection)
 
 ## Reads and Writes
 
-Keys are `[]Key`, lent in place, and values are a `Tape`: bytes end to end around one more offset than values, as Apache Arrow lays them out.
+Keys are `[]Key`, viewed in place, and values are a `Tape`: bytes end to end around one more offset than values, as Apache Arrow lays them out.
 `TapeOf` packs strings or byte slices into a fresh tape, while `U32Tape` and `U64Tape` view bytes and offsets the caller already holds, without a copy.
-A read answers `Values`, which addresses the tape in the arena rather than copying out of it, reports a missing key as absent, and lends the whole batch back through `Values.Tape`, so a tape a read wrote is written again as it is.
+A read answers `Values`, which addresses the tape in the arena rather than copying out of it, reports a missing key as absent, and passes the whole batch back through `Values.Tape`, so a tape a read wrote is written again as it is.
 A write carries values and nothing else, so an empty value is still a value, and `BlobsRemove` removes keys, or ranges given end keys.
 
 ```go
@@ -153,6 +153,7 @@ A start key of `Key{}` walks up from the first key, and `KeyUnknown` walks down 
 A cursor walks one collection page by page, each pull resuming past the last key the one before it handed out, and a page shorter than wanted exhausts it for good.
 `ChangesCursorInit` opens a feed of the changes committed after a `CommitStamp`, oldest first, pinning that stamp as a snapshot does.
 A cursor keeps no executor: `cursor.NextPairs(..)` pulls on the calling goroutine, and `cursor.On(executor).NextPairs(..)` blocks on the executor named for that pull.
+A `DocsCursor` gathers the `Fields` of its config into typed columns, and its `Next` answers `DocsBatches`, one batch of keys and columns per executor task that found rows, none once the walk is exhausted.
 
 ```go
 first, err := database.BlobsScan(people, 100, arena, nil)
@@ -169,6 +170,12 @@ for {
 		break
 	}
 }
+
+ages, err := database.DocsCursorInit(people, ustore.Key{}, &ustore.DocsCursorConfig{
+	Fields: ustore.TapeOf("age"), ColumnsTypes: []ustore.DocsFieldType{ustore.DocsFieldTypeU64},
+})
+defer ages.Close()
+batches, err := ages.On(executor).Next(1024, arena) // batches.Keys(i) and batches.Columns(i) per batch
 ```
 
 ### Progress and Cancellation
@@ -242,7 +249,7 @@ err = snapshot.Save("/var/lib/people-copy", nil)
 
 `DocsWrite` writes JSON text by default, whole documents or, with `Fields`, top-level keys and RFC 6901 pointers inside them, and `DocsModification` chooses between an upsert, an update, an insert, an RFC 6902 patch and an RFC 7386 merge.
 `DocsRead` reads whole documents or fields as JSON or as strings, and `DocsGist` lists the paths to every leaf.
-`DocsGather` converts fields into typed columns, a row per key, whose scalars `DocsColumnScalars` lends straight out of the arena beside the validity, conversion and collision bitmaps.
+`DocsGather` converts fields into typed columns, a row per key, whose scalars `DocsColumnScalars` views straight in the arena beside the validity, conversion and collision bitmaps.
 
 ```go
 documents := ustore.TapeOf(`{"name":"Ada","born":1815}`)
@@ -307,13 +314,13 @@ committing, err := transaction.Deferred(executor).Commit(ustore.DurabilityBuffer
 ## Executors
 
 An `Executor` is the threads that run calls, shared by any number of databases and receivers, serving one call at a time, so a call submitted while another holds it answers `StatusContended`.
-`ExecutorForRam` spawns threads near the NUMA nodes it names, every node for an empty list, where zero threads take seven eighths of their cores; `ExecutorOnPool` borrows a ForkUnion pool, which must outlive it.
-`ExecutorForNvme` spawns the NVMe engine's rings, and `ExecutorForVram` drives one GPU, its position in `GPUDevices`.
+`ExecutorForRam` spawns threads near the NUMA nodes it names, every node for an empty list, where zero threads take seven eighths of their cores, and a nonzero scratch limit caps each thread's scratch.
+`ExecutorForNvme` spawns the NVMe engine's rings near the memory domains it names or the media under its `Paths`, and `ExecutorForVram` drives one GPU, its position in `GPUDevices`, on a stream it creates and destroys, a caller's stream answering `StatusUnsupported` since the executor drives only its own.
 Opening a database blocks, on the executor its config names or the calling goroutine, and closing an executor waits for the call holding it.
 An arena never outlives the executor that made it, so `defer executor.Close()` comes before `defer arena.Close()`, and an arena from `NewArena(nil)` lives until it is closed.
 
 ```go
-executor, err := ustore.ExecutorForRam([]int32{0}, 8, ustore.CPUClassUnknown)
+executor, err := ustore.ExecutorForRam([]int32{0}, 8, ustore.CPUClassUnknown, 0)
 defer executor.Close()
 people, err := ustore.DatabaseOpenRocksdb("/var/lib/people", &ustore.DatabaseOpenRocksdbConfig{Executor: executor})
 arena, err := ustore.NewArena(executor)
@@ -326,7 +333,7 @@ err = executor.Drain(ustore.MoodParked)
 
 Every output whose length scales with the call lands in an `Arena`, and the verb answers a view over it.
 `NewArena(executor)` places one where that executor computes, and `NewArena(nil)` on host pages, and a call rewinds it, keeping its high-water mark, so a steady loop allocates once.
-Every view and every slice it lends end at the arena's next call, so a result kept past the next call needs the next call to take another arena.
+Every view and every slice it hands out end at the arena's next call, so a result kept past the next call needs the next call to take another arena.
 An input lying inside the arena a call rewinds is refused with `StatusInvalidArgument`.
 A `Key` is sixteen bytes ordered as their bytes, and `KeyFromUint64` spells an integer big-endian, so integer keys order as integers.
 
@@ -386,7 +393,8 @@ err = database.BlobsWrite(people, keys, tape, nil)
 
 ### Engines
 
-`DatabaseInitRam` starts an empty database in memory alone, `DatabaseOpenRam` serves a directory as one image, `DatabaseOpenRocksdb`, `DatabaseOpenLeveldb` and `DatabaseOpenNvme` serve a directory in place, and `DatabaseViewRocksdb` serves one read-only, refusing every change with `StatusReadOnly`.
+`DatabaseInitRam` starts an empty database in memory alone, `DatabaseOpenRam` serves a directory as one image, `DatabaseOpenRocksdb`, `DatabaseOpenLeveldb` and `DatabaseOpenNvme` serve a directory in place, and `DatabaseViewRocksdb` and `DatabaseViewNvme` serve one read-only, refusing every change with `StatusReadOnly`.
+`Close` writes nothing to disk, so `On(executor).Flush()` makes commits with `DurabilityBuffered` durable before it.
 `Describe` reports the engine, the isolation, the CPU class picked and the sizes the engine estimates, `Clear` empties every collection at once, and `Compact` reclaims space through the phases its engine runs, where a `CompactPlan` keeps a stopped compaction open until `CompactPlanFinish`.
 The RAM engine always links, and build tags mirror the Cargo features for the others: `ustore_rocksdb` links `librocksdb`, and on Linux `liburing` beside it, and `ustore_leveldb` links `libleveldb`.
 Build the archive with the matching `USTORE_WITH_*` options and point `CGO_LDFLAGS` at the directory holding the engine archives too, as the `lib/` of a prefix CMake installed with `USTORE_INSTALL` does; the NVMe engine links nothing more.
@@ -405,7 +413,7 @@ err = people.Compact(nil)            // reclaims what overwritten and removed da
 
 ### Left Unbound
 
-- Deferred opens, transaction and snapshot inits, resets, cursor inits and cursor pulls: these block whatever receiver they are called on.
+- Deferred opens, transaction and snapshot inits, resets, cursor inits, cursor pulls and ingests: these block whatever receiver they are called on.
 - The progress of a cursor pull, and the lengths a read writes beside its values, which the tape's offsets carry.
 - Batches of strings through an accessor: every input batch is a `Tape`.
 - Exporting strided keys, like the columns of edges, through `KeysViewToArrow`, which takes dense keys alone.

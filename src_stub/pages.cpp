@@ -283,7 +283,7 @@ class xml_parser_t {
             std::size_t const end = text_.find('>', at_);
             if (end == std::string_view::npos) return {ustore_status_malformed_k, "A markup does not parse"};
             if (text_.substr(at_, end - at_).find('[') != std::string_view::npos)
-                return {ustore_status_unsupported_k, "A DOCTYPE carries an internal subset"};
+                return {ustore_status_unsupported_k, "A DOCTYPE holds an internal subset"};
             at_ = end + 1;
             return {};
         }
@@ -744,7 +744,7 @@ void ustore_pages_import(ustore_pages_import_t* arguments) {
         if (call.failed_with(parse_markup(values[index], arguments->encoding, root))) return;
         stored[index] = encode_page(root);
         parsed += values[index].size();
-        if (!carries_on(arguments->progress, arguments->progress_state, parsed, total))
+        if (!keeps_going(arguments->progress, arguments->progress_state, parsed, total))
             return call.refuse(ustore_status_cancelled_k, "The progress callback cancelled the import");
     }
     write_through(

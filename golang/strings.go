@@ -31,18 +31,18 @@ import "C"
 
 // StringsWrite maps every string onto one key, its value.
 func (on writes[Handle]) StringsWrite(collections Collections, strings Tape, values []Key, config *WriteConfig) error {
-	var lent lent[struct{}]
-	_, err := block(&lent, on.stringsWrite(&lent, C.ustore_completion_blocking_k, collections, strings, values, config))
+	var call callWithResult[struct{}]
+	_, err := block(&call, on.stringsWrite(&call, C.ustore_completion_blocking_k, collections, strings, values, config))
 	return err
 }
 
 // StringsWrite submits [DatabaseOn.StringsWrite].
 func (on deferredWrites[Handle]) StringsWrite(collections Collections, strings Tape, values []Key, config *WriteConfig) (*Deferred[struct{}], error) {
 	deferred := new(Deferred[struct{}])
-	return submitted(deferred, on.stringsWrite(&deferred.lent, C.ustore_completion_deferred_k, collections, strings, values, config))
+	return submitted(deferred, on.stringsWrite(&deferred.call, C.ustore_completion_deferred_k, collections, strings, values, config))
 }
 
-func (receiver storeReceiver[Handle]) stringsWrite(lent *lent[struct{}], completion C.ustore_completion_t, collections Collections, strings Tape, values []Key, config *WriteConfig) error {
+func (receiver storeReceiver[Handle]) stringsWrite(call *callWithResult[struct{}], completion C.ustore_completion_t, collections Collections, strings Tape, values []Key, config *WriteConfig) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
@@ -52,17 +52,17 @@ func (receiver storeReceiver[Handle]) stringsWrite(lent *lent[struct{}], complet
 		return err
 	}
 	options := configOf(config)
-	arguments, inputs := stage[C.ustore_strings_write_t](lent)
+	arguments, inputs := stage[C.ustore_strings_write_t](call)
 	*arguments = C.ustore_strings_write_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		completion:  completion,
 		transaction: receiver.transaction(),
 		count:       C.ustore_size_t(count),
-		collections: lent.collections(inputs, collections),
-		strings:     lent.strings(strings),
-		values:      lent.keys(values),
+		collections: call.collections(inputs, collections),
+		strings:     call.strings(strings),
+		values:      call.keys(values),
 		durability:  C.ustore_durability_t(options.Durability),
 		watch:       C.ustore_watch_t(receiver.watch),
 	}
@@ -82,18 +82,18 @@ type StringsRemoveConfig struct {
 // StringsRemove removes strings with the keys they map onto, or every string of a range per task
 // given end strings.
 func (on writes[Handle]) StringsRemove(collections Collections, strings Tape, config *StringsRemoveConfig) error {
-	var lent lent[struct{}]
-	_, err := block(&lent, on.stringsRemove(&lent, C.ustore_completion_blocking_k, collections, strings, config))
+	var call callWithResult[struct{}]
+	_, err := block(&call, on.stringsRemove(&call, C.ustore_completion_blocking_k, collections, strings, config))
 	return err
 }
 
 // StringsRemove submits [DatabaseOn.StringsRemove].
 func (on deferredWrites[Handle]) StringsRemove(collections Collections, strings Tape, config *StringsRemoveConfig) (*Deferred[struct{}], error) {
 	deferred := new(Deferred[struct{}])
-	return submitted(deferred, on.stringsRemove(&deferred.lent, C.ustore_completion_deferred_k, collections, strings, config))
+	return submitted(deferred, on.stringsRemove(&deferred.call, C.ustore_completion_deferred_k, collections, strings, config))
 }
 
-func (receiver storeReceiver[Handle]) stringsRemove(lent *lent[struct{}], completion C.ustore_completion_t, collections Collections, strings Tape, config *StringsRemoveConfig) error {
+func (receiver storeReceiver[Handle]) stringsRemove(call *callWithResult[struct{}], completion C.ustore_completion_t, collections Collections, strings Tape, config *StringsRemoveConfig) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
@@ -103,17 +103,17 @@ func (receiver storeReceiver[Handle]) stringsRemove(lent *lent[struct{}], comple
 	if err := shape(collections, count, int(options.EndStrings.Len())); err != nil {
 		return err
 	}
-	arguments, inputs := stage[C.ustore_strings_remove_t](lent)
+	arguments, inputs := stage[C.ustore_strings_remove_t](call)
 	*arguments = C.ustore_strings_remove_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		completion:  completion,
 		transaction: receiver.transaction(),
 		count:       C.ustore_size_t(count),
-		collections: lent.collections(inputs, collections),
-		strings:     lent.strings(strings),
-		end_strings: lent.strings(options.EndStrings),
+		collections: call.collections(inputs, collections),
+		strings:     call.strings(strings),
+		end_strings: call.strings(options.EndStrings),
 		durability:  C.ustore_durability_t(options.Durability),
 		watch:       C.ustore_watch_t(receiver.watch),
 	}
@@ -146,17 +146,17 @@ func (mapped Mapped) Get(index uint) (Key, bool) {
 
 // StringsRead looks up the key every string maps onto into arena.
 func (on reads[Handle]) StringsRead(collections Collections, strings Tape, arena *Arena) (Mapped, error) {
-	var lent lent[Mapped]
-	return block(&lent, on.stringsRead(&lent, C.ustore_completion_blocking_k, collections, strings, arena))
+	var call callWithResult[Mapped]
+	return block(&call, on.stringsRead(&call, C.ustore_completion_blocking_k, collections, strings, arena))
 }
 
 // StringsRead submits [DatabaseOn.StringsRead].
 func (on deferredReads[Handle]) StringsRead(collections Collections, strings Tape, arena *Arena) (*Deferred[Mapped], error) {
 	deferred := new(Deferred[Mapped])
-	return submitted(deferred, on.stringsRead(&deferred.lent, C.ustore_completion_deferred_k, collections, strings, arena))
+	return submitted(deferred, on.stringsRead(&deferred.call, C.ustore_completion_deferred_k, collections, strings, arena))
 }
 
-func (receiver storeReceiver[Handle]) stringsRead(lent *lent[Mapped], completion C.ustore_completion_t, collections Collections, strings Tape, arena *Arena) error {
+func (receiver storeReceiver[Handle]) stringsRead(call *callWithResult[Mapped], completion C.ustore_completion_t, collections Collections, strings Tape, arena *Arena) error {
 	database, executor, outputs, err := receiver.lowerInto(arena)
 	if err != nil {
 		return err
@@ -165,19 +165,19 @@ func (receiver storeReceiver[Handle]) stringsRead(lent *lent[Mapped], completion
 	if err := shape(collections, count); err != nil {
 		return err
 	}
-	arguments, inputs := stage[C.ustore_strings_read_t](lent)
-	lent.result.count = uint(count)
+	arguments, inputs := stage[C.ustore_strings_read_t](call)
+	call.result.count = uint(count)
 	*arguments = C.ustore_strings_read_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		completion:  completion,
 		view:        receiver.view(),
 		count:       C.ustore_size_t(count),
-		collections: lent.collections(inputs, collections),
-		strings:     lent.strings(strings),
-		presences:   &lent.result.presences,
-		values:      &lent.result.values,
+		collections: call.collections(inputs, collections),
+		strings:     call.strings(strings),
+		presences:   &call.result.presences,
+		values:      &call.result.values,
 		arena:       outputs,
 	}
 	C.ustore_strings_read(arguments)
@@ -205,12 +205,12 @@ func (listing Listing) Count(task uint) uint {
 	return uint(at(listing.offsets, task+1) - at(listing.offsets, task))
 }
 
-// Get borrows string index of scan task from the arena; index must be below [Listing.Count].
+// Get views string index of scan task in the arena; index must be below [Listing.Count].
 func (listing Listing) Get(task, index uint) []byte {
 	return listing.strings.sized(uint(at(listing.offsets, listing.count))).Get(uint(at(listing.offsets, task)) + index)
 }
 
-// Scores borrows the BM25 score of every string scan task found, and nothing unless the patterns
+// Scores views the BM25 score of every string scan task found, and nothing unless the patterns
 // carried weights.
 func (listing Listing) Scores(task uint) []float32 {
 	begin, end := at(listing.offsets, task), at(listing.offsets, task+1)
@@ -244,17 +244,17 @@ type StringsScanConfig struct {
 // StringsScan lists up to wanted strings per task into arena, one task per collection collections
 // names.
 func (on reads[Handle]) StringsScan(collections Collections, wanted uint, arena *Arena, config *StringsScanConfig) (Listing, error) {
-	var lent lent[Listing]
-	return block(&lent, on.stringsScan(&lent, C.ustore_completion_blocking_k, collections, wanted, arena, config))
+	var call callWithResult[Listing]
+	return block(&call, on.stringsScan(&call, C.ustore_completion_blocking_k, collections, wanted, arena, config))
 }
 
 // StringsScan submits [DatabaseOn.StringsScan].
 func (on deferredReads[Handle]) StringsScan(collections Collections, wanted uint, arena *Arena, config *StringsScanConfig) (*Deferred[Listing], error) {
 	deferred := new(Deferred[Listing])
-	return submitted(deferred, on.stringsScan(&deferred.lent, C.ustore_completion_deferred_k, collections, wanted, arena, config))
+	return submitted(deferred, on.stringsScan(&deferred.call, C.ustore_completion_deferred_k, collections, wanted, arena, config))
 }
 
-func (receiver storeReceiver[Handle]) stringsScan(lent *lent[Listing], completion C.ustore_completion_t, collections Collections, wanted uint, arena *Arena, config *StringsScanConfig) error {
+func (receiver storeReceiver[Handle]) stringsScan(call *callWithResult[Listing], completion C.ustore_completion_t, collections Collections, wanted uint, arena *Arena, config *StringsScanConfig) error {
 	database, executor, outputs, err := receiver.lowerInto(arena)
 	if err != nil {
 		return err
@@ -267,25 +267,25 @@ func (receiver storeReceiver[Handle]) stringsScan(lent *lent[Listing], completio
 	if err := options.Patterns.check(); err != nil {
 		return err
 	}
-	arguments, inputs := stage[C.ustore_strings_scan_t](lent)
-	lent.result.count = uint(count)
-	progress, state := lent.progress(options.Progress)
+	arguments, inputs := stage[C.ustore_strings_scan_t](call)
+	call.result.count = uint(count)
+	progress, state := call.progress(options.Progress)
 	*arguments = C.ustore_strings_scan_t{
 		database:       database,
 		executor:       executor,
-		outcome:        lent.outcome(),
+		outcome:        call.outcome(),
 		completion:     completion,
 		view:           receiver.view(),
 		count:          C.ustore_size_t(count),
-		collections:    lent.collections(inputs, collections),
-		prefixes:       lent.strings(options.Prefixes),
-		start_strings:  lent.strings(options.StartStrings),
-		end_strings:    lent.strings(options.EndStrings),
+		collections:    call.collections(inputs, collections),
+		prefixes:       call.strings(options.Prefixes),
+		start_strings:  call.strings(options.StartStrings),
+		end_strings:    call.strings(options.EndStrings),
 		direction:      C.ustore_scan_direction_t(options.Direction),
-		patterns:       lent.patterns(options.Patterns),
-		predicate:      lent.predicate(options.Predicate),
-		offsets:        &lent.result.offsets,
-		strings:        &lent.result.strings.raw,
+		patterns:       call.patterns(options.Patterns),
+		predicate:      call.predicate(options.Predicate),
+		offsets:        &call.result.offsets,
+		strings:        &call.result.strings.raw,
 		arena:          outputs,
 		wanted:         C.ustore_size_t(wanted),
 		mode:           C.ustore_scan_mode_t(options.Mode),
@@ -293,7 +293,7 @@ func (receiver storeReceiver[Handle]) stringsScan(lent *lent[Listing], completio
 		progress_state: state,
 	}
 	if len(options.Patterns.Weights) != 0 {
-		arguments.scores = &lent.result.scores
+		arguments.scores = &call.result.scores
 	}
 	C.ustore_strings_scan(arguments)
 	return nil
@@ -353,24 +353,24 @@ func (on reads[Handle]) StringsCursorInit(collection CollectionID, config *Strin
 		return nil, err
 	}
 	cursor := new(StringsCursor)
-	var lent lent[C.ustore_strings_cursor_t]
-	arguments := open[C.ustore_strings_cursor_init_t](&lent)
+	var call callWithResult[C.ustore_strings_cursor_t]
+	arguments := open[C.ustore_strings_cursor_init_t](&call)
 	*arguments = C.ustore_strings_cursor_init_t{
-		cursor:       lent.result,
+		cursor:       call.result,
 		database:     database,
 		executor:     executor,
-		outcome:      lent.outcome(),
+		outcome:      call.outcome(),
 		view:         on.view(),
 		collection:   rawCollection(collection),
-		prefix:       lent.text(options.Prefix),
-		start_string: lent.text(options.StartString),
-		end_string:   lent.text(options.EndString),
+		prefix:       call.text(options.Prefix),
+		start_string: call.text(options.StartString),
+		end_string:   call.text(options.EndString),
 		direction:    C.ustore_scan_direction_t(options.Direction),
-		patterns:     lent.patterns(options.Patterns),
+		patterns:     call.patterns(options.Patterns),
 		predicate:    cursor.admits(options.Predicate),
 	}
 	C.ustore_strings_cursor_init(arguments)
-	if cursor.handle, err = block(&lent, nil); err != nil {
+	if cursor.handle, err = block(&call, nil); err != nil {
 		cursor.end()
 		return nil, err
 	}
@@ -390,50 +390,50 @@ type StringsPage struct {
 // Len reports how many strings the pull handed out; fewer than wanted exhausts the walk for good.
 func (page StringsPage) Len() uint { return uint(page.written) }
 
-// Strings borrows the strings of the page from the arena.
+// Strings views the strings of the page in the arena.
 func (page StringsPage) Strings() Strings { return page.strings.sized(uint(page.written)) }
 
-// Values borrows the key every string maps onto, and is empty after a
+// Values views the key every string maps onto, and is empty after a
 // [StringsCursor.NextStrings] pull.
 func (page StringsPage) Values() []Key { return keysAt(page.values, 0, uint64(page.written)) }
 
 // NextStrings pulls up to wanted strings of the walk into arena.
 func (on StringsCursorOn) NextStrings(wanted uint, arena *Arena) (StringsPage, error) {
-	var lent lent[StringsPage]
-	arguments, err := on.next(&lent, wanted, arena)
+	var call callWithResult[StringsPage]
+	arguments, err := on.next(&call, wanted, arena)
 	if err != nil {
 		return StringsPage{}, err
 	}
 	C.ustore_strings_cursor_next(arguments)
-	return block(&lent, nil)
+	return block(&call, nil)
 }
 
 // NextPairs pulls up to wanted strings of the walk with the keys they map onto into arena.
 func (on StringsCursorOn) NextPairs(wanted uint, arena *Arena) (StringsPage, error) {
-	var lent lent[StringsPage]
-	arguments, err := on.next(&lent, wanted, arena)
+	var call callWithResult[StringsPage]
+	arguments, err := on.next(&call, wanted, arena)
 	if err != nil {
 		return StringsPage{}, err
 	}
-	arguments.values = &lent.result.values
+	arguments.values = &call.result.values
 	C.ustore_strings_cursor_next(arguments)
-	return block(&lent, nil)
+	return block(&call, nil)
 }
 
 // next opens a pull and fills every argument but the optional values.
-func (on StringsCursorOn) next(lent *lent[StringsPage], wanted uint, arena *Arena) (*C.ustore_strings_cursor_next_t, error) {
+func (on StringsCursorOn) next(call *callWithResult[StringsPage], wanted uint, arena *Arena) (*C.ustore_strings_cursor_next_t, error) {
 	cursor, database, executor, outputs, err := on.lowerInto(arena)
 	if err != nil {
 		return nil, err
 	}
-	arguments := open[C.ustore_strings_cursor_next_t](lent)
+	arguments := open[C.ustore_strings_cursor_next_t](call)
 	*arguments = C.ustore_strings_cursor_next_t{
 		database: database,
 		executor: executor,
-		outcome:  lent.outcome(),
+		outcome:  call.outcome(),
 		cursor:   cursor,
-		strings:  &lent.result.strings.raw,
-		written:  &lent.result.written,
+		strings:  &call.result.strings.raw,
+		written:  &call.result.written,
 		arena:    outputs,
 		wanted:   C.ustore_size_t(wanted),
 	}
@@ -458,34 +458,34 @@ func (cursor *StringsCursor) Close() error {
 // StringsSample draws up to wanted strings uniformly at random into arena, one task per collection
 // collections names.
 func (on reads[Handle]) StringsSample(collections Collections, wanted uint, arena *Arena) (Listing, error) {
-	var lent lent[Listing]
-	return block(&lent, on.stringsSample(&lent, C.ustore_completion_blocking_k, collections, wanted, arena))
+	var call callWithResult[Listing]
+	return block(&call, on.stringsSample(&call, C.ustore_completion_blocking_k, collections, wanted, arena))
 }
 
 // StringsSample submits [DatabaseOn.StringsSample].
 func (on deferredReads[Handle]) StringsSample(collections Collections, wanted uint, arena *Arena) (*Deferred[Listing], error) {
 	deferred := new(Deferred[Listing])
-	return submitted(deferred, on.stringsSample(&deferred.lent, C.ustore_completion_deferred_k, collections, wanted, arena))
+	return submitted(deferred, on.stringsSample(&deferred.call, C.ustore_completion_deferred_k, collections, wanted, arena))
 }
 
-func (receiver storeReceiver[Handle]) stringsSample(lent *lent[Listing], completion C.ustore_completion_t, collections Collections, wanted uint, arena *Arena) error {
+func (receiver storeReceiver[Handle]) stringsSample(call *callWithResult[Listing], completion C.ustore_completion_t, collections Collections, wanted uint, arena *Arena) error {
 	database, executor, outputs, err := receiver.lowerInto(arena)
 	if err != nil {
 		return err
 	}
 	count := tasks(collections)
-	arguments, inputs := stage[C.ustore_strings_sample_t](lent)
-	lent.result.count = uint(count)
+	arguments, inputs := stage[C.ustore_strings_sample_t](call)
+	call.result.count = uint(count)
 	*arguments = C.ustore_strings_sample_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		completion:  completion,
 		view:        receiver.view(),
 		count:       C.ustore_size_t(count),
-		collections: lent.collections(inputs, collections),
-		offsets:     &lent.result.offsets,
-		strings:     &lent.result.strings.raw,
+		collections: call.collections(inputs, collections),
+		offsets:     &call.result.offsets,
+		strings:     &call.result.strings.raw,
 		arena:       outputs,
 		wanted:      C.ustore_size_t(wanted),
 	}
@@ -507,17 +507,17 @@ type StringsMeasureConfig struct {
 // StringsMeasure estimates the entries and the space inside a range of strings per task into arena,
 // one task per collection collections names.
 func (on reads[Handle]) StringsMeasure(collections Collections, arena *Arena, config *StringsMeasureConfig) (Measurement, error) {
-	var lent lent[Measurement]
-	return block(&lent, on.stringsMeasure(&lent, C.ustore_completion_blocking_k, collections, arena, config))
+	var call callWithResult[Measurement]
+	return block(&call, on.stringsMeasure(&call, C.ustore_completion_blocking_k, collections, arena, config))
 }
 
 // StringsMeasure submits [DatabaseOn.StringsMeasure].
 func (on deferredReads[Handle]) StringsMeasure(collections Collections, arena *Arena, config *StringsMeasureConfig) (*Deferred[Measurement], error) {
 	deferred := new(Deferred[Measurement])
-	return submitted(deferred, on.stringsMeasure(&deferred.lent, C.ustore_completion_deferred_k, collections, arena, config))
+	return submitted(deferred, on.stringsMeasure(&deferred.call, C.ustore_completion_deferred_k, collections, arena, config))
 }
 
-func (receiver storeReceiver[Handle]) stringsMeasure(lent *lent[Measurement], completion C.ustore_completion_t, collections Collections, arena *Arena, config *StringsMeasureConfig) error {
+func (receiver storeReceiver[Handle]) stringsMeasure(call *callWithResult[Measurement], completion C.ustore_completion_t, collections Collections, arena *Arena, config *StringsMeasureConfig) error {
 	database, executor, outputs, err := receiver.lowerInto(arena)
 	if err != nil {
 		return err
@@ -527,25 +527,25 @@ func (receiver storeReceiver[Handle]) stringsMeasure(lent *lent[Measurement], co
 	if err := shape(collections, count, int(options.StartStrings.Len()), int(options.EndStrings.Len())); err != nil {
 		return err
 	}
-	arguments, inputs := stage[C.ustore_strings_measure_t](lent)
-	lent.result.count = uint(count)
+	arguments, inputs := stage[C.ustore_strings_measure_t](call)
+	call.result.count = uint(count)
 	*arguments = C.ustore_strings_measure_t{
 		database:          database,
 		executor:          executor,
-		outcome:           lent.outcome(),
+		outcome:           call.outcome(),
 		completion:        completion,
 		view:              receiver.view(),
 		count:             C.ustore_size_t(count),
-		collections:       lent.collections(inputs, collections),
-		start_strings:     lent.strings(options.StartStrings),
-		end_strings:       lent.strings(options.EndStrings),
+		collections:       call.collections(inputs, collections),
+		start_strings:     call.strings(options.StartStrings),
+		end_strings:       call.strings(options.EndStrings),
 		direction:         C.ustore_scan_direction_t(options.Direction),
-		min_cardinalities: &lent.result.minCardinalities,
-		max_cardinalities: &lent.result.maxCardinalities,
-		min_value_bytes:   &lent.result.minValueBytes,
-		max_value_bytes:   &lent.result.maxValueBytes,
-		min_space_usages:  &lent.result.minSpaceUsages,
-		max_space_usages:  &lent.result.maxSpaceUsages,
+		min_cardinalities: &call.result.minCardinalities,
+		max_cardinalities: &call.result.maxCardinalities,
+		min_value_bytes:   &call.result.minValueBytes,
+		max_value_bytes:   &call.result.maxValueBytes,
+		min_space_usages:  &call.result.minSpaceUsages,
+		max_space_usages:  &call.result.maxSpaceUsages,
 		arena:             outputs,
 	}
 	C.ustore_strings_measure(arguments)

@@ -6,7 +6,7 @@ Every verb is a batch, and every blocking verb returns a `Result`:
 
 - `Database`, `Transaction` and `Snapshot`: the head, a group of changes, and a point in time.
 - `Collection`: a collection by name, with `blobs`, `docs` and `graph` views of one key at a time.
-- `Arena`: where outputs land, borrowed by the result that views them.
+- `Arena`: where outputs land, held by the result that views them.
 - `Executor` and `Deferred`: the threads a call runs on, and a call deferred there.
 
 ## Installation
@@ -70,7 +70,7 @@ Collections are created under a name and the modality they hold, resolved by nam
 A name starting with `_` is refused with `Status::InvalidArgument`, as the engines keep their own system collections there.
 `collection_find` answers the identifier and modality of a name, `collection_list` every identifier, and `collection_names` a page of names from a prefix.
 `Database::collection_drop` empties a collection of its pairs or values with `DropMode::Pairs` or `DropMode::Values`, or drops it whole with `DropMode::Collection`.
-The ABI carries a collection per task, so every batch verb takes a `Collections`: a bare `CollectionID` converts into `Collections::Every`, and `Collections::Each` names one per entry.
+The ABI holds a collection per task, so every batch verb takes a `Collections`: a bare `CollectionID` converts into `Collections::Every`, and `Collections::Each` names one per entry.
 
 ```rust
 use ustore::{BlobsVerbs, Collections, DropMode, Modality, StringsVerbs};
@@ -87,10 +87,10 @@ database.collection_drop(people, DropMode::Collection)?;
 
 ## Reads and Writes
 
-An `Entry` pairs a key with borrowed bytes, laid out so a slice of them crosses as it stands: the keys as one strided run, and the values through an accessor over the same entries.
+An `Entry` pairs a key with bytes the caller keeps, laid out so a slice of them crosses as it stands: the keys as one strided run, and the values through an accessor over the same entries.
 A write also takes owned keys beside a `stringtape::BytesTape<u32>` or `BytesTape<u64>`, which the library reads as it stands.
-A read hands back `Values`, which addresses the tape in the arena rather than copying out of it, and reports a missing key as `None`.
-A write carries values and nothing else, so an empty slice writes an empty value, and `remove` and `remove_range` remove keys in batches of their own.
+A read hands back `Values`, which addresses the tape in the arena rather than copying out of it, reports a missing key as `None`, and exports the whole batch through `Values::tape` in Arrow's `binary` or `large_binary` layout.
+A write holds values and nothing else, so an empty slice writes an empty value, and `remove` and `remove_range` remove keys in batches of their own.
 
 ```rust
 use ustore::{Arena, BlobsVerbs, Durability, Entry, Key, Modality};
@@ -112,10 +112,11 @@ database.remove(people, &[grace], Durability::Buffered)?;
 Scans, cursors and measures take a `KeyRange` of a start key, inclusive, an end key, exclusive, and a `ScanDirection`, where a key alone walks up from it and `start..end` walks up between them.
 `scan` lists up to the count it wants, `sample` draws keys at random, and `measure` bounds the keys and bytes a range holds without walking it; `docs_sample`, `pages_sample` and `graph_sample_vertices` serve the other modalities.
 A `Cursor` walks one collection page by page, each pull resuming past the last key the one before it handed out, and a page shorter than wanted exhausts it for good.
+`DocsCursor::next` pulls `Batches` of rows instead, each its keys and the `Columns` the cursor gathers, one per executor task that found rows, none once the walk is exhausted.
 `Database::changes_cursor` opens a feed of the changes committed after a `CommitStamp`, oldest first, pinning that stamp as a snapshot does.
 A cursor keeps no executor: `cursor.next_pairs(..)` pulls on the calling thread, and `cursor.on(&executor).next_pairs(..)` blocks on the executor named for that pull.
 
-A `Matching` narrows a scan or a cursor by patterns, a filter, and a `Predicate` borrowing a handler: `Predicate::each` answers one key at a time and is asked cheaply, while `Predicate::batch` fills a page of `Admission`s and is asked once per page unless told `.cheap()`.
+A `Matching` narrows a scan or a cursor by patterns, a filter, and a `Predicate` viewing a handler: `Predicate::each` answers one key at a time and is asked cheaply, while `Predicate::batch` fills a page of `Admission`s and is asked once per page unless told `.cheap()`.
 
 ```rust
 use ustore::{BlobsScanConfig, KeyRange, Matching, Predicate, ScanDirection};
@@ -137,7 +138,7 @@ loop {
 
 ### Progress and Cancellation
 
-The configs of `compact`, `save`, `pages_import` and the scans carry an optional `Progress`, which `Progress::new(&mut handler)` lends from any `FnMut(finished, total) -> ControlFlow<()> + Send` through a trampoline made for its type.
+The configs of `compact`, `save`, `pages_import` and the scans hold an optional `Progress`, which `Progress::new(&mut handler)` makes from any `FnMut(finished, total) -> ControlFlow<()> + Send` through a trampoline made for its type.
 The handler runs on whichever thread advances the work, never on two at once and never after the call is final, and a deferred call needs a `'static` one.
 Answering `ControlFlow::Break(())` cancels the call, which fails with `Status::Cancelled` and publishes nothing, a cancelled save removing what it wrote.
 A handler must not panic, since unwinding out of the library's `extern "C"` frame aborts the process.
@@ -181,7 +182,7 @@ let commit_stamp = transaction.commit(Durability::Flushed)?;
 
 ## Snapshots
 
-A snapshot pins the state it was taken at until it is dropped, and every view at it borrows it, so a view of a snapshot has no verb that writes.
+A snapshot pins the state it was taken at until it is dropped, and every view at it holds it, so a view of a snapshot has no verb that writes.
 `Snapshot::read_stamp` is the stamp it reads at, which every commit whose `CommitStamp` is at or below it shows.
 `Snapshot::save` writes it out as a new database of the same engine, holding exactly the collections and names it records, where RocksDB and LevelDB create the path and the RAM engine writes its image into the directory the path names.
 
@@ -196,8 +197,8 @@ snapshot.save("/var/lib/people-copy")?;
 ## Documents
 
 `Collection::docs` parses what it reads through JsonTape: `get` hands out a `jsontape::Json`, `get_json` the text itself as an `Owned` value, and `set` writes a `jsontape::Json`, while with the `serde` feature `get_as` deserializes into any `DeserializeOwned` type.
-The batch verbs carry documents as text both ways and parse nothing on the Rust side.
-A field is a top-level key or an RFC 6901 pointer, a write carries one format for the whole batch, named by the type of its entries, and `Modification` chooses between an upsert, an update, an insert, an RFC 6902 patch and an RFC 7386 merge.
+The batch verbs hold documents as text both ways and parse nothing on the Rust side.
+A field is a top-level key or an RFC 6901 pointer, a write holds one format for the whole batch, named by the type of its entries, and `Modification` chooses between an upsert, an update, an insert, an RFC 6902 patch and an RFC 7386 merge.
 A gather converts fields into typed columns, a row per key, handing out scalar columns as slices straight out of the arena beside their validity, conversion and collision bitmaps.
 
 ```rust
@@ -266,7 +267,7 @@ fn main() -> Result<()> {
     let people = database.collection_create("people", Modality::Blobs)?;
     database.write(people, &[Entry::new(ada, b"Ada")], Durability::Buffered)?;     // the calling thread
     let executor = Executor::for_ram(&[], 8)?;
-    let mut arena = Arena::new_in(&executor)?;                                       // Arena<'_> borrows the executor
+    let mut arena = Arena::new_in(&executor)?;                                       // Arena<'_> holds the executor
     let local = database.read(people, &[ada], &mut Arena::new()?)?;                  // the calling thread
     let pooled = database.head().on(&executor).read(people, &[ada], &mut arena)?;   // blocks on the executor
     let call = database.head().deferred(&executor).read(people, vec![ada], &mut arena)?; // Deferred<'_, Read<..>>
@@ -277,7 +278,7 @@ fn main() -> Result<()> {
 ```
 
 Overlapping work in synchronous code goes through `block_on` of a join, as above, or through a scoped thread that waits on the call, since a `Deferred` never awaited or waited on never runs.
-The borrow checker carries the lifetime rules: a deferred verb takes only owned or `'static` inputs, predicates and progress handlers, since the library reads them after the call is submitted, its result borrows the arena as a blocking one does, the arena borrows the executor that made it, and dropping a submitted `Deferred` waits for its call.
+The compiler holds the lifetime rules: a deferred verb takes only owned or `'static` inputs, predicates and progress handlers, since the library reads them after the call is submitted, its result views the arena as a blocking one does, the arena holds the executor that made it, and dropping a submitted `Deferred` waits for its call.
 Passing `&[Key]` to a deferred view fails to compile with "a deferred view needs owned inputs".
 
 | Path                     | Allocations |
@@ -290,9 +291,9 @@ Passing `&[Key]` to a deferred view fails to compile with "a deferred view needs
 ## Executors
 
 An `Executor` is the threads that run calls, shared by any number of databases and views, `Send` and `Sync`, and serving one call at a time, so a call submitted while another holds it answers `Status::Contended`.
-`Executor::for_ram` spawns threads near the NUMA nodes it names, every node for an empty list, where zero threads take 7/8 of their cores; `Executor::on_pool` borrows a ForkUnion pool and is `unsafe`, since the pool must outlive it.
-`Executor::for_nvme` spawns the NVMe engine's rings, and `Executor::for_vram` drives one CUDA device.
-Opening a database blocks, on the executor its options name or the calling thread, and dropping an executor waits as `Executor::drain` does, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#executors) describe.
+`Executor::for_ram` spawns threads near the NUMA nodes it names, every node for an empty list, where zero threads take 7/8 of their cores.
+`Executor::for_nvme` spawns the NVMe engine's rings near the memory domains it names, or near the drives under its paths, and `Executor::for_vram` drives one GPU through a stream it owns, answering `Status::Unsupported` to a caller's stream, since the executor drives only its own.
+Opening a database blocks, on the executor its options name or the calling thread, dropping a database writes nothing, so `flush` makes its buffered commits durable first, and dropping an executor waits as `Executor::drain` does, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#executors) describe.
 
 ```rust
 use ustore::{Arena, Executor, Mood, RocksDBOptions};
@@ -308,8 +309,8 @@ executor.drain(Mood::Parked)?;
 ## Batches and Arenas
 
 Every output whose length scales with the call lands in an `Arena`, and the verb answers a view over it, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#batches-and-arenas) describe.
-`Arena::new_in(&executor)` places one where that executor computes, borrowing the executor so the arena never outlives it, and `Arena::new()` on host pages, and a call rewinds it, keeping its high-water mark, so a steady loop allocates once.
-Every verb takes `&mut Arena` last and its result borrows it, so the call that would overwrite a live result does not compile; to keep one result while making the next, pass the next call another arena.
+`Arena::new_in(&executor)` places one where that executor computes, holding the executor so the arena never outlives it, and `Arena::new()` on host pages, and a call rewinds it, keeping its high-water mark, so a steady loop allocates once.
+Every verb takes `&mut Arena` last and its result views it, so the call that would overwrite a live result does not compile; to keep one result while making the next, pass the next call another arena.
 A `Key` is sixteen bytes ordered as their bytes, converting from `[u8; 16]`, a `UUID`, or a `u64` or `u128` spelled big-endian, and a batch of keys is anything that reads as `&[Key]`.
 
 ```rust
@@ -327,8 +328,8 @@ An arena is `Send` and serves one call at a time, so deferred calls in flight to
 
 ## Errors
 
-Every fallible call answers `Result<T, Error>`, where the error carries the `Status` the C ABI reported and the static message beside it, so nothing allocates on the failure path.
-`Status` leaves success to `Result`, so an `Error` never carries `Status::Deferred`, and a status a newer library added reads as `Status::Internal`.
+Every fallible call answers `Result<T, Error>`, where the error holds the `Status` the C ABI reported and the static message beside it, so nothing allocates on the failure path.
+`Status` leaves success to `Result`, so an `Error` never holds `Status::Deferred`, and a status a newer library added reads as `Status::Internal`.
 `Status`, `Durability`, `Watch`, `Modality` and the other enums print through `Display` and parse through `FromStr` the spellings the C tables own, such as `"not-found"` or `"strict-serializable"`.
 
 ```rust
@@ -346,7 +347,7 @@ The converters of `c/ustore/arrow.h` view an Arrow column as a call's input in p
 ```rust
 let columns = [Column::new::<u64>("born"), Column::new::<Text>("name")];
 let gathered = database.docs_gather(people, &[ada], &columns, &mut arena)?;
-let exported = gathered.to_arrow()?; // one `ArrowExport` per column, borrowing the arena
+let exported = gathered.to_arrow()?; // one `ArrowExport` per column, viewing the arena
 let names = &exported[1];            // `names.schema()` and `names.array()` address any Arrow consumer
 
 let posters = database.collection("posters")?;
@@ -356,13 +357,13 @@ copies.import_arrow(stream, Durability::Buffered)?; // every batch's columns rea
 ```
 
 `Collection::export_arrow` writes keys and strings through `keys_view_to_arrow` and `strings_view_to_arrow`, `import_arrow` and `ingest_arrow` read them through `keys_view_from_arrow` and `strings_view_from_arrow`, and `Columns::to_arrow` is `docs_column_view_to_arrow`.
-`Values::tape` lends a read's values in Arrow's `binary` or `large_binary` layout without a copy.
+`Values::tape` views a read's values in Arrow's `binary` or `large_binary` layout without a copy.
 
 ## Platform Notes
 
 ### Engines
 
-`Database::init_ram` starts an empty database in memory alone, `open_ram` serves a directory as one image, `open_rocksdb`, `open_leveldb` and `open_nvme` serve a directory in place, and `view_rocksdb` serves one read-only, refusing every change with `Status::ReadOnly`.
+`Database::init_ram` starts an empty database in memory alone, `open_ram` serves a directory as one image, `open_rocksdb`, `open_leveldb` and `open_nvme` serve a directory in place, and `view_rocksdb` and `view_nvme` serve one read-only, refusing every change with `Status::ReadOnly`.
 `RAMOptions` and `NVMEOptions` take a `cpu_class_ceiling`, the newest `CPUClass` the database's kernels may run as, intersected with the machine, and `describe` reports the class picked as `cpu_class` beside the engine, the isolation and the sizes it estimates.
 `clear` empties every collection at once, and `compact` reclaims space through the phases its engine runs, where a `CompactPlan` keeps a stopped compaction open until `compact_plan_finish`.
 
@@ -380,15 +381,15 @@ people.compact(CompactConfig::default())?; // reclaims what overwritten and remo
 
 - Deferred opens, describes, collection creates, transaction and snapshot inits, and cursor pulls: these block whatever receiver you hold, as does every call through a `Collection`.
 - The strings cursor, which `export_arrow` drives, and the range removals of `ustore_pages_remove`.
-- The progress of a cursor pull, and the lengths a read writes beside its values, which the tape's offsets carry.
+- The progress of a cursor pull, and the lengths a read writes beside its values, which the tape's offsets hold.
 
 ### Design
 
 - __`On<'view, Parent, Completion>` makes the receiver a type, not a flag.__
   Each verb is written once, as a provided method of its modality's trait, which every handle and `On` implements, and the parent decides what compiles: only a transaction commits, only the head clears and compacts, and nothing writes through a snapshot.
 - __Ragged inputs cross as they lie.__
-  A slice of entries lends its keys as a strided run and its values through an accessor over the same records, and owned values cross as a tape, so nothing is staged on the way in.
-- __The borrow checker retires stale views.__
-  Every verb borrows its arena as `&mut Arena`, blocking or deferred, and no handle keeps an arena of its own.
+  A slice of entries passes its keys as a strided run and its values through an accessor over the same records, and owned values cross as a tape, so nothing is staged on the way in.
+- __The compiler retires stale views.__
+  Every verb takes its arena as `&mut Arena`, blocking or deferred, and no handle keeps an arena of its own.
 - __No life of its own.__
   The crate starts no threads and keeps no counts or queues, no call allocates on the Rust side, deferred ones included, callbacks cross as the C struct their handler shape lowers to, and releasing a `Deferred` rides `Drop`, which waits for a submitted call first.

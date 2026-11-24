@@ -91,7 +91,7 @@ def test_ingest_lands(database: ustore.Database, engine: str, order: str) -> Non
     rows = [(key(1), b"a"), (key(2), b"b"), (key(3), b"c")]
     if order == "unsorted":
         rows = [(key(3), b"c"), (key(1), b"stale"), (key(2), b"b"), (key(1), b"a")]
-    if engine in ("rocksdb", "leveldb"):
+    if engine == "leveldb":
         with pytest.raises(ustore.UnsupportedError):
             database.ingest_arrow(table_of(rows), collection="copies", order=order)
         return

@@ -109,7 +109,7 @@ std::size_t write_tweet(split_mix_generator_t& random, std::uint64_t id, char* b
     std::size_t const words = 12 + draw % 24;
     for (std::size_t word = 0; word != words; ++word) {
         std::uint64_t const pick = random();
-        // One document in eight carries escapes in its text
+        // One document in eight holds escapes in its text
         std::size_t const pool = (draw >> 8) % 8 == 0 ? std::size(words_k) : 8;
         std::string_view const chosen = words_k[pick % pool];
         if (text_length + chosen.size() + 1 >= sizeof(text)) break;
@@ -273,7 +273,7 @@ enum class resolver_t { yyjson_k, subdocuments_k };
 
 /** Runs one row: each call resolves the next batch of the corpus with @p resolver, then
  *  fills @p columns. */
-row_t run_row(util::executor_t& executor, docs_paths_settings_t const& settings, corpus_t const& corpus,
+row_t run_row(util::ram_executor_t& executor, docs_paths_settings_t const& settings, corpus_t const& corpus,
               std::string_view name, std::span<column_t const> columns, resolver_t resolver) noexcept {
     std::size_t const batch_size = fu::min_of(settings.batch_size.value, settings.documents.value);
     std::array<std::string_view, columns_k.size()> fields;
@@ -322,7 +322,7 @@ int main(int argc, char** argv) {
     }};
     std::array<char const*, 2> const variables {"USTORE_DOCUMENTS", "USTORE_BATCH_SIZE"};
     read_bench_settings(argc, argv, settings, flags, variables);
-    auto [executor, executor_status] = util::executor_t::make(1, util::caller_exclusivity_t::caller_inclusive_k);
+    auto [executor, executor_status] = util::ram_executor_t::make(1, util::caller_exclusivity_t::caller_inclusive_k);
     if (st::failed(executor_status)) {
         fmt::println(stderr, "Failed to pin the calling thread");
         return 1;

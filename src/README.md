@@ -21,7 +21,7 @@ Engines aim for the highest isolation `ram` delivers, each reports the level its
 ## RAM
 
 `src/ram/` is the reference in-memory engine, and the one every other engine is checked against.
-Every collection keeps a stamp-based SmashTable `partitioned_store` of its own, of the kind its modality picks: UUID keys mapped onto values for blobs, onto JSON text for documents and onto dense element trees for pages, strings mapped onto values for strings, and the half-edges of a graph, so no stored key carries its collection.
+Every collection keeps a stamp-based SmashTable `partitioned_store` of its own, of the kind its modality picks: UUID keys mapped onto values for blobs, onto JSON text for documents and onto dense element trees for pages, strings mapped onto values for strings, and the half-edges of a graph, so no stored key holds its collection.
 `src/ram/docs.hpp` and `src/ram/pages.hpp` edit documents and pages in place, reading, modifying and writing them back inside one transaction, the caller's or one of the call's own retried on conflicts.
 The `_collections` system collection maps the UUID of every collection onto its modality, its name and its store, and the `_names` system collection maps every name onto its collection's UUID.
 Every store is built into one commit order, and a `dynamic_transaction_group` joins whichever stores a transaction reaches, so it publishes under one stamp and a snapshot reads all of them at it.
@@ -33,7 +33,7 @@ One library serves both isolation levels: the `isolation` field of `ustore_datab
 - `snapshot_k` validates only the reads a transaction watches, trading write skew for cheaper commits.
 
 Snapshots map onto the versions the store already keeps.
-`ustore_database_init_ram` starts a database in memory alone, while one `ustore_database_open_ram` serves persists in its directory as one binary image, rewritten whole on a flushed commit and on close.
+`ustore_database_init_ram` starts a database in memory alone, while one `ustore_database_open_ram` persists in its directory as one binary image, rewritten whole on a flushed commit and on `ustore_database_flush`, never on free.
 A compaction merges with one task per collection, vacuuming its store as a fresh stamp lists it, the tasks running at once on the threads of the executor, then reclaims in one more task, freeing the retired stores and rewriting the image, and a save writes the snapshot's collections as an image into the directory it names, removing `ram.image.tmp` when cancelled.
 
 ## RocksDB
@@ -46,6 +46,8 @@ A stage reports its snapshot's sequence number as the read stamp, taking that sn
 A commit reports the sequence number it was written at, and a snapshot the one it pins.
 Scans are not validated, and a prepared transaction a crash leaves behind is rolled back when the database opens.
 This is one design for durability and two-phase commits rather than the settled one, and a log kept above the engine, as a data-lake coordinator would own, remains open.
+An ingest of blobs, documents or pages writes SST files into the first data directory and moves them into the column family with one `IngestExternalFile` at its finish, while strings and graphs answer unsupported.
+RocksDB validates a staged key only against the sequence numbers its memtables and files hold, which a file ingested at the bottom level may not, so every ingest records the key range it landed and a transaction that began before it and touched a key there fails at stage.
 
 `ustore_database_view_rocksdb` opens a directory through `DB::OpenForReadOnly` instead, with the data directories the database was opened with, since RocksDB finds table files placed outside the directory only through them.
 The router refuses every call that would change such a database with `ustore_status_read_only_k` before the engine sees it.
@@ -86,7 +88,7 @@ Reads of documents and pages take the read paths of `src/docs_layer.hpp` and `sr
 `USTORE_WITH_NVME` is off by default, and the Python package turns it on; what follows is a v1 target, with SPDK mounts, GPU compaction and GPUDirect Storage reads supported today:
 
 - __Kernel bypass__ — a transport chosen at mount reaches each data directory through io_uring on `O_DIRECT` files, io_uring on NVMe block devices, NVMe passthrough, or SPDK's user-space driver, and falls back to blocking positioned I/O on macOS, Windows and wherever io_uring is refused.
-- __SIMD point lookups__ — sorted run indexes, micro-sets and ring buffers become SmashTable components with compile-time SIMD kits, one artifact carrying all of them and a database choosing one when it opens.
+- __SIMD point lookups__ — sorted run indexes, micro-sets and ring buffers become SmashTable components with compile-time SIMD kits, one artifact holding all of them and a database choosing one when it opens.
 - __GPU bulk operations__ — compaction merges sorted runs on the CPU or on a CUDA GPU, runs on both Hopper and Blackwell, and produces the same output as CPU compaction.
 - __GPUDirect Storage__ — compaction reads sorted runs from NVMe drives into GPU memory without staging in host memory.
 - __Isolation__ — NVMe's transactions reach SmashTable's levels once they run on SmashTable, after an analysis shows no loss of consistency or efficiency.
@@ -102,28 +104,26 @@ See [`nvme/README.md`](nvme/README.md) for its layers.
   An arena's first block spans its first allocation rounded up to a page, and every later block at least doubles the newest, so the one-off arena of a small call takes one page.
 - `algorithm.hpp` in `include/ustore/utilities/` — the search over sorted batches that the documents and graphs share, the reservoir sampling of keys over the iterators of RocksDB and LevelDB, and the inserts and erases in buffers of trivially copyable elements.
 - `blocking_files.hpp` in `include/ustore/utilities/` — whole-file mappings and directory queries, that block the calling thread and report a `status_t`.
-- `progress.hpp` — `progress_t`, the one reporter of a call's progress, which runs its callback on one thread at a time, so the counts it sees never decrease, and carries a cancellation to every thread of the call.
+- `progress.hpp` — `progress_t`, the one reporter of a call's progress, which runs its callback on one thread at a time, so the counts it sees never decrease, and holds a cancellation to every thread of the call.
 
 `batches.hpp` holds `strings_arg_t`, which reads a ragged input in any of its three layouts once the router has gathered what an accessor writes, beside the other batched arguments every engine takes and the checks every engine runs on them.
 `ram_device.hpp` and the arenas of `ram_buffers.hpp` own threads, topology and domain-placed memory over ForkUnion's C ABI, and nothing else calls `fu_*` directly, while `vram_nvidia_device.hpp` is the CUDA device layer GPU compaction builds on.
 
 ## Executors
 
-`include/ustore/utilities/ram_device.hpp` holds pools by type: an `executor_t` is spawned and deleted here and is the only kind parked when idle, a `lent_pool_t` is borrowed from another library and never deleted or parked, and both dispatch through a `pool_view_t`.
+`include/ustore/utilities/ram_device.hpp` holds the one kind of pool, an `ram_executor_t`, spawned, parked when idle and deleted here, which dispatches through a `pool_view_t`.
 Every `ustore_executor_t` that `src/types.cpp` builds holds one of them, one scratch per pool thread plus one for the call holding it, and that `holding_call_t`.
-Its `device` variant is the kind tag: nothing beyond the pool on RAM, the rings' options on NVMe, and on VRAM a `cuda_executor_t` holding the device ordinal, the one stream every call queues on, made or borrowed, and the scratch limit.
+Its `device` variant is the kind tag: nothing beyond the pool on RAM, the rings' options on NVMe, and on VRAM a `cuda_executor_t` holding the device ordinal, the one stream every call queues on, the caller's or the device's default one and never destroyed by the executor, and the scratch limit.
 A VRAM executor is caller-inclusive with one thread, its caller, which stages, feeds the device and waits on it, and every device verb table an engine leaves to `unsupported_vram_tables_k` answers `ustore_status_unsupported_k` until its device tower lands.
-`ustore_executor_for_ram` spawns its `executor_t` over a `topology_t`, which owns a `fu_topology_t`: `fu_pool_spawn` over every memory domain, `fu_pool_spawn_near_memory_domain` near one of several, and the whole machine for several but not all, since ForkUnion has no spawn over a subset.
+`ustore_executor_for_ram` spawns its `ram_executor_t` over a `topology_t`, which owns a `fu_topology_t`: `fu_pool_spawn` over every memory domain, `fu_pool_spawn_near_memory_domain` near one of several, and the whole machine for several but not all, since ForkUnion has no spawn over a subset.
 Zero threads take 7/8 of the cores of the compute domains local to the named memory domains, rounded down and at least one.
-`ustore_executor_on_pool` builds a `lent_pool_t` through `lent_pool_t::borrow`, which refuses a null pool or one holding no threads.
-At creation, a `for_threads` dispatch places each pool thread's scratch on its local memory domain when the options name it, and on the first named domain otherwise, and the call's scratch and every arena the executor makes live where thread 0's does, which the executor keeps as its one piece of placement state; a lent pool refusing that dispatch refuses the creation.
+At creation, a `for_threads` dispatch places each pool thread's scratch on its local memory domain when the options name it, and on the first named domain otherwise, and the call's scratch and every arena the executor makes live where thread 0's does, which the executor keeps as its one piece of placement state.
 
 `dispatch` in `src/lib.hpp` takes the executor's `holding_call.claim` with one exchange, and a second call from any thread finishes `ustore_status_contended_k`, so nothing queues and no thread drives the executor.
 The holding call records its outcome, the arena, cursor and transaction claims the router took, and raises the named-call counts of its database, of the transaction, snapshot or cursor it names and of its arena.
 A blocking call, and every call on a caller-inclusive pool, is served on the calling thread through `call_view`, the call's own scratch at the index past every pool thread's.
-A deferred call on an owned caller-exclusive pool is copied into `holding_call.delegated_arguments`, a `std::variant` of every struct that names an executor, and dispatched with `fu_pool_unsafe_for_threads`: pool thread 0 serves it in the caller's place and ends it, while the other threads return at once.
+A deferred call on a caller-exclusive pool is copied into `holding_call.delegated_arguments`, a `std::variant` of every struct that names an executor, and dispatched with `fu_pool_unsafe_for_threads`: pool thread 0 serves it in the caller's place and ends it, while the other threads return at once.
 Thread 0 may end the call before the submitter returns, so the dispatch's token stays local to the submitter, and the next call, a drain and a free each call `fu_pool_unsafe_join` with a zero token, which waits for whatever dispatch is in flight: at most the last instructions of the previous call on thread 0.
-A lent pool never delegates, since its lender keeps its dispatches and joins, so a deferred call on it runs at submission.
 Inside a call, every `for_threads`, `for_n` and `for_n_dynamic` on the executor's pool forks the other threads, thread 0 running its slice in place, so a verb splits its batch the same way whether its caller or thread 0 serves it.
 `end_call` ends every call in one order: the call's claims, its named-call counts, the executor claim, then the message and the status with release ordering, reading nothing of the executor after the claim, so a caller seeing the status final may submit again or free the executor at once.
 An engine's `ustore_database_init_ram`, `ustore_database_open_*` and `ustore_database_view_rocksdb` name their open as the template argument of `route_init`, which routes it as any other call, its copy the caller's argument struct and its serving verb the one instantiated for that open, since no handle names the engine yet.
@@ -131,10 +131,10 @@ An engine's `ustore_database_init_ram`, `ustore_database_open_*` and `ustore_dat
 Each scratch holds whatever a call needs only while it runs, such as the documents the docs layer parses or the edges a graph read stages, rewound before use and kept at its high-water mark until the executor is freed, so the call's arena holds only its outputs.
 The router gathers the views an accessor writes into the call's scratch, in blocks of up to 64 indices on the thread that serves the call, so an engine reads every ragged input as a tape or as gathered views.
 A call without an executor works in a scratch of its own on the calling thread, whose first page lies on the stack and whose larger blocks are freed once the call is final, so a small call allocates nothing and nothing keeps state behind the caller's back.
-An arena, made by `ustore_arena_init` on host pages or on the device of its executor, every transaction handle and every cursor carry a claim word, which the router takes before a call and releases once the engine returns, so a second call on any of them is refused as contended.
+An arena, made by `ustore_arena_init` on host pages or on the device of its executor, every transaction handle and every cursor hold a claim word, which the router takes before a call and releases once the engine returns, so a second call on any of them is refused as contended.
 The router refuses a `NULL` arena and an arena living where the call's executor does not compute, serves every call through the verb table of its executor's residency, `engine_t::host` or `engine_t::vram_nvidia`, leaves every output of a call `NULL` or zero until the engine writes it, and again after a failure or a cancellation, and refuses to reset a transaction through a database it does not belong to.
-Every handle carries an `access`, and the router refuses every call naming a transaction, collection creates and drops, clears and compactions with `ustore_status_read_only_k` on a database `ustore_database_view_rocksdb` opened.
-A compaction is a plan: each engine's `compact_plan_t` carries `tasks()`, `run(task, context)`, `advance()` and `finish()`, as USearch's refine plan does, its `compact_plan_open` reserving everything the plan keeps, the plan's only allocation, and `run_plan` of `src/utilities/progress.hpp` fans each phase's tasks out over the executor's pool, then ticks the phase's units at its barrier, where a cancel stops, so a live plan resumes at the phase it reached and runs its idempotent tasks again after a failure.
+Every handle holds an `access`, and the router refuses every call naming a transaction, collection creates and drops, clears and compactions with `ustore_status_read_only_k` on a database `ustore_database_view_rocksdb` or `ustore_database_view_nvme` opened.
+A compaction is a plan: each engine's `compact_plan_t` holds `tasks()`, `run(task, context)`, `advance()` and `finish()`, as USearch's refine plan does, its `compact_plan_open` reserving everything the plan keeps, the plan's only allocation, and `run_plan` of `src/utilities/progress.hpp` fans each phase's tasks out over the executor's pool, then ticks the phase's units at its barrier, where a cancel stops, so a live plan resumes at the phase it reached and runs its idempotent tasks again after a failure.
 NVMe compacts in a flush, then up to `compaction_passes_k` merge passes over every level, each one task run on the call's thread, since the store flushes and merges every collection under its one claim and a pass fans its own merge out over the pool.
 The router refuses a compaction and a plan's finish before taking any claim, so `uninitialized`, `invalid_argument`, `read_only` and `unsupported` come ahead of `contended`; a database's `compaction` claim admits one plan from its open to its finish, or one call naming no plan while it runs, and a plan's `named_calls` makes its finish wait for the call continuing it.
 Every handle, arenas and ingests included, counts the calls naming it in `named_calls`, raised at the call's claim and lowered at its end, with or without an executor, and each free waits for zero, so no binding keeps counts of its own.

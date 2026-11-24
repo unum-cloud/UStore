@@ -33,6 +33,15 @@ using namespace unum;
 /** The reason the stamp cases report on an engine that keeps no snapshots to stamp. */
 constexpr char const* needs_stamps_k = "needs stamps";
 
+/** An executor of the suite's engine, since an NVMe database refuses a RAM one with @c device_k. */
+expected<executor_t> engine_executor() noexcept {
+    engine_names_t names;
+    if (unnamed_flag_t const unnamed = read_engine_names(test_run.settings.engine, names); !unnamed.flag.empty())
+        return {{}, status_t {status_code_t::invalid_argument_k, "The suite's engine has no such name"}};
+    if (names.engine != ustore_engine_nvme_k) return executor_t::for_ram({.threads = 1});
+    return executor_t::for_nvme({.nvme = {.transport = names.transport}, .threads = 1});
+}
+
 /** The binary, document, graph and strings handles whose verbs answer deferred calls. */
 using deferred_blobs_t = blobs_collection_on<ustore_completion_deferred_k, collection_access_t::read_write_k>;
 using deferred_blobs_read_t = blobs_collection_on<ustore_completion_deferred_k, collection_access_t::read_only_k>;
@@ -96,7 +105,7 @@ static_assert(
 static_assert(std::same_as<decltype(std::declval<blobs_collection_t const&>().remove(keys_view_t {})), status_t>);
 static_assert(std::same_as<decltype(std::declval<deferred_blobs_t const&>().remove(keys_view_t {})), deferred<>>);
 
-/* A deferred verb borrows its inputs as views of any contiguous batch, and an arena by reference,
+/* A deferred verb views its inputs as views of any contiguous batch, and an arena by reference,
  * so a temporary arena, which would die before the call is final, never reaches it */
 static_assert(reads_concept<deferred_blobs_t, std::array<ustore_key_t, 2>&, arena_t&>);
 static_assert(reads_concept<deferred_blobs_t, st::vector<ustore_key_t>&, arena_t&>);
@@ -142,12 +151,12 @@ static_assert(std::is_nothrow_move_constructible_v<changes_cursor_t> &&
 static_assert(std::is_nothrow_move_constructible_v<ingest_t> && !std::is_copy_constructible_v<ingest_t>);
 static_assert(std::is_nothrow_move_constructible_v<arrow_export_t> && !std::is_copy_constructible_v<arrow_export_t>);
 
-/* A shorthand result owns its one-off arena, while a view only borrows one */
+/* A shorthand result owns its one-off arena, while a view only views one */
 static_assert(owns_arena_concept<owned_value_t, value_view_t>);
 static_assert(owns_arena_concept<owned<values_view_t>, values_view_t>);
 static_assert(!owns_arena_concept<value_view_t, value_view_t>);
 
-/* A progress callable never throws, as every wrapper is noexcept, and the call borrows it, so a
+/* A progress callable never throws, as every wrapper is noexcept, and the call views it, so a
  * temporary never does */
 using continuing_progress_t = decltype([](ustore_size_t, ustore_size_t) noexcept { return ustore_continue_k; });
 using throwing_progress_t = decltype([](ustore_size_t, ustore_size_t) { return ustore_continue_k; });
@@ -203,8 +212,8 @@ void test_wrappers_compile(config_t const& config) {
     auto [prefixes, prefixes_status] = head.find_or_create("prefixes");
     if (!expect_true(!prefixes_status.failed())) return;
     expect_true(!prefixes.at(key_from_integer(42)).assign("purpose").failed());
-    auto [articles, articles_status] = head["articles"];
-    auto [suffixes, suffixes_status] = head["suffixes"];
+    auto [articles, articles_status] = head.find_or_create("articles");
+    auto [suffixes, suffixes_status] = head.find_or_create("suffixes");
     expect_true(!articles_status.failed() && !articles.at(key_from_integer(42)).assign("of").failed());
     expect_true(!suffixes_status.failed() && !suffixes.at(key_from_integer(42)).assign("life").failed());
 
@@ -249,12 +258,13 @@ void test_wrappers_compile(config_t const& config) {
     if (!expect_true(!documents_collection_status.failed())) return;
     expect_true(!documents_collection[key_from_integer(56)].assign(R"({"hello":"world","answer":42})").failed());
     auto [field, field_status] = documents_collection[collection_key_field_t {key_from_integer(56), "hello"}].value();
-    expect_true(!field_status.failed() && field == "world");
+    expect_true(!field_status.failed() && field == R"("world")");
 
-    // The same verbs blocking on an executor, and answering deferred calls that borrow their inputs
-    auto [executor, executor_status] = executor_t::for_ram({.threads = 1});
-    if (!expect_true(!executor_status.failed())) return;
-    expect_true(!database_t::init_ram({}, executor).status.failed());
+    // The same verbs blocking on an executor, and answering deferred calls that view their inputs
+    auto [executor, executor_status] = engine_executor();
+    auto [ram_executor, ram_executor_status] = executor_t::for_ram({.threads = 1});
+    if (!expect_true(!executor_status.failed() && !ram_executor_status.failed())) return;
+    expect_true(!database_t::init_ram({}, ram_executor).status.failed());
     database_ref_t const head_on_executor = database.on(executor);
     auto [on_executor, on_executor_status] = head_on_executor.find("main");
     if (!expect_true(!on_executor_status.failed())) return;
@@ -267,57 +277,55 @@ void test_wrappers_compile(config_t const& config) {
 
     database_on<ustore_completion_deferred_k> const deferred_head = database.deferred(executor);
     deferred_blobs_t const deferred_main = deferred_head[main_collection.handle()];
-    std::array<ustore_key_t, 2> const borrowed_keys {key_from_integer(43), key_from_integer(44)};
+    std::array<ustore_key_t, 2> const viewed_keys {key_from_integer(43), key_from_integer(44)};
     std::array<std::string_view, 2> const blobs {"left", "right"};
-    expect_true(!deferred_main.write(borrowed_keys, blobs).wait().failed());
-    deferred<values_view_t> reading = deferred_main.read(borrowed_keys, arena);
+    expect_true(!deferred_main.write(viewed_keys, blobs).wait().failed());
+    deferred<values_view_t> reading = deferred_main.read(viewed_keys, arena);
     [[maybe_unused]] status_code_t const polled = reading.status();
     auto const [read, read_status] = reading.wait();
     expect_true(!read_status.failed());
     if (!read_status.failed())
         for ([[maybe_unused]] value_view_t const element : read) {}
-    deferred<> removing = deferred_main.remove(borrowed_keys);
+    deferred<> removing = deferred_main.remove(viewed_keys);
     expect_true(!removing.wait().failed());
     expect_true(!main_collection.deferred(executor).clear_values().wait().failed());
     auto const [created, deferred_create_status] = deferred_head.create("created").wait();
     expect_true(!deferred_create_status.failed());
     if (!deferred_create_status.failed()) {
-        expect_true(!deferred_head[created.handle()].remove(borrowed_keys).wait().failed());
+        expect_true(!deferred_head[created.handle()].remove(viewed_keys).wait().failed());
         expect_true(!deferred_head.drop(created.handle()).wait().failed());
     }
     expect_true(!deferred_head.collections(arena).wait().status.failed());
     expect_true(!deferred_head.describe().wait().status.failed());
     expect_true(!deferred_head.flush().wait().failed());
 
-    // Deferred documents, graphs and strings, each verb borrowing its inputs
+    // Deferred documents, graphs and strings, each verb viewing its inputs
     expect_true(!head.find_or_create<docs_collection_t>("docs").status.failed());
     auto [deferred_documents, deferred_documents_status] = deferred_head.find<docs_collection_t>("docs", arena).wait();
     if (!expect_true(!deferred_documents_status.failed())) return;
     std::array<std::string_view, 2> const documents {R"({"hello":"world"})", R"({"hello":"again"})"};
-    expect_true(!deferred_documents.write(borrowed_keys, documents).wait().failed());
-    [[maybe_unused]] expected<values_view_t> const documents_read =
-        deferred_documents.read(borrowed_keys, arena).wait();
+    expect_true(!deferred_documents.write(viewed_keys, documents).wait().failed());
+    [[maybe_unused]] expected<values_view_t> const documents_read = deferred_documents.read(viewed_keys, arena).wait();
     std::array<std::string_view, 1> const hello {"hello"};
     [[maybe_unused]] expected<values_view_t> const fields_read =
-        deferred_documents.read(borrowed_keys, arena, hello, ustore_docs_field_type_string_k).wait();
-    [[maybe_unused]] expected<strings_view_t> const gist = deferred_documents.gist(borrowed_keys, arena).wait();
+        deferred_documents.read(viewed_keys, arena, hello, ustore_docs_field_type_string_k).wait();
+    [[maybe_unused]] expected<strings_view_t> const gist = deferred_documents.gist(viewed_keys, arena).wait();
     auto const header = make_table_header().with<std::string_view>("hello");
     [[maybe_unused]] expected<docs_table<std::string_view>> const gathered =
-        deferred_documents.gather(borrowed_keys, header, arena).wait();
-    expect_true(!deferred_documents.remove(borrowed_keys).wait().failed());
+        deferred_documents.gather(viewed_keys, header, arena).wait();
+    expect_true(!deferred_documents.remove(viewed_keys).wait().failed());
     expect_true(!head.create<graph_collection_t>("graph").status.failed());
     auto [deferred_graph, deferred_graph_status] = deferred_head.find<graph_collection_t>("graph", arena).wait();
     if (!expect_true(!deferred_graph_status.failed())) return;
-    std::array<edge_t, 1> const borrowed_edges {edge_t {key_from_integer(43), key_from_integer(44)}};
+    std::array<edge_t, 1> const viewed_edges {edge_t {key_from_integer(43), key_from_integer(44)}};
     ustore_vertex_role_t const leaving = ustore_vertex_role_source_k;
-    strided_span<ustore_vertex_role_t const> const roles {{&leaving, 0}, borrowed_keys.size()};
-    expect_true(!deferred_graph.write_edges(borrowed_edges).wait().failed());
-    expect_true(!deferred_graph.write_vertices(borrowed_keys).wait().failed());
-    [[maybe_unused]] expected<edges_view_t> const edges_read = deferred_graph.read_edges(borrowed_keys, arena).wait();
-    [[maybe_unused]] expected<degrees_view_t> const degrees =
-        deferred_graph.degrees(borrowed_keys, arena, roles).wait();
-    expect_true(!deferred_graph.remove_edges(borrowed_edges).wait().failed());
-    expect_true(!deferred_graph.remove_vertices(borrowed_keys).wait().failed());
+    strided_span<ustore_vertex_role_t const> const roles {{&leaving, 0}, viewed_keys.size()};
+    expect_true(!deferred_graph.write_edges(viewed_edges).wait().failed());
+    expect_true(!deferred_graph.write_vertices(viewed_keys).wait().failed());
+    [[maybe_unused]] expected<edges_view_t> const edges_read = deferred_graph.read_edges(viewed_keys, arena).wait();
+    [[maybe_unused]] expected<degrees_view_t> const degrees = deferred_graph.degrees(viewed_keys, arena, roles).wait();
+    expect_true(!deferred_graph.remove_edges(viewed_edges).wait().failed());
+    expect_true(!deferred_graph.remove_vertices(viewed_keys).wait().failed());
 
     expect_true(!head.create<strings_collection_t>("strings").status.failed());
     auto [deferred_strings,
@@ -356,7 +364,7 @@ void test_wrappers_compile(config_t const& config) {
         [[maybe_unused]] expected<deferred_blobs_t> const deferred_named =
             deferred_transaction.find("docs", arena).wait();
         auto [transaction_main, transaction_main_status] = deferred_transaction.find("main", arena).wait();
-        expect_true(!transaction_main_status.failed() && !transaction_main.remove(borrowed_keys).wait().failed());
+        expect_true(!transaction_main_status.failed() && !transaction_main.remove(viewed_keys).wait().failed());
         [[maybe_unused]] expected<read_stamp_t> const staged = deferred_transaction.stage().wait();
         [[maybe_unused]] status_t const rolled_back = deferred_transaction.rollback().wait();
         [[maybe_unused]] expected<commit_stamp_t> const committed = deferred_transaction.commit().wait();
@@ -379,11 +387,11 @@ void test_wrappers_compile(config_t const& config) {
             snapshot.find<strings_collection_t>("strings");
         auto [deferred_snapshot, deferred_snapshot_status] = snapshot.deferred(executor).find("main", arena).wait();
         if (!expect_true(!deferred_snapshot_status.failed())) return;
-        expect_true(!deferred_snapshot.read(borrowed_keys, arena).wait().status.failed());
+        expect_true(!deferred_snapshot.read(viewed_keys, arena).wait().status.failed());
         auto [deferred_snapshot_documents, deferred_snapshot_documents_status] =
             snapshot.deferred(executor).find<docs_collection_t>("docs", arena).wait();
         if (!expect_true(!deferred_snapshot_documents_status.failed())) return;
-        expect_true(!deferred_snapshot_documents.read(borrowed_keys, arena).wait().status.failed());
+        expect_true(!deferred_snapshot_documents.read(viewed_keys, arena).wait().status.failed());
         if (config.directory()) {
             std::string const saved = fmt::format("{}/{}", config.directory(), "saved");
             expect_true(create_directories(saved.c_str()));
@@ -438,8 +446,11 @@ void test_wrappers_match(config_t const& config) {
     match_t const filtered {.filter = bytes_of(older), .predicate = predicate_of(even_keys)};
     auto [cursor, cursor_status] = docs_cursor_t::make(receiver, people.handle(), smallest_key_k, filtered);
     if (!expect_true(!cursor_status.failed())) return;
-    auto [page, page_status] = cursor.next_pairs(8, arena);
-    expect_true(!page_status.failed() && page.keys.size() == 2 && page.keys[1] == key_from_integer(4));
+    auto [batches, batches_status] = cursor.next(8, arena);
+    std::size_t rows = 0;
+    for (ustore_docs_batch_view_t const& batch : batches) rows += batch.count;
+    expect_true(!batches_status.failed() && rows == 2 &&
+                batches.back().keys[batches.back().count - 1] == key_from_integer(4));
     expect_true(asked != 0);
     expect_true(!database.clear(ustore_drop_collection_k).failed());
 }
@@ -452,7 +463,7 @@ void test_wrappers_sample_measure(config_t const& config) {
     database_t const& head = database;
     expect_true(!head.clear(ustore_drop_collection_k).failed());
     auto [arena, arena_status] = arena_t::make();
-    auto [executor, executor_status] = executor_t::for_ram({.threads = 1});
+    auto [executor, executor_status] = engine_executor();
     auto [words, words_status] = head.create<strings_collection_t>("words");
     auto [people, people_status] = head.create<docs_collection_t>("people");
     auto [graph, graph_status] = head.create<graph_collection_t>("graph");
@@ -504,7 +515,7 @@ case_result_t test_wrappers_pages(config_t const& config) {
     database_t const& head = database;
     expect_true(!head.clear(ustore_drop_collection_k).failed());
     auto [arena, arena_status] = arena_t::make();
-    auto [executor, executor_status] = executor_t::for_ram({.threads = 1});
+    auto [executor, executor_status] = engine_executor();
     auto [pages, pages_status] = head.create<pages_collection_t>("pages");
     if (!expect_true(!arena_status.failed() && !executor_status.failed() && !pages_status.failed())) return {};
 

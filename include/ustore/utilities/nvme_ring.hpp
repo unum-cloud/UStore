@@ -10,7 +10,7 @@
  *  serialization in @c types.hpp.
  *
  *  The ring is exposed rather than hidden behind a blocking read, because a blocking read reaches
- *  the depth of one thread and an NVMe namespace wants thousands of commands outstanding. An queue
+ *  the depth of one thread and an NVMe namespace wants thousands of commands outstanding. A queue
  *  pair submits a batch, does other work, and polls its own completions; nothing here ever blocks,
  *  so no fiber is needed to park a caller that ran out of credit.
  *
@@ -33,6 +33,7 @@
 #include <concepts> // `std::same_as`
 #include <span>     // `std::span`
 #include <utility>  // `std::exchange`
+#include <variant>  // `std::variant`, `std::get_if`, `std::holds_alternative`
 
 #include "ustore/utilities/types.hpp" // `status_t`, `status_code_t`, `expected`, `byte_t`
 
@@ -104,11 +105,13 @@ class countdown {
         return !has_failed();
     }
 
-    /** The failure a part reported, and success once the counter carries none again. */
-    status_t release_status() noexcept {
-        int const code = code_reference_().exchange(0, std::memory_order_acquire);
+    /** The failure a part reported, kept until @c reset so a part failing after the wait ended
+     *  never reopens the latch; call it only after @c wait, since the note is a plain word only
+     *  the winning failure writes. */
+    status_t release_status() const noexcept {
+        int const code = code_reference_().load(std::memory_order_acquire);
         if (code == 0) return {};
-        return {static_cast<status_code_t>(code), std::exchange(note_, nullptr)};
+        return {static_cast<status_code_t>(code), note_};
     }
 
   private:
@@ -140,7 +143,7 @@ class countdown {
 /**
  *  @brief One part's handle onto the counter its job reports through, cheap enough to copy per part.
  *
- *  Every handle borrows a counter that outlives it, so a part reports without knowing who waits.
+ *  Every handle views a counter that outlives it, so a part reports without knowing who waits.
  */
 template <template <typename> typename atomic_reference_, typename waiter_type_>
 class notifier {
@@ -317,10 +320,7 @@ struct extent_t {
 #pragma region Vocabulary
 
 /** A table's version, raised on every change so a ring knows its copy is behind. */
-using epoch_t = std::int32_t;
-
-/** The hash of a thread's identity, which binds a queue pair to the thread that submits on it. */
-using thread_identity_t = std::uint64_t;
+using epoch_t = std::uint64_t;
 
 /** Which reissue of a queue pair slot a token belongs to, the 16 bits of the token beside the tag. */
 using queue_pair_generation_t = std::uint16_t;
@@ -402,12 +402,14 @@ enum class memory_space_t : std::uint8_t {
 };
 
 /** One queue pair on a share of the ring's depth, or @c unallocated_k for a handle that holds none. */
-enum class queue_pair_id_t : std::uint16_t {
+enum class queue_id_t : std::uint16_t {
     unallocated_k = 0xFFFF,
 };
 
-/** One registered memory range, or @c unregistered_k for a handle that names none. */
+/** One registered memory range, @c queue_range_k for the submitting queue's own blocks, which no
+ *  disk registers, or @c unregistered_k for a handle that names none. */
 enum class registered_memory_id_t : std::uint16_t {
+    queue_range_k = 0xFFFE,
     unregistered_k = 0xFFFF,
 };
 
@@ -470,15 +472,15 @@ struct request_token_t {
     std::uint64_t bits = 0;
 
     /** Packs a queue pair, its queue pair generation and the queue pair's own tag into one token. */
-    [[nodiscard]] static constexpr request_token_t make(queue_pair_id_t queue_pair, queue_pair_generation_t generation,
+    [[nodiscard]] static constexpr request_token_t make(queue_id_t queue_pair, queue_pair_generation_t generation,
                                                         request_tag_t tag) noexcept {
         return request_token_t {(static_cast<std::uint64_t>(queue_pair) << 48) |
                                 (static_cast<std::uint64_t>(generation) << 32) | tag};
     }
 
     /** The queue pair this completion belongs to. */
-    [[nodiscard]] constexpr queue_pair_id_t queue_pair() const noexcept {
-        return static_cast<queue_pair_id_t>(static_cast<std::uint16_t>(bits >> 48));
+    [[nodiscard]] constexpr queue_id_t queue_pair() const noexcept {
+        return static_cast<queue_id_t>(static_cast<std::uint16_t>(bits >> 48));
     }
 
     /** The queue pair generation, which separates a queue pair from its predecessor in the same slot. */
@@ -503,7 +505,7 @@ struct request_token_t {
  *
  *  A bare pointer cannot be submitted: io_uring's fixed forms want a slot index plus an offset,
  *  cuFile wants the registered base plus an offset, and SPDK needs the range in its memory map
- *  before @c spdk_vtophys can translate it. Naming the registered memory also makes the borrow
+ *  before @c spdk_vtophys can translate it. Naming the registered memory also makes the view
  *  visible, so a disk can refuse to deregister memory that is still a live DMA medium.
  */
 struct memory_reference_t {
@@ -524,7 +526,7 @@ struct memory_reference_t {
  *  Storage is addressed exactly as memory is, by a registered slot and an offset into it, because a
  *  path cannot be submitted any more than a pointer can: @c IORING_REGISTER_FILES wants a table
  *  index, and an SPDK namespace has no path at all. The offset lives in the request's extent, so
- *  what a place carries is the slot and the generation that separates it from its predecessor.
+ *  what a place holds is the slot and the generation that separates it from its predecessor.
  */
 struct medium_reference_t {
 
@@ -536,7 +538,7 @@ struct medium_reference_t {
 };
 
 /**
- *  @brief One command the queue pair submits, borrowing a registered buffer until its token retires.
+ *  @brief One command the queue pair submits, viewing a registered buffer until its token retires.
  *
  *  The ring never copies the bytes and never owns them. From the moment @c submit accepts a request
  *  until its completion is completed, the registered range behind @p buffer belongs to the device: the
@@ -635,7 +637,7 @@ struct completion_t {
 class disk_handle_t {
   public:
 
-    /** The index an empty handle carries, which is every 16-bit pool's absent index. */
+    /** The index an empty handle holds, which is every 16-bit pool's absent index. */
     static constexpr std::uint16_t absent_k = 0xFFFF;
 
     disk_handle_t() noexcept = default;
@@ -682,64 +684,72 @@ class disk_handle_t {
     std::uint16_t generation_ = 0;
 };
 
+class blocking_queue_t;
+class linux_uring_queue_t;
+class linux_aio_queue_t;
+class linux_spdk_queue_t;
+class linux_cufile_queue_t;
+
 /**
- *  @brief One queue pair on a share of the ring's depth, held by exactly one thread at a time.
+ *  @brief A channel's handle on one queue its thread owns, of whichever transport the queue set
+ *      was made for.
  *
- *  The queue pair is the queue pair identity the transports demand, not a convenience: an io_uring
- *  ring set up with @c SINGLE_ISSUER refuses a foreign reaper, and an SPDK queue pair corrupts
- *  itself silently under one. Moving a queue pair hands it to another thread, which is the only
- *  legal handoff when a controller offers fewer queue pairs than the executor has threads; a queue
- *  pair is never shared. The receiving thread announces itself with the disk's @c adopt, since a
- *  ring cannot observe a move and an unannounced one is indistinguishable from two threads sharing
- *  a queue pair.
- *
- *  @note Return the queue pair with the disk's @c release before the handle dies, since the handle cannot
- *      drain the device on its own.
+ *  The queue is the identity the transports demand: an SPDK queue pair corrupts itself silently
+ *  under a second reaper, so only the thread owning a queue submits and polls on it. The queue
+ *  set owns the queue and outlives every handle; a disk resolves the alternative of its own
+ *  transport and refuses another, and registers its media on the queue with @c register_media
+ *  before the first submission.
  */
-class queue_pair_t {
+class queue_ref_t {
   public:
 
-    queue_pair_t() noexcept = default;
+    queue_ref_t() noexcept = default;
 
-    /** The handle a disk hands back from @c acquire_queue_pair; callers never call this. */
-    queue_pair_t(disk_handle_t&& handle, queue_depth_t depth) noexcept : handle_(std::move(handle)), depth_(depth) {}
+    /** The handle on @p queue, whose tokens hold @p id. */
+    template <typename queue_type_>
+    queue_ref_t(queue_type_& queue, queue_id_t id) noexcept : queue_(&queue), id_(id), depth_(queue.depth()) {}
 
-    /** Empties the handle once the disk has taken the queue pair back; callers never call this. */
-    void surrender() noexcept { handle_.surrender(); }
+    /** The queue of transport @p queue_type_, or null when the handle names another transport's or
+     *  none. */
+    template <typename queue_type_>
+    [[nodiscard]] queue_type_* queue() const noexcept {
+        queue_type_* const* const held = std::get_if<queue_type_*>(&queue_);
+        return held ? *held : nullptr;
+    }
 
-    /** Whether this handle still holds a queue pair. */
-    [[nodiscard]] bool held() const noexcept { return handle_.held(); }
+    /** Whether this handle names a queue. */
+    [[nodiscard]] bool held() const noexcept { return !std::holds_alternative<std::monostate>(queue_); }
 
-    /** The slot this queue pair occupies. */
-    [[nodiscard]] queue_pair_id_t id() const noexcept { return static_cast<queue_pair_id_t>(handle_.index()); }
+    /** The identifier every token of this queue holds. */
+    [[nodiscard]] queue_id_t id() const noexcept { return id_; }
 
-    /** The generation that separates this queue pair from the slot's previous one. */
-    [[nodiscard]] queue_pair_generation_t generation() const noexcept { return handle_.generation(); }
-
-    /** Requests this queue pair may keep in flight at once, reserved when the queue pair was taken. */
+    /** Requests the queue keeps in flight at once, fixed when the queue set made it. */
     [[nodiscard]] queue_depth_t depth() const noexcept { return depth_; }
 
-    /** Mints a token of this queue pair carrying the queue pair's own @p tag. */
-    [[nodiscard]] request_token_t token(request_tag_t tag) const noexcept {
-        return request_token_t::make(id(), generation(), tag);
-    }
+    /** Mints a token of this queue holding the caller's own @p tag. */
+    [[nodiscard]] request_token_t token(request_tag_t tag) const noexcept { return request_token_t::make(id_, 0, tag); }
 
   private:
 
-    /** The record the queue pair occupies in its disk's pool. */
-    disk_handle_t handle_;
+    /** The queue, owned by the queue set. */
+    std::variant<std::monostate, blocking_queue_t*, linux_uring_queue_t*, linux_aio_queue_t*, linux_spdk_queue_t*,
+                 linux_cufile_queue_t*>
+        queue_;
 
-    /** Requests this queue pair may keep in flight at once. */
+    /** The identifier its tokens hold. */
+    queue_id_t id_ = queue_id_t::unallocated_k;
+
+    /** Requests the queue keeps in flight at once. */
     queue_depth_t depth_ = 0;
 };
 
 /**
  *  @brief One registered memory range, which a request addresses by slot and offset.
  *
- *  A registered memory is the borrow the ring can enforce: while requests against it are in flight the
- *  disk refuses to give it back, so a buffer cannot be freed under a live DMA medium by accident.
- *  Registration is also where a transport says what it cannot reach, such as device memory on the
- *  blocking floor, and where it pins pages once instead of per request.
+ *  A registered memory is the view the ring can enforce: while requests against it are in flight
+ *  the disk refuses to give it back, so a buffer cannot be freed under a live DMA medium by
+ *  accident. Registration is also where a transport says what it cannot reach, such as device
+ *  memory on the blocking floor, and where it pins pages once instead of per request.
  */
 class registered_memory_t {
   public:
@@ -773,7 +783,7 @@ class registered_memory_t {
     /** Where the range lives, which the disk agreed to at registration. */
     [[nodiscard]] memory_space_t space() const noexcept { return space_; }
 
-    /** The place @p offset bytes into this range, which a request carries instead of a pointer. */
+    /** The place @p offset bytes into this range, which a request holds instead of a pointer. */
     [[nodiscard]] memory_reference_t reference(std::uint64_t offset = 0) const noexcept {
         return memory_reference_t {id(), generation(), offset};
     }
@@ -795,8 +805,8 @@ class registered_memory_t {
  *
  *  A medium is registered for the same reason a buffer is: @c IORING_REGISTER_FILES addresses a
  *  file by table index and skips the registered medium lookup every request would otherwise repeat,
- *  and an SPDK namespace has no name to pass at all. Registering it also makes the borrow visible,
- *  so a disk can refuse to close a medium that requests are still in flight against.
+ *  and an SPDK namespace has no name to pass at all. Registering it also makes the view visible, so
+ *  a disk can refuse to close a medium that requests are still in flight against.
  */
 class registered_medium_t {
   public:
@@ -832,7 +842,7 @@ class registered_medium_t {
      *  tear fits inside. */
     [[nodiscard]] std::uint64_t logical_block_bytes() const noexcept { return logical_block_bytes_; }
 
-    /** The place a request carries instead of a name. */
+    /** The place a request holds instead of a name. */
     [[nodiscard]] medium_reference_t reference() const noexcept { return medium_reference_t {id(), generation()}; }
 
   private:
@@ -860,7 +870,7 @@ class registered_medium_t {
  *  @c portable_alignment_k satisfies every transport, so a caller that does not want to branch may
  *  use it and be accepted everywhere.
  */
-struct ring_capabilities_t {
+struct disk_capabilities_t {
 
     /** Alignment the first byte of a registered buffer must meet. */
     std::uint64_t memory_alignment = 1;
@@ -871,13 +881,14 @@ struct ring_capabilities_t {
     /** Multiple an extent's length must be. */
     std::uint64_t length_granularity = 1;
 
-    /** Largest extent one request may carry. */
+    /** Largest extent one request may hold. */
     std::uint64_t max_transfer_bytes = 0;
 
     /** Requests one queue pair may keep in flight at once. */
     queue_depth_t depth_limit = 0;
 
-    /** Leases the ring can hand out at once, which a controller's queue-pair count bounds. */
+    /** Queue pairs a controller grants the process at once, zero where the transport sets no such
+     *  bound. */
     std::uint16_t queue_pairs_limit = 0;
 
     /** Targets the disk registers at once, which is one on a namespace and many in a directory. */
@@ -894,19 +905,19 @@ struct ring_capabilities_t {
 /**
  *  @brief What every NVMe disk offers, so a caller compiles against the transport its mount chose.
  *
- *  Nothing here blocks. @c submit takes a prefix of the batch and answers how much it took, which is
- *  zero on a full ring; @c poll answers how many completions it moved, which is zero when none are
- *  ready. A disk whose kernel can park the caller also offers @c wait_completions, which sleeps
- *  until one lands; SPDK has no interrupt at all, so @ref wait_completions polls it instead.
+ *  Nothing here blocks. @c submit takes a prefix of the batch and answers how much it took, which
+ *  is zero on a full ring; @c poll answers how many completions it moved, which is zero when none
+ *  are ready. A disk whose kernel can park the caller also offers @c wait_completions, which sleeps
+ *  until one lands; SPDK has no interrupt at all, so @ref wait_completions polls it instead. A
+ *  queue belongs to a queue set, never to a disk, so a call first registers the disk's media on the
+ *  queue it submits on, which costs nothing while the queue already holds them.
  */
 template <typename disk_type_>
-concept ring_concept = requires(disk_type_& disk, disk_type_ const& constant, queue_pair_t& queue_pair,
+concept disk_concept = requires(disk_type_& disk, disk_type_ const& constant, queue_ref_t const& queue_pair,
                                 registered_memory_t& registered_memory, registered_medium_t& registered_medium,
                                 medium_options_t medium, std::span<request_t const> requests,
                                 std::span<completion_t> completions, std::span<byte_t> memory) {
-    { disk.acquire_queue_pair(std::uint32_t {}) } -> std::same_as<expected<queue_pair_t>>;
-    { disk.bind_queue_pair(queue_pair) } -> std::same_as<status_t>;
-    { disk.release_queue_pair(queue_pair) } -> std::same_as<status_t>;
+    { disk.register_media(queue_pair) } -> std::same_as<status_t>;
     { disk.register_memory(memory, memory_space_t::host_k) } -> std::same_as<expected<registered_memory_t>>;
     { disk.unregister_memory(registered_memory) } -> std::same_as<status_t>;
     { disk.register_medium(medium) } -> std::same_as<expected<registered_medium_t>>;
@@ -916,25 +927,25 @@ concept ring_concept = requires(disk_type_& disk, disk_type_ const& constant, qu
     { disk.cancel(queue_pair) } -> std::same_as<void>;
     { disk.drain(queue_pair) } -> std::same_as<status_t>;
     { constant.outstanding(queue_pair) } -> std::same_as<std::size_t>;
-    { constant.capabilities() } -> std::same_as<ring_capabilities_t>;
+    { constant.capabilities() } -> std::same_as<disk_capabilities_t>;
 };
 
 /** Whether a disk parks the caller in the kernel until a completion lands. */
 template <typename disk_type_>
-concept sleeping_ring_concept = requires(disk_type_& disk, queue_pair_t const& queue_pair,
+concept sleeping_disk_concept = requires(disk_type_& disk, queue_ref_t const& queue_pair,
                                          std::span<completion_t> into) { disk.wait_completions(queue_pair, into); };
 
 /** Whether a disk may need the memory it transfers from pages its DMA engine reaches. */
 template <typename disk_type_>
-concept dma_memory_ring_concept = requires(disk_type_& disk) { disk.needs_dma_memory(); };
+concept dma_memory_disk_concept = requires(disk_type_& disk) { disk.needs_dma_memory(); };
 
 /** Whether a disk names the memory domain its transfers prefer. */
 template <typename disk_type_>
-concept memory_domain_ring_concept = requires(disk_type_& disk) { disk.memory_domain(); };
+concept memory_domain_disk_concept = requires(disk_type_& disk) { disk.memory_domain(); };
 
 /** Whether a disk holds a share of the process's transport to give back on unmount. */
 template <typename disk_type_>
-concept releasing_ring_concept = requires(disk_type_& disk) { disk.release(); };
+concept releasing_disk_concept = requires(disk_type_& disk) { disk.release(); };
 
 /** Spins over a ring that never blocks, so a bounded wait needs no fiber and no interrupt. */
 inline constexpr std::size_t poll_spin_limit_k = std::size_t {1} << 30;
@@ -950,8 +961,8 @@ inline constexpr std::size_t poll_spin_limit_k = std::size_t {1} << 30;
  *  @tparam waiter_type_ What the polling core does after a poll that moved nothing.
  */
 template <typename waiter_type_, typename disk_type_>
-    requires ring_concept<disk_type_>
-expected<std::size_t> poll_completions_at_least(disk_type_& disk, queue_pair_t const& queue_pair,
+    requires disk_concept<disk_type_>
+expected<std::size_t> poll_completions_at_least(disk_type_& disk, queue_ref_t const& queue_pair,
                                                 std::span<completion_t> into, std::size_t wanted,
                                                 std::size_t spins_limit = poll_spin_limit_k) noexcept {
     if (wanted > into.size())
@@ -976,10 +987,10 @@ expected<std::size_t> poll_completions_at_least(disk_type_& disk, queue_pair_t c
  *  @tparam waiter_type_ What the polling core does after a poll that moved nothing.
  */
 template <typename waiter_type_, typename disk_type_>
-    requires ring_concept<disk_type_>
-expected<std::size_t> wait_completions(disk_type_& disk, queue_pair_t const& queue_pair,
+    requires disk_concept<disk_type_>
+expected<std::size_t> wait_completions(disk_type_& disk, queue_ref_t const& queue_pair,
                                        std::span<completion_t> into) noexcept {
-    if constexpr (sleeping_ring_concept<disk_type_>) return disk.wait_completions(queue_pair, into);
+    if constexpr (sleeping_disk_concept<disk_type_>) return disk.wait_completions(queue_pair, into);
     else
         for (std::size_t spins = 0;; ++spins) {
             auto [moved, poll_completions_status] = disk.poll_completions(queue_pair, into);

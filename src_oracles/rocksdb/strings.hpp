@@ -20,7 +20,8 @@
 
 #include <rocksdb/db.h>
 
-#include "ustore/utilities/ranges.hpp" // `strided`, `strided_iterator`
+#include "ustore/utilities/ram_buffers.hpp" // `arena_copy`
+#include "ustore/utilities/ranges.hpp"      // `strided`, `strided_iterator`
 
 #include "database.hpp"           // `database_t`, `transaction_t`, `refuse_collections`, `buffer_write`, `step_towards`
 #include "utilities/batches.hpp"  // `validate_choices`, `validate_direction`, `samples_of`, `sample_generator_t`
@@ -197,16 +198,21 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
 
     auto [outputs, outputs_status] = strings_read_outputs_t::make(arguments);
     if (outputs_status.failed()) return outputs_status;
-    auto read_slice = [&](std::size_t first, std::size_t length, view_t const&) noexcept -> status_t {
+    auto read_slice = [&](std::size_t first, std::size_t length, std::size_t, view_t const&) noexcept -> status_t {
         ::rocksdb::PinnableSlice value;
         for (std::size_t index = first; index != first + length; ++index) {
             ustore_collection_id_t const collection = collections[index];
             column_t* const column = column_of(database, collection);
             std::string_view const text = chars_of(texts[index]);
             ::rocksdb::Slice const key {text};
-            if (transaction && view.watch == ustore_watch_keys_k &&
-                st::failed(transaction->watched_strings.push_back(std::pair {collection, std::string(text)})))
-                return {status_code_t::out_of_memory_k, "Failed to watch a string"};
+            if (transaction && view.watch == ustore_watch_keys_k) {
+                auto [watched, watched_status] = arena_copy<char>(&transaction->watched_texts,
+                                                                  std::span<char const> {text});
+                if (watched_status.failed()) return watched_status;
+                if (st::failed(transaction->watched_strings.push_back(
+                        std::pair {collection, std::string_view {watched.begin(), watched.end()}})))
+                    return {status_code_t::out_of_memory_k, "Failed to watch a string"};
+            }
             value.Reset();
             native_status_t const status = transaction ? transaction->batch.GetFromBatchAndDB(
                                                              database.native.get(), read_options, column, key, &value)
@@ -229,7 +235,7 @@ status_t strings_read(ustore_strings_read_t const& arguments, strings_arg_t cons
     ::rocksdb::ManagedSnapshot pinned {database.native.get(),
                                        read_options.snapshot ? nullptr : database.native->GetSnapshot()};
     if (pinned.snapshot()) read_options.snapshot = pinned.snapshot();
-    status_t const read = transaction ? read_slice(0, arguments.count, view)
+    status_t const read = transaction ? read_slice(0, arguments.count, 0, view)
                                       : for_task_slices(view, arguments.count, read_slice);
     if (read.failed()) return read;
     outputs.finish(arguments);

@@ -4,10 +4,10 @@
 //! `c/ustore/`, so nothing but the vocabulary below crosses the boundary. One module per
 //! header it mirrors.
 //!
-//! A [`Database`] owns its directory, a [`Transaction`] and a [`Snapshot`] borrow it, and every
-//! result borrows the [`Arena`] it landed in, so a value read out of an arena cannot outlive it, nor
+//! A [`Database`] owns its directory, a [`Transaction`] and a [`Snapshot`] hold it, and every
+//! result views the [`Arena`] it landed in, so a value read out of an arena cannot outlive it, nor
 //! survive the call that would overwrite it. A [`DeferredOn`] defers the same verbs to an
-//! [`Executor`] instead, borrowing the arena the same way until the call is final.
+//! [`Executor`] instead, holding the arena the same way until the call is final.
 //!
 //! A [`Collection`] addresses one collection by name, as the Python binding does:
 //! [`Database::collection`] finds it, and [`Database::find_or_create`] creates a missing one.
@@ -57,7 +57,7 @@
 //! assert_eq!(values.get(0), Some(b"Ada".as_slice()));
 //! assert_eq!(values.get(2), None);
 //!
-//! // A batch carries a collection per task, and a bare one gives every task the same.
+//! // A batch holds a collection per task, and a bare one gives every task the same.
 //! let spanned = [people, places];
 //! let across = [Entry::new(ada, b"Ada"), Entry::new(ada, b"Kent")];
 //! database.write(spanned.as_slice(), &across, Durability::Buffered)?;
@@ -66,11 +66,11 @@
 //! # Ok::<(), ustore::Error>(())
 //! ```
 //!
-//! The receiver chooses how a call completes, and the verb stays: `.on(&executor)` blocks on an [`Executor`], and
-//! `.deferred(&executor)` answers a [`Deferred`] that owns the inputs and borrows the arena until the call is final.
-//! A `Deferred` is the call's `Future`: it submits when first polled or waited on, at the address
-//! it is pinned at, so it allocates nothing, and any executor of async tasks polls it, such as this
-//! one of a dozen `std` lines:
+//! The receiver chooses how a call completes, and the verb stays: `.on(&executor)` blocks on an
+//! [`Executor`], and `.deferred(&executor)` answers a [`Deferred`] that owns the inputs and holds
+//! the arena until the call is final. A `Deferred` is the call's `Future`: it submits when first
+//! polled or waited on, at the address it is pinned at, so it allocates nothing, and any executor
+//! of async tasks polls it, such as this one of a dozen `std` lines:
 //!
 //! ```no_run
 //! use std::future::Future;
@@ -110,8 +110,9 @@
 //! # Ok::<(), ustore::Error>(())
 //! ```
 //!
-//! The library rewinds an arena on every call through it, so a second call would overwrite the run the
-//! first one exported. That is the borrow the verbs take, and using a result after the next call does not compile:
+//! The library rewinds an arena on every call through it, so a second call would overwrite the run
+//! the first one exported. That is the `&mut` the verbs take, and using a result after the next
+//! call does not compile:
 //!
 //! ```compile_fail,E0499
 //! use ustore::{Arena, BlobsVerbs, Database, Key, Modality, RAMOptions};
@@ -126,7 +127,7 @@
 //! ```
 //!
 //! The library reads a deferred call's inputs after it is submitted, so a deferred view refuses
-//! borrowed ones, while it borrows the arena, whose free waits for the call:
+//! viewed ones, while it holds the arena, whose free waits for the call:
 //!
 //! ```compile_fail,E0277
 //! use ustore::{Arena, BlobsVerbs, Database, Executor, Key, Modality, RAMOptions};
@@ -141,7 +142,7 @@
 //! ```
 //!
 //! The library calls a deferred call's progress handler after it is submitted as well, so a handler
-//! borrowed from a local does not compile either:
+//! referencing a local does not compile either:
 //!
 //! ```compile_fail,E0597
 //! use std::ops::ControlFlow;
@@ -211,7 +212,7 @@ mod testing;
 pub use jsontape;
 pub use stringtape;
 
-// Named only so their archives link, carrying the objects the UStore archive leaves out.
+// Named only so their archives link, holding the objects the UStore archive leaves out.
 extern crate forkunion as _;
 extern crate stringzilla as _;
 
@@ -226,14 +227,14 @@ pub use db::{
     ChangesCursorConfig, CollectionID, Collections, CommitStamp, CompactConfig, CompactPlan, CursorOn, DataDirectory,
     Database, Deferred, DeferredOn, Deferring, Description, DropMode, Durability, Engine, Error, Executor, GPUClass,
     GPUDevice, GPUVendor, Gds, IOOptions, Isolation, Key, KeyRange, LevelDBOptions, Matching, Modality, Mood,
-    NVMEOptions, On, PatternKind, Phase, PhaseProgress, Predicate, PredicateCost, Progress, RAMOptions, ReadStamp,
-    Residency, Result, RocksDBOptions, SaveConfig, ScanDirection, ScanMode, Snapshot, Status, Tape, Transaction,
-    Transport, UUID, ViewVerbs, Watch, gpu_devices, key_unknown, version,
+    NVMEOptions, NVMEViewOptions, On, PatternKind, Phase, PhaseProgress, Predicate, PredicateCost, Progress,
+    RAMOptions, ReadStamp, Residency, Result, RocksDBOptions, SaveConfig, ScanDirection, ScanMode, Snapshot, Status,
+    Tape, Transaction, Transport, UUID, ViewVerbs, Watch, gpu_devices, key_unknown, version,
 };
 pub use docs::{
-    Binary, Bitmap, Column, ColumnFormat, Columns, DocsCursor, DocsCursorConfig, DocsGatherConfig, DocsSampleConfig,
-    DocsScanConfig, DocsVerbs, Document, DocumentEntry, FieldAddress, FieldEntry, FieldFormat, FieldType, Half, Json,
-    KeyedBy, Modification, Paths, ReadFormat, Scalar, StringColumn, Text, WritableScalar,
+    Batches, Binary, Bitmap, Column, ColumnFormat, Columns, DocsCursor, DocsCursorConfig, DocsGatherConfig,
+    DocsSampleConfig, DocsScanConfig, DocsVerbs, Document, DocumentEntry, FieldAddress, FieldEntry, FieldFormat,
+    FieldType, Half, Json, KeyedBy, Modification, Paths, ReadFormat, Scalar, StringColumn, Text, WritableScalar,
 };
 pub use graph::{
     Degree, Edge, GraphSampleVerticesConfig, GraphScanVerticesConfig, GraphVerbs, GraphVerticesCursor,

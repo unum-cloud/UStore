@@ -4,7 +4,7 @@
  *  @date September 15, 2026
  *  @brief The key slots the compaction suite merges, the engine's own, shared by its host
  *      translation unit and its device one, so its 16-byte cases run on the kernels the
- *      library's bundle carries.
+ *      library's bundle holds.
  */
 #pragma once
 

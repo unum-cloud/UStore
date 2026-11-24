@@ -82,18 +82,18 @@ type PagesImportConfig struct {
 
 // PagesImport replaces whole pages, one per key, with parsed markup.
 func (on writes[Handle]) PagesImport(collections Collections, keys []Key, values Tape, config *PagesImportConfig) error {
-	var lent lent[struct{}]
-	_, err := block(&lent, on.pagesImport(&lent, C.ustore_completion_blocking_k, collections, keys, values, config))
+	var call callWithResult[struct{}]
+	_, err := block(&call, on.pagesImport(&call, C.ustore_completion_blocking_k, collections, keys, values, config))
 	return err
 }
 
 // PagesImport submits [DatabaseOn.PagesImport].
 func (on deferredWrites[Handle]) PagesImport(collections Collections, keys []Key, values Tape, config *PagesImportConfig) (*Deferred[struct{}], error) {
 	deferred := new(Deferred[struct{}])
-	return submitted(deferred, on.pagesImport(&deferred.lent, C.ustore_completion_deferred_k, collections, keys, values, config))
+	return submitted(deferred, on.pagesImport(&deferred.call, C.ustore_completion_deferred_k, collections, keys, values, config))
 }
 
-func (receiver storeReceiver[Handle]) pagesImport(lent *lent[struct{}], completion C.ustore_completion_t, collections Collections, keys []Key, values Tape, config *PagesImportConfig) error {
+func (receiver storeReceiver[Handle]) pagesImport(call *callWithResult[struct{}], completion C.ustore_completion_t, collections Collections, keys []Key, values Tape, config *PagesImportConfig) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
@@ -102,18 +102,18 @@ func (receiver storeReceiver[Handle]) pagesImport(lent *lent[struct{}], completi
 		return err
 	}
 	options := configOf(config)
-	arguments, inputs := stage[C.ustore_pages_import_t](lent)
-	progress, state := lent.progress(options.Progress)
+	arguments, inputs := stage[C.ustore_pages_import_t](call)
+	progress, state := call.progress(options.Progress)
 	*arguments = C.ustore_pages_import_t{
 		database:       database,
 		executor:       executor,
-		outcome:        lent.outcome(),
+		outcome:        call.outcome(),
 		completion:     completion,
 		transaction:    receiver.transaction(),
 		count:          C.ustore_size_t(len(keys)),
-		collections:    lent.collections(inputs, collections),
-		keys:           lent.keys(keys),
-		values:         lent.strings(values),
+		collections:    call.collections(inputs, collections),
+		keys:           call.keys(keys),
+		values:         call.strings(values),
 		encoding:       C.ustore_page_encoding_t(options.Encoding),
 		durability:     C.ustore_durability_t(options.Durability),
 		watch:          C.ustore_watch_t(receiver.watch),
@@ -148,23 +148,23 @@ type Inserted struct {
 	count uint
 }
 
-// Keys borrows the keys of the inserted elements from the arena, one per fragment.
+// Keys views the keys of the inserted elements in the arena, one per fragment.
 func (inserted Inserted) Keys() []Key { return keysAt(inserted.keys, 0, uint64(inserted.count)) }
 
 // PagesInsert parses one fragment per task into elements of the page keys names, reporting the key
 // every element ended up with into arena.
 func (on writes[Handle]) PagesInsert(collections Collections, keys []Key, values Tape, arena *Arena, config *PagesInsertConfig) (Inserted, error) {
-	var lent lent[Inserted]
-	return block(&lent, on.pagesInsert(&lent, C.ustore_completion_blocking_k, collections, keys, values, arena, config))
+	var call callWithResult[Inserted]
+	return block(&call, on.pagesInsert(&call, C.ustore_completion_blocking_k, collections, keys, values, arena, config))
 }
 
 // PagesInsert submits [DatabaseOn.PagesInsert].
 func (on deferredWrites[Handle]) PagesInsert(collections Collections, keys []Key, values Tape, arena *Arena, config *PagesInsertConfig) (*Deferred[Inserted], error) {
 	deferred := new(Deferred[Inserted])
-	return submitted(deferred, on.pagesInsert(&deferred.lent, C.ustore_completion_deferred_k, collections, keys, values, arena, config))
+	return submitted(deferred, on.pagesInsert(&deferred.call, C.ustore_completion_deferred_k, collections, keys, values, arena, config))
 }
 
-func (receiver storeReceiver[Handle]) pagesInsert(lent *lent[Inserted], completion C.ustore_completion_t, collections Collections, keys []Key, values Tape, arena *Arena, config *PagesInsertConfig) error {
+func (receiver storeReceiver[Handle]) pagesInsert(call *callWithResult[Inserted], completion C.ustore_completion_t, collections Collections, keys []Key, values Tape, arena *Arena, config *PagesInsertConfig) error {
 	database, executor, outputs, err := receiver.lowerInto(arena)
 	if err != nil {
 		return err
@@ -173,23 +173,23 @@ func (receiver storeReceiver[Handle]) pagesInsert(lent *lent[Inserted], completi
 	if err := shape(collections, len(keys), int(values.Len()), len(options.Elements), len(options.Parents), len(options.Anchors)); err != nil {
 		return err
 	}
-	arguments, inputs := stage[C.ustore_pages_insert_t](lent)
-	lent.result.count = uint(len(keys))
+	arguments, inputs := stage[C.ustore_pages_insert_t](call)
+	call.result.count = uint(len(keys))
 	*arguments = C.ustore_pages_insert_t{
 		database:       database,
 		executor:       executor,
-		outcome:        lent.outcome(),
+		outcome:        call.outcome(),
 		completion:     completion,
 		transaction:    receiver.transaction(),
 		count:          C.ustore_size_t(len(keys)),
-		collections:    lent.collections(inputs, collections),
-		keys:           lent.keys(keys),
-		elements:       lent.keys(options.Elements),
-		parents:        lent.keys(options.Parents),
-		anchors:        lent.keys(options.Anchors),
-		values:         lent.strings(values),
+		collections:    call.collections(inputs, collections),
+		keys:           call.keys(keys),
+		elements:       call.keys(options.Elements),
+		parents:        call.keys(options.Parents),
+		anchors:        call.keys(options.Anchors),
+		values:         call.strings(values),
 		encoding:       C.ustore_page_encoding_t(options.Encoding),
-		effective_keys: &lent.result.keys,
+		effective_keys: &call.result.keys,
 		arena:          outputs,
 		durability:     C.ustore_durability_t(options.Durability),
 		watch:          C.ustore_watch_t(receiver.watch),
@@ -212,18 +212,18 @@ type PagesRemoveConfig struct {
 // PagesRemove removes elements with their subtrees, or whole pages of a range per task given end
 // keys.
 func (on writes[Handle]) PagesRemove(collections Collections, keys []Key, config *PagesRemoveConfig) error {
-	var lent lent[struct{}]
-	_, err := block(&lent, on.pagesRemove(&lent, C.ustore_completion_blocking_k, collections, keys, config))
+	var call callWithResult[struct{}]
+	_, err := block(&call, on.pagesRemove(&call, C.ustore_completion_blocking_k, collections, keys, config))
 	return err
 }
 
 // PagesRemove submits [DatabaseOn.PagesRemove].
 func (on deferredWrites[Handle]) PagesRemove(collections Collections, keys []Key, config *PagesRemoveConfig) (*Deferred[struct{}], error) {
 	deferred := new(Deferred[struct{}])
-	return submitted(deferred, on.pagesRemove(&deferred.lent, C.ustore_completion_deferred_k, collections, keys, config))
+	return submitted(deferred, on.pagesRemove(&deferred.call, C.ustore_completion_deferred_k, collections, keys, config))
 }
 
-func (receiver storeReceiver[Handle]) pagesRemove(lent *lent[struct{}], completion C.ustore_completion_t, collections Collections, keys []Key, config *PagesRemoveConfig) error {
+func (receiver storeReceiver[Handle]) pagesRemove(call *callWithResult[struct{}], completion C.ustore_completion_t, collections Collections, keys []Key, config *PagesRemoveConfig) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
@@ -232,18 +232,18 @@ func (receiver storeReceiver[Handle]) pagesRemove(lent *lent[struct{}], completi
 	if err := shape(collections, len(keys), len(options.Elements), len(options.EndKeys)); err != nil {
 		return err
 	}
-	arguments, inputs := stage[C.ustore_pages_remove_t](lent)
+	arguments, inputs := stage[C.ustore_pages_remove_t](call)
 	*arguments = C.ustore_pages_remove_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		completion:  completion,
 		transaction: receiver.transaction(),
 		count:       C.ustore_size_t(len(keys)),
-		collections: lent.collections(inputs, collections),
-		keys:        lent.keys(keys),
-		end_keys:    lent.keys(options.EndKeys),
-		elements:    lent.keys(options.Elements),
+		collections: call.collections(inputs, collections),
+		keys:        call.keys(keys),
+		end_keys:    call.keys(options.EndKeys),
+		elements:    call.keys(options.Elements),
 		durability:  C.ustore_durability_t(options.Durability),
 		watch:       C.ustore_watch_t(receiver.watch),
 	}
@@ -265,18 +265,18 @@ type PagesMoveConfig struct {
 
 // PagesMove moves elements with their subtrees under parents after anchors.
 func (on writes[Handle]) PagesMove(collections Collections, keys, elements []Key, config *PagesMoveConfig) error {
-	var lent lent[struct{}]
-	_, err := block(&lent, on.pagesMove(&lent, C.ustore_completion_blocking_k, collections, keys, elements, config))
+	var call callWithResult[struct{}]
+	_, err := block(&call, on.pagesMove(&call, C.ustore_completion_blocking_k, collections, keys, elements, config))
 	return err
 }
 
 // PagesMove submits [DatabaseOn.PagesMove].
 func (on deferredWrites[Handle]) PagesMove(collections Collections, keys, elements []Key, config *PagesMoveConfig) (*Deferred[struct{}], error) {
 	deferred := new(Deferred[struct{}])
-	return submitted(deferred, on.pagesMove(&deferred.lent, C.ustore_completion_deferred_k, collections, keys, elements, config))
+	return submitted(deferred, on.pagesMove(&deferred.call, C.ustore_completion_deferred_k, collections, keys, elements, config))
 }
 
-func (receiver storeReceiver[Handle]) pagesMove(lent *lent[struct{}], completion C.ustore_completion_t, collections Collections, keys, elements []Key, config *PagesMoveConfig) error {
+func (receiver storeReceiver[Handle]) pagesMove(call *callWithResult[struct{}], completion C.ustore_completion_t, collections Collections, keys, elements []Key, config *PagesMoveConfig) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
@@ -285,19 +285,19 @@ func (receiver storeReceiver[Handle]) pagesMove(lent *lent[struct{}], completion
 	if err := shape(collections, len(keys), len(elements), len(options.Parents), len(options.Anchors)); err != nil {
 		return err
 	}
-	arguments, inputs := stage[C.ustore_pages_move_t](lent)
+	arguments, inputs := stage[C.ustore_pages_move_t](call)
 	*arguments = C.ustore_pages_move_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		completion:  completion,
 		transaction: receiver.transaction(),
 		count:       C.ustore_size_t(len(keys)),
-		collections: lent.collections(inputs, collections),
-		keys:        lent.keys(keys),
-		elements:    lent.keys(elements),
-		parents:     lent.keys(options.Parents),
-		anchors:     lent.keys(options.Anchors),
+		collections: call.collections(inputs, collections),
+		keys:        call.keys(keys),
+		elements:    call.keys(elements),
+		parents:     call.keys(options.Parents),
+		anchors:     call.keys(options.Anchors),
 		durability:  C.ustore_durability_t(options.Durability),
 		watch:       C.ustore_watch_t(receiver.watch),
 	}
@@ -308,18 +308,18 @@ func (receiver storeReceiver[Handle]) pagesMove(lent *lent[struct{}], completion
 // PagesSplice replaces textLengths bytes of the text of every element from textStarts with values,
 // where a zero length only inserts and an empty value only removes.
 func (on writes[Handle]) PagesSplice(collections Collections, keys, elements []Key, textStarts, textLengths []uint64, values Tape, config *WriteConfig) error {
-	var lent lent[struct{}]
-	_, err := block(&lent, on.pagesSplice(&lent, C.ustore_completion_blocking_k, collections, keys, elements, textStarts, textLengths, values, config))
+	var call callWithResult[struct{}]
+	_, err := block(&call, on.pagesSplice(&call, C.ustore_completion_blocking_k, collections, keys, elements, textStarts, textLengths, values, config))
 	return err
 }
 
 // PagesSplice submits [DatabaseOn.PagesSplice].
 func (on deferredWrites[Handle]) PagesSplice(collections Collections, keys, elements []Key, textStarts, textLengths []uint64, values Tape, config *WriteConfig) (*Deferred[struct{}], error) {
 	deferred := new(Deferred[struct{}])
-	return submitted(deferred, on.pagesSplice(&deferred.lent, C.ustore_completion_deferred_k, collections, keys, elements, textStarts, textLengths, values, config))
+	return submitted(deferred, on.pagesSplice(&deferred.call, C.ustore_completion_deferred_k, collections, keys, elements, textStarts, textLengths, values, config))
 }
 
-func (receiver storeReceiver[Handle]) pagesSplice(lent *lent[struct{}], completion C.ustore_completion_t, collections Collections, keys, elements []Key, textStarts, textLengths []uint64, values Tape, config *WriteConfig) error {
+func (receiver storeReceiver[Handle]) pagesSplice(call *callWithResult[struct{}], completion C.ustore_completion_t, collections Collections, keys, elements []Key, textStarts, textLengths []uint64, values Tape, config *WriteConfig) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
@@ -328,20 +328,20 @@ func (receiver storeReceiver[Handle]) pagesSplice(lent *lent[struct{}], completi
 		return err
 	}
 	options := configOf(config)
-	arguments, inputs := stage[C.ustore_pages_splice_t](lent)
+	arguments, inputs := stage[C.ustore_pages_splice_t](call)
 	*arguments = C.ustore_pages_splice_t{
 		database:     database,
 		executor:     executor,
-		outcome:      lent.outcome(),
+		outcome:      call.outcome(),
 		completion:   completion,
 		transaction:  receiver.transaction(),
 		count:        C.ustore_size_t(len(keys)),
-		collections:  lent.collections(inputs, collections),
-		keys:         lent.keys(keys),
-		elements:     lent.keys(elements),
-		text_starts:  lent.lengths(textStarts),
-		text_lengths: lent.lengths(textLengths),
-		values:       lent.strings(values),
+		collections:  call.collections(inputs, collections),
+		keys:         call.keys(keys),
+		elements:     call.keys(elements),
+		text_starts:  call.lengths(textStarts),
+		text_lengths: call.lengths(textLengths),
+		values:       call.strings(values),
 		durability:   C.ustore_durability_t(options.Durability),
 		watch:        C.ustore_watch_t(receiver.watch),
 	}
@@ -351,18 +351,18 @@ func (receiver storeReceiver[Handle]) pagesSplice(lent *lent[struct{}], completi
 
 // PagesSetAttributes sets one attribute of an element per task.
 func (on writes[Handle]) PagesSetAttributes(collections Collections, keys, elements []Key, fields, values Tape, config *WriteConfig) error {
-	var lent lent[struct{}]
-	_, err := block(&lent, on.pagesSetAttributes(&lent, C.ustore_completion_blocking_k, collections, keys, elements, fields, values, config))
+	var call callWithResult[struct{}]
+	_, err := block(&call, on.pagesSetAttributes(&call, C.ustore_completion_blocking_k, collections, keys, elements, fields, values, config))
 	return err
 }
 
 // PagesSetAttributes submits [DatabaseOn.PagesSetAttributes].
 func (on deferredWrites[Handle]) PagesSetAttributes(collections Collections, keys, elements []Key, fields, values Tape, config *WriteConfig) (*Deferred[struct{}], error) {
 	deferred := new(Deferred[struct{}])
-	return submitted(deferred, on.pagesSetAttributes(&deferred.lent, C.ustore_completion_deferred_k, collections, keys, elements, fields, values, config))
+	return submitted(deferred, on.pagesSetAttributes(&deferred.call, C.ustore_completion_deferred_k, collections, keys, elements, fields, values, config))
 }
 
-func (receiver storeReceiver[Handle]) pagesSetAttributes(lent *lent[struct{}], completion C.ustore_completion_t, collections Collections, keys, elements []Key, fields, values Tape, config *WriteConfig) error {
+func (receiver storeReceiver[Handle]) pagesSetAttributes(call *callWithResult[struct{}], completion C.ustore_completion_t, collections Collections, keys, elements []Key, fields, values Tape, config *WriteConfig) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
@@ -371,19 +371,19 @@ func (receiver storeReceiver[Handle]) pagesSetAttributes(lent *lent[struct{}], c
 		return err
 	}
 	options := configOf(config)
-	arguments, inputs := stage[C.ustore_pages_set_attributes_t](lent)
+	arguments, inputs := stage[C.ustore_pages_set_attributes_t](call)
 	*arguments = C.ustore_pages_set_attributes_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		completion:  completion,
 		transaction: receiver.transaction(),
 		count:       C.ustore_size_t(len(keys)),
-		collections: lent.collections(inputs, collections),
-		keys:        lent.keys(keys),
-		elements:    lent.keys(elements),
-		fields:      lent.strings(fields),
-		values:      lent.strings(values),
+		collections: call.collections(inputs, collections),
+		keys:        call.keys(keys),
+		elements:    call.keys(elements),
+		fields:      call.strings(fields),
+		values:      call.strings(values),
 		durability:  C.ustore_durability_t(options.Durability),
 		watch:       C.ustore_watch_t(receiver.watch),
 	}
@@ -393,18 +393,18 @@ func (receiver storeReceiver[Handle]) pagesSetAttributes(lent *lent[struct{}], c
 
 // PagesRemoveAttributes removes one attribute of an element per task.
 func (on writes[Handle]) PagesRemoveAttributes(collections Collections, keys, elements []Key, fields Tape, config *WriteConfig) error {
-	var lent lent[struct{}]
-	_, err := block(&lent, on.pagesRemoveAttributes(&lent, C.ustore_completion_blocking_k, collections, keys, elements, fields, config))
+	var call callWithResult[struct{}]
+	_, err := block(&call, on.pagesRemoveAttributes(&call, C.ustore_completion_blocking_k, collections, keys, elements, fields, config))
 	return err
 }
 
 // PagesRemoveAttributes submits [DatabaseOn.PagesRemoveAttributes].
 func (on deferredWrites[Handle]) PagesRemoveAttributes(collections Collections, keys, elements []Key, fields Tape, config *WriteConfig) (*Deferred[struct{}], error) {
 	deferred := new(Deferred[struct{}])
-	return submitted(deferred, on.pagesRemoveAttributes(&deferred.lent, C.ustore_completion_deferred_k, collections, keys, elements, fields, config))
+	return submitted(deferred, on.pagesRemoveAttributes(&deferred.call, C.ustore_completion_deferred_k, collections, keys, elements, fields, config))
 }
 
-func (receiver storeReceiver[Handle]) pagesRemoveAttributes(lent *lent[struct{}], completion C.ustore_completion_t, collections Collections, keys, elements []Key, fields Tape, config *WriteConfig) error {
+func (receiver storeReceiver[Handle]) pagesRemoveAttributes(call *callWithResult[struct{}], completion C.ustore_completion_t, collections Collections, keys, elements []Key, fields Tape, config *WriteConfig) error {
 	database, executor, err := receiver.lower()
 	if err != nil {
 		return err
@@ -413,18 +413,18 @@ func (receiver storeReceiver[Handle]) pagesRemoveAttributes(lent *lent[struct{}]
 		return err
 	}
 	options := configOf(config)
-	arguments, inputs := stage[C.ustore_pages_remove_attributes_t](lent)
+	arguments, inputs := stage[C.ustore_pages_remove_attributes_t](call)
 	*arguments = C.ustore_pages_remove_attributes_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		completion:  completion,
 		transaction: receiver.transaction(),
 		count:       C.ustore_size_t(len(keys)),
-		collections: lent.collections(inputs, collections),
-		keys:        lent.keys(keys),
-		elements:    lent.keys(elements),
-		fields:      lent.strings(fields),
+		collections: call.collections(inputs, collections),
+		keys:        call.keys(keys),
+		elements:    call.keys(elements),
+		fields:      call.strings(fields),
 		durability:  C.ustore_durability_t(options.Durability),
 		watch:       C.ustore_watch_t(receiver.watch),
 	}
@@ -447,17 +447,17 @@ type PagesReadConfig struct {
 
 // PagesRead renders whole pages or subtrees into arena, a missing one reading as absent.
 func (on reads[Handle]) PagesRead(collections Collections, keys []Key, arena *Arena, config *PagesReadConfig) (Values, error) {
-	var lent lent[Values]
-	return block(&lent, on.pagesRead(&lent, C.ustore_completion_blocking_k, collections, keys, arena, config))
+	var call callWithResult[Values]
+	return block(&call, on.pagesRead(&call, C.ustore_completion_blocking_k, collections, keys, arena, config))
 }
 
 // PagesRead submits [DatabaseOn.PagesRead].
 func (on deferredReads[Handle]) PagesRead(collections Collections, keys []Key, arena *Arena, config *PagesReadConfig) (*Deferred[Values], error) {
 	deferred := new(Deferred[Values])
-	return submitted(deferred, on.pagesRead(&deferred.lent, C.ustore_completion_deferred_k, collections, keys, arena, config))
+	return submitted(deferred, on.pagesRead(&deferred.call, C.ustore_completion_deferred_k, collections, keys, arena, config))
 }
 
-func (receiver storeReceiver[Handle]) pagesRead(lent *lent[Values], completion C.ustore_completion_t, collections Collections, keys []Key, arena *Arena, config *PagesReadConfig) error {
+func (receiver storeReceiver[Handle]) pagesRead(call *callWithResult[Values], completion C.ustore_completion_t, collections Collections, keys []Key, arena *Arena, config *PagesReadConfig) error {
 	database, executor, outputs, err := receiver.lowerInto(arena)
 	if err != nil {
 		return err
@@ -466,20 +466,20 @@ func (receiver storeReceiver[Handle]) pagesRead(lent *lent[Values], completion C
 	if err := shape(collections, len(keys), len(options.Elements)); err != nil {
 		return err
 	}
-	arguments, inputs := stage[C.ustore_pages_read_t](lent)
-	lent.result.count = uint(len(keys))
+	arguments, inputs := stage[C.ustore_pages_read_t](call)
+	call.result.count = uint(len(keys))
 	*arguments = C.ustore_pages_read_t{
 		database:         database,
 		executor:         executor,
-		outcome:          lent.outcome(),
+		outcome:          call.outcome(),
 		completion:       completion,
 		view:             receiver.view(),
 		count:            C.ustore_size_t(len(keys)),
-		collections:      lent.collections(inputs, collections),
-		keys:             lent.keys(keys),
-		elements:         lent.keys(options.Elements),
-		presences:        &lent.result.presences,
-		values:           &lent.result.values.raw,
+		collections:      call.collections(inputs, collections),
+		keys:             call.keys(keys),
+		elements:         call.keys(options.Elements),
+		presences:        &call.result.presences,
+		values:           &call.result.values.raw,
 		arena:            outputs,
 		outputs_encoding: C.ustore_page_encoding_t(options.OutputsEncoding),
 	}
@@ -513,17 +513,17 @@ type PagesScanConfig struct {
 // PagesScan lists up to wanted page keys of a range per task into arena, one task per collection
 // collections names.
 func (on reads[Handle]) PagesScan(collections Collections, wanted uint, arena *Arena, config *PagesScanConfig) (Scanned, error) {
-	var lent lent[Scanned]
-	return block(&lent, on.pagesScan(&lent, C.ustore_completion_blocking_k, collections, wanted, arena, config))
+	var call callWithResult[Scanned]
+	return block(&call, on.pagesScan(&call, C.ustore_completion_blocking_k, collections, wanted, arena, config))
 }
 
 // PagesScan submits [DatabaseOn.PagesScan].
 func (on deferredReads[Handle]) PagesScan(collections Collections, wanted uint, arena *Arena, config *PagesScanConfig) (*Deferred[Scanned], error) {
 	deferred := new(Deferred[Scanned])
-	return submitted(deferred, on.pagesScan(&deferred.lent, C.ustore_completion_deferred_k, collections, wanted, arena, config))
+	return submitted(deferred, on.pagesScan(&deferred.call, C.ustore_completion_deferred_k, collections, wanted, arena, config))
 }
 
-func (receiver storeReceiver[Handle]) pagesScan(lent *lent[Scanned], completion C.ustore_completion_t, collections Collections, wanted uint, arena *Arena, config *PagesScanConfig) error {
+func (receiver storeReceiver[Handle]) pagesScan(call *callWithResult[Scanned], completion C.ustore_completion_t, collections Collections, wanted uint, arena *Arena, config *PagesScanConfig) error {
 	database, executor, outputs, err := receiver.lowerInto(arena)
 	if err != nil {
 		return err
@@ -533,24 +533,24 @@ func (receiver storeReceiver[Handle]) pagesScan(lent *lent[Scanned], completion 
 	if err := shape(collections, count, len(options.StartKeys), len(options.EndKeys)); err != nil {
 		return err
 	}
-	arguments, inputs := stage[C.ustore_pages_scan_t](lent)
-	lent.result.count = uint(count)
-	progress, state := lent.progress(options.Progress)
+	arguments, inputs := stage[C.ustore_pages_scan_t](call)
+	call.result.count = uint(count)
+	progress, state := call.progress(options.Progress)
 	*arguments = C.ustore_pages_scan_t{
 		database:       database,
 		executor:       executor,
-		outcome:        lent.outcome(),
+		outcome:        call.outcome(),
 		completion:     completion,
 		view:           receiver.view(),
 		count:          C.ustore_size_t(count),
-		collections:    lent.collections(inputs, collections),
-		start_keys:     lent.keys(options.StartKeys),
-		end_keys:       lent.keys(options.EndKeys),
+		collections:    call.collections(inputs, collections),
+		start_keys:     call.keys(options.StartKeys),
+		end_keys:       call.keys(options.EndKeys),
 		direction:      C.ustore_scan_direction_t(options.Direction),
-		filter:         lent.text(options.Filter),
-		predicate:      lent.predicate(options.Predicate),
-		offsets:        &lent.result.offsets,
-		keys:           &lent.result.keys,
+		filter:         call.text(options.Filter),
+		predicate:      call.predicate(options.Predicate),
+		offsets:        &call.result.offsets,
+		keys:           &call.result.keys,
 		arena:          outputs,
 		wanted:         C.ustore_size_t(wanted),
 		mode:           C.ustore_scan_mode_t(options.Mode),
@@ -606,23 +606,23 @@ func (on reads[Handle]) PagesCursorInit(collection CollectionID, startKey Key, c
 	}
 	options := configOf(config)
 	cursor := new(PagesCursor)
-	var lent lent[C.ustore_pages_cursor_t]
-	arguments, inputs := stage[C.ustore_pages_cursor_init_t](&lent)
+	var call callWithResult[C.ustore_pages_cursor_t]
+	arguments, inputs := stage[C.ustore_pages_cursor_init_t](&call)
 	*arguments = C.ustore_pages_cursor_init_t{
-		cursor:     lent.result,
+		cursor:     call.result,
 		database:   database,
 		executor:   executor,
-		outcome:    lent.outcome(),
+		outcome:    call.outcome(),
 		view:       on.view(),
 		collection: rawCollection(collection),
 		start_key:  raw(startKey),
-		end_key:    lent.key(inputs, options.EndKey),
+		end_key:    call.key(inputs, options.EndKey),
 		direction:  C.ustore_scan_direction_t(options.Direction),
-		filter:     lent.text(options.Filter),
+		filter:     call.text(options.Filter),
 		predicate:  cursor.admits(options.Predicate),
 	}
 	C.ustore_pages_cursor_init(arguments)
-	if cursor.handle, err = block(&lent, nil); err != nil {
+	if cursor.handle, err = block(&call, nil); err != nil {
 		cursor.end()
 		return nil, err
 	}
@@ -633,43 +633,43 @@ func (on reads[Handle]) PagesCursorInit(collection CollectionID, startKey Key, c
 
 // NextKeys pulls up to wanted page keys of the walk into arena.
 func (on PagesCursorOn) NextKeys(wanted uint, arena *Arena) (Page, error) {
-	var lent lent[Page]
-	arguments, err := on.next(&lent, wanted, arena)
+	var call callWithResult[Page]
+	arguments, err := on.next(&call, wanted, arena)
 	if err != nil {
 		return Page{}, err
 	}
 	C.ustore_pages_cursor_next(arguments)
-	return block(&lent, nil)
+	return block(&call, nil)
 }
 
 // NextPairs pulls up to wanted page keys of the walk with their pages rendered as outputsEncoding
 // into arena.
 func (on PagesCursorOn) NextPairs(wanted uint, outputsEncoding PageEncoding, arena *Arena) (Page, error) {
-	var lent lent[Page]
-	arguments, err := on.next(&lent, wanted, arena)
+	var call callWithResult[Page]
+	arguments, err := on.next(&call, wanted, arena)
 	if err != nil {
 		return Page{}, err
 	}
-	arguments.values = &lent.result.values.raw
+	arguments.values = &call.result.values.raw
 	arguments.outputs_encoding = C.ustore_page_encoding_t(outputsEncoding)
 	C.ustore_pages_cursor_next(arguments)
-	return block(&lent, nil)
+	return block(&call, nil)
 }
 
 // next opens a pull and fills every argument but the optional renderings.
-func (on PagesCursorOn) next(lent *lent[Page], wanted uint, arena *Arena) (*C.ustore_pages_cursor_next_t, error) {
+func (on PagesCursorOn) next(call *callWithResult[Page], wanted uint, arena *Arena) (*C.ustore_pages_cursor_next_t, error) {
 	cursor, database, executor, outputs, err := on.lowerInto(arena)
 	if err != nil {
 		return nil, err
 	}
-	arguments := open[C.ustore_pages_cursor_next_t](lent)
+	arguments := open[C.ustore_pages_cursor_next_t](call)
 	*arguments = C.ustore_pages_cursor_next_t{
 		database: database,
 		executor: executor,
-		outcome:  lent.outcome(),
+		outcome:  call.outcome(),
 		cursor:   cursor,
-		keys:     &lent.result.keys,
-		written:  &lent.result.written,
+		keys:     &call.result.keys,
+		written:  &call.result.written,
 		arena:    outputs,
 		wanted:   C.ustore_size_t(wanted),
 	}
@@ -694,34 +694,34 @@ func (cursor *PagesCursor) Close() error {
 // PagesSample draws up to wanted page keys uniformly at random into arena, one task per collection
 // collections names.
 func (on reads[Handle]) PagesSample(collections Collections, wanted uint, arena *Arena) (Scanned, error) {
-	var lent lent[Scanned]
-	return block(&lent, on.pagesSample(&lent, C.ustore_completion_blocking_k, collections, wanted, arena))
+	var call callWithResult[Scanned]
+	return block(&call, on.pagesSample(&call, C.ustore_completion_blocking_k, collections, wanted, arena))
 }
 
 // PagesSample submits [DatabaseOn.PagesSample].
 func (on deferredReads[Handle]) PagesSample(collections Collections, wanted uint, arena *Arena) (*Deferred[Scanned], error) {
 	deferred := new(Deferred[Scanned])
-	return submitted(deferred, on.pagesSample(&deferred.lent, C.ustore_completion_deferred_k, collections, wanted, arena))
+	return submitted(deferred, on.pagesSample(&deferred.call, C.ustore_completion_deferred_k, collections, wanted, arena))
 }
 
-func (receiver storeReceiver[Handle]) pagesSample(lent *lent[Scanned], completion C.ustore_completion_t, collections Collections, wanted uint, arena *Arena) error {
+func (receiver storeReceiver[Handle]) pagesSample(call *callWithResult[Scanned], completion C.ustore_completion_t, collections Collections, wanted uint, arena *Arena) error {
 	database, executor, outputs, err := receiver.lowerInto(arena)
 	if err != nil {
 		return err
 	}
 	count := tasks(collections)
-	arguments, inputs := stage[C.ustore_pages_sample_t](lent)
-	lent.result.count = uint(count)
+	arguments, inputs := stage[C.ustore_pages_sample_t](call)
+	call.result.count = uint(count)
 	*arguments = C.ustore_pages_sample_t{
 		database:    database,
 		executor:    executor,
-		outcome:     lent.outcome(),
+		outcome:     call.outcome(),
 		completion:  completion,
 		view:        receiver.view(),
 		count:       C.ustore_size_t(count),
-		collections: lent.collections(inputs, collections),
-		offsets:     &lent.result.offsets,
-		keys:        &lent.result.keys,
+		collections: call.collections(inputs, collections),
+		offsets:     &call.result.offsets,
+		keys:        &call.result.keys,
 		arena:       outputs,
 		wanted:      C.ustore_size_t(wanted),
 	}
@@ -732,17 +732,17 @@ func (receiver storeReceiver[Handle]) pagesSample(lent *lent[Scanned], completio
 // PagesMeasure estimates the pages and the space inside a range per task into arena, one task per
 // collection collections names.
 func (on reads[Handle]) PagesMeasure(collections Collections, arena *Arena, config *MeasureConfig) (Measurement, error) {
-	var lent lent[Measurement]
-	return block(&lent, on.pagesMeasure(&lent, C.ustore_completion_blocking_k, collections, arena, config))
+	var call callWithResult[Measurement]
+	return block(&call, on.pagesMeasure(&call, C.ustore_completion_blocking_k, collections, arena, config))
 }
 
 // PagesMeasure submits [DatabaseOn.PagesMeasure].
 func (on deferredReads[Handle]) PagesMeasure(collections Collections, arena *Arena, config *MeasureConfig) (*Deferred[Measurement], error) {
 	deferred := new(Deferred[Measurement])
-	return submitted(deferred, on.pagesMeasure(&deferred.lent, C.ustore_completion_deferred_k, collections, arena, config))
+	return submitted(deferred, on.pagesMeasure(&deferred.call, C.ustore_completion_deferred_k, collections, arena, config))
 }
 
-func (receiver storeReceiver[Handle]) pagesMeasure(lent *lent[Measurement], completion C.ustore_completion_t, collections Collections, arena *Arena, config *MeasureConfig) error {
+func (receiver storeReceiver[Handle]) pagesMeasure(call *callWithResult[Measurement], completion C.ustore_completion_t, collections Collections, arena *Arena, config *MeasureConfig) error {
 	database, executor, outputs, err := receiver.lowerInto(arena)
 	if err != nil {
 		return err
@@ -752,25 +752,25 @@ func (receiver storeReceiver[Handle]) pagesMeasure(lent *lent[Measurement], comp
 	if err := shape(collections, count, len(options.StartKeys), len(options.EndKeys)); err != nil {
 		return err
 	}
-	arguments, inputs := stage[C.ustore_pages_measure_t](lent)
-	lent.result.count = uint(count)
+	arguments, inputs := stage[C.ustore_pages_measure_t](call)
+	call.result.count = uint(count)
 	*arguments = C.ustore_pages_measure_t{
 		database:          database,
 		executor:          executor,
-		outcome:           lent.outcome(),
+		outcome:           call.outcome(),
 		completion:        completion,
 		view:              receiver.view(),
 		count:             C.ustore_size_t(count),
-		collections:       lent.collections(inputs, collections),
-		start_keys:        lent.keys(options.StartKeys),
-		end_keys:          lent.keys(options.EndKeys),
+		collections:       call.collections(inputs, collections),
+		start_keys:        call.keys(options.StartKeys),
+		end_keys:          call.keys(options.EndKeys),
 		direction:         C.ustore_scan_direction_t(options.Direction),
-		min_cardinalities: &lent.result.minCardinalities,
-		max_cardinalities: &lent.result.maxCardinalities,
-		min_value_bytes:   &lent.result.minValueBytes,
-		max_value_bytes:   &lent.result.maxValueBytes,
-		min_space_usages:  &lent.result.minSpaceUsages,
-		max_space_usages:  &lent.result.maxSpaceUsages,
+		min_cardinalities: &call.result.minCardinalities,
+		max_cardinalities: &call.result.maxCardinalities,
+		min_value_bytes:   &call.result.minValueBytes,
+		max_value_bytes:   &call.result.maxValueBytes,
+		min_space_usages:  &call.result.minSpaceUsages,
+		max_space_usages:  &call.result.maxSpaceUsages,
 		arena:             outputs,
 	}
 	C.ustore_pages_measure(arguments)

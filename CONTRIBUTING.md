@@ -21,7 +21,7 @@ git submodule foreach --quiet 'git pull --ff-only --quiet'
 `cmake/ustore_siblings.cmake` builds each sibling from its nested checkout when it is there, and otherwise fetches the commit its submodule pins, unless `FETCHCONTENT_SOURCE_DIR_<NAME>` names a local checkout.
 Machine specifics such as a compiler path go into a gitignored `CMakeUserPresets.json`, whose presets inherit the ones in `CMakePresets.json`.
 
-The repository carries its own hooks, and configuring CMake arms them; to arm them without a build:
+The repository holds its own hooks, and configuring CMake arms them; to arm them without a build:
 
 ```sh
 git config core.hooksPath .githooks
@@ -60,7 +60,7 @@ The `metal` preset builds them on macOS, and off Apple platforms the same switch
 `USTORE_INSTALL` installs the two libraries, the headers, a `.pc` file and a CMake package under `lib/cmake/ustore`, which `find_package(ustore)` reads as `ustore::abi`, `ustore::templates`, `ustore::static`, `ustore::shared` and `ustore::cpp`, the C++ SDK linking the C headers and the archive.
 The install splits into components: `sdk` holds both libraries with the engines' archives, `c/ustore/`, `cpp/ustore/`, the package and the license, and `templates` the header-only `include/ustore/`.
 `cpack --config build_release/CPackConfig.cmake` archives the `sdk` component alone, stripped, as the preview SDK `ustore-<version>-<platform>-sdk.tar.gz`, a ZIP on Windows.
-A function the headers declare without `USTORE_EXPORT` links against the archive but is missing from the shared library, so every new declaration carries it.
+A function the headers declare without `USTORE_EXPORT` links against the archive but is missing from the shared library, so every new declaration holds it.
 
 ## Layout and Namespaces
 
@@ -92,11 +92,11 @@ A file name never repeats its directory — `include/ustore/blobs/nvme_tree.hpp`
 ### Naming
 
 - `_t` marks concrete types and the aliases that materialize a template; `_k` marks enumerators and constants.
-- Class templates carry no suffix: `class lsm_tree`, never `class lsm_tree_gt`.
+- Class templates hold no suffix: `class lsm_tree`, never `class lsm_tree_gt`.
 - Template type parameters end in `_type_` and private members in one underscore, so a parameter never shadows a member: `typename locations_type_` beside `locations_type_ locations_`.
 - Identifiers are whole words: `index`, `count`, `transaction`, `directory` — never `i`, `cnt`, `txn`, `dir`.
 - `init`, `min`, `max`, `id`, `gds`, `ref` and vendor terms are whole words of the vocabulary and stay as they are.
-- A transport type carries its operating system, as in `linux_spdk_environment`, while a type mirroring a vendor's own struct or API table keeps the vendor word, as in `cufile_api_t`.
+- A transport type holds its operating system, as in `linux_spdk_environment`, while a type mirroring a vendor's own struct or API table keeps the vendor word, as in `cufile_api_t`.
 - A type is named `<domain>_<role>`: the domain word says what it holds and the role word what it does, as in `lsm_tree`, `lsm_level`, `lsm_sorted_run`, `sorted_run_index`, `key_slot`, `stored_value`, `write_buffer` and `graph_store`.
   Only C ABI terms stay one word — `database`, `collection`, `transaction`, `snapshot` — and no name is a metaphor or a legacy project name.
 - A file is named after its main type without `_t` and never repeats its directory; C++ headers are `.hpp`, never `.h` or `.tcc`.
@@ -146,7 +146,7 @@ Compiler predefines like `__clang__`, `__GNUC__` and `_MSC_VER` are read raw whe
 Nothing throws.
 Fallible calls return a status or `expected`, constructors that can fail become factories returning `expected`, and no code adds `try` or `catch` except one `try` per exported `ustore_*` call in the RocksDB and LevelDB engines, whose libraries throw.
 Errors are checked with an explicit `if` and `return`, never a macro.
-The status is `status_t {status_code_t code; char const* message;}`, mirroring the C ABI's `ustore_outcome_t`, and `expected<value_type_>` keeps its value in a union alive only on success, so a move-only type needs no empty state.
+The status is `status_t {status_code_t code; char const* note;}`, mirroring the C ABI's `ustore_outcome_t`, and `expected<value_type_>` keeps its value in a union alive only on success, so a move-only type needs no empty state.
 
 No owning standard type that can throw appears in `cpp/` or `src/`:
 
@@ -169,10 +169,66 @@ Per-thread scratch belongs to the executor that owns the threads.
 
 ### Threads and Placement
 
-Threads, topology and domain-placed memory come from ForkUnion's C ABI in `forkunion/forkunion.h`, wrapped once by the C++ executor of `include/ustore/utilities/ram_device.hpp` and the arenas of `include/ustore/utilities/ram_buffers.hpp`; nothing else calls `fu_*` directly.
-The executor owns a `fu_topology_t` and a `fu_pool_t` created through `fu_topology_new`, `fu_pool_new` and `fu_pool_spawn`, returns `expected` from its factory, deletes the pool in its destructor, and forwards C++ callables to the pool through a C callback.
-A pool another library lends through `ustore_executor_on_pool` is wrapped by `lent_pool_t` instead, which dispatches on it but never deletes or parks it.
+Threads, topology and domain-placed memory come from ForkUnion's C ABI in `forkunion/forkunion.h`, wrapped once by the C++ `ram_executor_t` of `include/ustore/utilities/ram_device.hpp` and the arenas of `include/ustore/utilities/ram_buffers.hpp`; nothing else calls `fu_*` directly.
+The executor holds its threads as `threads_t`, a variant of the `fu_pool_t` its factories spawn through `fu_topology_new`, `fu_pool_new` and `fu_pool_spawn` and its destructor deletes, or of `fu::dummy_pool_t`, the calling thread alone, which `on_calling_thread()` builds with no topology probe, pool or spawn; it forwards C++ callables to either through a C callback.
 The arenas place their blocks with `fu_allocate_on_domain_id` and release them with `fu_free_on_domain_id`.
+
+These principles hold in `include/` and `src/`, and the other three libraries state the same ones:
+
+1. No mutable global or static, as the rule above says.
+2. Ownership is a type.
+   - Who frees a resource, and which call uses it exclusively, are types such as `io_channel_t&` and `claimed_channels_t`, never a `bool` or a raw pointer.
+3. Threads belong to an executor.
+   - The `ram_executor_t` of an executor handle creates every thread, and `nvme_queues_t` creates its queues but no thread.
+   - An NVMe executor has one reading and one writing queue per thread, plus the pair at index `threads` for I/O run on the calling thread.
+   - Nothing creates a thread inside a verb, no verb naming an executor creates a queue, and nothing runs that no one called.
+4. Warm calls allocate nothing.
+   - Sizes come from hardware facts or the caller's budget, fixed at creation.
+   - A call naming no executor runs on the calling thread and creates no pool, thread, ring, SPDK queue pair or stream and probes no topology; its scratch and blocking queues live for that call only.
+   - On RAM such a call runs through `run_alone`, and on NVMe `make_call_queues` in `src/nvme/database.hpp` builds blocking queues only, over files the database holds, freed when the call returns.
+   - Nothing under `include/` builds queues: a call naming no queues answers `invalid_argument`, and a mount reads on the opening call's queues.
+   - `ustore_database_free` builds no queues and does no I/O on any transport, so durability comes only from `ustore_database_flush`, and a collection drop that finds open readers answers `contended`.
+5. Spin only on completions the call itself submitted.
+   - Wait in the kernel for events a remote party triggers.
+6. A library never names cores.
+   - Threads and staging go on the memory domain the caller names, else the one the media sit on, inside the creating thread's affinity mask.
+   - `ustore_executor_for_nvme` takes the first memory domain its `ram` options name, else the domain its `nvme.paths` share on a machine of several.
+   - Zero threads take the fewest hardware queues of the disks under those paths, capped by the cores.
+   - Every executor covers its own core set.
+   - A third-party pool, such as RocksDB's, is created at one documented site, sized from the cores the executors left idle.
+7. Residency is a type of the data handle.
+   - An executor of another residency answers `device`: a RAM executor on an NVMe database is refused by the router before it claims the executor.
+   - A `NULL` executor on an SPDK database answers `invalid_argument` before any work, since no blocking queue reaches a namespace.
+   - A VRAM executor reads through the blocking queues it owns and queues device work on the stream it owns.
+   - A caller's stream answers `unsupported`.
+   - One call runs per executor; a second answers `contended`.
+8. One word per concept, the same in all four libraries.
+   - A name says who owns a thing and until when it is valid, never a hand-over, so `.githooks/pre-commit` refuses `lend`, `borrow`, `loan` and `lease` words in the identifiers of every language, as snake_case or camelCase words, except Rust's `std::borrow` names, and the docs use none of them.
+   - "Lane" names only SIMD and warp lanes.
+
+An NVMe executor owns its `nvme_queues_t` of `include/ustore/utilities/nvme_queues.hpp`, a reading and a writing ring per thread over that thread's own staging, and a call reads, writes and merges on its own thread's rings.
+No engine compares executor addresses to pick a path, and `.githooks/pre-commit` refuses an added `executor ==` or `executor !=` under `src/` and `include/`; a database owns its media, cache and reader epochs, never an executor.
+A ring registers a database's media by its `media_list_key_t`, the disk's media identity drawn from the system's entropy and its 64-bit media epoch, so a warm call makes no registration, and a database never holds a ring or a queue set.
+A ring's registered-file table keeps the descriptors of the last media registered into it, so the kernel keeps those files open after a database closes them, until the ring registers other media or its executor is freed.
+
+### Hardening
+
+`.githooks/pre-commit` holds the rules here that a check on added lines can hold.
+
+- A `NULL` executor runs the call on the calling thread. It creates no pool, thread, ring, SPDK queue pair or stream and probes no topology; its scratch and blocking queues live for that call only. Name an executor for calls that allocate nothing once warm.
+- No static, global, shared or thread-local pool, executor, queue set, stream or handle exists, stateless ones included: whoever needs one creates it and frees it.
+- A `*_free` waits for the calls naming its handle and releases memory; it reads and writes no drive, and durability comes only from the flush verb.
+- An executor owns its streams, created with it; a call without one uses the null legacy stream or is refused, and no second origin sits beside the owner.
+- Every arena is freed before its executor; a binding enforces the order by lifetime where its language can and documents it otherwise, never by reference counts.
+- A C struct change lands with every binding that lays the struct out by hand, checked field by field in review.
+- Tests never restate a struct's layout that the compiler already pins, so no binding asserts a mirror's size or offsets.
+- A handler the engine may call from several threads at once is safe to call concurrently in every binding: predicates.
+- Every executor is equal; a handle owns its media, cache and epochs, never an executor, so no engine compares executor addresses to pick a path; the C layer may refuse an arena or plan used on another executor than its own.
+- Names say who owns a thing and until when a view is valid; no identifier in any language hands a thing over.
+- A fix lands on every residency and vendor that has the bug, or its message names the ones left and why.
+- A commit message names only what its diff shows.
+- A wave never re-wraps or rewords comments it does not otherwise touch.
+- A commit touching `.cu`, `.cuh`, `.hip` or `.metal` names the box that built and ran it, or says none did.
 
 ### Query Views
 
@@ -207,7 +263,7 @@ A report's verdict-like enum starts at `none = 0`, so a zeroed report never read
 
 UStore's one long operation is compaction: `ustore_database_compact` takes a `ustore_database_compact_plan_t`, and `ustore_database_compact_plan_finish` frees it.
 Its phases are `flush`, `merge` and `reclaim`, between `none` and `done`, and each engine runs the ones it has: RAM a merge task per collection, then one reclaim task; NVMe a flush task, then merge passes of one task each; RocksDB a flush task per column family, then a merge task per family; LevelDB a merge pass per collection's key range.
-Each engine's `compact_plan_t` carries `task_t`, `tasks()`, `run(task, context)`, `advance()`, `stop()`, `status()`, `phase()`, `ordinal()`, `completed()`, `total()` and `finish()`, its table entry `compact_plan_open` opens one, and `compact_plan` holds the `plan_verbs` the router drives it through.
+Each engine's `compact_plan_t` holds `task_t`, `tasks()`, `run(task, context)`, `advance()`, `stop()`, `status()`, `phase()`, `ordinal()`, `completed()`, `total()` and `finish()`, its table entry `compact_plan_open` opens one, and `compact_plan` holds the `plan_verbs` the router drives it through.
 The driver fans each phase's tasks out over the executor and ticks the phase's units at its barrier, where a cancel stops, so a plan the cancel leaves live continues at the phase it reached.
 
 A member of a plan, cursor or walk names what it holds and when it holds it, like `picked_this_round_` or `visited_`.
@@ -230,7 +286,7 @@ Each header lists a verb's refusals under `@par Statuses` in this order and in t
 
 ### Statuses
 
-Statuses 0 to 19 carry the same numbers and meanings in every Unum library: success 0, deferred 1, out_of_memory 2, shape_mismatch 3, unsupported_layout 4, unknown_kind 5, read_only 6, io 7, device 8, malformed 9, internal 10, overflow 11, uninitialized 12, config_mismatch 13, contended 14, cancelled 15, unsupported 16, invalid_argument 17, not_found 18, already_exists 19.
+Statuses 0 to 19 hold the same numbers and meanings in every Unum library: success 0, deferred 1, out_of_memory 2, shape_mismatch 3, unsupported_layout 4, unknown_kind 5, read_only 6, io 7, device 8, malformed 9, internal 10, overflow 11, uninitialized 12, config_mismatch 13, contended 14, cancelled 15, unsupported 16, invalid_argument 17, not_found 18, already_exists 19.
 A library leaves out the ones it cannot answer but never renumbers the rest, and numbers its own statuses from 20.
 Every enum the C interface names, statuses included, has a `ustore_*_name` answering "unrecognized" for a value it does not know and a `ustore_*_from_name(view, &out)` answering `invalid_argument` for a name it does not know, leaving `out` as it was.
 CPU and GPU class values are ABI: each class keeps the number USearch gives the same hardware, written explicitly, with unused numbers reserved rather than reused.
@@ -358,7 +414,7 @@ The first rows are shared by every U* project, and UStore's own follow.
 - Every file opens with `@file`, `@author`, `@date` and `@brief`, in that order and contiguous; `@file` names the path from the repository root and `@date` reads like `January 9, 2023`.
 - Docblock text sits two spaces past its asterisk, as in ` *  @brief`, and a continuation indents two more.
 - Declarations are documented with `/** */`, never with a bare `//` line above them, and every `/**` has an empty line above it.
-- A block that is one unstructured paragraph carries no `@brief`: `/** What it is. */`.
+- A block that is one unstructured paragraph holds no `@brief`: `/** What it is. */`.
 - Every `@param` states its direction: `@param[in]`, `@param[out]` or `@param[in,out]`.
 - No Markdown inside docblocks — no headings, bullets or `__bold__`, bar the `- @c status` list of `@par Statuses:`; use `@note`, `@throws`, `@c`, `@p` and plain sentences.
 - A closing `@par Statuses:` block lists only the statuses a verb's contract adds, while resource failures, cancellation, deferral and defects are covered once by the categories in the `ustore_status_t` docblock.
@@ -380,7 +436,7 @@ Discard a result through `[[maybe_unused]] T const result = call();`, never `(vo
 ## Dispatch Classes
 
 A CPU class bundles the waiter, the atomic reference and the StringZilla kit its silicon generation guarantees, in `src/engine.hpp`.
-Only a class whose kit, waiter or atomic reference differs from its parent's carries a variant, and a `static_assert` refuses a compiled class that no longer advances.
+Only a class whose kit, waiter or atomic reference differs from its parent's holds a variant, and a `static_assert` refuses a compiled class that no longer advances.
 
 | Value | Name            | Parent          | Waiter        | Atomics           | Strings kit                |
 | ----: | :-------------- | :-------------- | :------------ | :---------------- | :------------------------- |
@@ -400,7 +456,7 @@ Only a class whose kit, waiter or atomic reference differs from its parent's car
 The serial floor spins on PAUSE or YIELD, a hint every core of its architecture has, rather than yielding to the scheduler.
 
 A GPU class names one generation of one vendor: `nvidia-ampere`, `nvidia-ada`, `nvidia-hopper`, `nvidia-blackwell`, `nvidia-blackwellrtx`, `amd-cdna3`, `amd-cdna4`, `amd-cdna5`, `apple-metal7`, `apple-metal9` and `apple-metal10`.
-Its value 0 is `unknown`, which a listed device carries when no compiled code runs on it.
+Its value 0 is `unknown`, which a listed device holds when no compiled code runs on it.
 
 ### Picking Rules
 
@@ -410,7 +466,7 @@ The ladder then takes the newest compiled class whose masks fit under that inter
 A description reports the class picked, never the ceiling.
 
 Every GPU class compiles its own bundle of its vendor's kernels for the configured codes naming its generation, so the classes partition those codes.
-Each vendor's oldest class is its floor, which carries later NVIDIA GPUs through Ampere's own PTX; a configured code no class claims, like Turing's, RDNA's or one newer than every class, stops the configure.
+Each vendor's oldest class is its floor, which holds later NVIDIA GPUs through Ampere's own PTX; a configured code no class claims, like Turing's, RDNA's or one newer than every class, stops the configure.
 A monoversioned build keeps only the newest class of each vendor holding codes.
 The GPU pick walks the device's vendor ladder newest first and takes the first class whose bundle the device's driver loads, at or under the executor's `gpu_class_ceiling`, and a device that loads none there refuses with `ustore_status_unsupported_k`.
 A class unit reads its class from its own `USTORE_TARGET_<VENDOR>_<CLASS>` and writes StringZilla's GPU floor target off, so its bundle holds UStore's kernels alone over StringZilla's building blocks.
@@ -421,8 +477,8 @@ A future NVIDIA GPU takes the newest class whose PTX its driver compiles, and a 
 
 ### Principles
 
-Suites carry no framework.
-The C++ suites share `test/harness.hpp`, every C test file opens with the `Shared C Checks` region, the Python suites share `test/base.py` and `test/conftest.py`, the Rust tests share `rust/testing.rs`, and `mojo/test.mojo` carries its own helpers at its top.
+Suites hold no framework.
+The C++ suites share `test/harness.hpp`, every C test file opens with the `Shared C Checks` region, the Python suites share `test/base.py` and `test/conftest.py`, the Rust tests share `rust/testing.rs`, and `mojo/test.mojo` holds its own helpers at its top.
 Each of those holds a pinned region, `Shared Settings`, `Shared Run`, `Shared C Checks`, `Shared Pytest` or `Shared Testing`, whose tokens are identical across the Second Decade libraries and which the pre-commit hook keeps identical, so a fix lands in all of them.
 The pinned C++ regions print with `std::printf`, the one exception to `fmt::println`, so every library's suites print the same bytes.
 
@@ -444,7 +500,7 @@ Every reason takes one of four forms, and a reason used twice is a constant, suc
 - `<symbol> is refused on this machine`, like `ucall_io_backend_linux_uring618_k is refused on this machine`;
 - `no <device>`, like `no GPU device`.
 
-Every engine suite runs on every engine and isolation the build carries, and a case needing a capability skips on the engines that lack it.
+Every engine suite runs on every engine and isolation the build holds, and a case needing a capability skips on the engines that lack it.
 Inputs come from `stream_key(seed, name, index)`, identical in C, C++, Python, Rust and Mojo, with each case keyed by its own label, so a case draws the same inputs whichever cases ran before it, and `USTORE_SEED` with `USTORE_FILTER` reproduces any one of them.
 
 ### Running
@@ -493,9 +549,10 @@ USTORE_TRAP_ON_FAILURE=1 USTORE_FILTER='^test_ring_wraps_its_slots\(transport_t:
 The bindings run their suites as CI does:
 
 ```sh
-pip install --group test . && python -X faulthandler -m pytest -x   # Python, once per engine the extension carries
+pip install --group test . && python -X faulthandler -m pytest -x   # Python, once per engine the extension holds
 cargo test --features serde                                         # Rust, over RAM, RocksDB and LevelDB
 pixi run test                                                       # Mojo, against the library on the loader path
+CGO_LDFLAGS="-L$PWD/build_release" go test -race ./golang/...       # Go, against the archive CGO_LDFLAGS names
 ```
 
 pytest prints `UStore <version> from <path>`, the capabilities of each engine and the same `- Seed: …, scale: …` line in its header.
@@ -538,7 +595,7 @@ A C++ filter that does not compile as a regex stops the run, the C suites run ev
 With a directory, a suite creates a unique `ustore-XXXXXX` directory under it, runs every case inside it, and removes it at exit, so parallel runs never share a database; without one, the cases that need persistence or files skip, naming the setting they need.
 CTest passes `test_data` inside the build directory as the directory, the engine suites get their engine, and the tools suite also gets the CLI it drives on that engine.
 
-Flags are long kebab-case words with no short forms or aliases, sizes carry IEC suffixes, durations carry `ms`, `s` or `m`, and lists are comma-separated.
+Flags are long kebab-case words with no short forms or aliases, sizes hold IEC suffixes, durations hold `ms`, `s` or `m`, and lists are comma-separated.
 A namespace-scope `_k` constant names an invariant — a format, an alignment, an ABI limit — while workload sizes, thread counts and paths are settings with defaults.
 No binary hard-codes a directory, and the CLI and the tools take flags alone, parsed by `tools/arguments.hpp`:
 
@@ -598,12 +655,12 @@ A test that needs a cargo feature is compiled under `#[cfg(feature = "…")]`, n
 
 A Mojo test is `test_<behaviour>`, registered in `main` in the order it is defined, and opens with `if not _library_is_present(): _skipped(library_missing_k)`, as Mojo has no discovery; its private helpers and types take a leading underscore.
 
-One concept carries one stem in every language: the Rust name is the stem, and C, C++, Python and Mojo call it `test_<stem>`, as in `readme_quickstart`, `snapshots_save_a_database_of_their_own`, `databases_open_at_a_directory_and_keep_what_they_held`, `a_held_executor_refuses_the_next_call`, `compact_plans_stay_live_until_finished` and `progress_reports_and_cancels`.
+One concept holds one stem in every language: the Rust name is the stem, and C, C++, Python and Mojo call it `test_<stem>`, as in `readme_quickstart`, `snapshots_save_a_database_of_their_own`, `databases_open_at_a_directory_and_keep_what_they_held`, `a_held_executor_refuses_the_next_call`, `compact_plans_stay_live_until_finished` and `progress_reports_and_cancels`.
 `test/readme.py` runs the README Quickstarts verbatim, as `test_readme_quickstart` and `test_readme_mojo_mirror`.
 
 ### Benchmarks
 
-The benchmarks of `bench/` share `bench/harness.hpp`, which carries the same pinned `Shared Settings` region, so `USTORE_SEED`, `USTORE_FILTER`, `USTORE_WARMUP`, `USTORE_TIME_LIMIT` and every other benchmark flag read as the suites' settings do.
+The benchmarks of `bench/` share `bench/harness.hpp`, which holds the same pinned `Shared Settings` region, so `USTORE_SEED`, `USTORE_FILTER`, `USTORE_WARMUP`, `USTORE_TIME_LIMIT` and every other benchmark flag read as the suites' settings do.
 Rows follow the suites' label grammar, every number comes from the `release` preset, and [`bench/README.md`](bench/README.md) describes the suite, its flags and its datasets.
 The evaluation harnesses outside this repository read `USTORE_LIBRARY_DIR` and `USTORE_CUDA_ARCH`, which keep their names.
 
@@ -622,12 +679,12 @@ These tests reach past the public surface, each because the surface lacks what i
 - `test/tools/*.cpp` take `tools/arrow_ipc.hpp` and `tools/dataset.h`, which the CLI keeps to itself.
 - `rust/db.rs`'s `a_call_without_an_arena_is_refused` calls `ffi::ustore_collection_list` with a null arena, which the safe API cannot express.
 - `rust/db.rs`'s `statuses_map_spell_and_tolerate_newer_libraries` builds raw `ffi::ustore_outcome_t` values and calls the crate-private `check` and `Status::from_raw`, as a status from a newer library reaches Rust no other way.
-- `rust/db.rs`'s `a_forgotten_deferred_call_holds_its_database_open` reads the private `lent` field of `Deferred`, which no public accessor exposes.
+- `rust/db.rs`'s `a_forgotten_deferred_call_holds_its_database_open` reads the private `submitted` field of `Deferred`, which no public accessor exposes.
 
 ## Bindings
 
 Every binding is a thin layer over the C interface, and these rules hold in each of them.
-Typed bindings are those whose compiler checks callback signatures, and dynamic bindings are the rest; in UStore the typed ones are Rust, Mojo and C++, and the dynamic ones are Python.
+Typed bindings are those whose compiler checks callback signatures, and dynamic bindings are the rest; in UStore the typed ones are Rust, Mojo, Go and C++, and the dynamic ones are Python.
 
 The C library decides what is valid.
 A binding forwards its status, turns each status into its language's error in one place, re-checks nothing the library refuses, and keeps no copy of state the library already holds.
@@ -650,18 +707,18 @@ A view the library hands back lives until the next call on its arena.
 The library describes where the memory sits, and the caller checks it; the binding neither copies the view to be safe nor checks its residency on the caller's behalf.
 
 Every array a verb reads shares the call's one count, so mismatched shapes cannot be expressed.
-Where a binding's own types carry two lengths, like a slice of keys beside a matrix of values, it checks once that they agree before the call crosses into the library, and nowhere else.
+Where a binding's own types hold two lengths, like a slice of keys beside a matrix of values, it checks once that they agree before the call crosses into the library, and nowhere else.
 
 Each verb has one body, which fills the C struct and calls the library with no layers in between.
 What it returns is read from the struct's output slot, a trampoline receives the handler itself as its state with no hub around it, and whether a call blocks or defers follows from the type of the receiver it is called on, never from a flag.
 Verbs are never shared through a base class; a trait whose default methods hold the one body per verb is fine, like Rust's and Mojo's, since each receiver supplies only its handle, and C++ writes each handle and its receivers as one class template over what the receiver holds, so the handle carries the verbs as Rust's `&Handle` does.
 
 A typed binding takes the scalar as a type parameter of each call, like *Example (USearch): `search::<f32>`*, rather than letting a handle's type fix one.
-A deferred Rust call owns what it lends the library until the call is final, since the borrow checker cannot see the library holding it.
+A deferred Rust call owns everything the library reads until the call is final, since Rust's lifetimes cannot see the library holding it.
 A C++ wrapper over the C interface is a full typed binding: it has a deferred receiver, `noexcept` callback types and per-call scalar templates.
 
 A dynamic binding publishes every field of every report the library fills.
-A type the binding hands to C by cast, like a slice of parts lent as the C array, is a transparent wrapper over the C struct, like Rust's `#[repr(transparent)]` newtype, so the cast is sound by construction and nothing asserts its size or alignment.
+A type the binding hands to C by cast, like a slice of parts passed as the C array, is a transparent wrapper over the C struct, like Rust's `#[repr(transparent)]` newtype, so the cast is sound by construction and nothing asserts its size or alignment.
 Tests never restate a struct's layout that the compiler already pins: no `offset_of!`, `size_of`, `MemoryLayout` or `Marshal.SizeOf` asserts against the C structs; `offsetof` tables that declare members are declarations, not tests.
 Tests of how names print and parse, and of an engine run again through the binding, stay.
 A binding test asserts a status, or the exception or error type mapped from it, and never the wording of a message or note, in any language: no pytest `match=`, no comparison of `error.message`, `err.Error()` or a note's text, and no substring search in them, since engines refine their notes over time.
@@ -670,11 +727,11 @@ Bindings wrap the C ABI and never instantiate C++ templates themselves.
 A binding is usable once it covers opening and closing, binary reads and writes, named collections, transactions and scans; documents and graphs follow in any order.
 
 A binding has no life of its own: the C executor owns every thread, and every C free waits for the deferred calls naming its handle, so a binding starts no threads and counts no calls, transactions or snapshots.
-Every verb whose outputs scale with the call takes an arena made through `ustore_arena_init` and answers views borrowing it, while shorthand with no place for an arena makes a one-off arena and frees it with its result.
+Every verb whose outputs scale with the call takes an arena made through `ustore_arena_init` and answers views viewing it, while shorthand with no place for an arena makes a one-off arena and frees it with its result.
 A receiver chooses the executor and the completion: `on(executor)` blocks on it, and `deferred(executor)` offers the same verbs answering deferred calls.
 Opening has no database yet, so every binding's constructor blocks and takes the executor to block on as an optional argument, as `database_t::open_rocksdb(options, executor)` does in C++, while only the C opens defer through their `completion`.
 A deferred call polls only through `ustore_outcome_status`, and releasing one rides the language's own lifetime construct, which waits first.
-A walk is a cursor whose every pull takes an arena, and a language's loop shorthand owns one arena for the loop's lifetime.
+A walk is a cursor whose every pull takes an arena and names its executor, which the cursor never keeps, and a language's loop shorthand owns one arena for the loop's lifetime.
 A progress callback runs on the thread that runs the call, an executor's own for a deferred one, so a binding's callback enters its runtime there.
 The Design sections of [`rust/README.md`](rust/README.md) and [`python/README.md`](python/README.md) spell these rules out in each language.
 
@@ -682,10 +739,11 @@ A verb called on the handle itself runs on the calling thread, `on(executor)` bl
 A deferred call allocates nothing in C++, Rust or Mojo: C++ and Mojo construct it immovable where the caller holds it and submit at once, while a Rust `Deferred` submits on its first poll or `wait`, once pinned in place.
 A callback crosses as the C struct it lowers to, built by one generic constructor per handler shape with a trampoline made per handler type, never a trait object, a box or an enum.
 A per-key predicate lowers as cheap, and a batch predicate as expensive unless the caller says it is cheap.
+A predicate may run on several executor threads at once, so every binding takes only handlers safe to call concurrently: Rust's `Fn + Sync`, a C++ handler called through `const&`, a goroutine-safe Go function, Mojo's read-only judge state, while Python's calls stay serialized by the GIL.
 An arena never outlives the executor that made it: Rust's `Arena<'executor>` and Mojo's arena origin enforce the order, and the other bindings document it.
 Brackets and name lookups only find, and creating or dropping a collection stays an explicit database verb.
 
-`.githooks/pre-commit` refuses locks in binding sources, throwing callback types, caught unwinds and kept exceptions.
+`.githooks/pre-commit` refuses locks and reference counts in binding sources, throwing callback types, caught unwinds and kept exceptions.
 
 ## Python
 
@@ -728,7 +786,7 @@ cargo test --no-default-features --features rocksdb  # RAM and RocksDB alone
 - The title reads `<Verb>: <Summary>`, where the verb is one of `Add`, `Break`, `Chore`, `Docs`, `Fix`, `Improve` or `Make`.
 - The summary opens with a capital letter, unless it opens with a code identifier, which keeps its own case.
 - The title runs to at most 80 characters, and a body line to at most 100 columns, unless it holds a URL or is indented code.
-- The message carries no AI-assistant attribution, since authorship is the human who committed.
+- The message holds no AI-assistant attribution, since authorship is the human who committed.
 - `Break` marks a change to what the project offers, such as a dropped modality or binding; `Chore` removes or rearranges without changing it.
 - The body is prose wrapped near 80 columns and explains the change in primary logic, not renames or formatting.
 - One commit per topic, however many files it touches; an intermediate commit may leave the tree unbuildable.

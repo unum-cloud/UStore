@@ -2,8 +2,9 @@
  *  @file include/ustore/strings/nvme_store.hpp
  *  @author Ash Vardanian
  *  @date October 20, 2026
- *  @brief The NVMe store of a strings collection, keyed by whole strings: strings memory runs in front of an LSM tree
- *      whose runs carry the tails of their strings, and the strings one database transaction writes and watches.
+ *  @brief The NVMe store of a strings collection, keyed by whole strings: strings memory runs in
+ *      front of an LSM tree whose runs hold the tails of their strings, and the strings one
+ *      database transaction writes and watches.
  *
  *  Every string is a key of its own, mapped onto one 16-byte key of another collection. A memory
  *  run keeps it whole on its key tape, and a run file keeps its 16-byte head and its 16-byte value
@@ -75,7 +76,7 @@ using blobs::transaction_share_t;
 using blobs::value_layout_t;
 using utilities::constrained_allocator;
 using utilities::io_channel_t;
-using utilities::outside_executor_k;
+using utilities::nvme_queues_ref_t;
 using utilities::resource_constraint;
 
 #pragma region Keys
@@ -122,7 +123,7 @@ struct listed_string_t {
     /** Bytes it takes. */
     std::size_t length = 0;
 
-    /** Whether its newest version carries a value or a removal. */
+    /** Whether its newest version holds a value or a removal. */
     lookup_result_t state = lookup_result_t::missing_k;
 
     /** The 16 bytes of the value as they were written, zero for a removal. */
@@ -159,9 +160,9 @@ class nvme_store {
      *  its strings through. */
     using strings_kit_t = strings_kit_type_;
 
-    /** The cell every run of this store holds: the head of a string and the 16 bytes of its value, in runs that carry
-     *  the tails of their strings, which tell the strings of one head apart. */
-    using key_slot_t = key_slot<st::key128_t, value_layout_t::uuid_k, key_tails_t::carried_k>;
+    /** The cell every run of this store holds: the head of a string and the 16 bytes of its value,
+     *  in runs that hold the tails of their strings, which tell the strings of one head apart. */
+    using key_slot_t = key_slot<st::key128_t, value_layout_t::uuid_k, key_tails_t::present_k>;
 
     /** The volume every run of this store lives on. */
     using volume_t = volume_type_;
@@ -172,7 +173,7 @@ class nvme_store {
     /** The key a caller addresses this store by. */
     using stored_key_t = std::string_view;
 
-    /** The stamps this store's writes carry and its readers pin. */
+    /** The stamps this store's writes hold and its readers pin. */
     using ledger_t = commit_ledger<atomic_reference_, waiter_type_>;
 
     /** One stamp a reader or a view of this store holds against the ledger. */
@@ -196,7 +197,7 @@ class nvme_store {
     /** The tree the flushed strings live in. */
     using tree_t = typename published_runs_t::tree_t;
 
-    /** What one slice of a merge of that tree writes into, lent by the database. */
+    /** What one slice of a merge of that tree writes into, owned by the database. */
     using merge_buffers_t = typename tree_t::merge_buffers_t;
 
     /** One level set of that tree, which a view names. */
@@ -214,7 +215,7 @@ class nvme_store {
     /** One delta a commit hands over: the string, its kind, and its bytes. */
     using keyed_delta_t = keyed_delta<std::string_view>;
 
-    /** One version a merge or a flush carries over from a memory run. */
+    /** One version a merge or a flush holds over from a memory run. */
     using stamped_delta_t = stamped_delta<std::string_view>;
 
     /** One commit's strings for this store, sealed off every shared path by its committer, and the run the leader
@@ -254,10 +255,12 @@ class nvme_store {
 
     /**
      *  @brief An empty store over @p volume, whose memory is charged to @p constraint.
-     *  @param[in,out] volume The volume every run lands on, borrowed and outliving the store.
+     *  @param[in,out] volume The volume every run lands on, owned by the caller and
+     *      outliving the store.
      *  @param[in] config The bounds of the memory runs and the shape of the tree below.
      *  @param[in,out] constraint The budget the memory runs are charged to.
-     *  @param[in,out] ledger The stamps the store's writes carry and its readers pin, outliving the store.
+     *  @param[in,out] ledger The stamps the store's writes hold and its readers pin,
+     *      outliving the store.
      *  @param[in,out] runs The database's pool the tree's runs live in, outliving the store.
      */
     static expected<nvme_store> mount(volume_t& volume, collection_config_t const& config, constraint_t& constraint,
@@ -301,9 +304,7 @@ class nvme_store {
 
     /** Announces executor thread @p thread_index in the ledger's epochs until the answer dies,
      *  which keeps every reading taken meanwhile walkable. */
-    [[nodiscard]] reader_t enter(std::size_t thread_index = outside_executor_k) const noexcept {
-        return runs_.enter(thread_index);
-    }
+    [[nodiscard]] reader_t enter(std::size_t thread_index = 0) const noexcept { return runs_.enter(thread_index); }
 
     /** The view a read at @p stamp walks and the stamp it answers at, for a caller inside the
      *  ledger's epochs, which every read of one call may walk with no pin, as the epochs keep the
@@ -311,8 +312,8 @@ class nvme_store {
     [[nodiscard]] reading_t reading(transaction_stamp_t stamp) const noexcept { return runs_.reading(stamp); }
 
     /**
-     *  @brief Whether anything carries @p text, copying its 16-byte value into @p value from a memory run or from a
-     *      cell, with no I/O.
+     *  @brief Whether anything holds @p text, copying its 16-byte value into @p value from a memory
+     *      run or from a cell, with no I/O.
      *  @param[in] text The string to look up.
      *  @param[out] value The value, written only for @c written_k.
      *  @param[in] stamp The stamp a reader is pinned at, or @c head_stamp_k for the published one.
@@ -320,7 +321,7 @@ class nvme_store {
      */
     [[nodiscard]] lookup_result_t find(std::string_view text, std::span<byte_t, key_slot_t::size> value,
                                        transaction_stamp_t stamp = head_stamp_k,
-                                       std::size_t thread_index = outside_executor_k) const noexcept {
+                                       std::size_t thread_index = 0) const noexcept {
         reader_t const inside = runs_.enter(thread_index);
         return find(runs_.reading(stamp), text, value);
     }
@@ -338,11 +339,11 @@ class nvme_store {
         return lookup_result_t::written_k;
     }
 
-    /** Whether anything carries @p text, answering in @p size the 16 bytes its value takes, or zero for anything but
-     *  @c written_k, as a database asks of every store. */
+    /** Whether anything holds @p text, answering in @p size the 16 bytes its value takes, or zero
+     *  for anything but @c written_k, as a database asks of every store. */
     [[nodiscard]] lookup_result_t find(std::string_view text, stored_value_size_t& size,
                                        transaction_stamp_t stamp = head_stamp_k,
-                                       std::size_t thread_index = outside_executor_k) const noexcept {
+                                       std::size_t thread_index = 0) const noexcept {
         byte_t value[key_slot_t::size];
         lookup_result_t const found = find(text, value, stamp, thread_index);
         size = found == lookup_result_t::written_k ? key_slot_t::size : 0;
@@ -359,23 +360,23 @@ class nvme_store {
      *  @return @c not_found_k for a miss or a removal, @c invalid_argument_k for a buffer shorter than 16 bytes.
      */
     status_t select(io_channel_t&, std::string_view text, std::span<byte_t> into, stored_value_size_t& size,
-                    transaction_stamp_t stamp = head_stamp_k, std::size_t thread_index = outside_executor_k) noexcept {
+                    transaction_stamp_t stamp = head_stamp_k, std::size_t thread_index = 0) noexcept {
         size = 0;
         if (into.size() < key_slot_t::size) return {status_code_t::invalid_argument_k, "A buffer shorter than a key"};
         if (find(text, into.first<key_slot_t::size>(), stamp, thread_index) != lookup_result_t::written_k)
-            return {status_code_t::not_found_k, "No version carries that string"};
+            return {status_code_t::not_found_k, "No version holds that string"};
         size = key_slot_t::size;
         return {};
     }
 
     /**
      *  @brief Reads into @p page up to @c strings_page_k strings starting with @p prefix and not below @p from, in
-     *      order, each with what its newest version at or below @p stamp carries, a removal included.
+     *      order, each with what its newest version at or below @p stamp holds, a removal included.
      *  @param[in] prefix What every string of the page starts with.
      *  @param[in] from The first string the page may hold.
      *  @param[in] stamp A stamp a reader pins, whose versions every merge keeps, so a walk reads every page at it.
      *  @param[in] thread_index The executor thread reading, which announces on its own epoch slot.
-     *  @param[out] page The strings read, each with what its newest version carries.
+     *  @param[out] page The strings read, each with what its newest version holds.
      *
      *  Every run gets a cursor over its window, newest first: the memory runs, then level zero youngest first, then
      *  the deeper levels. The page takes the smallest key among them, answers it from the first cursor holding a
@@ -869,7 +870,7 @@ class nvme_store {
     }
 
     /** Drops every version a mount found stamped above @p ceiling, which only a store holding no
-     *  memory run takes, merging into the lent @p buffers. */
+     *  memory run takes, merging into the database's @p buffers. */
     status_t truncate_above(io_channel_t& reading_channel, io_channel_t& writing_channel,
                             std::span<merge_buffers_t> buffers, transaction_stamp_t ceiling,
                             lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {}) noexcept {
@@ -882,7 +883,8 @@ class nvme_store {
 
 #pragma region Private Types
 
-    /** The versions one merge or one flush carries over, before and after they are sorted into a run's order. */
+    /** The versions one merge or one flush holds over, before and after they are sorted into
+     *  a run's order. */
     using stamped_deltas_t = st::vector<stamped_delta_t>;
 
     /** The deltas one batch of its own hands over. */
@@ -1162,7 +1164,7 @@ class nvme_store {
 
     /**
      *  @brief Lists into @p page the string of @p head and @p tail with what its newest version at
-     *      or below @p stamp carries, moving every cursor of @p cursors sitting on it past its
+     *      or below @p stamp holds, moving every cursor of @p cursors sitting on it past its
      *      versions, and lists nothing when no version is old enough.
      *
      *  Cursors sit newest first with disjoint stamps, so the first version at or below the stamp is
@@ -1263,7 +1265,7 @@ class nvme_store {
         return {};
     }
 
-    /** Whether a run of @p key_slots strings carrying @p tails bytes of tails outgrows one slot:
+    /** Whether a run of @p key_slots strings holding @p tails bytes of tails outgrows one slot:
      *  its keys whole, its trailer of zero-width stamps, its kinds at a byte each, and layers at
      *  most a head and a row's share per 15 bytes of every key. */
     [[nodiscard]] static bool ingested_run_overflows_(std::uint64_t key_slots, std::uint64_t tails) noexcept {
@@ -1412,12 +1414,12 @@ class nvme_transaction {
      *  which only lowers the watch an earlier write of the string took, or @c invalid_transaction_stamp_k for none. */
     status_t write(collection_id_t collection, std::string_view text, delta_view_t delta,
                    transaction_stamp_t watch_stamp) noexcept {
-        std::size_t const carried = delta.kind == delta_kind_t::remove_k ? 0 : sizeof(ustore_key_t);
-        if (delta.bytes.size() != carried) return {status_code_t::invalid_argument_k, "A string is one 16-byte write"};
+        std::size_t const held = delta.kind == delta_kind_t::remove_k ? 0 : sizeof(ustore_key_t);
+        if (delta.bytes.size() != held) return {status_code_t::invalid_argument_k, "A string is one 16-byte write"};
         if (writes_.reserve_more(1) == writes_t::reserve_result_t::failed_k)
             return {status_code_t::out_of_memory_k, "No room to list another written string"};
         write_t written {ustore_key_t {}, delta.kind, watch_stamp};
-        if (carried != 0) std::memcpy(&written.value, delta.bytes.data(), carried);
+        if (held != 0) std::memcpy(&written.value, delta.bytes.data(), held);
         bool updated = false;
         writes_.probe_to_find(probe_t {collection, text}, [&](auto& slot) noexcept {
             write_t& held = slot.value_ref();
@@ -1529,23 +1531,24 @@ class nvme_transaction {
     }
 
     /** Seals the strings, then stages @p transaction, which this joined, holding the ledger's leader word until the
-     *  transaction commits or lets it go. */
-    status_t stage(transaction_t& transaction) noexcept {
-        if (status_t const sealed = seal_(); sealed.failed()) return sealed;
-        return transaction.stage();
+     *  transaction commits or lets it go, flushing on the thread of @p queues. */
+    status_t stage(transaction_t& transaction, nvme_queues_ref_t queues = {}) noexcept {
+        if (status_t const sealed = seal_(queues); sealed.failed()) return sealed;
+        return transaction.stage(queues);
     }
 
-    /** Seals the strings, then commits @p transaction, which this joined, and maintains every strings collection it
-     *  wrote once it landed; a refused commit keeps every write and watch. */
-    status_t commit(transaction_t& transaction) noexcept {
-        if (status_t const sealed = seal_(); sealed.failed()) return sealed;
-        if (status_t const committed = transaction.commit(); committed.failed()) {
+    /** Seals the strings, then commits @p transaction, which this joined, and maintains every
+     *  strings collection it wrote once it landed, on the thread of @p queues; a refused commit
+     *  keeps every write and watch. */
+    status_t commit(transaction_t& transaction, nvme_queues_ref_t queues = {}) noexcept {
+        if (status_t const sealed = seal_(queues); sealed.failed()) return sealed;
+        if (status_t const committed = transaction.commit(queues); committed.failed()) {
             sealed_.clear();
             return committed;
         }
         // The commit has landed, so a failure to maintain is met again by the collection's next commit.
         for (sealed_collection_t const& sealed : sealed_) [[maybe_unused]]
-            status_t const maintained = database_->maintain(sealed.collection);
+            status_t const maintained = database_->maintain(sealed.collection, queues);
         clear();
         return {};
     }
@@ -1678,8 +1681,8 @@ class nvme_transaction {
     }
 
     /** Seals every written collection's strings on the committing thread, making room first when a collection's
-     *  memory runs are past twice their bounds. */
-    status_t seal_() noexcept {
+     *  memory runs are past twice their bounds, on the thread of @p queues. */
+    status_t seal_(nvme_queues_ref_t queues) noexcept {
         sealed_.clear();
         st::vector<keyed_delta_t> deltas;
         st::vector<collection_id_t> collections;
@@ -1723,11 +1726,12 @@ class nvme_transaction {
                                                   });
                 made.failed())
                 return made;
-            if (status_t const room = database_->make_room(collection, sealed.commit); room.failed()) return room;
+            if (status_t const room = database_->make_room(collection, sealed.commit, queues); room.failed())
+                return room;
             // Claimed before the leader word, waiting on a flush when every record is out, so the
             // share cannot be refused one.
             if (!sealed.commit.empty())
-                if (status_t const claimed = database_->claim_memory_record(collection, sealed.record);
+                if (status_t const claimed = database_->claim_memory_record(collection, sealed.record, queues);
                     claimed.failed())
                     return claimed;
             if (sealed_.push_back(std::move(sealed)) != st::status_t::success_k)

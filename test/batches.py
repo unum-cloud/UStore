@@ -10,7 +10,7 @@ import threading
 
 import numpy as np
 import pytest
-from base import keys
+from base import executor_for, keys
 
 import ustore
 
@@ -205,7 +205,7 @@ def test_scan_batch_outgrows_the_stack(populated, blobs, arena, scans: int):
 
 
 def test_progress_counts_every_scan(populated, blobs, arena):
-    """Reports never go back, and an answer of None carries on to the last one, which finishes every scan."""
+    """Reports never go back, and an answer of None goes on to the last one, which finishes every scan."""
     reports: list[tuple[int, int]] = []
     found = populated.scan_batch(
         [1, 9, 17, 25], 2, arena, progress=lambda *report: reports.append(report), collection=blobs
@@ -233,7 +233,7 @@ def test_a_raising_progress_reports_unraisable_and_cancels(populated, blobs, are
     assert [report.exc_type for report in unraisable] == [ZeroDivisionError]
 
 
-def test_progress_runs_on_the_executors_threads(populated, blobs, unraisable):
+def test_progress_runs_on_the_executors_threads(populated, blobs, unraisable, engine: str):
     """A deferred call reports from the executor's threads, where the callable attaches the interpreter itself, and
     one that raises reports there and cancels the call, which `wait` raises as cancelled."""
     reporters: set[int] = set()
@@ -241,7 +241,7 @@ def test_progress_runs_on_the_executors_threads(populated, blobs, unraisable):
     def report(finished: int, total: int) -> None:
         reporters.add(threading.get_ident())
 
-    with ustore.Executor.for_ram(2) as executor:
+    with executor_for(engine, 2) as executor:
         later, arena = populated.deferred(executor), ustore.Arena(executor)
         assert runs(later.scan_batch(KEYS, 1, arena, progress=report, collection=blobs).wait()) == [
             [key] for key in KEYS

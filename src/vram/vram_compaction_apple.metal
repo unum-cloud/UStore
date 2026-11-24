@@ -322,11 +322,11 @@ inline void merge_rank(constant merge_rank_arguments_t& arguments, blocks_t bloc
             probe.sorted_run = other;
             ulong before = 0;
             for (ulong count = theirs.key_slots_count; count;) {
-                ulong const half = count / 2;
-                probe.key_slot = cells[before + half];
+                ulong const step = count / 2;
+                probe.key_slot = cells[before + step];
                 bool const below = order(probe, record);
-                before += below ? half + 1 : 0;
-                count = below ? count - half - 1 : half;
+                before += below ? step + 1 : 0;
+                count = below ? count - step - 1 : step;
             }
             rank += before;
             if (before == 0) continue;
@@ -354,9 +354,9 @@ inline located_key_slot<key_slot_type_> merge_packed(device located_key_slot<key
                                                      ulong replaced_count) {
     ulong low = 0;
     for (ulong count = replaced_count; count;) {
-        ulong const half = count / 2;
-        if (replaced[low + half] < index) low += half + 1, count -= half + 1;
-        else count = half;
+        ulong const step = count / 2;
+        if (replaced[low + step] < index) low += step + 1, count -= step + 1;
+        else count = step;
     }
     return low != replaced_count && replaced[low] == index ? replacements[low] : merged[index];
 }
@@ -659,10 +659,10 @@ inline strings_merge_verdict_t strings_merge_verdict(blocks_t blocks, device str
         bool const ahead = both_upper ? other > run : other < run;
         ulong before = 0;
         for (ulong count = theirs.count; count;) {
-            ulong const half = count / 2;
-            int const order = strings_merge_order(blocks, theirs, before + half, own, position);
-            if (order < 0 || (order == 0 && ahead)) before += half + 1, count -= half + 1;
-            else count = half;
+            ulong const step = count / 2;
+            int const order = strings_merge_order(blocks, theirs, before + step, own, position);
+            if (order < 0 || (order == 0 && ahead)) before += step + 1, count -= step + 1;
+            else count = step;
         }
         rank += before;
         if (before == 0 || !ahead || strings_merge_order(blocks, theirs, before - 1, own, position) != 0) continue;

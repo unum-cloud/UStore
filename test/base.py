@@ -1,6 +1,6 @@
 """Settings, engine capabilities and key spellings every Python suite shares, read once at import.
 
-The extension carries every engine its build enabled, so each case runs once per engine, and a case
+The extension holds every engine its build enabled, so each case runs once per engine, and a case
 marked as needing a capability skips on the engines that lack it. Suites write integer keys and
 expect them back as the `uuid.UUID` every key is answered as, which `key` and `keys` spell.
 
@@ -154,6 +154,14 @@ def open_engine(
     if isolation is not None:
         return ustore.Database.open_ram(directory, isolation=isolation)
     return getattr(ustore.Database, f"open_{engine}")(location(engine, directory))
+
+
+def executor_for(engine: str, threads: int, memory_domains: list[int] | None = None) -> ustore.Executor:
+    """An executor of `threads` threads of the kind `engine` admits: NVMe queues on the NVMe engine, whose databases
+    refuse a RAM executor, and host threads on every other."""
+    if engine == "nvme":
+        return ustore.Executor.for_nvme(threads, memory_domains=memory_domains)
+    return ustore.Executor.for_ram(threads, memory_domains=memory_domains)
 
 
 def serves_pages(database: ustore.Database) -> bool:

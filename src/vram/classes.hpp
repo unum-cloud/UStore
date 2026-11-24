@@ -40,7 +40,7 @@ using util::vram_kernel_names_k;
  *  vendor, and a device takes its vendor's newest class whose code it runs. */
 enum class gpu_class_t : std::uint32_t {
 
-    /** No class, which a device carries where no compiled class runs on it. */
+    /** No class, which a device reports where no compiled class runs on it. */
     unknown_k = ustore_gpu_class_unknown_k,
 
     /** Ampere-class NVIDIA - A100, A10 & RTX 30, and every later GPU that compiles its PTX. */
@@ -82,6 +82,20 @@ inline constexpr std::size_t gpu_classes_count_k = static_cast<std::size_t>(gpu_
 
 /** The bundle of kernels the library embeds for @p gpu_class, empty for a class left out. */
 std::span<byte_t const> gpu_class_bundle(gpu_class_t gpu_class) noexcept;
+
+/** Bytes of the walk record StringZilla's MSL regex walks read after an Apple kernel's parameters,
+ *  which the one unit filling it checks against StringZilla's own record. */
+inline constexpr std::size_t metal_regex_walk_bytes_k = 888;
+
+/** The walk record an Apple regex kernel reads after the parameters its CUDA twin takes, held as
+ *  bytes, since StringZilla declares it only in a header one unit may include. */
+struct metal_regex_walk_t {
+    alignas(8) byte_t bytes[metal_regex_walk_bytes_k];
+};
+
+/** The walk record of @p engine: its start states, acceptance bound and row stride, as
+ *  StringZilla's own Metal launches fill them, and zeros in a build without the Metal layer. */
+metal_regex_walk_t metal_regex_walk(sz_regex_engine_t const& engine) noexcept;
 
 /** Whether @p gpu_class, a class of @p device 's vendor, runs there, as its driver answers by
  *  loading the class's bundle: an NVIDIA device's into the primary context @p drivers retains, an
@@ -142,7 +156,7 @@ gpu_class_t pick_gpu_class(gpu_ladder<classes_...>, gpu_drivers_t& drivers, gpu_
 }
 
 /** The class @p device takes under @p gpu_class_ceiling, @c unknown_k setting none, walking its own
- *  vendor's ladder; @c unknown_k where no class this build carries runs on it, or none at or under
+ *  vendor's ladder; @c unknown_k where no class this build compiles runs on it, or none at or under
  *  the ceiling does. */
 inline gpu_class_t pick_gpu_class(gpu_drivers_t& drivers, gpu_device_t const& device,
                                   gpu_class_t gpu_class_ceiling) noexcept {
@@ -213,7 +227,7 @@ class kernel_tables {
  *      context, then loads the library's bundle of the class into @p cuda_kernels, @p hip_kernels
  *      or @p metal_kernels, each once.
  *
- *  A device the bundle carries no code for keeps moving memory and refuses launches alone. No
+ *  A device the bundle compiles no code for keeps moving memory and refuses launches alone. No
  *  other open of the same device runs meanwhile.
  *
  *  @par Statuses:
@@ -248,30 +262,29 @@ inline util::status_t open_gpu_device(gpu_drivers_t& drivers, gpu_device_t const
 }
 
 /** Spawns into @p into the executor of @p device, which @c open_gpu_device opened for
- *  @p gpu_class, over its vendor's driver in @p drivers, queueing on @p stream, the caller's
- *  stream of that vendor or null for one of its own, its scratch capped at @p scratch_limit bytes,
- *  zero for no ceiling, moving bytes between the drives and an NVIDIA device as @p gds asks, and
- *  launching the library's kernels from the table of its device and class in @p cuda_kernels,
- *  @p hip_kernels or @p metal_kernels, if one loaded. */
+ *  @p gpu_class, over its vendor's driver in @p drivers, queueing on a stream of its own, its
+ *  scratch capped at @p scratch_limit bytes, zero for no ceiling, moving bytes between the drives
+ *  and an NVIDIA device as @p gds asks, and launching the library's kernels from the table of its
+ *  device and class in @p cuda_kernels, @p hip_kernels or @p metal_kernels, if one loaded. */
 template <typename variant_type_>
 util::status_t spawn_gpu_executor(gpu_drivers_t const& drivers, kernel_tables<cuda_module_t> const& cuda_kernels,
                                   kernel_tables<hip_module_t> const& hip_kernels,
                                   kernel_tables<metal_module_t> const& metal_kernels, gpu_device_t const& device,
-                                  gpu_class_t gpu_class, void* stream, std::size_t scratch_limit, ustore_gds_t gds,
+                                  gpu_class_t gpu_class, std::size_t scratch_limit, ustore_gds_t gds,
                                   variant_type_& into) noexcept {
     int const ordinal = static_cast<int>(device.vendor_ordinal);
     if (device.vendor == gpu_vendor_t::nvidia_k) {
         if (device.vendor_ordinal >= gpu_devices_capacity_k)
             return {util::status_code_t::device_k, "The CUDA ordinal passes the devices UStore lists"};
         cuda_context_handle_t const context = drivers.cuda_contexts[device.vendor_ordinal];
-        auto [executor, status] = cuda_executor_t::spawn(drivers.cuda, context, device, stream, scratch_limit, gds,
+        auto [executor, status] = cuda_executor_t::spawn(drivers.cuda, context, device, scratch_limit, gds,
                                                          cuda_kernels.table_of(ordinal, gpu_class));
         if (status.failed()) return status;
         into.template emplace<cuda_executor_t>(std::move(executor));
         return {};
     }
     if (device.vendor == gpu_vendor_t::amd_k) {
-        auto [executor, status] = hip_executor_t::spawn(drivers.hip, device, stream, scratch_limit,
+        auto [executor, status] = hip_executor_t::spawn(drivers.hip, device, scratch_limit,
                                                         hip_kernels.table_of(ordinal, gpu_class));
         if (status.failed()) return status;
         into.template emplace<hip_executor_t>(std::move(executor));
@@ -279,8 +292,7 @@ util::status_t spawn_gpu_executor(gpu_drivers_t const& drivers, kernel_tables<cu
     }
     if (device.vendor == gpu_vendor_t::apple_k) {
         auto [executor, status] = metal_executor_t::spawn(drivers.metal, drivers.metal_devices.device(ordinal), device,
-                                                          stream, scratch_limit,
-                                                          metal_kernels.table_of(ordinal, gpu_class));
+                                                          scratch_limit, metal_kernels.table_of(ordinal, gpu_class));
         if (status.failed()) return status;
         into.template emplace<metal_executor_t>(std::move(executor));
         return {};

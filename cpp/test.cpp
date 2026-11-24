@@ -93,6 +93,38 @@ static void test_readme_quickstart() { expect_true(quickstart() == 0, "The READM
 
 #pragma region Modalities
 
+/** A predicate counting the keys it is asked about, which only one thread could call safely, as a
+ *  @c mutable lambda would. */
+struct counting_predicate_t {
+    std::size_t asked = 0;
+    bool operator()(ustore_key_t) noexcept { return ++asked != 0; }
+};
+
+/** A predicate reading only what it was built with, safe on every executor thread at once. */
+struct reading_predicate_t {
+    ustore_key_t refused {};
+    bool operator()(ustore_key_t key) const noexcept { return key != refused; }
+};
+
+/** A batch predicate counting the pages it is asked about, which only one thread could call
+ *  safely, as a @c mutable lambda would. */
+struct counting_batch_predicate_t {
+    std::size_t asked = 0;
+    void operator()(std::span<ustore_key_t const>, std::span<ustore_admission_t>) noexcept { ++asked; }
+};
+
+/** A batch predicate admitting every key, safe on every executor thread at once. */
+struct admitting_batch_predicate_t {
+    void operator()(std::span<ustore_key_t const>, std::span<ustore_admission_t> admissions) const noexcept {
+        for (ustore_admission_t& admission : admissions) admission = ustore_admit_k;
+    }
+};
+
+static_assert(!us::key_predicate_handler<counting_predicate_t>, "a predicate runs on several threads at once");
+static_assert(us::key_predicate_handler<reading_predicate_t>);
+static_assert(!us::keys_predicate_handler<counting_batch_predicate_t>, "a predicate runs on several threads at once");
+static_assert(us::keys_predicate_handler<admitting_batch_predicate_t>);
+
 /** Blobs written in a batch read back in place, count exactly, and answer shorthand reads. */
 static void test_blobs_round_trip() {
     auto [database, database_status] = us::database_t::init_ram();
@@ -179,6 +211,16 @@ static void test_docs_round_trip() {
     us::scalar_column_view<std::int64_t> const ages = table.column<0>();
     expect_true(ages.size() == 2 && ages[0].valid && ages[0].value == 7 && ages[1].value == 9,
                 "A gathered column must convert every document's field");
+
+    us::table_header<std::int64_t> const header = us::make_table_header().with<std::int64_t>("age");
+    auto [cursor, cursor_status] = us::docs_cursor_t::make(docs.receiver(), docs.handle(), us::smallest_key_k, {},
+                                                           header.view());
+    expect_success(cursor_status, "opening a documents cursor");
+    auto [batches, batches_status] = cursor.next(keys.size(), arena);
+    expect_success(batches_status, "pulling documents with a column");
+    std::size_t rows = 0;
+    for (ustore_docs_batch_view_t const& batch : batches) rows += batch.count;
+    expect_true(rows == keys.size(), "A documents cursor must pull every row in typed batches");
     auto [count, count_status] = docs.size();
     expect_true(!count_status.failed() && count == 2, "The size must count every document exactly");
 }

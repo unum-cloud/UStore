@@ -86,8 +86,8 @@ inline void set_degree(ustore_byte_t* value, std::size_t index, ustore_vertex_de
     std::memcpy(value + index * sizeof(ustore_vertex_degree_t), &degree, sizeof(ustore_vertex_degree_t));
 }
 
-/** Walks the neighborships of a value, loading each one through @c std::memcpy because the value carries no
- *  alignment of its own. */
+/** Walks the neighborships of a value, loading each one through @c std::memcpy because the value
+ *  holds no alignment of its own. */
 class neighborship_iterator_t {
 
     ustore_byte_t const* bytes_ {nullptr};
