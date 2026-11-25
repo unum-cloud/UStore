@@ -45,7 +45,7 @@
 #include "ustore/utilities/nvme_linux_aio_disk.hpp"   // `linux_aio_files_disk`, `linux_aio_probe_t`
 #include "ustore/utilities/nvme_linux_spdk_disk.hpp"  // `linux_spdk_disk`, `linux_spdk_environment`
 #include "ustore/utilities/nvme_linux_uring_disk.hpp" // `linux_uring_files_disk`, `linux_uring_probe_t`
-#include "ustore/utilities/nvme_ring.hpp"             // `queue_ref_t`, `request_t`, `completion_t`, `disk_concept`
+#include "ustore/utilities/nvme_ring.hpp"             // `queue_ref_t`, `request_t`, `completion_t`, `a_disk`
 #include "ustore/utilities/nvme_volume.hpp"           // `any_volume`, `data_address_t`, `parse_data_address`
 #include "ustore/utilities/ram_buffers.hpp" // `resource_constraint`, `constrained_allocator`, `unlimited_resource_k`
 #include "ustore/utilities/types.hpp"       // `status_t`, `status_code_t`, `expected`, `byte_t`, `string_t`
@@ -362,7 +362,7 @@ struct mount_report_t {
  *  @tparam waiter_type_ What a core waiting on the volume's reads and barriers does.
  */
 template <typename disk_type_, template <typename> typename atomic_reference_, typename waiter_type_>
-    requires disk_concept<disk_type_>
+    requires a_disk<disk_type_>
 class basic_storage_mount {
   public:
 
@@ -423,7 +423,7 @@ class basic_storage_mount {
      *  process. */
     status_t unmount() noexcept {
         status_t const closed = volume_.unmount();
-        if constexpr (releasing_disk_concept<disk_type_>) disk_.release();
+        if constexpr (a_releasing_disk<disk_type_>) disk_.release();
         return closed;
     }
 

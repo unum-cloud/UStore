@@ -594,14 +594,14 @@ inline st::status_t executor_status(status_t status) noexcept {
 
 /** Carves @p count elements off @p executor's bounce for one merge, which the
  *  next merge rewinds. */
-template <typename element_type_, utilities::gpu_executor_concept executor_type_>
+template <typename element_type_, utilities::a_gpu_executor executor_type_>
 element_type_* carve_bounce(executor_type_& executor, std::size_t count) noexcept {
     auto [carved, status] = utilities::arena_allocate<element_type_>(executor.bounce(), count);
     return status.failed() ? nullptr : carved.data();
 }
 
 /** Queues uploading @p count elements from host @p source to device @p target on @p executor. */
-template <typename element_type_, utilities::gpu_executor_concept executor_type_>
+template <typename element_type_, utilities::a_gpu_executor executor_type_>
 st::status_t upload(executor_type_& executor, element_type_* target, element_type_ const* source,
                     std::size_t count) noexcept {
     if (count == 0) return st::status_t::success_k;
@@ -610,7 +610,7 @@ st::status_t upload(executor_type_& executor, element_type_* target, element_typ
 }
 
 /** Queues downloading @p count elements from device @p source to host @p target on @p executor. */
-template <typename element_type_, utilities::gpu_executor_concept executor_type_>
+template <typename element_type_, utilities::a_gpu_executor executor_type_>
 st::status_t download(executor_type_& executor, element_type_* target, element_type_ const* source,
                       std::size_t count) noexcept {
     if (count == 0) return st::status_t::success_k;
@@ -621,7 +621,7 @@ st::status_t download(executor_type_& executor, element_type_* target, element_t
 
 /** Queues kernel @p name of @p executor's bundle over @p items items, one thread each, as
  *  many blocks of @c merge_block_threads_k as cover them up to @p blocks_limit. */
-template <utilities::gpu_executor_concept executor_type_, typename... argument_types_>
+template <utilities::a_gpu_executor executor_type_, typename... argument_types_>
 st::status_t launch_over(executor_type_& executor, char const* name, std::uint64_t items, std::uint64_t blocks_limit,
                          argument_types_... arguments) noexcept {
     std::uint64_t const blocks = fu::min_of(divide_round_up(items, std::uint64_t {merge_block_threads_k}),
@@ -733,7 +733,7 @@ constexpr std::size_t saved_words(sorted_run_index_view<key_slot_type_> const& v
  *  With @c no_device_fold_t every chain of the merge folds there.
  */
 template <typename key_slot_type_, typename fold_type_, typename device_fold_type_, typename allocator_type_,
-          utilities::gpu_executor_concept executor_type_>
+          utilities::a_gpu_executor executor_type_>
 st::status_t fold_survivors(executor_type_& executor, utilities::device_blocks_t& blocks, compaction_kind_t kind,
                             compaction_stamps_t const& stamps, std::uint64_t sorted_runs_count,
                             std::uint64_t value_stride, located_key_slot<key_slot_type_> const* merged,
@@ -875,9 +875,8 @@ st::expected<packed_counts_t> cuda_compactor_t::pack_(char const* name,
     return packed_counts_t {chains};
 }
 
-template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
-          typename allocator_type_>
-    requires compactable_key_slot_concept<key_slot_type_>
+template <typename key_slot_type_, utilities::a_fold fold_type_, typename device_fold_type_, typename allocator_type_>
+    requires a_compactable_key_slot<key_slot_type_>
 st::status_t cuda_compactor_t::compact(compaction_kind_t kind,
                                        std::span<sorted_run_index_view<key_slot_type_> const> upper,
                                        std::span<sorted_run_index_view<key_slot_type_> const> lower,
@@ -892,9 +891,8 @@ st::status_t cuda_compactor_t::compact(compaction_kind_t kind,
     else return st::status_t::invalid_argument_k;
 }
 
-template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
-          typename allocator_type_>
-    requires compactable_key_slot_concept<key_slot_type_>
+template <typename key_slot_type_, utilities::a_fold fold_type_, typename device_fold_type_, typename allocator_type_>
+    requires a_compactable_key_slot<key_slot_type_>
 st::status_t cuda_compactor_t::compact_on_device_(compaction_kind_t kind,
                                                   std::span<sorted_run_index_view<key_slot_type_> const> upper,
                                                   std::span<sorted_run_index_view<key_slot_type_> const> lower,
@@ -908,7 +906,7 @@ st::status_t cuda_compactor_t::compact_on_device_(compaction_kind_t kind,
     using view_t = sorted_run_index_view<key_slot_type_>;
     using names_t = merge_kernel_names<key_slot_type_>;
     using range_t = range_tombstone<typename key_slot_type_::stored_key_t>;
-    constexpr bool locates_k = locates_stored_values_concept<key_slot_type_>;
+    constexpr bool locates_k = a_key_slot_with_located_values<key_slot_type_>;
     constexpr bool gathers_keys_k = !is_inline(key_slot_type_::value_layout_k);
     constexpr st::assume_uninitialized_t uninitialized {};
 

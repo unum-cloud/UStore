@@ -72,8 +72,8 @@ constexpr bool is_variable_length(ustore_docs_field_type_t type) noexcept {
 
 /** Element types stored as offsets into a joined tape rather than as fixed-width scalars. */
 template <typename element_type_>
-concept variable_length_element = std::same_as<element_type_, value_view_t> ||
-                                  std::same_as<element_type_, std::string_view>;
+concept a_variable_length_element = std::same_as<element_type_, value_view_t> ||
+                                    std::same_as<element_type_, std::string_view>;
 
 /** One entry of a column, with the flags a gather reports for it. */
 template <typename element_type_>
@@ -147,7 +147,7 @@ class variable_length_column_view {
 
 /** Column view matching how @p element_type_ is stored. */
 template <typename element_type_>
-using column_view = std::conditional_t<variable_length_element<element_type_>,
+using column_view = std::conditional_t<a_variable_length_element<element_type_>,
                                        variable_length_column_view<element_type_>, scalar_column_view<element_type_>>;
 
 /** Column whose type is known only at runtime, viewed as a typed column through @c as. */
@@ -168,7 +168,7 @@ class dynamic_column_view_t {
 
     template <typename element_type_>
     column_view<element_type_> as() const noexcept {
-        if constexpr (variable_length_element<element_type_>) return {arrays_, count_, name_, type_};
+        if constexpr (a_variable_length_element<element_type_>) return {arrays_, count_, name_, type_};
         else return {arrays_, count_, name_};
     }
 
@@ -794,7 +794,7 @@ class docs_cursor_t {
 
 /** The fields a call over @p count keys passes as @p fields: none for whole documents, one for
  *  every key, which an accessor whose handle is @p fields repeats, or one per key. */
-template <strings_batch fields_type_>
+template <a_strings_batch fields_type_>
 status_t fields_view_(fields_type_ const& fields, std::size_t count, ustore_strings_view_t& view) noexcept {
     std::size_t const given = std::size(fields);
     if (given == 0) view = {};
@@ -825,14 +825,14 @@ class docs_collection_on {
 
     /** A proxy over one location inside this collection, read and written as @p type. */
     template <typename key_argument_type_>
-        requires(!batch<key_argument_type_>)
+        requires(!a_batch<key_argument_type_>)
     docs_ref<collection_key_field_t, access_> address_(key_argument_type_ const& key,
                                                        ustore_docs_field_type_t type) const noexcept {
         return {receiver_, location_in(collection_, key), type};
     }
 
     /** A proxy over a batch of locations inside this collection, read and written as @p type. */
-    template <batch keys_argument_type_>
+    template <a_batch keys_argument_type_>
     docs_ref<locations_in_collection<keys_argument_type_>, access_> address_(
         keys_argument_type_&& keys, ustore_docs_field_type_t type) const noexcept {
         using locations_t = locations_in_collection<keys_argument_type_>;
@@ -841,9 +841,9 @@ class docs_collection_on {
 
     /** The proxy @c at answers: over a batch of locations, or over one. */
     template <typename keys_argument_type_>
-    using ref_of =
-        std::conditional_t<batch<keys_argument_type_>, docs_ref<locations_in_collection<keys_argument_type_>, access_>,
-                           docs_ref<collection_key_field_t, access_>>;
+    using ref_of = std::conditional_t<a_batch<keys_argument_type_>,
+                                      docs_ref<locations_in_collection<keys_argument_type_>, access_>,
+                                      docs_ref<collection_key_field_t, access_>>;
 
   public:
     /** The handle a snapshot hands out for this kind of collection, which only reads. */
@@ -892,7 +892,7 @@ class docs_collection_on {
      *  @par Statuses:
      *  - @c status_code_t::invalid_argument_k The @p fields are neither none, one, nor one per key.
      */
-    template <strings_batch fields_type_ = strings_view_t>
+    template <a_strings_batch fields_type_ = strings_view_t>
     deferrable<values_view_t> read(keys_view_t keys, arena_t& arena, fields_type_ const& fields = {},
                                    ustore_docs_field_type_t type = ustore_docs_field_type_json_k,
                                    ustore_watch_t watch = ustore_watch_keys_k) const noexcept {
@@ -919,7 +919,7 @@ class docs_collection_on {
      *  - @c status_code_t::invalid_argument_k The @p keys and @p values differ in count, or the
      *    @p fields are neither none, one, nor one per key.
      */
-    template <strings_batch values_type_, strings_batch fields_type_ = strings_view_t>
+    template <a_strings_batch values_type_, a_strings_batch fields_type_ = strings_view_t>
     deferrable<> write(keys_view_t keys, values_type_ const& values, fields_type_ const& fields = {},
                        ustore_docs_modification_t modification = ustore_docs_modify_upsert_k,
                        ustore_docs_field_type_t type = ustore_docs_field_type_json_k,

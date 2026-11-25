@@ -43,7 +43,7 @@
 #include "ustore/utilities/blocking_files.hpp" // `replace_file_durably`, `read_file`, `list_directory`, `temporary_path_of`
 #include "ustore/utilities/nvme_channels.hpp"  // `io_channel_t`, `basic_read_pipeline`, `basic_write_pipeline`
 #include "ustore/utilities/nvme_manifest.hpp"  // `manifest_t`, `manifest_file_t`
-#include "ustore/utilities/nvme_ring.hpp"      // `extent_t`, `disk_concept`, `registered_medium_t`
+#include "ustore/utilities/nvme_ring.hpp"      // `extent_t`, `a_disk`, `registered_medium_t`
 #include "ustore/utilities/nvme_slots.hpp"     // `slot_t`, `slot_owner_block_t`, `slot_bytes_k`
 #include "ustore/utilities/types.hpp"          // `status_t`, `status_code_t`, `expected`, `uuid128_t`
 
@@ -442,7 +442,7 @@ class basic_slot_allocator {
  *  @tparam allocator_type_ The byte allocator the run-file pool and the manifest are charged to.
  */
 template <typename disk_type_, typename waiter_type_, typename allocator_type_>
-    requires disk_concept<disk_type_>
+    requires a_disk<disk_type_>
 class basic_directory_volume {
   public:
 
@@ -833,7 +833,7 @@ class basic_directory_volume {
  *  flush leaves the old generation in force.
  */
 template <typename disk_type_, typename waiter_type_, typename allocator_type_>
-    requires disk_concept<disk_type_>
+    requires a_disk<disk_type_>
 class basic_slotted_volume {
   public:
 
@@ -1410,7 +1410,7 @@ class basic_slotted_volume {
  *  directory, a slotted volume when it is a raw medium; every call is one @c visit, paid per
  *  run rather than per request. */
 template <typename disk_type_, typename waiter_type_, typename allocator_type_>
-    requires disk_concept<disk_type_>
+    requires a_disk<disk_type_>
 class any_volume {
   public:
 

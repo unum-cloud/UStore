@@ -52,13 +52,14 @@ using deferred_pages_t = pages_collection_on<ustore_completion_deferred_k, colle
 
 /** Whether @p collection_type_ imports pages, which only a handle that writes does. */
 template <typename collection_type_>
-concept imports_concept = requires(collection_type_ const& collection, std::array<std::string_view, 1> const& markups) {
+concept an_importing_collection = requires(collection_type_ const& collection,
+                                           std::array<std::string_view, 1> const& markups) {
     collection.import(keys_view_t {}, markups);
 };
 
 /** Whether a value can be assigned through a binary collection that @p receiver_type_ finds. */
 template <typename receiver_type_>
-concept assigns_through_concept =
+concept an_assignable_receiver =
     requires(answer_value_t<decltype(std::declval<receiver_type_&>().find(std::string_view {}))> collection) {
         collection[key_from_integer(1)].assign("x");
     };
@@ -66,32 +67,32 @@ concept assigns_through_concept =
 /** Whether @p collection_type_ reads keys and an arena passed as @p keys_type_
  *  and @p arena_type_. */
 template <typename collection_type_, typename keys_type_, typename arena_type_>
-concept reads_concept = requires(collection_type_ const& collection, keys_type_&& keys, arena_type_&& arena) {
+concept a_reading_collection = requires(collection_type_ const& collection, keys_type_&& keys, arena_type_&& arena) {
     collection.read(std::forward<keys_type_>(keys), std::forward<arena_type_>(arena));
 };
 
 /** Whether @p collection_type_ removes keys passed as @p keys_type_. */
 template <typename collection_type_, typename keys_type_>
-concept removes_concept = requires(collection_type_ const& collection, keys_type_&& keys) {
+concept a_removing_collection = requires(collection_type_ const& collection, keys_type_&& keys) {
     collection.remove(std::forward<keys_type_>(keys));
 };
 
 /** Whether @p collection_type_ hands out a proxy, which only a blocking handle does. */
 template <typename collection_type_>
-concept addresses_concept = requires(collection_type_ const& collection) { collection[key_from_integer(1)]; };
+concept an_addressable_collection = requires(collection_type_ const& collection) { collection[key_from_integer(1)]; };
 
 /** Whether @p result_type_ owns the one-off arena its view reads from: it moves, never copies, and
  *  hands out a view of @p view_type_. */
 template <typename result_type_, typename view_type_>
-concept owns_arena_concept = std::is_nothrow_move_constructible_v<result_type_> &&
-                             !std::is_copy_constructible_v<result_type_> && requires(result_type_ const& result) {
-                                 { result.view() } -> std::same_as<view_type_ const&>;
-                             };
+concept an_arena_owning_result = std::is_nothrow_move_constructible_v<result_type_> &&
+                                 !std::is_copy_constructible_v<result_type_> && requires(result_type_ const& result) {
+                                     { result.view() } -> std::same_as<view_type_ const&>;
+                                 };
 
 /* A snapshot hands out read-only collections, so nothing writes through it, while a transaction
  * does */
-static_assert(!assigns_through_concept<snapshot_ref_t>);
-static_assert(assigns_through_concept<transaction_ref_t>);
+static_assert(!an_assignable_receiver<snapshot_ref_t>);
+static_assert(an_assignable_receiver<transaction_ref_t>);
 
 /* Every verb is written once: blocking, it answers an expected, and deferred, a call holding its
 
@@ -107,22 +108,22 @@ static_assert(std::same_as<decltype(std::declval<deferred_blobs_t const&>().remo
 
 /* A deferred verb views its inputs as views of any contiguous batch, and an arena by reference,
  * so a temporary arena, which would die before the call is final, never reaches it */
-static_assert(reads_concept<deferred_blobs_t, std::array<ustore_key_t, 2>&, arena_t&>);
-static_assert(reads_concept<deferred_blobs_t, st::vector<ustore_key_t>&, arena_t&>);
-static_assert(reads_concept<deferred_blobs_t, std::span<ustore_key_t const>, arena_t&>);
-static_assert(reads_concept<deferred_blobs_t, keys_view_t, arena_t&>);
-static_assert(!reads_concept<deferred_blobs_t, keys_view_t, arena_t>);
-static_assert(reads_concept<deferred_docs_t, keys_view_t, arena_t&>);
-static_assert(reads_concept<deferred_strings_t, strings_view_t&, arena_t&>);
-static_assert(reads_concept<deferred_strings_t, std::span<value_view_t const>, arena_t&>);
-static_assert(!reads_concept<deferred_strings_t, strings_view_t&, arena_t>);
+static_assert(a_reading_collection<deferred_blobs_t, std::array<ustore_key_t, 2>&, arena_t&>);
+static_assert(a_reading_collection<deferred_blobs_t, st::vector<ustore_key_t>&, arena_t&>);
+static_assert(a_reading_collection<deferred_blobs_t, std::span<ustore_key_t const>, arena_t&>);
+static_assert(a_reading_collection<deferred_blobs_t, keys_view_t, arena_t&>);
+static_assert(!a_reading_collection<deferred_blobs_t, keys_view_t, arena_t>);
+static_assert(a_reading_collection<deferred_docs_t, keys_view_t, arena_t&>);
+static_assert(a_reading_collection<deferred_strings_t, strings_view_t&, arena_t&>);
+static_assert(a_reading_collection<deferred_strings_t, std::span<value_view_t const>, arena_t&>);
+static_assert(!a_reading_collection<deferred_strings_t, strings_view_t&, arena_t>);
 
 /* A read-only handle never removes, and a deferred handle hands out no proxy, as a proxy blocks */
-static_assert(removes_concept<deferred_blobs_t, keys_view_t>);
-static_assert(!removes_concept<deferred_blobs_read_t, keys_view_t>);
-static_assert(!removes_concept<blobs_read_collection_t, keys_view_t>);
-static_assert(addresses_concept<blobs_collection_t>);
-static_assert(!addresses_concept<deferred_blobs_t>);
+static_assert(a_removing_collection<deferred_blobs_t, keys_view_t>);
+static_assert(!a_removing_collection<deferred_blobs_read_t, keys_view_t>);
+static_assert(!a_removing_collection<blobs_read_collection_t, keys_view_t>);
+static_assert(an_addressable_collection<blobs_collection_t>);
+static_assert(!an_addressable_collection<deferred_blobs_t>);
 
 /* A deferred call never moves, as the library writes into it, while a plan moves, as its finish
  * consumes it */
@@ -142,8 +143,8 @@ static_assert(std::same_as<decltype(std::declval<deferred_strings_t const&>().sa
 static_assert(
     std::same_as<decltype(std::declval<deferred_pages_t const&>().read(keys_view_t {}, std::declval<arena_t&>())),
                  deferred<values_view_t>>);
-static_assert(imports_concept<pages_collection_t> && imports_concept<deferred_pages_t>);
-static_assert(!imports_concept<pages_read_collection_t>);
+static_assert(an_importing_collection<pages_collection_t> && an_importing_collection<deferred_pages_t>);
+static_assert(!an_importing_collection<pages_read_collection_t>);
 
 /* A feed, an ingest and an Arrow export own their C handles, so they move but never copy */
 static_assert(std::is_nothrow_move_constructible_v<changes_cursor_t> &&
@@ -152,9 +153,9 @@ static_assert(std::is_nothrow_move_constructible_v<ingest_t> && !std::is_copy_co
 static_assert(std::is_nothrow_move_constructible_v<arrow_export_t> && !std::is_copy_constructible_v<arrow_export_t>);
 
 /* A shorthand result owns its one-off arena, while a view only views one */
-static_assert(owns_arena_concept<owned_value_t, value_view_t>);
-static_assert(owns_arena_concept<owned<values_view_t>, values_view_t>);
-static_assert(!owns_arena_concept<value_view_t, value_view_t>);
+static_assert(an_arena_owning_result<owned_value_t, value_view_t>);
+static_assert(an_arena_owning_result<owned<values_view_t>, values_view_t>);
+static_assert(!an_arena_owning_result<value_view_t, value_view_t>);
 
 /* A progress callable never throws, as every wrapper is noexcept, and the call views it, so a
  * temporary never does */
@@ -167,8 +168,8 @@ static_assert(!std::is_convertible_v<throwing_progress_t&, progress_t>);
 /* Nor does a predicate throw */
 using admitting_predicate_t = decltype([](std::span<ustore_key_t const>, std::span<ustore_admission_t>) noexcept {});
 using throwing_predicate_t = decltype([](std::span<ustore_key_t const>, std::span<ustore_admission_t>) {});
-static_assert(keys_predicate_handler<admitting_predicate_t>);
-static_assert(!keys_predicate_handler<throwing_predicate_t>);
+static_assert(a_keys_predicate<admitting_predicate_t>);
+static_assert(!a_keys_predicate<throwing_predicate_t>);
 
 /** Calls every C++ wrapper in each accepted form against one database. */
 void test_wrappers_compile(config_t const& config) {

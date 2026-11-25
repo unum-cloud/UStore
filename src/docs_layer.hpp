@@ -490,7 +490,7 @@ inline bool reads_whole_documents(ustore_docs_read_t const& arguments, strings_a
 
 /** Implements @c ustore_docs_read over @p source for every read but one of whole JSON documents, exporting the
  *  fields its tasks address as JSON or as strings. */
-template <util::strings_kit_concept strings_kit_type_, typename documents_type_>
+template <util::a_strings_kit strings_kit_type_, typename documents_type_>
 util::status_t read_document_fields(documents_type_ const& source, ustore_docs_read_t const& arguments,
                                     strings_arg_t const& fields, view_t const& view) noexcept {
     if (arguments.outputs_type != ustore_docs_field_type_json_k &&
@@ -775,7 +775,7 @@ inline util::status_t fragments_into_columns(std::span<column_fragments_t const>
  *  the flight into the fragments of each field, staged in the call's scratch, so only the cells
  *  outlive their documents and reach the arena once the last flight is read.
  */
-template <util::strings_kit_concept strings_kit_type_, typename documents_type_>
+template <util::a_strings_kit strings_kit_type_, typename documents_type_>
 util::status_t gather_documents(documents_type_ const& source, ustore_docs_gather_t const& arguments,
                                 strings_arg_t const& fields, view_t const& view) noexcept {
     if (!arguments.count || !arguments.fields_count) return {};
@@ -1078,7 +1078,7 @@ struct docs_batches_t {
     /** Appends to batch @p task a row per key of @p keys that @p kept names, with the cells of
      *  every column, extracted from @p documents in one pass in @p scratch, where @p document_of
      *  finds each key's document. */
-    template <util::strings_kit_concept strings_kit_type_>
+    template <util::a_strings_kit strings_kit_type_>
     util::status_t append(std::size_t task, std::span<ustore_key_t const> keys, candidates_t const& kept,
                           json_documents_t const& documents, std::span<std::uint32_t const> document_of,
                           ustore_arena_t scratch) noexcept {
@@ -1165,7 +1165,7 @@ struct docs_batches_t {
 
     /** Fills one batch on the calling thread from the @p listed keys, narrowing them and reading
      *  the documents of those left through @p read, as @c narrow reads. */
-    template <util::strings_kit_concept strings_kit_type_, typename read_type_>
+    template <util::a_strings_kit strings_kit_type_, typename read_type_>
     util::status_t fill_one(std::span<ustore_key_t const> listed, read_type_&& read, ustore_arena_t scratch) noexcept {
         candidates_t kept;
         json_documents_t documents;
@@ -1185,7 +1185,7 @@ struct docs_batches_t {
  *  arguments on the calling thread, listing its keys through @p scan and reading the whole
  *  documents of those the match lets through @p read, the verbs of one engine called as
  *  <tt>scan(listing, view)</tt> and <tt>read(reading, view)</tt>. */
-template <util::strings_kit_concept strings_kit_type_, typename scan_type_, typename read_type_>
+template <util::a_strings_kit strings_kit_type_, typename scan_type_, typename read_type_>
 util::status_t fill_one_batch(ustore_docs_scan_t const& arguments, docs_batches_t& batches, scan_type_&& scan,
                               read_type_&& read, view_t const& view) noexcept {
     ustore_length_t const* offsets = nullptr;
@@ -1273,7 +1273,7 @@ util::status_t docs_write_over_blobs(ustore_docs_write_t const& arguments, strin
     return write_documents(documents_in_values_t {values_verbs_, arguments.database}, arguments, fields, values, view);
 }
 
-template <util::strings_kit_concept strings_kit_type_, blobs_verbs<vendored_residency_t::host_k> const& values_verbs_,
+template <util::a_strings_kit strings_kit_type_, blobs_verbs<vendored_residency_t::host_k> const& values_verbs_,
           auto resolve_>
 util::status_t docs_read_over_blobs(ustore_docs_read_t const& arguments, strings_arg_t const& fields,
                                     view_t const& view) noexcept {
@@ -1304,7 +1304,7 @@ util::status_t docs_gist_over_blobs(ustore_docs_gist_t const& arguments, view_t 
     return gist_documents(documents_in_values_t {values_verbs_, arguments.database}, arguments, view);
 }
 
-template <util::strings_kit_concept strings_kit_type_, blobs_verbs<vendored_residency_t::host_k> const& values_verbs_,
+template <util::a_strings_kit strings_kit_type_, blobs_verbs<vendored_residency_t::host_k> const& values_verbs_,
           auto resolve_>
 util::status_t docs_gather_over_blobs(ustore_docs_gather_t const& arguments, strings_arg_t const& fields,
                                       view_t const& view) noexcept {
@@ -1317,7 +1317,7 @@ util::status_t docs_gather_over_blobs(ustore_docs_gather_t const& arguments, str
 
 /** The docs scan of an engine keeping every document as one whole value, which lists keys alone, or
  *  fills the one batch of a cursor's pull serially when @p batches is not null. */
-template <util::strings_kit_concept strings_kit_type_, blobs_verbs<vendored_residency_t::host_k> const& values_verbs_,
+template <util::a_strings_kit strings_kit_type_, blobs_verbs<vendored_residency_t::host_k> const& values_verbs_,
           auto resolve_>
 util::status_t docs_scan_over_blobs(ustore_docs_scan_t const& arguments, docs_batches_t* batches,
                                     view_t const& view) noexcept {

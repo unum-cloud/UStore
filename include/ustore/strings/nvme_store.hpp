@@ -46,7 +46,7 @@
 #include "ustore/strings/string_keys.hpp"       // `head_of`, `head_length_of`, `tail_of`, `head_prefix_bytes_k`
 #include "ustore/strings/nvme_memory_run.hpp"   // `memory_run`, `sealed_deltas`, `kept_versions`
 #include "ustore/utilities/folds.hpp"           // `last_write_fold_t`, `delta_view_t`
-#include "ustore/utilities/ram_buffers.hpp"     // `local_arena_t`, `arena_allocator`, `strings_kit_concept`
+#include "ustore/utilities/ram_buffers.hpp"     // `local_arena_t`, `arena_allocator`, `a_strings_kit`
 #include "ustore/utilities/types.hpp"           // `status_t`, `expected`, `byte_t`
 
 namespace unum::ustore::strings {
@@ -150,7 +150,7 @@ struct listed_string_t {
  *      its strings through.
  */
 template <typename volume_type_, template <typename> typename atomic_reference_, typename waiter_type_,
-          utilities::strings_kit_concept strings_kit_type_>
+          utilities::a_strings_kit strings_kit_type_>
 class nvme_store {
   public:
 

@@ -54,13 +54,13 @@ using namespace unum::ustore::strings;
 #pragma region Stores
 
 template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_,
-          util::strings_kit_concept strings_kit_type_>
+          util::a_strings_kit strings_kit_type_>
 struct collection_store;
 
 /** What the collections system collection records of a collection: its name, and the store its
  *  entries live in, whose kind says what it holds. */
 template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_,
-          util::strings_kit_concept strings_kit_type_>
+          util::a_strings_kit strings_kit_type_>
 struct collection_entry {
 
     /** The name of the collection, empty for one created without. */
@@ -72,13 +72,13 @@ struct collection_entry {
 
 /** A collection's UUID mapped onto what the collections system collection records of it. */
 template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_,
-          util::strings_kit_concept strings_kit_type_>
+          util::a_strings_kit strings_kit_type_>
 using collections_pair = st::mapping<ustore_collection_id_t,
                                      collection_entry<isolation_, atomic_reference_, waiter_type_, strings_kit_type_>>;
 
 /** The collections system collection: every collection's UUID mapped onto its entry. */
 template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_,
-          util::strings_kit_concept strings_kit_type_>
+          util::a_strings_kit strings_kit_type_>
 using collections_by_id_store =
     ordered_store<collections_pair<isolation_, atomic_reference_, waiter_type_, strings_kit_type_>, util::uuid_order_t,
                   util::uuid_hash_t, isolation_, atomic_reference_, waiter_type_>;
@@ -86,7 +86,7 @@ using collections_by_id_store =
 /** The store of one collection, of the kind its creator picked, which a drop retires
  *  rather than frees. */
 template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_,
-          util::strings_kit_concept strings_kit_type_>
+          util::a_strings_kit strings_kit_type_>
 struct collection_store {
 
     /** The collection's entries. */
@@ -118,7 +118,7 @@ struct collection_store {
 /** A transaction over both system collections and every collection store it reaches, published
  *  under one stamp. */
 template <isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_,
-          util::strings_kit_concept strings_kit_type_>
+          util::a_strings_kit strings_kit_type_>
 using collections_transaction = st::dynamic_transaction_group<
     collections_by_id_store<isolation_, atomic_reference_, waiter_type_, strings_kit_type_>,
     values_by_key_store<isolation_, atomic_reference_, waiter_type_>,
@@ -786,7 +786,7 @@ store_status_t scan_descending(view_type_ const& view, util::scan_task_t const& 
 
 /** Whether a view walks its entries partition by partition, handing each to @p take_type_. */
 template <typename view_type_, typename take_type_>
-concept walks_partitions_concept = requires(view_type_ const& view, take_type_& take) { view.for_each(take); };
+concept a_partitioned_view = requires(view_type_ const& view, take_type_& take) { view.for_each(take); };
 
 /** Appends up to the limit of @p scan keys of a collection of @p entry_type_ in any order,
  *  partition by partition, halting with @p outcome when the scratch refuses. A view offering no
@@ -802,7 +802,7 @@ store_status_t scan_unordered(view_type_ const& view, util::scan_task_t const& s
         if (outcome.failed()) return walk_control_t::halt_k;
         return outputs.size() - first == scan.limit ? walk_control_t::halt_k : walk_control_t::resume_k;
     };
-    if constexpr (walks_partitions_concept<view_type_, decltype(take)>) return view.for_each(take);
+    if constexpr (a_partitioned_view<view_type_, decltype(take)>) return view.for_each(take);
     else return scan_ascending<entry_type_>(view, scan, outputs, outcome);
 }
 
@@ -2748,7 +2748,7 @@ void pin_call(ustore_database_t database, ustore_collection_id_t const*, view_t 
 
 /** Whether a call lands keys or values, which the memory limit of its database counts. */
 template <typename arguments_type_>
-concept lands_values_concept =
+concept a_call_landing_values =
     std::is_same_v<arguments_type_, ustore_blobs_write_t> || std::is_same_v<arguments_type_, ustore_docs_write_t> ||
     std::is_same_v<arguments_type_, ustore_strings_write_t> || std::is_same_v<arguments_type_, ustore_pages_import_t> ||
     std::is_same_v<arguments_type_, ustore_pages_insert_t> || std::is_same_v<arguments_type_, ustore_pages_splice_t> ||
@@ -2789,7 +2789,7 @@ util::status_t serve_database(arguments_type_ const& arguments, strings_types_ c
                               view_t const& view) noexcept {
     database_state<cpu_class_, isolation_>& state = *state_of<database_state<cpu_class_, isolation_>>(
         database_of(arguments));
-    if constexpr (lands_values_concept<arguments_type_>) {
+    if constexpr (a_call_landing_values<arguments_type_>) {
         std::size_t const keys = std::is_same_v<arguments_type_, ustore_graph_write_edges_t> ? 3 : 1;
         std::size_t const bytes = keys * arguments.count * sizeof(ustore_key_t) +
                                   (std::size_t {0} + ... + strings_bytes(strings, arguments.count));

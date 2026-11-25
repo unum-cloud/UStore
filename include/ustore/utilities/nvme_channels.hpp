@@ -40,7 +40,7 @@
 #include <smashtable/basic_fixed_pool.hpp> // `st::basic_fixed_pool`
 #include <smashtable/basic_vector.hpp>     // `st::vector`
 
-#include "ustore/utilities/nvme_ring.hpp" // `disk_concept`, `read_request`, `write_request`, `deallocate_request`
+#include "ustore/utilities/nvme_ring.hpp" // `a_disk`, `read_request`, `write_request`, `deallocate_request`
 #include "ustore/utilities/types.hpp"     // `status_t`, `status_code_t`, `expected`, `byte_t`
 
 namespace unum::ustore::utilities {
@@ -292,7 +292,7 @@ struct nvme_queues_ref_t {
 };
 
 template <typename disk_type_>
-    requires disk_concept<disk_type_>
+    requires a_disk<disk_type_>
 class basic_read_pipeline;
 
 /**
@@ -361,7 +361,7 @@ class io_channel_t {
     friend class nvme_queues_t;
 
     template <typename disk_type_>
-        requires disk_concept<disk_type_>
+        requires a_disk<disk_type_>
     friend class basic_read_pipeline;
 
     /** One read a pipeline offered and has not yet retired, at the ring position of its slot. */
@@ -460,7 +460,7 @@ inline status_t require_completed_in_full(completed_buffer_t const& completed) n
  *  The offers live in the channel's read ring at their slot's position, so nothing is allocated.
  */
 template <typename disk_type_>
-    requires disk_concept<disk_type_>
+    requires a_disk<disk_type_>
 class basic_read_pipeline {
   public:
 
@@ -631,7 +631,7 @@ class basic_read_pipeline {
 
     /** Waits for at least one completion where the disk offers a sleeping wait, or polls once. */
     expected<std::size_t> wait_on_disk_() noexcept {
-        if constexpr (sleeping_disk_concept<disk_type_>)
+        if constexpr (a_sleeping_disk<disk_type_>)
             return disk_.wait_completions(channel_.queue_pair(), channel_.completion_buffer());
         else return disk_.poll_completions(channel_.queue_pair(), channel_.completion_buffer());
     }
@@ -701,7 +701,7 @@ class basic_read_pipeline {
  *  @tparam waiter_type_ What the core does while it waits for the barrier's completion.
  */
 template <typename disk_type_, typename waiter_type_>
-    requires disk_concept<disk_type_>
+    requires a_disk<disk_type_>
 class basic_write_pipeline {
   public:
 

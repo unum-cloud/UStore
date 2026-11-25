@@ -24,7 +24,7 @@
 
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_allocator`, `growing_strings`, `export_strings`
 
-#include "utilities/arguments.hpp" // `takes_limits_concept`
+#include "utilities/arguments.hpp" // `a_call_taking_limits`
 
 namespace unum::ustore::utilities {
 
@@ -93,7 +93,7 @@ class read_outputs_t {
         outputs.presences_ = presences.data();
         outputs.lengths_ = lengths.data();
         outputs.found_ = found.data();
-        if constexpr (takes_limits_concept<arguments_type_>) {
+        if constexpr (a_call_taking_limits<arguments_type_>) {
             outputs.offsets_ = strided(arguments.offsets);
             outputs.limits_ = strided(arguments.limits);
         }

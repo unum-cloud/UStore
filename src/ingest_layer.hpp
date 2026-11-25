@@ -54,7 +54,7 @@ inline ingest_values_t ingest_values_of(ustore_modality_t modality) noexcept {
  *  into, unescaped through @p strings_kit_type_, the page of row @c r placed at @p placement with
  *  its sequence advanced by @c r.
  */
-template <strings_kit_concept strings_kit_type_>
+template <a_strings_kit strings_kit_type_>
 expected<std::span<std::span<byte_t const>>> parse_ingest_values(ingest_values_t values, util::keyed_rows_t const& rows,
                                                                  pages::placement_t placement,
                                                                  view_t const& view) noexcept {

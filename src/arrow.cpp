@@ -196,7 +196,7 @@ util::expected<converted_offsets_t> convert_on_host(ustore_arena_t arena, ustore
 
 /** Converts the @p rows + 1 offsets at @p offsets on @p executor's device into @p blocks in the
  *  other width, through the executor's bounce. */
-template <typename converted_type_, typename source_type_, gpu_executor_concept executor_type_>
+template <typename converted_type_, typename source_type_, a_gpu_executor executor_type_>
 util::expected<converted_offsets_t> convert_through(executor_type_& executor, util::device_blocks_t& blocks,
                                                     source_type_ const* offsets, std::size_t rows) noexcept {
     ustore_arena_t const bounce = executor.bounce();
@@ -410,7 +410,7 @@ ustore_status_t drop_on_host(ustore_arena_t arena, offset_type_ const* offsets, 
 }
 
 /** Packs the @p rows booleans at @p bools on @p executor's device into bits cut from @p blocks. */
-template <gpu_executor_concept executor_type_>
+template <a_gpu_executor executor_type_>
 util::expected<std::span<ustore_octet_t>> pack_on_device(executor_type_& executor, util::device_blocks_t& blocks,
                                                          ustore_byte_t const* bools, std::size_t rows) noexcept {
     if (!executor.kernels()) return util::status_code_t::device_k;
@@ -429,7 +429,7 @@ util::expected<std::span<ustore_octet_t>> pack_on_device(executor_type_& executo
 /** Copies the device text tape of @p rows rows at @p offsets and @p bytes without the null byte
  *  ending every row, on @p executor's device into @p blocks, learning its length from its first and
  *  last offsets through the bounce. */
-template <typename offset_type_, gpu_executor_concept executor_type_>
+template <typename offset_type_, a_gpu_executor executor_type_>
 ustore_status_t drop_on_device(executor_type_& executor, util::device_blocks_t& blocks, offset_type_ const* offsets,
                                ustore_byte_t const* bytes, std::size_t rows, column_buffers_t& buffers) noexcept {
     if (!executor.kernels()) return ustore_status_device_k;

@@ -28,7 +28,7 @@ Pin a commit, not a version, when building on them.
   - `ranges.hpp`: strided iterators, spans and tapes viewing the batched arguments and results of the C ABI inside the engines.
   - `blocking_files.hpp`: whole-file mappings, paths joined into one buffer, directories created and removed, and shared libraries opened by name.
   - `algorithm.hpp`: searches over sorted batches, reservoir sampling over ordered iterators, and inserts and erases in trivially copyable buffers.
-  - `folds.hpp`: `fold_concept`, which folds the base of a key with the deltas newer than it, and `last_write_fold_t`, where the newest delta wins.
+  - `folds.hpp`: `a_fold`, which folds the base of a key with the deltas newer than it, and `last_write_fold_t`, where the newest delta wins.
   - `nvme_ring.hpp`: completion counters, disk and file identifiers, alignment, extents, and the submission and completion ring every NVMe transport exposes.
     It reaches no StringZilla, so CUDA translation units include it.
   - `nvme_disks.hpp`: the ring machinery every disk shares, the volume in memory, and the blocking floor of positioned reads and writes.

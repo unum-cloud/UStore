@@ -39,11 +39,11 @@
 #include <smashtable/immutable_splus_tree.hpp>   // `st::immutable_splus_tree_view`
 #include <smashtable/shared.hpp>                 // `st::status_t`, `st::default_allocator`, `st::assume_uninitialized`
 
-#include "ustore/blobs/nvme_key_slot.hpp"          // `stored_key_concept`
+#include "ustore/blobs/nvme_key_slot.hpp"          // `a_stored_key`
 #include "ustore/utilities/algorithm.hpp"          // `loser_tree`
 #include "ustore/utilities/blocking_files.hpp"     // `path_max_bytes_k`
-#include "ustore/utilities/folds.hpp"              // `fold_concept`, `fold_delta_pair`, `delta_kind_t`
-#include "ustore/utilities/nvme_ring.hpp"          // `extent_t`, `disk_concept`, `queue_ref_t`, `read_request`
+#include "ustore/utilities/folds.hpp"              // `a_fold`, `fold_delta_pair`, `delta_kind_t`
+#include "ustore/utilities/nvme_ring.hpp"          // `extent_t`, `a_disk`, `queue_ref_t`, `read_request`
 #include "ustore/utilities/ram_buffers.hpp"        // `local_arena_t`, `arena_allocator`
 #include "ustore/utilities/types.hpp"              // `round_up_to_multiple`, `expected`, `uuid128_t`
 #include "ustore/utilities/vram_amd_device.hpp"    // `hip_executor_t`
@@ -69,23 +69,23 @@ using sorted_run_tree_view =
 /** A key slot shape compaction merges: trivially copyable and keyed by a stored key, with the kind of each delta in
  *  its run's kinds column. */
 template <typename key_slot_type_>
-concept compactable_key_slot_concept = std::is_trivially_copyable_v<key_slot_type_> &&
-                                       stored_key_concept<typename key_slot_type_::stored_key_t> &&
-                                       requires(key_slot_type_ const& key_slot) {
-                                           {
-                                               key_slot.stored_key
-                                           } -> std::convertible_to<typename key_slot_type_::stored_key_t>;
-                                       };
+concept a_compactable_key_slot = std::is_trivially_copyable_v<key_slot_type_> &&
+                                 a_stored_key<typename key_slot_type_::stored_key_t> &&
+                                 requires(key_slot_type_ const& key_slot) {
+                                     {
+                                         key_slot.stored_key
+                                     } -> std::convertible_to<typename key_slot_type_::stored_key_t>;
+                                 };
 
 /** A key slot shape recording the size of its inline value, which a shape holding one width for every value lacks. */
 template <typename key_slot_type_>
-concept sizes_stored_values_concept = requires(key_slot_type_& key_slot) {
+concept a_key_slot_with_sizes = requires(key_slot_type_& key_slot) {
     key_slot.size = static_cast<stored_value_size_t>(0);
 };
 
 /** A key slot shape whose stored values live in its sorted run's stored values section, found by sorted position. */
 template <typename key_slot_type_>
-concept locates_stored_values_concept = requires {
+concept a_key_slot_with_located_values = requires {
     requires is_fixed_or_variable_width(key_slot_type_::value_layout_k);
 };
 
@@ -93,8 +93,8 @@ concept locates_stored_values_concept = requires {
  *  its runs hold the tails the heads cut short, and two key slots hold one key only where their
  *  tails match too. Only the host compactor merges these. */
 template <typename key_slot_type_>
-concept tailed_key_slot_concept = compactable_key_slot_concept<key_slot_type_> &&
-                                  requires { requires key_slot_type_::has_tails_k; };
+concept a_tailed_key_slot = a_compactable_key_slot<key_slot_type_> &&
+                            requires { requires key_slot_type_::has_tails_k; };
 
 /** The tails of the keys a run's heads cut short, in sorted order: key slot @c i's tail is @c bytes from
  *  @c offsets[i] to @c offsets[i + 1], and a run of whole keys holds no offsets at all. */
@@ -778,8 +778,8 @@ constexpr bool same_key(located_tailed_key_slot<key_slot_type_> const& first,
 /** The record a merge of @p key_slot_type_ moves: a located key slot, beside its tail for
  *  a tailed shape. */
 template <typename key_slot_type_>
-using compaction_record = std::conditional_t<tailed_key_slot_concept<key_slot_type_>,
-                                             located_tailed_key_slot<key_slot_type_>, located_key_slot<key_slot_type_>>;
+using compaction_record = std::conditional_t<a_tailed_key_slot<key_slot_type_>, located_tailed_key_slot<key_slot_type_>,
+                                             located_key_slot<key_slot_type_>>;
 
 /** What one compaction writes, kept between compactions so their buffers are reused, and the host
  *  compactor's working buffers beside it. */
@@ -1034,13 +1034,13 @@ constexpr std::uint64_t stored_values_offset(sorted_run_bounds_t const& bounds,
                                              std::uint64_t key_slots_count) noexcept {
     // Only cells holding inline values are saved; the key tree holds every key of the others.
     std::uint64_t cells_bytes = 0;
-    if constexpr (!locates_stored_values_concept<key_slot_type_>)
+    if constexpr (!a_key_slot_with_located_values<key_slot_type_>)
         cells_bytes = key_slots_count * sizeof(key_slot_type_);
     std::uint64_t const keys_bytes = sizeof(st::splus_tree_header_t) +
                                      sorted_run_tree_view<typename key_slot_type_::stored_key_t>::size_bytes(
                                          static_cast<std::size_t>(key_slots_count));
     std::uint64_t offsets_bytes = 0;
-    if constexpr (locates_stored_values_concept<key_slot_type_>)
+    if constexpr (a_key_slot_with_located_values<key_slot_type_>)
         if (is_variable_width(key_slot_type_::value_layout_k))
             offsets_bytes = round_up_to_multiple((key_slots_count + 1) * sizeof(stored_value_offset_t),
                                                  bounds.alignment_bytes);
@@ -1055,7 +1055,7 @@ constexpr std::uint64_t sorted_run_file_bytes(sorted_run_bounds_t const& bounds,
                                               std::uint64_t stored_values_bytes) noexcept {
     // A run of strings keeps its heads in a saved S+ tree, then its values, key offsets, keys
     // and layers apart.
-    if constexpr (tailed_key_slot_concept<key_slot_type_>) {
+    if constexpr (a_tailed_key_slot<key_slot_type_>) {
         std::uint64_t const heads = sizeof(st::splus_tree_header_t) + sorted_run_tree_view<st::key128_t>::size_bytes(
                                                                           static_cast<std::size_t>(key_slots_count));
         return bounds.header_bytes + round_up_to_multiple(heads, bounds.alignment_bytes) +
@@ -1064,7 +1064,7 @@ constexpr std::uint64_t sorted_run_file_bytes(sorted_run_bounds_t const& bounds,
                round_up_to_multiple(stored_values_bytes, bounds.alignment_bytes) + bounds.alignment_bytes;
     }
     std::uint64_t const key_slots_end = stored_values_offset<key_slot_type_>(bounds, key_slots_count);
-    if constexpr (locates_stored_values_concept<key_slot_type_>)
+    if constexpr (a_key_slot_with_located_values<key_slot_type_>)
         return key_slots_end + round_up_to_multiple(stored_values_bytes, bounds.alignment_bytes);
     else return key_slots_end;
 }
@@ -1101,7 +1101,7 @@ constexpr void place_key_slot(located_key_slot<key_slot_type_> const& source, st
  *  @param[out] folded The bytes of the merge's folded values, or the inline key slot when the value fits it.
  */
 template <typename key_slot_type_, typename folded_type_>
-    requires locates_stored_values_concept<key_slot_type_>
+    requires a_key_slot_with_located_values<key_slot_type_>
 st::status_t place_folded_value(std::span<byte_t const> bytes, std::uint64_t value_stride, std::uint32_t folded_run,
                                 located_key_slot<key_slot_type_>& record, folded_type_& folded) noexcept {
     using st::status_t;
@@ -1130,8 +1130,7 @@ st::status_t place_folded_value(std::span<byte_t const> bytes, std::uint64_t, st
     key_slot_type_& key_slot = record.key_slot;
     if (bytes.size() > sizeof(key_slot.data)) return status_t::capacity_exhausted_k;
     if (!bytes.empty()) std::memcpy(key_slot.data, bytes.data(), bytes.size());
-    if constexpr (sizes_stored_values_concept<key_slot_type_>)
-        key_slot.size = static_cast<stored_value_size_t>(bytes.size());
+    if constexpr (a_key_slot_with_sizes<key_slot_type_>) key_slot.size = static_cast<stored_value_size_t>(bytes.size());
     else if (bytes.size() != key_slot_type_::size) return status_t::invalid_argument_k;
     return status_t::success_k;
 }
@@ -1367,7 +1366,7 @@ st::status_t plan_sorted_runs(std::uint64_t key_slots_count, sorted_run_bounds_t
 template <typename key_slot_type_>
 constexpr bool views_locate_values(std::span<sorted_run_index_view<key_slot_type_> const> views,
                                    sorted_run_bounds_t const& bounds) noexcept {
-    if constexpr (!locates_stored_values_concept<key_slot_type_>) return bounds.value_stride == 0;
+    if constexpr (!a_key_slot_with_located_values<key_slot_type_>) return bounds.value_stride == 0;
     else if constexpr (is_fixed(key_slot_type_::value_layout_k)) return bounds.value_stride != 0;
     else {
         if (bounds.value_stride != 0) return false;
@@ -1489,7 +1488,7 @@ constexpr folded_versions_t folded_versions(compaction_kind_t kind, compaction_s
  *  @param[in,out] arena Where the bytes the fold reads and writes are allocated.
  *  @param[out] folded What the change folds to, a write, a removal or a change, its bytes in @p arena or a record.
  */
-template <typename record_type_, utilities::fold_concept fold_type_, typename value_of_type_>
+template <typename record_type_, utilities::a_fold fold_type_, typename value_of_type_>
 st::status_t fold_versions(fold_type_ const& fold, record_type_ const* merged, std::uint64_t head,
                            folded_versions_t const& versions, value_of_type_&& value_of,
                            utilities::arena_allocator<byte_t>& arena, delta_view_t& folded) noexcept {
@@ -1540,9 +1539,9 @@ struct host_compactor_t {
      *  - @c capacity_exhausted_k A folded value outgrows its inline key slot or the 32-bit sizes.
      *  - @c out_of_memory_heap_k A buffer could not grow.
      */
-    template <typename key_slot_type_, utilities::fold_concept fold_type_, typename value_reader_type_,
+    template <typename key_slot_type_, utilities::a_fold fold_type_, typename value_reader_type_,
               typename allocator_type_>
-        requires compactable_key_slot_concept<key_slot_type_>
+        requires a_compactable_key_slot<key_slot_type_>
     st::status_t compact(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_type_> const> upper,
                          std::span<sorted_run_index_view<key_slot_type_> const> lower,
                          sorted_run_bounds_t const& bounds, compaction_stamps_t const& stamps, fold_type_ const& fold,
@@ -1551,8 +1550,8 @@ struct host_compactor_t {
         using st::status_t;
         using record_t = compaction_record<key_slot_type_>;
         using view_t = sorted_run_index_view<key_slot_type_>;
-        constexpr bool tailed_k = tailed_key_slot_concept<key_slot_type_>;
-        constexpr bool locates_k = locates_stored_values_concept<key_slot_type_>;
+        constexpr bool tailed_k = a_tailed_key_slot<key_slot_type_>;
+        constexpr bool locates_k = a_key_slot_with_located_values<key_slot_type_>;
         constexpr bool drops_value_offsets_k = locates_k && !is_variable_width(key_slot_type_::value_layout_k);
         constexpr st::assume_uninitialized_t uninitialized {};
 
@@ -1782,7 +1781,7 @@ class fold_ref_t {
   public:
 
     /** Views @p fold, which must outlive every call. */
-    template <utilities::fold_concept fold_type_>
+    template <utilities::a_fold fold_type_>
     explicit fold_ref_t(fold_type_ const& fold) noexcept
         : fold_(&fold), apply_(&apply_through_<fold_type_>), compose_(&compose_through_<fold_type_>),
           closes_(&closes_through_<fold_type_>) {}
@@ -1843,7 +1842,7 @@ class fold_ref_t {
     closes_t closes_ = nullptr;
 };
 
-static_assert(utilities::fold_concept<fold_ref_t>);
+static_assert(utilities::a_fold<fold_ref_t>);
 
 /** A viewed reader of the values a fold reads, called as @c host_compactor_t calls its own, so one
  *  device compaction compiled per key slot serves a reader of any type. */
@@ -1974,7 +1973,7 @@ class device_sections_reader_t {
  *  @tparam volume_type_ The directory volume naming the run files, or @c void for raw media alone.
  */
 template <typename disk_type_, typename waiter_type_, typename volume_type_ = void>
-    requires utilities::disk_concept<disk_type_>
+    requires utilities::a_disk<disk_type_>
 class ring_sections_reader {
   public:
 

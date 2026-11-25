@@ -20,7 +20,7 @@
 
 #include "ustore/blobs/nvme_key_slot.hpp"   // `limit`
 #include "ustore/blobs/nvme_store.hpp"      // `nvme_store`
-#include "ustore/utilities/folds.hpp"       // `fold_concept`
+#include "ustore/utilities/folds.hpp"       // `a_fold`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocator`
 
 namespace unum::ustore::blobs {
@@ -41,7 +41,7 @@ namespace unum::ustore::blobs {
  *  starts at for as long as it lives.
  */
 template <typename key_slot_type_, typename volume_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_, utilities::fold_concept fold_type_, typename device_fold_type_, typename row_kit_type_>
+          typename waiter_type_, utilities::a_fold fold_type_, typename device_fold_type_, typename row_kit_type_>
 class nvme_store_cursor {
   public:
 

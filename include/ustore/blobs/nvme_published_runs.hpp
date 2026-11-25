@@ -41,7 +41,7 @@
 #include "ustore/blobs/nvme_memory_run.hpp"      // `kept_versions`, `stamped_delta`
 #include "ustore/blobs/nvme_tree.hpp"            // `lsm_tree`, `collection_config_t`, `compaction_stamps_t`
 #include "ustore/utilities/algorithm.hpp"        // `radix_sort`, `word_byte`
-#include "ustore/utilities/folds.hpp"            // `fold_concept`
+#include "ustore/utilities/folds.hpp"            // `a_fold`
 #include "ustore/utilities/nvme_channels.hpp"    // `io_channel_t`
 #include "ustore/utilities/ram_buffers.hpp" // `local_arena_t`, `arena_allocator`, `resource_constraint`, `constrained_allocator`
 #include "ustore/utilities/types.hpp" // `status_t`, `status_code_t`, `expected`, `byte_t`
@@ -1332,7 +1332,7 @@ class published_runs {
      *  @note The owner serializes it with flushes, compactions and truncations of the store, and
      *      the calling thread is inside no epoch.
      */
-    template <utilities::fold_concept fold_type_>
+    template <utilities::a_fold fold_type_>
     status_t merge_memory_runs(fold_type_ const& fold) noexcept {
         std::size_t const fan_in = config_.lsm_tree.level_enlarge_factor;
         // Every pass reuses the room the first one grew.
@@ -1452,7 +1452,7 @@ class published_runs {
      *  @param[in] fan_out The threads a merge on the host fans its slices out over, or one slice on
      *      the calling thread.
      */
-    template <utilities::fold_concept fold_type_, typename device_fold_type_>
+    template <utilities::a_fold fold_type_, typename device_fold_type_>
     expected<compaction_outcome_t> compact(io_channel_t& reading_channel, io_channel_t& writing_channel,
                                            std::span<merge_buffers_t> buffers, compactor_ref_t const& compactor,
                                            fold_type_ const& fold, device_fold_type_ const& device_fold,
@@ -1514,7 +1514,7 @@ class published_runs {
     }
 
     /** Drops every version a mount found stamped above @p ceiling, which only a store holding no memory run takes. */
-    template <utilities::fold_concept fold_type_>
+    template <utilities::a_fold fold_type_>
     status_t truncate_above(io_channel_t& reading_channel, io_channel_t& writing_channel,
                             std::span<merge_buffers_t> buffers, transaction_stamp_t ceiling, fold_type_ const& fold,
                             lsm_tree_publication_hook_t const& published) noexcept {

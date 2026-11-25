@@ -33,7 +33,7 @@
 #include "ustore/blobs/nvme_compaction.hpp" // `compaction_stamps_t`, `keeps_older_version`
 #include "ustore/blobs/nvme_key_slot.hpp"   // `transaction_stamp_t`, `stored_value_offset_t`, `storage_limits_t`
 #include "ustore/utilities/algorithm.hpp"   // `sort_by_stored_key`, `loser_tree`
-#include "ustore/utilities/folds.hpp"       // `delta_kind_t`, `delta_view_t`, `fold_concept`, `fold_delta_pair`
+#include "ustore/utilities/folds.hpp"       // `delta_kind_t`, `delta_view_t`, `a_fold`, `fold_delta_pair`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocator`
 #include "ustore/utilities/types.hpp"       // `byte_t`, `expected`, `status_t`
 
@@ -606,7 +606,7 @@ expected<range_tombstones<typename run_type_::stored_key_t, allocator_type_>> ga
  *  keys and bytes, and locate the bytes among the runs' buffers in order, so the runs outlive them
  *  until a merged run inherits their buffers or a flushed one is written.
  */
-template <typename run_type_, utilities::fold_concept fold_type_, typename versions_type_>
+template <typename run_type_, utilities::a_fold fold_type_, typename versions_type_>
 status_t kept_versions(std::span<run_type_ const* const> runs, compaction_stamps_t const& survival,
                        fold_type_ const& fold, versions_type_& versions,
                        utilities::arena_allocator<byte_t>& arena) noexcept {

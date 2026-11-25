@@ -30,10 +30,10 @@
 
 namespace unum::ustore::blobs {
 
+using utilities::a_serializable_value;
 using utilities::load;
 using utilities::resources_config_t;
 using utilities::save_fields;
-using utilities::serializable_concept;
 using utilities::storage_requirements;
 using utilities::string_t;
 using utilities::string_view_t;
@@ -268,12 +268,12 @@ struct database_schema_t {
 
 /** A schema saved as a document of its own. */
 template <typename schema_type_>
-concept database_schema_concept = std::same_as<schema_type_, single_collection_database_schema_t> ||
-                                  std::same_as<schema_type_, database_schema_t>;
+concept a_database_schema = std::same_as<schema_type_, single_collection_database_schema_t> ||
+                            std::same_as<schema_type_, database_schema_t>;
 
 /** A schema saved as bytes behind a signed and versioned header, as backups are. */
 template <typename schema_type_>
-concept binary_schema_concept = serializable_concept<schema_type_> && requires {
+concept a_binary_schema = a_serializable_value<schema_type_> && requires {
     { schema_type_::schema_kind_k } -> std::convertible_to<schema_kind_t>;
     { schema_type_::database_kind_k } -> std::convertible_to<database_kind_t>;
 };
@@ -290,13 +290,13 @@ struct binary_schema_header_t {
 static_assert(sizeof(binary_schema_header_t) == 12);
 
 /** The bytes of @p schema behind its header. */
-template <binary_schema_concept schema_type_>
+template <a_binary_schema schema_type_>
 std::size_t binary_schema_storage_requirements(schema_type_ const& schema) noexcept {
     return sizeof(binary_schema_header_t) + schema.storage_requirements();
 }
 
 /** Saves the header of @p schema, then the schema itself. */
-template <binary_schema_concept schema_type_>
+template <a_binary_schema schema_type_>
 status_t save_binary_schema(schema_type_ const& schema, bytes_span_t destination) noexcept {
     binary_schema_header_t header;
     header.schema_kind = schema_type_::schema_kind_k;
@@ -305,7 +305,7 @@ status_t save_binary_schema(schema_type_ const& schema, bytes_span_t destination
 }
 
 /** Loads a schema behind its header, rejecting another signature, kind or version. */
-template <binary_schema_concept schema_type_>
+template <a_binary_schema schema_type_>
 status_t load_binary_schema(schema_type_& schema, bytes_view_t source) noexcept {
     binary_schema_header_t header;
     if (status_t const status = load(header, source); status.failed()) return status;
@@ -516,7 +516,7 @@ inline status_t load_schema_header(char const* file_path, schema_header_t& heade
 }
 
 /** Reads the schema document at @p file_path, rejecting one of another kind. */
-template <database_schema_concept schema_type_>
+template <a_database_schema schema_type_>
 status_t load_schema(char const* file_path, schema_type_& schema) noexcept {
     yyjson_read_err error;
     yyjson_doc* const document = yyjson_read_file(file_path, YYJSON_READ_NOFLAG, nullptr, &error);
@@ -708,7 +708,7 @@ template <typename element_type_, template <typename> typename allocator_>
 }
 
 /** Writes @p schema as an indented document at @p file_path, replacing any file there. */
-template <database_schema_concept schema_type_>
+template <a_database_schema schema_type_>
 status_t save_schema(char const* file_path, schema_type_ const& schema) noexcept {
     yyjson_mut_doc* const document = yyjson_mut_doc_new(nullptr);
     if (!document) return status_t {status_code_t::out_of_memory_k, "No room for the schema document"};
@@ -742,11 +742,11 @@ enum class issue_kind_t : std::uint8_t {
 
 /** A callable validation hands every issue to, with a message that lives only during the call. */
 template <typename sink_type_>
-concept issue_sink_concept = std::invocable<sink_type_&, issue_kind_t, std::string_view>;
+concept an_issue_sink = std::invocable<sink_type_&, issue_kind_t, std::string_view>;
 
 /** Formats an issue on the stack and hands it to @p sink, answering whether it was
  *  only a warning. */
-template <issue_sink_concept sink_type_, typename... argument_types_>
+template <an_issue_sink sink_type_, typename... argument_types_>
 bool report_issue(sink_type_& sink, issue_kind_t kind, fmt::format_string<argument_types_...> format,
                   argument_types_&&... arguments) noexcept {
     char message[256];
@@ -757,7 +757,7 @@ bool report_issue(sink_type_& sink, issue_kind_t kind, fmt::format_string<argume
 }
 
 /** Checks resources on their own, answering whether no error was reported. */
-template <issue_sink_concept sink_type_>
+template <an_issue_sink sink_type_>
 [[nodiscard]] bool validate(resources_config_t const& config, sink_type_&& sink) noexcept {
     if (config.memory_limit == 0) return report_issue(sink, issue_kind_t::error_k, "Memory limit is not set");
     if (config.gpu_devices.empty() && config.gpu_memory_limit > 0)
@@ -780,7 +780,7 @@ template <issue_sink_concept sink_type_>
 }
 
 /** Checks the delta limits of one transaction against the storage limits. */
-template <issue_sink_concept sink_type_>
+template <an_issue_sink sink_type_>
 [[nodiscard]] bool validate(transaction_config_t const& config, sink_type_&& sink) noexcept {
     if (config.max_deltas < storage_limits_t::transaction_min_deltas_k ||
         config.max_deltas > storage_limits_t::transaction_max_deltas_k)
@@ -795,7 +795,7 @@ template <issue_sink_concept sink_type_>
 
 /** Checks the limits of one collection holding values of @p value_layout against
  *  the storage limits. */
-template <issue_sink_concept sink_type_>
+template <an_issue_sink sink_type_>
 [[nodiscard]] bool validate(user_collection_config_t const& config, value_layout_t value_layout,
                             sink_type_&& sink) noexcept {
     if ((config.value_size == 0) == (config.value_max_size == 0))
@@ -854,7 +854,7 @@ template <issue_sink_concept sink_type_>
 }
 
 /** Checks resources and the limits of a database within them. */
-template <issue_sink_concept sink_type_>
+template <an_issue_sink sink_type_>
 [[nodiscard]] bool validate(resources_config_t const& resources, database_config_t const& config,
                             sink_type_&& sink) noexcept {
     if (!validate(resources, sink) || !validate(config.default_transaction, sink)) return false;
@@ -864,7 +864,7 @@ template <issue_sink_concept sink_type_>
 }
 
 /** Checks resources and the limits of a single-collection database within them. */
-template <issue_sink_concept sink_type_>
+template <an_issue_sink sink_type_>
 [[nodiscard]] bool validate(resources_config_t const& resources, user_single_collection_database_config_t const& config,
                             sink_type_&& sink) noexcept {
     if (!validate(resources, sink) || !validate(config.default_transaction, sink)) return false;
@@ -879,7 +879,7 @@ template <issue_sink_concept sink_type_>
 }
 
 /** Checks resources and the limits of a collection within them. */
-template <issue_sink_concept sink_type_>
+template <an_issue_sink sink_type_>
 [[nodiscard]] bool validate(resources_config_t const& resources, user_collection_config_t const& config,
                             sink_type_&& sink) noexcept {
     if (!validate(resources, sink) || !validate(config, resolve_value_layout(config.value_size), sink)) return false;

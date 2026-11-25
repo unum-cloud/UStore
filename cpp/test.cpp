@@ -120,10 +120,10 @@ struct admitting_batch_predicate_t {
     }
 };
 
-static_assert(!us::key_predicate_handler<counting_predicate_t>, "a predicate runs on several threads at once");
-static_assert(us::key_predicate_handler<reading_predicate_t>);
-static_assert(!us::keys_predicate_handler<counting_batch_predicate_t>, "a predicate runs on several threads at once");
-static_assert(us::keys_predicate_handler<admitting_batch_predicate_t>);
+static_assert(!us::a_key_predicate<counting_predicate_t>, "a predicate runs on several threads at once");
+static_assert(us::a_key_predicate<reading_predicate_t>);
+static_assert(!us::a_keys_predicate<counting_batch_predicate_t>, "a predicate runs on several threads at once");
+static_assert(us::a_keys_predicate<admitting_batch_predicate_t>);
 
 /** Blobs written in a batch read back in place, count exactly, and answer shorthand reads. */
 static void test_blobs_round_trip() {

@@ -427,7 +427,7 @@ class strings_collection_on {
      *      the answer views.
      *  @param[in] watch Whether a read inside a transaction records the strings for conflicts.
      */
-    template <strings_batch texts_type_>
+    template <a_strings_batch texts_type_>
     deferrable<keys_view_t> read(texts_type_ const& texts, arena_t& arena,
                                  ustore_watch_t watch = ustore_watch_keys_k) const noexcept {
         return strings_read_<completion_, keys_view_t>(receiver_, collection_, strings_view_of(texts), std::size(texts),
@@ -443,7 +443,7 @@ class strings_collection_on {
      *  @par Statuses:
      *  - @c status_code_t::invalid_argument_k The @p texts and @p keys differ in count.
      */
-    template <strings_batch texts_type_>
+    template <a_strings_batch texts_type_>
     deferrable<> write(texts_type_ const& texts, std::span<ustore_key_t const> keys,
                        ustore_durability_t durability = ustore_durability_buffered_k) const noexcept
         requires writes_k
@@ -459,7 +459,7 @@ class strings_collection_on {
      *  @param[in] texts Strings to remove, owned by the caller until the call is final.
      *  @param[in] durability Whether the call finishes only after the data reaches the disk.
      */
-    template <strings_batch texts_type_>
+    template <a_strings_batch texts_type_>
     deferrable<> remove(texts_type_ const& texts,
                         ustore_durability_t durability = ustore_durability_buffered_k) const noexcept
         requires writes_k
@@ -485,7 +485,7 @@ class strings_collection_on {
      *  @par Statuses:
      *  - @c status_code_t::invalid_argument_k The @p starts are neither empty nor one per prefix.
      */
-    template <strings_batch prefixes_type_, strings_batch starts_type_ = strings_view_t>
+    template <a_strings_batch prefixes_type_, a_strings_batch starts_type_ = strings_view_t>
     deferrable<strings_pages_t> scan(prefixes_type_ const& prefixes, std::size_t limit, arena_t& arena,
                                      starts_type_ const& starts = {}, match_t const& match = {},
                                      ustore_watch_t watch = ustore_watch_keys_k) const noexcept {

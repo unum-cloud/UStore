@@ -45,8 +45,8 @@
 
 #include <smashtable/shared.hpp> // `st::status_t`
 
-#include "ustore/utilities/algorithm.hpp" // `compare_128`, `sorted_128_cursor_concept`, `radix_sort`, `word_byte`
-#include "ustore/utilities/folds.hpp"     // `delta_kind_t`, `delta_view_t`, `fold_concept`
+#include "ustore/utilities/algorithm.hpp" // `compare_128`, `a_sorted_128_cursor`, `radix_sort`, `word_byte`
+#include "ustore/utilities/folds.hpp"     // `delta_kind_t`, `delta_view_t`, `a_fold`
 #include "ustore/utilities/types.hpp"     // `byte_t`, `expected`, `round_up_to_multiple`, `smallest_key_k`
 
 namespace unum::ustore::graph {
@@ -505,7 +505,8 @@ class half_edge_cursor_t {
     byte_t const* record_ = nullptr;
 };
 
-/** Walks the distinct neighbors of a half-edge walk, fitting @c sorted_128_cursor_concept for 128-bit intersections. */
+/** Walks the distinct neighbors of a half-edge walk, fitting @c a_sorted_128_cursor for 128-bit
+ *  intersections. */
 class neighbor_cursor_t {
   public:
     neighbor_cursor_t() noexcept = default;
@@ -537,7 +538,7 @@ class neighbor_cursor_t {
     half_edge_cursor_t half_edges_;
 };
 
-static_assert(utilities::sorted_128_cursor_concept<neighbor_cursor_t>);
+static_assert(utilities::a_sorted_128_cursor<neighbor_cursor_t>);
 
 #pragma endregion Merging Cursor
 
@@ -714,7 +715,7 @@ struct adjacency_fold_t {
     }
 };
 
-static_assert(utilities::fold_concept<adjacency_fold_t>);
+static_assert(utilities::a_fold<adjacency_fold_t>);
 
 #pragma endregion Fold
 

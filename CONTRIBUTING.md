@@ -100,7 +100,6 @@ A file name never repeats its directory — `include/ustore/blobs/nvme_tree.hpp`
 - A type is named `<domain>_<role>`: the domain word says what it holds and the role word what it does, as in `lsm_tree`, `lsm_level`, `lsm_sorted_run`, `sorted_run_index`, `key_slot`, `stored_value`, `write_buffer` and `graph_store`.
   Only C ABI terms stay one word — `database`, `collection`, `transaction`, `snapshot` — and no name is a metaphor or a legacy project name.
 - A file is named after its main type without `_t` and never repeats its directory; C++ headers are `.hpp`, never `.h` or `.tcc`.
-- Concepts end in `_concept`, like `stored_key_concept`, so a concept never collides with a member of the same name.
 - A `bool` answers a yes-or-no question and never selects behaviour; name the states in an `enum class`, backed by `bool` when width matters.
 - A closed set of configurations gets one enumerator per configuration, never a struct of knobs that can express combinations that do not exist.
 - These rules govern C and C++ alone; Python follows PEP 8, with `UPPER_SNAKE_CASE` module constants, `snake_case` functions and variables and `CapWords` classes, and never a `_t` or `_k` suffix.
@@ -118,7 +117,7 @@ lsm_tree_def_m class lsm_tree;
 
 // Written out, constrained by a concept
 template <typename stored_key_type_, value_layout_t value_layout_>
-    requires stored_key_concept<stored_key_type_>
+    requires a_stored_key<stored_key_type_>
 class lsm_tree;
 ```
 
@@ -322,7 +321,7 @@ Every constrained overload has an unconstrained fallback beside it, so a type th
 
 ```cpp
 template <typename index_type_>
-status_t run_plan(index_type_& index) noexcept requires is_nvme_index<index_type_> { /* NVMe rounds */ }
+status_t run_plan(index_type_& index) noexcept requires an_nvme_index<index_type_> { /* NVMe rounds */ }
 
 template <typename index_type_>
 status_t run_plan(index_type_& index) noexcept { /* every other residency */ }
@@ -333,10 +332,10 @@ An `else if constexpr` chain is still one level.
 
 ```cpp
 template <typename query_type_>
-concept hinted_query = requires(query_type_& query) { query.find_hinted(0u); };
+concept a_hinted_query = requires(query_type_& query) { query.find_hinted(0u); };
 
-if constexpr (hinted_query<query_type_>) seeds = query.find_hinted(shard); // allowed: a named concept
-else if constexpr (serial_class_k) seeds = {};                            // allowed: one chain, one level
+if constexpr (a_hinted_query<query_type_>) seeds = query.find_hinted(shard); // allowed: a named concept
+else if constexpr (serial_class_k) seeds = {};                              // allowed: one chain, one level
 ```
 
 The hook refuses each of these, in the directories its `gated_source_directories` names:
@@ -432,6 +431,29 @@ An include's trailing comment lists in backticks the symbols the file takes from
 Sibling projects are reached through the aliases `fu`, `st` and `sz`, declared once in `cpp/ustore/types.hpp`, never through spelled-out `ashvardanian::` namespaces or local aliases.
 C++ prints through `fmt::println` — no iostreams, no `printf`.
 Discard a result through `[[maybe_unused]] T const result = call();`, never `(void)call();`, and declare return types before the name, never after an arrow.
+
+## Lean State
+
+A type holds only what it cannot recompute, and names each part for what it holds.
+These rules are shared by every sibling library, and the pre-commit hook enforces each rule that names a check.
+
+- Members are named for what they hold, never for their type.
+  Write `request->call` or `call->kept`, never `call->call` or `file.file`.
+  Checked by `check_self_repeat_access`.
+- Derived state is a method, not a field.
+  A count, mask or capacity that follows from other members is computed when asked, so it can never disagree with them.
+- One fact, one constant.
+  Every `_k` constant states its derivation in its docblock, or says "measured" and where, and no other constant restates it.
+- An owner that never moves holds its parts by value.
+  A pointer is for a part that outlives its owner, moves apart from it, or is shared beyond it.
+- Empty allocators take no bytes.
+  An allocator member is declared `[[no_unique_address]]`, so a container over a stateless allocator is no larger than its own state.
+  Checked by `check_empty_member_bytes`.
+- No wrapper without its own state or invariant.
+  A type that only forwards to one member is a name for that member, so use an alias or a function instead.
+- Concepts are `a_`/`an_` noun phrases.
+  A concept names what satisfies it, as `an_allocator` or `a_task_callback`: `an_` before a vowel sound, singular, with no `is_` or `has_` prefix and no `_concept` or `_t` suffix.
+  Checked by `check_concept_names`.
 
 ## Dispatch Classes
 

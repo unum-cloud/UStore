@@ -32,13 +32,13 @@
 #include "ustore/blobs/vram_apple_compaction.hpp"  // `metal_compactor_t`
 #include "ustore/blobs/vram_nvidia_compaction.hpp" // `cuda_compactor_t`
 #include "ustore/utilities/nvme_channels.hpp"      // `io_channel_t`, `basic_read_pipeline`
-#include "ustore/utilities/nvme_ring.hpp"          // `extent_t`, `disk_concept`
+#include "ustore/utilities/nvme_ring.hpp"          // `extent_t`, `a_disk`
 #include "ustore/utilities/nvme_volume.hpp"        // `medium_extent_t`
 #include "ustore/utilities/types.hpp"              // `status_t`, `byte_t`, `uuid128_t`, `uuid_generator`
 
 namespace unum::ustore::blobs {
 
-using utilities::disk_concept;
+using utilities::a_disk;
 using utilities::load;
 using utilities::medium_reference_t;
 using utilities::memory_reference_t;
@@ -220,7 +220,7 @@ inline status_t compaction_status(st::status_t status) noexcept {
 /** Drains a channel's queue pair before the pipelines above it hand their blocks back, which a
  *  failure needs too. */
 template <typename disk_type_>
-    requires disk_concept<disk_type_>
+    requires a_disk<disk_type_>
 class channel_drain {
   public:
 
@@ -526,7 +526,7 @@ class lsm_level_merger {
      *  @return The new runs in ascending order, or the status that stopped the merge with every new
      *      run already given back.
      */
-    template <utilities::fold_concept fold_type_, typename device_fold_type_>
+    template <utilities::a_fold fold_type_, typename device_fold_type_>
     static expected<merged_runs_t> merge(volume_t& volume, run_pool_t& runs, io_channel_t& reading_channel,
                                          io_channel_t& writing_channel, merge_request_t const& request,
                                          fold_type_ const& fold, device_fold_type_ const& device_fold) noexcept {
@@ -553,7 +553,7 @@ class lsm_level_merger {
      *  and the calling thread hands every run to the pool in key order. A merge of one slice runs
      *  each step on the calling thread over the channels it was handed.
      */
-    template <utilities::fold_concept fold_type_, typename device_fold_type_>
+    template <utilities::a_fold fold_type_, typename device_fold_type_>
     static expected<merged_runs_t> merge_fixed_(volume_t& volume, run_pool_t& runs, io_channel_t& reading_channel,
                                                 io_channel_t& writing_channel, merge_request_t const& request,
                                                 fold_type_ const& fold, device_fold_type_ const& device_fold) noexcept {

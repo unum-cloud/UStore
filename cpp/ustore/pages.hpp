@@ -34,7 +34,7 @@ status_t pages_column_(strided_span<element_type_ const> column, std::size_t cou
 }
 
 /** The view a column of strings of a batch of @p count tasks passes as, like @c pages_column_. */
-template <strings_batch strings_type_>
+template <a_strings_batch strings_type_>
 status_t pages_strings_(strings_type_ const& strings, std::size_t count, ustore_strings_view_t& view) noexcept {
     std::size_t const given = std::size(strings);
     if (given == 0) view = {};
@@ -107,7 +107,7 @@ class pages_collection_on {
      *  @par Statuses:
      *  - @c status_code_t::invalid_argument_k The @p keys and @p markups differ in count.
      */
-    template <strings_batch markups_type_>
+    template <a_strings_batch markups_type_>
     deferrable<> import(keys_view_t keys, markups_type_ const& markups,
                         ustore_page_encoding_t encoding = ustore_page_encoding_xml_k,
                         ustore_durability_t durability = ustore_durability_buffered_k,
@@ -154,7 +154,7 @@ class pages_collection_on {
      *  @par Statuses:
      *  - @c status_code_t::invalid_argument_k A column holds neither none nor one item per key.
      */
-    template <strings_batch fragments_type_>
+    template <a_strings_batch fragments_type_>
     deferrable<keys_view_t> insert(keys_view_t keys, fragments_type_ const& fragments, arena_t& arena,
                                    keys_view_t parents = {}, keys_view_t anchors = {}, keys_view_t elements = {},
                                    ustore_page_encoding_t encoding = ustore_page_encoding_xml_k,
@@ -294,7 +294,7 @@ class pages_collection_on {
      *  @par Statuses:
      *  - @c status_code_t::invalid_argument_k A column holds neither none nor one item per key.
      */
-    template <strings_batch texts_type_>
+    template <a_strings_batch texts_type_>
     deferrable<> splice(keys_view_t keys, keys_view_t elements, strided_span<ustore_length_t const> text_starts,
                         strided_span<ustore_length_t const> text_lengths, texts_type_ const& texts,
                         ustore_durability_t durability = ustore_durability_buffered_k) const noexcept
@@ -342,7 +342,7 @@ class pages_collection_on {
      *  @par Statuses:
      *  - @c status_code_t::invalid_argument_k A column holds neither none nor one item per key.
      */
-    template <strings_batch fields_type_, strings_batch values_type_>
+    template <a_strings_batch fields_type_, a_strings_batch values_type_>
     deferrable<> set_attributes(keys_view_t keys, keys_view_t elements, fields_type_ const& fields,
                                 values_type_ const& values,
                                 ustore_durability_t durability = ustore_durability_buffered_k) const noexcept
@@ -385,7 +385,7 @@ class pages_collection_on {
      *  @par Statuses:
      *  - @c status_code_t::invalid_argument_k A column holds neither none nor one item per key.
      */
-    template <strings_batch fields_type_>
+    template <a_strings_batch fields_type_>
     deferrable<> remove_attributes(keys_view_t keys, keys_view_t elements, fields_type_ const& fields,
                                    ustore_durability_t durability = ustore_durability_buffered_k) const noexcept
         requires writes_k

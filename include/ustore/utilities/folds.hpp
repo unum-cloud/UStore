@@ -64,8 +64,8 @@ struct delta_view_t {
  *  the arena it is given.
  */
 template <typename fold_type_>
-concept fold_concept = requires(fold_type_ const& fold, std::span<byte_t const> base,
-                                std::span<delta_view_t const> deltas, arena_allocator<byte_t>& arena) {
+concept a_fold = requires(fold_type_ const& fold, std::span<byte_t const> base, std::span<delta_view_t const> deltas,
+                          arena_allocator<byte_t>& arena) {
     { fold.apply(base, deltas, arena) } -> std::same_as<expected<std::span<byte_t const>>>;
     { fold.compose(deltas, arena) } -> std::same_as<expected<std::span<byte_t const>>>;
     { fold.closes(deltas.front()) } -> std::same_as<bool>;
@@ -94,14 +94,14 @@ struct last_write_fold_t {
     bool closes(delta_view_t const&) const noexcept { return true; }
 };
 
-static_assert(fold_concept<last_write_fold_t>);
+static_assert(a_fold<last_write_fold_t>);
 
 /**
  *  @brief The one delta that stands for change @p newer over @p older, which a merge keeps where no reader tells the
  *      two apart: a write of @p newer applied to a write or a removal below it, or one change composed of both.
  *  @return The delta, whose bytes may sit in @p arena, or the status @p fold refused it with.
  */
-template <fold_concept fold_type_>
+template <a_fold fold_type_>
 expected<delta_view_t> fold_delta_pair(fold_type_ const& fold, delta_view_t const& newer, delta_view_t const& older,
                                        arena_allocator<byte_t>& arena) noexcept {
     if (older.kind == delta_kind_t::change_k) {

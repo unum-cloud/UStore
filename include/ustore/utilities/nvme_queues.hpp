@@ -34,7 +34,7 @@
 #include "ustore/utilities/nvme_linux_aio_disk.hpp"   // `linux_aio_queue_t`, `linux_aio_probe_t`
 #include "ustore/utilities/nvme_linux_spdk_disk.hpp"  // `linux_spdk_queue_t`, `linux_spdk_dma_allocator`
 #include "ustore/utilities/nvme_linux_uring_disk.hpp" // `linux_uring_queue_t`, `linux_uring_probe_t`
-#include "ustore/utilities/nvme_ring.hpp"             // `queue_ref_t`, `queue_id_t`, `disk_concept`
+#include "ustore/utilities/nvme_ring.hpp"             // `queue_ref_t`, `queue_id_t`, `a_disk`
 #include "ustore/utilities/ram_buffers.hpp"           // `allocate_domain_block`, `domain_block_t`
 #include "ustore/utilities/types.hpp"                 // `status_t`, `status_code_t`, `expected`, `byte_t`
 
@@ -180,7 +180,7 @@ class nvme_queues_t {
      *      queue is behind.
      */
     template <typename disk_type_>
-        requires disk_concept<disk_type_>
+        requires a_disk<disk_type_>
     expected<io_channel_t*> reading_channel_with_disk_media(std::size_t thread_index, disk_type_& disk) noexcept {
         if (thread_index >= threads_.size())
             return status_t {status_code_t::invalid_argument_k, "The queue set lacks that thread"};
@@ -193,7 +193,7 @@ class nvme_queues_t {
     /** As @c reading_channel_with_disk_media, both channels of thread @p thread_index, for a merge
      *  slice that reads and writes at once. */
     template <typename disk_type_>
-        requires disk_concept<disk_type_>
+        requires a_disk<disk_type_>
     expected<thread_channels_t> both_channels_with_disk_media(std::size_t thread_index, disk_type_& disk) noexcept {
         if (thread_index >= threads_.size())
             return status_t {status_code_t::invalid_argument_k, "The queue set lacks that thread"};

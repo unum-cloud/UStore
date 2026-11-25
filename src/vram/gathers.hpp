@@ -67,7 +67,7 @@ inline unsigned blocks_for(std::size_t lanes, unsigned threads) noexcept {
  *  one length class share the walkers' memory in stream order. Nothing is waited for: the walks'
  *  refusal lands in the page.
  */
-template <gpu_executor_concept executor_type_>
+template <a_gpu_executor executor_type_>
 expected<walked_documents_t> walk_documents(engine_t const& engine, ustore_docs_read_t whole,
                                             std::span<std::string_view const> fields, view_t const& view,
                                             executor_type_& executor, util::device_blocks_t& blocks) noexcept {
@@ -197,7 +197,7 @@ struct measured_texts_t {
 
 /** Measures the rows of @p texts on @p executor and scans their lengths into offsets carved off
  *  @p blocks, filling in the scratch the kernels need. */
-template <gpu_executor_concept executor_type_>
+template <a_gpu_executor executor_type_>
 expected<measured_texts_t> measure_texts(walked_documents_t const& walked, gather_texts_t texts,
                                          executor_type_& executor, util::device_blocks_t& blocks) noexcept {
     std::size_t const rows = walked.page.rows;
@@ -224,7 +224,7 @@ expected<measured_texts_t> measure_texts(walked_documents_t const& walked, gathe
 /** Carves the @p total bytes of the measured @p texts off @p blocks and writes their rows there,
  *  behind offsets as narrow as their bytes allow, as the host exports a tape: 32-bit ones scanned
  *  again from the same lengths. */
-template <gpu_executor_concept executor_type_>
+template <a_gpu_executor executor_type_>
 expected<ustore_strings_view_t> write_texts(walked_documents_t const& walked, measured_texts_t measured,
                                             std::uint64_t total, executor_type_& executor,
                                             util::device_blocks_t& blocks) noexcept {
@@ -252,7 +252,7 @@ expected<ustore_strings_view_t> write_texts(walked_documents_t const& walked, me
 /** Downloads the refusal of @p walked and the last offset of every one of @p measured into
  *  the bounce and waits, answering whether the call is left to the host, with the totals
  *  in @p totals. */
-template <gpu_executor_concept executor_type_>
+template <a_gpu_executor executor_type_>
 expected<device_answer_t> settle_measures(walked_documents_t const& walked, std::span<measured_texts_t const> measured,
                                           std::span<std::uint64_t> totals, executor_type_& executor) noexcept {
     auto [refused, refused_status] = arena_allocate<std::uint32_t>(executor.bounce(), 1);

@@ -53,9 +53,8 @@ st::expected<packed_counts_t> hip_compactor_t::pack_(char const* name,
     return packed_counts_t {chains};
 }
 
-template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
-          typename allocator_type_>
-    requires compactable_key_slot_concept<key_slot_type_>
+template <typename key_slot_type_, utilities::a_fold fold_type_, typename device_fold_type_, typename allocator_type_>
+    requires a_compactable_key_slot<key_slot_type_>
 st::status_t hip_compactor_t::compact(compaction_kind_t kind,
                                       std::span<sorted_run_index_view<key_slot_type_> const> upper,
                                       std::span<sorted_run_index_view<key_slot_type_> const> lower,
@@ -70,9 +69,8 @@ st::status_t hip_compactor_t::compact(compaction_kind_t kind,
     else return st::status_t::invalid_argument_k;
 }
 
-template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
-          typename allocator_type_>
-    requires compactable_key_slot_concept<key_slot_type_>
+template <typename key_slot_type_, utilities::a_fold fold_type_, typename device_fold_type_, typename allocator_type_>
+    requires a_compactable_key_slot<key_slot_type_>
 st::status_t hip_compactor_t::compact_on_device_(compaction_kind_t kind,
                                                  std::span<sorted_run_index_view<key_slot_type_> const> upper,
                                                  std::span<sorted_run_index_view<key_slot_type_> const> lower,
@@ -86,7 +84,7 @@ st::status_t hip_compactor_t::compact_on_device_(compaction_kind_t kind,
     using view_t = sorted_run_index_view<key_slot_type_>;
     using names_t = merge_kernel_names<key_slot_type_>;
     using range_t = range_tombstone<typename key_slot_type_::stored_key_t>;
-    constexpr bool locates_k = locates_stored_values_concept<key_slot_type_>;
+    constexpr bool locates_k = a_key_slot_with_located_values<key_slot_type_>;
     constexpr bool gathers_keys_k = !is_inline(key_slot_type_::value_layout_k);
     constexpr st::assume_uninitialized_t uninitialized {};
 

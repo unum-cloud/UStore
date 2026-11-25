@@ -39,12 +39,12 @@
 #include <stringzilla/subdocuments.h>  // `sz_subdocuments_engine_init`, `sz_subdocuments_find`
 
 #include "ustore/pages/element_tree.hpp"    // `element_tree`, `element_key_t`, `placement_t`
-#include "ustore/utilities/ram_buffers.hpp" // `strings_kit_concept`
+#include "ustore/utilities/ram_buffers.hpp" // `a_strings_kit`
 #include "ustore/utilities/types.hpp"       // `stringzilla_view`, `tape_string`, `stringzilla_refusal`
 
 namespace unum::ustore::pages {
 
-using utilities::strings_kit_concept;
+using utilities::a_strings_kit;
 using utilities::stringzilla_refusal;
 using utilities::stringzilla_view;
 using utilities::tape_string;
@@ -408,7 +408,7 @@ class xml_tokenizer {
         return {};
     }
 
-    template <strings_kit_concept strings_kit_type_>
+    template <a_strings_kit strings_kit_type_>
     status_t unescape() noexcept {
         st::vector<sz_string_view_t, rebound<sz_string_view_t>> runs {rebound<sz_string_view_t>(allocator_)};
         auto enlist = [&](std::uint32_t offset, std::uint32_t length, std::uint32_t& unescaped) noexcept -> status_t {
@@ -447,7 +447,7 @@ class xml_tokenizer {
 
     /** Splits @p document into tokens and decodes its escaped runs through @p strings_kit_type_,
      *  refusing past 4 GiB. */
-    template <strings_kit_concept strings_kit_type_>
+    template <a_strings_kit strings_kit_type_>
     status_t tokenize(std::string_view document) noexcept {
         if (document.size() > ~std::uint32_t(0)) return {status_code_t::capacity_exhausted_k, "XML past 4 GiB"};
         document_ = document;
@@ -493,7 +493,7 @@ class xml_tokenizer {
  *  @tparam strings_kit_type_ The StringZilla kernels of the calling CPU class, which decode
  *      the escaped runs.
  */
-template <strings_kit_concept strings_kit_type_, typename allocator_type_, typename mint_type_>
+template <a_strings_kit strings_kit_type_, typename allocator_type_, typename mint_type_>
 status_t import_xml(std::string_view xml, element_key_t const& root_key, placement_t placement, mint_type_&& mint,
                     element_tree<allocator_type_>& tree) noexcept {
     using indices_allocator_t = typename std::allocator_traits<allocator_type_>::template rebind_alloc<element_index_t>;
@@ -576,7 +576,7 @@ status_t import_text(std::string_view text, element_key_t const& root_key, place
 
 /** Replaces @p tree with @p markup in @p encoding, unescaping through @p strings_kit_type_,
  *  answering @c status_code_t::unsupported_k for HTML, Markdown and JSON. */
-template <strings_kit_concept strings_kit_type_, typename allocator_type_, typename mint_type_>
+template <a_strings_kit strings_kit_type_, typename allocator_type_, typename mint_type_>
 status_t import_markup(page_encoding_t encoding, std::string_view markup, element_key_t const& root_key,
                        placement_t placement, mint_type_&& mint, element_tree<allocator_type_>& tree) noexcept {
     switch (encoding) {
@@ -601,7 +601,7 @@ status_t append_bytes(st::vector<char, output_allocator_type_>& output, std::str
 
 /** Appends @p bytes to @p output with <tt>&amp;</tt>, <tt>&lt;</tt>, <tt>&gt;</tt>, <tt>"</tt> and <tt>'</tt>
  *  escaped by StringZilla. */
-template <strings_kit_concept strings_kit_type_, typename output_allocator_type_>
+template <a_strings_kit strings_kit_type_, typename output_allocator_type_>
 status_t append_escaped(st::vector<char, output_allocator_type_>& output, std::string_view bytes) noexcept {
     sz_string_view_t const view = stringzilla_view(bytes);
     sz_strings_view_t const strings = strings_of(&view, 1);
@@ -619,7 +619,7 @@ status_t append_escaped(st::vector<char, output_allocator_type_>& output, std::s
 
 /** Appends the opening tag of the element @p at with its attributes, self-closing when
  *  @p content_of finds it holds nothing, and nothing for a nameless element. */
-template <strings_kit_concept strings_kit_type_, typename tree_allocator_type_, typename output_allocator_type_,
+template <a_strings_kit strings_kit_type_, typename tree_allocator_type_, typename output_allocator_type_,
           typename content_type_>
 status_t append_open_tag(element_tree<tree_allocator_type_> const& tree, element_index_t at,
                          st::vector<char, output_allocator_type_>& output, content_type_ const& content_of) noexcept {
@@ -642,7 +642,7 @@ status_t append_open_tag(element_tree<tree_allocator_type_> const& tree, element
 
 /** Appends the bytes of the element @p at before its children: a text, a comment, or a tag and
  *  its text. */
-template <strings_kit_concept strings_kit_type_, typename tree_allocator_type_, typename output_allocator_type_,
+template <a_strings_kit strings_kit_type_, typename tree_allocator_type_, typename output_allocator_type_,
           typename content_type_>
 status_t append_element(element_tree<tree_allocator_type_> const& tree, element_index_t at,
                         st::vector<char, output_allocator_type_>& output, content_type_ const& content_of) noexcept {
@@ -671,7 +671,7 @@ status_t append_close_tag(element_tree<tree_allocator_type_> const& tree, elemen
 }
 
 /** Renders the subtree of @p from as XML, calling @p open and @p close around every element's bytes. */
-template <strings_kit_concept strings_kit_type_, typename tree_allocator_type_, typename output_allocator_type_,
+template <a_strings_kit strings_kit_type_, typename tree_allocator_type_, typename output_allocator_type_,
           typename open_type_, typename close_type_>
 status_t render_xml_with(element_tree<tree_allocator_type_> const& tree, element_index_t from,
                          st::vector<char, output_allocator_type_>& output, open_type_&& open,
@@ -708,7 +708,7 @@ status_t render_xml_with(element_tree<tree_allocator_type_> const& tree, element
 }
 
 /** Appends the subtree of @p from to @p output as XML. */
-template <strings_kit_concept strings_kit_type_, typename tree_allocator_type_, typename output_allocator_type_>
+template <a_strings_kit strings_kit_type_, typename tree_allocator_type_, typename output_allocator_type_>
 status_t render_xml(element_tree<tree_allocator_type_> const& tree, element_index_t from,
                     st::vector<char, output_allocator_type_>& output) noexcept {
     return render_xml_with<strings_kit_type_>(
@@ -717,7 +717,7 @@ status_t render_xml(element_tree<tree_allocator_type_> const& tree, element_inde
 }
 
 /** Appends the subtree of @p from to @p output as XML, and the span of every element to @p spans in preorder. */
-template <strings_kit_concept strings_kit_type_, typename tree_allocator_type_, typename output_allocator_type_,
+template <a_strings_kit strings_kit_type_, typename tree_allocator_type_, typename output_allocator_type_,
           typename spans_allocator_type_>
 status_t render_xml(element_tree<tree_allocator_type_> const& tree, element_index_t from,
                     st::vector<char, output_allocator_type_>& output,
@@ -750,7 +750,7 @@ status_t render_text(element_tree<tree_allocator_type_> const& tree, element_ind
 
 /** Appends the subtree of @p from to @p output in @p encoding, answering
  *  @c status_code_t::unsupported_k for HTML, Markdown and JSON. */
-template <strings_kit_concept strings_kit_type_, typename tree_allocator_type_, typename output_allocator_type_>
+template <a_strings_kit strings_kit_type_, typename tree_allocator_type_, typename output_allocator_type_>
 status_t render_markup(element_tree<tree_allocator_type_> const& tree, element_index_t from, page_encoding_t encoding,
                        st::vector<char, output_allocator_type_>& output) noexcept {
     switch (encoding) {
@@ -775,7 +775,7 @@ status_t render_markup(element_tree<tree_allocator_type_> const& tree, element_i
  *      attribute value, or a text node.
  *  @return @c status_code_t::malformed_k for a path outside the subset or malformed XML, which needs one root element.
  */
-template <strings_kit_concept strings_kit_type_, typename allocator_type_>
+template <a_strings_kit strings_kit_type_, typename allocator_type_>
 status_t find_xpath(std::string_view xml, std::span<std::string_view const> paths, sz_capability_t strings,
                     st::vector<sz_match_t, allocator_type_>& matches) noexcept {
     using views_allocator_t = typename std::allocator_traits<allocator_type_>::template rebind_alloc<sz_string_view_t>;

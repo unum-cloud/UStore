@@ -59,7 +59,7 @@ struct outputs<collections_list_t> {
 
 /** A handle to one collection of some modality, as a lookup or a creation answers. */
 template <typename collection_type_>
-concept collection_handle = requires(collection_type_ const& collection) {
+concept a_collection_handle = requires(collection_type_ const& collection) {
     { collection_type_::modality_k } -> std::convertible_to<ustore_modality_t>;
     { collection.handle() } -> std::same_as<ustore_collection_id_t>;
 };
@@ -67,7 +67,7 @@ concept collection_handle = requires(collection_type_ const& collection) {
 /** Where a lookup or a creation writes the collection it answers, beside the receiver the handle
  *  carries. A creation writes the identifier alone, and a lookup the presence, the identifier and
  *  the modality of the one name it was given. */
-template <collection_handle collection_type_>
+template <a_collection_handle collection_type_>
 struct outputs<collection_type_> {
 
     /** The database, executor, and transaction or snapshot the handle carries. */
@@ -107,7 +107,7 @@ struct outputs<collection_type_> {
  *  - @c status_code_t::invalid_argument_k The collection holds another modality than
  *    @p collection_type_.
  */
-template <ustore_completion_t completion_, collection_handle collection_type_>
+template <ustore_completion_t completion_, a_collection_handle collection_type_>
 deferrable<collection_type_, completion_> collection_find_(receiver_t const& receiver, std::string_view name,
                                                            arena_t& arena) noexcept {
     return answered_<deferrable<collection_type_, completion_>>(
@@ -211,14 +211,14 @@ class transaction {
 
   public:
     transaction() noexcept
-        requires owns_handle<receiver_type_>
+        requires an_owning_receiver<receiver_type_>
     = default;
 
     ustore_transaction_t handle() const noexcept { return receiver_.handle(); }
 
     /** The output field an open writes the new handle into. */
     ustore_transaction_t* handle_field() noexcept
-        requires owns_handle<receiver_type_>
+        requires an_owning_receiver<receiver_type_>
     {
         return receiver_.handle_field();
     }
@@ -291,7 +291,7 @@ class transaction {
     }
 
     template <typename keys_argument_type_>
-        requires has_collection<batch_element_of<keys_argument_type_>>
+        requires a_collection_location<batch_element_of<keys_argument_type_>>
     blobs_ref<keys_argument_type_> operator[](keys_argument_type_&& keys) const noexcept
         requires blocks<completion_k>
     {
@@ -367,7 +367,7 @@ class transaction {
     /** Begins a transaction of the database @p receiver names, blocking on the executor it names;
      *  every later verb names its own through @c on or @c deferred. */
     static expected<transaction> make(receiver_t receiver) noexcept
-        requires owns_handle<receiver_type_>
+        requires an_owning_receiver<receiver_type_>
     {
         ustore_transaction_init_t arguments {.database = receiver.database, .executor = receiver.executor};
         auto [opened, status] = opened_<transaction>(ustore_transaction_init, arguments,
@@ -415,14 +415,14 @@ class snapshot {
 
   public:
     snapshot() noexcept
-        requires owns_handle<receiver_type_>
+        requires an_owning_receiver<receiver_type_>
     = default;
 
     ustore_snapshot_t handle() const noexcept { return receiver_.handle(); }
 
     /** The output field an open writes the new handle into. */
     ustore_snapshot_t* handle_field() noexcept
-        requires owns_handle<receiver_type_>
+        requires an_owning_receiver<receiver_type_>
     {
         return receiver_.handle_field();
     }
@@ -501,7 +501,7 @@ class snapshot {
     }
 
     template <typename keys_argument_type_>
-        requires has_collection<batch_element_of<keys_argument_type_>>
+        requires a_collection_location<batch_element_of<keys_argument_type_>>
     blobs_read_ref<keys_argument_type_> operator[](keys_argument_type_&& keys) const noexcept
         requires blocks<completion_k>
     {
@@ -537,7 +537,7 @@ class snapshot {
     /** Pins a point-in-time view of the database @p receiver names, blocking on the executor it
      *  names; every later verb names its own through @c on or @c deferred. */
     static expected<snapshot> make(receiver_t receiver) noexcept
-        requires owns_handle<receiver_type_>
+        requires an_owning_receiver<receiver_type_>
     {
         ustore_stamp_t read_stamp = 0;
         ustore_snapshot_init_t arguments {.database = receiver.database,
@@ -722,7 +722,7 @@ class ingest_t {
      *  - @c status_code_t::malformed_k A value is past what the collection admits, a document no
      *    JSON, or a page no XML.
      */
-    template <strings_batch values_type_>
+    template <a_strings_batch values_type_>
     status_t append(keys_view_t keys, values_type_ const& values, executor_t const& executor = {}) noexcept {
         // The call has one count, so only this side sees the keys and the values disagree
         if (keys.size() != std::size(values))
@@ -835,12 +835,12 @@ class database {
 
   public:
     database() noexcept
-        requires owns_handle<receiver_type_>
+        requires an_owning_receiver<receiver_type_>
     = default;
 
     /** Takes over @p adopted, which this handle frees. */
     explicit database(ustore_database_t adopted) noexcept
-        requires owns_handle<receiver_type_>
+        requires an_owning_receiver<receiver_type_>
     {
         *receiver_.handle_field() = adopted;
     }
@@ -849,7 +849,7 @@ class database {
 
     /** The output field an open writes the new handle into. */
     ustore_database_t* handle_field() noexcept
-        requires owns_handle<receiver_type_>
+        requires an_owning_receiver<receiver_type_>
     {
         return receiver_.handle_field();
     }
@@ -1138,7 +1138,7 @@ class database {
      *  names an executor. */
     static expected<database> init_ram(ustore_database_init_ram_t options = {},
                                        executor_t const& executor = {}) noexcept
-        requires owns_handle<receiver_type_>
+        requires an_owning_receiver<receiver_type_>
     {
         return opened_<database>(ustore_database_init_ram, options, &ustore_database_init_ram_t::database, executor);
     }
@@ -1146,7 +1146,7 @@ class database {
     /** Serves the directory @p options name through the in-memory engine, which persists there as
      *  one image, blocking on @p executor, or on the calling thread without one. */
     static expected<database> open_ram(ustore_database_open_ram_t options, executor_t const& executor = {}) noexcept
-        requires owns_handle<receiver_type_>
+        requires an_owning_receiver<receiver_type_>
     {
         return opened_<database>(ustore_database_open_ram, options, &ustore_database_open_ram_t::database, executor);
     }
@@ -1155,7 +1155,7 @@ class database {
      *  on the calling thread without one. */
     static expected<database> open_rocksdb(ustore_database_open_rocksdb_t options,
                                            executor_t const& executor = {}) noexcept
-        requires owns_handle<receiver_type_>
+        requires an_owning_receiver<receiver_type_>
     {
         return opened_<database>(ustore_database_open_rocksdb, options, &ustore_database_open_rocksdb_t::database,
                                  executor);
@@ -1165,7 +1165,7 @@ class database {
      *  executor, or on the calling thread without one. */
     static expected<database> view_rocksdb(ustore_database_view_rocksdb_t options,
                                            executor_t const& executor = {}) noexcept
-        requires owns_handle<receiver_type_>
+        requires an_owning_receiver<receiver_type_>
     {
         return opened_<database>(ustore_database_view_rocksdb, options, &ustore_database_view_rocksdb_t::database,
                                  executor);
@@ -1175,7 +1175,7 @@ class database {
      *  on the calling thread without one. */
     static expected<database> open_leveldb(ustore_database_open_leveldb_t options,
                                            executor_t const& executor = {}) noexcept
-        requires owns_handle<receiver_type_>
+        requires an_owning_receiver<receiver_type_>
     {
         return opened_<database>(ustore_database_open_leveldb, options, &ustore_database_open_leveldb_t::database,
                                  executor);
@@ -1184,7 +1184,7 @@ class database {
     /** Serves the directories @p options name through the NVMe engine, moving bytes as an NVMe
      *  executor's placement names, blocking on @p executor or on the calling thread without it. */
     static expected<database> open_nvme(ustore_database_open_nvme_t options, executor_t const& executor = {}) noexcept
-        requires owns_handle<receiver_type_>
+        requires an_owning_receiver<receiver_type_>
     {
         return opened_<database>(ustore_database_open_nvme, options, &ustore_database_open_nvme_t::database, executor);
     }
@@ -1193,7 +1193,7 @@ class database {
      *  writing nothing to its data directories, blocking on @p executor or on the calling
      *  thread without it. */
     static expected<database> view_nvme(ustore_database_view_nvme_t options, executor_t const& executor = {}) noexcept
-        requires owns_handle<receiver_type_>
+        requires an_owning_receiver<receiver_type_>
     {
         return opened_<database>(ustore_database_view_nvme, options, &ustore_database_view_nvme_t::database, executor);
     }
@@ -1201,7 +1201,7 @@ class database {
     /** Drops this handle, closing the database once no transaction or snapshot of it holds it
      *  open; closing writes nothing, so @c flush first makes buffered commits durable. */
     void close() noexcept
-        requires owns_handle<receiver_type_>
+        requires an_owning_receiver<receiver_type_>
     {
         receiver_ = receiver_type_ {};
     }

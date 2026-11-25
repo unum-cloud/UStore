@@ -46,7 +46,7 @@
 #include "ustore/utilities/ram_device.hpp"  // `claim_t`
 #include "ustore/utilities/vram_device.hpp" // `cuda_executor_t`, `hip_executor_t`, `metal_executor_t`
 
-#include "utilities/arguments.hpp" // `names_database_concept`, `walks_cursor_concept`, `feeds_ingest_concept`
+#include "utilities/arguments.hpp" // `a_call_naming_database`, `a_cursor_walker`, `a_call_feeding_ingest`
 #include "utilities/batches.hpp"   // `strings_arg_t`
 #include "vram/classes.hpp"        // `gpu_class_t`
 
@@ -587,10 +587,10 @@ util::expected<made_handle<handle_type_, state_type_>> make_handle(engine_t cons
 /** The database a call addresses: the one it names, or the one its snapshot holds open. */
 template <typename arguments_type_>
 ustore_database_t database_of(arguments_type_ const& arguments) noexcept {
-    if constexpr (names_database_concept<arguments_type_>) return arguments.database;
-    else if constexpr (walks_cursor_concept<arguments_type_>)
+    if constexpr (a_call_naming_database<arguments_type_>) return arguments.database;
+    else if constexpr (a_cursor_walker<arguments_type_>)
         return arguments.cursor ? arguments.cursor->cursor.database : nullptr;
-    else if constexpr (feeds_ingest_concept<arguments_type_>)
+    else if constexpr (a_call_feeding_ingest<arguments_type_>)
         return arguments.ingest ? arguments.ingest->database : nullptr;
     else return arguments.snapshot ? arguments.snapshot->database : nullptr;
 }

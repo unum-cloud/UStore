@@ -341,27 +341,27 @@ inline ustore_snapshot_t viewed(ustore_snapshot_t snapshot) noexcept { return sn
 
 /** Whether a call reads through or reuses a transaction. */
 template <typename arguments_type_>
-concept has_transaction_concept = requires(arguments_type_ const& arguments) { held(arguments.transaction); };
+concept a_call_with_transaction = requires(arguments_type_ const& arguments) { held(arguments.transaction); };
 
 /** Whether a call reads through a snapshot, or answers a new one. */
 template <typename arguments_type_>
-concept reads_snapshot_concept = requires(arguments_type_ const& arguments) { viewed(arguments.snapshot); };
+concept a_call_reading_snapshot = requires(arguments_type_ const& arguments) { viewed(arguments.snapshot); };
 
 /** Decodes what @p arguments read through into @p view, answering false for a view neither view
  *  constructor made. */
 template <typename arguments_type_>
 bool decode_call(arguments_type_ const& arguments, view_t& view) noexcept {
-    if constexpr (reads_view_concept<arguments_type_>)
+    if constexpr (a_call_reading_view<arguments_type_>)
         if (!decode_view(arguments.view, view)) return false;
-    if constexpr (has_transaction_concept<arguments_type_>) view.transaction = held(arguments.transaction);
-    if constexpr (names_watch_concept<arguments_type_>) view.watch = arguments.watch;
-    if constexpr (reads_snapshot_concept<arguments_type_>) view.snapshot = viewed(arguments.snapshot);
+    if constexpr (a_call_with_transaction<arguments_type_>) view.transaction = held(arguments.transaction);
+    if constexpr (a_call_naming_watch<arguments_type_>) view.watch = arguments.watch;
+    if constexpr (a_call_reading_snapshot<arguments_type_>) view.snapshot = viewed(arguments.snapshot);
     return true;
 }
 
 /** A pull reads through the view its cursor opened with. */
 template <typename arguments_type_>
-    requires walks_cursor_concept<arguments_type_>
+    requires a_cursor_walker<arguments_type_>
 bool decode_call(arguments_type_ const& arguments, view_t& view) noexcept {
     return decode_view(arguments.cursor->cursor.view, view);
 }
@@ -566,7 +566,7 @@ inline void clear_outputs(ustore_changes_cursor_next_t const& arguments) noexcep
 
 /** Whether a call has outputs to leave null or zero before it runs and after it fails. */
 template <typename arguments_type_>
-concept clears_outputs_concept = requires(arguments_type_ const& arguments) { clear_outputs(arguments); };
+concept a_call_clearing_outputs = requires(arguments_type_ const& arguments) { clear_outputs(arguments); };
 
 #pragma endregion Outputs
 
@@ -646,7 +646,7 @@ inline std::array<ragged_input_t, 2> ragged_inputs(ustore_strings_measure_t cons
 
 /** Whether a call takes ragged inputs, which the engines read gathered on the host. */
 template <typename arguments_type_>
-concept gathers_ragged_inputs_concept = requires(arguments_type_ const& arguments) { ragged_inputs(arguments); };
+concept a_call_with_ragged_inputs = requires(arguments_type_ const& arguments) { ragged_inputs(arguments); };
 
 /** Strings an accessor writes per block, so the indices it reads fit on the stack of the thread running the call. */
 constexpr std::size_t accessor_block_k = 64;
@@ -800,7 +800,7 @@ util::status_t pull(engine_t const& engine, ustore_changes_cursor_next_t const& 
                     ustore_changes_cursor_handle_t& cursor, view_t const& view) noexcept;
 
 /** Refuses a feed pulled on a device, as change feeds read host runs alone. */
-template <util::gpu_executor_concept executor_type_>
+template <util::a_gpu_executor executor_type_>
 util::status_t pull(engine_t const&, ustore_changes_cursor_next_t const&, ustore_changes_cursor_handle_t&,
                     view_t const&, executor_type_&) noexcept {
     return {util::status_code_t::unsupported_k, "Change feeds run on host executors"};
@@ -822,7 +822,7 @@ auto host_engine_of(cursor_type_& cursor) noexcept {
  *  tables in the managed runs the call rewinds. A cursor opened on the host walks there alone. The
  *  pull body of every walk, @c pull_through, is defined where its modality's pull is.
  */
-template <typename arguments_type_, typename cursor_type_, util::gpu_executor_concept executor_type_>
+template <typename arguments_type_, typename cursor_type_, util::a_gpu_executor executor_type_>
 util::status_t pull(engine_t const& engine, arguments_type_ const& arguments, cursor_type_& cursor, view_t const& view,
                     executor_type_& executor) noexcept {
     constexpr vendored_residency_t residency_k = vendored_residency_of<executor_type_>;
@@ -913,7 +913,7 @@ inline void wait_while_claimed(claim_t const& word) noexcept { host_verbs().wait
 /** The arena @p arguments fill, or null for a call without outputs in one. */
 template <typename arguments_type_>
 ustore_arena_t arena_of(arguments_type_ const& arguments) noexcept {
-    if constexpr (fills_arena_concept<arguments_type_>) return arguments.arena;
+    if constexpr (a_call_filling_arena<arguments_type_>) return arguments.arena;
     else return nullptr;
 }
 
@@ -932,8 +932,8 @@ std::array<std::uint32_t*, 3> named_calls_of(arguments_type_ const& arguments) n
     ustore_arena_t const arena = arena_of(arguments);
     ustore_database_t const database = database_of(arguments);
     std::uint32_t* viewed = nullptr;
-    if constexpr (walks_cursor_concept<arguments_type_>) viewed = &arguments.cursor->cursor.named_calls;
-    else if constexpr (feeds_ingest_concept<arguments_type_>) viewed = &arguments.ingest->named_calls;
+    if constexpr (a_cursor_walker<arguments_type_>) viewed = &arguments.cursor->cursor.named_calls;
+    else if constexpr (a_call_feeding_ingest<arguments_type_>) viewed = &arguments.ingest->named_calls;
     else if constexpr (std::is_same_v<arguments_type_, ustore_database_compact_t>)
         viewed = arguments.plan && *arguments.plan ? &(*arguments.plan)->named_calls : nullptr;
     else {
@@ -973,8 +973,8 @@ inline void lower_named_calls(std::array<std::uint32_t*, 3> const& counts) noexc
 /** The claim of the cursor @p arguments pull or of the ingest they feed, or null for neither. */
 template <typename arguments_type_>
 claim_t* handle_claim_of(arguments_type_ const& arguments) noexcept {
-    if constexpr (walks_cursor_concept<arguments_type_>) return &arguments.cursor->cursor.claim;
-    else if constexpr (feeds_ingest_concept<arguments_type_>) return &arguments.ingest->claim;
+    if constexpr (a_cursor_walker<arguments_type_>) return &arguments.cursor->cursor.claim;
+    else if constexpr (a_call_feeding_ingest<arguments_type_>) return &arguments.ingest->claim;
     else return nullptr;
 }
 
@@ -993,8 +993,7 @@ inline bool arena_serves(ustore_executor_handle_t const* executor, ustore_arena_
     if (!executor) return std::holds_alternative<util::host_blocks_t>(arena->memory);
     return std::visit(
         [&]<typename device_type_>(device_type_ const& device) noexcept {
-            if constexpr (util::gpu_executor_concept<device_type_>)
-                return util::device_blocks_of(arena, device) != nullptr;
+            if constexpr (util::a_gpu_executor<device_type_>) return util::device_blocks_of(arena, device) != nullptr;
             else return std::holds_alternative<util::host_blocks_t>(arena->memory);
         },
         executor->device);
@@ -1002,19 +1001,19 @@ inline bool arena_serves(ustore_executor_handle_t const* executor, ustore_arena_
 
 /** Whether @p arguments_type_ pulls a cursor, whose claim a contended call names. */
 template <typename arguments_type_>
-concept pulls_cursor_concept = requires(arguments_type_ const& arguments) { arguments.cursor; };
+concept a_call_pulling_cursor = requires(arguments_type_ const& arguments) { arguments.cursor; };
 
 /** Whether @p arguments_type_ names its keys through one keys view. */
 template <typename arguments_type_>
-concept views_keys_concept = requires(arguments_type_ const& arguments) { arguments.keys.data; };
+concept a_call_viewing_keys = requires(arguments_type_ const& arguments) { arguments.keys.data; };
 
 /** Whether an input of @p arguments lies inside @p arena, which the call rewinds before it
  *  reads it: their keys or the bytes and offsets of their ragged inputs. */
 template <typename arguments_type_>
 bool reads_from_arena(arguments_type_ const& arguments, ustore_arena_t arena) noexcept {
-    if constexpr (views_keys_concept<arguments_type_>)
+    if constexpr (a_call_viewing_keys<arguments_type_>)
         if (util::arena_holds(arena, arguments.keys.data)) return true;
-    if constexpr (gathers_ragged_inputs_concept<arguments_type_>)
+    if constexpr (a_call_with_ragged_inputs<arguments_type_>)
         for (ragged_input_t const& input : ragged_inputs(arguments)) {
             ustore_strings_view_t const& view = input.view;
             if (view.layout == ustore_strings_u32_tape_k && (util::arena_holds(arena, view.data.u32_tape.data) ||
@@ -1033,12 +1032,12 @@ bool reads_from_arena(arguments_type_ const& arguments, ustore_arena_t arena) no
  *  the arena it rewinds. */
 template <typename arguments_type_>
 util::status_t take_claims(arguments_type_ const& arguments) noexcept {
-    if constexpr (pulls_cursor_concept<arguments_type_>)
+    if constexpr (a_call_pulling_cursor<arguments_type_>)
         if (!arguments.cursor) return {util::status_code_t::invalid_argument_k, "The call needs a cursor"};
-    if constexpr (feeds_ingest_concept<arguments_type_>)
+    if constexpr (a_call_feeding_ingest<arguments_type_>)
         if (!arguments.ingest) return {util::status_code_t::invalid_argument_k, "The ingest is missing"};
     ustore_arena_t const arena = arena_of(arguments);
-    if constexpr (fills_arena_concept<arguments_type_>) {
+    if constexpr (a_call_filling_arena<arguments_type_>) {
         if (!arena) return {util::status_code_t::invalid_argument_k, "The call needs an arena for its outputs"};
         if (!arena_serves(arguments.executor, arena))
             return {util::status_code_t::device_k, "The arena lives where another executor computes"};
@@ -1051,7 +1050,7 @@ util::status_t take_claims(arguments_type_ const& arguments) noexcept {
     claim_t* const handle = handle_claim_of(arguments);
     if (handle && !take(*handle)) {
         if (arena) release(arena->claim);
-        return {util::status_code_t::contended_k, feeds_ingest_concept<arguments_type_>
+        return {util::status_code_t::contended_k, a_call_feeding_ingest<arguments_type_>
                                                       ? "The ingest serves another call"
                                                       : "The cursor serves another pull"};
     }
@@ -1502,11 +1501,11 @@ struct verb_slot<ustore_pages_measure_t> {
 
 /** Whether a call's verb sits in the control plane's table, served on host executors alone. */
 template <typename arguments_type_>
-concept control_verb_concept = requires { verb_slot<arguments_type_>::database; };
+concept a_control_plane_call = requires { verb_slot<arguments_type_>::database; };
 
 /** Whether a call's verb sits in its modality's table at @p residency_. */
 template <typename arguments_type_, vendored_residency_t residency_>
-concept residency_verb_concept = requires { verb_slot<arguments_type_>::template verb<residency_>; };
+concept a_residency_call = requires { verb_slot<arguments_type_>::template verb<residency_>; };
 
 #pragma endregion Verb Slots
 
@@ -1534,7 +1533,7 @@ util::status_t visit_residency(view_t const& view, visitor_type_&& visitor) noex
 template <typename verb_type_, typename arguments_type_, typename... executors_types_>
 util::status_t call_gathered(verb_type_ verb, arguments_type_ const& arguments, view_t const& view,
                              executors_types_&... executor) noexcept {
-    if constexpr (gathers_ragged_inputs_concept<arguments_type_>) {
+    if constexpr (a_call_with_ragged_inputs<arguments_type_>) {
         auto const inputs = ragged_inputs(arguments);
         std::array<strings_arg_t, inputs.size()> strings;
         for (std::size_t index = 0; index != inputs.size(); ++index)
@@ -1563,12 +1562,12 @@ util::status_t call_staged(verb_type_ verb, arguments_type_ const& arguments, vi
 /** Readies @p executor for one call of @p arguments: binds its device to the calling thread, rewinds the bounce and
  *  the managed runs, as every call before was waited for, and rewinds the call's arena, freeing its older runs in
  *  stream order. */
-template <typename arguments_type_, util::gpu_executor_concept executor_type_>
+template <typename arguments_type_, util::a_gpu_executor executor_type_>
 util::status_t open_device_call(arguments_type_ const& arguments, executor_type_& executor) noexcept {
     if (util::status_t const status = executor.bind(); status.failed()) return status;
     executor.rewind_bounce();
     util::rewind(executor.managed(), executor);
-    if constexpr (fills_arena_concept<arguments_type_>)
+    if constexpr (a_call_filling_arena<arguments_type_>)
         if (util::device_blocks_t* const blocks = util::device_blocks_of(arguments.arena, executor))
             util::rewind(*blocks, executor);
     return {};
@@ -1630,7 +1629,7 @@ util::status_t serve_modality(engine_t const& engine, ustore_database_t database
         return util::status_t {util::status_code_t::unsupported_k, "The engine keeps no collections of that modality"};
     auto const verb = verbs->*verb_slot<arguments_type_>::template verb<residency_>;
     if (!verb) return util::status_t {util::status_code_t::unsupported_k, "The engine does not implement this call"};
-    if constexpr (has_match<arguments_type_>) {
+    if constexpr (a_call_with_match<arguments_type_>) {
         auto [match, match_status] = compile_match(arguments, runner.scratch, database->ceiling.strings, executor...);
         if (match_status.failed()) return match_status;
         if (!match.matches_everything())
@@ -1663,10 +1662,10 @@ util::status_t serve(arguments_type_ const& arguments, view_t const& runner) noe
     if constexpr (changes_database<arguments_type_>)
         if (database->access == access_t::read_only_k)
             return {util::status_code_t::read_only_k, "The database was opened read-only"};
-    if constexpr (walks_cursor_concept<arguments_type_>)
+    if constexpr (a_cursor_walker<arguments_type_>)
         if (arguments.cursor->cursor.database != database)
             return {util::status_code_t::invalid_argument_k, "The cursor walks another database"};
-    if constexpr (names_collections_concept<arguments_type_>)
+    if constexpr (a_call_naming_collections<arguments_type_>)
         if (arguments.count && !arguments.collections.data)
             return {util::status_code_t::invalid_argument_k, "No collections were named"};
     if constexpr (std::is_same_v<arguments_type_, ustore_database_clear_t>)
@@ -1690,7 +1689,7 @@ util::status_t serve(arguments_type_ const& arguments, view_t const& runner) noe
         (view.snapshot && view.snapshot->database != database))
         return {util::status_code_t::invalid_argument_k, "The view reads another database"};
 
-    if constexpr (fills_arena_concept<arguments_type_>) util::arena_rewind(arguments.arena);
+    if constexpr (a_call_filling_arena<arguments_type_>) util::arena_rewind(arguments.arena);
     if (util::status_t const seeded = reserve_scratches(runner, 0); seeded.failed()) return seeded;
     return visit_residency(
         view, [&]<typename... executors_types_>(executors_types_&... executor) noexcept -> util::status_t {
@@ -1698,16 +1697,16 @@ util::status_t serve(arguments_type_ const& arguments, view_t const& runner) noe
             if constexpr (residency_k != vendored_residency_t::host_k)
                 if (util::status_t const opened = open_device_call(arguments, executor...); opened.failed())
                     return opened;
-            if constexpr (walks_cursor_concept<arguments_type_>)
+            if constexpr (a_cursor_walker<arguments_type_>)
                 return with_call_stamp(engine, database, &arguments.cursor->cursor.collection, view,
                                        [&](view_t const& pinned) noexcept {
                                            return pull(engine, arguments, *arguments.cursor, pinned, executor...);
                                        });
             else if constexpr (residency_k != vendored_residency_t::host_k &&
-                               !residency_verb_concept<arguments_type_, residency_k>)
+                               !a_residency_call<arguments_type_, residency_k>)
                 return util::status_t {util::status_code_t::unsupported_k,
                                        "Changes and the control plane run on host executors"};
-            else if constexpr (control_verb_concept<arguments_type_>) return serve_control(engine, arguments, view);
+            else if constexpr (a_control_plane_call<arguments_type_>) return serve_control(engine, arguments, view);
             else return serve_modality<residency_k>(engine, database, arguments, view, runner, executor...);
         });
 }
@@ -1802,14 +1801,14 @@ template <typename arguments_type_>
 util::status_t serve_deferred(arguments_type_& arguments, view_t const& runner) noexcept {
     util::status_t const status = serve(arguments, runner);
     // A landed commit keeps its stamp beside a failed flush; the router zeroed it beforehand
-    if constexpr (clears_outputs_concept<arguments_type_> && !stamps_commit_concept<arguments_type_>)
+    if constexpr (a_call_clearing_outputs<arguments_type_> && !a_call_stamping_commit<arguments_type_>)
         if (status.failed()) clear_outputs(arguments);
     return status;
 }
 
 /** Whether an open of @p arguments_type_ caps the CPU class, as the RAM and NVMe opens do. */
 template <typename arguments_type_>
-concept caps_cpu_class_concept = requires(arguments_type_ const& arguments) { arguments.cpu_class_ceiling; };
+concept an_open_capping_cpu_class = requires(arguments_type_ const& arguments) { arguments.cpu_class_ceiling; };
 
 /** Whether an open keeps the directory it names for later calls, as the RAM image and the RocksDB
  *  and LevelDB files are reopened by path; an NVMe open names a manifest or a raw medium. */
@@ -1840,7 +1839,7 @@ util::status_t open_from_root(arguments_type_& call, cpu_ceiling_t const& ceilin
 template <typename arguments_type_, auto open_>
 util::status_t serve_open(arguments_type_& call, view_t const& runner) noexcept {
     ustore_cpu_class_t cpu_class_ceiling = ustore_cpu_class_unknown_k;
-    if constexpr (caps_cpu_class_concept<arguments_type_>) cpu_class_ceiling = call.cpu_class_ceiling;
+    if constexpr (an_open_capping_cpu_class<arguments_type_>) cpu_class_ceiling = call.cpu_class_ceiling;
     auto const [ceiling, pick_status] = pick_cpu_ceiling(cpu_class_ceiling);
     if (pick_status.failed()) return pick_status;
     if (util::status_t const opened = open_from_root<open_>(call, ceiling, runner); opened.failed()) return opened;
@@ -1924,7 +1923,7 @@ void dispatch(call_type_* call) noexcept {
  *  to the verb their type names. */
 template <typename arguments_type_>
 void route(arguments_type_* arguments) noexcept {
-    if constexpr (clears_outputs_concept<arguments_type_>) clear_outputs(*arguments);
+    if constexpr (a_call_clearing_outputs<arguments_type_>) clear_outputs(*arguments);
     if (util::status_t const claimed = take_claims(*arguments); claimed.failed())
         return finish(*arguments->outcome, claimed);
     dispatch<arguments_type_, &serve_deferred<arguments_type_>>(arguments);
@@ -1942,7 +1941,7 @@ void route_init(arguments_type_* arguments) noexcept {
     if (arguments->database) *arguments->database = nullptr;
     if (residency_of(arguments->executor) != vendored_residency_t::host_k)
         return finish(*arguments->outcome, {util::status_code_t::device_k, "Databases open on host executors"});
-    if constexpr (names_directory_concept<arguments_type_>)
+    if constexpr (an_open_naming_directory<arguments_type_>)
         if (arguments->directory.length && !arguments->directory.data)
             return finish(*arguments->outcome,
                           {util::status_code_t::invalid_argument_k, "A directory with a length needs its bytes"});
@@ -2144,7 +2143,7 @@ util::expected<cursor_type_*> open_cursor(arguments_type_ const& arguments) noex
     cursor->cursor.view = arguments.view;
     cursor->cursor.collection = arguments.collection;
     cursor->cursor.direction = arguments.direction;
-    if constexpr (ends_at_key_concept<arguments_type_>)
+    if constexpr (an_init_ending_at_key<arguments_type_>)
         if (arguments.end_key) cursor->end_key = *arguments.end_key;
     take_hold(database);
     if (view.transaction) take_hold(view.transaction);

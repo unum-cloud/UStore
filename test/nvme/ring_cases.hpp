@@ -4,8 +4,8 @@
  *  @date September 19, 2026
  *  @brief The transport-independent ring cases, written once and run against every disk.
  *
- *  Every case here is a template constrained on @c disk_concept, so the blocking floor, the
- *  volume in memory and the @c io_uring rings all run the same code. A case that passes on one
+ *  Every case here is a template constrained on @c a_disk, so the blocking floor, the volume
+ *  in memory and the @c io_uring rings all run the same code. A case that passes on one
  *  transport and fails on another is the point: that is a conformance defect in the transport,
  *  not a case to fork.
  */
@@ -27,7 +27,7 @@
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/utilities/nvme_ring.hpp"   // `disk_concept`, `queue_ref_t`, `countdown`, `notifier`, `completion_t`
+#include "ustore/utilities/nvme_ring.hpp"   // `a_disk`, `queue_ref_t`, `countdown`, `notifier`, `completion_t`
 #include "ustore/utilities/ram_buffers.hpp" // `aligned_allocator`
 #include "ustore/utilities/ram_device.hpp"  // `ram_executor_t`
 
@@ -88,7 +88,7 @@ void paint(std::span<util::byte_t> buffer, std::uint64_t seed) noexcept {
 
 /** A write of a few blocks comes back byte for byte through a read of the same extents. */
 template <typename disk_type_>
-    requires util::disk_concept<disk_type_>
+    requires util::a_disk<disk_type_>
 void test_ring_reads_back_what_it_wrote(disk_type_& disk, util::medium_reference_t medium) {
     constexpr std::size_t blocks_k = 4;
     test_buffer_t buffer = make_buffer(2 * blocks_k * block_bytes_k);
@@ -148,7 +148,7 @@ void test_ring_reads_back_what_it_wrote(disk_type_& disk, util::medium_reference
 /** One queue pair of eight holds sixty-four requests by polling what it submitted and submitting
  *  again. */
 template <typename disk_type_>
-    requires util::disk_concept<disk_type_>
+    requires util::a_disk<disk_type_>
 void test_ring_reaches_depth_beyond_its_credit(disk_type_& disk, util::medium_reference_t medium) {
     constexpr std::size_t rounds_k = 8;
     test_buffer_t buffer = make_buffer(queue_pair_depth_k * block_bytes_k);
@@ -194,7 +194,7 @@ void test_ring_reaches_depth_beyond_its_credit(disk_type_& disk, util::medium_re
 
 /** A full ring takes a prefix and then nothing at all, and never waits for room. */
 template <typename disk_type_>
-    requires util::disk_concept<disk_type_>
+    requires util::a_disk<disk_type_>
 void test_ring_refuses_when_full(disk_type_& disk, util::medium_reference_t medium) {
     constexpr std::size_t offered_k = queue_pair_depth_k + 3;
     test_buffer_t buffer = make_buffer(block_bytes_k);
@@ -235,7 +235,7 @@ void test_ring_refuses_when_full(disk_type_& disk, util::medium_reference_t medi
 
 /** A read that meets the end of the volume moves a prefix, says so, and leaves the tail alone. */
 template <typename disk_type_>
-    requires util::disk_concept<disk_type_>
+    requires util::a_disk<disk_type_>
 void test_ring_reports_a_partial_transfer(disk_type_& disk, util::medium_reference_t medium, ring_edge_t edge) {
     std::uint64_t const reachable = edge == ring_edge_t::clipped_k ? 1024 : block_bytes_k;
     std::size_t const bytes = edge == ring_edge_t::clipped_k ? block_bytes_k : 2 * block_bytes_k;
@@ -283,7 +283,7 @@ void test_ring_reports_a_partial_transfer(disk_type_& disk, util::medium_referen
 
 /** A read wholly past the end of the volume refuses rather than handing back whatever the buffer held. */
 template <typename disk_type_>
-    requires util::disk_concept<disk_type_>
+    requires util::a_disk<disk_type_>
 void test_ring_refuses_a_torn_read(disk_type_& disk, util::medium_reference_t medium) {
     test_buffer_t buffer = make_buffer(block_bytes_k);
     expect_equal(buffer.size(), std::size_t {block_bytes_k});
@@ -321,7 +321,7 @@ void test_ring_refuses_a_torn_read(disk_type_& disk, util::medium_reference_t me
 
 /** A cancelled queue pair's outstanding requests come back cancelled, and its queue pair drains and releases. */
 template <typename disk_type_>
-    requires util::disk_concept<disk_type_>
+    requires util::a_disk<disk_type_>
 void test_ring_drains_a_cancelled_queue_pair(disk_type_& disk, util::medium_reference_t medium) {
     test_buffer_t buffer = make_buffer(queue_pair_depth_k * block_bytes_k);
     expect_equal(buffer.size(), queue_pair_depth_k * block_bytes_k);
@@ -378,7 +378,7 @@ void test_ring_drains_a_cancelled_queue_pair(disk_type_& disk, util::medium_refe
 
 /** Two queue pairs interleave their batches on one ring and each polls only the tokens it minted. */
 template <typename disk_type_>
-    requires util::disk_concept<disk_type_>
+    requires util::a_disk<disk_type_>
 case_result_t test_ring_separates_two_queue_pairs(disk_type_& disk, util::medium_reference_t medium) {
     test_buffer_t buffer = make_buffer(2 * queue_pair_depth_k * block_bytes_k);
     expect_equal(buffer.size(), 2 * queue_pair_depth_k * block_bytes_k);
@@ -441,7 +441,7 @@ case_result_t test_ring_separates_two_queue_pairs(disk_type_& disk, util::medium
 /** A batch holding another queue pair's token is refused whole, since a misrouted completion is
  *  unrecoverable. */
 template <typename disk_type_>
-    requires util::disk_concept<disk_type_>
+    requires util::a_disk<disk_type_>
 void test_ring_refuses_a_foreign_token(disk_type_& disk, util::medium_reference_t medium) {
     test_buffer_t buffer = make_buffer(block_bytes_k);
     expect_equal(buffer.size(), std::size_t {block_bytes_k});
@@ -471,7 +471,7 @@ void test_ring_refuses_a_foreign_token(disk_type_& disk, util::medium_reference_
 
 /** A registered range cannot be handed back while the device may still be writing into it. */
 template <typename disk_type_>
-    requires util::disk_concept<disk_type_>
+    requires util::a_disk<disk_type_>
 void test_ring_holds_a_registered_memory_in_flight(disk_type_& disk, util::medium_reference_t medium) {
     test_buffer_t buffer = make_buffer(block_bytes_k);
     expect_equal(buffer.size(), std::size_t {block_bytes_k});
@@ -503,7 +503,7 @@ void test_ring_holds_a_registered_memory_in_flight(disk_type_& disk, util::mediu
 
 /** A chain runs in submission order and is cut at the first result that is not whole. */
 template <typename disk_type_>
-    requires util::disk_concept<disk_type_>
+    requires util::a_disk<disk_type_>
 void test_ring_cuts_a_chain(disk_type_& disk, util::medium_reference_t medium) {
     test_buffer_t buffer = make_buffer(3 * block_bytes_k);
     expect_equal(buffer.size(), 3 * block_bytes_k);
@@ -543,7 +543,7 @@ void test_ring_cuts_a_chain(disk_type_& disk, util::medium_reference_t medium) {
 
 /** Durability is written as submit, poll, flush, poll, since the ring orders nothing on its own. */
 template <typename disk_type_>
-    requires util::disk_concept<disk_type_>
+    requires util::a_disk<disk_type_>
 void test_ring_flushes_what_it_reaped(disk_type_& disk, util::medium_reference_t medium) {
     test_buffer_t buffer = make_buffer(block_bytes_k);
     expect_equal(buffer.size(), std::size_t {block_bytes_k});
@@ -583,7 +583,7 @@ void test_ring_flushes_what_it_reaped(disk_type_& disk, util::medium_reference_t
  *  which is what the kernel does with a misaligned @c O_DIRECT read: it is accepted into the ring and
  *  comes back with @c -EINVAL on that one entry, leaving the rest of the batch alone. */
 template <typename disk_type_>
-    requires util::disk_concept<disk_type_>
+    requires util::a_disk<disk_type_>
 void test_ring_fails_a_misaligned_request(disk_type_& disk, util::medium_reference_t medium) {
     util::disk_capabilities_t const limits = disk.capabilities();
     expect_equal(limits.offset_alignment, std::uint64_t {util::portable_alignment_k});
@@ -624,7 +624,7 @@ void test_ring_fails_a_misaligned_request(disk_type_& disk, util::medium_referen
 
 /** A queue is refused when it asks for no depth. */
 template <typename disk_type_>
-    requires util::disk_concept<disk_type_>
+    requires util::a_disk<disk_type_>
 void test_ring_refuses_an_impossible_queue_pair([[maybe_unused]] disk_type_& disk,
                                                 [[maybe_unused]] util::medium_reference_t medium) {
     auto [none, none_status] = disk_type_::queue_t::make(0, {});
@@ -634,7 +634,7 @@ void test_ring_refuses_an_impossible_queue_pair([[maybe_unused]] disk_type_& dis
 
 /** Every registered memory slot runs out, and says so rather than overbooking. */
 template <typename disk_type_>
-    requires util::disk_concept<disk_type_>
+    requires util::a_disk<disk_type_>
 void test_ring_exhausts_its_slots(disk_type_& disk, [[maybe_unused]] util::medium_reference_t medium) {
     test_buffer_t buffer = make_buffer(block_bytes_k);
     expect_equal(buffer.size(), std::size_t {block_bytes_k});
@@ -660,7 +660,7 @@ void test_ring_exhausts_its_slots(disk_type_& disk, [[maybe_unused]] util::mediu
 /** A medium with requests against it refuses to be given back, exactly as a registered range does,
  *  and a reference kept past its release names nothing, even once another medium takes its slot. */
 template <typename disk_type_>
-    requires util::disk_concept<disk_type_>
+    requires util::a_disk<disk_type_>
 void test_ring_holds_a_medium_in_flight(disk_type_& disk, util::medium_options_t const& request) {
     test_buffer_t buffer = make_buffer(block_bytes_k);
     expect_equal(buffer.size(), std::size_t {block_bytes_k});
@@ -719,7 +719,7 @@ void test_ring_holds_a_medium_in_flight(disk_type_& disk, util::medium_options_t
 
 /** A bounded wait that wants more than it has room for is refused rather than truncating silently. */
 template <typename disk_type_>
-    requires util::disk_concept<disk_type_>
+    requires util::a_disk<disk_type_>
 void test_ring_refuses_an_oversized_wait(disk_type_& disk, [[maybe_unused]] util::medium_reference_t medium) {
 
     auto [queue, make_queue_status] = disk_type_::queue_t::make(queue_pair_depth_k, {});
@@ -738,7 +738,7 @@ void test_ring_refuses_an_oversized_wait(disk_type_& disk, [[maybe_unused]] util
 /** A queue made on one thread serves another, as a queue set made by its creator serves the pool's
  *  threads. */
 template <typename disk_type_>
-    requires util::disk_concept<disk_type_>
+    requires util::a_disk<disk_type_>
 void test_ring_serves_a_queue_on_another_thread(disk_type_& disk, util::medium_reference_t medium) {
     test_buffer_t buffer = make_buffer(block_bytes_k);
     expect_equal(buffer.size(), std::size_t {block_bytes_k});
@@ -775,7 +775,7 @@ void test_ring_serves_a_queue_on_another_thread(disk_type_& disk, util::medium_r
  *      medium, which is why the RAM driver does not run it.
  */
 template <typename disk_type_>
-    requires util::disk_concept<disk_type_>
+    requires util::a_disk<disk_type_>
 void test_ring_keeps_what_it_flushed(disk_type_& disk, util::medium_options_t const& request) {
     test_buffer_t buffer = make_buffer(2 * block_bytes_k);
     expect_equal(buffer.size(), 2 * block_bytes_k);
@@ -833,7 +833,7 @@ void test_ring_keeps_what_it_flushed(disk_type_& disk, util::medium_options_t co
 /** Deallocating a written extent of a file gives its blocks back to the filesystem, and it
  *  reads as zeros. */
 template <typename disk_type_>
-    requires util::disk_concept<disk_type_>
+    requires util::a_disk<disk_type_>
 void test_ring_deallocates_a_file_extent(disk_type_& disk, util::medium_options_t const& request) {
     constexpr std::size_t blocks_k = 16;
     test_buffer_t buffer = make_buffer(blocks_k * block_bytes_k);
@@ -900,7 +900,7 @@ void test_ring_deallocates_a_file_extent(disk_type_& disk, util::medium_options_
 /** A file reports a power-of-two logical block, and an unbuffered disk aligns every request to
  *  whole ones of it. */
 template <typename disk_type_>
-    requires util::disk_concept<disk_type_>
+    requires util::a_disk<disk_type_>
 void test_ring_reports_a_logical_block(disk_type_& disk, util::medium_options_t const& request) {
     auto [registered_medium, register_medium_status] = disk.register_medium(request);
     expect_true(register_medium_status.succeeded());
@@ -970,7 +970,7 @@ case_result_t test_countdown_keeps_one_failure_whole() {
  *  instantiated for @p disk_type , the disk's type as the caller spells it, like
  *  <tt>test_ring_cuts_a_chain<memory_disk_t></tt>. */
 template <typename disk_type_>
-    requires util::disk_concept<disk_type_>
+    requires util::a_disk<disk_type_>
 void ring_cases(char const* disk_type, disk_type_& disk, util::medium_reference_t medium,
                 ring_edge_t edge = ring_edge_t::clipped_k) {
     auto const label = [disk_type](char const* function) { return fmt::format("{}<{}>", function, disk_type); };
@@ -1013,7 +1013,7 @@ void ring_cases(char const* disk_type, disk_type_& disk, util::medium_reference_
  *  @param[in] body What to run against the registered medium, running its own cases.
  */
 template <typename disk_type_, typename body_type_>
-    requires util::disk_concept<disk_type_>
+    requires util::a_disk<disk_type_>
 void on_medium(char const* label, disk_type_& disk, util::medium_options_t const& request, body_type_&& body) {
     auto [registered_medium, register_status] = disk.register_medium(request);
     if (register_status.succeeded()) body(registered_medium.reference());

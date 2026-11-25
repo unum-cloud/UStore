@@ -28,7 +28,7 @@
 
 #include "ustore/blobs/nvme_compaction.hpp"        // `compaction_output`, `merge_pack_regions`
 #include "ustore/blobs/vram_nvidia_compaction.cuh" // `merge_run`, `carve_sections`, `fold_survivors`, `launch_over`
-#include "ustore/utilities/folds.hpp"              // `fold_concept`
+#include "ustore/utilities/folds.hpp"              // `a_fold`
 #include "ustore/utilities/ram_buffers.hpp"        // `device_blocks_t`
 #include "ustore/utilities/types.hpp"              // `expected`
 #include "ustore/utilities/vram_apple_device.hpp"  // `metal_executor_t`
@@ -89,9 +89,9 @@ class metal_compactor_t {
      *  whose scratch would pass the executor's limit, or whose planned runs outgrow what the
      *  merge leaves free, refuses with @c out_of_memory_heap_k, so the tree merges on the host.
      */
-    template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
+    template <typename key_slot_type_, utilities::a_fold fold_type_, typename device_fold_type_,
               typename allocator_type_>
-        requires compactable_key_slot_concept<key_slot_type_>
+        requires a_compactable_key_slot<key_slot_type_>
     st::status_t compact(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_type_> const> upper,
                          std::span<sorted_run_index_view<key_slot_type_> const> lower,
                          std::span<sorted_run_extents_t const> extents, sorted_run_bounds_t const& bounds,
@@ -119,9 +119,9 @@ class metal_compactor_t {
 
   private:
     /** As @c compact, for a key slot the bundles export merge kernels for. */
-    template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
+    template <typename key_slot_type_, utilities::a_fold fold_type_, typename device_fold_type_,
               typename allocator_type_>
-        requires compactable_key_slot_concept<key_slot_type_>
+        requires a_compactable_key_slot<key_slot_type_>
     st::status_t compact_on_device_(compaction_kind_t kind,
                                     std::span<sorted_run_index_view<key_slot_type_> const> upper,
                                     std::span<sorted_run_index_view<key_slot_type_> const> lower,
@@ -205,9 +205,8 @@ st::expected<packed_counts_t> metal_compactor_t::pack_(char const* name,
     return packed_counts_t {survivors_count};
 }
 
-template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
-          typename allocator_type_>
-    requires compactable_key_slot_concept<key_slot_type_>
+template <typename key_slot_type_, utilities::a_fold fold_type_, typename device_fold_type_, typename allocator_type_>
+    requires a_compactable_key_slot<key_slot_type_>
 st::status_t metal_compactor_t::compact(compaction_kind_t kind,
                                         std::span<sorted_run_index_view<key_slot_type_> const> upper,
                                         std::span<sorted_run_index_view<key_slot_type_> const> lower,
@@ -222,9 +221,8 @@ st::status_t metal_compactor_t::compact(compaction_kind_t kind,
     else return st::status_t::invalid_argument_k;
 }
 
-template <typename key_slot_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
-          typename allocator_type_>
-    requires compactable_key_slot_concept<key_slot_type_>
+template <typename key_slot_type_, utilities::a_fold fold_type_, typename device_fold_type_, typename allocator_type_>
+    requires a_compactable_key_slot<key_slot_type_>
 st::status_t metal_compactor_t::compact_on_device_(
     compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_type_> const> upper,
     std::span<sorted_run_index_view<key_slot_type_> const> lower, std::span<sorted_run_extents_t const> extents,
@@ -236,7 +234,7 @@ st::status_t metal_compactor_t::compact_on_device_(
     using view_t = sorted_run_index_view<key_slot_type_>;
     using names_t = merge_kernel_names<key_slot_type_>;
     using range_t = range_tombstone<typename key_slot_type_::stored_key_t>;
-    constexpr bool locates_k = locates_stored_values_concept<key_slot_type_>;
+    constexpr bool locates_k = a_key_slot_with_located_values<key_slot_type_>;
     constexpr bool gathers_keys_k = !is_inline(key_slot_type_::value_layout_k);
     constexpr st::assume_uninitialized_t uninitialized {};
 

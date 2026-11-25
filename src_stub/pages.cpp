@@ -603,7 +603,7 @@ bool compile_xpath(call_t& call, ustore_bytes_view_t filter, verdict_t& verdict)
 
 /** Whether a page edit names elements, as every edit but an import does. */
 template <typename arguments_type_>
-concept edits_elements_concept = requires(arguments_type_ const& arguments) { arguments.elements; };
+concept an_edit_of_elements = requires(arguments_type_ const& arguments) { arguments.elements; };
 
 /** Whether a page edit names the elements it edits, or may leave them out, as an import and a
  *  range removal do. */
@@ -618,7 +618,7 @@ bool check_page_edit(call_t& call, arguments_type_* arguments, elements_t elemen
     if (refuse_collections(call, arguments->collections, count)) return false;
     if (count && !arguments->keys.data)
         return call.fail(ustore_status_invalid_argument_k, "The call needs the keys of the pages");
-    if constexpr (edits_elements_concept<arguments_type_>)
+    if constexpr (an_edit_of_elements<arguments_type_>)
         if (needs_elements && count && !arguments->elements.data)
             return call.fail(ustore_status_invalid_argument_k, "The call needs the elements it edits");
     if (count > 0xFFFFFFFFull) return call.fail(ustore_status_invalid_argument_k, "One call edits past 4 Gi tasks");

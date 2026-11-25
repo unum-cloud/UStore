@@ -33,7 +33,7 @@
 
 #include "ustore/pages/element_tree.hpp" // `element_tree`, `page_view_t`
 #include "ustore/pages/page_edits.hpp"   // `edit_t`, `for_each_edit`, `encode_edits`
-#include "ustore/utilities/folds.hpp"    // `delta_kind_t`, `delta_view_t`, `fold_concept`
+#include "ustore/utilities/folds.hpp"    // `delta_kind_t`, `delta_view_t`, `a_fold`
 
 namespace unum::ustore::pages {
 
@@ -298,6 +298,6 @@ struct page_fold_t {
     }
 };
 
-static_assert(utilities::fold_concept<page_fold_t>);
+static_assert(utilities::a_fold<page_fold_t>);
 
 } // namespace unum::ustore::pages

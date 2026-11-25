@@ -82,10 +82,9 @@ namespace unum::ustore::utilities {
  *  of satisfying this.
  */
 template <typename device_type_>
-concept block_device_concept = requires(device_type_& device, device_type_ const& constant, medium_options_t medium,
-                                        std::uint16_t index, native_file_event_t const& event, std::size_t count,
-                                        extent_t extent, std::span<byte_t> destination,
-                                        std::span<byte_t const> source) {
+concept a_block_device = requires(device_type_& device, device_type_ const& constant, medium_options_t medium,
+                                  std::uint16_t index, native_file_event_t const& event, std::size_t count,
+                                  extent_t extent, std::span<byte_t> destination, std::span<byte_t const> source) {
     { device.reserve_media(count) } -> std::same_as<status_t>;
     { device.open_medium(index, medium) } -> std::same_as<status_t>;
     { device.close_medium(index) } -> std::same_as<status_t>;
@@ -292,7 +291,7 @@ class blocking_queue_t {
  *      the same pool.
  */
 template <typename device_type_, template <typename> typename atomic_reference_, typename waiter_type_>
-    requires block_device_concept<device_type_>
+    requires a_block_device<device_type_>
 class basic_disk {
   public:
 

@@ -1362,11 +1362,11 @@ inline void stage_edges(reader_t const& reader, writer_t& writer, collection_t c
 
 /** Whether a scan can answer one BM25 score per listed key. */
 template <typename arguments_type_>
-concept scores_matches_concept = requires(arguments_type_ const& arguments) { arguments.scores; };
+concept a_call_scoring_matches = requires(arguments_type_ const& arguments) { arguments.scores; };
 
 /** Whether a pull can answer the values of its keys beside them. */
 template <typename arguments_type_>
-concept exports_values_concept = requires(arguments_type_ const& arguments) { arguments.values; };
+concept a_call_exporting_values = requires(arguments_type_ const& arguments) { arguments.values; };
 
 #pragma endregion Arguments
 

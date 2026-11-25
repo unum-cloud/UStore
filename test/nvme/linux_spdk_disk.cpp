@@ -38,7 +38,7 @@
 
 #include "ustore/utilities/nvme_disks.hpp"           // `blocking_queue_t`
 #include "ustore/utilities/nvme_linux_spdk_disk.hpp" // `linux_spdk_disk_t`, `linux_spdk_queue_t`, `linux_spdk_probe_t`
-#include "ustore/utilities/nvme_ring.hpp"            // `disk_concept`, `queue_ref_t`
+#include "ustore/utilities/nvme_ring.hpp"            // `a_disk`, `queue_ref_t`
 
 #include "nvme/ring_cases.hpp" // `ring_cases`, `ring_edge_t`, every transport-independent result
 
@@ -58,7 +58,7 @@ using linux_spdk_environment_t = util::linux_spdk_environment<atomic_reference, 
 
 #pragma region Fixtures
 
-static_assert(util::disk_concept<linux_spdk_disk_t>, "The SPDK transport is a ring in every configuration");
+static_assert(util::a_disk<linux_spdk_disk_t>, "The SPDK transport is a ring in every configuration");
 
 /** A PCIe address no machine answers at, since function seven of device 31 on bus 255 is empty. */
 constexpr char const* absent_address_k = "0000:ff:1f.7";

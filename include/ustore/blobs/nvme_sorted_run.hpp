@@ -599,7 +599,7 @@ inline expected<kinds_column_t> pack_kinds(std::span<std::uint8_t const> kinds) 
  *  bytes from @c from on, so a flush copies each value once, from where its memory runs hold it
  *  straight into a write block. */
 template <typename values_type_>
-concept gathered_values_concept = requires(values_type_ const& values, std::uint64_t from, std::span<byte_t> into) {
+concept a_gathered_value_source = requires(values_type_ const& values, std::uint64_t from, std::span<byte_t> into) {
     { values.size() } noexcept -> std::convertible_to<std::uint64_t>;
     { values.gather(from, into) } noexcept;
 };
@@ -634,7 +634,7 @@ class lsm_sorted_run {
 
     /** The range tombstones the run holds at its end, over whole strings for a run of strings. */
     using range_tombstones_t =
-        std::conditional_t<tailed_key_slot_concept<key_slot_t>, blobs::range_tombstones<std::string_view>,
+        std::conditional_t<a_tailed_key_slot<key_slot_t>, blobs::range_tombstones<std::string_view>,
                            blobs::range_tombstones<stored_key_t>>;
 
     /** The transport the volume moves bytes through. */
@@ -666,7 +666,7 @@ class lsm_sorted_run {
 
     /** Whether the run holds strings: heads in an S+ tree, whole keys on a tape and layers
      *  under wide ties. */
-    static constexpr bool tailed_k = tailed_key_slot_concept<key_slot_t>;
+    static constexpr bool tailed_k = a_tailed_key_slot<key_slot_t>;
 
     /** Where the sections of a run of strings sit inside its extent, which only a run of
      *  strings instantiates. */
@@ -765,7 +765,7 @@ class lsm_sorted_run {
      *  @param[in] floor The stamp every stamp is raised to at least, since no reader can tell those below it apart.
      *  @param[in] stored_values The values back to back in sorted order, which for a fixed-width
      *      run are @p value_max_size bytes per key slot, removals included, as one span or as a
-     *      @c gathered_values_concept that gathers them a block at a time.
+     *      @c a_gathered_value_source that gathers them a block at a time.
      *  @param[in] value_offsets Where each key slot's value starts inside @p stored_values and one past the last, for
      *      a variable-width run alone; none otherwise.
      *  @param[in] value_max_size The largest value the writing collection admits, which is the width of every value
@@ -1631,7 +1631,7 @@ class lsm_sorted_run {
     }
 
     /** Stages @p bytes zero-padded to @p section bytes at @p offset of @p extent, a block at a
-     *  time, gathering each block's share when @p bytes is a @c gathered_values_concept. */
+     *  time, gathering each block's share when @p bytes is a @c a_gathered_value_source. */
     template <typename bytes_type_ = std::span<byte_t const>>
     static status_t write_bytes_(write_pipeline_t& writer, medium_extent_t const& extent, std::uint64_t offset,
                                  std::uint64_t section, bytes_type_ const& bytes) noexcept {
@@ -1645,7 +1645,7 @@ class lsm_sorted_run {
             std::span<byte_t> const payload = block.bytes().first(static_cast<std::size_t>(chunk));
             std::uint64_t const left = bytes.size() > written ? bytes.size() - written : 0;
             std::uint64_t const held = left < chunk ? left : chunk;
-            if constexpr (gathered_values_concept<bytes_type_>) {
+            if constexpr (a_gathered_value_source<bytes_type_>) {
                 if (held != 0) bytes.gather(written, payload.first(static_cast<std::size_t>(held)));
             }
             else if (held != 0) std::memcpy(payload.data(), bytes.data() + written, static_cast<std::size_t>(held));

@@ -338,7 +338,7 @@ class device_compaction {
         std::size_t scratch_limit = 0;
         bool const on_device = std::visit(
             [&]<typename device_type_>(device_type_ const& device) noexcept {
-                if constexpr (!util::gpu_executor_concept<device_type_>) return false;
+                if constexpr (!util::a_gpu_executor<device_type_>) return false;
                 else {
                     twin = device.device();
                     scratch_limit = device.scratch_limit();

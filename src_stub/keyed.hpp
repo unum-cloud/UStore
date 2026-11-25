@@ -127,7 +127,7 @@ void scan_keyed(call_t& call, arguments_type_* arguments, ustore_modality_t moda
     auto* const offsets_out = carve<ustore_length_t>(call, *arena, count + 1);
     auto* const keys_out = carve<ustore_key_t>(call, *arena, listed.size());
     float* scores_out = nullptr;
-    if constexpr (scores_matches_concept<arguments_type_>)
+    if constexpr (a_call_scoring_matches<arguments_type_>)
         if (arguments->scores && matcher && matcher->scored()) scores_out = carve<float>(call, *arena, listed.size());
     if (call.failed()) return;
     std::copy(offsets.begin(), offsets.end(), offsets_out);
@@ -137,7 +137,7 @@ void scan_keyed(call_t& call, arguments_type_* arguments, ustore_modality_t moda
     }
     *arguments->offsets = offsets_out;
     *arguments->keys = keys_out;
-    if constexpr (scores_matches_concept<arguments_type_>)
+    if constexpr (a_call_scoring_matches<arguments_type_>)
         if (arguments->scores) *arguments->scores = scores_out;
 }
 
@@ -147,7 +147,7 @@ template <typename arguments_type_>
 bool check_scan(call_t& call, arguments_type_* arguments) noexcept {
     if (arguments->offsets) *arguments->offsets = nullptr;
     if (arguments->keys) *arguments->keys = nullptr;
-    if constexpr (scores_matches_concept<arguments_type_>)
+    if constexpr (a_call_scoring_matches<arguments_type_>)
         if (arguments->scores) *arguments->scores = nullptr;
     if (refuse_database(call, arguments->database)) return false;
     if (!arguments->arena) return call.fail(ustore_status_invalid_argument_k, "The call needs an arena");
@@ -405,7 +405,7 @@ template <typename arguments_type_>
 ustore_arena_handle_t* open_pull(call_t& call, arguments_type_* arguments, keyed_cursor_t* cursor) {
     if (arguments->keys) *arguments->keys = nullptr;
     if (arguments->written) *arguments->written = 0;
-    if constexpr (exports_values_concept<arguments_type_>)
+    if constexpr (a_call_exporting_values<arguments_type_>)
         if (arguments->values) *arguments->values = {};
     if (refuse_database(call, arguments->database)) return nullptr;
     if (!cursor || !arguments->arena || !arguments->written || !arguments->keys) {

@@ -1079,7 +1079,7 @@ struct powervsx_strings_kit_t {
 
 /** Names the six slots every strings kit holds. */
 template <typename strings_kit_type_>
-concept strings_kit_concept = requires {
+concept a_strings_kit = requires {
     { strings_kit_type_::capability_k } -> std::convertible_to<sz_capability_t>;
     strings_kit_type_::sort_order;
     strings_kit_type_::utf8_count_strings;

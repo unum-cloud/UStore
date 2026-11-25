@@ -301,12 +301,12 @@ struct stored_key_hash_t {
 /** A key a key slot holds: trivially copyable, ordered by @c < and @c ==, with bounds from @c
  *  limit. */
 template <typename stored_key_type_>
-concept stored_key_concept = std::is_trivially_copyable_v<stored_key_type_> &&
-                             requires(stored_key_type_ const& first, stored_key_type_ const& second) {
-                                 { first < second } -> std::convertible_to<bool>;
-                                 { first == second } -> std::convertible_to<bool>;
-                                 { limit<stored_key_type_>::max_k } -> std::convertible_to<stored_key_type_>;
-                             };
+concept a_stored_key = std::is_trivially_copyable_v<stored_key_type_> &&
+                       requires(stored_key_type_ const& first, stored_key_type_ const& second) {
+                           { first < second } -> std::convertible_to<bool>;
+                           { first == second } -> std::convertible_to<bool>;
+                           { limit<stored_key_type_>::max_k } -> std::convertible_to<stored_key_type_>;
+                       };
 
 #pragma endregion Stored Key
 
@@ -339,7 +339,7 @@ enum class locations_mutability_t : bool {
 
 /** Value layouts whose stored values live inline in key slots rather than in sorted run files. */
 template <value_layout_t value_layout_>
-concept inline_value_layout_concept = is_inline(value_layout_);
+concept an_inline_value_layout = is_inline(value_layout_);
 
 /**
  *  @brief Where the value of one key sits, in the shape the collection's value layout gives it.
@@ -388,7 +388,7 @@ struct stored_value_location {
 
 /** An inline value sits in the key slot itself, so its location names the run it was read from. */
 template <value_layout_t value_layout_>
-    requires inline_value_layout_concept<value_layout_>
+    requires an_inline_value_layout<value_layout_>
 struct stored_value_location<value_layout_> {
 
     /** The caller, size, offset and kind every layout shares. */

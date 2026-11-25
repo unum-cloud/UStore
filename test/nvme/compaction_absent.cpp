@@ -25,7 +25,7 @@
 
 namespace unum::ustore {
 
-using blobs::compactable_key_slot_concept;
+using blobs::a_compactable_key_slot;
 using blobs::compaction_kind_t;
 using blobs::compaction_output;
 using blobs::compaction_stamps_t;
@@ -40,8 +40,8 @@ util::expected<cuda_compactor_t> cuda_compactor_t::make(util::cuda_executor_t&, 
 
 cuda_compactor_t::~cuda_compactor_t() noexcept {}
 
-template <typename key_slot_type_, util::fold_concept fold_type_, typename device_fold_type_, typename allocator_type_>
-    requires compactable_key_slot_concept<key_slot_type_>
+template <typename key_slot_type_, util::a_fold fold_type_, typename device_fold_type_, typename allocator_type_>
+    requires a_compactable_key_slot<key_slot_type_>
 st::status_t cuda_compactor_t::compact(compaction_kind_t, std::span<sorted_run_index_view<key_slot_type_> const>,
                                        std::span<sorted_run_index_view<key_slot_type_> const>,
                                        std::span<sorted_run_extents_t const>, sorted_run_bounds_t const&,
@@ -57,8 +57,8 @@ util::expected<hip_compactor_t> hip_compactor_t::make(util::hip_executor_t&, dev
 
 hip_compactor_t::~hip_compactor_t() noexcept {}
 
-template <typename key_slot_type_, util::fold_concept fold_type_, typename device_fold_type_, typename allocator_type_>
-    requires compactable_key_slot_concept<key_slot_type_>
+template <typename key_slot_type_, util::a_fold fold_type_, typename device_fold_type_, typename allocator_type_>
+    requires a_compactable_key_slot<key_slot_type_>
 st::status_t hip_compactor_t::compact(compaction_kind_t, std::span<sorted_run_index_view<key_slot_type_> const>,
                                       std::span<sorted_run_index_view<key_slot_type_> const>,
                                       std::span<sorted_run_extents_t const>, sorted_run_bounds_t const&,

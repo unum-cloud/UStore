@@ -377,7 +377,7 @@ template <typename disk_type_>
 
 /** A mounted disk, its channels and the media the volumes of a case occupy, torn down in order. */
 template <typename disk_type_>
-    requires util::disk_concept<disk_type_>
+    requires util::a_disk<disk_type_>
 struct basic_fixture {
 
     using disk_t = disk_type_;
@@ -535,7 +535,7 @@ util::status_t blank_head(disk_type_& disk, util::io_channel_t& channel, util::m
  *  no case inherits the catalog its predecessor left; a volume in memory is blank by construction.
  */
 template <typename disk_type_>
-    requires util::disk_concept<disk_type_>
+    requires util::a_disk<disk_type_>
 struct basic_mount {
 
     using fixture_t = basic_fixture<disk_type_>;

@@ -47,7 +47,7 @@
 #include "ustore/blobs/nvme_key_slot.hpp"       // `stored_value_size_t`, `collection_id_t`
 #include "ustore/blobs/nvme_published_runs.hpp" // `pinned_snapshot`, `maintenance_claim`, `commit_ledger`
 #include "ustore/blobs/nvme_store.hpp"          // `nvme_store_cursor`, `keyed_delta`
-#include "ustore/blobs/nvme_transactions.hpp"   // `transaction_registry`, `transaction_core`, `nvme_store_concept`
+#include "ustore/blobs/nvme_transactions.hpp"   // `transaction_registry`, `transaction_core`, `an_nvme_store`
 #include "ustore/blobs/nvme_tree.hpp"           // `lsm_tree_run_record_t`, `database_config_t`
 #include "ustore/utilities/nvme_manifest.hpp"   // `manifest_t`, `manifest_collection_t`, `manifest_file_t`
 #include "ustore/utilities/nvme_queues.hpp"     // `thread_channels_t`
@@ -137,7 +137,7 @@ class database_snapshot {
 /**
  *  @brief A group of writes and reads over several collections that succeed or fail together.
  *  @tparam stored_key_type_ The key every collection of the store is addressed by.
- *  @tparam store_type_ The store the writes land in, which must satisfy @c transaction_store_concept.
+ *  @tparam store_type_ The store the writes land in, which must satisfy @c a_transaction_store.
  *  @tparam row_kit_type_ The SmashTable kit the writes' and watches' hash tables search with.
  *
  *  The core holds the writes, the watches, the stamps and the two-phase lifecycle; what is here
@@ -354,7 +354,7 @@ class database_transaction {
      *  A change reads nothing, so it watches nothing, and two transactions changing one key both commit; a caller
      *  whose change depends on what it read watches that key itself.
      */
-    template <utilities::fold_concept fold_type_>
+    template <utilities::a_fold fold_type_>
     status_t change(any_collection_id_t const& id, stored_key_t stored_key, stored_value_view_t delta,
                     fold_type_ const& fold) noexcept {
         if (!core_.started()) return {status_code_t::invalid_argument_k, "That transaction is staged"};
@@ -613,13 +613,13 @@ struct ingest_outcome_t {
 
 /** Whether a store lays rows of @p row_type_ out as the runs of an ingest. */
 template <typename store_type_, typename row_type_>
-concept ingests_rows_concept = requires(
+concept a_row_ingesting_store = requires(
     store_type_& store, utilities::io_channel_t& channel, std::span<row_type_ const> rows,
     typename store_type_::ingest_runs_t& ingested) { store.write_ingest(channel, rows, ingested); };
 
 /** Whether a store weighs the memory a sealed commit of @p sealed_type_ leaves its memory runs. */
 template <typename store_type_, typename sealed_type_>
-concept weighs_memory_pressure_concept = requires(store_type_ const& store, sealed_type_ const& sealed) {
+concept a_pressure_weighing_store = requires(store_type_ const& store, sealed_type_ const& sealed) {
     store.memory_pressure(sealed);
 };
 
@@ -640,7 +640,7 @@ concept weighs_memory_pressure_concept = requires(store_type_ const& store, seal
  *  registry and every live transaction name it.
  */
 template <typename stored_key_type_, typename volume_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_, typename row_kit_type_, typename store_tags_type_, nvme_store_concept... store_types_>
+          typename waiter_type_, typename row_kit_type_, typename store_tags_type_, an_nvme_store... store_types_>
 class basic_database {
   public:
 
@@ -1697,7 +1697,7 @@ class basic_database {
         io_channel_t& channel = channels.writing();
         return with_ingest_<status_t>(
             ingest, [&]<typename held_type_>(held_type_& held, typename held_type_::ingest_runs_t& ingested) noexcept {
-                if constexpr (ingests_rows_concept<held_type_, row_type_>)
+                if constexpr (a_row_ingesting_store<held_type_, row_type_>)
                     return held.write_ingest(channel, rows, ingested);
                 else return status_t {status_code_t::unsupported_k, "This collection's store ingests no such rows"};
             });
@@ -2588,7 +2588,7 @@ class basic_database {
                 if (!found) return {status_code_t::write_conflict_k, "A collection the transaction wrote is gone"};
                 memory_pressure_t const pressure = std::visit(
                     [&]<typename collection_type_>(collection_type_ const& collection) noexcept {
-                        if constexpr (weighs_memory_pressure_concept<collection_type_, sealed_type_>)
+                        if constexpr (a_pressure_weighing_store<collection_type_, sealed_type_>)
                             return collection.memory_pressure(sealed);
                         else return memory_pressure_t::fits_k;
                     },

@@ -4,7 +4,7 @@
  *  @date September 18, 2026
  *  @brief The ring contract, run against the RAM transport and the blocking file transport alike.
  *
- *  Every case is written once against @c disk_concept and run on both disks, since a transport that
+ *  Every case is written once against @c a_disk and run on both disks, since a transport that
  *  passes only its own suite proves nothing about the contract. The file cases need @c --directory
  *  and want a real filesystem: tmpfs accepts @c O_DIRECT and ignores alignment outright, so a volume
  *  in a scratch directory hides exactly the mistakes the alignment case looks for.
@@ -27,13 +27,13 @@ namespace unum::ustore::test {
 
 using namespace unum::ustore::test::nvme;
 
-static_assert(util::disk_concept<util::linux_spdk_disk<atomic_reference, waiter_t>>,
+static_assert(util::a_disk<util::linux_spdk_disk<atomic_reference, waiter_t>>,
               "The SPDK transport is a ring like every other");
-static_assert(util::disk_concept<util::linux_uring_files_disk<atomic_reference, waiter_t>>,
+static_assert(util::a_disk<util::linux_uring_files_disk<atomic_reference, waiter_t>>,
               "The io_uring transport is a ring like every other");
-static_assert(util::disk_concept<util::linux_aio_files_disk<atomic_reference, waiter_t>>,
+static_assert(util::a_disk<util::linux_aio_files_disk<atomic_reference, waiter_t>>,
               "The Linux AIO transport is a ring like every other");
-static_assert(util::disk_concept<util::any_files_disk<atomic_reference, waiter_t>>,
+static_assert(util::a_disk<util::any_files_disk<atomic_reference, waiter_t>>,
               "Any file transport is a ring like every other");
 
 #pragma region Transport Drivers

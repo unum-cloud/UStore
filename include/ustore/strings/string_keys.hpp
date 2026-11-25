@@ -21,7 +21,7 @@
 #include <smashtable/shared.hpp>       // `st::expected`
 #include <stringzilla/stringzilla.hpp> // `sz::string_view_t`
 
-#include "ustore/utilities/ram_buffers.hpp" // `strings_kit_concept`
+#include "ustore/utilities/ram_buffers.hpp" // `a_strings_kit`
 #include "ustore/utilities/types.hpp"       // `blob_t`, `byte_t`
 
 namespace unum::ustore::strings {
@@ -58,7 +58,7 @@ struct string_key_order_t {
 
 /** Hashes a string through the kit's StringZilla kernel, spreading the strings of a collection
  *  over every partition. */
-template <utilities::strings_kit_concept strings_kit_type_>
+template <utilities::a_strings_kit strings_kit_type_>
 struct string_key_hash {
     std::size_t operator()(string_key_t const& stored) const noexcept {
         std::string_view const text = stored.view();

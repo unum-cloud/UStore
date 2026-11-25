@@ -45,7 +45,7 @@
 
 #include "ustore/docs/json_patch.hpp"       // `modify`, `modification_t`
 #include "ustore/docs/json_values.hpp"      // `json_parse`, `any_parse`, `json_mutable`, `json_dump`
-#include "ustore/utilities/folds.hpp"       // `delta_kind_t`, `delta_view_t`, `fold_concept`
+#include "ustore/utilities/folds.hpp"       // `delta_kind_t`, `delta_view_t`, `a_fold`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocator`, `arena_allocate`, `growth_status`
 
 namespace unum::ustore::docs {
@@ -609,7 +609,7 @@ struct json_fold_t {
     }
 };
 
-static_assert(utilities::fold_concept<json_fold_t>);
+static_assert(utilities::a_fold<json_fold_t>);
 
 #pragma endregion Fold
 

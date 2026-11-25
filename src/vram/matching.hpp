@@ -38,13 +38,13 @@
 #include "ustore/utilities/vram_matching.hpp" // `matching_kits_of`
 
 #include "match.hpp"               // `compiled_match`, `candidates_t`, `scan_matched`, `compile_values`
-#include "utilities/arguments.hpp" // `matches_patterns_concept`, `takes_start_keys_concept`
+#include "utilities/arguments.hpp" // `a_call_matching_patterns`, `a_call_taking_start_keys`
 #include "vram/columns.hpp"        // `upload_output_columns`
 
 namespace unum::ustore {
 
 /** Serves @p bytes off the managed runs of the executor @p handle points to, as a StringZilla allocator does. */
-template <util::gpu_executor_concept executor_type_>
+template <util::a_gpu_executor executor_type_>
 void* allocate_managed(sz_size_t bytes, void* handle, sz_stream_t) noexcept {
     executor_type_& executor = *static_cast<executor_type_*>(handle);
     auto [block, status] = util::carve<byte_t>(executor.managed(), executor, bytes);
@@ -52,7 +52,7 @@ void* allocate_managed(sz_size_t bytes, void* handle, sz_stream_t) noexcept {
 }
 
 /** Grows the managed block at @p pointer into a new one, as a StringZilla allocator does. */
-template <util::gpu_executor_concept executor_type_>
+template <util::a_gpu_executor executor_type_>
 void* reallocate_managed(void* pointer, sz_size_t old_bytes, sz_size_t new_bytes, void* handle,
                          sz_stream_t stream) noexcept {
     if (new_bytes <= old_bytes) return pointer;
@@ -64,7 +64,7 @@ void* reallocate_managed(void* pointer, sz_size_t old_bytes, sz_size_t new_bytes
 
 /** The memory a device match lays its engine state out in: the managed runs of @p executor, which the host writes and
  *  the device reads, released all at once when the next call on the executor rewinds them. */
-template <util::gpu_executor_concept executor_type_>
+template <util::a_gpu_executor executor_type_>
 sz_allocator_t match_memory(executor_type_& executor) noexcept {
     return {allocate_managed<executor_type_>, reallocate_managed<executor_type_>, util::stringzilla_free, &executor};
 }
@@ -72,7 +72,7 @@ sz_allocator_t match_memory(executor_type_& executor) noexcept {
 /** Copies the @p bytes at @p memory into a block of @p executor's managed runs, which the host
  *  never touches again, so the device keeps it where its kernels read it until the next call
  *  rewinds the runs. */
-template <util::gpu_executor_concept executor_type_>
+template <util::a_gpu_executor executor_type_>
 util::expected<byte_t*> copy_for_device(void const* memory, std::size_t bytes, executor_type_& executor) noexcept {
     auto [block, block_status] = util::carve<byte_t>(executor.managed(), executor, bytes);
     if (block_status.failed()) return block_status;
@@ -132,7 +132,7 @@ util::status_t rebase_on_device(compiled_match<residency_>& match, residency_exe
  *  managed runs, which the host walks for the shapes no kernel takes, rebased onto a copy
  *  the library's kernels walk, and the host half, the predicate and the BM25 scorer, all
  *  for @p host_capabilities, laid out in @p into, which must outlive the match. */
-template <typename arguments_type_, util::gpu_executor_concept executor_type_>
+template <typename arguments_type_, util::a_gpu_executor executor_type_>
 util::expected<compiled_match<vendored_residency_of<executor_type_>>> compile_match(arguments_type_ const& arguments,
                                                                                     ustore_arena_t into,
                                                                                     sz_capability_t host_capabilities,
@@ -145,7 +145,7 @@ util::expected<compiled_match<vendored_residency_of<executor_type_>>> compile_ma
         status.failed())
         return status;
     if (util::status_t const status = rebase_on_device(match, executor); status.failed()) return status;
-    if constexpr (matches_patterns_concept<arguments_type_>)
+    if constexpr (a_call_matching_patterns<arguments_type_>)
         if (arguments.patterns.weights) {
             value_matcher_t scorer;
             if (util::status_t const status = compile_patterns(arguments.patterns, into, host_capabilities,
@@ -586,7 +586,7 @@ util::status_t scan_matched_on_device(residency_tables<vendored_residency_t::hos
     if (util::status_t const status = settle<ustore_collection_id_t>(hosted.collections, count, view.scratch);
         status.failed())
         return status;
-    if constexpr (takes_start_keys_concept<arguments_type_>)
+    if constexpr (a_call_taking_start_keys<arguments_type_>)
         if (util::status_t const status = settle<ustore_key_t>(hosted.start_keys, count, view.scratch); status.failed())
             return status;
     util::status_t const served = [&]<std::size_t... index_>(std::index_sequence<index_...>) noexcept {

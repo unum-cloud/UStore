@@ -8,7 +8,7 @@
  *  One binary drives NVIDIA, AMD and Apple devices at once, each vendor through a runtime its
  *  caller loads once and declared without its SDK, so every unit names all three: NVIDIA devices
  *  are listed first, then AMD, then Apple, and a vendor whose runtime is absent lists no devices.
- *  Every vendor's device header provides the surface @c gpu_executor_concept names.
+ *  Every vendor's device header provides the surface @c a_gpu_executor names.
  *
  *  The library embeds bundles of kernels, which a device loads into a @c kernel_table the process
  *  keeps, and every executor spawned over that table launches through it, finding each kernel by
@@ -42,9 +42,9 @@ namespace unum::ustore::utilities {
  *  one stream it waits on, the ceiling on its scratch, the memory entries arenas and towers queue
  *  on its stream, and its pinned bounce and managed runs. */
 template <typename executor_type_>
-concept gpu_executor_concept = requires(executor_type_& executor, executor_type_ const& spawned, std::size_t bytes,
-                                        std::uintptr_t address, std::span<byte_t> target,
-                                        typename executor_type_::arena_blocks_t& arena) {
+concept a_gpu_executor = requires(executor_type_& executor, executor_type_ const& spawned, std::size_t bytes,
+                                  std::uintptr_t address, std::span<byte_t> target,
+                                  typename executor_type_::arena_blocks_t& arena) {
     { executor_type_::vendor_k } -> std::convertible_to<gpu_vendor_t>;
     { arena.blocks } -> std::convertible_to<device_blocks_t&>;
     { executor.wait() } -> std::same_as<status_t>;
@@ -66,9 +66,9 @@ concept gpu_executor_concept = requires(executor_type_& executor, executor_type_
     { executor.managed() } -> std::same_as<managed_blocks_t&>;
 };
 
-static_assert(gpu_executor_concept<cuda_executor_t>);
-static_assert(gpu_executor_concept<hip_executor_t>);
-static_assert(gpu_executor_concept<metal_executor_t>);
+static_assert(a_gpu_executor<cuda_executor_t>);
+static_assert(a_gpu_executor<hip_executor_t>);
+static_assert(a_gpu_executor<metal_executor_t>);
 
 /** Every vendor's driver table and cuFile's, which a process builds once and hands to every GPU call; a library that
  *  is absent keeps an empty table. */
@@ -331,7 +331,7 @@ status_t launch(metal_executor_t& executor, metal_function_handle_t function, un
  *  @par Statuses:
  *  - @c status_code_t::device_k The device holds no kernels of the library, or refused a launch.
  */
-template <typename offset_type_, gpu_executor_concept executor_type_>
+template <typename offset_type_, a_gpu_executor executor_type_>
 status_t assemble_tape(executor_type_& executor, std::span<tape_source_t const> sources,
                        std::span<offset_type_> offsets, std::span<byte_t> bytes) noexcept {
     static_assert(std::is_same_v<offset_type_, std::uint32_t> || std::is_same_v<offset_type_, std::uint64_t>,
@@ -366,7 +366,7 @@ status_t assemble_tape(executor_type_& executor, std::span<tape_source_t const> 
 /** Bumps @p count elements off @p blocks, opening a run through @p allocate_ when the newest is full, each carve
  *  padded to @c arena_alignment_k with its tail zeroed on @p executor's stream, so a column's bitmap reads whole. A
  *  run opened under the executor's scratch limit shrinks to fit what the listed runs leave of it, or is refused. */
-template <typename element_type_, gpu_executor_concept executor_type_, typename allocate_type_>
+template <typename element_type_, a_gpu_executor executor_type_, typename allocate_type_>
 expected<std::span<element_type_>> carve_runs(device_blocks_t& blocks, executor_type_& executor, std::size_t count,
                                               allocate_type_&& allocate) noexcept {
     if (!count) return std::span<element_type_> {};
@@ -399,7 +399,7 @@ expected<std::span<element_type_>> carve_runs(device_blocks_t& blocks, executor_
 
 /** Carves @p count elements of device memory off @p blocks on @p executor's stream: a warm carve is a host bump and at
  *  most one fill, and a cold one adds one stream-ordered allocation at least doubling the newest run. */
-template <typename element_type_, gpu_executor_concept executor_type_>
+template <typename element_type_, a_gpu_executor executor_type_>
 expected<std::span<element_type_>> carve(device_blocks_t& blocks, executor_type_& executor,
                                          std::size_t count) noexcept {
     return carve_runs<element_type_>(blocks, executor, count,
@@ -407,7 +407,7 @@ expected<std::span<element_type_>> carve(device_blocks_t& blocks, executor_type_
 }
 
 /** Carves @p count elements of managed memory off @p blocks, which the host and @p executor's device both reach. */
-template <typename element_type_, gpu_executor_concept executor_type_>
+template <typename element_type_, a_gpu_executor executor_type_>
 expected<std::span<element_type_>> carve(managed_blocks_t& blocks, executor_type_& executor,
                                          std::size_t count) noexcept {
     return carve_runs<element_type_>(blocks.blocks, executor, count,
@@ -415,7 +415,7 @@ expected<std::span<element_type_>> carve(managed_blocks_t& blocks, executor_type
 }
 
 /** Rewinds @p blocks to their newest run, the largest, freeing every older one in stream order on @p executor. */
-template <gpu_executor_concept executor_type_>
+template <a_gpu_executor executor_type_>
 void rewind(device_blocks_t& blocks, executor_type_& executor) noexcept {
     if (blocks.count > 1) {
         for (std::uint32_t block = 0; block + 1 != blocks.count; ++block)
@@ -427,7 +427,7 @@ void rewind(device_blocks_t& blocks, executor_type_& executor) noexcept {
 }
 
 /** Rewinds managed @p blocks to their newest run, freeing every older one once @p executor's device is done. */
-template <gpu_executor_concept executor_type_>
+template <a_gpu_executor executor_type_>
 void rewind(managed_blocks_t& blocks, executor_type_& executor) noexcept {
     device_blocks_t& runs = blocks.blocks;
     if (runs.count > 1) {
@@ -440,7 +440,7 @@ void rewind(managed_blocks_t& blocks, executor_type_& executor) noexcept {
 }
 
 /** The device runs of @p arena when they live on @p executor's device, or null for any other arena. */
-template <gpu_executor_concept executor_type_>
+template <a_gpu_executor executor_type_>
 device_blocks_t* device_blocks_of(ustore_arena_t arena, executor_type_ const& executor) noexcept {
     using arena_blocks_t = typename executor_type_::arena_blocks_t;
     arena_blocks_t* const memory = arena ? std::get_if<arena_blocks_t>(&arena->memory) : nullptr;
@@ -449,7 +449,7 @@ device_blocks_t* device_blocks_of(ustore_arena_t arena, executor_type_ const& ex
 
 /** Whether @p pointer lies on a device of a vendor other than @p executor_type_'s, which
  *  @p drivers answer; Apple's unified memory reads as host memory to every vendor. */
-template <gpu_executor_concept executor_type_>
+template <a_gpu_executor executor_type_>
 bool on_another_vendor(gpu_drivers_t const& drivers, void const* pointer) noexcept {
     if constexpr (executor_type_::vendor_k == gpu_vendor_t::nvidia_k) return hip_device_of(drivers.hip, pointer) >= 0;
     else if constexpr (executor_type_::vendor_k == gpu_vendor_t::amd_k)

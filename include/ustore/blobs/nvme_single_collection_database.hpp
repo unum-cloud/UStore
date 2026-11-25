@@ -32,7 +32,7 @@
 #include "ustore/blobs/nvme_key_slot.hpp"       // `value_layout_t`, `collection_id_t`, `is_fixed`
 #include "ustore/blobs/nvme_published_runs.hpp" // `pinned_snapshot`, `maintenance_claim`, `commit_ledger`
 #include "ustore/blobs/nvme_store.hpp"          // `nvme_store_cursor`, `sealed_commit`, `keyed_delta`
-#include "ustore/blobs/nvme_transactions.hpp"   // `transaction_registry`, `transaction_core`, `nvme_store_concept`
+#include "ustore/blobs/nvme_transactions.hpp"   // `transaction_registry`, `transaction_core`, `an_nvme_store`
 #include "ustore/blobs/nvme_tree.hpp"           // `lsm_tree_run_record_t`, `lsm_tree_publication_hook_t`
 #include "ustore/utilities/nvme_manifest.hpp"   // `manifest_t`, `manifest_collection_t`, `manifest_file_t`
 #include "ustore/utilities/nvme_mounts.hpp"     // `resources_shared_ptr`
@@ -455,7 +455,7 @@ inline constexpr char single_collection_name_k[] = "records";
  *  is opened into a @c std::unique_ptr and stays where it was opened.
  */
 template <typename stored_key_type_, typename volume_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_, nvme_store_concept store_type_>
+          typename waiter_type_, an_nvme_store store_type_>
 class basic_single_collection_database {
   public:
 

@@ -42,7 +42,7 @@
 #include "ustore/blobs/nvme_published_runs.hpp" // `commit_ledger`, `stamp_pin`, `commit_request_t`, `memory_shape_t`
 #include "ustore/blobs/nvme_store.hpp"          // `sealed_commit`
 #include "ustore/blobs/nvme_tree.hpp"         // `transaction_config_t`, `lsm_tree_run_record_t`, `compaction_outcome_t`
-#include "ustore/utilities/folds.hpp"         // `fold_concept`, `fold_delta_pair`, `delta_kind_t`
+#include "ustore/utilities/folds.hpp"         // `a_fold`, `fold_delta_pair`, `delta_kind_t`
 #include "ustore/utilities/nvme_channels.hpp" // `io_channel_t`
 #include "ustore/utilities/nvme_mounts.hpp"   // `resources_shared_ptr`
 #include "ustore/utilities/nvme_ring.hpp"     // `notifier`
@@ -233,7 +233,7 @@ class transaction_deltas {
     /** Writes @p change, a change delta of @p fold, under @p stored_key of @p id, folded
      *  after whatever the deltas hold for the key, keeping that delta's watch and taking none
      *  of its own. */
-    template <utilities::fold_concept fold_type_>
+    template <utilities::a_fold fold_type_>
     inline status_t change(collection_id_t id, value_widths_t widths, stored_key_t stored_key,
                            stored_value_view_t change, fold_type_ const& fold) noexcept;
 
@@ -664,7 +664,7 @@ transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_ty
 
 template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
           typename row_kit_type_>
-template <utilities::fold_concept fold_type_>
+template <utilities::a_fold fold_type_>
 inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::change(
     collection_id_t id, value_widths_t widths, stored_key_t stored_key, stored_value_view_t change,
     fold_type_ const& fold) noexcept {
@@ -1177,7 +1177,7 @@ struct transaction_state {
  *  A scan walks the store through the @c nvme_store_cursor its key slot and fold name.
  */
 template <typename store_type_>
-concept nvme_store_concept = requires(
+concept an_nvme_store = requires(
     store_type_& store, store_type_ const& viewed, typename store_type_::volume_t& volume,
     collection_config_t const& config, typename store_type_::constraint_t& constraint,
     typename store_type_::ledger_t& ledger, io_channel_t& channel, lsm_tree_publication_hook_t const& published,
@@ -1237,7 +1237,7 @@ concept nvme_store_concept = requires(
  */
 template <typename store_type_, typename stored_key_type_, template <typename> typename atomic_reference_,
           typename waiter_type_, typename row_kit_type_ = st::native_row_kit_t>
-concept transaction_store_concept = requires(
+concept a_transaction_store = requires(
     store_type_& store, collection_id_t collection_id, stored_key_type_ stored_key,
     transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_> const& deltas,
     sealed_commit<stored_key_type_, atomic_reference_, row_kit_type_>& sealed, memory_run_claim_t& claimed,
@@ -1267,7 +1267,7 @@ class transaction_core;
  *      that stop them.
  *  @tparam stored_key_type_ The key every collection of the store is addressed by.
  *  @tparam store_type_ The store the commits land in, which must
- *      satisfy @c transaction_store_concept.
+ *      satisfy @c a_transaction_store.
  *
  *  Nothing here is shared state of its own: the stamps come from the store's ledger, and a conflict
  *  is a key the store says was written since the watch, read from the memory runs and the runs that

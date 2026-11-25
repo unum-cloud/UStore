@@ -113,7 +113,7 @@ variable_width_key_slot<stored_key_type_> make_key_slot(std::type_identity<varia
 /** The bounds @p bounds name with the value stride of @p key_slot_type_, which only a fixed width has. */
 template <typename key_slot_type_>
 sorted_run_bounds_t shaped_bounds(sorted_run_bounds_t bounds) noexcept {
-    if constexpr (locates_stored_values_concept<key_slot_type_>)
+    if constexpr (a_key_slot_with_located_values<key_slot_type_>)
         if (is_fixed(key_slot_type_::value_layout_k)) bounds.value_stride = fixed_value_bytes_k;
     return bounds;
 }
@@ -123,7 +123,7 @@ template <typename key_slot_type_>
 key_slot_type_ poison_key_slot() noexcept {
     key_slot_type_ poison {};
     poison.stored_key = limit<typename key_slot_type_::stored_key_t>::min_k;
-    if constexpr (sizes_stored_values_concept<key_slot_type_>) poison.size = 7;
+    if constexpr (a_key_slot_with_sizes<key_slot_type_>) poison.size = 7;
     return poison;
 }
 
@@ -144,7 +144,7 @@ bool same_inline_stored_value(key_slot_type_ const&, key_slot_type_ const&) noex
 template <typename key_slot_type_>
 bool same_key_slot(key_slot_type_ const& first, key_slot_type_ const& second) noexcept {
     bool same = (first.stored_key == second.stored_key) && same_inline_stored_value(first, second);
-    if constexpr (sizes_stored_values_concept<key_slot_type_>) same = same && first.size == second.size;
+    if constexpr (a_key_slot_with_sizes<key_slot_type_>) same = same && first.size == second.size;
     return same;
 }
 
@@ -433,7 +433,7 @@ st::status_t lay_out(test_lsm_level<key_slot_type_>& lsm_level) noexcept {
     st::status_t status = lsm_level.cells.resize(lsm_level.sorted.size());
     if (status != st::status_t::success_k) return status;
     bool offsets = false;
-    if constexpr (locates_stored_values_concept<key_slot_type_>)
+    if constexpr (a_key_slot_with_located_values<key_slot_type_>)
         offsets = is_variable_width(key_slot_type_::value_layout_k);
     status = lsm_level.value_offsets.resize(offsets ? lsm_level.sorted.size() + lsm_level.counts.size() : 0);
     if (status != st::status_t::success_k) return status;
@@ -627,10 +627,10 @@ void check_compaction(compaction_kind_t kind, sorted_run_bounds_t const& bounds,
     expect_equal(key_slots_count, std::uint64_t {wanted_survivors.size()});
     expect_equal(output.cells.size(), std::size_t {key_slots_count});
     bool offsets = false;
-    if constexpr (locates_stored_values_concept<key_slot_type_>)
+    if constexpr (a_key_slot_with_located_values<key_slot_type_>)
         offsets = is_variable_width(key_slot_type_::value_layout_k);
     expect_equal(output.value_offsets.size(), offsets ? std::size_t {key_slots_count + 1} : 0u);
-    if (!locates_stored_values_concept<key_slot_type_>) expect_equal(output.value_copy_ranges.size(), std::size_t {0});
+    if (!a_key_slot_with_located_values<key_slot_type_>) expect_equal(output.value_copy_ranges.size(), std::size_t {0});
     expect_equal(output.stamps.size(), std::size_t {key_slots_count});
     if (!expect_equal(output.kinds.size(), std::size_t {key_slots_count})) return;
 

@@ -27,7 +27,7 @@ namespace unum::ustore {
 /** Whether @p view_type_ compares with @p other_type_ as a value, as a value view does with a
  *  string. */
 template <typename view_type_, typename other_type_>
-concept compares_with = requires(view_type_ const& view, other_type_ const& other) {
+concept a_view_comparable_with = requires(view_type_ const& view, other_type_ const& other) {
     { view == other } -> std::convertible_to<bool>;
 };
 
@@ -67,7 +67,7 @@ class owned {
 
     /** Compares the view with anything it compares with, as the view itself would. */
     template <typename other_type_>
-        requires compares_with<view_type_, other_type_>
+        requires a_view_comparable_with<view_type_, other_type_>
     bool operator==(other_type_ const& other) const noexcept {
         return view_ == other;
     }
@@ -316,17 +316,16 @@ struct match_t {
 /** A per-key predicate handler: answers whether one key is kept, through a const call operator,
  *  as the executor's threads may call it at once. */
 template <typename handler_type_>
-concept key_predicate_handler = std::is_nothrow_invocable_r_v<bool, handler_type_ const&, ustore_key_t>;
+concept a_key_predicate = std::is_nothrow_invocable_r_v<bool, handler_type_ const&, ustore_key_t>;
 
 /** A batch predicate handler: given the keys of a page, it writes one admission per key, through a
  *  const call operator, as the executor's threads may call it at once. */
 template <typename handler_type_>
-concept keys_predicate_handler =
-    std::is_nothrow_invocable_r_v<void, handler_type_ const&, std::span<ustore_key_t const>,
-                                  std::span<ustore_admission_t>>;
+concept a_keys_predicate = std::is_nothrow_invocable_r_v<void, handler_type_ const&, std::span<ustore_key_t const>,
+                                                         std::span<ustore_admission_t>>;
 
 /** Answers the admissions of @p count keys one at a time through the handler @p state points to. */
-template <key_predicate_handler handler_type_>
+template <a_key_predicate handler_type_>
 void admit_each_(ustore_key_t const* keys, ustore_admission_t* admissions, ustore_size_t count, void* state) noexcept {
     handler_type_ const& handler = *static_cast<handler_type_ const*>(state);
     for (ustore_size_t position = 0; position != count; ++position)
@@ -334,7 +333,7 @@ void admit_each_(ustore_key_t const* keys, ustore_admission_t* admissions, ustor
 }
 
 /** Answers the admissions of @p count keys in one batch through the handler @p state points to. */
-template <keys_predicate_handler handler_type_>
+template <a_keys_predicate handler_type_>
 void admit_batch_(ustore_key_t const* keys, ustore_admission_t* admissions, ustore_size_t count, void* state) noexcept {
     std::size_t const size = static_cast<std::size_t>(count);
     (*static_cast<handler_type_ const*>(state))(std::span<ustore_key_t const> {keys, size},
@@ -343,8 +342,8 @@ void admit_batch_(ustore_key_t const* keys, ustore_admission_t* admissions, usto
 
 /** The predicate a scan calls as <tt>handler(key)</tt>, one key at a time and cheaply, as const from
  *  the executor's threads, so @p handler must outlive every scan and cursor it is given to. */
-template <key_predicate_handler handler_type_>
-    requires(!keys_predicate_handler<handler_type_>)
+template <a_key_predicate handler_type_>
+    requires(!a_keys_predicate<handler_type_>)
 ustore_predicate_t predicate_of(handler_type_& handler) noexcept {
     return {&admit_each_<handler_type_>, &handler, ustore_predicate_cost_cheap_k};
 }
@@ -352,7 +351,7 @@ ustore_predicate_t predicate_of(handler_type_& handler) noexcept {
 /** The predicate a scan calls as <tt>handler(keys, admissions)</tt> over spans, once per page at
  *  @p cost, as const from the executor's threads, so @p handler must outlive every scan and
  *  cursor it is given to. */
-template <keys_predicate_handler handler_type_>
+template <a_keys_predicate handler_type_>
 ustore_predicate_t predicate_of(handler_type_& handler,
                                 ustore_predicate_cost_t cost = ustore_predicate_cost_expensive_k) noexcept {
     return {&admit_batch_<handler_type_>, &handler, cost};
@@ -360,27 +359,27 @@ ustore_predicate_t predicate_of(handler_type_& handler,
 
 /** Whether the arguments @p call_type_ take patterns over values, as blobs and strings do. */
 template <typename call_type_>
-concept takes_patterns = requires(call_type_& call) { call.patterns; };
+concept a_call_with_patterns = requires(call_type_& call) { call.patterns; };
 
 /** Whether the arguments @p call_type_ take a JSONPath or XPath filter, as documents
  *  and pages do. */
 template <typename call_type_>
-concept takes_filter = requires(call_type_& call) { call.filter; };
+concept a_call_with_filter = requires(call_type_& call) { call.filter; };
 
 /** Whether the arguments @p call_type_ export values beside the keys they pull. */
 template <typename call_type_>
-concept takes_values = requires(call_type_& call) { call.values; };
+concept a_call_with_values = requires(call_type_& call) { call.values; };
 
 /** Whether the arguments @p call_type_ export one BM25 score per key. */
 template <typename call_type_>
-concept takes_scores = requires(call_type_& call) { call.scores; };
+concept a_call_with_scores = requires(call_type_& call) { call.scores; };
 
 /** Copies what @p match narrows by into the arguments @p call takes, as far as they
  *  take each part. */
 template <typename call_type_>
 void narrow(call_type_& call, match_t const& match) noexcept {
-    if constexpr (takes_patterns<call_type_>) call.patterns = match.patterns;
-    if constexpr (takes_filter<call_type_>) call.filter = match.filter;
+    if constexpr (a_call_with_patterns<call_type_>) call.patterns = match.patterns;
+    if constexpr (a_call_with_filter<call_type_>) call.filter = match.filter;
     call.predicate = match.predicate;
 }
 
@@ -413,7 +412,7 @@ class keys_cursor {
         next.executor = executor;
         next.cursor = owner_.handle();
         next.keys = &keys;
-        if constexpr (takes_values<next_type_>) next.values = values;
+        if constexpr (a_call_with_values<next_type_>) next.values = values;
         next.written = &written;
         next.arena = arena.handle();
         next.wanted = wanted;
@@ -458,7 +457,7 @@ class keys_cursor {
      *  other fields of @p options, such as the encoding pages render in, taken as they are. */
     expected<blobs_page_t> next_pairs(std::size_t wanted, arena_t& arena, executor_t const& executor = {},
                                       next_type_ options = {}) noexcept
-        requires takes_values<next_type_>
+        requires a_call_with_values<next_type_>
     {
         ustore_strings_view_t values {};
         auto [keys, status] = pull_(wanted, arena, executor.handle(), &values, options);
@@ -497,7 +496,7 @@ expected<std::span<ustore_key_t const>> scan_keys_through(receiver_t receiver, u
                           .arena = arena.handle(),
                           .wanted = wanted};
     narrow(arguments, match);
-    if constexpr (takes_scores<scan_type_>) arguments.scores = scores;
+    if constexpr (a_call_with_scores<scan_type_>) arguments.scores = scores;
     status_t const status = answered_<status_t>([&](ustore_outcome_t* outcome, outputs<void>*) noexcept {
         arguments.outcome = outcome;
         scan_(&arguments);
@@ -1043,13 +1042,13 @@ class blobs_collection_on {
     /** A proxy over one location inside this collection, whose own collection wins over the one it
      *  names. */
     template <typename key_argument_type_>
-        requires(!batch<key_argument_type_>)
+        requires(!a_batch<key_argument_type_>)
     blobs_ref<collection_key_field_t, access_> address_(key_argument_type_ const& key) const noexcept {
         return {receiver_, location_in(collection_, key)};
     }
 
     /** A proxy over a batch of locations inside this collection. */
-    template <batch keys_argument_type_>
+    template <a_batch keys_argument_type_>
     blobs_ref<locations_in_collection<keys_argument_type_>, access_> address_(
         keys_argument_type_&& keys) const noexcept {
         using locations_t = locations_in_collection<keys_argument_type_>;
@@ -1058,9 +1057,9 @@ class blobs_collection_on {
 
     /** The proxy @c at answers: over a batch of locations, or over one. */
     template <typename keys_argument_type_>
-    using ref_of =
-        std::conditional_t<batch<keys_argument_type_>, blobs_ref<locations_in_collection<keys_argument_type_>, access_>,
-                           blobs_ref<collection_key_field_t, access_>>;
+    using ref_of = std::conditional_t<a_batch<keys_argument_type_>,
+                                      blobs_ref<locations_in_collection<keys_argument_type_>, access_>,
+                                      blobs_ref<collection_key_field_t, access_>>;
 
   public:
     /** The handle a snapshot hands out for this kind of collection, which only reads. */
@@ -1116,7 +1115,7 @@ class blobs_collection_on {
      *  @par Statuses:
      *  - @c status_code_t::invalid_argument_k The @p keys and @p values differ in count.
      */
-    template <strings_batch values_type_>
+    template <a_strings_batch values_type_>
     deferrable<> write(keys_view_t keys, values_type_ const& values,
                        ustore_durability_t durability = ustore_durability_buffered_k) const noexcept
         requires writes_k

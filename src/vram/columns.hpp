@@ -19,14 +19,14 @@
 
 #include "ustore/docs/json_cells.hpp"       // `field_size_bytes`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_copy`, `device_blocks_t`, `divide_round_up`
-#include "ustore/utilities/vram_device.hpp" // `carve`, `gpu_executor_concept`
+#include "ustore/utilities/vram_device.hpp" // `carve`, `a_gpu_executor`
 
-#include "utilities/arguments.hpp" // `answers_scores_concept`, `has_keys_concept`, `has_values_concept`
+#include "utilities/arguments.hpp" // `a_call_answering_scores`, `a_call_holding_keys`, `a_call_holding_values`
 
 namespace unum::ustore {
 
 /** Moves output columns from the bounce into one device arena: each is carved there, copied once and repointed. */
-template <util::gpu_executor_concept executor_type_>
+template <util::a_gpu_executor executor_type_>
 class column_uploader {
   public:
     column_uploader(util::device_blocks_t& blocks, executor_type_& executor) noexcept
@@ -110,7 +110,7 @@ template <typename arguments_type_, typename uploader_type_>
 void output_columns(arguments_type_ const& arguments, uploader_type_& uploader) noexcept {
     std::size_t const listed = listed_by(arguments.offsets, arguments.count);
     uploader.move_output(arguments.keys, listed);
-    if constexpr (answers_scores_concept<arguments_type_>) uploader.move_output(arguments.scores, listed);
+    if constexpr (a_call_answering_scores<arguments_type_>) uploader.move_output(arguments.scores, listed);
     uploader.move_output(arguments.offsets, static_cast<std::size_t>(arguments.count) + 1);
 }
 
@@ -122,12 +122,12 @@ template <typename arguments_type_, typename uploader_type_>
     }
 void output_columns(arguments_type_ const& arguments, uploader_type_& uploader) noexcept {
     std::size_t const written = static_cast<std::size_t>(*arguments.written);
-    if constexpr (has_keys_concept<arguments_type_>) uploader.move_output(arguments.keys, written);
-    if constexpr (has_strings_concept<arguments_type_>) uploader.move(*arguments.strings, written);
-    if constexpr (has_ragged_values_concept<arguments_type_>) {
+    if constexpr (a_call_holding_keys<arguments_type_>) uploader.move_output(arguments.keys, written);
+    if constexpr (a_call_holding_strings<arguments_type_>) uploader.move(*arguments.strings, written);
+    if constexpr (a_call_holding_ragged_values<arguments_type_>) {
         if (arguments.values) uploader.move(*arguments.values, written);
     }
-    else if constexpr (has_values_concept<arguments_type_>) uploader.move_output(arguments.values, written);
+    else if constexpr (a_call_holding_values<arguments_type_>) uploader.move_output(arguments.values, written);
 }
 
 /** The output columns of a strings read: presence bits and one key per string. */
@@ -208,7 +208,7 @@ void output_columns(arguments_type_ const& arguments, uploader_type_& uploader) 
 
 /** Moves every output column of @p hosted, which a host verb wrote into @p executor's bounce, into @p blocks, the
  *  call's device arena, one copy per column, and waits once. */
-template <typename arguments_type_, util::gpu_executor_concept executor_type_>
+template <typename arguments_type_, util::a_gpu_executor executor_type_>
 util::status_t upload_output_columns(arguments_type_ const& hosted, util::device_blocks_t& blocks,
                                      executor_type_& executor) noexcept {
     if (util::status_t const pinned = executor.pin_bounce(); pinned.failed()) return pinned;

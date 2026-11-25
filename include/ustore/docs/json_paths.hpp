@@ -35,16 +35,16 @@
 #include <stringzilla/subdocuments.h>      // `sz_subdocuments_engine_init`, `sz_subdocuments_find`
 
 #include "ustore/docs/json_values.hpp"      // `json_cell_t`, `print_number`
-#include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `strings_kit_concept`
+#include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `a_strings_kit`
 #include "ustore/utilities/types.hpp"       // `value_view_t`, `stringzilla_view`, `tape_string`
 
 namespace unum::ustore::docs {
 
+using utilities::a_strings_kit;
 using utilities::arena_allocator;
 using utilities::bytes_of;
 using utilities::chars_of;
 using utilities::growth_status;
-using utilities::strings_kit_concept;
 using utilities::stringzilla_allocator;
 using utilities::stringzilla_refusal;
 using utilities::stringzilla_view;
@@ -296,7 +296,7 @@ class subdocuments_engine_t {
  *  @retval malformed_k A document a cell reads breaks RFC 8259, or a string's escapes do not decode.
  *  @tparam strings_kit_type_ The StringZilla kernels of the calling CPU class.
  */
-template <strings_kit_concept strings_kit_type_, typename cell_of_type_>
+template <a_strings_kit strings_kit_type_, typename cell_of_type_>
 status_t extract_fields(json_documents_t const& documents, std::span<std::string_view const> fields,
                         std::size_t cells_count, cell_of_type_ const& cell_of, sz_capability_t strings,
                         ustore_arena_t scratch, json_cells_t& cells) noexcept {
@@ -450,7 +450,7 @@ inline status_t append_minified(st::vector<char, arena_allocator<char>>& text, s
 }
 
 /** Appends @p body to @p text as a JSON string, escaped by StringZilla into @p scratch. */
-template <strings_kit_concept strings_kit_type_>
+template <a_strings_kit strings_kit_type_>
 status_t append_json_string(st::vector<char, arena_allocator<char>>& text, std::string_view body,
                             ustore_arena_t scratch) noexcept {
     sz_string_view_t const view = stringzilla_view(body);
@@ -523,7 +523,7 @@ inline std::string_view print_json_real(double real, printed_number_buffer_t& bu
 
 /** Prints @p value as JSON text into @p scratch: a scalar canonically, a container minified, nothing for a missing
  *  value. */
-template <strings_kit_concept strings_kit_type_>
+template <a_strings_kit strings_kit_type_>
 expected<value_view_t> json_text_of(json_cell_t const& value, ustore_arena_t scratch) noexcept {
     st::vector<char, arena_allocator<char>> text {{scratch}};
     printed_number_buffer_t printed;

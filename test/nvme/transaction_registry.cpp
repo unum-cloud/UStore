@@ -249,7 +249,7 @@ class test_store_t {
 
 using registry_t = transaction_registry<stored_key_t, test_store_t, atomic_reference, waiter_t>;
 
-static_assert(transaction_store_concept<test_store_t, stored_key_t, atomic_reference, waiter_t>,
+static_assert(a_transaction_store<test_store_t, stored_key_t, atomic_reference, waiter_t>,
               "The store must serve the commit path");
 
 #pragma endregion Store

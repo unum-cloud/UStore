@@ -205,7 +205,7 @@ class bits_view_t {
 /** Whether @p container_type_ lays out elements a pointer to @p element_type_ addresses, back to
  *  back. */
 template <typename container_type_, typename element_type_>
-concept contiguous_of_concept =
+concept a_contiguous_range_of =
     std::ranges::contiguous_range<container_type_> && std::ranges::sized_range<container_type_> &&
     std::same_as<std::ranges::range_value_t<container_type_>, std::remove_cv_t<element_type_>> &&
     requires(container_type_& container) {
@@ -233,7 +233,7 @@ class strided_span {
     /** Views a contiguous container of the same elements, stepping by their size, as @c std::span
      *  does. */
     template <typename container_type_>
-        requires contiguous_of_concept<container_type_, element_type_>
+        requires a_contiguous_range_of<container_type_, element_type_>
     strided_span(container_type_&& container) noexcept
         : begin_(std::ranges::data(container), sizeof(element_type_)), count_(std::ranges::size(container)) {}
 
@@ -383,7 +383,7 @@ struct edges_span {
 
     /** Views a contiguous container of edges as strided edge columns. */
     template <typename tuples_type_>
-        requires contiguous_of_concept<tuples_type_, tuple_t>
+        requires a_contiguous_range_of<tuples_type_, tuple_t>
     edges_span(tuples_type_&& tuples) noexcept
         : edges_span(std::ranges::data(tuples), std::ranges::data(tuples) + std::ranges::size(tuples)) {}
 

@@ -223,15 +223,15 @@ ustore_database_handle_t* make_database(call_t& call, ustore_isolation_t isolati
 
 /** Whether an open lists further data directories, as RocksDB and NVMe opens do. */
 template <typename arguments_type_>
-concept lists_data_directories_concept = requires(arguments_type_ const& arguments) { arguments.data_directories; };
+concept an_open_listing_data_directories = requires(arguments_type_ const& arguments) { arguments.data_directories; };
 
 /** Whether an open caps the CPU class, which only the NVMe open among the missing engines takes. */
 template <typename arguments_type_>
-concept caps_cpu_class_concept = requires(arguments_type_ const& arguments) { arguments.cpu_class_ceiling; };
+concept an_open_capping_cpu_class = requires(arguments_type_ const& arguments) { arguments.cpu_class_ceiling; };
 
 /** Whether a transaction call asks for a durability, as a commit does. */
 template <typename arguments_type_>
-concept asks_durability_concept = requires(arguments_type_ const& arguments) { arguments.durability; };
+concept a_call_asking_durability = requires(arguments_type_ const& arguments) { arguments.durability; };
 
 /** Whether a collection of @p database holds @p name; an empty name is never taken. */
 bool name_taken(ustore_database_handle_t const& database, std::string_view name) noexcept {
@@ -251,9 +251,9 @@ void refuse_engine(arguments_type_* arguments, char const* note) {
         return call.refuse(ustore_status_invalid_argument_k, "The call needs an output for the database");
     if (!arguments->directory.length) return call.refuse(ustore_status_invalid_argument_k, "The directory is empty");
     if (refuse_path(call, arguments->directory)) return;
-    if constexpr (lists_data_directories_concept<arguments_type_>)
+    if constexpr (an_open_listing_data_directories<arguments_type_>)
         if (refuse_data_directories(call, arguments->data_directories, arguments->data_directories_count)) return;
-    if constexpr (caps_cpu_class_concept<arguments_type_>) {
+    if constexpr (an_open_capping_cpu_class<arguments_type_>) {
         if (refuse_cpu_class_ceiling(call, arguments->cpu_class_ceiling)) return;
         std::string_view const manifest = text_of(arguments->directory);
         if (!manifest.ends_with(".ustore.json") && !manifest.starts_with("/dev/"))
@@ -382,7 +382,7 @@ bool open_transaction_call(call_t& call, arguments_type_ const& arguments) {
     if (refuse_database(call, arguments.database)) return false;
     if (!arguments.transaction) return call.fail(ustore_status_uninitialized_k, "The transaction is not open");
     call.name(&arguments.transaction->named_calls);
-    if constexpr (asks_durability_concept<arguments_type_>) {
+    if constexpr (a_call_asking_durability<arguments_type_>) {
         auto const durability = std::bit_cast<std::underlying_type_t<ustore_durability_t>>(arguments.durability);
         if (durability != ustore_durability_buffered_k && durability != ustore_durability_flushed_k)
             return call.fail(ustore_status_invalid_argument_k, "Unknown durability");

@@ -112,8 +112,7 @@ inline int compare_128(ustore_key_t const& first, ustore_key_t const& second) no
  *  A walk that reads storage as it goes answers a status from every move, so a failed read ends the merge using it.
  */
 template <typename cursor_type_>
-concept sorted_128_cursor_concept = requires(cursor_type_& cursor, cursor_type_ const& constant,
-                                             ustore_key_t const& key) {
+concept a_sorted_128_cursor = requires(cursor_type_& cursor, cursor_type_ const& constant, ustore_key_t const& key) {
     { constant.valid() } -> std::same_as<bool>;
     { constant.key() } -> std::convertible_to<ustore_key_t>;
     { cursor.next() } -> std::same_as<status_t>;
@@ -168,7 +167,7 @@ class sorted_128_cursor_t {
     std::size_t offset_ = 0;
 };
 
-static_assert(sorted_128_cursor_concept<sorted_128_cursor_t>);
+static_assert(a_sorted_128_cursor<sorted_128_cursor_t>);
 
 /**
  *  @brief Calls @p callback with every key both walks hold, once each and in order, leapfrogging the walk that lags.
@@ -176,8 +175,7 @@ static_assert(sorted_128_cursor_concept<sorted_128_cursor_t>);
  *  @param[in,out] second The second walk, advanced as it is read.
  *  @param[in] callback Takes the shared key and answers a status, where a failure stops the walk and is returned.
  */
-template <sorted_128_cursor_concept first_cursor_type_, sorted_128_cursor_concept second_cursor_type_,
-          typename callback_type_>
+template <a_sorted_128_cursor first_cursor_type_, a_sorted_128_cursor second_cursor_type_, typename callback_type_>
 status_t intersect_sorted_128(first_cursor_type_& first, second_cursor_type_& second,
                               callback_type_&& callback) noexcept {
     while (first.valid() && second.valid()) {

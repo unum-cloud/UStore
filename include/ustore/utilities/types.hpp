@@ -874,7 +874,7 @@ inline bytes_view_t as_bytes_view(st::vector<byte_t, allocator_type_> const& buf
 /** A value that measures, saves and loads its own bytes, where a successful load consumes its
  *  storage requirements. */
 template <typename value_type_>
-concept serializable_concept = requires(value_type_ const& constant, value_type_& value, bytes_span_t destination,
+concept a_serializable_value = requires(value_type_ const& constant, value_type_& value, bytes_span_t destination,
                                         bytes_view_t source) {
     { constant.storage_requirements() } noexcept -> std::same_as<std::size_t>;
     { constant.save(destination) } noexcept -> std::same_as<status_t>;
@@ -883,17 +883,17 @@ concept serializable_concept = requires(value_type_ const& constant, value_type_
 
 /** A value stored as its object representation, having no serialization of its own. */
 template <typename value_type_>
-concept trivially_serializable_concept = std::is_trivially_copyable_v<value_type_> &&
-                                         !serializable_concept<value_type_>;
+concept a_trivially_serializable_value = std::is_trivially_copyable_v<value_type_> &&
+                                         !a_serializable_value<value_type_>;
 
 /** The bytes of a trivially serializable value. */
-template <trivially_serializable_concept value_type_>
+template <a_trivially_serializable_value value_type_>
 std::size_t storage_requirements(value_type_ const&) noexcept {
     return sizeof(value_type_);
 }
 
 /** Copies the object representation of @p value into @p destination. */
-template <trivially_serializable_concept value_type_>
+template <a_trivially_serializable_value value_type_>
 status_t save(value_type_ const& value, bytes_span_t destination) noexcept {
     if (destination.size() < sizeof(value_type_))
         return status_t {status_code_t::invalid_argument_k, "Buffer is too small"};
@@ -902,7 +902,7 @@ status_t save(value_type_ const& value, bytes_span_t destination) noexcept {
 }
 
 /** Copies the object representation of @p value out of @p source. */
-template <trivially_serializable_concept value_type_>
+template <a_trivially_serializable_value value_type_>
 status_t load(value_type_& value, bytes_view_t source) noexcept {
     if (source.size() < sizeof(value_type_)) return status_t {status_code_t::malformed_k, "Corrupted data"};
     std::memcpy(&value, source.data(), sizeof(value_type_));
@@ -910,19 +910,19 @@ status_t load(value_type_& value, bytes_view_t source) noexcept {
 }
 
 /** The bytes a serializable value reports. */
-template <serializable_concept value_type_>
+template <a_serializable_value value_type_>
 std::size_t storage_requirements(value_type_ const& value) noexcept {
     return value.storage_requirements();
 }
 
 /** Saves a serializable value through its own member. */
-template <serializable_concept value_type_>
+template <a_serializable_value value_type_>
 status_t save(value_type_ const& value, bytes_span_t destination) noexcept {
     return value.save(destination);
 }
 
 /** Loads a serializable value through its own member. */
-template <serializable_concept value_type_>
+template <a_serializable_value value_type_>
 status_t load(value_type_& value, bytes_view_t source) noexcept {
     return value.load(source);
 }

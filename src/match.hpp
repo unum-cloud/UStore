@@ -32,7 +32,7 @@
 #include "ustore/utilities/types.hpp"       // `key_after`, `key_before`, `largest_key_k`, `stringzilla_refusal`
 
 #include "engine.hpp"              // `vendored_residency_t`, `residency_tables`, `view_t`
-#include "utilities/arguments.hpp" // `matches_patterns_concept`, `matches_filter_concept`, `answers_scores_concept`
+#include "utilities/arguments.hpp" // `a_call_matching_patterns`, `a_call_matching_filter`, `a_call_answering_scores`
 #include "utilities/batches.hpp"   // `strings_arg_t`, `validate_scan`
 #include "utilities/progress.hpp"  // `progress_t`, `progress_cancelled_k`
 
@@ -205,7 +205,7 @@ struct compiled_match<residency_> {
 
 /** Whether @p arguments_type_ is a scan or cursor init holding a match. */
 template <typename arguments_type_>
-concept has_match = requires(arguments_type_ const& arguments) { arguments.predicate; };
+concept a_call_with_match = requires(arguments_type_ const& arguments) { arguments.predicate; };
 
 /** Whether the patterns of a call match everything. */
 inline bool matches_everything(ustore_patterns_t const& patterns) noexcept {
@@ -215,8 +215,8 @@ inline bool matches_everything(ustore_patterns_t const& patterns) noexcept {
 /** Whether the patterns or the filter of @p arguments read the values of the keys they narrow. */
 template <typename arguments_type_>
 bool reads_values(arguments_type_ const& arguments) noexcept {
-    if constexpr (matches_patterns_concept<arguments_type_>) return !matches_everything(arguments.patterns);
-    else if constexpr (matches_filter_concept<arguments_type_>) return arguments.filter.length != 0;
+    if constexpr (a_call_matching_patterns<arguments_type_>) return !matches_everything(arguments.patterns);
+    else if constexpr (a_call_matching_filter<arguments_type_>) return arguments.filter.length != 0;
     else return false;
 }
 
@@ -327,12 +327,12 @@ inline util::status_t compile_filter(ustore_bytes_view_t filter, sz_subdocuments
 template <typename arguments_type_>
 util::status_t compile_values(arguments_type_ const& arguments, ustore_arena_t into, sz_capability_t capabilities,
                               sz_allocator_t engine_memory, value_matcher_t& matcher) noexcept {
-    if constexpr (matches_patterns_concept<arguments_type_>)
+    if constexpr (a_call_matching_patterns<arguments_type_>)
         return compile_patterns(arguments.patterns, into, capabilities, engine_memory, matcher);
     else if constexpr (std::is_same_v<arguments_type_, ustore_docs_scan_t> ||
                        std::is_same_v<arguments_type_, ustore_docs_cursor_init_t>)
         return compile_filter(arguments.filter, sz_subdocuments_json_k, into, capabilities, engine_memory, matcher);
-    else if constexpr (matches_filter_concept<arguments_type_>)
+    else if constexpr (a_call_matching_filter<arguments_type_>)
         return compile_filter(arguments.filter, sz_subdocuments_xml_k, into, capabilities, engine_memory, matcher);
     else return {};
 }
@@ -348,7 +348,7 @@ util::expected<compiled_match<vendored_residency_t::host_k>> compile_match(argum
                                                      match.matcher);
         status.failed())
         return status;
-    if constexpr (matches_patterns_concept<arguments_type_>)
+    if constexpr (a_call_matching_patterns<arguments_type_>)
         if (arguments.patterns.weights)
             match.scorer = std::get<sz_substrings_engine_t*>(match.matcher), match.weights = arguments.patterns.weights;
     if (arguments.predicate.cost != ustore_predicate_cost_cheap_k &&
@@ -367,7 +367,7 @@ util::expected<compiled_match<vendored_residency_t::host_k>> compile_match(argum
  *  Progress counts steps, and cancellation is checked between them.
  */
 template <typename plan_type_>
-concept plan_concept = requires(plan_type_& plan, typename plan_type_::step_t step, view_t const& view) {
+concept a_plan = requires(plan_type_& plan, typename plan_type_::step_t step, view_t const& view) {
     { plan.steps() } -> std::convertible_to<std::size_t>;
     { plan.run(step, view) } -> std::same_as<util::status_t>;
     plan.advance();
@@ -375,7 +375,7 @@ concept plan_concept = requires(plan_type_& plan, typename plan_type_::step_t st
 
 /** Runs every phase of @p plan on the thread @p view names, step after step, reporting one unit of @p progress per
  *  step and unwinding with @c progress_cancelled_k once it answers false. */
-template <plan_concept plan_type_>
+template <a_plan plan_type_>
 util::status_t run_steps(plan_type_& plan, view_t const& view, util::progress_t& progress) noexcept {
     for (std::size_t steps = plan.steps(); steps != 0; plan.advance(), steps = plan.steps())
         for (std::size_t step = 0; step != steps; ++step) {
@@ -587,7 +587,7 @@ util::status_t scan_matched(residency_tables<vendored_residency_t::host_k> const
     keyed_survivors_t survivors {util::arena_allocator<ustore_key_t> {view.scratch}};
     scores_sink_t scores {util::arena_allocator<float> {view.scratch}};
     bool const scored = [&]() noexcept {
-        if constexpr (answers_scores_concept<scan_type_>) return arguments.scores && match.scores();
+        if constexpr (a_call_answering_scores<scan_type_>) return arguments.scores && match.scores();
         else return false;
     }();
     util::progress_t progress {arguments.progress, arguments.progress_state, arguments.count};
@@ -601,7 +601,7 @@ util::status_t scan_matched(residency_tables<vendored_residency_t::host_k> const
     if (copied_offsets_status.failed()) return copied_offsets_status;
     auto [keys, keys_status] = util::arena_copy<ustore_key_t>(arguments.arena, survivors);
     if (keys_status.failed()) return keys_status;
-    if constexpr (answers_scores_concept<scan_type_>)
+    if constexpr (a_call_answering_scores<scan_type_>)
         if (scored) {
             auto [copied_scores, scores_status] = util::arena_copy<float>(arguments.arena, scores);
             if (scores_status.failed()) return scores_status;

@@ -17,14 +17,14 @@
 #include <cstdint> // `std::uint8_t`, `std::uintptr_t`
 
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`
-#include "ustore/utilities/vram_device.hpp" // `gpu_drivers_t`, `gpu_executor_concept`, `on_another_vendor`
+#include "ustore/utilities/vram_device.hpp" // `gpu_drivers_t`, `a_gpu_executor`, `on_another_vendor`
 
-#include "utilities/arguments.hpp" // `takes_keys_concept`, `takes_strings_concept`, `takes_fields_concept`
+#include "utilities/arguments.hpp" // `a_call_taking_keys`, `a_call_taking_strings`, `a_call_taking_fields`
 
 namespace unum::ustore {
 
+using util::a_gpu_executor;
 using util::gpu_drivers_t;
-using util::gpu_executor_concept;
 
 /** Where one input of a device call lives. */
 enum class residence_t : std::uint8_t {
@@ -41,7 +41,7 @@ enum class residence_t : std::uint8_t {
 
 /** Where @p pointer lives as calls on @p executor see it, asking the executor's vendor first and @p drivers' other
  *  vendor next; null reads as host memory. */
-template <gpu_executor_concept executor_type_>
+template <a_gpu_executor executor_type_>
 residence_t residence_of(gpu_drivers_t const& drivers, executor_type_ const& executor, void const* pointer) noexcept {
     if (!pointer) return residence_t::host_k;
     int const device = executor.device_of(pointer);
@@ -54,7 +54,7 @@ residence_t residence_of(gpu_drivers_t const& drivers, executor_type_ const& exe
 
 /** Moves the inputs of one call on @p executor_type_ to the host: each is classified once, and one on the executor's
  *  device is downloaded into the bounce and repointed there, every download waited on once by @c finish. */
-template <gpu_executor_concept executor_type_>
+template <a_gpu_executor executor_type_>
 class input_stager {
   public:
     input_stager(gpu_drivers_t const& drivers, executor_type_& executor) noexcept
@@ -125,30 +125,30 @@ class input_stager {
 
 /** Moves every input of @p arguments, a call on @p executor, to the host as @c input_stager does, finding them by the
  *  names the argument structures give them, and waits once for what it downloaded. */
-template <gpu_executor_concept executor_type_, typename arguments_type_>
+template <a_gpu_executor executor_type_, typename arguments_type_>
 util::status_t stage_inputs(gpu_drivers_t const& drivers, executor_type_& executor,
                             arguments_type_& arguments) noexcept {
     input_stager<executor_type_> stager {drivers, executor};
     std::size_t const count = static_cast<std::size_t>(arguments.count);
     stager.stage(arguments.collections, count);
-    if constexpr (takes_keys_concept<arguments_type_>) stager.stage(arguments.keys, count);
-    if constexpr (takes_start_keys_concept<arguments_type_>) stager.stage(arguments.start_keys, count);
-    if constexpr (takes_vertices_concept<arguments_type_>) stager.stage(arguments.vertices, count);
-    if constexpr (takes_roles_concept<arguments_type_>) stager.stage(arguments.roles, count);
-    if constexpr (takes_elements_concept<arguments_type_>) stager.stage(arguments.elements, count);
-    if constexpr (takes_offsets_concept<arguments_type_>) stager.stage(arguments.offsets, count);
-    if constexpr (takes_limits_concept<arguments_type_>) stager.stage(arguments.limits, count);
-    if constexpr (takes_strings_concept<arguments_type_>) stager.stage(arguments.strings, count);
-    if constexpr (takes_prefixes_concept<arguments_type_>) stager.stage(arguments.prefixes, count);
-    if constexpr (takes_start_strings_concept<arguments_type_>) stager.stage(arguments.start_strings, count);
-    if constexpr (takes_end_strings_concept<arguments_type_>) stager.stage(arguments.end_strings, count);
-    if constexpr (takes_typed_fields_concept<arguments_type_>) {
+    if constexpr (a_call_taking_keys<arguments_type_>) stager.stage(arguments.keys, count);
+    if constexpr (a_call_taking_start_keys<arguments_type_>) stager.stage(arguments.start_keys, count);
+    if constexpr (a_call_taking_vertices<arguments_type_>) stager.stage(arguments.vertices, count);
+    if constexpr (a_call_taking_roles<arguments_type_>) stager.stage(arguments.roles, count);
+    if constexpr (a_call_taking_elements<arguments_type_>) stager.stage(arguments.elements, count);
+    if constexpr (a_call_taking_offsets<arguments_type_>) stager.stage(arguments.offsets, count);
+    if constexpr (a_call_taking_limits<arguments_type_>) stager.stage(arguments.limits, count);
+    if constexpr (a_call_taking_strings<arguments_type_>) stager.stage(arguments.strings, count);
+    if constexpr (a_call_taking_prefixes<arguments_type_>) stager.stage(arguments.prefixes, count);
+    if constexpr (a_call_taking_start_strings<arguments_type_>) stager.stage(arguments.start_strings, count);
+    if constexpr (a_call_taking_end_strings<arguments_type_>) stager.stage(arguments.end_strings, count);
+    if constexpr (a_call_taking_typed_fields<arguments_type_>) {
         std::size_t const fields_count = static_cast<std::size_t>(arguments.fields_count);
         stager.stage(arguments.fields, fields_count);
         arguments.outputs_types = stager.stage(arguments.outputs_types,
                                                fields_count * sizeof(*arguments.outputs_types));
     }
-    else if constexpr (takes_fields_concept<arguments_type_>) stager.stage(arguments.fields, count);
+    else if constexpr (a_call_taking_fields<arguments_type_>) stager.stage(arguments.fields, count);
     return stager.finish();
 }
 

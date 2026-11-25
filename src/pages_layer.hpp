@@ -136,7 +136,7 @@ inline std::uint64_t clock_stamp() noexcept {
 /** Parses @p markup in @p encoding as the whole page under @p root, its elements placed at
  *  @p placement and minted from it, unescaping through @p strings_kit_type_, into its dense tree
  *  in @p allocator, as imports and ingests lay pages. */
-template <util::strings_kit_concept strings_kit_type_>
+template <util::a_strings_kit strings_kit_type_>
 util::expected<std::span<util::byte_t const>> import_page_tree(pages::page_encoding_t encoding, std::string_view markup,
                                                                pages::element_key_t const& root,
                                                                pages::placement_t placement,
@@ -360,8 +360,8 @@ struct appended_edits_t {
 
 /** Receives a task, its placement and the page it edits, and answers the edit of that task. */
 template <typename edit_maker_type_>
-concept edit_maker_concept = std::is_invocable_r_v<util::expected<pages::edit_t>, edit_maker_type_&, std::size_t,
-                                                   pages::placement_t, touched_page_t&>;
+concept an_edit_maker = std::is_invocable_r_v<util::expected<pages::edit_t>, edit_maker_type_&, std::size_t,
+                                              pages::placement_t, touched_page_t&>;
 
 /**
  *  @brief Applies the edit @p make_edit answers for every task of @p arguments, in order, to the pages they name, read
@@ -372,7 +372,7 @@ concept edit_maker_concept = std::is_invocable_r_v<util::expected<pages::edit_t>
  *  <tt>land(arguments, pages, view)</tt>. Refuses an edit of a missing page, other than an import or the
  *  removal of a whole page, with @c status_code_t::not_found_k, and writes nothing on any failure.
  */
-template <typename arguments_type_, edit_maker_concept make_edit_type_, typename lander_type_>
+template <typename arguments_type_, an_edit_maker make_edit_type_, typename lander_type_>
 util::status_t edit_pages(arguments_type_ const& arguments, view_t const& view, make_edit_type_&& make_edit,
                           lander_type_ const& land) noexcept {
     if (!arguments.count) return {};
@@ -412,7 +412,7 @@ util::status_t edit_pages(arguments_type_ const& arguments, view_t const& view, 
 #pragma region Edit Calls
 
 /** Implements @c ustore_pages_import, landing the call through @p land. */
-template <util::strings_kit_concept strings_kit_type_, typename lander_type_>
+template <util::a_strings_kit strings_kit_type_, typename lander_type_>
 util::status_t serve_import(ustore_pages_import_t const& arguments, strings_arg_t const& values, view_t const& view,
                             lander_type_ const& land) noexcept {
     if (!arguments.count) return {};
@@ -439,7 +439,7 @@ util::status_t serve_import(ustore_pages_import_t const& arguments, strings_arg_
 }
 
 /** Implements @c ustore_pages_insert, landing the call through @p land. */
-template <util::strings_kit_concept strings_kit_type_, typename lander_type_>
+template <util::a_strings_kit strings_kit_type_, typename lander_type_>
 util::status_t serve_insert(ustore_pages_insert_t const& arguments, strings_arg_t const& values, view_t const& view,
                             lander_type_ const& land) noexcept {
     if (!arguments.count) return {};
@@ -568,7 +568,7 @@ util::status_t serve_remove_attributes(ustore_pages_remove_attributes_t const& a
  *  applied over the pages read unwatched through @p values_verbs, so concurrent edits of one page
  *  both land, leaving the chain of every page the call touched in the scratch of the call for the
  *  engine to commit. */
-template <util::strings_kit_concept strings_kit_type_>
+template <util::a_strings_kit strings_kit_type_>
 util::expected<std::span<page_edits_t const>> pages_import_edits(
     blobs_verbs<vendored_residency_t::host_k> const& values_verbs, ustore_pages_import_t const& arguments,
     strings_arg_t const& values, view_t const& view) noexcept {
@@ -579,7 +579,7 @@ util::expected<std::span<page_edits_t const>> pages_import_edits(
     return chains;
 }
 
-template <util::strings_kit_concept strings_kit_type_>
+template <util::a_strings_kit strings_kit_type_>
 util::expected<std::span<page_edits_t const>> pages_insert_edits(
     blobs_verbs<vendored_residency_t::host_k> const& values_verbs, ustore_pages_insert_t const& arguments,
     strings_arg_t const& values, view_t const& view) noexcept {
@@ -643,7 +643,7 @@ inline util::expected<std::span<page_edits_t const>> pages_remove_attributes_edi
 /** Implements @c ustore_pages_read over the trees @p read_trees answers, called as
  *  <tt>read_trees()</tt> for the pages the call names, task by task, as values appended to the
  *  scratch. */
-template <util::strings_kit_concept strings_kit_type_, typename read_trees_type_>
+template <util::a_strings_kit strings_kit_type_, typename read_trees_type_>
 util::status_t read_pages(ustore_pages_read_t const& arguments, view_t const& view,
                           read_trees_type_&& read_trees) noexcept {
     if (!arguments.count) return {};
@@ -698,7 +698,7 @@ util::status_t read_pages(ustore_pages_read_t const& arguments, view_t const& vi
 /** The page verbs of an engine keeping every page as one value, its dense element tree, bound to
  *  its unchecked whole-value verbs @p values_verbs_ and its resolver @p resolve_, which refuses
  *  every collection holding another modality first. */
-template <util::strings_kit_concept strings_kit_type_, blobs_verbs<vendored_residency_t::host_k> const& values_verbs_,
+template <util::a_strings_kit strings_kit_type_, blobs_verbs<vendored_residency_t::host_k> const& values_verbs_,
           auto resolve_>
 util::status_t pages_import_over_blobs(ustore_pages_import_t const& arguments, strings_arg_t const& values,
                                        view_t const& view) noexcept {
@@ -709,7 +709,7 @@ util::status_t pages_import_over_blobs(ustore_pages_import_t const& arguments, s
                                            rewritten_pages_t {values_verbs_, arguments.database});
 }
 
-template <util::strings_kit_concept strings_kit_type_, blobs_verbs<vendored_residency_t::host_k> const& values_verbs_,
+template <util::a_strings_kit strings_kit_type_, blobs_verbs<vendored_residency_t::host_k> const& values_verbs_,
           auto resolve_>
 util::status_t pages_insert_over_blobs(ustore_pages_insert_t const& arguments, strings_arg_t const& values,
                                        view_t const& view) noexcept {
@@ -768,7 +768,7 @@ util::status_t pages_remove_attributes_over_blobs(ustore_pages_remove_attributes
     return serve_remove_attributes(arguments, fields, view, rewritten_pages_t {values_verbs_, arguments.database});
 }
 
-template <util::strings_kit_concept strings_kit_type_, blobs_verbs<vendored_residency_t::host_k> const& values_verbs_,
+template <util::a_strings_kit strings_kit_type_, blobs_verbs<vendored_residency_t::host_k> const& values_verbs_,
           auto resolve_>
 util::status_t pages_read_over_blobs(ustore_pages_read_t const& arguments, view_t const& view) noexcept {
     util::status_t const resolved = resolve_(arguments.database, arguments.collections, arguments.count,

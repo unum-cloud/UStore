@@ -628,7 +628,7 @@ status_t blobs_scan(ustore_blobs_scan_t const& arguments, view_t const& view) no
 
 /** A store keeping its collections under the database's own key, which the blobs calls reach. */
 template <typename store_type_>
-concept database_keyed_store_concept = std::is_same_v<typename store_type_::stored_key_t, stored_key_t>;
+concept a_database_keyed_store = std::is_same_v<typename store_type_::stored_key_t, stored_key_t>;
 
 /**
  *  @brief Appends to @p kept up to @p wanted distinct present keys of the collection @p read reads
@@ -704,7 +704,7 @@ status_t sample_ranks(call_access<cpu_class_> const& access, collection_id_t col
                 reading,
                 [&]<typename store_type_>(store_type_ const& source,
                                           typename store_type_::reading_t const& read) noexcept -> status_t {
-                    if constexpr (database_keyed_store_concept<store_type_>)
+                    if constexpr (a_database_keyed_store<store_type_>)
                         return draw_ranks(source, read, wanted, generator, access.scratch, kept, versions);
                     else return {status_code_t::invalid_argument_k, "That collection is keyed otherwise"};
                 });

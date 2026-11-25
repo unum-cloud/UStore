@@ -60,7 +60,7 @@
 #include "ustore/blobs/nvme_published_runs.hpp" // `published_runs`, `commit_ledger`, `stamp_pin`
 #include "ustore/blobs/nvme_tree.hpp"           // `lsm_tree`, `lsm_tree_position_t`, `collection_config_t`
 #include "ustore/utilities/algorithm.hpp"       // `sort_by_stored_key`, `heap_sort`, `heap_sift_up`
-#include "ustore/utilities/folds.hpp"           // `fold_concept`
+#include "ustore/utilities/folds.hpp"           // `a_fold`
 #include "ustore/utilities/nvme_channels.hpp"   // `io_channel_t`
 #include "ustore/utilities/nvme_ring.hpp"       // `portable_alignment_k`
 #include "ustore/utilities/ram_buffers.hpp" // `local_arena_t`, `arena_allocator`, `resource_constraint`, `constrained_buffer`
@@ -187,8 +187,8 @@ constexpr bool change_precedes(stored_change<stored_key_type_> const& first,
 /** A sink of a batched select told each value's size before its bytes, answering whether they
  *  should land, so a caller reserves room for a value in the descent that finds it. */
 template <typename sink_type_>
-concept sized_sink_concept = requires(sink_type_& sink, std::size_t request, stored_value_size_t size,
-                                      std::uint64_t offset, std::span<byte_t const> bytes) {
+concept a_sized_sink = requires(sink_type_& sink, std::size_t request, stored_value_size_t size, std::uint64_t offset,
+                                std::span<byte_t const> bytes) {
     { sink.sized(request, size) } -> std::same_as<bool>;
     sink.landed(request, offset, bytes);
 };
@@ -203,7 +203,7 @@ struct sized_sink {
 };
 
 template <typename key_slot_type_, typename volume_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
+          typename waiter_type_, utilities::a_fold fold_type_, typename device_fold_type_,
           typename row_kit_type_ = st::native_row_kit_t>
 class nvme_store_cursor;
 
@@ -242,7 +242,7 @@ class nvme_store_cursor;
  *  @tparam row_kit_type_ The SmashTable kit the memory runs' trees search with.
  */
 template <typename key_slot_type_, typename volume_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_, utilities::fold_concept fold_type_, typename device_fold_type_,
+          typename waiter_type_, utilities::a_fold fold_type_, typename device_fold_type_,
           typename row_kit_type_ = st::native_row_kit_t>
 class nvme_store {
   public:
@@ -527,7 +527,7 @@ class nvme_store {
      *  @param[in] stored_keys The keys to read, in any order and with any number of misses among them.
      *  @param[out] results What every key answered, which separates a miss from a removal.
      *  @param[in] sink Called as <tt>sink(request, offset, bytes)</tt> for every key that locates a
-     *      value, or a @c sized_sink_concept told each size first, landing the bytes it asks for.
+     *      value, or a @c a_sized_sink told each size first, landing the bytes it asks for.
      *  @param[in] stamp The stamp a reader is pinned at, or @c head_stamp_k for the published one.
      *  @param[in] thread_index The executor thread reading, which announces on its own epoch slot.
      *  @return Success, or the failure that stopped the batch rather than one of its keys.
@@ -708,7 +708,7 @@ class nvme_store {
 
     /** Tells @p sink the size of the value of @p request, answering whether its bytes land. */
     template <typename sink_type_>
-        requires sized_sink_concept<sink_type_>
+        requires a_sized_sink<sink_type_>
     static bool sized_(sink_type_& sink, std::size_t request, stored_value_size_t size) noexcept {
         return sink.sized(request, size);
     }
@@ -721,7 +721,7 @@ class nvme_store {
 
     /** Hands @p sink the @p bytes of the value of @p request starting at @p offset. */
     template <typename sink_type_>
-        requires sized_sink_concept<sink_type_>
+        requires a_sized_sink<sink_type_>
     static void landed_(sink_type_& sink, std::size_t request, std::uint64_t offset,
                         std::span<byte_t const> bytes) noexcept {
         sink.landed(request, offset, bytes);

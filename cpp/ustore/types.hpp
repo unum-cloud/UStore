@@ -131,11 +131,11 @@ struct outputs<void> {};
 /** Runs @p poll with @p state later on its own loop, storing the two words and allocating
  *  nothing. */
 template <typename scheduler_type_>
-concept scheduler = requires(scheduler_type_& loop, void (*poll)(void*) noexcept, void* state) {
+concept a_scheduler = requires(scheduler_type_& loop, void (*poll)(void*) noexcept, void* state) {
     loop.post(poll, state);
 };
 
-template <typename value_type_, scheduler scheduler_type_>
+template <typename value_type_, a_scheduler scheduler_type_>
 class awaiter;
 
 /**
@@ -196,7 +196,7 @@ class [[nodiscard]] deferred {
     }
 
     /** Awaits the call on @p loop, which polls its status until it is final. */
-    template <scheduler scheduler_type_>
+    template <a_scheduler scheduler_type_>
     awaiter<value_type_, scheduler_type_> wait(scheduler_type_& loop) noexcept {
         return {*this, loop};
     }
@@ -204,7 +204,7 @@ class [[nodiscard]] deferred {
 
 /** A @c deferred being awaited, living in the awaiting coroutine's frame: each poll reads the
  *  status word, and one not yet final posts itself again. */
-template <typename value_type_, scheduler scheduler_type_>
+template <typename value_type_, a_scheduler scheduler_type_>
 class awaiter {
     deferred<value_type_>& call_;
     scheduler_type_& loop_;
@@ -335,7 +335,7 @@ struct caller_owned {
 
 /** Only an owning receiver opens, loads and hands out cursors. */
 template <typename receiver_type_>
-concept owns_handle = requires(receiver_type_& receiver) { receiver.handle_field(); };
+concept an_owning_receiver = requires(receiver_type_& receiver) { receiver.handle_field(); };
 
 /** Whether a receiver completed as @p completion_ submits its calls and answers @c deferred ones,
  *  rather than blocking until each is final. */
@@ -667,7 +667,7 @@ class bits_view_t {
 /** Whether @p container_type_ lays out elements a pointer to @p element_type_ addresses, back to
  *  back. */
 template <typename container_type_, typename element_type_>
-concept contiguous_of =
+concept a_contiguous_range_of =
     std::ranges::contiguous_range<container_type_> && std::ranges::sized_range<container_type_> &&
     std::same_as<std::ranges::range_value_t<container_type_>, std::remove_cv_t<element_type_>> &&
     std::convertible_to<decltype(std::ranges::data(std::declval<container_type_&>())), element_type_*>;
@@ -693,7 +693,7 @@ class strided_span {
     /** Views a contiguous container of the same elements, stepping by their size, as @c std::span
      *  does. */
     template <typename container_type_>
-        requires contiguous_of<container_type_, element_type_>
+        requires a_contiguous_range_of<container_type_, element_type_>
     strided_span(container_type_&& container) noexcept
         : begin_(std::ranges::data(container), sizeof(element_type_)), count_(std::ranges::size(container)) {}
 
@@ -938,7 +938,7 @@ struct edges_span {
 
     /** Views a contiguous container of edges as strided edge columns. */
     template <typename tuples_type_>
-        requires contiguous_of<tuples_type_, tuple_t>
+        requires a_contiguous_range_of<tuples_type_, tuple_t>
     edges_span(tuples_type_&& tuples) noexcept
         : edges_span(std::ranges::data(tuples), std::ranges::data(tuples) + std::ranges::size(tuples)) {}
 
@@ -1007,25 +1007,25 @@ struct collection_key_field_t {
 
 /** A location that names the collection it lives in. */
 template <typename location_type_>
-concept has_collection = requires(location_type_ const& location) { location.collection; };
+concept a_collection_location = requires(location_type_ const& location) { location.collection; };
 
 /** A location that narrows its value down to one document field. */
 template <typename location_type_>
-concept has_field = requires(location_type_ const& location) { location.field; };
+concept a_field_location = requires(location_type_ const& location) { location.field; };
 
 /** A single key with its collection, that widens into a @c collection_key_field_t. */
 template <typename location_type_>
-concept key_location = std::same_as<std::remove_cvref_t<location_type_>, collection_key_t>;
+concept a_key_location = std::same_as<std::remove_cvref_t<location_type_>, collection_key_t>;
 
 /** A batch of locations or values rather than a single one, recognized by its
  *  nested @c value_type. */
 template <typename batch_type_>
-concept batch = requires { typename std::remove_cvref_t<batch_type_>::value_type; };
+concept a_batch = requires { typename std::remove_cvref_t<batch_type_>::value_type; };
 
 /** A batch that holds its own byte stride instead of stepping by the size of its elements. */
 template <typename batch_type_>
-concept strided_batch = batch<batch_type_> &&
-                        requires(std::remove_cvref_t<batch_type_> const& elements) { elements.stride(); };
+concept a_strided_batch = a_batch<batch_type_> &&
+                          requires(std::remove_cvref_t<batch_type_> const& elements) { elements.stride(); };
 
 /** Resolves a single location or value to itself. */
 template <typename batch_type_>
@@ -1034,7 +1034,7 @@ struct batch_element {
 };
 
 /** Resolves a batch to the type of its elements. */
-template <batch batch_type_>
+template <a_batch batch_type_>
 struct batch_element<batch_type_> {
     using type = typename std::remove_cvref_t<batch_type_>::value_type;
 };
@@ -1061,7 +1061,7 @@ class location_store {
 };
 
 /** Widens a single key into a full location stored by value. */
-template <key_location location_type_>
+template <a_key_location location_type_>
 class location_store<location_type_> {
   public:
     using plain_t = collection_key_field_t;
@@ -1080,7 +1080,7 @@ class location_store<location_type_> {
 
 /** Stores a caller-owned location by pointer, so a batch is never copied. */
 template <typename location_type_>
-    requires(!key_location<location_type_>)
+    requires(!a_key_location<location_type_>)
 class location_store<location_type_&> {
   public:
     using plain_t = location_type_;
@@ -1115,7 +1115,7 @@ struct places_arg_extractor {
 
     using location_t = locations_type_;
     using element_t = batch_element_of<locations_type_>;
-    static constexpr bool is_one_k = !batch<locations_type_>;
+    static constexpr bool is_one_k = !a_batch<locations_type_>;
 
     ustore_size_t count(location_t const& locations) noexcept {
         if constexpr (is_one_k) return 1;
@@ -1128,12 +1128,12 @@ struct places_arg_extractor {
     }
 
     strided_iterator<ustore_collection_id_t const> collections(location_t const& locations) noexcept {
-        if constexpr (has_collection<element_t>) return elements(locations).members(&element_t::collection);
+        if constexpr (a_collection_location<element_t>) return elements(locations).members(&element_t::collection);
         else return {};
     }
 
     strided_iterator<std::string_view const> fields(location_t const& locations) noexcept {
-        if constexpr (has_field<element_t>) return elements(locations).members(&element_t::field);
+        if constexpr (a_field_location<element_t>) return elements(locations).members(&element_t::field);
         else return {};
     }
 
@@ -1147,14 +1147,14 @@ struct places_arg_extractor {
 
     /** A batch that holds its stride steps by it. */
     static strided_iterator<element_t const> elements(location_t const& locations) noexcept
-        requires(!is_one_k && strided_batch<location_t>)
+        requires(!is_one_k && a_strided_batch<location_t>)
     {
         return {std::data(locations), locations.stride()};
     }
 
     /** Any other batch steps by the size of its elements. */
     static strided_iterator<element_t const> elements(location_t const& locations) noexcept
-        requires(!is_one_k && !strided_batch<location_t>)
+        requires(!is_one_k && !a_strided_batch<location_t>)
     {
         return {std::data(locations), sizeof(element_t)};
     }
@@ -1221,7 +1221,7 @@ inline collection_key_field_t location_in(ustore_collection_id_t collection, ust
 
 /** Where @p located lives once moved into @p collection, which wins over its own, keeping the field
  *  it names. */
-template <has_field location_type_>
+template <a_field_location location_type_>
 collection_key_field_t location_in(ustore_collection_id_t collection, location_type_ const& located) noexcept {
     return {collection, located.key, located.field};
 }
@@ -1239,26 +1239,26 @@ collection_key_field_t location_in(ustore_collection_id_t collection, location_t
 /** An element a batch of strings may hold: a value view, a null-terminated string, or anything that
  *  converts into a string view. */
 template <typename element_type_>
-concept string_like = std::same_as<element_type_, value_view_t> ||
-                      std::is_convertible_v<element_type_ const&, std::string_view>;
+concept a_string_like_element = std::same_as<element_type_, value_view_t> ||
+                                std::is_convertible_v<element_type_ const&, std::string_view>;
 
 /** Whether @p text_type_ is a null-terminated string, which may be null. */
 template <typename text_type_>
-concept c_string = std::is_convertible_v<text_type_ const&, char const*>;
+concept a_c_string = std::is_convertible_v<text_type_ const&, char const*>;
 
 /** The bytes @p text spells as an element of a batch, where a missing value spells an empty one. */
 inline ustore_bytes_view_t bytes_of(value_view_t const& text) noexcept { return text.bytes(); }
 
 /** The bytes @p text spells as an element of a batch, where a null string spells an empty one. */
-template <string_like text_type_>
-    requires c_string<text_type_>
+template <a_string_like_element text_type_>
+    requires a_c_string<text_type_>
 ustore_bytes_view_t bytes_of(text_type_ const& text) noexcept {
     char const* const string = text;
     return string ? bytes_of(std::string_view {string}) : ustore_bytes_view_t {};
 }
 
 /** The bytes @p text spells as an element of a batch, through the string view it converts into. */
-template <string_like text_type_>
+template <a_string_like_element text_type_>
 ustore_bytes_view_t bytes_of(text_type_ const& text) noexcept {
     return bytes_of(std::string_view {text});
 }
@@ -1270,7 +1270,7 @@ ustore_bytes_view_t bytes_of(text_type_ const& text) noexcept {
  *  The view it hands out points at the object itself, so the object outlives every call
  *  given the view.
  */
-template <string_like element_type_>
+template <a_string_like_element element_type_>
 class strided_strings {
     strided_iterator<element_type_ const> elements_ {};
 
@@ -1297,7 +1297,7 @@ class strided_strings {
 
 /** Answers the string at every index of a contiguous run of @p element_type_ that
  *  @p handle starts. */
-template <string_like element_type_>
+template <a_string_like_element element_type_>
 void contiguous_strings_get_(void const* handle, ustore_size_t const* indices, ustore_size_t count,
                              ustore_bytes_view_t* views) noexcept {
     element_type_ const* const elements = static_cast<element_type_ const*>(handle);
@@ -1306,7 +1306,7 @@ void contiguous_strings_get_(void const* handle, ustore_size_t const* indices, u
 
 /** Answers the first string of a contiguous run of @p element_type_ that @p handle starts, for
  *  every index. */
-template <string_like element_type_>
+template <a_string_like_element element_type_>
 void repeated_strings_get_(void const* handle, ustore_size_t const*, ustore_size_t count,
                            ustore_bytes_view_t* views) noexcept {
     element_type_ const& element = *static_cast<element_type_ const*>(handle);
@@ -1323,15 +1323,16 @@ void repeated_view_get_(void const* handle, ustore_size_t const*, ustore_size_t 
 
 /** Whether @p strings_type_ lays out string-like elements back to back. */
 template <typename strings_type_>
-concept contiguous_strings = std::ranges::contiguous_range<strings_type_> && std::ranges::sized_range<strings_type_> &&
-                             string_like<std::ranges::range_value_t<strings_type_>>;
+concept a_contiguous_string_range = std::ranges::contiguous_range<strings_type_> &&
+                                    std::ranges::sized_range<strings_type_> &&
+                                    a_string_like_element<std::ranges::range_value_t<strings_type_>>;
 
 /** The tape a batch of strings already is, read where it lies. */
 inline ustore_strings_view_t strings_view_of(strings_view_t const& strings) noexcept { return strings.tape(); }
 
 /** An accessor whose handle is the first element of @p strings itself, so the view needs no object
  *  of its own and stays valid while @p strings does. */
-template <contiguous_strings strings_type_>
+template <a_contiguous_string_range strings_type_>
 ustore_strings_view_t strings_view_of(strings_type_ const& strings) noexcept {
     using element_t = std::ranges::range_value_t<strings_type_>;
     ustore_strings_view_t view {};
@@ -1351,7 +1352,7 @@ inline ustore_strings_view_t repeated_view_of(strings_view_t const& strings) noe
 
 /** The first string of a contiguous batch, repeated for every task, through an accessor whose
  *  handle is it. */
-template <contiguous_strings strings_type_>
+template <a_contiguous_string_range strings_type_>
 ustore_strings_view_t repeated_view_of(strings_type_ const& strings) noexcept {
     using element_t = std::ranges::range_value_t<strings_type_>;
     ustore_strings_view_t view {.layout = ustore_strings_accessor_k};
@@ -1362,7 +1363,7 @@ ustore_strings_view_t repeated_view_of(strings_type_ const& strings) noexcept {
 /** A batch of strings a verb reads where it lies, so a deferred call views it: a tape, or values
  *  laid out back to back. */
 template <typename strings_type_>
-concept strings_batch = requires(strings_type_ const& strings) {
+concept a_strings_batch = requires(strings_type_ const& strings) {
     { strings_view_of(strings) } -> std::same_as<ustore_strings_view_t>;
     { std::size(strings) } -> std::convertible_to<std::size_t>;
 };
@@ -1616,7 +1617,7 @@ struct values_arg_extractor<strings_view_t> {
 
 /** A contiguous container of value views or of strings, read through an accessor. */
 template <std::ranges::contiguous_range strings_type_>
-    requires std::ranges::sized_range<strings_type_> && string_like<std::ranges::range_value_t<strings_type_>>
+    requires std::ranges::sized_range<strings_type_> && a_string_like_element<std::ranges::range_value_t<strings_type_>>
 struct values_arg_extractor<strings_type_> {
     using element_t = std::ranges::range_value_t<strings_type_>;
     strided_strings<element_t> strings;
@@ -1813,14 +1814,14 @@ deferrable<void, completion_> collection_drop_(receiver_t const& receiver, ustor
 
 /** A progress handler: hears the units finished of a total and answers whether the call goes on. */
 template <typename handler_type_>
-concept progress_handler =
+concept a_progress_handler =
     std::is_nothrow_invocable_r_v<ustore_continuation_t, handler_type_&, ustore_size_t, ustore_size_t>;
 
 /** A progress handler the caller keeps for one call, a callback and the state it reads; empty
  *  hears nothing. */
 class progress_t {
 
-    template <progress_handler handler_type_>
+    template <a_progress_handler handler_type_>
     static ustore_continuation_t report_(ustore_size_t finished, ustore_size_t total, void* state) noexcept {
         return (*static_cast<handler_type_*>(state))(finished, total);
     }
@@ -1836,7 +1837,7 @@ class progress_t {
     progress_t() noexcept = default;
 
     /** Views @p handler, which answers @c ustore_cancel_k to stop the call. */
-    template <progress_handler handler_type_>
+    template <a_progress_handler handler_type_>
     progress_t(handler_type_& handler) noexcept : callback(&report_<handler_type_>), state(&handler) {}
 };
 

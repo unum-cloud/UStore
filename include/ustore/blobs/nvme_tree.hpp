@@ -67,7 +67,7 @@
 #include "ustore/blobs/vram_nvidia_compaction.hpp" // `cuda_compactor_t`
 #include "ustore/utilities/nvme_channels.hpp"      // `io_channel_t`, `basic_read_pipeline`
 #include "ustore/utilities/nvme_mounts.hpp"        // `resources_config_t`
-#include "ustore/utilities/nvme_ring.hpp"          // `extent_t`, `disk_concept`, `portable_alignment_k`
+#include "ustore/utilities/nvme_ring.hpp"          // `extent_t`, `a_disk`, `portable_alignment_k`
 #include "ustore/utilities/nvme_slots.hpp"         // `slot_bytes_k`, `slot_payload_offset_k`
 #include "ustore/utilities/nvme_volume.hpp"        // `medium_extent_t`
 #include "ustore/utilities/ram_buffers.hpp"        // `constrained_allocator`, `resource_constraint`
@@ -75,8 +75,9 @@
 
 namespace unum::ustore::blobs {
 
+using utilities::a_disk;
+using utilities::a_serializable_value;
 using utilities::constrained_allocator;
-using utilities::disk_concept;
 using utilities::fields_storage_requirements;
 using utilities::load;
 using utilities::load_fields;
@@ -86,7 +87,6 @@ using utilities::resource_constraint;
 using utilities::resources_config_t;
 using utilities::save;
 using utilities::save_fields;
-using utilities::serializable_concept;
 using utilities::storage_requirements;
 using utilities::string_t;
 using utilities::string_view_t;
@@ -580,7 +580,7 @@ class lsm_tree {
      *  @param[in] kinds The @c delta_kind_t of every key slot, in the same order.
      *  @param[in] floor The stamp every stamp is raised to at least, since no reader can tell those below it apart.
      *  @param[in] stored_values The values back to back in sorted order, one of @p value_max_size
-     *      bytes per key slot for a fixed width, as one span or as a @c gathered_values_concept
+     *      bytes per key slot for a fixed width, as one span or as a @c a_gathered_value_source
      *      that gathers them into the write blocks.
      *  @param[in] value_offsets Where each value starts inside @p stored_values and one past the last, for a variable
      *      width alone.
@@ -745,7 +745,7 @@ class lsm_tree {
      *      @p reading_channel and @p writing_channel.
      *  @return What the pass did, or the status that stopped it with the current level set untouched.
      */
-    template <utilities::fold_concept fold_type_, typename device_fold_type_>
+    template <utilities::a_fold fold_type_, typename device_fold_type_>
     expected<compaction_outcome_t> compact(
         io_channel_t& reading_channel, io_channel_t& writing_channel, std::span<merge_buffers_t> buffers,
         compaction_placement_t placement, compactor_ref_t const& compactor, cancellation_t const* cancellation,
@@ -772,7 +772,7 @@ class lsm_tree {
      *  manifest it found never promised, and those land nowhere else, so dropping them all leaves
      *  only commits that landed whole.
      */
-    template <utilities::fold_concept fold_type_>
+    template <utilities::a_fold fold_type_>
     status_t truncate_above(io_channel_t& reading_channel, io_channel_t& writing_channel,
                             std::span<merge_buffers_t> buffers, std::uint64_t ceiling, fold_type_ const& fold,
                             lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {}) noexcept {

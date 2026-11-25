@@ -195,7 +195,7 @@ status_t write_deltas(ingest_state<cpu_class_>& ingest, sorted_keyed_ingest_t& p
 
 /** Holds the rows of an unsorted append of blobs, documents or pages until the finish, their
  *  values parsed over the slices of @p view and copied. */
-template <strings_kit_concept strings_kit_type_>
+template <a_strings_kit strings_kit_type_>
 status_t hold_deltas(held_keyed_ingest_t& path, keyed_rows_t const& rows, view_t const& view) noexcept {
     auto [values, values_status] = parse_ingest_values<strings_kit_type_>(path.lands_as, rows, path.placement, view);
     if (values_status.failed()) return values_status;
@@ -215,7 +215,7 @@ status_t hold_deltas(held_keyed_ingest_t& path, keyed_rows_t const& rows, view_t
 
 /** Orders the held rows of @p path by key through @p strings_kit_type_, keeping the last of every
  *  key, as deltas carved in @p scratch. */
-template <strings_kit_concept strings_kit_type_>
+template <a_strings_kit strings_kit_type_>
 expected<std::span<keyed_delta_t>> order_held_deltas(held_keyed_ingest_t& path, ustore_arena_t scratch) noexcept {
     auto [permutation, permutation_status] = arena_allocate<sz_size_t>(scratch, path.keys.size());
     if (permutation_status.failed()) return permutation_status;

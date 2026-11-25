@@ -913,10 +913,10 @@ struct disk_capabilities_t {
  *  queue it submits on, which costs nothing while the queue already holds them.
  */
 template <typename disk_type_>
-concept disk_concept = requires(disk_type_& disk, disk_type_ const& constant, queue_ref_t const& queue_pair,
-                                registered_memory_t& registered_memory, registered_medium_t& registered_medium,
-                                medium_options_t medium, std::span<request_t const> requests,
-                                std::span<completion_t> completions, std::span<byte_t> memory) {
+concept a_disk = requires(disk_type_& disk, disk_type_ const& constant, queue_ref_t const& queue_pair,
+                          registered_memory_t& registered_memory, registered_medium_t& registered_medium,
+                          medium_options_t medium, std::span<request_t const> requests,
+                          std::span<completion_t> completions, std::span<byte_t> memory) {
     { disk.register_media(queue_pair) } -> std::same_as<status_t>;
     { disk.register_memory(memory, memory_space_t::host_k) } -> std::same_as<expected<registered_memory_t>>;
     { disk.unregister_memory(registered_memory) } -> std::same_as<status_t>;
@@ -932,20 +932,21 @@ concept disk_concept = requires(disk_type_& disk, disk_type_ const& constant, qu
 
 /** Whether a disk parks the caller in the kernel until a completion lands. */
 template <typename disk_type_>
-concept sleeping_disk_concept = requires(disk_type_& disk, queue_ref_t const& queue_pair,
-                                         std::span<completion_t> into) { disk.wait_completions(queue_pair, into); };
+concept a_sleeping_disk = requires(disk_type_& disk, queue_ref_t const& queue_pair, std::span<completion_t> into) {
+    disk.wait_completions(queue_pair, into);
+};
 
 /** Whether a disk may need the memory it transfers from pages its DMA engine reaches. */
 template <typename disk_type_>
-concept dma_memory_disk_concept = requires(disk_type_& disk) { disk.needs_dma_memory(); };
+concept a_dma_memory_disk = requires(disk_type_& disk) { disk.needs_dma_memory(); };
 
 /** Whether a disk names the memory domain its transfers prefer. */
 template <typename disk_type_>
-concept memory_domain_disk_concept = requires(disk_type_& disk) { disk.memory_domain(); };
+concept a_memory_domain_disk = requires(disk_type_& disk) { disk.memory_domain(); };
 
 /** Whether a disk holds a share of the process's transport to give back on unmount. */
 template <typename disk_type_>
-concept releasing_disk_concept = requires(disk_type_& disk) { disk.release(); };
+concept a_releasing_disk = requires(disk_type_& disk) { disk.release(); };
 
 /** Spins over a ring that never blocks, so a bounded wait needs no fiber and no interrupt. */
 inline constexpr std::size_t poll_spin_limit_k = std::size_t {1} << 30;
@@ -961,7 +962,7 @@ inline constexpr std::size_t poll_spin_limit_k = std::size_t {1} << 30;
  *  @tparam waiter_type_ What the polling core does after a poll that moved nothing.
  */
 template <typename waiter_type_, typename disk_type_>
-    requires disk_concept<disk_type_>
+    requires a_disk<disk_type_>
 expected<std::size_t> poll_completions_at_least(disk_type_& disk, queue_ref_t const& queue_pair,
                                                 std::span<completion_t> into, std::size_t wanted,
                                                 std::size_t spins_limit = poll_spin_limit_k) noexcept {
@@ -987,10 +988,10 @@ expected<std::size_t> poll_completions_at_least(disk_type_& disk, queue_ref_t co
  *  @tparam waiter_type_ What the polling core does after a poll that moved nothing.
  */
 template <typename waiter_type_, typename disk_type_>
-    requires disk_concept<disk_type_>
+    requires a_disk<disk_type_>
 expected<std::size_t> wait_completions(disk_type_& disk, queue_ref_t const& queue_pair,
                                        std::span<completion_t> into) noexcept {
-    if constexpr (sleeping_disk_concept<disk_type_>) return disk.wait_completions(queue_pair, into);
+    if constexpr (a_sleeping_disk<disk_type_>) return disk.wait_completions(queue_pair, into);
     else
         for (std::size_t spins = 0;; ++spins) {
             auto [moved, poll_completions_status] = disk.poll_completions(queue_pair, into);

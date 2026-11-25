@@ -16,7 +16,7 @@
 
 #include "ustore/blobs/ram_store.hpp"       // `ordered_store`, `copy_blob`, `isolation_t`
 #include "ustore/strings/string_keys.hpp"   // `string_key_t`, `string_key_order_t`, `string_key_hash`
-#include "ustore/utilities/ram_buffers.hpp" // `strings_kit_concept`
+#include "ustore/utilities/ram_buffers.hpp" // `a_strings_kit`
 #include "ustore/utilities/types.hpp"       // `value_view_t`
 
 namespace unum::ustore::strings {
@@ -27,7 +27,7 @@ using string_pair_t = st::mapping<string_key_t, ustore_key_t>;
 /** A strings collection, and the names system collection, which maps names onto collection IDs,
  *  partitioned by the hash of @p strings_kit_type_. */
 template <blobs::isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_,
-          utilities::strings_kit_concept strings_kit_type_>
+          utilities::a_strings_kit strings_kit_type_>
 using keys_by_string_store = blobs::ordered_store<string_pair_t, string_key_order_t, string_key_hash<strings_kit_type_>,
                                                   isolation_, atomic_reference_, waiter_type_>;
 
