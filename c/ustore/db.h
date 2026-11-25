@@ -318,6 +318,11 @@ typedef struct ustore_database_init_ram_t {
      *  zero takes 16 GiB. */
     ustore_size_t memory_limit;
 
+    /** Conflicts with concurrent commits a commit of the database's own absorbs before it answers
+     *  @c ustore_status_write_conflict_k; zero derives 12 per logical core, enough that a commit
+     *  racing a committer on every core loses all of its rounds with odds of one in 65536. */
+    ustore_size_t commit_conflicts_limit;
+
 } ustore_database_init_ram_t;
 
 /**
@@ -365,6 +370,11 @@ typedef struct ustore_database_open_ram_t {
      *  only a clear gives them back, as removals and overwrites leave older versions to the store;
      *  zero takes 16 GiB. */
     ustore_size_t memory_limit;
+
+    /** Conflicts with concurrent commits a commit of the database's own absorbs before it answers
+     *  @c ustore_status_write_conflict_k; zero derives 12 per logical core, enough that a commit
+     *  racing a committer on every core loses all of its rounds with odds of one in 65536. */
+    ustore_size_t commit_conflicts_limit;
 
 } ustore_database_open_ram_t;
 
@@ -600,6 +610,11 @@ typedef struct ustore_database_open_nvme_t {
      *  refusing it; zero sets none. The description reports the class picked. */
     ustore_cpu_class_t cpu_class_ceiling;
 
+    /** Conflicts with concurrent commits a commit of the database's own absorbs before it answers
+     *  @c ustore_status_write_conflict_k; zero derives 12 per logical core, enough that a commit
+     *  racing a committer on every core loses all of its rounds with odds of one in 65536. */
+    ustore_size_t commit_conflicts_limit;
+
 } ustore_database_open_nvme_t;
 
 /**
@@ -731,6 +746,11 @@ typedef struct ustore_database_description_t {
     /** Requests the NVMe engine sent unpinned while its arena was pinned, as each crossed a
      *  gibibyte of it. */
     ustore_size_t requests_across_registered_slots;
+
+    /** Conflicts a commit of the database's own absorbs before it answers
+     *  @c ustore_status_write_conflict_k, as its open named or derived them, on the RAM and NVMe
+     *  engines, and zero elsewhere. */
+    ustore_size_t commit_conflicts_limit;
 
 } ustore_database_description_t;
 

@@ -472,6 +472,7 @@ pub(crate) mod ffi {
         pub isolation: ustore_enum_t,
         pub cpu_class_ceiling: ustore_enum_t,
         pub memory_limit: ustore_size_t,
+        pub commit_conflicts_limit: ustore_size_t,
     }
 
     #[repr(C)]
@@ -484,6 +485,7 @@ pub(crate) mod ffi {
         pub isolation: ustore_enum_t,
         pub cpu_class_ceiling: ustore_enum_t,
         pub memory_limit: ustore_size_t,
+        pub commit_conflicts_limit: ustore_size_t,
     }
 
     #[repr(C)]
@@ -534,6 +536,7 @@ pub(crate) mod ffi {
         pub collection_value_size: ustore_size_t,
         pub collection_value_max_size: ustore_size_t,
         pub cpu_class_ceiling: ustore_enum_t,
+        pub commit_conflicts_limit: ustore_size_t,
     }
 
     #[repr(C)]
@@ -563,6 +566,7 @@ pub(crate) mod ffi {
         pub disk_bytes: ustore_size_t,
         pub unpinned_staging_bytes: ustore_size_t,
         pub requests_across_registered_slots: ustore_size_t,
+        pub commit_conflicts_limit: ustore_size_t,
     }
 
     #[repr(C)]
@@ -2383,6 +2387,9 @@ pub struct RAMOptions<'options> {
     /// Bytes of keys and values the database may hold, past which a write fails with
     /// [`Status::CapacityExhausted`]; zero takes the engine's default.
     pub memory_limit: u64,
+    /// Conflicts with concurrent commits a commit of the database's own absorbs before it fails
+    /// with [`Status::WriteConflict`]; zero derives 12 per logical core.
+    pub commit_conflicts_limit: u64,
 }
 
 /// What [`Database::open_rocksdb`] and [`Database::view_rocksdb`] open.
@@ -2466,6 +2473,9 @@ pub struct NVMEOptions<'path> {
     /// the pick rather than failing and `None` sets no ceiling. [`Database::describe`] reports the
     /// class picked, and [`Status::Unsupported`] means no compiled class fits under it.
     pub cpu_class_ceiling: Option<CPUClass>,
+    /// Conflicts with concurrent commits a commit of the database's own absorbs before it fails
+    /// with [`Status::WriteConflict`]; zero derives 12 per logical core.
+    pub commit_conflicts_limit: u64,
 }
 
 impl<'path> NVMEOptions<'path> {
@@ -2589,6 +2599,9 @@ pub struct Description {
     /// Requests the NVMe engine sent unpinned while its arena was pinned, as each crossed a
     /// gibibyte of it.
     pub requests_across_registered_slots: u64,
+    /// Conflicts a commit of the database's own absorbs before it fails, as its open named or
+    /// derived them, on the RAM and NVMe engines, and zero elsewhere.
+    pub commit_conflicts_limit: u64,
 }
 
 impl Description {
@@ -2633,6 +2646,7 @@ impl Database {
             isolation: options.isolation as ffi::ustore_enum_t,
             cpu_class_ceiling: CPUClass::to_raw(options.cpu_class_ceiling),
             memory_limit: options.memory_limit,
+            commit_conflicts_limit: options.commit_conflicts_limit,
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_database_init_ram(&mut arguments) };
@@ -2656,6 +2670,7 @@ impl Database {
             isolation: options.isolation as ffi::ustore_enum_t,
             cpu_class_ceiling: CPUClass::to_raw(options.cpu_class_ceiling),
             memory_limit: options.memory_limit,
+            commit_conflicts_limit: options.commit_conflicts_limit,
         };
         // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
         unsafe { ffi::ustore_database_open_ram(&mut arguments) };
@@ -2758,6 +2773,7 @@ impl Database {
             collection_value_size: options.collection_value_size,
             collection_value_max_size: options.collection_value_max_size,
             cpu_class_ceiling: CPUClass::to_raw(options.cpu_class_ceiling),
+            commit_conflicts_limit: options.commit_conflicts_limit,
         };
         // SAFETY: every pointer in `arguments` outlives the call, the paths included.
         unsafe { ffi::ustore_database_open_nvme(&mut arguments) };
@@ -2835,6 +2851,7 @@ impl Database {
             disk_bytes: description.disk_bytes,
             unpinned_staging_bytes: description.unpinned_staging_bytes,
             requests_across_registered_slots: description.requests_across_registered_slots,
+            commit_conflicts_limit: description.commit_conflicts_limit,
         })
     }
 

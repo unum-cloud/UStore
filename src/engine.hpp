@@ -773,6 +773,20 @@ bool take_unless_zero(value_type_& value, ustore_size_t requested) noexcept {
     return true;
 }
 
+/** Odds, as a power of two, that a commit racing every other committer still loses all the
+ *  rounds its budget allows. */
+inline constexpr std::size_t commit_conflict_odds_log2_k = 16;
+
+/** Conflicts a commit absorbs before answering @c write_conflict_k. Racing @p committers, it
+ *  loses a round with odds of about 1 − 1 / committers, so it loses k rounds with odds of about
+ *  e^(−k / committers), which fall under 2^−16 once k reaches ⌈16 × ln 2⌉ = 12 per committer,
+ *  counting at least one committer. */
+[[nodiscard]] constexpr std::size_t commit_conflicts_budget(std::size_t committers) noexcept {
+    // ln 2 rounds up to 0.6932, so the product rounds up too
+    constexpr std::size_t per_committer = (commit_conflict_odds_log2_k * 6932 + 9999) / 10000;
+    return per_committer * (committers ? committers : 1);
+}
+
 /** Serves @p serve_ of an oracle, whose library may throw, turning whatever it throws into a
  *  status; each argument binds as the verb takes it, so a plan the verb fills stays writable. */
 template <auto serve_, typename... arguments_types_>

@@ -597,10 +597,12 @@ struct DatabaseNvmeOptions(Defaultable, ImplicitlyCopyable):
     """Bytes of the largest value of a collection whose values vary in size."""
     var cpu_class_ceiling: CPUClass
     """The newest class the database may confine its waits, atomics and string kernels to, narrowed to what the CPU runs, so a class it lacks is never refused; `UNKNOWN` sets none."""
+    var commit_conflicts_limit: c_size_t
+    """Conflicts a commit of the database's own absorbs before it answers `WRITE_CONFLICT`; zero derives 12 per logical core."""
 
     def __init__(out self):
         """Every engine default."""
-        self = Self(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, CPUClass.UNKNOWN)
+        self = Self(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, CPUClass.UNKNOWN, 0)
 
 
 @fieldwise_init
@@ -614,6 +616,7 @@ struct DatabaseInitRamArguments(ImplicitlyCopyable):
     var isolation: Isolation
     var cpu_class_ceiling: CPUClass
     var memory_limit: c_size_t
+    var commit_conflicts_limit: c_size_t
 
 
 @fieldwise_init
@@ -628,6 +631,7 @@ struct DatabaseOpenRamArguments(ImplicitlyCopyable):
     var isolation: Isolation
     var cpu_class_ceiling: CPUClass
     var memory_limit: c_size_t
+    var commit_conflicts_limit: c_size_t
 
 
 @fieldwise_init
@@ -681,6 +685,7 @@ struct DatabaseOpenNvmeArguments(ImplicitlyCopyable):
     var collection_value_size: c_size_t
     var collection_value_max_size: c_size_t
     var cpu_class_ceiling: CPUClass
+    var commit_conflicts_limit: c_size_t
 
 
 @fieldwise_init
@@ -739,10 +744,12 @@ struct DatabaseDescription(Defaultable, Deferrable, ImplicitlyCopyable):
     """Bytes of the NVMe engine's io_uring arena the locked-memory cap refused to pin, so each request pins its own."""
     var requests_across_registered_slots: c_size_t
     """Requests the NVMe engine sent unpinned while its arena was pinned, as each crossed a gibibyte of it."""
+    var commit_conflicts_limit: c_size_t
+    """Conflicts a commit of the database's own absorbs before it fails, as its open named or derived them; zero off RAM and NVMe."""
 
     def __init__(out self):
         """Zeroes every field, which is what a failed report leaves."""
-        self = Self(Capabilities(0), Engine.RAM, Isolation.STRICT_SERIALIZABLE, CPUClass.UNKNOWN, 0, 0, 0, 0, 0)
+        self = Self(Capabilities(0), Engine.RAM, Isolation.STRICT_SERIALIZABLE, CPUClass.UNKNOWN, 0, 0, 0, 0, 0, 0)
 
     def __init__(out self, arena: Address, generation: Int, written: DatabaseDescription, count: Int):
         """Adopts the description a call wrote."""
@@ -1695,6 +1702,7 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         executor: Executor,
         isolation: Isolation = Isolation.STRICT_SERIALIZABLE,
         cpu_class_ceiling: CPUClass = CPUClass.UNKNOWN,
+        commit_conflicts_limit: Int = 0,
     ) raises Error -> Self:
         """Starts an empty database of the in-memory engine, which persists nowhere. Calls `ustore_database_init_ram`.
 
@@ -1702,6 +1710,7 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
             executor: The executor the open runs on; it also supplies its engine.
             isolation: How transactions see each other.
             cpu_class_ceiling: The newest class the database may confine its kernels to, narrowed to what the CPU runs, so a class it lacks is never refused; `UNKNOWN` sets none.
+            commit_conflicts_limit: Conflicts a commit of the database's own absorbs before it answers `WRITE_CONFLICT`; zero derives 12 per logical core.
 
         Raises:
             `Error` with `INVALID_ARGUMENT` if no class takes the ceiling, or `UNSUPPORTED` if the build compiled
@@ -1713,7 +1722,14 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         outcome[] = Outcome()
         _cross(
             DatabaseInitRamArguments(
-                created, executor.address, outcome, Completion.BLOCKING, isolation, cpu_class_ceiling, c_size_t(0)
+                created,
+                executor.address,
+                outcome,
+                Completion.BLOCKING,
+                isolation,
+                cpu_class_ceiling,
+                c_size_t(0),
+                c_size_t(commit_conflicts_limit),
             ),
             executor.library.symbols().database_init_ram,
         )
@@ -1729,9 +1745,11 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         directory: StringSlice[directory_origin],
         isolation: Isolation = Isolation.STRICT_SERIALIZABLE,
         cpu_class_ceiling: CPUClass = CPUClass.UNKNOWN,
+        commit_conflicts_limit: Int = 0,
     ) raises Error -> Self:
         """Serves a directory through the in-memory engine, loading its image and rewriting it on flushed
-        commits and on `flush`, never on close. Calls `ustore_database_open_ram`.
+        commits and on `flush`, never on close, its own commits absorbing `commit_conflicts_limit` conflicts, or
+        12 per logical core for zero. Calls `ustore_database_open_ram`.
 
         Raises:
             `Error` with `NOT_FOUND` if the directory does not exist, or `MALFORMED` for a corrupt image.
@@ -1750,6 +1768,7 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
                 isolation,
                 cpu_class_ceiling,
                 c_size_t(0),
+                c_size_t(commit_conflicts_limit),
             ),
             executor.library.symbols().database_open_ram,
         )
@@ -1918,6 +1937,7 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
                 options.collection_value_size,
                 options.collection_value_max_size,
                 options.cpu_class_ceiling,
+                options.commit_conflicts_limit,
             ),
             executor.library.symbols().database_open_nvme,
         )

@@ -79,13 +79,16 @@ extern template struct ram_variant<cpu_class_t::monoversioned_k, isolation_t::sn
 extern template struct ram_variant<cpu_class_t::monoversioned_k, isolation_t::strict_serializable_k>;
 #endif // USTORE_TARGET_MONOVERSIONED
 
-/** Opens a database of @p cpu_class_ at @p isolation into @p database, of @p memory_limit bytes. */
+/** Opens a database of @p cpu_class_ at @p isolation into @p database, of @p memory_limit bytes,
+ *  its own commits absorbing @p commit_conflicts_limit conflicts. */
 template <cpu_class_t cpu_class_>
 status_t open_as(ustore_database_t* database, ustore_isolation_t isolation, std::string_view directory,
-                 std::size_t memory_limit) noexcept {
+                 std::size_t memory_limit, std::size_t commit_conflicts_limit) noexcept {
     if (isolation == ustore_isolation_snapshot_k)
-        return ram_variant<cpu_class_, isolation_t::snapshot_k>::open(database, directory, memory_limit);
-    return ram_variant<cpu_class_, isolation_t::strict_serializable_k>::open(database, directory, memory_limit);
+        return ram_variant<cpu_class_, isolation_t::snapshot_k>::open(database, directory, memory_limit,
+                                                                      commit_conflicts_limit);
+    return ram_variant<cpu_class_, isolation_t::strict_serializable_k>::open(database, directory, memory_limit,
+                                                                             commit_conflicts_limit);
 }
 
 /** Opens the database @p arguments describe into their output, which stays null unless the open succeeds, with the
@@ -96,8 +99,16 @@ status_t open_in(arguments_type_ const& arguments, cpu_ceiling_t ceiling, std::s
     if (arguments.isolation != ustore_isolation_strict_serializable_k &&
         arguments.isolation != ustore_isolation_snapshot_k)
         return {status_code_t::invalid_argument_k, "Unknown isolation"};
+    // Every logical core may commit, and a machine whose topology answers nothing counts one; a
+    // named limit harvests no topology
+    std::size_t conflicts = static_cast<std::size_t>(arguments.commit_conflicts_limit);
+    if (!conflicts) {
+        auto [topology, topology_status] = util::topology_t::make();
+        conflicts = commit_conflicts_budget(topology.logical_cores_count());
+    }
     return open_fitting_rung(cpu_ladder_t {}, ceiling, [&]<cpu_class_t cpu_class_>() noexcept {
-        return open_as<cpu_class_>(arguments.database, arguments.isolation, directory, arguments.memory_limit);
+        return open_as<cpu_class_>(arguments.database, arguments.isolation, directory, arguments.memory_limit,
+                                   conflicts);
     });
 }
 

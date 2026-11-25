@@ -251,9 +251,10 @@ struct ram_variant {
     struct compact_plan_t;
 
     /** Opens a database of this class and isolation into @p database, persisting in @p directory
-     *  unless it is empty, holding at most @p memory_limit bytes of keys and values. */
-    static util::status_t open(ustore_database_t* database, std::string_view directory,
-                               std::size_t memory_limit) noexcept;
+     *  unless it is empty, holding at most @p memory_limit bytes of keys and values, its own
+     *  commits absorbing @p commit_conflicts_limit conflicts. */
+    static util::status_t open(ustore_database_t* database, std::string_view directory, std::size_t memory_limit,
+                               std::size_t commit_conflicts_limit) noexcept;
 };
 
 template <cpu_class_t cpu_class_, isolation_t isolation_>
@@ -300,6 +301,9 @@ struct database_state {
     /** Bytes of keys and values landed since the open or the last clear, through the class's atomic
      *  reference. */
     std::size_t landed_bytes = 0;
+
+    /** Conflicts a commit of the database's own absorbs, as its open named or derived them. */
+    std::size_t commit_conflicts_limit = commit_conflicts_budget(1);
 
     database_state() noexcept = default;
     database_state(database_state const&) = delete;
@@ -1146,8 +1150,8 @@ store_status_t stage_string_range_removals(transaction_type_& transaction, strin
 }
 
 /**
- *  @brief Commits what @p stage_changes stages through a transaction of its own, retrying conflicts
- *      up to @c commit_attempts_k times.
+ *  @brief Commits what @p stage_changes stages through a transaction of its own, absorbing the
+ *      database's @c commit_conflicts_limit conflicts.
  *  @param[out] commit_stamp Optional output for the stamp the commit published under.
  *
  *  @p stage_changes takes a @c transaction_source and may refuse the call through its outcome, answering a failure
@@ -1160,7 +1164,7 @@ store_status_t commit_group(database_state<cpu_class_, isolation_>& state, stage
     if (!opened) return opened.status();
     transaction_source<cpu_class_, isolation_> source {state, *opened, ustore_watch_none_k};
     store_status_t const committed = st::commit_with_retries(
-        *opened, commit_attempts_k,
+        *opened, state.commit_conflicts_limit + 1,
         [&](collections_transaction_of<cpu_class_, isolation_>&) noexcept -> store_status_t {
             return stage_changes(source);
         });
@@ -2100,6 +2104,7 @@ util::status_t serve(database_state<cpu_class_, isolation_>& state, ustore_datab
             .cpu_class = static_cast<ustore_cpu_class_t>(cpu_class_),
             .keys = keys,
             .disk_bytes = image_bytes(state),
+            .commit_conflicts_limit = static_cast<ustore_size_t>(state.commit_conflicts_limit),
         });
 }
 
@@ -2830,12 +2835,14 @@ void database_free(ustore_database_t database) noexcept {
 
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 util::status_t ram_variant<cpu_class_, isolation_>::open(ustore_database_t* database, std::string_view directory,
-                                                         std::size_t memory_limit) noexcept {
+                                                         std::size_t memory_limit,
+                                                         std::size_t commit_conflicts_limit) noexcept {
     auto [made, status] = make_handle<ustore_database_handle_t, database_state<cpu_class_, isolation_>>(
         ram_variant<cpu_class_, isolation_>::engine_k);
     if (status.failed()) return status;
     if (util::status_t const opened = open_database(*made.state, directory); opened.failed()) return opened;
     if (memory_limit) made.state->memory_limit = memory_limit;
+    made.state->commit_conflicts_limit = commit_conflicts_limit;
     // The image holds the keys and values loaded, so it stands for what they take
     made.state->landed_bytes = image_bytes(*made.state);
     if (made.state->landed_bytes > made.state->memory_limit)

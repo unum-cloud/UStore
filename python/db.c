@@ -37,6 +37,7 @@ static nvme_size_keyword_t const nvme_size_keywords[] = {
     {"collection_level_enlarge_factor", offsetof(ustore_database_open_nvme_t, collection_level_enlarge_factor)},
     {"collection_value_size", offsetof(ustore_database_open_nvme_t, collection_value_size)},
     {"collection_value_max_size", offsetof(ustore_database_open_nvme_t, collection_value_max_size)},
+    {"commit_conflicts_limit", offsetof(ustore_database_open_nvme_t, commit_conflicts_limit)},
     {NULL, 0},
 };
 
@@ -225,29 +226,32 @@ static PyObject* Database_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNU
     return NULL;
 }
 
-static char const doc_Database_open_ram[] =                                                  //
-    "open_ram(directory=None, *, isolation=Isolation.STRICT_SERIALIZABLE, executor=None,\n"  //
-    "cpu_class_ceiling=CPUClass.UNKNOWN, memory_limit=0) answers a database in memory.\n"    //
-    "\n"                                                                                     //
-    "Calls `ustore_database_open_ram` with a directory and `ustore_database_init_ram`\n"     //
-    "without one.\n"                                                                         //
-    "\n"                                                                                     //
-    "Args:\n"                                                                                //
-    "  directory (str | bytes | PathLike, optional): Where the database persists as one\n"   //
-    "    image, rewritten whole on a flush; None keeps it in memory alone.\n"                //
-    "  isolation (Isolation): How transactions see each other.\n"                            //
-    "  executor (Executor, optional): The executor the open blocks on, or None to open on\n" //
-    "    the calling thread.\n"                                                              //
-    "  cpu_class_ceiling (CPUClass): The newest CPU class the database may confine its\n"    //
-    "    waits, atomics and string kernels to, narrowed to what the CPU runs, so a class\n"  //
-    "    the CPU lacks is never refused; UNKNOWN sets none.\n"                               //
-    "  memory_limit (int, optional): Bytes of keys and values the database may hold, past\n" //
-    "    which a write raises CapacityExhaustedError; zero takes 16 GiB.\n"                  //
-    "Returns:\n"                                                                             //
-    "  Database: The opened database, whose describe() reports the class picked.\n"          //
-    "Raises:\n"                                                                              //
-    "  ValueError: No CPU class takes the `cpu_class_ceiling`.\n"                            //
-    "  UnsupportedError: No class this build compiled fits under the `cpu_class_ceiling`\n"  //
+static char const doc_Database_open_ram[] =                                                   //
+    "open_ram(directory=None, *, isolation=Isolation.STRICT_SERIALIZABLE, executor=None,\n"   //
+    "cpu_class_ceiling=CPUClass.UNKNOWN, memory_limit=0, commit_conflicts_limit=0) answers\n" //
+    "a database in memory.\n"                                                                 //
+    "\n"                                                                                      //
+    "Calls `ustore_database_open_ram` with a directory and `ustore_database_init_ram`\n"      //
+    "without one.\n"                                                                          //
+    "\n"                                                                                      //
+    "Args:\n"                                                                                 //
+    "  directory (str | bytes | PathLike, optional): Where the database persists as one\n"    //
+    "    image, rewritten whole on a flush; None keeps it in memory alone.\n"                 //
+    "  isolation (Isolation): How transactions see each other.\n"                             //
+    "  executor (Executor, optional): The executor the open blocks on, or None to open on\n"  //
+    "    the calling thread.\n"                                                               //
+    "  cpu_class_ceiling (CPUClass): The newest CPU class the database may confine its\n"     //
+    "    waits, atomics and string kernels to, narrowed to what the CPU runs, so a class\n"   //
+    "    the CPU lacks is never refused; UNKNOWN sets none.\n"                                //
+    "  memory_limit (int, optional): Bytes of keys and values the database may hold, past\n"  //
+    "    which a write raises CapacityExhaustedError; zero takes 16 GiB.\n"                   //
+    "  commit_conflicts_limit (int, optional): Conflicts a commit of the database's own\n"    //
+    "    absorbs before it raises WriteConflictError; zero derives 12 per logical core.\n"    //
+    "Returns:\n"                                                                              //
+    "  Database: The opened database, whose describe() reports the class picked.\n"           //
+    "Raises:\n"                                                                               //
+    "  ValueError: No CPU class takes the `cpu_class_ceiling`.\n"                             //
+    "  UnsupportedError: No class this build compiled fits under the `cpu_class_ceiling`\n"   //
     "    on this CPU.";
 
 static PyObject* Database_open_ram(PyObject* Py_UNUSED(type), PyObject* const* arguments,
@@ -255,6 +259,7 @@ static PyObject* Database_open_ram(PyObject* Py_UNUSED(type), PyObject* const* a
     opening_t opening = {0};
     int isolation = ustore_isolation_strict_serializable_k;
     int cpu_class_ceiling = ustore_cpu_class_unknown_k;
+    size_t commit_conflicts_limit = 0;
     Py_ssize_t const keyword_names_count = opening_positional(&opening, "open_ram", arguments,
                                                               positional_arguments_count, keyword_names_tuple);
     if (keyword_names_count < 0) goto failed;
@@ -271,6 +276,8 @@ static PyObject* Database_open_ram(PyObject* Py_UNUSED(type), PyObject* const* a
                                               &cpu_class_ceiling);
         else if (PyUnicode_CompareWithASCIIString(name, "memory_limit") == 0)
             read = ustore_py_size_from_object(value, "memory_limit", &opening.memory_limit);
+        else if (PyUnicode_CompareWithASCIIString(name, "commit_conflicts_limit") == 0)
+            read = ustore_py_size_from_object(value, "commit_conflicts_limit", &commit_conflicts_limit);
         else PyErr_Format(PyExc_TypeError, "Got unexpected keyword argument: %S", name);
         if (read != 0) goto failed;
     }
@@ -284,6 +291,7 @@ static PyObject* Database_open_ram(PyObject* Py_UNUSED(type), PyObject* const* a
         .isolation = (ustore_isolation_t)isolation,
         .cpu_class_ceiling = (ustore_cpu_class_t)cpu_class_ceiling,
         .memory_limit = (ustore_size_t)opening.memory_limit,
+        .commit_conflicts_limit = (ustore_size_t)commit_conflicts_limit,
     };
     ustore_database_open_ram_t open_ram = {
         .database = &handle,
@@ -293,6 +301,7 @@ static PyObject* Database_open_ram(PyObject* Py_UNUSED(type), PyObject* const* a
         .isolation = (ustore_isolation_t)isolation,
         .cpu_class_ceiling = (ustore_cpu_class_t)cpu_class_ceiling,
         .memory_limit = (ustore_size_t)opening.memory_limit,
+        .commit_conflicts_limit = (ustore_size_t)commit_conflicts_limit,
     };
     Py_BEGIN_ALLOW_THREADS;
     if (opening.directory) ustore_database_open_ram(&open_ram);
@@ -976,7 +985,8 @@ static char const doc_Database_describe[] =                                     
     "\n"                                                                                   //
     "Returns:\n"                                                                           //
     "  Description: The `capabilities`, `engine`, `isolation`, `keys`, `memory_bytes`,\n"  //
-    "  `disk_bytes`, `unpinned_staging_bytes` and `requests_across_registered_slots` of the database.";
+    "  `disk_bytes`, `unpinned_staging_bytes`, `requests_across_registered_slots` and\n"   //
+    "  `commit_conflicts_limit` of the database.";
 
 static void describe_submit(void* arguments) { ustore_database_describe((ustore_database_describe_t*)arguments); }
 

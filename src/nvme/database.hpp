@@ -209,9 +209,6 @@ inline constexpr std::size_t engine_transaction_bytes_k = 4ull * 1024ull * 1024u
 /** Deltas one caller's transaction buffers at once. */
 inline constexpr std::size_t engine_transaction_deltas_k = 16ull * 1024ull;
 
-/** Times a call retries a commit of its own whose watched reads conflicted. */
-inline constexpr std::size_t commit_attempts_k = 64;
-
 /** Times a read measures and copies a value that keeps changing its size in between. */
 inline constexpr std::size_t read_attempts_k = 8;
 
@@ -489,6 +486,9 @@ struct database_state {
 
     /** The buffer every caller's transaction takes. */
     transaction_config_t transaction_shape;
+
+    /** Conflicts a commit of the database's own absorbs, as its open named or derived them. */
+    std::size_t commit_conflicts_limit = 0;
 
     /** Held by whoever changes both system collections, so a name is checked and taken in one step. */
     std::int32_t collections_claim = 0;
@@ -1131,7 +1131,9 @@ util::status_t settle(database_state<cpu_class_>& state, ustore_durability_t dur
 }
 
 /**
- *  @brief Commits what @p writes writes through a transaction of its own, retrying conflicts of its watched reads.
+ *  @brief Commits what @p writes writes through a transaction of its own, retrying conflicts of
+ *      its watched reads until they exceed the database's @c commit_conflicts_limit, and growing
+ *      the transaction's buffer, which spends none of that budget.
  *  @param[in] count The writes @p writes makes at most, sizing the transaction's buffer.
  *  @param[in] bytes The bytes those writes take, a hint the buffer doubles past when @p writes outgrows it.
  *  @param[in] schedule Whether @p writes watches what it reads, which a read-modify-write needs.
@@ -1145,7 +1147,8 @@ util::status_t commit_one_collection(database_state<cpu_class_>& state, ustore_a
     transaction_config_t shape;
     shape.max_deltas = fu::max_of<std::size_t>(count, 1);
     shape.max_bytes = fu::max_of<std::size_t>(bytes, 1);
-    for (std::size_t attempt = 0; attempt != commit_attempts_k; ++attempt) {
+    // Growth ends, as each round at least doubles the buffer up to the format's ceiling
+    for (std::size_t conflicts = 0; conflicts <= state.commit_conflicts_limit;) {
         // Declared first, so the transaction it joins dies before it does.
         strings_transaction_of<cpu_class_> strings {*state.store};
         auto [held, begin_status] = begin_transaction(state, shape);
@@ -1167,8 +1170,9 @@ util::status_t commit_one_collection(database_state<cpu_class_>& state, ustore_a
         }
         if (written.failed()) return written;
         util::status_t const committed = strings.commit(*held, queues);
-        if (committed == util::status_code_t::write_conflict_k && schedule != watch_schedule_t::never_k) continue;
-        return committed;
+        if (committed != util::status_code_t::write_conflict_k || schedule == watch_schedule_t::never_k)
+            return committed;
+        ++conflicts;
     }
     return {util::status_code_t::write_conflict_k, "Concurrent commits kept conflicting with the call"};
 }
@@ -1849,6 +1853,7 @@ util::status_t database_describe(ustore_database_describe_t const& arguments, vi
             .unpinned_staging_bytes = static_cast<ustore_size_t>(queues ? queues->unpinned_staging_bytes() : 0),
             .requests_across_registered_slots = static_cast<ustore_size_t>(
                 queues ? queues->requests_across_registered_slots() : 0),
+            .commit_conflicts_limit = static_cast<ustore_size_t>(state.commit_conflicts_limit),
         });
 }
 
@@ -2543,6 +2548,13 @@ util::status_t nvme_variant<cpu_class_>::open(ustore_database_open_nvme_t const&
                                               util::io_transport_t::linux_spdk_k
                                           ? executor_admission_t::nvme_executor_k
                                           : executor_admission_t::no_ram_executor_k;
+    // Every logical core may commit, and a machine whose topology answers nothing counts one; a
+    // named limit harvests no topology
+    made.state->commit_conflicts_limit = static_cast<std::size_t>(arguments.commit_conflicts_limit);
+    if (!made.state->commit_conflicts_limit) {
+        auto [topology, topology_status] = util::topology_t::make();
+        made.state->commit_conflicts_limit = commit_conflicts_budget(topology.logical_cores_count());
+    }
     *arguments.database = made.release();
     return {};
 }

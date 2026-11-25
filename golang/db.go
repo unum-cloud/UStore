@@ -774,6 +774,9 @@ type DatabaseInitRamConfig struct {
 	// MemoryLimit caps the bytes of keys and values the database holds, past which a write answers
 	// [StatusCapacityExhausted]; zero takes 16 GiB.
 	MemoryLimit uint64
+	// CommitConflictsLimit is the conflicts a commit of the database's own absorbs before it answers
+	// [StatusWriteConflict]; zero derives 12 per logical core.
+	CommitConflictsLimit uint64
 }
 
 // DatabaseInitRam starts an empty database in memory alone.
@@ -786,12 +789,13 @@ func DatabaseInitRam(config *DatabaseInitRamConfig) (*Database, error) {
 	var call callWithResult[C.ustore_database_t]
 	arguments := open[C.ustore_database_init_ram_t](&call)
 	*arguments = C.ustore_database_init_ram_t{
-		database:          call.result,
-		executor:          executor,
-		outcome:           call.outcome(),
-		isolation:         C.ustore_isolation_t(options.Isolation),
-		cpu_class_ceiling: C.ustore_cpu_class_t(options.CPUClassCeiling),
-		memory_limit:      C.ustore_size_t(options.MemoryLimit),
+		database:               call.result,
+		executor:               executor,
+		outcome:                call.outcome(),
+		isolation:              C.ustore_isolation_t(options.Isolation),
+		cpu_class_ceiling:      C.ustore_cpu_class_t(options.CPUClassCeiling),
+		memory_limit:           C.ustore_size_t(options.MemoryLimit),
+		commit_conflicts_limit: C.ustore_size_t(options.CommitConflictsLimit),
 	}
 	C.ustore_database_init_ram(arguments)
 	return databaseOf(block(&call, nil))
@@ -807,13 +811,14 @@ func DatabaseOpenRam(directory string, config *DatabaseInitRamConfig) (*Database
 	var call callWithResult[C.ustore_database_t]
 	arguments := open[C.ustore_database_open_ram_t](&call)
 	*arguments = C.ustore_database_open_ram_t{
-		database:          call.result,
-		executor:          executor,
-		outcome:           call.outcome(),
-		directory:         call.text(directory),
-		isolation:         C.ustore_isolation_t(options.Isolation),
-		cpu_class_ceiling: C.ustore_cpu_class_t(options.CPUClassCeiling),
-		memory_limit:      C.ustore_size_t(options.MemoryLimit),
+		database:               call.result,
+		executor:               executor,
+		outcome:                call.outcome(),
+		directory:              call.text(directory),
+		isolation:              C.ustore_isolation_t(options.Isolation),
+		cpu_class_ceiling:      C.ustore_cpu_class_t(options.CPUClassCeiling),
+		memory_limit:           C.ustore_size_t(options.MemoryLimit),
+		commit_conflicts_limit: C.ustore_size_t(options.CommitConflictsLimit),
 	}
 	C.ustore_database_open_ram(arguments)
 	return databaseOf(block(&call, nil))
@@ -968,6 +973,9 @@ type DatabaseOpenNvmeConfig struct {
 	CollectionValueMaxSize uint64
 	// CPUClassCeiling is the newest class the database's kernels may run as; zero sets no ceiling.
 	CPUClassCeiling CPUClass
+	// CommitConflictsLimit is the conflicts a commit of the database's own absorbs before it answers
+	// [StatusWriteConflict]; zero derives 12 per logical core.
+	CommitConflictsLimit uint64
 }
 
 // DatabaseOpenNvme serves a directory through the in-tree NVMe engine.
@@ -1003,6 +1011,7 @@ func DatabaseOpenNvme(directory string, config *DatabaseOpenNvmeConfig) (*Databa
 		collection_value_size:             C.ustore_size_t(options.CollectionValueSize),
 		collection_value_max_size:         C.ustore_size_t(options.CollectionValueMaxSize),
 		cpu_class_ceiling:                 C.ustore_cpu_class_t(options.CPUClassCeiling),
+		commit_conflicts_limit:            C.ustore_size_t(options.CommitConflictsLimit),
 	}
 	C.ustore_database_open_nvme(arguments)
 	return databaseOf(block(&call, nil))
@@ -1076,6 +1085,9 @@ type DatabaseDescription struct {
 	// RequestsAcrossRegisteredSlots counts the requests the NVMe engine sent unpinned while its
 	// arena was pinned, as each crossed a gibibyte of it.
 	RequestsAcrossRegisteredSlots uint64
+	// CommitConflictsLimit is the conflicts a commit of the database's own absorbs before it fails, as
+	// its open named or derived them, on the RAM and NVMe engines, and zero elsewhere.
+	CommitConflictsLimit uint64
 }
 
 // Describe reports the engine's capabilities, isolation, CPU class and the sizes it estimates.

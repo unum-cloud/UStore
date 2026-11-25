@@ -897,6 +897,11 @@ class Description:
     def requests_across_registered_slots(self) -> int:
         """Requests the NVMe engine sent unpinned while its arena was pinned, as each crossed a gibibyte of it."""
 
+    @property
+    def commit_conflicts_limit(self) -> int:
+        """Conflicts a commit of the database's own absorbs before it fails, as its open named or derived them; zero
+        off the RAM and NVMe engines."""
+
 @type_check_only
 class _Reads:
     """The read verbs every blocking receiver answers, and the views it derives."""
@@ -1674,10 +1679,13 @@ class Database(_Writes, _Receivers):
         executor: Executor | None = None,
         cpu_class_ceiling: CPUClass = CPUClass.UNKNOWN,
         memory_limit: int = 0,
+        commit_conflicts_limit: int = 0,
     ) -> Self:
         """An in-memory database, persisted as one image when it names a directory, opened blocking on `executor`,
         confined to the newest class the CPU runs at or under `cpu_class_ceiling` and holding at most `memory_limit`
-        bytes of keys and values, past which a write raises `CapacityExhaustedError`; zero takes 16 GiB."""
+        bytes of keys and values, past which a write raises `CapacityExhaustedError`; zero takes 16 GiB. A commit of
+        its own absorbs `commit_conflicts_limit` conflicts before it raises `WriteConflictError`, 12 per logical core
+        for zero."""
 
     @classmethod
     def open_rocksdb(
@@ -1737,6 +1745,7 @@ class Database(_Writes, _Receivers):
         collection_level_enlarge_factor: int = 0,
         collection_value_size: int = 0,
         collection_value_max_size: int = 0,
+        commit_conflicts_limit: int = 0,
     ) -> Self:
         """A database on the NVMe engine, named by its `manifest`, `<database>.ustore.json` in an existing directory or
         the raw address of its first slot, where every zero size keeps the engine's default, opened blocking on
@@ -2560,7 +2569,8 @@ class DeferredOn:
 
         Returns:
           Description: The `capabilities`, `engine`, `isolation`, `keys`, `memory_bytes`,
-          `disk_bytes`, `unpinned_staging_bytes` and `requests_across_registered_slots` of the database.
+          `disk_bytes`, `unpinned_staging_bytes`, `requests_across_registered_slots` and
+          `commit_conflicts_limit` of the database.
         """
 
     def write(

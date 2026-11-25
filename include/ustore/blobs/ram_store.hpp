@@ -110,9 +110,6 @@ using order_t = st::commit_order_t;
 /** A claim on the stamp a call, a snapshot or a transaction reads at, which keeps every store it may reach alive. */
 using claim_t = order_t::snapshot_claim_t;
 
-/** How many times an engine-internal commit is attempted before its conflicts reach the caller. */
-inline constexpr std::size_t commit_attempts_k = 16;
-
 /** The status of the C ABI a caller reads for @p status. */
 constexpr status_t translate(store_status_t status) noexcept {
     switch (status) {

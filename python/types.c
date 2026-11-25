@@ -3053,6 +3053,9 @@ static PyMemberDef Description_members[] = {
     {"requests_across_registered_slots", Py_T_ULONGLONG,
      offsetof(Description, description.requests_across_registered_slots), Py_READONLY,
      "Requests the NVMe engine sent unpinned while its arena was pinned, as each crossed a gibibyte of it."},
+    {"commit_conflicts_limit", Py_T_ULONGLONG, offsetof(Description, description.commit_conflicts_limit), Py_READONLY,
+     "Conflicts a commit of the database's own absorbs before it fails, as its open named or derived them; zero off " //
+     "the RAM and NVMe engines."},
     {NULL, 0, 0, 0, NULL},
 };
 
