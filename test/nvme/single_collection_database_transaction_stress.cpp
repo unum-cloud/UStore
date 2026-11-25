@@ -146,7 +146,7 @@ util::expected<std::unique_ptr<stress_stack<typename mount_type_::fixture_t>>> m
 template <typename stack_type_>
 util::expected<typename stack_type_::database_t::database_unique_ptr_t> open_over(stack_type_& stack) noexcept {
     return stack_type_::database_t::open(*stack.volume, *stack.writing, *stack.merging, stress_config(),
-                                         stack.fixture->resources);
+                                         *stack.fixture->resources);
 }
 
 /**

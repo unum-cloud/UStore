@@ -29,7 +29,7 @@
 
 #include "ustore/utilities/nvme_ring.hpp"   // `a_disk`, `queue_ref_t`, `countdown`, `notifier`, `completion_t`
 #include "ustore/utilities/ram_buffers.hpp" // `aligned_allocator`
-#include "ustore/utilities/ram_device.hpp"  // `ram_executor_t`
+#include "ustore/utilities/ram_device.hpp"  // `spawn_pool`, `harvest_topology`
 
 #include "nvme/fixture.hpp" // `case_label_t`, `same_bytes`
 
@@ -935,9 +935,13 @@ case_result_t test_countdown_keeps_one_failure_whole() {
         util::status_t {util::status_code_t::read_conflict_k, "Fifteenth racing part"},
         util::status_t {util::status_code_t::capacity_exhausted_k, "Sixteenth racing part"},
     };
-    if (!util::ram_executor_t::spawns_threads()) return case_result_t::skipped("needs fu_capability_os_threads_k");
-    auto [pool, make_pool_status] = util::ram_executor_t::make_unpinned(
-        failures.size() + 1, util::caller_exclusivity_t::caller_inclusive_k, fu_capabilities_all_k);
+    if (!(fu_comptime_capabilities() & fu_capability_os_threads_k))
+        return case_result_t::skipped("needs fu_capability_os_threads_k");
+    // Without memory placement ForkUnion spawns a flat pool of plain threads, which pins nothing
+    auto [topology, topology_status] = util::harvest_topology();
+    auto [pool, make_pool_status] = util::spawn_pool(
+        topology, failures.size() + 1, fu::caller_inclusive_k,
+        static_cast<fu_capabilities_t>(fu_capabilities_all_k & ~fu_capability_place_memory_on_domain_k));
     expect_true(st::succeeded(make_pool_status));
     if (st::failed(make_pool_status)) return {};
 
@@ -947,14 +951,14 @@ case_result_t test_countdown_keeps_one_failure_whole() {
     for (std::size_t round = 0, rounds = scaled_iterations(256); round != rounds; ++round) {
         counter.reset(failures.size());
         util::status_t released;
-        st::status_t const dispatched = pool.for_threads([&](std::size_t thread) noexcept {
+        fu::status_t const dispatched = pool.for_threads([&](std::size_t thread) noexcept {
             if (thread != 0) notifier.fail(failures[(thread - 1 + round) % failures.size()]);
             else {
                 expect_true(!counter.wait());
                 released = counter.release_status();
             }
         });
-        if (!expect_true(st::succeeded(dispatched))) return {};
+        if (!expect_true(!fu::failed(dispatched))) return {};
         auto const sent = std::find_if(failures.begin(), failures.end(),
                                        [&](util::status_t const& failure) { return failure.code == released.code; });
         if (!expect_true(sent != failures.end(), "round {}", round)) return {};

@@ -1556,7 +1556,7 @@ impl<Documents: Writes> Calling for DocsWrite<'_, Documents> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1564,11 +1564,11 @@ impl<Documents: Writes> Calling for DocsWrite<'_, Documents> {
             return Ok(None);
         };
         Ok(Some(ffi::ustore_docs_write_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            transaction: view.transaction(),
+            transaction: handles.transaction(),
             count: tasks.count as ustore_size_t,
             collections: self.collections.view(tasks.count)?,
             keys: tasks.keys,
@@ -1578,7 +1578,7 @@ impl<Documents: Writes> Calling for DocsWrite<'_, Documents> {
             type_: tasks.format,
             modification: self.modification as ustore_enum_t,
             durability: self.durability,
-            watch: view.watch(),
+            watch: handles.watch(),
         }))
     }
 
@@ -1605,7 +1605,7 @@ impl<Keys: AsRef<[Key]>> Calling for DocsRemove<'_, Keys> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1614,17 +1614,17 @@ impl<Keys: AsRef<[Key]>> Calling for DocsRemove<'_, Keys> {
             return Ok(None);
         }
         Ok(Some(ffi::ustore_docs_remove_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            transaction: view.transaction(),
+            transaction: handles.transaction(),
             count: keys.len() as ustore_size_t,
             collections: self.collections.view(keys.len())?,
             keys: ustore_strided_view_t::packed(keys),
             end_keys: ustore_keys_view_t::default(),
             durability: self.durability,
-            watch: view.watch(),
+            watch: handles.watch(),
         }))
     }
 
@@ -1651,22 +1651,22 @@ impl Calling for DocsRemoveRange {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         Ok(Some(ffi::ustore_docs_remove_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            transaction: view.transaction(),
+            transaction: handles.transaction(),
             count: 1,
             collections: ustore_strided_view_t::repeated(&self.collection),
             keys: ustore_strided_view_t::repeated(&self.range.start),
             end_keys: ustore_strided_view_t::repeated(&self.range.end),
             durability: self.durability,
-            watch: view.watch(),
+            watch: handles.watch(),
         }))
     }
 
@@ -1699,17 +1699,17 @@ impl<'arena> Calling for DocsScan<'arena, '_> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         let (progress, progress_state) = lowered_progress(&self.progress);
         Ok(Some(ffi::ustore_docs_scan_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            view: view.view(),
+            view: handles.view(),
             count: 1,
             collections: ustore_strided_view_t::repeated(&self.collection),
             start_keys: ustore_strided_view_t::repeated(&self.start),
@@ -1753,16 +1753,16 @@ impl<'arena> Calling for DocsSample<'arena> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         Ok(Some(ffi::ustore_docs_sample_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            view: view.view(),
+            view: handles.view(),
             count: 1,
             collections: ustore_strided_view_t::repeated(&self.collection),
             offsets: &mut self.found.offsets.0,
@@ -1799,7 +1799,7 @@ impl Calling for DocsMeasure<'_> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1812,11 +1812,11 @@ impl Calling for DocsMeasure<'_> {
             max_space_usages,
         ] = &mut self.bounds.0;
         Ok(Some(ffi::ustore_docs_measure_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            view: view.view(),
+            view: handles.view(),
             count: 1,
             collections: ustore_strided_view_t::repeated(&self.collection),
             start_keys: ustore_strided_view_t::repeated(&self.start),
@@ -1862,7 +1862,7 @@ impl<'arena, Targets: Addresses> Calling for DocsRead<'arena, '_, Targets> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1873,11 +1873,11 @@ impl<'arena, Targets: Addresses> Calling for DocsRead<'arena, '_, Targets> {
             return Ok(None);
         }
         Ok(Some(ffi::ustore_docs_read_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            view: view.view(),
+            view: handles.view(),
             count: tasks.count as ustore_size_t,
             collections,
             keys: tasks.keys,
@@ -1917,17 +1917,17 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for DocsGist<'arena, '_, Keys> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         let keys = self.keys.as_ref();
         Ok(Some(ffi::ustore_docs_gist_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            view: view.view(),
+            view: handles.view(),
             count: keys.len() as ustore_size_t,
             collections: self.collections.view(keys.len())?,
             keys: ustore_strided_view_t::packed(keys),
@@ -1968,7 +1968,7 @@ impl<'arena, 'field, Keys: AsRef<[Key]>, Requested: AsRef<[Column<'field>]>> Cal
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1982,11 +1982,11 @@ impl<'arena, 'field, Keys: AsRef<[Key]>, Requested: AsRef<[Column<'field>]>> Cal
             .map_err(|_| fail(Status::OutOfMemory, "the column types could not be staged"))?;
         self.formats.extend(columns.iter().map(|column| column.format));
         Ok(Some(ffi::ustore_docs_gather_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            view: view.view(),
+            view: handles.view(),
             count: keys.len() as ustore_size_t,
             collections,
             keys: ustore_strided_view_t::packed(keys),

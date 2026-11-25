@@ -29,7 +29,7 @@
 #include "ustore/blobs/nvme_key_slot.hpp"          // `key_slot`
 #include "ustore/blobs/nvme_tree.hpp"              // `lsm_level`, `lsm_level_order_t`, `lsm_level_depth_t`
 #include "ustore/blobs/vram_nvidia_compaction.cuh" // `cuda_compactor_t`, `strings_merge_verdict`
-#include "ustore/utilities/ram_device.hpp"         // `ram_executor_t`, `pool_view_t`
+#include "ustore/utilities/ram_device.hpp"         // `spawn_pool`, `harvest_topology`
 #include "ustore/utilities/vram_device.hpp"        // `gpu_drivers_t`
 
 #include "nvme/allocation_watch.hpp" // `allocation_watch_t`, `allocation_watch_g`
@@ -300,7 +300,7 @@ template <typename disk_type_>
 struct pooled_fan_out {
 
     /** The pool whose threads run the slices, one slice per thread. */
-    util::pool_view_t pool;
+    fu::pool_t& pool;
 
     /** The queue set every slice registers the disk's media on. */
     util::nvme_queues_t* queues = nullptr;
@@ -325,7 +325,7 @@ struct pooled_fan_out {
             }
             statuses[task] = slice(task, *channels.reading, *channels.writing);
         };
-        if (st::failed(pool.for_n_dynamic(statuses.size(), run_slice)))
+        if (fu::failed(pool.for_n_dynamic(statuses.size(), run_slice)))
             return {util::status_code_t::contended_k, "The pool refused the slices"};
         for (util::status_t const& status : statuses)
             if (status.failed()) return status;
@@ -748,11 +748,14 @@ void test_intermediate_merge_keeps_remove_deltas(mount_type_ const& mount) {
         expect_equal(std::memcmp(kept_values.data(), sliced_values.data(), kept_values.size()), 0);
 
     // And again with every slice on its own thread of a pool, side by side.
-    auto [pool, make_pool_status] = util::ram_executor_t::make_unpinned(
-        threads_k, util::caller_exclusivity_t::caller_inclusive_k, fu_capabilities_all_k);
+    // Without memory placement ForkUnion spawns a flat pool of plain threads, which pins nothing
+    auto [topology, topology_status] = util::harvest_topology();
+    auto [pool, make_pool_status] = util::spawn_pool(
+        topology, threads_k, fu::caller_inclusive_k,
+        static_cast<fu_capabilities_t>(fu_capabilities_all_k & ~fu_capability_place_memory_on_domain_k));
     expect_true(st::succeeded(make_pool_status));
     if (st::failed(make_pool_status)) return;
-    pooled_fan_out<typename fixture_t::disk_t> pooled {pool.view(), &fixture->queues, &fixture->disk, 2};
+    pooled_fan_out<typename fixture_t::disk_t> pooled {pool, &fixture->queues, &fixture->disk, 2};
     expect_equal(pooled.slices(), threads_k);
     request.buffers = buffers;
     request.fan_out = compaction_fan_out_t {pooled};
@@ -1225,21 +1228,33 @@ void test_compaction_history_matches_reference(mount_type_ const& mount) {
 
 #pragma region Compactor Choice Cases
 
-/** The threshold picks the device compactor only above it, and only where a device is present. */
-void test_compactor_choice_follows_the_threshold() {
-    constexpr std::uint64_t threshold_k = storage_limits_t::cuda_compaction_threshold_k;
+/** The derived break-even picks the device compactor only past it, and only where a device is
+ *  present: it never falls as the host merges on more slices, and stays finite on one thread. */
+void test_compactor_choice_follows_the_break_even() {
+    constexpr std::size_t slot_bytes_k = sizeof(st::key128_t);
+    constexpr std::uint64_t one_slice_k = device_compaction_min_key_slots(slot_bytes_k, 4, 1);
+    static_assert(one_slice_k != (std::numeric_limits<std::uint64_t>::max)());
+    for (std::size_t runs : {2u, 4u, 16u}) {
+        std::uint64_t fewer = device_compaction_min_key_slots(slot_bytes_k, runs, 1);
+        for (std::size_t slices = 2; slices <= 64; slices *= 2) {
+            std::uint64_t const more = device_compaction_min_key_slots(slot_bytes_k, runs, slices);
+            expect_true(more >= fewer, "{} runs on {} slices", runs, slices);
+            fewer = more;
+        }
+    }
 
-    expect_true(choose_compactor(compaction_placement_t::automatic_k, 1, threshold_k) == compactor_choice_t::host_k);
-    expect_true(choose_compactor(compaction_placement_t::automatic_k, 1, threshold_k + 1) ==
-                compactor_choice_t::device_k);
-    expect_true(choose_compactor(compaction_placement_t::automatic_k, 0, threshold_k + 1) ==
+    cuda_compactor_t* const absent = nullptr;
+    compactor_ref_t const device {absent}, host {host_compactor_t {}};
+    auto const automatic = compaction_placement_t::automatic_k;
+    expect_true(choose_compactor(automatic, device, one_slice_k, one_slice_k) == compactor_choice_t::host_k);
+    expect_true(choose_compactor(automatic, device, one_slice_k + 1, one_slice_k) == compactor_choice_t::device_k);
+    expect_true(choose_compactor(automatic, host, one_slice_k + 1, one_slice_k) == compactor_choice_t::host_k);
+
+    // A fixed placement answers itself, whatever the database holds and however large the merge is.
+    expect_true(choose_compactor(compaction_placement_t::host_k, device, one_slice_k * 8, one_slice_k) ==
                 compactor_choice_t::host_k);
-    expect_true(choose_compactor(compaction_placement_t::automatic_k, 4, threshold_k * 8) ==
+    expect_true(choose_compactor(compaction_placement_t::device_k, host, 1, one_slice_k) ==
                 compactor_choice_t::device_k);
-
-    // A fixed placement answers itself, whatever the machine holds and however large the merge is.
-    expect_true(choose_compactor(compaction_placement_t::host_k, 8, threshold_k * 8) == compactor_choice_t::host_k);
-    expect_true(choose_compactor(compaction_placement_t::device_k, 0, 1) == compactor_choice_t::device_k);
 }
 
 /** The compactor of NVIDIA device zero, made once as an engine makes its own at open, or none where
@@ -2101,7 +2116,7 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    run_test_case("test_compactor_choice_follows_the_threshold", test_compactor_choice_follows_the_threshold);
+    run_test_case("test_compactor_choice_follows_the_break_even", test_compactor_choice_follows_the_break_even);
     auto const cases = [&](auto const& mount) {
         report_on_mount(mount, "test_flush_lands_on_level_zero", test_flush_lands_on_level_zero);
         report_on_mount(mount, "test_restore_assigns_ingested_stamps", test_restore_assigns_ingested_stamps);

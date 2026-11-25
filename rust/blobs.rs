@@ -720,7 +720,7 @@ impl<Entries: Pairs> Calling for Write<'_, Entries> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -728,17 +728,17 @@ impl<Entries: Pairs> Calling for Write<'_, Entries> {
             return Ok(None);
         };
         Ok(Some(ffi::ustore_blobs_write_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            transaction: view.transaction(),
+            transaction: handles.transaction(),
             count: pairs.count as ustore_size_t,
             collections: self.collections.view(pairs.count)?,
             keys: pairs.keys,
             values: pairs.values,
             durability: self.durability,
-            watch: view.watch(),
+            watch: handles.watch(),
         }))
     }
 
@@ -765,7 +765,7 @@ impl<Keys: AsRef<[Key]>> Calling for Remove<'_, Keys> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -774,17 +774,17 @@ impl<Keys: AsRef<[Key]>> Calling for Remove<'_, Keys> {
             return Ok(None);
         }
         Ok(Some(ffi::ustore_blobs_remove_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            transaction: view.transaction(),
+            transaction: handles.transaction(),
             count: keys.len() as ustore_size_t,
             collections: self.collections.view(keys.len())?,
             keys: ustore_strided_view_t::packed(keys),
             end_keys: ustore_keys_view_t::default(),
             durability: self.durability,
-            watch: view.watch(),
+            watch: handles.watch(),
         }))
     }
 
@@ -811,22 +811,22 @@ impl Calling for RemoveRange {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         Ok(Some(ffi::ustore_blobs_remove_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            transaction: view.transaction(),
+            transaction: handles.transaction(),
             count: 1,
             collections: ustore_strided_view_t::repeated(&self.collection),
             keys: ustore_strided_view_t::repeated(&self.range.start),
             end_keys: ustore_strided_view_t::repeated(&self.range.end),
             durability: self.durability,
-            watch: view.watch(),
+            watch: handles.watch(),
         }))
     }
 
@@ -857,7 +857,7 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for Read<'arena, '_, Keys> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -866,11 +866,11 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for Read<'arena, '_, Keys> {
             return Ok(None);
         }
         Ok(Some(ffi::ustore_blobs_read_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            view: view.view(),
+            view: handles.view(),
             count: keys.len() as ustore_size_t,
             collections: self.collections.view(keys.len())?,
             keys: ustore_strided_view_t::packed(keys),
@@ -952,17 +952,17 @@ impl<'arena> Calling for Scan<'arena, '_> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         let (progress, progress_state) = lowered_progress(&self.progress);
         Ok(Some(ffi::ustore_blobs_scan_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            view: view.view(),
+            view: handles.view(),
             count: 1,
             collections: ustore_strided_view_t::repeated(&self.collection),
             start_keys: ustore_strided_view_t::repeated(&self.start),
@@ -1013,16 +1013,16 @@ impl<'arena> Calling for Sample<'arena> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         Ok(Some(ffi::ustore_blobs_sample_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            view: view.view(),
+            view: handles.view(),
             count: 1,
             collections: ustore_strided_view_t::repeated(&self.collection),
             offsets: &mut self.found.offsets.0,
@@ -1059,7 +1059,7 @@ impl Calling for Measure<'_> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1072,11 +1072,11 @@ impl Calling for Measure<'_> {
             max_space_usages,
         ] = &mut self.bounds.0;
         Ok(Some(ffi::ustore_blobs_measure_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            view: view.view(),
+            view: handles.view(),
             count: 1,
             collections: ustore_strided_view_t::repeated(&self.collection),
             start_keys: ustore_strided_view_t::repeated(&self.start),

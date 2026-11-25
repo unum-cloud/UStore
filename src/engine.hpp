@@ -60,7 +60,6 @@ using util::hip_executor_t;
 using util::host_blocks_t;
 using util::metal_blocks_t;
 using util::metal_executor_t;
-using util::ram_executor_t;
 using util::strings_arg_t;
 
 /** What a call reads through, decoded once by the router from its view, or from the transaction a
@@ -83,10 +82,9 @@ struct view_t {
     /** The executor whose thread runs the call, or null for a call run alone. */
     ustore_executor_t executor = nullptr;
 
-    /** The queues of a call naming no NVMe executor: a VRAM executor's own blocking queues, or
-     *  for a call without an executor queues empty in the router's frame until an NVMe path
-     *  first reads or writes, which makes them blocking queues that pin nothing; null on RAM
-     *  and NVMe executors. */
+    /** The queues of a call naming no NVMe executor: a VRAM executor's own blocking queues, or for
+     *  a call without an executor the router frame's, blocking queues pinning nothing where the
+     *  call reaches its data through queues and empty elsewhere; null on RAM and NVMe executors. */
     util::nvme_queues_t* queues = nullptr;
 
     /** Which thread of @c executor serves the work: a pool thread's index for a slice of a call,
@@ -405,8 +403,8 @@ struct pages_verbs<residency_> {
     util::status_t (*scan)(ustore_pages_scan_t const&, view_t const&, residency_executor<residency_>&) noexcept;
 };
 
-/** The verbs of every modality an engine serves at one residency; a null host table or verb answers
- *  @c ustore_status_unsupported_k, while every device table is filled. */
+/** The verbs of every modality an engine serves at one residency; a null table or verb answers
+ *  @c ustore_status_unsupported_k. */
 template <vendored_residency_t residency_>
 struct residency_tables {
     blobs_verbs<residency_> const* blobs = nullptr;
@@ -414,56 +412,6 @@ struct residency_tables {
     docs_verbs<residency_> const* docs = nullptr;
     graph_verbs<residency_> const* graph = nullptr;
     pages_verbs<residency_> const* pages = nullptr;
-};
-
-/** Answers a device verb whose stage has not landed yet, which fills every entry of the device tables. */
-template <typename... parameters_types_>
-util::status_t unsupported_on_vram(parameters_types_...) noexcept {
-    return {util::status_code_t::unsupported_k, "No engine serves this call on devices yet"};
-}
-
-template <vendored_residency_t residency_>
-inline constexpr blobs_verbs<residency_> unsupported_vram_blobs {
-    .read = &unsupported_on_vram,
-    .scan = &unsupported_on_vram,
-    .sample = &unsupported_on_vram,
-};
-
-template <vendored_residency_t residency_>
-inline constexpr strings_verbs<residency_> unsupported_vram_strings {
-    .read = &unsupported_on_vram,
-    .scan = &unsupported_on_vram,
-};
-
-template <vendored_residency_t residency_>
-inline constexpr docs_verbs<residency_> unsupported_vram_docs {
-    .read = &unsupported_on_vram,
-    .gather = &unsupported_on_vram,
-    .scan = &unsupported_on_vram,
-    .sample = &unsupported_on_vram,
-};
-
-template <vendored_residency_t residency_>
-inline constexpr graph_verbs<residency_> unsupported_vram_graph {
-    .read_edges = &unsupported_on_vram,
-    .scan_vertices = &unsupported_on_vram,
-};
-
-template <vendored_residency_t residency_>
-inline constexpr pages_verbs<residency_> unsupported_vram_pages {
-    .read = &unsupported_on_vram,
-    .scan = &unsupported_on_vram,
-};
-
-/** The device tables of an engine with no device tower yet at @p residency_, every entry answering
- *  @c unsupported_on_vram. */
-template <vendored_residency_t residency_>
-inline constexpr residency_tables<residency_> unsupported_vram_tables {
-    .blobs = &unsupported_vram_blobs<residency_>,
-    .strings = &unsupported_vram_strings<residency_>,
-    .docs = &unsupported_vram_docs<residency_>,
-    .graph = &unsupported_vram_graph<residency_>,
-    .pages = &unsupported_vram_pages<residency_>,
 };
 
 /**
@@ -483,16 +431,13 @@ struct engine_t {
     residency_tables<vendored_residency_t::host_k> host;
 
     /** The modality verbs on one NVIDIA device. */
-    residency_tables<vendored_residency_t::vram_nvidia_k> vram_nvidia =
-        unsupported_vram_tables<vendored_residency_t::vram_nvidia_k>;
+    residency_tables<vendored_residency_t::vram_nvidia_k> vram_nvidia;
 
-    /** The modality verbs on one AMD device, which no engine serves yet. */
-    residency_tables<vendored_residency_t::vram_amd_k> vram_amd =
-        unsupported_vram_tables<vendored_residency_t::vram_amd_k>;
+    /** The modality verbs on one AMD device. */
+    residency_tables<vendored_residency_t::vram_amd_k> vram_amd;
 
     /** The modality verbs on one Apple device. */
-    residency_tables<vendored_residency_t::vram_apple_k> vram_apple =
-        unsupported_vram_tables<vendored_residency_t::vram_apple_k>;
+    residency_tables<vendored_residency_t::vram_apple_k> vram_apple;
 
     /** The tables of the verbs served at @p residency_. */
     template <vendored_residency_t residency_>
@@ -589,7 +534,7 @@ template <typename arguments_type_>
 ustore_database_t database_of(arguments_type_ const& arguments) noexcept {
     if constexpr (a_call_naming_database<arguments_type_>) return arguments.database;
     else if constexpr (a_cursor_walker<arguments_type_>)
-        return arguments.cursor ? arguments.cursor->cursor.database : nullptr;
+        return arguments.cursor ? arguments.cursor->walk.database : nullptr;
     else if constexpr (a_call_feeding_ingest<arguments_type_>)
         return arguments.ingest ? arguments.ingest->database : nullptr;
     else return arguments.snapshot ? arguments.snapshot->database : nullptr;
@@ -1518,17 +1463,16 @@ struct ustore_snapshot_handle_t {
  *  the one call holding it, and what the executor computes with. */
 struct ustore_executor_handle_t {
 
-    /** The pool every call forks on; an exclusive one also runs delegated calls. */
-    ram_executor_t pool;
+    /** The pool every call forks on, empty on the calling thread alone; an exclusive one also
+     *  runs delegated calls. */
+    fu::pool_t threads;
 
-    /** One scratch per pool thread and one for the call at index @c threads, each kept local. */
+    /** One scratch per pool thread, each kept local, and the call's last, on the memory domain of
+     *  pool thread 0, where every arena made here lives too. */
     st::vector<ustore_arena_handle_t> scratches;
 
     /** The one call that holds the executor, from its claim to its end. */
     holding_call_t holding_call;
-
-    /** The memory domain of pool thread 0, holding the call's scratch and every arena made here. */
-    fu_memory_domain_id_t memory_domain = 0;
 
     /** Nothing beyond the pool on RAM, one reading and one writing ring per pool thread and the
      *  holding call on NVMe, the device's stream on VRAM of any vendor; the variant is the kind

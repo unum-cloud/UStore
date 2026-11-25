@@ -19,6 +19,7 @@
 #include <cstdint> // `std::uint8_t`, `std::uint16_t`, `std::uint64_t`
 
 #include <concepts>    // `std::convertible_to`, `std::same_as`, `std::unsigned_integral`
+#include <bit>         // `std::bit_width`
 #include <limits>      // `std::numeric_limits`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
@@ -814,10 +815,38 @@ struct storage_limits_t {
     static constexpr std::size_t level_min_enlarge_factor_k = 2;
     static constexpr std::size_t level_max_enlarge_factor_k = 64;
     static constexpr std::size_t sorted_run_file_max_size_k = utilities::sorted_run_bytes_max_k;
-    static constexpr std::size_t cuda_compaction_threshold_k = 900'000;
     static constexpr std::size_t value_max_size_k = fu::max_of(fixed_value_max_size_k, variable_value_max_size_k);
-    static constexpr std::size_t user_data_max_size_k = 4 * 1024 * 1024;
 };
+
+/**
+ *  @brief Key slots past which a device merge beats the host: N* = L0 / (c_key / (P × f) − r_gpu),
+ *      never when the divisor is at most zero.
+ *
+ *  The host spends c_key cycles per key, counted from @c host_compactor_t: log2 R dependent
+ *  compares of the tournament replay, each a 4-cycle L1 load-to-use and a 16-cycle branch
+ *  mispredicted half the time, and settle's four passes over the version at about 10 cycles each,
+ *  on P threads at a nominal 3 GHz clock f. The device pays L0 once: (2R + 15) driver calls at 5 µs
+ *  and the merge's 3 waits at 10 µs, counted from @c vram_nvidia_compaction.cuh, its latencies per
+ *  the CUDA Best Practices Guide. Each key then costs r_gpu: U + D bytes over a PCIe Gen4 x16 link
+ *  at 25 GB/s, 80% of its 31.5, and the serial host epilogue copying D bytes at 10 GB/s, one core's
+ *  rate, where U = s + 9 and D = 9 + (2s + 33) count the copies.
+ *
+ *  @param[in] slot_bytes The key slot's size, s.
+ *  @param[in] runs The sorted runs merged, R.
+ *  @param[in] slices The host threads a merge fans out over, P; a strings merge runs on one.
+ */
+[[nodiscard]] constexpr std::uint64_t device_compaction_min_key_slots(std::size_t slot_bytes, std::size_t runs,
+                                                                      std::size_t slices) noexcept {
+    double const compares = static_cast<double>(std::bit_width(runs > 1 ? runs - 1 : std::size_t {0}));
+    double const host_cycles_per_key = compares * (4 + 16 / 2.0) + 4 * 10;
+    double const host_seconds_per_key = host_cycles_per_key / (static_cast<double>(slices ? slices : 1) * 3e9);
+    double const uploaded = static_cast<double>(slot_bytes) + 9, downloaded = 9 + (2.0 * slot_bytes + 33);
+    double const device_seconds_per_key = (uploaded + downloaded) / 25e9 + downloaded / 10e9;
+    double const fixed_seconds = static_cast<double>(2 * runs + 15) * 5e-6 + 3 * 10e-6;
+    double const saved_per_key = host_seconds_per_key - device_seconds_per_key;
+    if (saved_per_key <= 0) return (std::numeric_limits<std::uint64_t>::max)();
+    return static_cast<std::uint64_t>(fixed_seconds / saved_per_key);
+}
 
 #pragma endregion Storage Limits
 

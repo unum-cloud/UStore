@@ -37,9 +37,9 @@ util::status_t pull_through(engine_t const& engine, ustore_strings_cursor_next_t
     if (sz::string_t const* const start = std::get_if<sz::string_t>(&cursor.position); start && arguments.wanted) {
         ustore_bytes_view_t const prefix = util::bytes_of(std::string_view {cursor.prefix});
         if (util::status_t const status = list_matched_strings(
-                engine.host, arguments.database, cursor.cursor.collection, prefix,
+                engine.host, arguments.database, cursor.walk.collection, prefix,
                 util::bytes_of(std::string_view {*start}), cursor.position_bound,
-                util::bytes_of(std::string_view {cursor.end_string}), cursor.cursor.direction, arguments.wanted, match,
+                util::bytes_of(std::string_view {cursor.end_string}), cursor.walk.direction, arguments.wanted, match,
                 arguments.arena, view, survivors, resume_bytes, resume);
             status.failed())
             return status;
@@ -52,7 +52,7 @@ util::status_t pull_through(engine_t const& engine, ustore_strings_cursor_next_t
         ustore_strings_view_t const listed = survivors.tape();
         ustore_strings_read_t const read {.database = arguments.database,
                                           .count = written,
-                                          .collections = {&cursor.cursor.collection, 0},
+                                          .collections = {&cursor.walk.collection, 0},
                                           .values = arguments.values,
                                           .arena = arguments.arena};
         if (util::status_t const status = verbs.read(read, strings_arg_t {listed}, view); status.failed())
@@ -71,7 +71,7 @@ util::status_t pull_through(engine_t const& engine, ustore_strings_cursor_next_t
     if (!next) cursor.position = exhausted_t {};
     else if (kept && arguments.wanted && kept->resize(next->length) == sz::status_t::success_k) {
         if (next->length) std::memcpy(kept->data(), next->data, next->length);
-        if (written) cursor.position_bound = resume_bound_of(cursor.cursor.direction);
+        if (written) cursor.position_bound = resume_bound_of(cursor.walk.direction);
     }
     *arguments.written = written;
     return {};

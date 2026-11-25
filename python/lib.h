@@ -1278,7 +1278,7 @@ typedef enum ustore_py_read_extent_t {
 typedef struct ustore_py_read_call_t {
 
     /** What the call keeps until it finishes: the outcome and the arena holding the tape. */
-    ustore_py_call_t call;
+    ustore_py_call_t kept;
 
     /** The keys to read. */
     ustore_py_keys_t keys;
@@ -1372,7 +1372,7 @@ int ustore_py_contents_from_object(PyObject* object, size_t count, ustore_py_con
 typedef struct ustore_py_write_call_t {
 
     /** What the call keeps until it finishes. */
-    ustore_py_call_t call;
+    ustore_py_call_t kept;
 
     /** The keys to write. */
     ustore_py_keys_t keys;
@@ -1395,7 +1395,7 @@ PyObject* ustore_py_values_write(ustore_py_context_t const* context, ustore_py_v
 typedef struct ustore_py_remove_call_t {
 
     /** What the call keeps until it finishes. */
-    ustore_py_call_t call;
+    ustore_py_call_t kept;
 
     /** The keys to remove, or the inclusive starts of ranges when @c ends holds any. */
     ustore_py_keys_t keys;

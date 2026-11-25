@@ -160,7 +160,7 @@ make_stack(mount_type_ const& mount) noexcept {
     single_collection_database_config_t const config = test_config(layout_type_::value_size_k,
                                                                    layout_type_::value_max_size_k);
     auto [store, open_status] = database_t::open(*stack->volume, *stack->writing, *stack->merging, config,
-                                                 stack->fixture->resources);
+                                                 *stack->fixture->resources);
     if (open_status.failed()) return open_status;
     stack->store = std::move(store);
     return stack;

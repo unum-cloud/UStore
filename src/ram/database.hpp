@@ -2672,7 +2672,7 @@ util::status_t find_changes(changes_feed_state<cpu_class_, isolation_> const& fe
 template <cpu_class_t cpu_class_, isolation_t isolation_>
 util::status_t changes_cursor_next(ustore_changes_cursor_next_t const& arguments, view_t const& view) noexcept {
     auto* const feed = state_of<changes_feed_state<cpu_class_, isolation_>>(arguments.cursor);
-    auto [store, store_status] = store_at_head(feed->state, arguments.cursor->cursor.collection);
+    auto [store, store_status] = store_at_head(feed->state, arguments.cursor->walk.collection);
     if (store_status.failed()) return store_status;
     if (store != feed->store) return {util::status_code_t::not_found_k, "The collection was dropped meanwhile"};
     claim_t claim;

@@ -184,23 +184,18 @@ class compaction_fan_out_t {
     run_t run_ = &refuse_;
 };
 
-/** Which compactor @p placement asks for, given @p devices devices and a merge of
- *  @p key_slots_count key slots. */
-[[nodiscard]] constexpr compactor_choice_t choose_compactor(compaction_placement_t placement, std::size_t devices,
-                                                            std::uint64_t key_slots_count) noexcept {
+/** Which compactor @p placement asks for, given the database's @p compactor and a merge of
+ *  @p key_slots_count key slots, which a device takes past @p min_key_slots, as
+ *  @c device_compaction_min_key_slots derives it. */
+[[nodiscard]] constexpr compactor_choice_t choose_compactor(compaction_placement_t placement,
+                                                            compactor_ref_t const& compactor,
+                                                            std::uint64_t key_slots_count,
+                                                            std::uint64_t min_key_slots) noexcept {
     if (placement == compaction_placement_t::host_k) return compactor_choice_t::host_k;
     if (placement == compaction_placement_t::device_k) return compactor_choice_t::device_k;
-    return devices != 0 && key_slots_count > storage_limits_t::cuda_compaction_threshold_k
+    return !std::holds_alternative<host_compactor_t>(compactor) && key_slots_count > min_key_slots
                ? compactor_choice_t::device_k
                : compactor_choice_t::host_k;
-}
-
-/** Devices @p compactor merges on: one for an NVIDIA, AMD or Apple one, none for the host's. */
-[[nodiscard]] inline std::size_t devices_of(compactor_ref_t const& compactor) noexcept {
-    bool const device = std::holds_alternative<cuda_compactor_t*>(compactor) ||
-                        std::holds_alternative<hip_compactor_t*>(compactor) ||
-                        std::holds_alternative<metal_compactor_t*>(compactor);
-    return device ? 1 : 0;
 }
 
 /** The engine's status for the @p status a compactor reported. */
@@ -589,8 +584,8 @@ class lsm_level_merger {
         st::status_t compacted = st::status_t::invalid_argument_k;
         if (status_t const tracked = compact_on_device_(
                 kind, level_views.first(upper_runs), level_views.subspan(upper_runs), runs, source_runs,
-                bounds_of_(request), request.stamps, request.placement, request.compactor, fold, device_fold,
-                value_reader(reading_channel), request.buffers[0].output, compacted);
+                bounds_of_(request), request.stamps, request.placement, request.compactor, request.fan_out.slices(),
+                fold, device_fold, value_reader(reading_channel), request.buffers[0].output, compacted);
             tracked.failed())
             return tracked;
         bool const refused = compacted == st::status_t::invalid_argument_k ||
@@ -807,9 +802,11 @@ class lsm_level_merger {
         compaction_kind_t const kind = kind_of_(request.upper_order, request.depth);
         std::uint64_t records = 0;
         for (run_handle_t const source : sources) records += runs[source.index].population_count();
-        std::size_t const devices = devices_of(request.compactor);
-        if (choose_compactor(request.placement, devices, records) == compactor_choice_t::device_k) {
-            if (devices == 0) return {status_code_t::unsupported_k, "No device compactor serves this database"};
+        std::uint64_t const min_key_slots = device_compaction_min_key_slots(sizeof(key_slot_t), sources.size(), 1);
+        if (choose_compactor(request.placement, request.compactor, records, min_key_slots) ==
+            compactor_choice_t::device_k) {
+            if (std::holds_alternative<host_compactor_t>(request.compactor))
+                return {status_code_t::unsupported_k, "No device compactor serves this database"};
             // The device reads every run's heads by position, as no kit searches them.
             st::vector<sorted_run_tree_view<st::key128_t>> heads;
             st::vector<strings_run_view> views;
@@ -1195,14 +1192,15 @@ class lsm_level_merger {
                                        std::span<sorted_run_index_view<key_slot_t> const> lower, run_pool_t const& runs,
                                        std::span<run_handle_t const> sources, sorted_run_bounds_t const& bounds,
                                        compaction_stamps_t const& stamps, compaction_placement_t placement,
-                                       compactor_ref_t const& compactor, fold_type_ const& fold,
+                                       compactor_ref_t const& compactor, std::size_t slices, fold_type_ const& fold,
                                        device_fold_type_ const& device_fold, value_reader_type_&& read_value,
                                        compaction_output_t& output, st::status_t& compacted) noexcept {
         constexpr bool device_folds_k = !std::same_as<device_fold_type_, no_device_fold_t>;
         std::uint64_t const merged = merged_count_(upper, lower);
-        std::size_t const devices = devices_of(compactor);
-        bool const on_device = choose_compactor(placement, devices, merged) == compactor_choice_t::device_k;
-        if (on_device && devices == 0)
+        std::uint64_t const min_key_slots = device_compaction_min_key_slots(sizeof(key_slot_t), sources.size(), slices);
+        bool const on_device = choose_compactor(placement, compactor, merged, min_key_slots) ==
+                               compactor_choice_t::device_k;
+        if (on_device && std::holds_alternative<host_compactor_t>(compactor))
             return {status_code_t::unsupported_k, "No device compactor serves this database"};
         if (!on_device) return {};
         st::vector<sorted_run_extents_t> extents;

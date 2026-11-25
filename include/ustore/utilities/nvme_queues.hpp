@@ -124,6 +124,8 @@ struct thread_channels_t {
  *  Only thread @c t of the executor submits and polls on thread @c t 's queues, which the thread
  *  index every fan-out passes guarantees, so nothing here is claimed or contended. The queue set
  *  holds no database pointer, and a database holds no queue set, so either may be freed first.
+ *  The C ABI's executor claim admits one caller of a set at a time, and a header-only user sharing
+ *  it must too.
  */
 class nvme_queues_t {
   public:
@@ -182,8 +184,7 @@ class nvme_queues_t {
     template <typename disk_type_>
         requires a_disk<disk_type_>
     expected<io_channel_t*> reading_channel_with_disk_media(std::size_t thread_index, disk_type_& disk) noexcept {
-        if (thread_index >= threads_.size())
-            return status_t {status_code_t::invalid_argument_k, "The queue set lacks that thread"};
+        if (thread_index >= threads_.size()) return missing_thread_();
         io_channel_t& reading = threads_[thread_index].reading;
         if (status_t const registered = disk.register_media(reading.queue_pair()); registered.failed())
             return registered;
@@ -195,8 +196,7 @@ class nvme_queues_t {
     template <typename disk_type_>
         requires a_disk<disk_type_>
     expected<thread_channels_t> both_channels_with_disk_media(std::size_t thread_index, disk_type_& disk) noexcept {
-        if (thread_index >= threads_.size())
-            return status_t {status_code_t::invalid_argument_k, "The queue set lacks that thread"};
+        if (thread_index >= threads_.size()) return missing_thread_();
         thread_queues_t& thread = threads_[thread_index];
         if (status_t const registered = disk.register_media(thread.reading.queue_pair()); registered.failed())
             return registered;
@@ -241,6 +241,12 @@ class nvme_queues_t {
     }
 
   private:
+    /** Why a channel ask names no thread: an empty set is one a lazy open failed to allocate, while
+     *  an open set lacks the thread named. */
+    status_t missing_thread_() const noexcept {
+        if (threads_.empty()) return status_t {status_code_t::out_of_memory_k, "The call's queues could not open"};
+        return status_t {status_code_t::invalid_argument_k, "The queue set lacks that thread"};
+    }
 
     /** The allocator of DMA bytes, placed on the queue set's memory domain. */
     using dma_allocator_t = linux_spdk_dma_allocator<byte_t>;
@@ -251,8 +257,9 @@ class nvme_queues_t {
     /** A thread's queue, of the transport the queue set resolved to. */
     using queue_t = std::variant<blocking_queue_t, linux_uring_queue_t, linux_aio_queue_t, linux_spdk_queue_t>;
 
-    /** A thread's blocks, its pools over them and its two queues with the channels holding them. */
-    struct thread_queues_t {
+    /** A thread's blocks, its pools over them and its two queues with the channels holding them,
+     *  on cache lines no other thread's queues share. */
+    struct alignas(fu::default_alignment_k) thread_queues_t {
 
         /** Host blocks, or DMA blocks for SPDK. */
         std::variant<std::monostate, domain_block_t, dma_storage_t> staging;
@@ -377,6 +384,13 @@ class nvme_queues_t {
     /** What every thread's channels were carved to. */
     io_channel_config_t config_;
 };
+
+template <typename disk_type_>
+    requires a_disk<disk_type_>
+expected<thread_channels_t> nvme_queues_ref_t::both_channels(disk_type_& disk) const noexcept {
+    if (!queues) return status_t {status_code_t::invalid_argument_k, "A call names its queues"};
+    return queues->both_channels_with_disk_media(thread_index, disk);
+}
 
 #pragma endregion Queue Sets
 

@@ -761,8 +761,8 @@ typedef struct ustore_executor_for_ram_t {
      *  the call returns. */
     ustore_ram_options_t ram;
 
-    /** Threads to spawn, interleaved across the compute domains local to @c ram, where zero takes 7/8 of the cores
-     *  those domains hold, rounded down and at least one. */
+    /** Threads to spawn, interleaved across the compute domains local to @c ram, where zero
+     *  takes all but one in eight of the cores those domains hold, and at least one. */
     ustore_size_t threads;
 
     /** The newest CPU class the threads may confine their waits and atomics to; a class the CPU
@@ -836,7 +836,9 @@ typedef struct ustore_nvme_options_t {
     /** How bytes move between the files and memory. */
     ustore_transport_t transport;
 
-    /** Submissions a channel holds at once. */
+    /** Submissions a channel holds at once; zero fits the disks under @c paths, their tags
+     *  shared by the threads on each hardware queue, up to @c request_buffers_count, or 64 when
+     *  no disk answers. */
     ustore_size_t queue_depth;
 
     /** Bytes of each request buffer of a channel. */
@@ -854,8 +856,9 @@ typedef struct ustore_nvme_options_t {
     /** The data directories, raw media or SPDK namespaces of the databases the executor will open,
      *  spelled as @c ustore_database_open_nvme names them and read only during the call: the memory
      *  domain they share places the threads and their staging unless
-     *  @c ustore_executor_for_nvme_t::ram names domains, and their fewest hardware queues give the
-     *  default thread count; @c NULL derives nothing from the media. */
+     *  @c ustore_executor_for_nvme_t::ram names domains, their fewest hardware queues give the
+     *  default thread count, and their block queues give the default depth; @c NULL derives nothing
+     *  from any medium. */
     ustore_bytes_view_t const* paths;
 
     /** Entries of @c paths. */

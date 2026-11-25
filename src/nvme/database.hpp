@@ -15,7 +15,6 @@
 #include <algorithm>   // `std::sort`
 #include <array>       // `std::array`
 #include <limits>      // `std::numeric_limits`
-#include <memory>      // `std::unique_ptr`
 #include <new>         // `std::nothrow`
 #include <optional>    // `std::optional`
 #include <span>        // `std::span`
@@ -324,13 +323,18 @@ class device_compaction {
     device_compaction(device_compaction const&) = delete;
     device_compaction& operator=(device_compaction const&) = delete;
 
-    /** Spawns the executor on the device @p compactions computes on and binds the compactor over
-     *  it, refusing with @c unsupported_k where the device loaded no bundle of the library's
-     *  kernels; on an NVIDIA device the compactor reads run sections through the reader over
-     *  @p volume, mounted over the data directories of @p resources, and on an AMD or an Apple one
-     *  it uploads them from memory. */
-    util::status_t open(ustore_executor_handle_t const& compactions, util::resources_config_t const& resources,
-                        volume_t const& volume) noexcept {
+    /**
+     *  @brief Spawns the executor on the device @p compactions computes on and binds the compactor
+     *      over it, refusing with @c unsupported_k where the device loaded no bundle of kernels.
+     *
+     *  On an NVIDIA device the compactor reads run sections through the reader over @p volume,
+     *  mounted over the data directories of @p resources, and on an AMD or an Apple one it uploads
+     *  them from memory.
+     *
+     *  @return The compactor every merge runs on, which lives as long as this.
+     */
+    util::expected<compactor_ref_t> open(ustore_executor_handle_t const& compactions,
+                                         util::resources_config_t const& resources, volume_t const& volume) noexcept {
         util::gpu_device_t twin {};
         std::size_t scratch_limit = 0;
         bool const on_device = std::visit(
@@ -344,7 +348,8 @@ class device_compaction {
             },
             compactions.device);
         if (!on_device)
-            return {util::status_code_t::device_k, "The compactions need an executor of ustore_executor_for_vram"};
+            return util::status_t {util::status_code_t::device_k,
+                                   "The compactions need an executor of ustore_executor_for_vram"};
         util::cuda_executor_t const* const nvidia = std::get_if<util::cuda_executor_t>(&compactions.device);
         gpu_runtime_t& runtime = gpu_runtime();
         util::gpu_drivers_t const& drivers = runtime.drivers;
@@ -357,56 +362,43 @@ class device_compaction {
                           executor_);
     }
 
-    /** The compactor every merge runs on: the device one @c open bound, or the host's before. */
-    compactor_ref_t compactor() noexcept {
-        return std::visit(
-            []<typename compactor_type_>(compactor_type_& compactor) noexcept -> compactor_ref_t {
-                if constexpr (std::is_same_v<compactor_type_, std::monostate>) return host_compactor_t {};
-                else return &compactor;
-            },
-            compactor_);
-    }
-
   private:
 
     /** Refuses an executor slot no spawn filled, which a successful spawn never leaves. */
-    util::status_t bind_(std::monostate&, util::gpu_drivers_t const&, util::resources_config_t const&,
-                         volume_t const&) noexcept {
-        return {util::status_code_t::internal_k, "The compactions spawned no executor"};
+    util::expected<compactor_ref_t> bind_(std::monostate&, util::gpu_drivers_t const&, util::resources_config_t const&,
+                                          volume_t const&) noexcept {
+        return util::status_t {util::status_code_t::internal_k, "The compactions spawned no executor"};
     }
 
     /** Binds the compactor over @p executor, reading run sections over @p volume where cuFile
      *  reaches the NVIDIA device. */
-    util::status_t bind_(util::cuda_executor_t& executor, util::gpu_drivers_t const& drivers,
-                         util::resources_config_t const& resources, volume_t const& volume) noexcept {
+    util::expected<compactor_ref_t> bind_(util::cuda_executor_t& executor, util::gpu_drivers_t const& drivers,
+                                          util::resources_config_t const& resources, volume_t const& volume) noexcept {
         if (util::status_t const opened = open_sections(drivers.cufile, executor.gds(), resources, volume);
             opened.failed())
             return opened;
         auto [compactor, status] = cuda_compactor_t::make(
             executor, sections_ ? device_sections_reader_t {&sections_.value()} : device_sections_reader_t {});
         if (status.failed()) return status;
-        compactor_.template emplace<cuda_compactor_t>(std::move(compactor));
-        return {};
+        return compactor_ref_t {&compactor_.template emplace<cuda_compactor_t>(std::move(compactor))};
     }
 
     /** Binds the compactor over @p executor, uploading run sections from memory, as no AMD device
      *  reads them by DMA. */
-    util::status_t bind_(util::hip_executor_t& executor, util::gpu_drivers_t const&, util::resources_config_t const&,
-                         volume_t const&) noexcept {
+    util::expected<compactor_ref_t> bind_(util::hip_executor_t& executor, util::gpu_drivers_t const&,
+                                          util::resources_config_t const&, volume_t const&) noexcept {
         auto [compactor, status] = hip_compactor_t::make(executor);
         if (status.failed()) return status;
-        compactor_.template emplace<hip_compactor_t>(std::move(compactor));
-        return {};
+        return compactor_ref_t {&compactor_.template emplace<hip_compactor_t>(std::move(compactor))};
     }
 
     /** Binds the compactor over @p executor, uploading run sections from memory, as no Apple device
      *  reads them by DMA. */
-    util::status_t bind_(util::metal_executor_t& executor, util::gpu_drivers_t const&, util::resources_config_t const&,
-                         volume_t const&) noexcept {
+    util::expected<compactor_ref_t> bind_(util::metal_executor_t& executor, util::gpu_drivers_t const&,
+                                          util::resources_config_t const&, volume_t const&) noexcept {
         auto [compactor, status] = metal_compactor_t::make(executor);
         if (status.failed()) return status;
-        compactor_.template emplace<metal_compactor_t>(std::move(compactor));
-        return {};
+        return compactor_ref_t {&compactor_.template emplace<metal_compactor_t>(std::move(compactor))};
     }
 
     /** Opens the reader over every raw medium of @p resources, or over the run files of @p volume
@@ -472,14 +464,17 @@ class device_compaction {
 template <cpu_class_t cpu_class_>
 struct database_state {
 
-    /** The budgets and the mount the store views its router and channels from. */
-    util::resources_shared_ptr<atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>> resources;
+    /** The budgets and the mount the store views its router and channels from, declared first so
+     *  it dies last. */
+    util::shared_resources<atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>> resources;
 
-    /** What every device merge of the store runs on, empty for host merges, outliving the store. */
-    std::optional<device_compaction<cpu_class_>> compaction;
+    /** What every device merge of the store runs on, unopened for host merges, outliving the
+     *  store. */
+    device_compaction<cpu_class_> compaction;
 
-    /** The store itself, unmounted before the mount underneath it is torn down. */
-    std::unique_ptr<basic_database_of<cpu_class_>> store;
+    /** The store itself, whose collections go without flushing before the compaction and the
+     *  mount underneath it are torn down. */
+    basic_database_of<cpu_class_> store {resources};
 
     /** The shape every collection this database creates takes. */
     collection_config_t collection_shape;
@@ -497,18 +492,11 @@ struct database_state {
      *  through the class's atomic reference. */
     std::size_t open_readers = 0;
 
-    database_state() noexcept = default;
+    /** Sizes the budgets as @p config names them, leaving the mount to @c open_state. */
+    explicit database_state(util::resources_config_t const& config) noexcept
+        : resources(config.memory_limit, config.gpu_memory_limit) {}
     database_state(database_state const&) = delete;
     database_state& operator=(database_state const&) = delete;
-
-    /** Lets the store's collections go without flushing them, then unmounts the storage under
-     *  it, before letting both go, since a collection or buffer may keep the resources alive
-     *  past the database. */
-    ~database_state() noexcept {
-        store.reset();
-        if (resources) { [[maybe_unused]] util::status_t const released = resources->storage.unmount(); }
-        resources.reset();
-    }
 };
 
 /** What a transaction holds, behind its transaction handle of the C ABI. */
@@ -529,7 +517,7 @@ struct transaction_state {
 
     transaction_state(database_state<cpu_class_>& owner,
                       typename basic_database_of<cpu_class_>::transaction_unique_ptr_t&& opened) noexcept
-        : state(owner), strings(*owner.store), held(std::move(opened)) {
+        : state(owner), strings(owner.store), held(std::move(opened)) {
         strings.join(*held);
     }
 };
@@ -624,7 +612,7 @@ database_state<cpu_class_>& database_state_of(arguments_type_ const& arguments) 
 template <cpu_class_t cpu_class_>
 util::expected<typename basic_database_of<cpu_class_>::transaction_unique_ptr_t> begin_transaction(
     database_state<cpu_class_>& state, transaction_config_t const& shape) noexcept {
-    return state.store->create_transaction(shape);
+    return state.store.create_transaction(shape);
 }
 
 #pragma endregion Handles
@@ -672,25 +660,17 @@ constexpr watch_schedule_t schedule_of(ustore_watch_t watch) noexcept {
     return watch == ustore_watch_keys_k ? watch_schedule_t::on_commit_k : watch_schedule_t::never_k;
 }
 
-/** One set of blocking queues of @p threads threads for a call naming no NVMe executor, freed when
- *  the call returns, at the 1 MiB shape of @c blocking_queues_config_k, which reach a database on
- *  any files transport and never open a ring, an AIO context or an SPDK queue pair. */
-inline util::expected<util::nvme_queues_t> make_call_queues(std::size_t threads) noexcept {
-    st::vector<fu_memory_domain_id_t> memory_domains;
-    if (memory_domains.resize(threads, fu_memory_domain_id_t {-1}) != st::status_t::success_k)
-        return util::status_t {util::status_code_t::out_of_memory_k, "A call could not size its queues"};
-    return util::nvme_queues_t::make(util::io_transport_t::blocking_k, util::blocking_queues_config_k, memory_domains);
-}
-
 /** The queue set a call running on @p view's thread reads and writes on: its NVMe executor's, at
- *  its thread, else the queues of the router's frame, built here on this first ask, one thread per
- *  slot of the call, which refuse every transfer if they do not fit. */
+ *  its thread, else the blocking queues of a VRAM executor or of the router's frame, which open on
+ *  first use, so a call that never reaches a queue never pays for one. A set that fails to open
+ *  stays empty, and its first channel ask answers @c out_of_memory_k. */
 inline nvme_queues_ref_t nvme_queues_of(view_t const& view) noexcept {
     if (util::nvme_queues_t* const own = nvme_queues_of(view.executor)) return {own, view.thread_index};
     if (view.queues && view.queues->threads() == 0) {
-        std::size_t const slots = view.executor ? view.executor->scratches.size() : 1;
-        auto [made, make_status] = make_call_queues(slots);
-        if (make_status.succeeded()) *view.queues = std::move(made);
+        fu_memory_domain_id_t const anywhere = -1;
+        auto [made, made_status] = util::nvme_queues_t::make(util::io_transport_t::blocking_k,
+                                                             util::blocking_queues_config_k, {&anywhere, 1});
+        if (made_status.succeeded()) *view.queues = std::move(made);
     }
     return {view.queues, view.thread_index};
 }
@@ -752,11 +732,11 @@ util::status_t read_at_one_state(call_access<cpu_class_>& access,
     if (one && access.reading && access.reading->id() == collections[0]) return {};
     access.reading = nullptr;
     if (!one) {
-        access.stamp = access.state.store->ledger().pin_reader(access.pin);
+        access.stamp = access.state.store.ledger().pin_reader(access.pin);
         return {};
     }
-    auto [taken, taken_status] = access.state.store->read_collection(collections[0], head_stamp_k,
-                                                                     access.queues.thread_index);
+    auto [taken, taken_status] = access.state.store.read_collection(collections[0], head_stamp_k,
+                                                                    access.queues.thread_index);
     if (taken_status.failed()) return taken_status;
     held = std::move(taken);
     access.reading = &held;
@@ -769,7 +749,7 @@ template <cpu_class_t cpu_class_, typename reads_type_>
 util::status_t with_reading(call_access<cpu_class_> const& access, collection_id_t collection, std::size_t thread_index,
                             reads_type_&& reads) noexcept {
     if (access.reading && access.reading->id() == collection) return reads(*access.reading);
-    auto [taken, taken_status] = access.state.store->read_collection(collection, read_stamp_of(access), thread_index);
+    auto [taken, taken_status] = access.state.store.read_collection(collection, read_stamp_of(access), thread_index);
     if (taken_status.failed()) return taken_status;
     return reads(taken);
 }
@@ -818,7 +798,7 @@ util::expected<util::value_view_t> fold_own_change(call_access<cpu_class_> const
         base = committed.size() ? std::span<util::byte_t const> {committed.begin(), committed.size()}
                                 : std::span<util::byte_t const> {empty_value_bytes_k, 0};
     util::value_view_t folded {};
-    util::status_t const visited = access.state.store->visit_store(
+    util::status_t const visited = access.state.store.visit_store(
         collection,
         [&]<typename store_type_>(store_type_&) noexcept -> status_t {
             util::arena_allocator<util::byte_t> arena {access.scratch};
@@ -845,7 +825,7 @@ util::expected<util::value_view_t> fold_own_change(call_access<cpu_class_> const
 template <cpu_class_t cpu_class_>
 util::expected<util::value_view_t> read_committed_value(call_access<cpu_class_> const& access,
                                                         collection_id_t collection, stored_key_t key) noexcept {
-    basic_database_of<cpu_class_>& store = *access.state.store;
+    basic_database_of<cpu_class_>& store = access.state.store;
     util::value_view_t read {};
     util::status_t const visited = with_reading(
         access, collection, access.queues.thread_index,
@@ -929,7 +909,7 @@ util::status_t write_value(call_access<cpu_class_> const& access, collection_id_
                            util::value_view_t value) noexcept {
     stored_value_view_t const bytes {value};
     if (!access.transaction) {
-        basic_database_of<cpu_class_>& store = *access.state.store;
+        basic_database_of<cpu_class_>& store = access.state.store;
         return value ? store.insert(collection, key, bytes, access.queues)
                      : store.remove(collection, key, access.queues);
     }
@@ -975,7 +955,7 @@ struct own_write_t {
 template <cpu_class_t cpu_class_, typename visitor_type_>
 util::status_t walk(call_access<cpu_class_> const& access, collection_id_t collection, stored_key_t from,
                     visitor_type_&& visitor, scan_direction_t direction = scan_direction_t::ascending_k) noexcept {
-    basic_database_of<cpu_class_>& store = *access.state.store;
+    basic_database_of<cpu_class_>& store = access.state.store;
     if (!access.transaction)
         return with_reading(access, collection, access.queues.thread_index,
                             [&](collection_reading_of<cpu_class_> const& reading) noexcept {
@@ -1085,7 +1065,7 @@ template <cpu_class_t cpu_class_, typename keys_type_>
 util::status_t collect_keys_unordered(call_access<cpu_class_> const& access, collection_id_t collection,
                                       stored_key_t lower, stored_key_t upper, std::size_t limit,
                                       keys_type_& keys) noexcept {
-    basic_database_of<cpu_class_>& store = *access.state.store;
+    basic_database_of<cpu_class_>& store = access.state.store;
     return with_reading(access, collection, access.queues.thread_index,
                         [&](collection_reading_of<cpu_class_> const& reading) noexcept -> status_t {
                             auto [counted, counted_status] = store.runs_count(reading);
@@ -1127,7 +1107,7 @@ template <cpu_class_t cpu_class_>
 util::status_t settle(database_state<cpu_class_>& state, ustore_durability_t durability,
                       nvme_queues_ref_t queues) noexcept {
     if (durability != ustore_durability_flushed_k) return {};
-    return state.store->flush(queues);
+    return state.store.flush(queues);
 }
 
 /**
@@ -1150,7 +1130,7 @@ util::status_t commit_one_collection(database_state<cpu_class_>& state, ustore_a
     // Growth ends, as each round at least doubles the buffer up to the format's ceiling
     for (std::size_t conflicts = 0; conflicts <= state.commit_conflicts_limit;) {
         // Declared first, so the transaction it joins dies before it does.
-        strings_transaction_of<cpu_class_> strings {*state.store};
+        strings_transaction_of<cpu_class_> strings {state.store};
         auto [held, begin_status] = begin_transaction(state, shape);
         if (begin_status.failed()) return begin_status;
         strings.join(*held);
@@ -1207,8 +1187,7 @@ template <cpu_class_t cpu_class_>
 util::status_t collection_modality(database_state<cpu_class_>& state, collection_id_t const& collection,
                                    ustore_modality_t& modality) noexcept {
     std::uint16_t store_tag = 0;
-    if (util::status_t const held = state.store->collection_store_tag(collection, store_tag); held.failed())
-        return held;
+    if (util::status_t const held = state.store.collection_store_tag(collection, store_tag); held.failed()) return held;
     modality = modality_of(store_tag);
     return {};
 }
@@ -1234,8 +1213,8 @@ util::status_t create_collection(database_state<cpu_class_>& state, nvme_queues_
     std::uint16_t const store_tag = store_tag_for(modality, shape);
     if (store_tags_t::index_of(store_tag) == std::size(store_tags_k))
         return {util::status_code_t::unsupported_k, "No store holds that modality and layout"};
-    return state.store->create_collection(collection, util::string_view_t {name}, store_tag, shape, flushed_with,
-                                          queues);
+    return state.store.create_collection(collection, util::string_view_t {name}, store_tag, shape, flushed_with,
+                                         queues);
 }
 
 /** Lays the record of a collection of @p store_tag shaped as @p shape and named @p name out
@@ -1304,7 +1283,7 @@ util::status_t resolve_runs(database_state<cpu_class_>& state, view_t const& vie
         if (index != 0 && collection == collections[index - 1]) continue;
         if (reserved(collection)) return {util::status_code_t::not_found_k, "No such collection"};
         std::uint16_t store_tag = 0;
-        if (util::status_t const listed = state.store->listed_store_tag(collection, stamp, store_tag, thread_index);
+        if (util::status_t const listed = state.store.listed_store_tag(collection, stamp, store_tag, thread_index);
             listed.failed())
             return listed;
         if (util::status_t const admitted = admit_modality(modality_of(store_tag), modality); admitted.failed())
@@ -1345,7 +1324,7 @@ util::status_t visit_strings(call_access<cpu_class_> const& access, collection_i
                              visitor_type_&& visitor) noexcept {
     return with_reading(
         access, collection, access.queues.thread_index, [&](collection_reading_of<cpu_class_> const& read) noexcept {
-            return access.state.store->visit_reading(
+            return access.state.store.visit_reading(
                 read,
                 [&]<typename store_type_>(store_type_& store, typename store_type_::reading_t const& reading) noexcept {
                     if constexpr (std::is_same_v<store_type_, strings_store_of<cpu_class_>>)
@@ -1545,7 +1524,7 @@ util::status_t walk_window_strings(call_access<cpu_class_> const& access, collec
     if (!descending) walked = walk_strings(access, collection, window.prefix, lower, merged);
     else {
         // The window's start is inclusive, so the walk starts below the least string past it.
-        st::vector<char> below;
+        st::vector<char, util::arena_allocator<char>> below {{access.scratch}};
         if (!window.upper().empty()) {
             if (below.resize(window.upper().size() + 1) != st::status_t::success_k)
                 return {util::status_code_t::out_of_memory_k, "A walk could not hold where it starts"};
@@ -1816,11 +1795,11 @@ util::status_t drop_collection(database_state<cpu_class_>& state, dropping_guard
                 return unnamed;
         if (util::status_t const unlisted = write_value(head, collections_collection_k, listed, {}); unlisted.failed())
             return unlisted;
-        if (util::status_t const unlisted = state.store->unlist_collection(collection); unlisted.failed())
+        if (util::status_t const unlisted = state.store.unlist_collection(collection); unlisted.failed())
             return unlisted;
     }
     // The unlisting reaches a run in the same manifest that stops naming the collection
-    return state.store->drop_collection(collection, collections_collection_k, queues);
+    return state.store.drop_collection(collection, collections_collection_k, queues);
 }
 
 /** Counts one reader of @p state closed. */
@@ -1847,9 +1826,9 @@ util::status_t database_describe(ustore_database_describe_t const& arguments, vi
             .engine = ustore_engine_nvme_k,
             .isolation = ustore_isolation_snapshot_k,
             .cpu_class = static_cast<ustore_cpu_class_t>(cpu_class_),
-            .keys = static_cast<ustore_size_t>(state.store->population_count()),
-            .memory_bytes = static_cast<ustore_size_t>(state.resources->memory_constraint.used()),
-            .disk_bytes = static_cast<ustore_size_t>(state.store->size_bytes()),
+            .keys = static_cast<ustore_size_t>(state.store.population_count()),
+            .memory_bytes = static_cast<ustore_size_t>(state.resources.memory_constraint.used()),
+            .disk_bytes = static_cast<ustore_size_t>(state.store.size_bytes()),
             .unpinned_staging_bytes = static_cast<ustore_size_t>(queues ? queues->unpinned_staging_bytes() : 0),
             .requests_across_registered_slots = static_cast<ustore_size_t>(
                 queues ? queues->requests_across_registered_slots() : 0),
@@ -1884,7 +1863,7 @@ util::status_t database_clear(ustore_database_clear_t const& arguments, view_t c
                                                               listed[index].entry.modality, mode);
         if (cleared.failed()) return cleared;
     }
-    if (util::status_t const flushed = state.store->flush(queues); flushed.failed()) return flushed;
+    if (util::status_t const flushed = state.store.flush(queues); flushed.failed()) return flushed;
     return compact_due(state, view);
 }
 
@@ -1900,7 +1879,7 @@ class compaction_fan_out {
   public:
     using disk_t = typename storage_mount_of<cpu_class_>::disk_t;
 
-    compaction_fan_out(util::pool_view_t pool, util::nvme_queues_t& queues, disk_t& disk, view_t const& caller) noexcept
+    compaction_fan_out(fu::pool_t& pool, util::nvme_queues_t& queues, disk_t& disk, view_t const& caller) noexcept
         : pool_(pool), queues_(queues), disk_(disk), scratch_(caller.scratch) {}
 
     /** One slice per thread of the pool. */
@@ -1921,7 +1900,7 @@ class compaction_fan_out {
             [[maybe_unused]] util::status_t const read_drained = disk_.drain(channels.reading->queue_pair());
             [[maybe_unused]] util::status_t const write_drained = disk_.drain(channels.writing->queue_pair());
         };
-        if (st::failed(pool_.for_n_dynamic(statuses.size(), run_slice)))
+        if (fu::failed(pool_.for_n_dynamic(statuses.size(), run_slice)))
             return {util::status_code_t::internal_k, "The executor's idle pool refused a fork"};
         for (util::status_t const& status : statuses)
             if (status.failed()) return status;
@@ -1930,7 +1909,7 @@ class compaction_fan_out {
 
   private:
     /** The executor's pool, idle but for this call's forks. */
-    util::pool_view_t pool_;
+    fu::pool_t& pool_;
 
     /** The queue set of the executor the call holds, whose thread @c t rings serve slice @c t. */
     util::nvme_queues_t& queues_;
@@ -1954,11 +1933,10 @@ class queues_fan_out {
         if (!queues) return;
         auto fan_out_on = [&]<typename mount_type_>(mount_type_& mount) noexcept {
             if constexpr (std::is_same_v<mount_type_, storage_mount_of<cpu_class_>>)
-                fan_out_ = compaction_fan_out_t {
-                    threads_.emplace(view.executor->pool.view(), *queues, mount.disk(), view)};
+                fan_out_ = compaction_fan_out_t {threads_.emplace(view.executor->threads, *queues, mount.disk(), view)};
             return util::status_t {};
         };
-        [[maybe_unused]] util::status_t const visited = state.resources->storage.visit(fan_out_on);
+        [[maybe_unused]] util::status_t const visited = state.resources.storage.visit(fan_out_on);
     }
 
     queues_fan_out(queues_fan_out const&) = delete;
@@ -1979,9 +1957,9 @@ class queues_fan_out {
  *  queue set of the call on @p view, whatever queue set that is. */
 template <cpu_class_t cpu_class_>
 util::status_t compact_due(database_state<cpu_class_>& state, view_t const& view) noexcept {
-    for (std::size_t pass = 0; pass != compaction_passes_k && state.store->needs_compaction(); ++pass) {
+    for (std::size_t pass = 0; pass != compaction_passes_k && state.store.needs_compaction(); ++pass) {
         queues_fan_out<cpu_class_> const fanned {state, view};
-        if (util::status_t const compacted = state.store->compact(fanned.fan_out(), nvme_queues_of(view));
+        if (util::status_t const compacted = state.store.compact(fanned.fan_out(), nvme_queues_of(view));
             compacted.failed())
             return compacted;
     }
@@ -2019,10 +1997,10 @@ struct nvme_variant<cpu_class_>::compact_plan_t {
 
     /** Runs the current phase's task on the calling thread, which @p context names. */
     util::status_t run(task_t const&, view_t const& context) noexcept {
-        if (phase_ == phase_t::flush_k) return database->store->flush(nvme_queues_of(context));
-        if (phase_ != phase_t::merge_k || !database->store->needs_compaction()) return {};
+        if (phase_ == phase_t::flush_k) return database->store.flush(nvme_queues_of(context));
+        if (phase_ != phase_t::merge_k || !database->store.needs_compaction()) return {};
         queues_fan_out<cpu_class_> const fanned {*database, context};
-        return database->store->compact(fanned.fan_out(), nvme_queues_of(context));
+        return database->store.compact(fanned.fan_out(), nvme_queues_of(context));
     }
 
     /** The barrier between phases and passes, one caller after the task ran: picks the next pass or
@@ -2078,7 +2056,7 @@ util::expected<void*> compact_plan_open(ustore_database_compact_t const& argumen
  *  manifest naming them. */
 template <cpu_class_t cpu_class_>
 util::status_t database_flush(ustore_database_flush_t const& arguments, view_t const& view) noexcept {
-    return database_state_of<cpu_class_>(arguments).store->flush(nvme_queues_of(view));
+    return database_state_of<cpu_class_>(arguments).store.flush(nvme_queues_of(view));
 }
 
 #pragma endregion Database Calls
@@ -2166,7 +2144,7 @@ util::status_t collection_create(ustore_collection_create_t const& arguments, vi
         return made;
     }
     if (!name.empty())
-        if (util::status_t const flushed = state.store->flush(queues); flushed.failed()) return flushed;
+        if (util::status_t const flushed = state.store.flush(queues); flushed.failed()) return flushed;
     *arguments.collection = created;
     return {};
 }
@@ -2188,7 +2166,7 @@ util::status_t collection_drop(ustore_collection_drop_t const& arguments, view_t
         if (util::status_t const dropped = drop_collection(state, dropping, view.scratch, queues, collection);
             dropped.failed())
             return dropped;
-        return state.store->flush(queues);
+        return state.store.flush(queues);
     }
     auto [entry, look_up_status] = look_up(state, view.scratch, queues, collection);
     if (look_up_status == util::status_code_t::not_found_k)
@@ -2392,7 +2370,7 @@ template <cpu_class_t cpu_class_>
 util::status_t reserve_collection(database_state<cpu_class_>& state, nvme_queues_ref_t queues,
                                   collection_id_t const& collection, std::string_view name, ustore_modality_t modality,
                                   collection_config_t const& shape) noexcept {
-    if (state.store->has_collection(collection)) return {};
+    if (state.store.has_collection(collection)) return {};
     return create_collection(state, queues, collection, name, modality, shape);
 }
 
@@ -2402,14 +2380,14 @@ util::status_t reserve_collection(database_state<cpu_class_>& state, nvme_queues
 template <cpu_class_t cpu_class_>
 util::status_t drop_unlisted(database_state<cpu_class_>& state, ustore_arena_t scratch,
                              nvme_queues_ref_t queues) noexcept {
-    st::vector<collection_ids_t> const held = state.store->list_collections();
+    st::vector<collection_ids_t> const held = state.store.list_collections();
     util::status_t first;
     for (std::size_t index = 0; index != held.size() && first.succeeded(); ++index) {
         ustore_collection_id_t const id = held[index].id;
         if (reserved(id)) continue;
         auto [entry, look_up_status] = look_up(state, scratch, queues, id);
         if (look_up_status == util::status_code_t::not_found_k)
-            first = state.store->drop_collection(id, collection_invalid_id_k, queues);
+            first = state.store.drop_collection(id, collection_invalid_id_k, queues);
         else if (look_up_status.failed()) first = look_up_status;
     }
     if (first.failed()) return first;
@@ -2420,7 +2398,7 @@ util::status_t drop_unlisted(database_state<cpu_class_>& state, ustore_arena_t s
     collections_guard<cpu_class_> const guarded {state};
     call_access<cpu_class_> const head {state, nullptr, watch_schedule_t::never_k, scratch, head_stamp_k, queues};
     for (listed_collection_t const& collection : listed) {
-        if (state.store->has_collection(collection.id)) continue;
+        if (state.store.has_collection(collection.id)) continue;
         if (!collection.entry.name.empty())
             if (util::status_t const unnamed = write_name(state, scratch, queues, collection.entry.name, nullptr);
                 unnamed.failed())
@@ -2441,16 +2419,14 @@ util::expected<compactor_ref_t> compactor_of(database_state<cpu_class_>& state,
                                              ustore_executor_handle_t const* compactions) noexcept {
     if (!compactions) return compactor_ref_t {};
     typename device_compaction<cpu_class_>::volume_t const* volume = nullptr;
-    [[maybe_unused]] util::status_t const visited = state.resources->storage.visit(
+    [[maybe_unused]] util::status_t const visited = state.resources.storage.visit(
         [&]<typename mount_type_>(mount_type_& mount) noexcept -> status_t {
             if constexpr (std::is_same_v<mount_type_, storage_mount_of<cpu_class_>>) volume = &mount.volume();
             return {};
         });
     if (!volume)
         return util::status_t {util::status_code_t::unsupported_k, "The engine mounts its volumes on files alone"};
-    device_compaction<cpu_class_>& compaction = state.compaction.emplace();
-    if (util::status_t const opened = compaction.open(*compactions, resources, *volume); opened.failed()) return opened;
-    return compaction.compactor();
+    return state.compaction.open(*compactions, resources, *volume);
 }
 
 /** Mounts the store of @p state over the storage its resources opened, which must be the one on files, merging on
@@ -2458,10 +2434,10 @@ util::expected<compactor_ref_t> compactor_of(database_state<cpu_class_>& state,
 template <cpu_class_t cpu_class_>
 util::status_t mount_store(database_state<cpu_class_>& state, database_config_t const& transactions,
                            compactor_ref_t compactor, nvme_queues_ref_t queues) noexcept {
-    return state.resources->storage.visit([&]<typename mount_type_>(mount_type_& mount) noexcept -> status_t {
+    return state.resources.storage.visit([&]<typename mount_type_>(mount_type_& mount) noexcept -> status_t {
         if constexpr (std::is_same_v<mount_type_, storage_mount_of<cpu_class_>>)
-            return state.store->mount(mount.volume(), queues, transactions, compactor,
-                                      util::strings_kit_sha256<strings_kit_of<cpu_class_>> {});
+            return state.store.mount(mount.volume(), queues, transactions, compactor,
+                                     util::strings_kit_sha256<strings_kit_of<cpu_class_>> {});
         else return {util::status_code_t::unsupported_k, "The engine mounts its volumes on files alone"};
     });
 }
@@ -2476,19 +2452,14 @@ util::status_t open_state(database_state<cpu_class_>& state, util::resources_con
                           ustore_executor_handle_t const* compactions) noexcept {
     state.collection_shape = shape;
     state.transaction_shape = transactions.default_transaction;
-    auto [opened, open_status] =
-        util::open_resources<atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>>(resources,
-                                                                                                         queues);
-    if (open_status.failed()) return open_status;
-    state.resources = std::move(opened);
-    state.store.reset(new (std::nothrow) basic_database_of<cpu_class_> {state.resources});
-    if (!state.store) return util::status_t {util::status_code_t::out_of_memory_k, "No room for the store"};
+    if (util::status_t const opened = util::open_resources(state.resources, resources, queues); opened.failed())
+        return opened;
     auto [compactor, compactor_status] = compactor_of(state, resources, compactions);
     if (compactor_status.failed()) return compactor_status;
     if (util::status_t const mounted = mount_store(state, transactions, compactor, queues); mounted.failed())
         return mounted;
     if (transactions.access == util::medium_access_t::read_only_k) {
-        if (!state.store->has_collection(collections_collection_k) || !state.store->has_collection(names_collection_k))
+        if (!state.store.has_collection(collections_collection_k) || !state.store.has_collection(names_collection_k))
             return {util::status_code_t::malformed_k, "The database holds no system collections"};
         return {};
     }
@@ -2536,7 +2507,7 @@ util::status_t nvme_variant<cpu_class_>::open(ustore_database_open_nvme_t const&
         return read;
     if (access == access_t::read_only_k) resources.access = transactions.access = util::medium_access_t::read_only_k;
     auto [made, status] = make_handle<ustore_database_handle_t, database_state<cpu_class_>>(
-        nvme_variant<cpu_class_>::engine_k);
+        nvme_variant<cpu_class_>::engine_k, resources);
     if (status.failed()) return status;
     if (util::status_t const opened = open_state<cpu_class_>(*made.state, resources, transactions,
                                                              create_collection_config(collections), view.scratch,
@@ -2544,7 +2515,7 @@ util::status_t nvme_variant<cpu_class_>::open(ustore_database_open_nvme_t const&
         opened.failed())
         return opened;
     made.handle->access = access;
-    made.handle->admitted_executors = made.state->resources->storage.report().transport ==
+    made.handle->admitted_executors = made.state->resources.storage.report().transport ==
                                               util::io_transport_t::linux_spdk_k
                                           ? executor_admission_t::nvme_executor_k
                                           : executor_admission_t::no_ram_executor_k;
@@ -2552,7 +2523,7 @@ util::status_t nvme_variant<cpu_class_>::open(ustore_database_open_nvme_t const&
     // named limit harvests no topology
     made.state->commit_conflicts_limit = static_cast<std::size_t>(arguments.commit_conflicts_limit);
     if (!made.state->commit_conflicts_limit) {
-        auto [topology, topology_status] = util::topology_t::make();
+        auto [topology, topology_status] = util::harvest_topology();
         made.state->commit_conflicts_limit = commit_conflicts_budget(topology.logical_cores_count());
     }
     *arguments.database = made.release();
@@ -2593,7 +2564,7 @@ util::status_t snapshot_init(ustore_snapshot_init_t const& arguments, view_t con
     if (status.failed()) return status;
     // Counted before its stamp is pinned, so no drop runs while it reads
     if (!open_reader(state)) return {util::status_code_t::contended_k, "A collection drop is in progress"};
-    transaction_stamp_t const stamp = state.store->ledger().pin_reader(made.state->pin);
+    transaction_stamp_t const stamp = state.store.ledger().pin_reader(made.state->pin);
     if (arguments.read_stamp) *arguments.read_stamp = static_cast<ustore_stamp_t>(stamp);
     *arguments.snapshot = made.release();
     return {};
@@ -2657,22 +2628,22 @@ util::status_t save_strings(call_access<cpu_class_> const& access, collection_id
 template <cpu_class_t cpu_class_>
 util::status_t save_collection(call_access<cpu_class_> const& access, collection_ids_t const& collection,
                                database_state<cpu_class_>& target, util::progress_t& progress) noexcept {
-    basic_database_of<cpu_class_>& store = *access.state.store;
+    basic_database_of<cpu_class_>& store = access.state.store;
     std::uint16_t store_tag = 0;
     if (util::status_t const held = store.collection_store_tag(collection.id, store_tag); held.failed()) return held;
-    if (!target.store->has_collection(collection.id)) {
+    if (!target.store.has_collection(collection.id)) {
         collection_config_t config;
         if (util::status_t const shaped = store.collection_config(collection.id, config); shaped.failed())
             return shaped;
-        if (util::status_t const made = target.store->create_collection(
-                collection.id, collection.name.view(), store_tag, config, collection_invalid_id_k, access.queues);
+        if (util::status_t const made = target.store.create_collection(collection.id, collection.name.view(), store_tag,
+                                                                       config, collection_invalid_id_k, access.queues);
             made.failed())
             return made;
     }
 
     // One window of keys is one commit's memory run of the target, which it lands without a flush in between
     collection_config_t config;
-    if (util::status_t const shaped = target.store->collection_config(collection.id, config); shaped.failed())
+    if (util::status_t const shaped = target.store.collection_config(collection.id, config); shaped.failed())
         return shaped;
     std::size_t const window = config.memory_runs_max_deltas;
     if (entry_layout_of(modality_of(store_tag)) == entry_layout_t::strings_to_uuids_k)
@@ -2699,7 +2670,7 @@ util::status_t save_collection(call_access<cpu_class_> const& access, collection
                                                          access.stamp, access.queues);
                 read.failed())
                 return read;
-            if (util::status_t const written = target.store->insert(
+            if (util::status_t const written = target.store.insert(
                     collection.id, key, stored_value_view_t {value.data(), copied}, access.queues);
                 written.failed())
                 return written;
@@ -2753,7 +2724,7 @@ util::status_t snapshot_save(ustore_snapshot_save_t const& arguments, view_t con
     auto report = [&](std::uint64_t placed, std::uint64_t total) noexcept {
         return !arguments.progress || arguments.progress(placed, total, arguments.progress_state) != ustore_cancel_k;
     };
-    auto [archive, archive_status] = source.store->save(
+    auto [archive, archive_status] = source.store.save(
         target, access.stamp, report, util::strings_kit_sha256<strings_kit_of<cpu_class_>> {}, access.queues);
     // A cancelled or failed save gave back every run it placed, and the directory it made
     // goes with them
@@ -2785,7 +2756,7 @@ void pin_call(ustore_database_t database, ustore_collection_id_t const* collecti
     database_state<cpu_class_>& state = *state_of<database_state<cpu_class_>>(database);
     if (collection) {
         // A collection gone since the call resolved it is left to the verbs, which refuse it.
-        auto [taken, taken_status] = state.store->read_collection(*collection, head_stamp_k, view.thread_index);
+        auto [taken, taken_status] = state.store.read_collection(*collection, head_stamp_k, view.thread_index);
         if (taken_status.succeeded()) {
             pin.reading = new (pin.room) reading_t {std::move(taken)};
             pin.release = [](call_pin_t& pinned) noexcept {
@@ -2795,7 +2766,7 @@ void pin_call(ustore_database_t database, ustore_collection_id_t const* collecti
         }
     }
     pin_t* const held = new (pin.room) pin_t {};
-    pin.stamp = static_cast<ustore_stamp_t>(state.store->ledger().pin_reader(*held));
+    pin.stamp = static_cast<ustore_stamp_t>(state.store.ledger().pin_reader(*held));
     pin.release = [](call_pin_t& pinned) noexcept { std::launder(reinterpret_cast<pin_t*>(pinned.room))->~pin_t(); };
 }
 
@@ -2837,7 +2808,7 @@ util::status_t changes_cursor_init(ustore_changes_cursor_init_t const& arguments
     if (!feed) return {util::status_code_t::out_of_memory_k, "No room for the change feed"};
     feed->handed.stamp = static_cast<transaction_stamp_t>(arguments.since_stamp);
     feed->handed.stored_key = limit<stored_key_t>::max_k;
-    util::status_t const pinned = state.store->pin_feed(arguments.collection, feed->pin, feed->handed.stamp);
+    util::status_t const pinned = state.store.pin_feed(arguments.collection, feed->pin, feed->handed.stamp);
     if (pinned.failed()) {
         delete feed;
         return pinned;
@@ -2852,7 +2823,7 @@ util::status_t changes_cursor_next(ustore_changes_cursor_next_t const& arguments
     using stored_change_t = typename basic_database_of<cpu_class_>::stored_change_t;
     changes_state<cpu_class_>& feed = *static_cast<changes_state<cpu_class_>*>(arguments.cursor->state);
     database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
-    ustore_collection_id_t const collection = arguments.cursor->cursor.collection;
+    ustore_collection_id_t const collection = arguments.cursor->walk.collection;
     // A dropped collection lingers while a snapshot may read it, so the listing tells if it is gone
     auto [entry, look_up_status] = look_up(state, view.scratch, nvme_queues_of(view), collection);
     if (look_up_status.failed()) return look_up_status;
@@ -2886,8 +2857,8 @@ util::status_t changes_cursor_next(ustore_changes_cursor_next_t const& arguments
         handed = change;
         return {};
     };
-    if (util::status_t const pulled = state.store->changes_after(collection, feed.handed, arguments.wanted, take,
-                                                                 nvme_queues_of(view));
+    if (util::status_t const pulled = state.store.changes_after(collection, feed.handed, arguments.wanted, take,
+                                                                nvme_queues_of(view));
         pulled.failed())
         return pulled;
 

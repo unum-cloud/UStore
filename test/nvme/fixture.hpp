@@ -25,7 +25,7 @@
 
 #include <array>       // `std::array`
 #include <filesystem>  // `std::filesystem::directory_iterator`, `std::filesystem::copy`, `std::filesystem::rename`
-#include <memory>      // `std::unique_ptr`, `std::make_shared`
+#include <memory>      // `std::unique_ptr`, `std::shared_ptr`, `std::make_shared`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
 #include <type_traits> // `std::is_same_v`
@@ -42,7 +42,7 @@
 
 #include "ustore/utilities/nvme_queues.hpp"    // `nvme_queues_t`, `io_transport_t`
 #include "ustore/blobs/nvme_store.hpp"         // `lookup_result_t`, `commit_ledger`, `stamp_pin`
-#include "ustore/utilities/nvme_mounts.hpp"    // `shared_resources`, `resources_shared_ptr`
+#include "ustore/utilities/nvme_mounts.hpp"    // `shared_resources`
 #include "ustore/utilities/blocking_files.hpp" // `read_file`, `file_buffering_t`
 #include "ustore/utilities/nvme_manifest.hpp"  // `manifest_t`, `manifest_file_t`
 #include "ustore/utilities/nvme_volume.hpp"    // `basic_directory_volume`, `volume_config_t`, `data_address_t`
@@ -69,7 +69,7 @@ using linux_uring_files_disk_t = util::linux_uring_files_disk<atomic_reference, 
 using linux_aio_files_disk_t = util::linux_aio_files_disk<atomic_reference, waiter_t>;
 using resource_constraint_t = util::resource_constraint<atomic_reference>;
 using resources_t = util::shared_resources<atomic_reference, waiter_t>;
-using resources_shared_ptr_t = util::resources_shared_ptr<atomic_reference, waiter_t>;
+using resources_shared_ptr_t = std::shared_ptr<resources_t>;
 using commit_ledger_t = commit_ledger<atomic_reference, waiter_t>;
 using stamp_pin_t = stamp_pin<atomic_reference, waiter_t>;
 using countdown_t = util::countdown<atomic_reference, waiter_t>;

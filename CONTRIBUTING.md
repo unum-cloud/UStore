@@ -168,7 +168,7 @@ Per-thread scratch belongs to the executor that owns the threads.
 
 ### Threads and Placement
 
-Threads, topology and domain-placed memory come from ForkUnion's C ABI in `forkunion/forkunion.h`, wrapped once by the C++ `ram_executor_t` of `include/ustore/utilities/ram_device.hpp` and the arenas of `include/ustore/utilities/ram_buffers.hpp`; nothing else calls `fu_*` directly.
+Threads, topology and domain-placed memory come from ForkUnion's C ABI in `forkunion/forkunion.h`, reached through ForkUnion's C++ `fu::pool_t`, which `include/ustore/utilities/ram_device.hpp` spawns, and the arenas of `include/ustore/utilities/ram_buffers.hpp`; nothing else calls `fu_*` directly.
 The executor holds its threads as `threads_t`, a variant of the `fu_pool_t` its factories spawn through `fu_topology_new`, `fu_pool_new` and `fu_pool_spawn` and its destructor deletes, or of `fu::dummy_pool_t`, the calling thread alone, which `on_calling_thread()` builds with no topology probe, pool or spawn; it forwards C++ callables to either through a C callback.
 The arenas place their blocks with `fu_allocate_on_domain_id` and release them with `fu_free_on_domain_id`.
 
@@ -178,7 +178,7 @@ These principles hold in `include/` and `src/`, and the other three libraries st
 2. Ownership is a type.
    - Who frees a resource, and which call uses it exclusively, are types such as `io_channel_t&` and `claimed_channels_t`, never a `bool` or a raw pointer.
 3. Threads belong to an executor.
-   - The `ram_executor_t` of an executor handle creates every thread, and `nvme_queues_t` creates its queues but no thread.
+   - The `fu::pool_t` of an executor handle creates every thread, and `nvme_queues_t` creates its queues but no thread.
    - An NVMe executor has one reading and one writing queue per thread, plus the pair at index `threads` for I/O run on the calling thread.
    - Nothing creates a thread inside a verb, no verb naming an executor creates a queue, and nothing runs that no one called.
 4. Warm calls allocate nothing.

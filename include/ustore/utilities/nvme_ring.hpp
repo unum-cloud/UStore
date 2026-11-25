@@ -30,6 +30,7 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::int32_t`, `std::uint8_t`, `std::uint16_t`, `std::uint32_t`, `std::uint64_t`, `std::uintptr_t`
 
+#include <array>    // `std::array`
 #include <concepts> // `std::same_as`
 #include <span>     // `std::span`
 #include <utility>  // `std::exchange`
@@ -950,6 +951,35 @@ concept a_releasing_disk = requires(disk_type_& disk) { disk.release(); };
 
 /** Spins over a ring that never blocks, so a bounded wait needs no fiber and no interrupt. */
 inline constexpr std::size_t poll_spin_limit_k = std::size_t {1} << 30;
+
+/** Completions one drain discards at a time. */
+inline constexpr std::size_t drain_batch_k = 32;
+
+/** Fruitless polls a drain tolerates before it stops what is still held back. */
+inline constexpr std::size_t drain_patience_k = 1024;
+
+/** Polls a drain performs before it calls the queue broken. */
+inline constexpr std::size_t drain_spin_limit_k = std::size_t {1} << 24;
+
+/**
+ *  @brief Finishes and discards everything @p queue_pair of @p disk has outstanding, polling,
+ *      and cancelling what is still held back after @c drain_patience_k fruitless polls.
+ *  @tparam waiter_type_ What the polling core does after a poll that moved nothing.
+ */
+template <typename waiter_type_, typename disk_type_>
+    requires a_disk<disk_type_>
+status_t drain_by_polling(disk_type_& disk, queue_ref_t const& queue_pair) noexcept {
+    std::array<completion_t, drain_batch_k> discarded {};
+    for (std::size_t spins = 0; spins != drain_spin_limit_k; ++spins) {
+        if (disk.outstanding(queue_pair) == 0) return {};
+        auto [moved, poll_completions_status] = disk.poll_completions(queue_pair, std::span<completion_t> {discarded});
+        if (poll_completions_status.failed()) return poll_completions_status;
+        if (moved != 0) continue;
+        if (spins == drain_patience_k) disk.cancel(queue_pair);
+        waiter_type_ {}(&spins, spins, std::size_t {0});
+    }
+    return {status_code_t::io_k, "The queue would not drain"};
+}
 
 /**
  *  @brief Reaps until @p wanted completions are in @p into, or the spin budget runs out.

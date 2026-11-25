@@ -147,7 +147,7 @@ char const doc_graph_write_edges[] =                                            
 typedef struct edges_write_call_t {
 
     /** What the call keeps until it finishes. */
-    ustore_py_call_t call;
+    ustore_py_call_t kept;
 
     /** The edges and the options the call names. */
     edge_batches_t batches;
@@ -160,7 +160,7 @@ static void edges_remove_submit(void* arguments) { ustore_graph_remove_edges((us
 static void edges_write_release(void* erased) {
     edges_write_call_t* const call = (edges_write_call_t*)erased;
     edge_batches_release(&call->batches);
-    ustore_py_call_release(&call->call);
+    ustore_py_call_release(&call->kept);
 }
 
 static ustore_py_verb_t const edges_write_verb = {sizeof(edges_write_call_t), edges_write_submit,
@@ -184,7 +184,7 @@ static edges_write_call_t* edges_write_open(PyObject* self, char const* name, us
     if (!call) return NULL;
     if (edge_batches_from_args(context, name, arguments, positional_arguments_count, keyword_names_tuple,
                                &call->batches) == 0) {
-        call->call.collection = call->batches.options.collection;
+        call->kept.collection = call->batches.options.collection;
         return call;
     }
     ustore_py_call_discard(context, verb, call);
@@ -203,11 +203,11 @@ PyObject* ustore_py_api_graph_write_edges(PyObject* self, PyObject* const* argum
     ustore_graph_write_edges_t write = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .transaction = context.transaction,
         .count = batches->sources.count,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .edges = {batches->edges.keys, sizeof(ustore_key_t)},
         .sources = {batches->sources.keys, sizeof(ustore_key_t)},
         .targets = {batches->targets.keys, sizeof(ustore_key_t)},
@@ -244,11 +244,11 @@ PyObject* ustore_py_api_graph_remove_edges(PyObject* self, PyObject* const* argu
     ustore_graph_remove_edges_t remove = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .transaction = context.transaction,
         .count = batches->sources.count,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .edges = {batches->edges.keys, sizeof(ustore_key_t)},
         .sources = {batches->sources.keys, sizeof(ustore_key_t)},
         .targets = {batches->targets.keys, sizeof(ustore_key_t)},
@@ -315,7 +315,7 @@ char const doc_graph_read_edges[] =                                             
 typedef struct edges_read_call_t {
 
     /** What the call keeps until it finishes: the outcome and the arena holding the degrees and the edges. */
-    ustore_py_call_t call;
+    ustore_py_call_t kept;
 
     /** The vertices whose edges are read. */
     ustore_py_keys_t vertices;
@@ -337,7 +337,7 @@ static void edges_read_submit(void* arguments) { ustore_graph_read_edges((ustore
 
 static PyObject* neighborhoods_answer(void* erased) {
     edges_read_call_t const* const call = (edges_read_call_t const*)erased;
-    return neighborhoods_new(call->call.arena, call->edges, call->edges_offsets, call->degrees, call->vertices.count);
+    return neighborhoods_new(call->kept.arena, call->edges, call->edges_offsets, call->degrees, call->vertices.count);
 }
 
 static PyObject* degrees_answer(void* erased) {
@@ -348,7 +348,7 @@ static PyObject* degrees_answer(void* erased) {
 static void edges_read_release(void* erased) {
     edges_read_call_t* const call = (edges_read_call_t*)erased;
     ustore_py_keys_release(&call->vertices);
-    ustore_py_call_release(&call->call);
+    ustore_py_call_release(&call->kept);
 }
 
 static ustore_py_verb_t const neighborhoods_verb = {sizeof(edges_read_call_t), edges_read_submit, neighborhoods_answer,
@@ -373,17 +373,17 @@ static PyObject* edges_read_run(ustore_py_context_t const* context, ustore_py_ve
     ustore_graph_read_edges_t read = {
         .database = context->database_handle,
         .executor = ustore_py_context_executor(context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context->completion,
         .view = context->view,
         .count = call->vertices.count,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .vertices = {call->vertices.keys, sizeof(ustore_key_t)},
         .roles = {&call->role, 0},
         .degrees_per_vertex = &call->degrees,
         .edges_offsets = exports_edges ? &call->edges_offsets : NULL,
         .edges_per_vertex = exports_edges ? &call->edges : NULL,
-        .arena = ustore_py_arena_handle(call->call.arena),
+        .arena = ustore_py_arena_handle(call->kept.arena),
     };
     return ustore_py_call_run(context, verb, call, &read);
 }
@@ -402,10 +402,10 @@ static PyObject* edges_read(PyObject* self, char const* name, ustore_py_verb_t c
     edges_read_call_t* const call = ustore_py_call_open(&context, verb, &stack);
     if (!call) return NULL;
     if (ustore_py_keys_from_object(arguments[0], &call->vertices) != 0 ||
-        ustore_py_arena_from_object(arguments[1], &call->call.arena) != 0)
+        ustore_py_arena_from_object(arguments[1], &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, verb, call);
     call->role = role;
-    call->call.collection = options.collection;
+    call->kept.collection = options.collection;
     return edges_read_run(&context, verb, call);
 }
 
@@ -463,13 +463,13 @@ PyObject* ustore_py_api_graph_contains(PyObject* self, PyObject* const* argument
     call->vertices.count = 1;
     PyObject* const arena = ustore_py_arena_new(ustore_py_context_executor(&context));
     if (!arena || ustore_py_key_from_object(arguments[0], call->vertices.inline_keys) != 0 ||
-        ustore_py_arena_from_object(arena, &call->call.arena) != 0) {
+        ustore_py_arena_from_object(arena, &call->kept.arena) != 0) {
         Py_XDECREF(arena);
         return ustore_py_call_discard(&context, &contains_verb, call);
     }
     Py_DECREF(arena);
     call->role = ustore_vertex_role_any_k;
-    call->call.collection = options.collection;
+    call->kept.collection = options.collection;
     return edges_read_run(&context, &contains_verb, call);
 }
 
@@ -493,7 +493,7 @@ char const doc_graph_write_vertices[] =                                         
 typedef struct vertices_write_call_t {
 
     /** What the call keeps until it finishes. */
-    ustore_py_call_t call;
+    ustore_py_call_t kept;
 
     /** The vertices to write or remove, or inclusive starts of ranges when @c ends holds any. */
     ustore_py_keys_t vertices;
@@ -517,7 +517,7 @@ static void vertices_write_release(void* erased) {
     vertices_write_call_t* const call = (vertices_write_call_t*)erased;
     ustore_py_keys_release(&call->vertices);
     ustore_py_keys_release(&call->ends);
-    ustore_py_call_release(&call->call);
+    ustore_py_call_release(&call->kept);
 }
 
 static ustore_py_verb_t const vertices_write_verb = {sizeof(vertices_write_call_t), vertices_write_submit,
@@ -543,15 +543,15 @@ PyObject* ustore_py_api_graph_write_vertices(PyObject* self, PyObject* const* ar
     if (!call) return NULL;
     if (ustore_py_keys_from_object(arguments[0], &call->vertices) != 0)
         return ustore_py_call_discard(&context, &vertices_write_verb, call);
-    call->call.collection = options.collection;
+    call->kept.collection = options.collection;
     ustore_graph_write_vertices_t write = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .transaction = context.transaction,
         .count = call->vertices.count,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .vertices = {call->vertices.keys, sizeof(ustore_key_t)},
         .durability = options.durability,
         .watch = context.watch,
@@ -600,15 +600,15 @@ PyObject* ustore_py_api_graph_remove_vertices(PyObject* self, PyObject* const* a
         ustore_py_ends_from_object(given[1], &call->vertices, &call->ends) != 0)
         return ustore_py_call_discard(&context, &vertices_remove_verb, call);
     call->role = (ustore_vertex_role_t)role;
-    call->call.collection = options.collection;
+    call->kept.collection = options.collection;
     ustore_graph_remove_vertices_t remove = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .transaction = context.transaction,
         .count = call->vertices.count,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .vertices = {call->vertices.keys, sizeof(ustore_key_t)},
         .end_vertices = ustore_py_ends_view(&call->ends),
         .roles = {&call->role, 0},

@@ -133,7 +133,7 @@ status_t changes_cursor_init(ustore_changes_cursor_init_t const& arguments, usto
 status_t changes_cursor_next(ustore_changes_cursor_next_t const& arguments, view_t const& view) {
     ustore_changes_cursor_handle_t& cursor = *arguments.cursor;
     changes_feed_t& feed = *static_cast<changes_feed_t*>(cursor.state);
-    database_t& database = *state_of<database_t>(cursor.cursor.database);
+    database_t& database = *state_of<database_t>(cursor.walk.database);
     std::size_t const wanted = arguments.wanted;
 
     st::vector<ustore_key_t, arena_allocator<ustore_key_t>> keys {{view.scratch}};
@@ -144,7 +144,7 @@ status_t changes_cursor_next(ustore_changes_cursor_next_t const& arguments, view
     changes_feed_t resumed = feed;
 
     std::shared_lock lock {database.columns_mutex};
-    column_t* const column = column_of(database, cursor.cursor.collection);
+    column_t* const column = column_of(database, cursor.walk.collection);
     if (!column) return {status_code_t::not_found_k, "The collection was dropped"};
 
     std::unique_ptr<::rocksdb::TransactionLogIterator> batches;
@@ -211,7 +211,7 @@ status_t changes_cursor_next(ustore_changes_cursor_next_t const& arguments, view
 }
 
 void changes_cursor_free(ustore_changes_cursor_t cursor) noexcept {
-    database_t& database = *state_of<database_t>(cursor->cursor.database);
+    database_t& database = *state_of<database_t>(cursor->walk.database);
     [[maybe_unused]] native_status_t const enabled = database.native->EnableFileDeletions();
     delete static_cast<changes_feed_t*>(cursor->state);
     cursor->state = nullptr;

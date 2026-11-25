@@ -779,7 +779,7 @@ typedef struct ingest_loop_t {
 typedef struct arrow_call_t {
 
     /** What the call keeps until it finishes. */
-    ustore_py_call_t call;
+    ustore_py_call_t kept;
 
     /** The stream the loop reads, released once the loop ends. */
     struct ArrowArrayStream stream;
@@ -994,7 +994,7 @@ static PyObject* arrow_answer(void* erased) {
 static void arrow_release(void* erased) {
     arrow_call_t* const call = (arrow_call_t*)erased;
     if (call->stream.release) call->stream.release(&call->stream);
-    ustore_py_call_release(&call->call);
+    ustore_py_call_release(&call->kept);
 }
 
 static ustore_py_verb_t const import_verb = {sizeof(arrow_call_t), import_submit, arrow_answer, arrow_release};
@@ -1087,15 +1087,15 @@ PyObject* ustore_py_api_import_arrow(PyObject* self, PyObject* const* arguments,
     arrow_call_t stack;
     arrow_call_t* const call = ustore_py_call_open(&context, &import_verb, &stack);
     if (!call) return NULL;
-    call->call.collection = options.collection;
+    call->kept.collection = options.collection;
     if (stream_from_object(arguments[0], &call->stream, &call->single) != 0)
         return ustore_py_call_discard(&context, &import_verb, call);
     import_loop_t loop = {
         .arrow = {.database = context.database_handle,
-                  .collection = call->call.collection,
+                  .collection = call->kept.collection,
                   .durability = options.durability,
                   .stream = &call->stream,
-                  .outcome = &call->call.outcome,
+                  .outcome = &call->kept.outcome,
                   .written = &call->written},
         .transaction = context.transaction,
         .watch = context.watch,
@@ -1119,15 +1119,15 @@ PyObject* ustore_py_api_ingest_arrow(PyObject* self, PyObject* const* arguments,
     arrow_call_t stack;
     arrow_call_t* const call = ustore_py_call_open(&context, &ingest_verb, &stack);
     if (!call) return NULL;
-    call->call.collection = options.collection;
+    call->kept.collection = options.collection;
     if (stream_from_object(arguments[0], &call->stream, &call->single) != 0)
         return ustore_py_call_discard(&context, &ingest_verb, call);
     ingest_loop_t loop = {
         .arrow = {.database = context.database_handle,
-                  .collection = call->call.collection,
+                  .collection = call->kept.collection,
                   .durability = options.durability,
                   .stream = &call->stream,
-                  .outcome = &call->call.outcome,
+                  .outcome = &call->kept.outcome,
                   .written = &call->written},
         .order = order,
     };

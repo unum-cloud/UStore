@@ -4,7 +4,7 @@
  *  @date September 30, 2026
  *  @brief Timed loops, latency histograms, result rows and the flags every benchmark shares.
  *
- *  A row runs one body on every thread of an @c ram_executor_t, each thread iterating its own
+ *  A row runs one body on every thread of an @c fu::pool_t, each thread iterating its own
  *  @c loop_t in a range-for, and folds the loops into one @c row_t. Setup above the range-for
  *  stays untimed. Every call lands in its thread's latency histogram, so p50, p99 and p99.9
  *  cost no shared writes.
@@ -46,7 +46,7 @@
 
 #include <smashtable/basic_vector.hpp>
 
-#include "ustore/utilities/ram_device.hpp" // `ram_executor_t`
+#include "ustore/utilities/ram_device.hpp" // `fu::pool_t`
 
 #include "arguments.hpp"
 
@@ -423,13 +423,13 @@ class loop_t {
  *  @param[in] body Called as `body(loop, thread)` on each thread; setup above its loop stays untimed.
  */
 template <typename body_type_>
-[[nodiscard]] row_t run_threads(util::ram_executor_t& executor, bench_settings_t const& settings, std::string_view name,
+[[nodiscard]] row_t run_threads(fu::pool_t& executor, bench_settings_t const& settings, std::string_view name,
                                 body_type_&& body) noexcept {
     st::vector<loop_t> loops;
     if (st::failed(loops.resize(executor.threads_count()))) return {.name = name, .skipped = "no memory for loops"};
     time_point_t const warmup_until = steady_clock_t::now() + settings.warmup;
     for (loop_t& loop : loops) loop = loop_t {warmup_until, warmup_until + settings.time_limit};
-    if (st::failed(executor.for_threads([&](std::size_t thread) noexcept { body(loops[thread], thread); })))
+    if (fu::failed(executor.for_threads([&](std::size_t thread) noexcept { body(loops[thread], thread); })))
         return {.name = name, .skipped = "the pool refused the dispatch"};
     return fold(name, loops);
 }
@@ -441,14 +441,14 @@ template <typename body_type_>
  *  @param[in] body Called as `body(loop, thread)` on each thread; setup above its loop stays untimed.
  */
 template <typename body_type_>
-[[nodiscard]] row_t run_pass(util::ram_executor_t& executor, std::string_view name, std::size_t count,
+[[nodiscard]] row_t run_pass(fu::pool_t& executor, std::string_view name, std::size_t count,
                              body_type_&& body) noexcept {
     st::vector<loop_t> loops;
     std::size_t const threads = executor.threads_count();
     if (st::failed(loops.resize(threads))) return {.name = name, .skipped = "no memory for loops"};
     for (std::size_t thread = 0; thread != threads; ++thread)
         loops[thread] = loop_t {count * thread / threads, count * (thread + 1) / threads};
-    if (st::failed(executor.for_threads([&](std::size_t thread) noexcept { body(loops[thread], thread); })))
+    if (fu::failed(executor.for_threads([&](std::size_t thread) noexcept { body(loops[thread], thread); })))
         return {.name = name, .skipped = "the pool refused the dispatch"};
     return fold(name, loops);
 }

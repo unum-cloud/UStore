@@ -44,7 +44,7 @@
 #include "ustore/blobs/nvme_tree.hpp"         // `transaction_config_t`, `lsm_tree_run_record_t`, `compaction_outcome_t`
 #include "ustore/utilities/folds.hpp"         // `a_fold`, `fold_delta_pair`, `delta_kind_t`
 #include "ustore/utilities/nvme_channels.hpp" // `io_channel_t`
-#include "ustore/utilities/nvme_mounts.hpp"   // `resources_shared_ptr`
+#include "ustore/utilities/nvme_mounts.hpp"   // `shared_resources`
 #include "ustore/utilities/nvme_ring.hpp"     // `notifier`
 #include "ustore/utilities/ram_buffers.hpp"   // `local_arena_t`, `arena_allocator`, `constrained_allocator`
 #include "ustore/utilities/types.hpp"         // `status_t`, `status_code_t`, `byte_t`, `bytes_span_t`, `as_bytes_view`
@@ -54,7 +54,7 @@ namespace unum::ustore::blobs {
 using utilities::constrained_allocator;
 using utilities::notifier;
 using utilities::nvme_queues_ref_t;
-using utilities::resources_shared_ptr;
+using utilities::shared_resources;
 
 #pragma region Transaction Deltas
 
@@ -164,7 +164,7 @@ class transaction_deltas {
 #pragma region Construction
 
     inline transaction_deltas(std::size_t capacity_bytes, std::size_t elements_max_count,
-                              resources_shared_ptr<atomic_reference_, waiter_type_> resources) noexcept;
+                              shared_resources<atomic_reference_, waiter_type_>& resources) noexcept;
 
     inline transaction_deltas(transaction_deltas const& other) = delete;
     inline transaction_deltas(transaction_deltas&& other) noexcept;
@@ -301,8 +301,8 @@ class transaction_deltas {
 
 #pragma region Private Members
 
-    /** The budget the deltas of every collection are charged to. */
-    resources_shared_ptr<atomic_reference_, waiter_type_> resources_;
+    /** The budget the deltas of every collection are charged to, which outlives them. */
+    shared_resources<atomic_reference_, waiter_type_>* resources_;
 
     /** The bytes @c insertions_buffer holds once sized. */
     std::size_t capacity_bytes_ = 0;
@@ -323,10 +323,10 @@ template <typename stored_key_type_, template <typename> typename atomic_referen
           typename row_kit_type_>
 inline transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::transaction_deltas(
     std::size_t capacity_bytes, std::size_t elements_max_count,
-    resources_shared_ptr<atomic_reference_, waiter_type_> resources) noexcept
-    : collections_by_id({}, {}, constrained_allocator<byte_t, atomic_reference_> {resources->memory_constraint}),
-      insertions_buffer(constrained_allocator<byte_t, atomic_reference_> {resources->memory_constraint}),
-      next_inserted_offset(0), resources_(resources), capacity_bytes_(capacity_bytes),
+    shared_resources<atomic_reference_, waiter_type_>& resources) noexcept
+    : collections_by_id({}, {}, constrained_allocator<byte_t, atomic_reference_> {resources.memory_constraint}),
+      insertions_buffer(constrained_allocator<byte_t, atomic_reference_> {resources.memory_constraint}),
+      next_inserted_offset(0), resources_(&resources), capacity_bytes_(capacity_bytes),
       elements_max_count_(elements_max_count), elements_count_(0) {}
 
 template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
@@ -334,7 +334,7 @@ template <typename stored_key_type_, template <typename> typename atomic_referen
 inline transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::transaction_deltas(
     transaction_deltas&& other) noexcept
     : collections_by_id(std::move(other.collections_by_id)), insertions_buffer(std::move(other.insertions_buffer)),
-      next_inserted_offset(other.next_inserted_offset), resources_(std::move(other.resources_)),
+      next_inserted_offset(other.next_inserted_offset), resources_(other.resources_),
       capacity_bytes_(other.capacity_bytes_), elements_max_count_(other.elements_max_count_),
       elements_count_(other.elements_count_), wanted_shape_(other.wanted_shape_) {}
 
@@ -944,8 +944,8 @@ class read_set {
                                                constrained_allocator<byte_t, atomic_reference_>, row_kit_type_>;
 
     /** A set charging @p resources for the keys it holds. */
-    explicit read_set(resources_shared_ptr<atomic_reference_, waiter_type_> const& resources) noexcept
-        : stored_keys({}, {}, constrained_allocator<byte_t, atomic_reference_> {resources->memory_constraint}) {}
+    explicit read_set(shared_resources<atomic_reference_, waiter_type_>& resources) noexcept
+        : stored_keys({}, {}, constrained_allocator<byte_t, atomic_reference_> {resources.memory_constraint}) {}
 
     /** Whether the transaction watches nothing. */
     bool empty() const noexcept { return stored_keys.empty(); }
@@ -1007,9 +1007,9 @@ class grouped_read_set {
                              constrained_allocator<byte_t, atomic_reference_>, row_kit_type_>;
 
     /** A set charging @p resources for the keys of every collection it watches. */
-    explicit grouped_read_set(resources_shared_ptr<atomic_reference_, waiter_type_> resources) noexcept
-        : resources(resources),
-          groups({}, {}, constrained_allocator<byte_t, atomic_reference_> {resources->memory_constraint}) {}
+    explicit grouped_read_set(shared_resources<atomic_reference_, waiter_type_>& resources) noexcept
+        : resources(&resources),
+          groups({}, {}, constrained_allocator<byte_t, atomic_reference_> {resources.memory_constraint}) {}
 
     /** Whether the transaction watches nothing anywhere. */
     bool empty() const noexcept { return count() == 0; }
@@ -1034,7 +1034,7 @@ class grouped_read_set {
         if (iterator == groups.end()) {
             if (groups.reserve_more(1) == groups_t::reserve_result_t::failed_k)
                 return {status_code_t::out_of_memory_k, "No room for another watched collection"};
-            groups.emplace(id, read_set_t {resources}, st::assume_reserved);
+            groups.emplace(id, read_set_t {*resources}, st::assume_reserved);
             iterator = groups.find(id);
             if (iterator == groups.end())
                 return {status_code_t::out_of_memory_k, "No room to seat the watched collection"};
@@ -1053,8 +1053,8 @@ class grouped_read_set {
     /** Drops every watch of every collection, for a transaction starting over. */
     void clear() noexcept { groups.clear(); }
 
-    /** The budget every watched collection's keys are charged to. */
-    resources_shared_ptr<atomic_reference_, waiter_type_> resources;
+    /** The budget every watched collection's keys are charged to, which outlives the set. */
+    shared_resources<atomic_reference_, waiter_type_>* resources;
 
     /** One watched-key set per collection the transaction touched. */
     groups_t groups;
@@ -1131,10 +1131,10 @@ struct transaction_state {
         st::vector<sealed_collection_t, constrained_allocator<sealed_collection_t, atomic_reference_>>;
 
     inline transaction_state(transaction_deltas_t&& written,
-                             resources_shared_ptr<atomic_reference_, waiter_type_> resources) noexcept
+                             shared_resources<atomic_reference_, waiter_type_>& resources) noexcept
         : deltas(std::move(written)), read_set(resources),
-          ranges(constrained_allocator<range_watch_t, atomic_reference_> {resources->memory_constraint}),
-          sealed(constrained_allocator<sealed_collection_t, atomic_reference_> {resources->memory_constraint}) {}
+          ranges(constrained_allocator<range_watch_t, atomic_reference_> {resources.memory_constraint}),
+          sealed(constrained_allocator<sealed_collection_t, atomic_reference_> {resources.memory_constraint}) {}
 
     /** Whether the transaction has neither written nor watched anything. */
     inline bool empty() const noexcept { return deltas.empty() && read_set.empty() && ranges.empty(); }
@@ -1290,9 +1290,8 @@ class transaction_registry {
 #pragma region Construction
 
     /** A registry committing into @p store, which outlives it. */
-    inline transaction_registry(store_t& store,
-                                resources_shared_ptr<atomic_reference_, waiter_type_> resources) noexcept
-        : store_(&store), resources_(std::move(resources)) {}
+    inline transaction_registry(store_t& store, shared_resources<atomic_reference_, waiter_type_>& resources) noexcept
+        : store_(&store), resources_(resources) {}
 
     inline transaction_registry(transaction_registry&&) = delete;
     inline transaction_registry(transaction_registry const&) = delete;
@@ -1367,8 +1366,8 @@ class transaction_registry {
     /** The store every commit of this registry lands in, owned by whoever named it. */
     store_t* store_;
 
-    /** The budget every transaction's writes and watches are charged to. */
-    resources_shared_ptr<atomic_reference_, waiter_type_> resources_;
+    /** The budget every transaction's writes and watches are charged to, outliving the registry. */
+    shared_resources<atomic_reference_, waiter_type_>& resources_;
 
 #pragma endregion Private Members
 };
@@ -1691,8 +1690,8 @@ class transaction_core {
      *  @param[in] resources The budget its watched keys are charged to.
      */
     transaction_core(registry_t& registry, transaction_deltas_t&& deltas,
-                     resources_shared_ptr<atomic_reference_, waiter_type_> resources) noexcept
-        : registry_(registry), data_(std::move(deltas), std::move(resources)) {
+                     shared_resources<atomic_reference_, waiter_type_>& resources) noexcept
+        : registry_(registry), data_(std::move(deltas), resources) {
         start_stamp_ = registry_.request_start_(pin_);
     }
 

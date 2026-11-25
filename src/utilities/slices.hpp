@@ -48,7 +48,6 @@ status_t for_tasks(view_t const& call, std::size_t count, task_type_&& task) noe
         return {};
     }
     if (!count) return {};
-    pool_view_t const pool = executor->pool.view();
     auto [statuses, statuses_status] = arena_allocate<status_t>(call.scratch, count);
     if (statuses_status.failed()) return statuses_status;
     for (status_t& status : statuses) status = {};
@@ -62,7 +61,7 @@ status_t for_tasks(view_t const& call, std::size_t count, task_type_&& task) noe
              index = claims.fetch_add(1, std::memory_order_relaxed))
             statuses[index] = task(index, sliced);
     };
-    if (st::failed(pool.for_threads(claim)))
+    if (fu::failed(executor->threads.for_threads(claim)))
         return {status_code_t::internal_k, "The executor's idle pool refused a fork"};
     for (status_t const& status : statuses)
         if (status.failed()) return status;
@@ -82,7 +81,7 @@ template <typename slice_type_>
 status_t for_task_slices(view_t const& call, std::size_t count, slice_type_&& slice) noexcept {
     if (!count) return {};
     std::size_t const words = divide_round_up(count, tasks_per_word_k);
-    std::size_t const runs = call.executor ? fu::min_of(words, call.executor->pool.view().threads_count()) : 1;
+    std::size_t const runs = call.executor ? fu::min_of(words, call.executor->threads.threads_count()) : 1;
     return for_tasks(call, runs, [&](std::size_t run, view_t const& sliced) noexcept -> status_t {
         std::size_t const first = run * words / runs * tasks_per_word_k;
         std::size_t const end = fu::min_of((run + 1) * words / runs * tasks_per_word_k, count);

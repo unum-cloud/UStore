@@ -45,7 +45,7 @@ util::status_t pull_through(engine_t const& engine, ustore_pages_cursor_next_t c
     if (written && arguments.values) {
         ustore_pages_read_t const read {.database = arguments.database,
                                         .count = written,
-                                        .collections = {&cursor.cursor.collection, 0},
+                                        .collections = {&cursor.walk.collection, 0},
                                         .keys = {survivors.data(), sizeof(ustore_key_t)},
                                         .values = arguments.values,
                                         .arena = arguments.arena,

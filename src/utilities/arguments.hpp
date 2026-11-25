@@ -18,7 +18,7 @@ concept a_call_naming_database = requires(arguments_type_ const& arguments) { ar
 
 /** Whether a call pulls through a cursor an init opened, keeping the database and view it reads. */
 template <typename arguments_type_>
-concept a_cursor_walker = requires(arguments_type_ const& arguments) { arguments.cursor->cursor; };
+concept a_cursor_walker = requires(arguments_type_ const& arguments) { arguments.cursor->walk; };
 
 /** Whether a call appends to or finishes an ingest an init opened. */
 template <typename arguments_type_>

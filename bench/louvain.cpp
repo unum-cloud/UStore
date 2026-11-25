@@ -649,7 +649,8 @@ int run_louvain(int argc, char** argv) {
                                                  "USTORE_MAX_LEVELS"};
 
     read_bench_settings(argc, argv, settings, flags, variables);
-    auto [executor, executor_status] = util::ram_executor_t::make(1, util::caller_exclusivity_t::caller_inclusive_k);
+    auto [topology, topology_status] = util::harvest_topology();
+    auto [executor, executor_status] = util::spawn_pool(topology, 1, fu::caller_inclusive_k, fu_capabilities_all_k);
     if (st::failed(executor_status)) {
         fmt::println(stderr, "Failed to pin the calling thread");
         return 1;

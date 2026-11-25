@@ -95,7 +95,7 @@ struct vertex_read_t {
 /** Whether @p key of @p collection held a vertex at the stamp @p access reads committed values at. */
 template <cpu_class_t cpu_class_>
 bool committed_vertex(call_access<cpu_class_> const& access, collection_id_t collection, stored_key_t key) noexcept {
-    return access.state.store->contains(collection, key, read_stamp_of(access), access.queues.thread_index);
+    return access.state.store.contains(collection, key, read_stamp_of(access), access.queues.thread_index);
 }
 
 /** Whether @p key of @p collection holds a vertex as @p access sees it, its own writes included. */
@@ -138,8 +138,8 @@ status_t read_vertices(call_access<cpu_class_> const& access, collection_id_t co
     };
     if (status_t const read = with_reading(access, collection, access.queues.thread_index,
                                            [&](collection_reading_of<cpu_class_> const& reading) noexcept {
-                                               return access.state.store->select(reading, access.scratch, keys, results,
-                                                                                 sink, access.queues);
+                                               return access.state.store.select(reading, access.scratch, keys, results,
+                                                                                sink, access.queues);
                                            });
         read.failed())
         return read;

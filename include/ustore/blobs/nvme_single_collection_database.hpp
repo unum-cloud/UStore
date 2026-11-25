@@ -35,7 +35,7 @@
 #include "ustore/blobs/nvme_transactions.hpp"   // `transaction_registry`, `transaction_core`, `an_nvme_store`
 #include "ustore/blobs/nvme_tree.hpp"           // `lsm_tree_run_record_t`, `lsm_tree_publication_hook_t`
 #include "ustore/utilities/nvme_manifest.hpp"   // `manifest_t`, `manifest_collection_t`, `manifest_file_t`
-#include "ustore/utilities/nvme_mounts.hpp"     // `resources_shared_ptr`
+#include "ustore/utilities/nvme_mounts.hpp"     // `shared_resources`
 #include "ustore/utilities/nvme_channels.hpp"   // `io_channel_t`, `basic_write_pipeline`, `basic_read_pipeline`
 #include "ustore/utilities/nvme_volume.hpp"     // `medium_extent_t`, `write_extent`, `read_extent`
 #include "ustore/utilities/types.hpp"           // `status_t`, `status_code_t`, `expected`
@@ -180,8 +180,8 @@ class single_collection_database_transaction {
      *  @param[in] resources The budget the watched keys are charged to.
      */
     single_collection_database_transaction(registry_t& manager, transaction_deltas_t&& deltas,
-                                           resources_shared_ptr<atomic_reference_, waiter_type_> resources) noexcept
-        : core_(manager, std::move(deltas), std::move(resources)) {}
+                                           shared_resources<atomic_reference_, waiter_type_>& resources) noexcept
+        : core_(manager, std::move(deltas), resources) {}
 
 #pragma endregion Construction
 
@@ -545,9 +545,8 @@ class basic_single_collection_database {
     static expected<database_unique_ptr_t> open(volume_t& volume, io_channel_t& writing_channel,
                                                 io_channel_t& merging_channel,
                                                 single_collection_database_config_t const& config,
-                                                resources_shared_ptr<atomic_reference_, waiter_type_> resources,
+                                                shared_resources<atomic_reference_, waiter_type_>& resources,
                                                 compactor_ref_t compactor = {}) noexcept {
-        if (!resources) return status_t {status_code_t::invalid_argument_k, "A database is charged to some budget"};
         if (&writing_channel == &merging_channel)
             return status_t {status_code_t::invalid_argument_k, "A compaction reads and writes on two channels"};
         database_unique_ptr_t opened {new (std::nothrow) basic_single_collection_database {
@@ -556,11 +555,11 @@ class basic_single_collection_database {
         // The collection's tree points into the pool and its views into the ledger, both members.
         std::size_t const capacity = volume.runs_capacity() < run_pool_capacity_k ? volume.runs_capacity()
                                                                                   : run_pool_capacity_k;
-        auto [pool, make_pool_status] = run_pool_t::make(1, capacity, resources->memory_constraint);
+        auto [pool, make_pool_status] = run_pool_t::make(1, capacity, resources.memory_constraint);
         if (make_pool_status.failed()) return make_pool_status;
         opened->runs_ = std::move(pool);
         auto [mounted, mount_collection_status] = collection_t::mount(
-            volume, config.collection, resources->memory_constraint, opened->ledger_, opened->runs_);
+            volume, config.collection, resources.memory_constraint, opened->ledger_, opened->runs_);
         if (mount_collection_status.failed()) return mount_collection_status;
         opened->collection_ = std::move(mounted);
         // A manifest the mount could not take back whole stays as it lies, never published over.
@@ -930,10 +929,10 @@ class basic_single_collection_database {
     /** Points the registry at this database; @c open fills the pool and the collection after. */
     basic_single_collection_database(volume_t& volume, io_channel_t& writing_channel, io_channel_t& merging_channel,
                                      single_collection_database_config_t const& config,
-                                     resources_shared_ptr<atomic_reference_, waiter_type_> resources,
+                                     shared_resources<atomic_reference_, waiter_type_>& resources,
                                      compactor_ref_t compactor) noexcept
         : volume_(volume), writing_channel_(writing_channel), merging_channel_(merging_channel), config_(config),
-          compactor_(compactor), resources_(resources), registry_(*this, std::move(resources)) {}
+          compactor_(compactor), resources_(resources), registry_(*this, resources) {}
 
     /**
      *  @brief Takes back the runs the manifest names, resumes the ledger above its durable stamp,
@@ -1174,7 +1173,7 @@ class basic_single_collection_database {
     status_t print_and_publish_(manifest_t const& manifest) noexcept {
         st::vector<char> json;
         if (status_t const printed = manifest.print(
-                constrained_allocator<byte_t, atomic_reference_> {resources_->memory_constraint}, json);
+                constrained_allocator<byte_t, atomic_reference_> {resources_.memory_constraint}, json);
             printed.failed())
             return printed;
         return volume_.publish_manifest(writing_channel_, std::span<char const> {json});
@@ -1248,7 +1247,7 @@ class basic_single_collection_database {
     std::array<typename collection_t::merge_buffers_t, 1> merge_buffers_ {};
 
     /** The budget the manifests this database prints are charged to. */
-    resources_shared_ptr<atomic_reference_, waiter_type_> resources_;
+    shared_resources<atomic_reference_, waiter_type_>& resources_;
 
     /** The order every transaction is placed in, and the last commit to write each key. */
     registry_t registry_;

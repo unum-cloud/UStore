@@ -51,7 +51,7 @@
 #include "ustore/blobs/nvme_tree.hpp"           // `lsm_tree_run_record_t`, `database_config_t`
 #include "ustore/utilities/nvme_manifest.hpp"   // `manifest_t`, `manifest_collection_t`, `manifest_file_t`
 #include "ustore/utilities/nvme_queues.hpp"     // `thread_channels_t`
-#include "ustore/utilities/nvme_mounts.hpp"     // `resources_shared_ptr`
+#include "ustore/utilities/nvme_mounts.hpp"     // `shared_resources`
 #include "ustore/utilities/nvme_ring.hpp"       // `portable_alignment_k`
 #include "ustore/utilities/algorithm.hpp"       // `radix_sort`
 #include "ustore/utilities/nvme_volume.hpp"     // `medium_extent_t`, `volume_config_t`
@@ -189,8 +189,8 @@ class database_transaction {
      *  @param[in] resources The budget its watched keys are charged to.
      */
     database_transaction(registry_t& manager, transaction_deltas_t&& deltas,
-                         resources_shared_ptr<atomic_reference_, waiter_type_> resources) noexcept
-        : core_(manager, std::move(deltas), std::move(resources)) {}
+                         shared_resources<atomic_reference_, waiter_type_>& resources) noexcept
+        : core_(manager, std::move(deltas), resources) {}
 
 #pragma endregion Construction
 
@@ -761,8 +761,8 @@ class basic_database {
     basic_database& operator=(basic_database&&) = delete;
 
     /** A database charging @p resources for every collection it opens, which @c mount then fills. */
-    explicit basic_database(resources_shared_ptr<atomic_reference_, waiter_type_> resources) noexcept
-        : resources_(std::move(resources)), transactions_(*this, resources_) {}
+    explicit basic_database(shared_resources<atomic_reference_, waiter_type_>& resources) noexcept
+        : resources_(resources), transactions_(*this, resources_) {}
 
     /** Lets every collection go without flushing or publishing, so unflushed commits are lost. */
     ~basic_database() noexcept { release_collections_(); }
@@ -793,7 +793,7 @@ class basic_database {
         config_ = config;
         compactor_ = compactor;
         auto [entries, entries_status] = entries_t::make(1, entries_t::capacity_max_k,
-                                                         catalog_allocator_t {resources_->memory_constraint});
+                                                         catalog_allocator_t {resources_.memory_constraint});
         entries_ = std::move(entries);
         status_t const opened = entries_status != st::status_t::success_k
                                     ? status_t {status_code_t::out_of_memory_k, "No room for the collections"}
@@ -1893,8 +1893,7 @@ class basic_database {
         transaction_deltas<stored_key_t, atomic_reference_, waiter_type_, row_kit_type_> const& written,
         sealed_commit<stored_key_t, atomic_reference_, row_kit_type_>& sealed, nvme_queues_ref_t queues = {}) noexcept {
         st::vector<keyed_delta<stored_key_t>, constrained_allocator<keyed_delta<stored_key_t>, atomic_reference_>>
-            deltas {
-                constrained_allocator<keyed_delta<stored_key_t>, atomic_reference_> {resources_->memory_constraint}};
+            deltas {constrained_allocator<keyed_delta<stored_key_t>, atomic_reference_> {resources_.memory_constraint}};
         if (deltas.reserve(written.count(collection_id)) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room to hand a commit over"};
         written.for_each_delta(collection_id, [&](stored_key_t stored_key, delta_view_t delta) noexcept {
@@ -2163,7 +2162,7 @@ class basic_database {
         if (config.database.empty()) config.database = volume_->manifest().database.view();
         auto [into, mount_status] = volume_t::mount(
             volume_->disk(), channel, config,
-            constrained_allocator<byte_t, atomic_reference_> {resources_->memory_constraint});
+            constrained_allocator<byte_t, atomic_reference_> {resources_.memory_constraint});
         if (mount_status.failed()) return mount_status;
         manifest_t const& held = into.manifest();
         st::vector<manifest_file_t const*> held_by_run;
@@ -2213,7 +2212,7 @@ class basic_database {
         }
         st::vector<char> json;
         if (failure.succeeded())
-            failure = manifest.print(constrained_allocator<byte_t, atomic_reference_> {resources_->memory_constraint},
+            failure = manifest.print(constrained_allocator<byte_t, atomic_reference_> {resources_.memory_constraint},
                                      json);
         if (failure.failed()) {
             for (medium_extent_t const& extent : placed) into.deallocate(extent);
@@ -2389,7 +2388,7 @@ class basic_database {
         std::unique_ptr<published_collections_t> next {new (std::nothrow) published_collections_t {}};
         if (!next || next->entries.reserve(collections_.size()) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room to publish the collections"};
-        catalog_allocator_t const allocator {resources_->memory_constraint};
+        catalog_allocator_t const allocator {resources_.memory_constraint};
         auto [by_id, ids_status] = ids_index_t::make(collections_.size(), {}, allocator);
         auto [by_name, names_status] = names_index_t::make(collections_.size(), {}, allocator);
         if (ids_status != st::status_t::success_k || names_status != st::status_t::success_k)
@@ -2706,9 +2705,7 @@ class basic_database {
      *  under @p claim; a call naming no queue set is refused, since only @c src/ builds queues
      *  for a call. */
     expected<claimed_channels_t> queues_channels_(nvme_queues_ref_t queues, claim_guard_t&& claim) noexcept {
-        if (!queues.queues) return status_t {status_code_t::invalid_argument_k, "A call names its queues"};
-        auto [channels, media_status] = queues.queues->both_channels_with_disk_media(queues.thread_index,
-                                                                                     volume_->disk());
+        auto [channels, media_status] = queues.both_channels(volume_->disk());
         if (media_status.failed()) return media_status;
         return claimed_channels_t {std::move(claim), volume_->disk(), channels};
     }
@@ -2761,14 +2758,14 @@ class basic_database {
                 std::size_t const capacity = volume_->runs_capacity() < run_pool_capacity_k ? volume_->runs_capacity()
                                                                                             : run_pool_capacity_k;
                 // The records grow in chunks that never move, from one record up to the capacity.
-                auto [made, make_status] = store_t::run_pool_t::make(1, capacity, resources_->memory_constraint);
+                auto [made, make_status] = store_t::run_pool_t::make(1, capacity, resources_.memory_constraint);
                 if (make_status.failed()) {
                     mounted = make_status;
                     return;
                 }
                 pool.template emplace<index_ + 1>(std::move(made));
             }
-            auto [store, mount_status] = store_t::mount(*volume_, entry.config, resources_->memory_constraint, ledger_,
+            auto [store, mount_status] = store_t::mount(*volume_, entry.config, resources_.memory_constraint, ledger_,
                                                         std::get<index_ + 1>(pool));
             mounted = mount_status;
             if (mount_status.succeeded()) entry.held.template emplace<index_>(std::move(store));
@@ -2954,9 +2951,9 @@ class basic_database {
         std::uint64_t const blocks = divide_round_up(from.extent.length, block_bytes);
 
         st::vector<byte_t, constrained_allocator<byte_t, atomic_reference_>> waiting {
-            constrained_allocator<byte_t, atomic_reference_> {resources_->memory_constraint}};
+            constrained_allocator<byte_t, atomic_reference_> {resources_.memory_constraint}};
         st::vector<std::uint64_t, constrained_allocator<std::uint64_t, atomic_reference_>> waiting_bytes {
-            constrained_allocator<std::uint64_t, atomic_reference_> {resources_->memory_constraint}};
+            constrained_allocator<std::uint64_t, atomic_reference_> {resources_.memory_constraint}};
         if (waiting.resize(hashed_window_k * block_bytes) != st::status_t::success_k ||
             waiting_bytes.resize(hashed_window_k, 0) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room for the hash wait blocks"};
@@ -3036,7 +3033,7 @@ class basic_database {
             return {status_code_t::out_of_memory_k, "No room to lay the manifest out"};
         for (placed_file_t const& entry : placed) [[maybe_unused]]
             st::status_t const named = manifest.files.push_back(st::assume_reserved, manifest_file_t {entry.file});
-        return manifest.print(constrained_allocator<byte_t, atomic_reference_> {resources_->memory_constraint}, json);
+        return manifest.print(constrained_allocator<byte_t, atomic_reference_> {resources_.memory_constraint}, json);
     }
 
     /** Names @p manifest after @p identity and lists every collection of this database in it. */
@@ -3249,7 +3246,7 @@ class basic_database {
 #pragma region Private Members
 
     /** The budget every collection and every transaction of this database charges. */
-    resources_shared_ptr<atomic_reference_, waiter_type_> resources_;
+    shared_resources<atomic_reference_, waiter_type_>& resources_;
 
     /** The stamps every commit of this database draws, a transaction's or a head write's, and the stamps pinned. */
     commit_ledger<atomic_reference_, waiter_type_> ledger_;

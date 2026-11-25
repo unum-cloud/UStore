@@ -283,12 +283,19 @@ struct io_channel_config_t {
 #pragma region Channel
 
 class nvme_queues_t;
+struct thread_channels_t;
 
 /** The queue set a call moves bytes on and the index of the thread running it, whose queues alone
  *  serve that thread. */
 struct nvme_queues_ref_t {
     nvme_queues_t* queues = nullptr;
     std::size_t thread_index = 0;
+
+    /** Both channels of this thread with @p disk's media registered, refusing a call that names no
+     *  queue set, since only @c src/ builds queues for a call. */
+    template <typename disk_type_>
+        requires a_disk<disk_type_>
+    expected<thread_channels_t> both_channels(disk_type_& disk) const noexcept;
 };
 
 template <typename disk_type_>

@@ -44,7 +44,7 @@ constexpr enumerator_spelling<ustore_docs_modification_t> docs_modification_name
 util::status_t copy_columns(ustore_docs_cursor_init_t const& arguments, ustore_docs_cursor_handle_t& cursor) noexcept {
     std::size_t const count = arguments.fields_count;
     if (!count) return {};
-    ustore_arena_t const compiled = &cursor.cursor.compiled;
+    ustore_arena_t const compiled = &cursor.walk.compiled;
     strings_arg_t fields;
     if (util::status_t const gathered = gather_strings({arguments.fields, count}, compiled, fields); gathered.failed())
         return gathered;
@@ -84,7 +84,7 @@ util::status_t fill_survivors(engine_t const& engine, ustore_docs_cursor_next_t 
         documents.count = picked.size();
         ustore_docs_read_t const read {.database = arguments.database,
                                        .count = picked.size(),
-                                       .collections = {&cursor.cursor.collection, 0},
+                                       .collections = {&cursor.walk.collection, 0},
                                        .keys = {keys.data(), sizeof(ustore_key_t)},
                                        .presences = &documents.presences,
                                        .values = &documents.tape,
@@ -126,10 +126,10 @@ util::status_t pull_through(engine_t const& engine, ustore_docs_cursor_next_t co
             ustore_key_t const* keys = nullptr;
             ustore_docs_scan_t const scan {.database = arguments.database,
                                            .count = 1,
-                                           .collections = {&cursor.cursor.collection, 0},
+                                           .collections = {&cursor.walk.collection, 0},
                                            .start_keys = {&from, 0},
                                            .end_keys = {end, 0},
-                                           .direction = cursor.cursor.direction,
+                                           .direction = cursor.walk.direction,
                                            .offsets = &offsets,
                                            .keys = &keys,
                                            .arena = arguments.arena,
@@ -141,7 +141,7 @@ util::status_t pull_through(engine_t const& engine, ustore_docs_cursor_next_t co
             keyed_survivors_t survivors {util::arena_allocator<ustore_key_t> {view.scratch}};
             std::variant<ustore_key_t, exhausted_t> resume;
             if (util::status_t const status = list_matched_keys<ustore_docs_scan_t>(
-                    engine.host, arguments.database, cursor.cursor.collection, from, end, cursor.cursor.direction,
+                    engine.host, arguments.database, cursor.walk.collection, from, end, cursor.walk.direction,
                     arguments.wanted, match, arguments.arena, view, survivors, resume);
                 status.failed())
                 return status;

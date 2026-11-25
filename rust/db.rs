@@ -3208,16 +3208,16 @@ impl<'arena> sealed::Calling for CollectionList<'arena> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ffi::ustore_outcome_t,
         completion: ffi::ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         Ok(Some(ffi::ustore_collection_list_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            snapshot: view.snapshot(),
+            snapshot: handles.snapshot(),
             collections: &mut self.collections.0,
             modalities: ptr::null_mut(),
             names: ptr::null_mut(),
@@ -3252,13 +3252,13 @@ impl sealed::Calling for CollectionDrop {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ffi::ustore_outcome_t,
         completion: ffi::ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         Ok(Some(ffi::ustore_collection_drop_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
             collection: self.collection,
@@ -3287,13 +3287,13 @@ impl sealed::Calling for Clear {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ffi::ustore_outcome_t,
         completion: ffi::ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         Ok(Some(ffi::ustore_database_clear_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
             mode: self.mode as ffi::ustore_enum_t,
@@ -3394,15 +3394,15 @@ impl<Plan: BorrowMut<CompactPlan>, Phase: BorrowMut<PhaseProgress>> sealed::Call
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ffi::ustore_outcome_t,
         completion: ffi::ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         let config = &mut self.config;
         let (progress, progress_state) = lowered_progress(&config.progress);
         Ok(Some(ffi::ustore_database_compact_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
             progress,
@@ -3443,13 +3443,13 @@ impl sealed::Calling for CompactPlanFinish {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ffi::ustore_outcome_t,
         completion: ffi::ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         Ok(Some(ffi::ustore_database_compact_plan_finish_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
             plan: self.plan.handle,
@@ -3475,13 +3475,13 @@ impl sealed::Calling for Flush {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ffi::ustore_outcome_t,
         completion: ffi::ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         Ok(Some(ffi::ustore_database_flush_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
         }))
@@ -3919,7 +3919,7 @@ pub(crate) mod sealed {
         /// The arguments point into `self`, so the verb stays in place until the call they feed is final.
         fn arguments(
             &mut self,
-            view: &Handles,
+            handles: &Handles,
             outcome: *mut ffi::ustore_outcome_t,
             completion: ffi::ustore_completion_t,
         ) -> Result<Option<Self::Arguments>>;
@@ -4264,9 +4264,9 @@ impl Executor {
     ///
     /// An empty list derives every domain the process may allocate on, and an identifier no domain
     /// holds is refused with [`Status::InvalidArgument`]. The scratch of each thread, and every
-    /// arena the executor makes, lives on the domains named. Zero `threads` takes 7/8 of the cores
-    /// those domains hold, rounded down and at least one, which leaves the rest to blocking calls
-    /// and to the background work of RocksDB and LevelDB.
+    /// arena the executor makes, lives on the domains named. Zero `threads` takes all but one in
+    /// eight of the cores those domains hold, and at least one, which leaves the rest to blocking
+    /// calls and to the background work of RocksDB and LevelDB.
     ///
     /// Calls `ustore_executor_for_ram`.
     pub fn for_ram(memory_domains: &[i32], threads: usize) -> Result<Self> {
@@ -4485,16 +4485,16 @@ impl sealed::Calling for Stage {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ffi::ustore_outcome_t,
         completion: ffi::ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         Ok(Some(ffi::ustore_transaction_stage_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            transaction: view.transaction(),
+            transaction: handles.transaction(),
             read_stamp: &mut self.stamp.0,
         }))
     }
@@ -4521,16 +4521,16 @@ impl sealed::Calling for Commit {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ffi::ustore_outcome_t,
         completion: ffi::ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         Ok(Some(ffi::ustore_transaction_commit_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            transaction: view.transaction(),
+            transaction: handles.transaction(),
             commit_stamp: &mut self.stamp.0,
             durability: self.durability,
         }))
@@ -4555,16 +4555,16 @@ impl sealed::Calling for Rollback {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ffi::ustore_outcome_t,
         completion: ffi::ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         Ok(Some(ffi::ustore_transaction_rollback_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            transaction: view.transaction(),
+            transaction: handles.transaction(),
         }))
     }
 
@@ -4590,15 +4590,15 @@ impl sealed::Calling for Reset {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ffi::ustore_outcome_t,
         completion: ffi::ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
-        self.transaction.0 = view.transaction();
+        self.transaction.0 = handles.transaction();
         Ok(Some(ffi::ustore_transaction_init_t {
             transaction: ptr::from_mut(&mut self.transaction.0).cast(),
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
         }))
@@ -4724,14 +4724,14 @@ impl<Path: AsRef<str>> sealed::Calling for Save<'_, Path> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ffi::ustore_outcome_t,
         completion: ffi::ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         let (progress, progress_state) = lowered_progress(&self.progress);
         Ok(Some(ffi::ustore_snapshot_save_t {
-            snapshot: view.snapshot(),
-            executor: view.executor(),
+            snapshot: handles.snapshot(),
+            executor: handles.executor(),
             outcome,
             completion,
             path: self.path.as_ref().as_bytes().into(),

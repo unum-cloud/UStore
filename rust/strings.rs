@@ -651,7 +651,7 @@ impl<Strs: Texts, Keys: AsRef<[Key]>> Calling for StringsWrite<'_, Strs, Keys> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -663,17 +663,17 @@ impl<Strs: Texts, Keys: AsRef<[Key]>> Calling for StringsWrite<'_, Strs, Keys> {
             return Err(fail(Status::InvalidArgument, "the batch holds a key per string"));
         }
         Ok(Some(ffi::ustore_strings_write_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            transaction: view.transaction(),
+            transaction: handles.transaction(),
             count: count as ustore_size_t,
             collections: self.collections.view(count)?,
             strings,
             values: ustore_strided_view_t::packed(keys),
             durability: self.durability,
-            watch: view.watch(),
+            watch: handles.watch(),
         }))
     }
 
@@ -700,7 +700,7 @@ impl<Strs: Texts> Calling for StringsRemove<'_, Strs> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -708,17 +708,17 @@ impl<Strs: Texts> Calling for StringsRemove<'_, Strs> {
             return Ok(None);
         };
         Ok(Some(ffi::ustore_strings_remove_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            transaction: view.transaction(),
+            transaction: handles.transaction(),
             count: count as ustore_size_t,
             collections: self.collections.view(count)?,
             strings,
             end_strings: ustore_strings_view_t::default(),
             durability: self.durability,
-            watch: view.watch(),
+            watch: handles.watch(),
         }))
     }
 
@@ -748,7 +748,7 @@ impl<'arena, Strs: Texts> Calling for StringsRead<'arena, '_, Strs> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -757,11 +757,11 @@ impl<'arena, Strs: Texts> Calling for StringsRead<'arena, '_, Strs> {
         };
         self.count = count;
         Ok(Some(ffi::ustore_strings_read_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            view: view.view(),
+            view: handles.view(),
             count: count as ustore_size_t,
             collections: self.collections.view(count)?,
             strings,
@@ -812,17 +812,17 @@ impl<'arena> Calling for StringsScan<'arena, '_, '_> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         let (progress, progress_state) = lowered_progress(&self.progress);
         Ok(Some(ffi::ustore_strings_scan_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            view: view.view(),
+            view: handles.view(),
             count: 1,
             collections: ustore_strided_view_t::repeated(&self.collection),
             prefixes: strings_view_of(&self.range.prefix),
@@ -873,16 +873,16 @@ impl<'arena> Calling for StringsSample<'arena> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         Ok(Some(ffi::ustore_strings_sample_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            view: view.view(),
+            view: handles.view(),
             count: 1,
             collections: ustore_strided_view_t::repeated(&self.collection),
             offsets: &mut self.offsets.0,
@@ -918,7 +918,7 @@ impl Calling for StringsMeasure<'_, '_> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -931,11 +931,11 @@ impl Calling for StringsMeasure<'_, '_> {
             max_space_usages,
         ] = &mut self.bounds.0;
         Ok(Some(ffi::ustore_strings_measure_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            view: view.view(),
+            view: handles.view(),
             count: 1,
             collections: ustore_strided_view_t::repeated(&self.collection),
             start_strings: strings_view_of(&self.range.0),
@@ -1003,18 +1003,18 @@ impl<Name: AsRef<str>> Calling for CollectionFind<'_, Name> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         let name = self.name.as_ref();
         self.offsets = [0, name.len() as u64];
         Ok(Some(db_ffi::ustore_collection_find_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            snapshot: view.snapshot(),
+            snapshot: handles.snapshot(),
             count: 1,
             names: ustore_strings_view_t::u64_tape(name.as_ptr(), self.offsets.as_ptr()),
             presences: &mut self.presences.0,
@@ -1088,16 +1088,16 @@ impl<'arena, Name: AsRef<str>> Calling for CollectionNames<'arena, Name> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         Ok(Some(db_ffi::ustore_collection_list_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            snapshot: view.snapshot(),
+            snapshot: handles.snapshot(),
             collections: ptr::null_mut(),
             modalities: ptr::null_mut(),
             names: &mut self.names,

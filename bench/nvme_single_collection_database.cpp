@@ -64,7 +64,7 @@ using atomic_reference = fu::standard_atomic_ref<value_type_>;
 using waiter_t = fu::standard_yield_t;
 
 using stored_key_t = std::uint64_t;
-using resources_ptr_t = resources_shared_ptr<atomic_reference, waiter_t>;
+using resources_t = shared_resources<atomic_reference, waiter_t>;
 
 /** Keys one batched select asks for. */
 constexpr std::size_t batch_keys_k = 256;
@@ -184,7 +184,7 @@ status_t settle(database_type_& database) noexcept {
  *  @p queues: thread @c t of the workload reads on thread @c t, and the database writes and
  *  merges on the last thread for its whole life. */
 template <value_layout_t layout_, typename mount_type_>
-status_t run_rows(mount_type_& mount, resources_ptr_t const& resources, util::nvme_queues_t& queues,
+status_t run_rows(mount_type_& mount, resources_t& resources, util::nvme_queues_t& queues,
                   nvme_single_collection_database_settings_t const& settings, workload_t const& workload) noexcept {
     using volume_t = typename mount_type_::volume_t;
     using slot_t = key_slot<stored_key_t, layout_>;
@@ -199,8 +199,9 @@ status_t run_rows(mount_type_& mount, resources_ptr_t const& resources, util::nv
     auto [database, open_status] = database_t::open(volume, *held.writing, *held.reading, database_config(workload),
                                                     resources);
     if (open_status.failed()) return open_status;
-    auto [executor, executor_status] = util::ram_executor_t::make(workload.threads,
-                                                                  util::caller_exclusivity_t::caller_inclusive_k);
+    auto [topology, topology_status] = util::harvest_topology();
+    auto [executor, executor_status] = util::spawn_pool(topology, workload.threads, fu::caller_inclusive_k,
+                                                        fu_capabilities_all_k);
     if (st::failed(executor_status)) return {status_code_t::out_of_memory_k, "The executor did not start"};
 
     // Inline and fixed layouts write values of their whole width, and the variable one draws a
@@ -342,16 +343,17 @@ status_t run_workload(nvme_single_collection_database_settings_t const& settings
     if (opening_status.failed()) return opening_status;
     status_t ran;
     {
-        auto const [resources, open_status] = open_resources<atomic_reference, waiter_t>(
-            config, util::nvme_queues_ref_t {&opening, 0});
-        if (open_status.failed()) return open_status;
-        auto [queues, queues_status] = util::nvme_queues_t::make(resources->storage.report().transport, config.channels,
+        resources_t resources {config.memory_limit, config.gpu_memory_limit};
+        if (status_t const opened = open_resources(resources, config, util::nvme_queues_ref_t {&opening, 0});
+            opened.failed())
+            return opened;
+        auto [queues, queues_status] = util::nvme_queues_t::make(resources.storage.report().transport, config.channels,
                                                                  anywhere);
         if (queues_status.failed()) return queues_status;
         fmt::println("- {}: {} transport, {} threads, {} keys", workload.name,
-                     storage_transport_names_k[static_cast<std::size_t>(resources->storage.report().transport)],
+                     storage_transport_names_k[static_cast<std::size_t>(resources.storage.report().transport)],
                      workload.threads, workload.population_count);
-        ran = resources->storage.visit(
+        ran = resources.storage.visit(
             [&](auto& mount) noexcept { return run_rows<layout_>(mount, resources, queues, settings, workload); });
         fmt::println("- {}: unpinned_staging_bytes {} requests_across_registered_slots {}", workload.name,
                      queues.unpinned_staging_bytes(), queues.requests_across_registered_slots());

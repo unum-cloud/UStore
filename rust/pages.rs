@@ -765,7 +765,7 @@ impl<'texts, Keys: AsRef<[Key]>, Markups: AsRef<[&'texts str]>> Calling for Page
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -775,18 +775,18 @@ impl<'texts, Keys: AsRef<[Key]>, Markups: AsRef<[&'texts str]>> Calling for Page
         }
         let (progress, progress_state) = lowered_progress(&self.progress);
         Ok(Some(ffi::ustore_pages_import_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            transaction: view.transaction(),
+            transaction: handles.transaction(),
             count: keys.len() as ustore_size_t,
             collections: self.collections.view(keys.len())?,
             keys: ustore_strided_view_t::packed(keys),
             values: texts(self.markups.as_ref(), keys.len())?,
             encoding: self.encoding as ustore_enum_t,
             durability: self.durability,
-            watch: view.watch(),
+            watch: handles.watch(),
             progress,
             progress_state,
         }))
@@ -821,7 +821,7 @@ impl<'arena, 'texts, Keys: AsRef<[Key]>, Fragments: AsRef<[&'texts str]>> Callin
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -830,11 +830,11 @@ impl<'arena, 'texts, Keys: AsRef<[Key]>, Fragments: AsRef<[&'texts str]>> Callin
             return Ok(None);
         }
         Ok(Some(ffi::ustore_pages_insert_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            transaction: view.transaction(),
+            transaction: handles.transaction(),
             count: keys.len() as ustore_size_t,
             collections: self.collections.view(keys.len())?,
             keys: ustore_strided_view_t::packed(keys),
@@ -846,7 +846,7 @@ impl<'arena, 'texts, Keys: AsRef<[Key]>, Fragments: AsRef<[&'texts str]>> Callin
             effective_keys: &mut self.effective.0,
             arena: self.arena.handle,
             durability: self.durability,
-            watch: view.watch(),
+            watch: handles.watch(),
         }))
     }
 
@@ -877,7 +877,7 @@ impl<Keys: AsRef<[Key]>, Elements: AsRef<[Key]>> Calling for PagesRemove<'_, Key
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -886,18 +886,18 @@ impl<Keys: AsRef<[Key]>, Elements: AsRef<[Key]>> Calling for PagesRemove<'_, Key
             return Ok(None);
         }
         Ok(Some(ffi::ustore_pages_remove_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            transaction: view.transaction(),
+            transaction: handles.transaction(),
             count: keys.len() as ustore_size_t,
             collections: self.collections.view(keys.len())?,
             keys: ustore_strided_view_t::packed(keys),
             end_keys: ustore_keys_view_t::default(),
             elements: column(self.elements.as_ref(), keys.len())?,
             durability: self.durability,
-            watch: view.watch(),
+            watch: handles.watch(),
         }))
     }
 
@@ -933,7 +933,7 @@ where
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -942,11 +942,11 @@ where
             return Ok(None);
         }
         Ok(Some(ffi::ustore_pages_move_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            transaction: view.transaction(),
+            transaction: handles.transaction(),
             count: keys.len() as ustore_size_t,
             collections: self.collections.view(keys.len())?,
             keys: ustore_strided_view_t::packed(keys),
@@ -954,7 +954,7 @@ where
             parents: column(self.parents.as_ref(), keys.len())?,
             anchors: column(self.anchors.as_ref(), keys.len())?,
             durability: self.durability,
-            watch: view.watch(),
+            watch: handles.watch(),
         }))
     }
 
@@ -992,7 +992,7 @@ where
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1001,11 +1001,11 @@ where
             return Ok(None);
         }
         Ok(Some(ffi::ustore_pages_splice_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            transaction: view.transaction(),
+            transaction: handles.transaction(),
             count: keys.len() as ustore_size_t,
             collections: self.collections.view(keys.len())?,
             keys: ustore_strided_view_t::packed(keys),
@@ -1014,7 +1014,7 @@ where
             text_lengths: column(self.lengths.as_ref(), keys.len())?,
             values: texts(self.texts.as_ref(), keys.len())?,
             durability: self.durability,
-            watch: view.watch(),
+            watch: handles.watch(),
         }))
     }
 
@@ -1050,7 +1050,7 @@ where
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1059,11 +1059,11 @@ where
             return Ok(None);
         }
         Ok(Some(ffi::ustore_pages_set_attributes_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            transaction: view.transaction(),
+            transaction: handles.transaction(),
             count: keys.len() as ustore_size_t,
             collections: self.collections.view(keys.len())?,
             keys: ustore_strided_view_t::packed(keys),
@@ -1071,7 +1071,7 @@ where
             fields: texts(self.fields.as_ref(), keys.len())?,
             values: texts(self.values.as_ref(), keys.len())?,
             durability: self.durability,
-            watch: view.watch(),
+            watch: handles.watch(),
         }))
     }
 
@@ -1105,7 +1105,7 @@ where
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1114,18 +1114,18 @@ where
             return Ok(None);
         }
         Ok(Some(ffi::ustore_pages_remove_attributes_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            transaction: view.transaction(),
+            transaction: handles.transaction(),
             count: keys.len() as ustore_size_t,
             collections: self.collections.view(keys.len())?,
             keys: ustore_strided_view_t::packed(keys),
             elements: column(self.elements.as_ref(), keys.len())?,
             fields: texts(self.fields.as_ref(), keys.len())?,
             durability: self.durability,
-            watch: view.watch(),
+            watch: handles.watch(),
         }))
     }
 
@@ -1155,7 +1155,7 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for PagesRead<'arena, '_, '_, Keys> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1164,11 +1164,11 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for PagesRead<'arena, '_, '_, Keys> {
             return Ok(None);
         }
         Ok(Some(ffi::ustore_pages_read_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            view: view.view(),
+            view: handles.view(),
             count: keys.len() as ustore_size_t,
             collections: self.collections.view(keys.len())?,
             keys: ustore_strided_view_t::packed(keys),
@@ -1212,17 +1212,17 @@ impl<'arena> Calling for PagesScan<'arena, '_> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         let (progress, progress_state) = lowered_progress(&self.progress);
         Ok(Some(ffi::ustore_pages_scan_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            view: view.view(),
+            view: handles.view(),
             count: 1,
             collections: ustore_strided_view_t::repeated(&self.collection),
             start_keys: ustore_strided_view_t::repeated(&self.start),
@@ -1266,16 +1266,16 @@ impl<'arena> Calling for PagesSample<'arena> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         Ok(Some(ffi::ustore_pages_sample_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            view: view.view(),
+            view: handles.view(),
             count: 1,
             collections: ustore_strided_view_t::repeated(&self.collection),
             offsets: &mut self.found.offsets.0,
@@ -1312,7 +1312,7 @@ impl Calling for PagesMeasure<'_> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1325,11 +1325,11 @@ impl Calling for PagesMeasure<'_> {
             max_space_usages,
         ] = &mut self.bounds.0;
         Ok(Some(ffi::ustore_pages_measure_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            view: view.view(),
+            view: handles.view(),
             count: 1,
             collections: ustore_strided_view_t::repeated(&self.collection),
             start_keys: ustore_strided_view_t::repeated(&self.start),

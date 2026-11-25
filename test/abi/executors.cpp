@@ -28,7 +28,7 @@
 #include "ustore/ustore.hpp"
 
 #include "ustore/utilities/ram_buffers.hpp" // `arena_block_t`, `arena_alignment_k`
-#include "ustore/utilities/ram_device.hpp"  // `caller_exclusivity_t`, `ram_executor_t`
+#include "ustore/utilities/ram_device.hpp"  // `spawn_pool`, `harvest_topology`
 
 #include "abi/fixture.hpp" // `held_scan_t`, `submit_held`, `release_held`, `spawn_executor`, `round_trip`, `edge_of`
 #include "engine.hpp"      // `ustore_database_handle_t`
@@ -854,20 +854,25 @@ void free_arena(arena_freeing_t& freeing) noexcept {
  *  counts before it stores the status. */
 void test_arena_free_waits(config_t const&) {
     auto [executor, spawn_status] = spawn_executor();
-    auto [freeing_thread, thread_status] = util::ram_executor_t::make(1,
-                                                                      util::caller_exclusivity_t::caller_exclusive_k);
+    auto [topology, topology_status] = util::harvest_topology();
+    auto [freeing_thread, thread_status] = util::spawn_pool(topology, 1, fu::caller_exclusive_k, fu_capabilities_all_k);
     if (!expect_true(!spawn_status.failed() && !st::failed(thread_status))) return;
 
     held_scan_t held;
     submit_held(held, executor);
     arena_freeing_t freeing {.arena = std::move(held.arena), .stage = &held.stage};
-    auto const [generation, start_status] = freeing_thread.start<&free_arena>(freeing);
-    expect_true(!st::failed(start_status));
+    fu_generation_t generation = 0;
+    fu::status_t const start_status = freeing_thread.unsafe_for_threads(
+        [](fu_lambda_context_t context, std::size_t, std::size_t) noexcept {
+            free_arena(*static_cast<arena_freeing_t*>(context));
+        },
+        &freeing, generation);
+    expect_true(!fu::failed(start_status));
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     expect_true(fu::standard_atomic_ref<std::uint32_t> {freeing.freed}.load(std::memory_order_acquire) == 0);
 
     fu::standard_atomic_ref<hold_stage_t> {held.stage}.store(hold_stage_t::released_k, std::memory_order_release);
-    if (!st::failed(start_status)) freeing_thread.join(generation);
+    if (!fu::failed(start_status)) freeing_thread.unsafe_join(generation);
     else free_arena(freeing);
     expect_true(freeing.stage_after_free == hold_stage_t::returned_k);
     expect_true(ustore_outcome_wait(&held.outcome) == ustore_status_success_k);
@@ -909,14 +914,19 @@ void test_executor_contended_from_another_thread(config_t const& config) {
     auto [blobs, blobs_status] = create_collection(database.handle(), "executor_contended_from_another_thread.blobs",
                                                    ustore_modality_blobs_k);
     auto [executor, spawn_status] = spawn_executor();
-    auto [holding_thread, thread_status] = util::ram_executor_t::make(1,
-                                                                      util::caller_exclusivity_t::caller_exclusive_k);
+    auto [topology, topology_status] = util::harvest_topology();
+    auto [holding_thread, thread_status] = util::spawn_pool(topology, 1, fu::caller_exclusive_k, fu_capabilities_all_k);
     if (!expect_true(!blobs_status.failed() && !spawn_status.failed() && !st::failed(thread_status))) return;
 
     held_scan_t held;
     arm_held(held, executor, nullptr, ustore_completion_blocking_k);
-    auto const [generation, start_status] = holding_thread.start<&scan_blocking>(held);
-    if (!expect_true(!st::failed(start_status))) return;
+    fu_generation_t generation = 0;
+    fu::status_t const start_status = holding_thread.unsafe_for_threads(
+        [](fu_lambda_context_t context, std::size_t, std::size_t) noexcept {
+            scan_blocking(*static_cast<held_scan_t*>(context));
+        },
+        &held, generation);
+    if (!expect_true(!fu::failed(start_status))) return;
     wait_held(held);
     ustore_key_t const key = key_from_integer(1300);
     ustore_outcome_t outcome {};
@@ -924,7 +934,7 @@ void test_executor_contended_from_another_thread(config_t const& config) {
     expect_status(outcome, status_code_t::contended_k);
     expect_true(held.drained == ustore_status_contended_k);
     fu::standard_atomic_ref<hold_stage_t> {held.stage}.store(hold_stage_t::released_k, std::memory_order_release);
-    holding_thread.join(generation);
+    holding_thread.unsafe_join(generation);
     expect_success(held.outcome);
     submit_writes(database.handle(), blobs, executor, {&key, 1}, {&outcome, 1});
     expect_true(ustore_outcome_wait(&outcome) == ustore_status_success_k);
@@ -1131,14 +1141,19 @@ void test_database_free_waits(config_t const&) {
 /** Freeing a database waits for a call naming it on no executor, held inside its callback on
  *  another thread, as such a call counts on its handles as an executor call does. */
 void test_database_free_waits_without_executor(config_t const&) {
-    auto [holding_thread, thread_status] = util::ram_executor_t::make(1,
-                                                                      util::caller_exclusivity_t::caller_exclusive_k);
+    auto [topology, topology_status] = util::harvest_topology();
+    auto [holding_thread, thread_status] = util::spawn_pool(topology, 1, fu::caller_exclusive_k, fu_capabilities_all_k);
     if (!expect_true(!st::failed(thread_status))) return;
 
     held_scan_t held;
     arm_held(held, nullptr, nullptr, ustore_completion_blocking_k);
-    auto const [generation, start_status] = holding_thread.start<&scan_blocking>(held);
-    if (!expect_true(!st::failed(start_status))) return;
+    fu_generation_t generation = 0;
+    fu::status_t const start_status = holding_thread.unsafe_for_threads(
+        [](fu_lambda_context_t context, std::size_t, std::size_t) noexcept {
+            scan_blocking(*static_cast<held_scan_t*>(context));
+        },
+        &held, generation);
+    if (!expect_true(!fu::failed(start_status))) return;
     wait_held(held);
     fu::standard_atomic_ref<hold_stage_t> const stage {held.stage};
     stage.store(hold_stage_t::released_k, std::memory_order_release);
@@ -1147,7 +1162,7 @@ void test_database_free_waits_without_executor(config_t const&) {
     held.database.holds = 2;
     ustore_database_free(&held.database);
     expect_true(stage.load(std::memory_order_acquire) == hold_stage_t::returned_k);
-    holding_thread.join(generation);
+    holding_thread.unsafe_join(generation);
     expect_success(held.outcome);
 }
 
@@ -1406,7 +1421,7 @@ case_result_t test_executor_sliced_ingest(config_t const& config) {
     }
     if (!expect_success(outcome)) return {};
     util::host_blocks_t const* const kept = std::get_if<util::host_blocks_t>(&ingest->kept.memory);
-    expect_true(kept && kept->memory_domain == executor->memory_domain);
+    expect_true(kept && kept->memory_domain == util::host_blocks_of(&executor->scratches.back())->memory_domain);
 
     constexpr std::size_t docs_k = 8 * util::tasks_per_word_k;
     std::array<ustore_key_t, docs_k> keys {};
@@ -1661,7 +1676,7 @@ case_result_t test_executor_sliced_strings(config_t const& config) {
 /** A RAM executor refuses a memory domain the machine lacks, leaving its output null, and keeps
  *  every arena it makes on the domain of its thread 0. */
 void test_executor_memory_domains(config_t const&) {
-    auto [topology, topology_status] = util::topology_t::make();
+    auto [topology, topology_status] = util::harvest_topology();
     if (!expect_true(!st::failed(topology_status))) return;
     std::int32_t const known = topology.memory_domain(0);
     std::int32_t const unknown = 1 << 20;

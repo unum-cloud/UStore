@@ -1106,7 +1106,7 @@ static char const doc_Database_collection_find[] =                              
 typedef struct find_call_t {
 
     /** What the call keeps until it finishes, its collection the one given outright. */
-    ustore_py_call_t call;
+    ustore_py_call_t kept;
 
     /** The name looked up, held. */
     PyObject* name;
@@ -1129,7 +1129,7 @@ static void find_submit(void* arguments) {
 
 static PyObject* find_answer(void* erased) {
     find_call_t const* const call = (find_call_t const*)erased;
-    if (!call->text.data) return ustore_py_uuid_to_object(&call->call.collection.uuid);
+    if (!call->text.data) return ustore_py_uuid_to_object(&call->kept.collection.uuid);
     if (ustore_py_present(call->presences, 0)) return ustore_py_uuid_to_object(&call->collections[0].uuid);
     ustore_py_raise(ustore_status_not_found_k, "No collection is named %R", call->name);
     return NULL;
@@ -1138,7 +1138,7 @@ static PyObject* find_answer(void* erased) {
 static void find_release(void* erased) {
     find_call_t* const call = (find_call_t*)erased;
     Py_CLEAR(call->name);
-    ustore_py_call_release(&call->call);
+    ustore_py_call_release(&call->kept);
 }
 
 static ustore_py_verb_t const find_verb = {sizeof(find_call_t), find_submit, find_answer, find_release};
@@ -1154,25 +1154,25 @@ static PyObject* Database_collection_find(PyObject* self, PyObject* const* argum
     if (!call) return NULL;
     Py_ssize_t length = 0;
     int const looked_up = PyUnicode_Check(name_object);
-    if (!looked_up && ustore_py_collection_from_object(&context, name_object, &call->call.collection) != 0)
+    if (!looked_up && ustore_py_collection_from_object(&context, name_object, &call->kept.collection) != 0)
         return ustore_py_call_discard(&context, &find_verb, call);
     if (looked_up && !(call->text.data = (uint8_t const*)PyUnicode_AsUTF8AndSize(name_object, &length)))
         return ustore_py_call_discard(&context, &find_verb, call);
     call->name = Py_NewRef(name_object);
     call->text.length = (ustore_size_t)length;
-    if (ustore_py_arena_from_object(arguments[1], &call->call.arena) != 0)
+    if (ustore_py_arena_from_object(arguments[1], &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, &find_verb, call);
     ustore_collection_find_t find = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .snapshot = context.snapshot,
         .count = looked_up,
         .names = ustore_py_strings_repeated(&call->text),
         .presences = &call->presences,
         .collections = &call->collections,
-        .arena = ustore_py_arena_handle(call->call.arena),
+        .arena = ustore_py_arena_handle(call->kept.arena),
     };
     return ustore_py_call_run(&context, &find_verb, call, &find);
 }
@@ -1221,7 +1221,7 @@ static char const doc_Database_collection_list[] =                              
 typedef struct list_call_t {
 
     /** What the call keeps until it finishes. */
-    ustore_py_call_t call;
+    ustore_py_call_t kept;
 
     /** Output slot for their identifiers, inside the arena. */
     ustore_collection_id_t const* collections;
@@ -1247,7 +1247,7 @@ static PyObject* list_answer(void* erased) {
     return listed;
 }
 
-static void list_release(void* call) { ustore_py_call_release(&((list_call_t*)call)->call); }
+static void list_release(void* call) { ustore_py_call_release(&((list_call_t*)call)->kept); }
 
 static ustore_py_verb_t const list_verb = {sizeof(list_call_t), list_submit, list_answer, list_release};
 
@@ -1257,17 +1257,17 @@ static PyObject* Database_collection_list(PyObject* self, PyObject* arena) {
     list_call_t stack;
     list_call_t* const call = ustore_py_call_open(&context, &list_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_arena_from_object(arena, &call->call.arena) != 0)
+    if (ustore_py_arena_from_object(arena, &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, &list_verb, call);
     ustore_collection_list_t list = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .snapshot = context.snapshot,
         .collections = &call->collections,
         .written = &call->written,
-        .arena = ustore_py_arena_handle(call->call.arena),
+        .arena = ustore_py_arena_handle(call->kept.arena),
     };
     return ustore_py_call_run(&context, &list_verb, call, &list);
 }
@@ -1475,7 +1475,7 @@ static char const doc_Snapshot_save[] =                                         
 typedef struct save_call_t {
 
     /** What the call keeps until it finishes. */
-    ustore_py_call_t call;
+    ustore_py_call_t kept;
 
     /** The directory the database lands in, encoded as bytes and held. */
     PyObject* path;
@@ -1486,7 +1486,7 @@ static void save_submit(void* arguments) { ustore_snapshot_save((ustore_snapshot
 static void save_release(void* erased) {
     save_call_t* const call = (save_call_t*)erased;
     Py_CLEAR(call->path);
-    ustore_py_call_release(&call->call);
+    ustore_py_call_release(&call->kept);
 }
 
 static ustore_py_verb_t const save_verb = {sizeof(save_call_t), save_submit, ustore_py_call_answer_none, save_release};
@@ -1506,15 +1506,15 @@ static PyObject* Snapshot_save(PyObject* self, PyObject* const* arguments, Py_ss
     save_call_t* const call = ustore_py_call_open(&context, &save_verb, &stack);
     if (!call) return NULL;
     if (!PyUnicode_FSConverter(arguments[0], &call->path)) return ustore_py_call_discard(&context, &save_verb, call);
-    call->call.progress = Py_XNewRef(progress);
+    call->kept.progress = Py_XNewRef(progress);
     ustore_snapshot_save_t save = {
         .snapshot = context.snapshot,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .path = path_bytes(call->path),
-        .progress = ustore_py_progress_callback(&call->call),
-        .progress_state = &call->call,
+        .progress = ustore_py_progress_callback(&call->kept),
+        .progress_state = &call->kept,
     };
     return ustore_py_call_run(&context, &save_verb, call, &save);
 }
@@ -1667,7 +1667,7 @@ static int transaction_context(PyObject* self, char const* verb, ustore_py_conte
 typedef struct stamped_call_t {
 
     /** What the call keeps until it finishes. */
-    ustore_py_call_t call;
+    ustore_py_call_t kept;
 
     /** The commit stamp of a commit, or the read stamp of a stage. */
     ustore_stamp_t stamp;
@@ -1679,7 +1679,7 @@ static void stage_submit(void* arguments) { ustore_transaction_stage((ustore_tra
 
 static PyObject* stamped_answer(void* call) { return PyLong_FromUnsignedLongLong(((stamped_call_t*)call)->stamp); }
 
-static void stamped_release(void* call) { ustore_py_call_release(&((stamped_call_t*)call)->call); }
+static void stamped_release(void* call) { ustore_py_call_release(&((stamped_call_t*)call)->kept); }
 
 static ustore_py_verb_t const commit_verb = {sizeof(stamped_call_t), commit_submit, stamped_answer, stamped_release};
 
@@ -1720,7 +1720,7 @@ static PyObject* Transaction_commit(PyObject* self, PyObject* const* arguments, 
     ustore_transaction_commit_t commit = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .transaction = context.transaction,
         .commit_stamp = &call->stamp,
@@ -1749,7 +1749,7 @@ static PyObject* Transaction_stage(PyObject* self, PyObject* Py_UNUSED(ignored))
     ustore_transaction_stage_t stage = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .transaction = context.transaction,
         .read_stamp = &call->stamp,

@@ -163,7 +163,7 @@ PyObject* ustore_py_collection_names(ustore_py_context_t const* context, char co
 typedef struct strings_call_t {
 
     /** What the call keeps until it finishes. */
-    ustore_py_call_t call;
+    ustore_py_call_t kept;
 
     /** The strings of a write, a read or a removal. */
     ustore_py_texts_t texts;
@@ -198,7 +198,7 @@ static void strings_release(void* erased) {
     ustore_py_texts_release(&call->texts);
     ustore_py_keys_release(&call->keys);
     for (size_t index = 0; index != 3; ++index) Py_CLEAR(call->held[index]);
-    ustore_py_call_release(&call->call);
+    ustore_py_call_release(&call->kept);
 }
 
 /** Holds the text or bytes @p object as the view the library reads, empty for None. */
@@ -328,15 +328,15 @@ PyObject* ustore_py_api_strings_write(PyObject* self, PyObject* const* arguments
                         call->keys.count);
         return ustore_py_call_discard(&context, &strings_write_verb, call);
     }
-    call->call.collection = options.collection;
+    call->kept.collection = options.collection;
     ustore_strings_write_t write = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .transaction = context.transaction,
         .count = call->keys.count,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .strings = contents->view,
         .values = {call->keys.keys, sizeof(ustore_key_t)},
         .durability = options.durability,
@@ -372,15 +372,15 @@ PyObject* ustore_py_api_strings_remove(PyObject* self, PyObject* const* argument
     if (!call) return NULL;
     if (ustore_py_texts_from_object(arguments[0], "strings", NULL, NULL, &call->texts) != 0)
         return ustore_py_call_discard(&context, &strings_remove_verb, call);
-    call->call.collection = options.collection;
+    call->kept.collection = options.collection;
     ustore_strings_remove_t remove = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .transaction = context.transaction,
         .count = call->texts.contents.count,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .strings = call->texts.contents.view,
         .durability = options.durability,
         .watch = context.watch,
@@ -417,21 +417,21 @@ PyObject* ustore_py_api_strings_read(PyObject* self, PyObject* const* arguments,
     strings_call_t* const call = ustore_py_call_open(&context, &strings_read_verb, &stack);
     if (!call) return NULL;
     if (ustore_py_texts_from_object(arguments[0], "strings", NULL, NULL, &call->texts) != 0 ||
-        ustore_py_arena_from_object(arguments[1], &call->call.arena) != 0)
+        ustore_py_arena_from_object(arguments[1], &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, &strings_read_verb, call);
-    call->call.collection = options.collection;
+    call->kept.collection = options.collection;
     ustore_strings_read_t read = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .view = context.view,
         .count = call->texts.contents.count,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .strings = call->texts.contents.view,
         .presences = &call->presences,
         .values = &call->values,
-        .arena = ustore_py_arena_handle(call->call.arena),
+        .arena = ustore_py_arena_handle(call->kept.arena),
     };
     return ustore_py_call_run(&context, &strings_read_verb, call, &read);
 }
@@ -485,24 +485,24 @@ PyObject* ustore_py_api_strings_scan(PyObject* self, PyObject* const* arguments,
     if (strings_bound_from_object(prefix, "prefix", &call->held[0], &call->bounds[0]) != 0 ||
         strings_bound_from_object(keywords[0], "start", &call->held[1], &call->bounds[1]) != 0 ||
         strings_bound_from_object(keywords[1], "end", &call->held[2], &call->bounds[2]) != 0 ||
-        ustore_py_arena_from_object(arguments[2], &call->call.arena) != 0)
+        ustore_py_arena_from_object(arguments[2], &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, &strings_scan_verb, call);
-    call->call.collection = options.collection;
+    call->kept.collection = options.collection;
     ustore_strings_scan_t scan = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .view = context.view,
         .count = 1,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .prefixes = strings_bound(call, 0),
         .start_strings = strings_bound(call, 1),
         .end_strings = strings_bound(call, 2),
         .direction = (ustore_scan_direction_t)direction,
         .offsets = &call->offsets,
         .strings = &call->strings,
-        .arena = ustore_py_arena_handle(call->call.arena),
+        .arena = ustore_py_arena_handle(call->kept.arena),
         .wanted = wanted,
     };
     return ustore_py_call_run(&context, &strings_scan_verb, call, &scan);
@@ -537,20 +537,20 @@ PyObject* ustore_py_api_strings_sample(PyObject* self, PyObject* const* argument
     strings_call_t stack;
     strings_call_t* const call = ustore_py_call_open(&context, &strings_sample_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_arena_from_object(arguments[1], &call->call.arena) != 0)
+    if (ustore_py_arena_from_object(arguments[1], &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, &strings_sample_verb, call);
-    call->call.collection = options.collection;
+    call->kept.collection = options.collection;
     ustore_strings_sample_t sample = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .view = context.view,
         .count = 1,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .offsets = &call->offsets,
         .strings = &call->strings,
-        .arena = ustore_py_arena_handle(call->call.arena),
+        .arena = ustore_py_arena_handle(call->kept.arena),
         .wanted = wanted,
     };
     return ustore_py_call_run(&context, &strings_sample_verb, call, &sample);
@@ -598,20 +598,20 @@ PyObject* ustore_py_api_strings_measure(PyObject* self, PyObject* const* argumen
     if (!call) return NULL;
     PyObject* const start = arguments[0] == Py_None ? NULL : arguments[0];
     PyObject* const end = arguments[1] == Py_None ? NULL : arguments[1];
-    Measurement* const bounds = (Measurement*)(call->call.result = ustore_py_report_new(&MeasurementType));
+    Measurement* const bounds = (Measurement*)(call->kept.result = ustore_py_report_new(&MeasurementType));
     if (!bounds || strings_bound_from_object(start, "start", &call->held[1], &call->bounds[1]) != 0 ||
         strings_bound_from_object(end, "end", &call->held[2], &call->bounds[2]) != 0 ||
-        ustore_py_arena_from_object(arguments[2], &call->call.arena) != 0)
+        ustore_py_arena_from_object(arguments[2], &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, &strings_measure_verb, call);
-    call->call.collection = options.collection;
+    call->kept.collection = options.collection;
     ustore_strings_measure_t measure = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .view = context.view,
         .count = 1,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .start_strings = strings_bound(call, 1),
         .end_strings = strings_bound(call, 2),
         .direction = (ustore_scan_direction_t)direction,
@@ -621,7 +621,7 @@ PyObject* ustore_py_api_strings_measure(PyObject* self, PyObject* const* argumen
         .max_value_bytes = &bounds->slots[3],
         .min_space_usages = &bounds->slots[4],
         .max_space_usages = &bounds->slots[5],
-        .arena = ustore_py_arena_handle(call->call.arena),
+        .arena = ustore_py_arena_handle(call->kept.arena),
     };
     return ustore_py_call_run(&context, &strings_measure_verb, call, &measure);
 }

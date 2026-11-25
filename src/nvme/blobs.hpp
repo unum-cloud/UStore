@@ -110,7 +110,7 @@ template <cpu_class_t cpu_class_>
 status_t read_values_batched(call_access<cpu_class_> const& access, view_t const& view,
                              ustore_blobs_read_t const& arguments, util::place_batch_t const& places,
                              util::read_outputs_t& outputs) noexcept {
-    basic_database_of<cpu_class_>& store = *access.state.store;
+    basic_database_of<cpu_class_>& store = access.state.store;
     std::size_t const count = places.size();
     // Slices read runs of neighbours in key order, and outputs land at their tasks in request order
     auto [sorted, sorted_status] = sort_places(places, access.scratch);
@@ -387,7 +387,7 @@ status_t scan_values(ustore_blobs_scan_t const& arguments, sink_type_& sink, vie
     util::scan_batch_t const scans = util::scans_of(arguments);
     util::scan_task_t const scan = scans[0];
     database_state<cpu_class_>& state = database_state_of<cpu_class_>(arguments);
-    basic_database_of<cpu_class_>& store = *state.store;
+    basic_database_of<cpu_class_>& store = state.store;
     call_access<cpu_class_> access = access_of(state, view);
     collection_reading_of<cpu_class_> held;
     if (status_t const one = read_at_one_state(access, scans.collections, 1, held); one.failed()) return one;
@@ -402,7 +402,7 @@ status_t scan_values(ustore_blobs_scan_t const& arguments, sink_type_& sink, vie
     stored_key_t const from = descending ? upper : lower;
     stored_key_t const bound = descending ? lower : upper;
     // One task per thread, or one where the match's engine serves one call at a time
-    std::size_t const capacity = view.executor && !sink.reads_values() ? view.executor->pool.view().threads_count()
+    std::size_t const capacity = view.executor && !sink.reads_values() ? view.executor->threads.threads_count()
                                                                        : std::size_t {1};
     auto [starts, starts_status] = arena_allocate<stored_key_t>(view.scratch, capacity);
     auto [entries, entries_status] = arena_allocate<std::uint64_t>(view.scratch, capacity);
@@ -695,7 +695,7 @@ status_t sample_walked(call_access<cpu_class_> const& access, collection_id_t co
 template <cpu_class_t cpu_class_, typename keys_type_>
 status_t sample_ranks(call_access<cpu_class_> const& access, collection_id_t collection, std::size_t wanted,
                       util::sample_generator_t& generator, keys_type_& kept) noexcept {
-    basic_database_of<cpu_class_>& store = *access.state.store;
+    basic_database_of<cpu_class_>& store = access.state.store;
     std::uint64_t versions = 0;
     status_t const drawn = with_reading(
         access, collection, access.queues.thread_index,

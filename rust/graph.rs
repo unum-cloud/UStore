@@ -745,7 +745,7 @@ impl<'view, Receiver: ViewVerbs<'view>> GraphVerbs<'view> for Receiver {}
 /// The arguments an edge upsert or removal takes over `edges`, whose keys sit one `Edge` apart, which is what
 /// `#[repr(C)]` on `Edge` promises.
 fn edges_arguments(
-    view: &Handles,
+    handles: &Handles,
     outcome: *mut ustore_outcome_t,
     completion: ustore_completion_t,
     collections: &Collections<'_>,
@@ -757,18 +757,18 @@ fn edges_arguments(
     let column =
         |offset: usize| ustore_strided_view_t { data: first.wrapping_byte_add(offset).cast::<ustore_key_t>(), stride };
     Ok(Some(ffi::ustore_graph_write_edges_t {
-        database: view.database(),
-        executor: view.executor(),
+        database: handles.database(),
+        executor: handles.executor(),
         outcome,
         completion,
-        transaction: view.transaction(),
+        transaction: handles.transaction(),
         count: edges.len() as ustore_size_t,
         collections: collections.view(edges.len())?,
         edges: column(offset_of!(Edge, id)),
         sources: column(offset_of!(Edge, source)),
         targets: column(offset_of!(Edge, target)),
         durability,
-        watch: view.watch(),
+        watch: handles.watch(),
     }))
 }
 
@@ -786,12 +786,12 @@ impl<Edges: AsRef<[Edge]>> Calling for GraphWriteEdges<'_, Edges> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         let edges = self.edges.as_ref();
-        edges_arguments(view, outcome, completion, &self.collections, edges, self.durability)
+        edges_arguments(handles, outcome, completion, &self.collections, edges, self.durability)
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
@@ -817,12 +817,12 @@ impl<Edges: AsRef<[Edge]>> Calling for GraphRemoveEdges<'_, Edges> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         let edges = self.edges.as_ref();
-        edges_arguments(view, outcome, completion, &self.collections, edges, self.durability)
+        edges_arguments(handles, outcome, completion, &self.collections, edges, self.durability)
     }
 
     unsafe fn call(arguments: *mut Self::Arguments) {
@@ -848,22 +848,22 @@ impl<Keys: AsRef<[Key]>> Calling for GraphWriteVertices<'_, Keys> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         let vertices = self.vertices.as_ref();
         Ok(Some(ffi::ustore_graph_write_vertices_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            transaction: view.transaction(),
+            transaction: handles.transaction(),
             count: vertices.len() as ustore_size_t,
             collections: self.collections.view(vertices.len())?,
             vertices: ustore_strided_view_t::packed(vertices),
             durability: self.durability,
-            watch: view.watch(),
+            watch: handles.watch(),
         }))
     }
 
@@ -891,24 +891,24 @@ impl<Keys: AsRef<[Key]>> Calling for GraphRemoveVertices<'_, Keys> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         let vertices = self.vertices.as_ref();
         Ok(Some(ffi::ustore_graph_remove_vertices_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            transaction: view.transaction(),
+            transaction: handles.transaction(),
             count: vertices.len() as ustore_size_t,
             collections: self.collections.view(vertices.len())?,
             vertices: ustore_strided_view_t::packed(vertices),
             end_vertices: ustore_keys_view_t::default(),
             roles: self.roles.view(vertices.len())?,
             durability: self.durability,
-            watch: view.watch(),
+            watch: handles.watch(),
         }))
     }
 
@@ -937,23 +937,23 @@ impl Calling for GraphRemoveVerticesRange {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         Ok(Some(ffi::ustore_graph_remove_vertices_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            transaction: view.transaction(),
+            transaction: handles.transaction(),
             count: 1,
             collections: ustore_strided_view_t::repeated(&self.collection),
             vertices: ustore_strided_view_t::repeated(&self.range.start),
             end_vertices: ustore_strided_view_t::repeated(&self.range.end),
             roles: self.roles.view(1)?,
             durability: self.durability,
-            watch: view.watch(),
+            watch: handles.watch(),
         }))
     }
 
@@ -986,17 +986,17 @@ impl<'arena> Calling for GraphScanVertices<'arena, '_> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         let (progress, progress_state) = lowered_progress(&self.progress);
         Ok(Some(ffi::ustore_graph_scan_vertices_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            view: view.view(),
+            view: handles.view(),
             count: 1,
             collections: ustore_strided_view_t::repeated(&self.collection),
             start_keys: ustore_strided_view_t::repeated(&self.start),
@@ -1039,16 +1039,16 @@ impl<'arena> Calling for GraphSampleVertices<'arena> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         Ok(Some(ffi::ustore_graph_sample_vertices_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            view: view.view(),
+            view: handles.view(),
             count: 1,
             collections: ustore_strided_view_t::repeated(&self.collection),
             offsets: &mut self.found.offsets.0,
@@ -1085,7 +1085,7 @@ impl Calling for GraphMeasureVertices<'_> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
@@ -1098,11 +1098,11 @@ impl Calling for GraphMeasureVertices<'_> {
             max_space_usages,
         ] = &mut self.bounds.0;
         Ok(Some(ffi::ustore_graph_measure_vertices_t {
-            database: view.database(),
-            executor: view.executor(),
+            database: handles.database(),
+            executor: handles.executor(),
             outcome,
             completion,
-            view: view.view(),
+            view: handles.view(),
             count: 1,
             collections: ustore_strided_view_t::repeated(&self.collection),
             start_keys: ustore_strided_view_t::repeated(&self.start),
@@ -1133,7 +1133,7 @@ impl Calling for GraphMeasureVertices<'_> {
 /// when `offsets` and `tape` are not null.
 #[allow(clippy::too_many_arguments)]
 fn read_edges_arguments(
-    view: &Handles,
+    handles: &Handles,
     outcome: *mut ustore_outcome_t,
     completion: ustore_completion_t,
     collections: &Collections<'_>,
@@ -1145,11 +1145,11 @@ fn read_edges_arguments(
     tape: *mut *const ustore_key_t,
 ) -> Result<Option<ffi::ustore_graph_read_edges_t>> {
     Ok(Some(ffi::ustore_graph_read_edges_t {
-        database: view.database(),
-        executor: view.executor(),
+        database: handles.database(),
+        executor: handles.executor(),
         outcome,
         completion,
-        view: view.view(),
+        view: handles.view(),
         count: vertices.len() as ustore_size_t,
         collections: collections.view(vertices.len())?,
         vertices: ustore_strided_view_t::packed(vertices),
@@ -1177,12 +1177,12 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for GraphDegrees<'arena, '_, Keys> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         read_edges_arguments(
-            view,
+            handles,
             outcome,
             completion,
             &self.collections,
@@ -1224,12 +1224,12 @@ impl<'arena, Keys: AsRef<[Key]>> Calling for GraphReadEdges<'arena, '_, Keys> {
 
     fn arguments(
         &mut self,
-        view: &Handles,
+        handles: &Handles,
         outcome: *mut ustore_outcome_t,
         completion: ustore_completion_t,
     ) -> Result<Option<Self::Arguments>> {
         read_edges_arguments(
-            view,
+            handles,
             outcome,
             completion,
             &self.collections,

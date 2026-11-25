@@ -477,8 +477,9 @@ class linux_cufile_files_disk {
 
         disk.depth_limit_ = properties.max_batch_io_size;
         std::uint64_t const direct_bytes = static_cast<std::uint64_t>(properties.nvfs.max_direct_io_size) * 1024u;
-        disk.max_transfer_bytes_ = direct_bytes != 0 && direct_bytes < max_transfer_bytes_k ? direct_bytes
-                                                                                            : max_transfer_bytes_k;
+        disk.max_transfer_bytes_ = direct_bytes != 0 && direct_bytes < native_transfer_bytes_k
+                                       ? direct_bytes
+                                       : native_transfer_bytes_k;
         if (status_t const sized = size_(disk.registered_memories_, config.registered_memory_limit); sized.failed())
             return sized;
         if (status_t const sized = size_(disk.media_, config.media_limit); sized.failed()) return sized;
@@ -769,16 +770,7 @@ class linux_cufile_files_disk {
     status_t drain(queue_ref_t const& queue_pair) noexcept {
         linux_cufile_queue_t const* const queue = queue_of_(queue_pair);
         if (!queue) return {status_code_t::invalid_argument_k, "The queue is of another transport"};
-        std::array<completion_t, drain_batch_k> discarded {};
-        for (std::size_t spins = 0; spins != drain_spin_limit_k; ++spins) {
-            if (outstanding_requests_(*queue) == 0) return {};
-            auto [moved, poll_completions_status] = poll_completions(queue_pair, std::span<completion_t> {discarded});
-            if (poll_completions_status.failed()) return poll_completions_status;
-            if (moved != 0) continue;
-            if (spins == drain_patience_k) cancel(queue_pair);
-            waiter_type_ {}(&spins, spins, std::size_t {0});
-        }
-        return {status_code_t::io_k, "The queue would not drain"};
+        return drain_by_polling<waiter_type_>(*this, queue_pair);
     }
 
 #pragma endregion Ring
@@ -838,18 +830,6 @@ class linux_cufile_files_disk {
     using submitted_request_t = linux_cufile_queue_t::submitted_request_t;
 
     static constexpr std::uint32_t no_request_slot_k = linux_cufile_queue_t::no_request_slot_k;
-
-    /** The largest extent one request holds, which the driver's direct size may lower. */
-    static constexpr std::uint64_t max_transfer_bytes_k = 1024ull * 1024ull * 1024ull;
-
-    /** Completions one drain discards at a time. */
-    static constexpr std::size_t drain_batch_k = 32;
-
-    /** Fruitless polls a drain tolerates before it stops what is still held back. */
-    static constexpr std::size_t drain_patience_k = 1024;
-
-    /** Polls a drain performs before it calls the batch broken. */
-    static constexpr std::size_t drain_spin_limit_k = std::size_t {1} << 24;
 
     /** Grows @p elements to @p count default slots, reporting an allocation failure as a status. */
     template <typename element_type_>
@@ -1195,7 +1175,7 @@ class linux_cufile_files_disk {
     queue_depth_t depth_limit_ = 0;
 
     /** The largest extent one request holds. */
-    std::uint64_t max_transfer_bytes_ = max_transfer_bytes_k;
+    std::uint64_t max_transfer_bytes_ = native_transfer_bytes_k;
 
     /** How the disk moves bytes, settled when the driver opened. */
     linux_cufile_probe_t mode_ = linux_cufile_probe_t::refused_k;

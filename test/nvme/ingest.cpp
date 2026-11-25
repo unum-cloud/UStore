@@ -151,7 +151,7 @@ template <typename stack_type_>
 util::expected<std::unique_ptr<typename stack_type_::database_t>> open_database(stack_type_& stack) noexcept {
     using database_t = typename stack_type_::database_t;
     if (util::status_t const remounted = remount_volume(stack); remounted.failed()) return remounted;
-    auto store = std::unique_ptr<database_t> {new (std::nothrow) database_t {stack.fixture->resources}};
+    auto store = std::unique_ptr<database_t> {new (std::nothrow) database_t {*stack.fixture->resources}};
     if (!store) return util::status_t {util::status_code_t::out_of_memory_k, "The database did not fit"};
     if (util::status_t const mounted = store->mount(stack.volume, util::nvme_queues_ref_t {&stack.fixture->queues, 0},
                                                     test_database_config());

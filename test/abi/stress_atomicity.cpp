@@ -21,7 +21,7 @@
 
 #include "ustore/ustore.hpp"
 
-#include "ustore/utilities/ram_device.hpp" // `caller_exclusivity_t`, `ram_executor_t`
+#include "ustore/utilities/ram_device.hpp" // `spawn_pool`, `harvest_topology`
 
 #include "harness.hpp" // `run_test_case`, `expect_true`, `split_mix_generator_t`
 
@@ -186,12 +186,12 @@ void verify_batch(blobs_collection_t& collection, arena_t& arena, keys_view_t ke
 
 /** Runs one round: every thread writes every batch, then the main thread checks what they left
  *  and clears it. */
-void run_round(atomicity_run_t& run, util::ram_executor_t& executor, batches_t const& batches) {
+void run_round(atomicity_run_t& run, fu::pool_t& executor, batches_t const& batches) {
     std::span<writer_slot_t> const slots {run.slots.data(), batches.threads_count};
     auto writer = [&](std::size_t thread) noexcept {
         write_round(slots[thread], run.collection.handle(), batches, thread);
     };
-    expect_true(st::succeeded(executor.for_threads(writer)));
+    expect_true(!fu::failed(executor.for_threads(writer)));
     for (std::size_t batch = 0; batch != batches.count(); ++batch)
         verify_batch(run.collection, run.arena, batches[batch]);
     expect_true(!run.database.clear(ustore_drop_pairs_k).failed());
@@ -215,7 +215,7 @@ void run_round(atomicity_run_t& run, util::ram_executor_t& executor, batches_t c
  *  @param[in] checkpoints Most rounds to run.
  *  @param[in] slice Time after which no further round starts; the first round always runs.
  */
-void insert_atomic_isolated(atomicity_run_t& run, util::ram_executor_t& executor, batches_t const& batches,
+void insert_atomic_isolated(atomicity_run_t& run, fu::pool_t& executor, batches_t const& batches,
                             std::size_t checkpoints, std::chrono::nanoseconds slice) {
     auto const deadline = std::chrono::steady_clock::now() + slice;
     std::size_t const failed_before = test_run.failed_checks.load();
@@ -229,8 +229,9 @@ void insert_atomic_isolated(atomicity_run_t& run, util::ram_executor_t& executor
 /** Runs every batch size on one pool of @p threads threads. */
 void inserts_on_threads(atomicity_run_t& run, atomicity_options_t const& options, std::size_t threads,
                         round_deletes_t deletes, std::chrono::nanoseconds slice) {
-    auto [executor, executor_status] = util::ram_executor_t::make(threads,
-                                                                  util::caller_exclusivity_t::caller_inclusive_k);
+    auto [topology, topology_status] = util::harvest_topology();
+    auto [executor, executor_status] = util::spawn_pool(topology, threads, fu::caller_inclusive_k,
+                                                        fu_capabilities_all_k);
     if (!expect_true(!st::failed(executor_status))) return;
     for (std::size_t const batch_size : options.batch_sizes.view()) {
         std::span<ustore_key_t const> const keys {run.keys.data(), run.keys.size() / batch_size * batch_size};

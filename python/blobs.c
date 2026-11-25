@@ -41,7 +41,7 @@ static void read_submit(void* arguments) { ustore_blobs_read((ustore_blobs_read_
 
 PyObject* ustore_py_read_answer_values(void* erased) {
     ustore_py_read_call_t const* const call = (ustore_py_read_call_t const*)erased;
-    return ustore_py_values_new(call->call.arena, call->presences, &call->values, call->keys.count);
+    return ustore_py_values_new(call->kept.arena, call->presences, &call->values, call->keys.count);
 }
 
 /** Copies the value of task @p task_index of @p call into bytes, or answers None where its key is absent. */
@@ -86,7 +86,7 @@ void ustore_py_read_release(void* erased) {
     ustore_py_keys_release(&call->keys);
     Py_CLEAR(call->field);
     Py_CLEAR(call->subscript);
-    ustore_py_call_release(&call->call);
+    ustore_py_call_release(&call->kept);
 }
 
 ustore_py_verb_t const ustore_py_read_verb = {sizeof(ustore_py_read_call_t), read_submit, ustore_py_read_answer_values,
@@ -100,22 +100,22 @@ ustore_py_verb_t const ustore_py_read_drawn_verb = {sizeof(ustore_py_read_call_t
 
 PyObject* ustore_py_values_read(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
                                 ustore_py_verb_t const* verb, ustore_py_read_call_t* call, PyObject* arena) {
-    if (ustore_py_arena_from_object(arena, &call->call.arena) != 0) return ustore_py_call_discard(context, verb, call);
-    call->call.collection = options->collection;
+    if (ustore_py_arena_from_object(arena, &call->kept.arena) != 0) return ustore_py_call_discard(context, verb, call);
+    call->kept.collection = options->collection;
     ustore_blobs_read_t read = {
         .database = context->database_handle,
         .executor = ustore_py_context_executor(context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context->completion,
         .view = context->view,
         .count = call->keys.count,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .keys = {call->keys.keys, sizeof(ustore_key_t)},
         .offsets = {call->offset ? &call->offset : NULL, 0},
         .limits = {call->extent == ustore_py_read_limited_k ? &call->limit : NULL, 0},
         .presences = &call->presences,
         .values = &call->values,
-        .arena = ustore_py_arena_handle(call->call.arena),
+        .arena = ustore_py_arena_handle(call->kept.arena),
     };
     return ustore_py_call_run(context, verb, call, &read);
 }
@@ -235,22 +235,22 @@ PyObject* ustore_py_value_contains(ustore_py_context_t const* context, ustore_py
     ustore_py_read_call_t* const call = one_key_open(context, &contains_verb, key, &stack);
     if (!call) return NULL;
     PyObject* const arena = ustore_py_arena_new(ustore_py_context_executor(context));
-    int const claimed = arena ? ustore_py_arena_from_object(arena, &call->call.arena) : -1;
+    int const claimed = arena ? ustore_py_arena_from_object(arena, &call->kept.arena) : -1;
     Py_XDECREF(arena);
     if (claimed != 0) return ustore_py_call_discard(context, &contains_verb, call);
-    call->call.collection = options->collection;
+    call->kept.collection = options->collection;
     // The presence alone is asked for, so no value crosses into the arena.
     ustore_blobs_read_t read = {
         .database = context->database_handle,
         .executor = ustore_py_context_executor(context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context->completion,
         .view = context->view,
         .count = 1,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .keys = {call->keys.keys, sizeof(ustore_key_t)},
         .presences = &call->presences,
-        .arena = ustore_py_arena_handle(call->call.arena),
+        .arena = ustore_py_arena_handle(call->kept.arena),
     };
     return ustore_py_call_run(context, &contains_verb, call, &read);
 }
@@ -325,7 +325,7 @@ static void write_release(void* erased) {
     ustore_py_write_call_t* const call = (ustore_py_write_call_t*)erased;
     ustore_py_contents_release(&call->contents);
     ustore_py_keys_release(&call->keys);
-    ustore_py_call_release(&call->call);
+    ustore_py_call_release(&call->kept);
 }
 
 ustore_py_verb_t const ustore_py_write_verb = {sizeof(ustore_py_write_call_t), write_submit, ustore_py_call_answer_none,
@@ -333,15 +333,15 @@ ustore_py_verb_t const ustore_py_write_verb = {sizeof(ustore_py_write_call_t), w
 
 PyObject* ustore_py_values_write(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
                                  ustore_py_write_call_t* call) {
-    call->call.collection = options->collection;
+    call->kept.collection = options->collection;
     ustore_blobs_write_t write = {
         .database = context->database_handle,
         .executor = ustore_py_context_executor(context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context->completion,
         .transaction = context->transaction,
         .count = call->keys.count,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .keys = {call->keys.keys, sizeof(ustore_key_t)},
         .values = call->contents.view,
         .durability = options->durability,
@@ -356,7 +356,7 @@ static void remove_release(void* erased) {
     ustore_py_remove_call_t* const call = (ustore_py_remove_call_t*)erased;
     ustore_py_keys_release(&call->keys);
     ustore_py_keys_release(&call->ends);
-    ustore_py_call_release(&call->call);
+    ustore_py_call_release(&call->kept);
 }
 
 int ustore_py_ends_from_object(PyObject* object, ustore_py_keys_t const* starts, ustore_py_keys_t* ends) {
@@ -382,16 +382,16 @@ static ustore_py_verb_t const docs_remove_verb = {sizeof(ustore_py_remove_call_t
 
 PyObject* ustore_py_values_remove(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
                                   ustore_modality_t modality, ustore_py_remove_call_t* call) {
-    call->call.collection = options->collection;
+    call->kept.collection = options->collection;
     if (modality == ustore_modality_docs_k) {
         ustore_docs_remove_t remove = {
             .database = context->database_handle,
             .executor = ustore_py_context_executor(context),
-            .outcome = &call->call.outcome,
+            .outcome = &call->kept.outcome,
             .completion = context->completion,
             .transaction = context->transaction,
             .count = call->keys.count,
-            .collections = {&call->call.collection, 0},
+            .collections = {&call->kept.collection, 0},
             .keys = {call->keys.keys, sizeof(ustore_key_t)},
             .end_keys = ustore_py_ends_view(&call->ends),
             .durability = options->durability,
@@ -402,11 +402,11 @@ PyObject* ustore_py_values_remove(ustore_py_context_t const* context, ustore_py_
     ustore_blobs_remove_t remove = {
         .database = context->database_handle,
         .executor = ustore_py_context_executor(context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context->completion,
         .transaction = context->transaction,
         .count = call->keys.count,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .keys = {call->keys.keys, sizeof(ustore_key_t)},
         .end_keys = ustore_py_ends_view(&call->ends),
         .durability = options->durability,
@@ -661,7 +661,7 @@ static int start_from_object(PyObject* object, ustore_scan_direction_t direction
 typedef struct keys_call_t {
 
     /** What the call keeps until it finishes. */
-    ustore_py_call_t call;
+    ustore_py_call_t kept;
 
     /** The key every scan starts from, empty for a sample. */
     ustore_py_keys_t starts;
@@ -697,7 +697,7 @@ typedef struct keys_call_t {
 
 static PyObject* keys_answer(void* erased) {
     keys_call_t const* const call = (keys_call_t const*)erased;
-    return ustore_py_keys_new(call->call.arena, call->offsets, call->keys, call->tasks, call->scores);
+    return ustore_py_keys_new(call->kept.arena, call->offsets, call->keys, call->tasks, call->scores);
 }
 
 static void keys_release(void* erased) {
@@ -708,7 +708,7 @@ static void keys_release(void* erased) {
     ustore_py_texts_release(&call->filter);
     PyMem_Free(call->weights);
     call->weights = NULL;
-    ustore_py_call_release(&call->call);
+    ustore_py_call_release(&call->kept);
 }
 
 /** Gathers into @p call what @p match names, viewing its patterns, copying its weights and
@@ -716,7 +716,7 @@ static void keys_release(void* erased) {
  *  @p patterns and @p filter. */
 static int match_fill(keys_call_t* call, scan_match_t const* match, ustore_patterns_t* patterns,
                       ustore_bytes_view_t* filter) {
-    call->call.predicate.handler = Py_XNewRef(match->predicate);
+    call->kept.predicate.handler = Py_XNewRef(match->predicate);
     if (match->patterns) {
         if (ustore_py_texts_from_object(match->patterns, "patterns", NULL, NULL, &call->patterns) != 0) return -1;
         Py_ssize_t const count = (Py_ssize_t)call->patterns.contents.count;
@@ -813,10 +813,10 @@ static ustore_py_verb_t const vertices_sample_verb = {sizeof(keys_call_t), verti
 static PyObject* keys_scan(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
                            ustore_modality_t modality, size_t wanted, ustore_scan_mode_t mode, PyObject* progress,
                            scan_match_t const* match, keys_call_t* call, PyObject* arena) {
-    if (ustore_py_arena_from_object(arena, &call->call.arena) != 0)
+    if (ustore_py_arena_from_object(arena, &call->kept.arena) != 0)
         return ustore_py_call_discard(context, &scan_verb, call);
-    call->call.collection = options->collection;
-    call->call.progress = Py_XNewRef(progress);
+    call->kept.collection = options->collection;
+    call->kept.progress = Py_XNewRef(progress);
     call->tasks = call->starts.count;
     scan_match_t const nothing = {0};
     if (!match) match = &nothing;
@@ -824,16 +824,16 @@ static PyObject* keys_scan(ustore_py_context_t const* context, ustore_py_verb_op
     ustore_bytes_view_t filter = {0};
     if (scan_match_admitted(match, modality) != 0 || match_fill(call, match, &patterns, &filter) != 0)
         return ustore_py_call_discard(context, &scan_verb, call);
-    ustore_predicate_t const predicate = ustore_py_predicate_of(&call->call.predicate);
+    ustore_predicate_t const predicate = ustore_py_predicate_of(&call->kept.predicate);
     if (modality == ustore_modality_docs_k) {
         ustore_docs_scan_t scan = {
             .database = context->database_handle,
             .executor = ustore_py_context_executor(context),
-            .outcome = &call->call.outcome,
+            .outcome = &call->kept.outcome,
             .completion = context->completion,
             .view = context->view,
             .count = call->tasks,
-            .collections = {&call->call.collection, 0},
+            .collections = {&call->kept.collection, 0},
             .start_keys = {call->starts.keys, sizeof(ustore_key_t)},
             .end_keys = ustore_py_ends_view(&call->ends),
             .direction = call->direction,
@@ -841,11 +841,11 @@ static PyObject* keys_scan(ustore_py_context_t const* context, ustore_py_verb_op
             .predicate = predicate,
             .offsets = &call->offsets,
             .keys = &call->keys,
-            .arena = ustore_py_arena_handle(call->call.arena),
+            .arena = ustore_py_arena_handle(call->kept.arena),
             .wanted = wanted,
             .mode = mode,
-            .progress = ustore_py_progress_callback(&call->call),
-            .progress_state = &call->call,
+            .progress = ustore_py_progress_callback(&call->kept),
+            .progress_state = &call->kept,
         };
         return ustore_py_call_run(context, &docs_scan_verb, call, &scan);
     }
@@ -853,11 +853,11 @@ static PyObject* keys_scan(ustore_py_context_t const* context, ustore_py_verb_op
         ustore_pages_scan_t scan = {
             .database = context->database_handle,
             .executor = ustore_py_context_executor(context),
-            .outcome = &call->call.outcome,
+            .outcome = &call->kept.outcome,
             .completion = context->completion,
             .view = context->view,
             .count = call->tasks,
-            .collections = {&call->call.collection, 0},
+            .collections = {&call->kept.collection, 0},
             .start_keys = {call->starts.keys, sizeof(ustore_key_t)},
             .end_keys = ustore_py_ends_view(&call->ends),
             .direction = call->direction,
@@ -865,11 +865,11 @@ static PyObject* keys_scan(ustore_py_context_t const* context, ustore_py_verb_op
             .predicate = predicate,
             .offsets = &call->offsets,
             .keys = &call->keys,
-            .arena = ustore_py_arena_handle(call->call.arena),
+            .arena = ustore_py_arena_handle(call->kept.arena),
             .wanted = wanted,
             .mode = mode,
-            .progress = ustore_py_progress_callback(&call->call),
-            .progress_state = &call->call,
+            .progress = ustore_py_progress_callback(&call->kept),
+            .progress_state = &call->kept,
         };
         return ustore_py_call_run(context, &pages_scan_verb, call, &scan);
     }
@@ -877,33 +877,33 @@ static PyObject* keys_scan(ustore_py_context_t const* context, ustore_py_verb_op
         ustore_graph_scan_vertices_t scan = {
             .database = context->database_handle,
             .executor = ustore_py_context_executor(context),
-            .outcome = &call->call.outcome,
+            .outcome = &call->kept.outcome,
             .completion = context->completion,
             .view = context->view,
             .count = call->tasks,
-            .collections = {&call->call.collection, 0},
+            .collections = {&call->kept.collection, 0},
             .start_keys = {call->starts.keys, sizeof(ustore_key_t)},
             .end_keys = ustore_py_ends_view(&call->ends),
             .direction = call->direction,
             .predicate = predicate,
             .offsets = &call->offsets,
             .keys = &call->keys,
-            .arena = ustore_py_arena_handle(call->call.arena),
+            .arena = ustore_py_arena_handle(call->kept.arena),
             .wanted = wanted,
             .mode = mode,
-            .progress = ustore_py_progress_callback(&call->call),
-            .progress_state = &call->call,
+            .progress = ustore_py_progress_callback(&call->kept),
+            .progress_state = &call->kept,
         };
         return ustore_py_call_run(context, &vertices_scan_verb, call, &scan);
     }
     ustore_blobs_scan_t scan = {
         .database = context->database_handle,
         .executor = ustore_py_context_executor(context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context->completion,
         .view = context->view,
         .count = call->tasks,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .start_keys = {call->starts.keys, sizeof(ustore_key_t)},
         .end_keys = ustore_py_ends_view(&call->ends),
         .direction = call->direction,
@@ -912,11 +912,11 @@ static PyObject* keys_scan(ustore_py_context_t const* context, ustore_py_verb_op
         .offsets = &call->offsets,
         .keys = &call->keys,
         .scores = patterns.weights ? &call->scores : NULL,
-        .arena = ustore_py_arena_handle(call->call.arena),
+        .arena = ustore_py_arena_handle(call->kept.arena),
         .wanted = wanted,
         .mode = mode,
-        .progress = ustore_py_progress_callback(&call->call),
-        .progress_state = &call->call,
+        .progress = ustore_py_progress_callback(&call->kept),
+        .progress_state = &call->kept,
     };
     return ustore_py_call_run(context, &scan_verb, call, &scan);
 }
@@ -1070,22 +1070,22 @@ static PyObject* keys_sample(ustore_py_context_t const* context, ustore_py_verb_
     keys_call_t stack;
     keys_call_t* const call = ustore_py_call_open(context, &sample_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_arena_from_object(arena, &call->call.arena) != 0)
+    if (ustore_py_arena_from_object(arena, &call->kept.arena) != 0)
         return ustore_py_call_discard(context, &sample_verb, call);
-    call->call.collection = options->collection;
+    call->kept.collection = options->collection;
     call->tasks = tasks;
     if (modality == ustore_modality_docs_k) {
         ustore_docs_sample_t sample = {
             .database = context->database_handle,
             .executor = ustore_py_context_executor(context),
-            .outcome = &call->call.outcome,
+            .outcome = &call->kept.outcome,
             .completion = context->completion,
             .view = context->view,
             .count = tasks,
-            .collections = {&call->call.collection, 0},
+            .collections = {&call->kept.collection, 0},
             .offsets = &call->offsets,
             .keys = &call->keys,
-            .arena = ustore_py_arena_handle(call->call.arena),
+            .arena = ustore_py_arena_handle(call->kept.arena),
             .wanted = wanted,
         };
         return ustore_py_call_run(context, &docs_sample_verb, call, &sample);
@@ -1094,14 +1094,14 @@ static PyObject* keys_sample(ustore_py_context_t const* context, ustore_py_verb_
         ustore_pages_sample_t sample = {
             .database = context->database_handle,
             .executor = ustore_py_context_executor(context),
-            .outcome = &call->call.outcome,
+            .outcome = &call->kept.outcome,
             .completion = context->completion,
             .view = context->view,
             .count = tasks,
-            .collections = {&call->call.collection, 0},
+            .collections = {&call->kept.collection, 0},
             .offsets = &call->offsets,
             .keys = &call->keys,
-            .arena = ustore_py_arena_handle(call->call.arena),
+            .arena = ustore_py_arena_handle(call->kept.arena),
             .wanted = wanted,
         };
         return ustore_py_call_run(context, &pages_sample_verb, call, &sample);
@@ -1110,14 +1110,14 @@ static PyObject* keys_sample(ustore_py_context_t const* context, ustore_py_verb_
         ustore_graph_sample_vertices_t sample = {
             .database = context->database_handle,
             .executor = ustore_py_context_executor(context),
-            .outcome = &call->call.outcome,
+            .outcome = &call->kept.outcome,
             .completion = context->completion,
             .view = context->view,
             .count = tasks,
-            .collections = {&call->call.collection, 0},
+            .collections = {&call->kept.collection, 0},
             .offsets = &call->offsets,
             .keys = &call->keys,
-            .arena = ustore_py_arena_handle(call->call.arena),
+            .arena = ustore_py_arena_handle(call->kept.arena),
             .wanted = wanted,
         };
         return ustore_py_call_run(context, &vertices_sample_verb, call, &sample);
@@ -1125,14 +1125,14 @@ static PyObject* keys_sample(ustore_py_context_t const* context, ustore_py_verb_
     ustore_blobs_sample_t sample = {
         .database = context->database_handle,
         .executor = ustore_py_context_executor(context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context->completion,
         .view = context->view,
         .count = tasks,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .offsets = &call->offsets,
         .keys = &call->keys,
-        .arena = ustore_py_arena_handle(call->call.arena),
+        .arena = ustore_py_arena_handle(call->kept.arena),
         .wanted = wanted,
     };
     return ustore_py_call_run(context, &sample_verb, call, &sample);
@@ -1237,7 +1237,7 @@ char const doc_measure[] =                                                      
 typedef struct measure_call_t {
 
     /** What the call keeps until it finishes. */
-    ustore_py_call_t call;
+    ustore_py_call_t kept;
 
     /** First key of the range. */
     ustore_key_t start;
@@ -1262,7 +1262,7 @@ static PyObject* measure_answer(void* erased) {
     return Py_NewRef((PyObject*)bounds);
 }
 
-static void measure_release(void* call) { ustore_py_call_release(&((measure_call_t*)call)->call); }
+static void measure_release(void* call) { ustore_py_call_release(&((measure_call_t*)call)->kept); }
 
 static ustore_py_verb_t const measure_verb = {sizeof(measure_call_t), measure_submit, measure_answer, measure_release};
 
@@ -1305,10 +1305,10 @@ PyObject* ustore_py_api_measure_of(PyObject* self, PyObject* const* arguments, P
     measure_call_t stack;
     measure_call_t* const call = ustore_py_call_open(&context, &measure_verb, &stack);
     if (!call) return NULL;
-    Measurement* const bounds = (Measurement*)(call->call.result = ustore_py_report_new(&MeasurementType));
-    if (!bounds || ustore_py_arena_from_object(arguments[2], &call->call.arena) != 0)
+    Measurement* const bounds = (Measurement*)(call->kept.result = ustore_py_report_new(&MeasurementType));
+    if (!bounds || ustore_py_arena_from_object(arguments[2], &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, &measure_verb, call);
-    call->call.collection = options.collection;
+    call->kept.collection = options.collection;
     call->start = start;
     call->end = end;
     call->direction = (ustore_scan_direction_t)direction;
@@ -1317,11 +1317,11 @@ PyObject* ustore_py_api_measure_of(PyObject* self, PyObject* const* arguments, P
         ustore_docs_measure_t measure = {
             .database = context.database_handle,
             .executor = ustore_py_context_executor(&context),
-            .outcome = &call->call.outcome,
+            .outcome = &call->kept.outcome,
             .completion = context.completion,
             .view = context.view,
             .count = 1,
-            .collections = {&call->call.collection, 0},
+            .collections = {&call->kept.collection, 0},
             .start_keys = {&call->start, 0},
             .end_keys = end_keys,
             .direction = call->direction,
@@ -1331,7 +1331,7 @@ PyObject* ustore_py_api_measure_of(PyObject* self, PyObject* const* arguments, P
             .max_value_bytes = &bounds->slots[3],
             .min_space_usages = &bounds->slots[4],
             .max_space_usages = &bounds->slots[5],
-            .arena = ustore_py_arena_handle(call->call.arena),
+            .arena = ustore_py_arena_handle(call->kept.arena),
         };
         return ustore_py_call_run(&context, &docs_measure_verb, call, &measure);
     }
@@ -1339,11 +1339,11 @@ PyObject* ustore_py_api_measure_of(PyObject* self, PyObject* const* arguments, P
         ustore_pages_measure_t measure = {
             .database = context.database_handle,
             .executor = ustore_py_context_executor(&context),
-            .outcome = &call->call.outcome,
+            .outcome = &call->kept.outcome,
             .completion = context.completion,
             .view = context.view,
             .count = 1,
-            .collections = {&call->call.collection, 0},
+            .collections = {&call->kept.collection, 0},
             .start_keys = {&call->start, 0},
             .end_keys = end_keys,
             .direction = call->direction,
@@ -1353,7 +1353,7 @@ PyObject* ustore_py_api_measure_of(PyObject* self, PyObject* const* arguments, P
             .max_value_bytes = &bounds->slots[3],
             .min_space_usages = &bounds->slots[4],
             .max_space_usages = &bounds->slots[5],
-            .arena = ustore_py_arena_handle(call->call.arena),
+            .arena = ustore_py_arena_handle(call->kept.arena),
         };
         return ustore_py_call_run(&context, &pages_measure_verb, call, &measure);
     }
@@ -1361,11 +1361,11 @@ PyObject* ustore_py_api_measure_of(PyObject* self, PyObject* const* arguments, P
         ustore_graph_measure_vertices_t measure = {
             .database = context.database_handle,
             .executor = ustore_py_context_executor(&context),
-            .outcome = &call->call.outcome,
+            .outcome = &call->kept.outcome,
             .completion = context.completion,
             .view = context.view,
             .count = 1,
-            .collections = {&call->call.collection, 0},
+            .collections = {&call->kept.collection, 0},
             .start_keys = {&call->start, 0},
             .end_keys = end_keys,
             .direction = call->direction,
@@ -1375,18 +1375,18 @@ PyObject* ustore_py_api_measure_of(PyObject* self, PyObject* const* arguments, P
             .max_value_bytes = &bounds->slots[3],
             .min_space_usages = &bounds->slots[4],
             .max_space_usages = &bounds->slots[5],
-            .arena = ustore_py_arena_handle(call->call.arena),
+            .arena = ustore_py_arena_handle(call->kept.arena),
         };
         return ustore_py_call_run(&context, &vertices_measure_verb, call, &measure);
     }
     ustore_blobs_measure_t measure = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .view = context.view,
         .count = 1,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .start_keys = {&call->start, 0},
         .end_keys = end_keys,
         .direction = call->direction,
@@ -1396,7 +1396,7 @@ PyObject* ustore_py_api_measure_of(PyObject* self, PyObject* const* arguments, P
         .max_value_bytes = &bounds->slots[3],
         .min_space_usages = &bounds->slots[4],
         .max_space_usages = &bounds->slots[5],
-        .arena = ustore_py_arena_handle(call->call.arena),
+        .arena = ustore_py_arena_handle(call->kept.arena),
     };
     return ustore_py_call_run(&context, &measure_verb, call, &measure);
 }
@@ -1564,7 +1564,7 @@ PyTypeObject PageType = {
 typedef struct pull_call_t {
 
     /** What the call keeps until it finishes. */
-    ustore_py_call_t call;
+    ustore_py_call_t kept;
 
     /** Output slot for the keys of the page, inside the arena. */
     ustore_key_t const* keys;
@@ -1585,22 +1585,22 @@ static void vertices_pull_submit(void* arguments) {
 
 static PyObject* pull_answer_keys(void* erased) {
     pull_call_t const* const call = (pull_call_t const*)erased;
-    return page_new(call->call.arena, call->keys, (size_t)call->written, Py_NewRef(Py_None));
+    return page_new(call->kept.arena, call->keys, (size_t)call->written, Py_NewRef(Py_None));
 }
 
 static PyObject* pull_answer_pairs(void* erased) {
     pull_call_t const* const call = (pull_call_t const*)erased;
-    PyObject* const values = ustore_py_values_new(call->call.arena, NULL, &call->values, (size_t)call->written);
-    return values ? page_new(call->call.arena, call->keys, (size_t)call->written, values) : NULL;
+    PyObject* const values = ustore_py_values_new(call->kept.arena, NULL, &call->values, (size_t)call->written);
+    return values ? page_new(call->kept.arena, call->keys, (size_t)call->written, values) : NULL;
 }
 
-static void pull_release(void* call) { ustore_py_call_release(&((pull_call_t*)call)->call); }
+static void pull_release(void* call) { ustore_py_call_release(&((pull_call_t*)call)->kept); }
 
 /** One pull of a walk over documents, whose batches land in the arena its header holds. */
 typedef struct docs_pull_call_t {
 
     /** What the call keeps until it finishes. */
-    ustore_py_call_t call;
+    ustore_py_call_t kept;
 
     /** The cursor whose fields name the columns of every batch. */
     Cursor* cursor;
@@ -1621,8 +1621,8 @@ static PyObject* docs_pull_answer(void* erased) {
     size_t const fields_count = cursor->fields ? (size_t)PyTuple_GET_SIZE(cursor->fields) : 0;
     for (size_t index = 0; index != call->batches_count; ++index) {
         ustore_docs_batch_view_t const* const batch = &call->batches[index];
-        PyObject* const keys = page_new(call->call.arena, batch->keys, (size_t)batch->count, Py_NewRef(Py_None));
-        PyObject* const columns = ustore_py_columns_new(call->call.arena, batch->columns,
+        PyObject* const keys = page_new(call->kept.arena, batch->keys, (size_t)batch->count, Py_NewRef(Py_None));
+        PyObject* const columns = ustore_py_columns_new(call->kept.arena, batch->columns,
                                                         cursor->fields ? cursor->fields : Py_None, cursor->types,
                                                         fields_count, (size_t)batch->count);
         PyObject* const pair = keys && columns ? PyTuple_Pack(2, keys, columns) : NULL;
@@ -1637,7 +1637,7 @@ static PyObject* docs_pull_answer(void* erased) {
     return list;
 }
 
-static void docs_pull_release(void* call) { ustore_py_call_release(&((docs_pull_call_t*)call)->call); }
+static void docs_pull_release(void* call) { ustore_py_call_release(&((docs_pull_call_t*)call)->kept); }
 
 /** A pull of documents, answering its batches. */
 static ustore_py_verb_t const docs_pull_verb = {sizeof(docs_pull_call_t), docs_pull_submit, docs_pull_answer,
@@ -1701,21 +1701,21 @@ static PyObject* cursor_pull(Cursor* self, Executor* executor, void* handle, siz
     if (self->modality == ustore_modality_docs_k) {
         docs_pull_call_t stack;
         docs_pull_call_t* const call = ustore_py_call_open(&context, &docs_pull_verb, &stack);
-        if (ustore_py_arena_from_object(arena, &call->call.arena) != 0)
+        if (ustore_py_arena_from_object(arena, &call->kept.arena) != 0)
             return ustore_py_call_discard(&context, &docs_pull_verb, call);
-        call->call.progress = Py_XNewRef(progress);
+        call->kept.progress = Py_XNewRef(progress);
         call->cursor = self;
         ustore_docs_cursor_next_t next = {
             .database = self->database,
             .executor = ustore_py_context_executor(&context),
-            .outcome = &call->call.outcome,
+            .outcome = &call->kept.outcome,
             .cursor = (ustore_docs_cursor_t)handle,
             .batches = &call->batches,
             .batches_count = &call->batches_count,
-            .arena = ustore_py_arena_handle(call->call.arena),
+            .arena = ustore_py_arena_handle(call->kept.arena),
             .wanted = wanted,
-            .progress = ustore_py_progress_callback(&call->call),
-            .progress_state = &call->call,
+            .progress = ustore_py_progress_callback(&call->kept),
+            .progress_state = &call->kept,
         };
         return ustore_py_call_run(&context, &docs_pull_verb, call, &next);
     }
@@ -1726,23 +1726,23 @@ static PyObject* cursor_pull(Cursor* self, Executor* executor, void* handle, siz
                                                                                      : &pull_keys_verb;
     pull_call_t stack;
     pull_call_t* const call = ustore_py_call_open(&context, verb, &stack);
-    if (ustore_py_arena_from_object(arena, &call->call.arena) != 0) return ustore_py_call_discard(&context, verb, call);
-    call->call.progress = Py_XNewRef(progress);
+    if (ustore_py_arena_from_object(arena, &call->kept.arena) != 0) return ustore_py_call_discard(&context, verb, call);
+    call->kept.progress = Py_XNewRef(progress);
     PyObject* page = NULL;
     if (self->modality == ustore_modality_pages_k) {
         ustore_pages_cursor_next_t next = {
             .database = self->database,
             .executor = ustore_py_context_executor(&context),
-            .outcome = &call->call.outcome,
+            .outcome = &call->kept.outcome,
             .cursor = (ustore_pages_cursor_t)handle,
             .keys = &call->keys,
             .values = values ? &call->values : NULL,
             .written = &call->written,
-            .arena = ustore_py_arena_handle(call->call.arena),
+            .arena = ustore_py_arena_handle(call->kept.arena),
             .wanted = wanted,
             .outputs_encoding = self->outputs_encoding,
-            .progress = ustore_py_progress_callback(&call->call),
-            .progress_state = &call->call,
+            .progress = ustore_py_progress_callback(&call->kept),
+            .progress_state = &call->kept,
         };
         page = ustore_py_call_run(&context, verb, call, &next);
     }
@@ -1750,14 +1750,14 @@ static PyObject* cursor_pull(Cursor* self, Executor* executor, void* handle, siz
         ustore_graph_vertices_cursor_next_t next = {
             .database = self->database,
             .executor = ustore_py_context_executor(&context),
-            .outcome = &call->call.outcome,
+            .outcome = &call->kept.outcome,
             .cursor = (ustore_graph_vertices_cursor_t)handle,
             .keys = &call->keys,
             .written = &call->written,
-            .arena = ustore_py_arena_handle(call->call.arena),
+            .arena = ustore_py_arena_handle(call->kept.arena),
             .wanted = wanted,
-            .progress = ustore_py_progress_callback(&call->call),
-            .progress_state = &call->call,
+            .progress = ustore_py_progress_callback(&call->kept),
+            .progress_state = &call->kept,
         };
         page = ustore_py_call_run(&context, verb, call, &next);
     }
@@ -1765,15 +1765,15 @@ static PyObject* cursor_pull(Cursor* self, Executor* executor, void* handle, siz
         ustore_blobs_cursor_next_t next = {
             .database = self->database,
             .executor = ustore_py_context_executor(&context),
-            .outcome = &call->call.outcome,
+            .outcome = &call->kept.outcome,
             .cursor = (ustore_blobs_cursor_t)handle,
             .keys = &call->keys,
             .values = values ? &call->values : NULL,
             .written = &call->written,
-            .arena = ustore_py_arena_handle(call->call.arena),
+            .arena = ustore_py_arena_handle(call->kept.arena),
             .wanted = wanted,
-            .progress = ustore_py_progress_callback(&call->call),
-            .progress_state = &call->call,
+            .progress = ustore_py_progress_callback(&call->kept),
+            .progress_state = &call->kept,
         };
         page = ustore_py_call_run(&context, verb, call, &next);
     }
@@ -2239,7 +2239,7 @@ typedef struct ChangesCursor {
 typedef struct changes_pull_call_t {
 
     /** What the call keeps until it finishes, the @c Changes it writes into included. */
-    ustore_py_call_t call;
+    ustore_py_call_t kept;
 } changes_pull_call_t;
 
 static void changes_pull_submit(void* arguments) {
@@ -2249,10 +2249,10 @@ static void changes_pull_submit(void* arguments) {
 /** Answers the @c Changes the pull @p call wrote into, once it built the objects over its
  *  slots, holding @p values, a @c Values or None, which it takes. */
 static PyObject* changes_answer(changes_pull_call_t const* call, PyObject* values) {
-    Changes* const changes = (Changes*)call->call.result;
+    Changes* const changes = (Changes*)call->kept.result;
     size_t const count = (size_t)changes->count;
     changes->values_object = values;
-    changes->keys_object = page_new(call->call.arena, changes->keys, count, Py_NewRef(Py_None));
+    changes->keys_object = page_new(call->kept.arena, changes->keys, count, Py_NewRef(Py_None));
     changes->stamps_object = PyTuple_New((Py_ssize_t)count);
     changes->kinds_object = PyTuple_New((Py_ssize_t)count);
     int failed = !values || !changes->keys_object || !changes->stamps_object || !changes->kinds_object;
@@ -2272,11 +2272,11 @@ static PyObject* changes_answer_keys(void* erased) {
 
 static PyObject* changes_answer_pairs(void* erased) {
     changes_pull_call_t const* const call = (changes_pull_call_t const*)erased;
-    Changes const* const changes = (Changes const*)call->call.result;
-    return changes_answer(call, ustore_py_values_new(call->call.arena, NULL, &changes->values, (size_t)changes->count));
+    Changes const* const changes = (Changes const*)call->kept.result;
+    return changes_answer(call, ustore_py_values_new(call->kept.arena, NULL, &changes->values, (size_t)changes->count));
 }
 
-static void changes_pull_release(void* call) { ustore_py_call_release(&((changes_pull_call_t*)call)->call); }
+static void changes_pull_release(void* call) { ustore_py_call_release(&((changes_pull_call_t*)call)->kept); }
 
 static ustore_py_verb_t const changes_pull_keys_verb = {sizeof(changes_pull_call_t), changes_pull_submit,
                                                         changes_answer_keys, changes_pull_release};
@@ -2352,21 +2352,21 @@ static PyObject* ChangesCursor_next(ChangesCursor* self, PyObject* const* argume
     ustore_py_context_t const context = {.completion = ustore_completion_blocking_k};
     changes_pull_call_t stack;
     changes_pull_call_t* const call = ustore_py_call_open(&context, verb, &stack);
-    Changes* const pulled = (Changes*)(call->call.result = ustore_py_report_new(&ChangesType));
+    Changes* const pulled = (Changes*)(call->kept.result = ustore_py_report_new(&ChangesType));
     PyObject* changes = NULL;
-    if (!pulled || ustore_py_arena_from_object(arguments[1], &call->call.arena) != 0)
+    if (!pulled || ustore_py_arena_from_object(arguments[1], &call->kept.arena) != 0)
         changes = ustore_py_call_discard(&context, verb, call);
     else {
         ustore_changes_cursor_next_t next = {
             .cursor = (ustore_changes_cursor_t)handle,
-            .outcome = &call->call.outcome,
+            .outcome = &call->kept.outcome,
             .wanted = wanted,
             .count = &pulled->count,
             .keys = &pulled->keys,
             .stamps = &pulled->stamps,
             .kinds = &pulled->kinds,
             .values = values ? &pulled->values : NULL,
-            .arena = ustore_py_arena_handle(call->call.arena),
+            .arena = ustore_py_arena_handle(call->kept.arena),
         };
         changes = ustore_py_call_run(&context, verb, call, &next);
     }

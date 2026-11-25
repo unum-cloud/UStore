@@ -261,7 +261,7 @@ Python's `in`, assignments, `del` and the table view take several calls or must 
 ## Executors
 
 An executor owns threads, and a database owns its data, so one executor serves any number of databases, one call at a time; a second call while one runs raises `ContendedError` once awaited.
-`Executor.for_ram(threads=0, *, memory_domains=None, scratch_limit=0)` spawns threads near the NUMA nodes it names, where zero threads take 7/8 of their cores, leaving the rest to blocking calls and the engines' background work, and each thread's scratch stops at `scratch_limit` bytes, 16 GiB for zero.
+`Executor.for_ram(threads=0, *, memory_domains=None, scratch_limit=0)` spawns threads near the NUMA nodes it names, where zero threads take all but one in eight of their cores, leaving the rest to blocking calls and the engines' background work, and each thread's scratch stops at `scratch_limit` bytes, 16 GiB for zero.
 `Executor.for_nvme` makes the I/O rings of the NVMe engine, and `Executor.for_vram(device)` drives one CUDA device.
 Used as a context manager, an executor waits for its calls and closes on exit, and progress callbacks on its threads take the GIL as they enter Python.
 

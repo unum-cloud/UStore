@@ -238,7 +238,7 @@ static char const* const no_keywords[] = {NULL};
 typedef struct edit_call_t {
 
     /** What the call keeps until it finishes. */
-    ustore_py_call_t call;
+    ustore_py_call_t kept;
 
     /** The tasks the call holds. */
     tasks_t tasks;
@@ -314,7 +314,7 @@ static void edit_release(void* erased) {
     PyMem_Free(call->text_lengths.lengths);
     call->text_starts.lengths = NULL;
     call->text_lengths.lengths = NULL;
-    ustore_py_call_release(&call->call);
+    ustore_py_call_release(&call->kept);
 }
 
 static ustore_py_verb_t const import_verb = {sizeof(edit_call_t), import_submit, ustore_py_call_answer_none,
@@ -351,7 +351,7 @@ static edit_call_t* edit_open(PyObject* self, char const* name, ustore_py_verb_t
     edit_call_t* const call = ustore_py_call_open(context, verb, stack);
     if (!call) return NULL;
     call->tasks.count = 1;
-    call->call.collection = options->collection;
+    call->kept.collection = options->collection;
     if (spread_keys_from_object(arguments[0], "pages", &call->tasks, &call->pages) == 0) return call;
     ustore_py_call_discard(context, verb, call);
     return NULL;
@@ -392,22 +392,22 @@ PyObject* ustore_py_api_pages_import(PyObject* self, PyObject* const* arguments,
     if (!call) return NULL;
     if (spread_texts_from_object(arguments[1], "markups", &call->tasks, &call->values) != 0)
         return ustore_py_call_discard(&context, &import_verb, call);
-    call->call.progress = Py_XNewRef(keywords.progress);
+    call->kept.progress = Py_XNewRef(keywords.progress);
     ustore_pages_import_t import = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .transaction = context.transaction,
         .count = call->tasks.count,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .keys = spread_keys_view(&call->pages),
         .values = call->values.contents.view,
         .encoding = (ustore_page_encoding_t)keywords.encoding,
         .durability = options.durability,
         .watch = context.watch,
-        .progress = ustore_py_progress_callback(&call->call),
-        .progress_state = &call->call,
+        .progress = ustore_py_progress_callback(&call->kept),
+        .progress_state = &call->kept,
     };
     return ustore_py_call_run(&context, &import_verb, call, &import);
 }
@@ -459,17 +459,17 @@ PyObject* ustore_py_api_pages_insert(PyObject* self, PyObject* const* arguments,
         return ustore_py_call_discard(&context, &insert_verb, call);
     // The arena only holds the effective keys out, so it dies with the call that named it.
     PyObject* const arena = ustore_py_arena_new(ustore_py_context_executor(&context));
-    int const claimed = arena ? ustore_py_arena_from_object(arena, &call->call.arena) : -1;
+    int const claimed = arena ? ustore_py_arena_from_object(arena, &call->kept.arena) : -1;
     Py_XDECREF(arena);
     if (claimed != 0) return ustore_py_call_discard(&context, &insert_verb, call);
     ustore_pages_insert_t insert = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .transaction = context.transaction,
         .count = call->tasks.count,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .keys = spread_keys_view(&call->pages),
         .elements = spread_keys_view(&call->elements),
         .parents = spread_keys_view(&call->parents),
@@ -477,7 +477,7 @@ PyObject* ustore_py_api_pages_insert(PyObject* self, PyObject* const* arguments,
         .values = call->values.contents.view,
         .encoding = (ustore_page_encoding_t)keywords.encoding,
         .effective_keys = &call->effective_keys,
-        .arena = ustore_py_arena_handle(call->call.arena),
+        .arena = ustore_py_arena_handle(call->kept.arena),
         .durability = options.durability,
         .watch = context.watch,
     };
@@ -536,11 +536,11 @@ PyObject* ustore_py_api_pages_remove(PyObject* self, PyObject* const* arguments,
     ustore_pages_remove_t remove = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .transaction = context.transaction,
         .count = call->tasks.count,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .keys = spread_keys_view(&call->pages),
         .end_keys = end_keys,
         .elements = removed_elements,
@@ -585,11 +585,11 @@ PyObject* ustore_py_api_pages_move(PyObject* self, PyObject* const* arguments, P
     ustore_pages_move_t move = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .transaction = context.transaction,
         .count = call->tasks.count,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .keys = spread_keys_view(&call->pages),
         .elements = spread_keys_view(&call->elements),
         .parents = spread_keys_view(&call->parents),
@@ -636,11 +636,11 @@ PyObject* ustore_py_api_pages_splice(PyObject* self, PyObject* const* arguments,
     ustore_pages_splice_t splice = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .transaction = context.transaction,
         .count = call->tasks.count,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .keys = spread_keys_view(&call->pages),
         .elements = spread_keys_view(&call->elements),
         .text_starts = spread_lengths_view(&call->text_starts),
@@ -687,11 +687,11 @@ PyObject* ustore_py_api_pages_set_attributes(PyObject* self, PyObject* const* ar
     ustore_pages_set_attributes_t set = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .transaction = context.transaction,
         .count = call->tasks.count,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .keys = spread_keys_view(&call->pages),
         .elements = spread_keys_view(&call->elements),
         .fields = call->fields.contents.view,
@@ -735,11 +735,11 @@ PyObject* ustore_py_api_pages_remove_attributes(PyObject* self, PyObject* const*
     ustore_pages_remove_attributes_t remove = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .transaction = context.transaction,
         .count = call->tasks.count,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .keys = spread_keys_view(&call->pages),
         .elements = spread_keys_view(&call->elements),
         .fields = call->fields.contents.view,
@@ -757,7 +757,7 @@ PyObject* ustore_py_api_pages_remove_attributes(PyObject* self, PyObject* const*
 typedef struct read_call_t {
 
     /** What the call keeps until it finishes. */
-    ustore_py_call_t call;
+    ustore_py_call_t kept;
 
     /** The tasks the call holds. */
     tasks_t tasks;
@@ -779,14 +779,14 @@ static void read_submit(void* arguments) { ustore_pages_read((ustore_pages_read_
 
 static PyObject* read_answer(void* erased) {
     read_call_t const* const call = (read_call_t const*)erased;
-    return ustore_py_values_new(call->call.arena, call->presences, &call->values, call->tasks.count);
+    return ustore_py_values_new(call->kept.arena, call->presences, &call->values, call->tasks.count);
 }
 
 static void read_release(void* erased) {
     read_call_t* const call = (read_call_t*)erased;
     ustore_py_keys_release(&call->pages.batch);
     ustore_py_keys_release(&call->elements.batch);
-    ustore_py_call_release(&call->call);
+    ustore_py_call_release(&call->kept);
 }
 
 static ustore_py_verb_t const read_verb = {sizeof(read_call_t), read_submit, read_answer, read_release};
@@ -826,22 +826,22 @@ PyObject* ustore_py_api_pages_read(PyObject* self, PyObject* const* arguments, P
     call->tasks.count = 1;
     if (spread_keys_from_object(arguments[0], "pages", &call->tasks, &call->pages) != 0 ||
         spread_keys_from_object(keywords.elements, "elements", &call->tasks, &call->elements) != 0 ||
-        ustore_py_arena_from_object(arguments[1], &call->call.arena) != 0)
+        ustore_py_arena_from_object(arguments[1], &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, &read_verb, call);
-    call->call.collection = options.collection;
+    call->kept.collection = options.collection;
     ustore_pages_read_t read = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .view = context.view,
         .count = call->tasks.count,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .keys = spread_keys_view(&call->pages),
         .elements = spread_keys_view(&call->elements),
         .presences = &call->presences,
         .values = &call->values,
-        .arena = ustore_py_arena_handle(call->call.arena),
+        .arena = ustore_py_arena_handle(call->kept.arena),
         .outputs_encoding = (ustore_page_encoding_t)keywords.outputs_encoding,
     };
     return ustore_py_call_run(&context, &read_verb, call, &read);

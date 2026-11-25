@@ -103,7 +103,7 @@ status_t open_in(arguments_type_ const& arguments, cpu_ceiling_t ceiling, std::s
     // named limit harvests no topology
     std::size_t conflicts = static_cast<std::size_t>(arguments.commit_conflicts_limit);
     if (!conflicts) {
-        auto [topology, topology_status] = util::topology_t::make();
+        auto [topology, topology_status] = util::harvest_topology();
         conflicts = commit_conflicts_budget(topology.logical_cores_count());
     }
     return open_fitting_rung(cpu_ladder_t {}, ceiling, [&]<cpu_class_t cpu_class_>() noexcept {

@@ -341,8 +341,9 @@ int main(int argc, char** argv) {
     fmt::println("- loaded {} rows, {:.2f} GB of keys, SMILES and fingerprints", rows,
                  static_cast<double>(ingested_bytes) / 1e9);
 
-    auto [executor, executor_status] = util::ram_executor_t::make(static_cast<std::size_t>(settings.threads.value),
-                                                                  util::caller_exclusivity_t::caller_inclusive_k);
+    auto [topology, topology_status] = util::harvest_topology();
+    auto [executor, executor_status] = util::spawn_pool(topology, static_cast<std::size_t>(settings.threads.value),
+                                                        fu::caller_inclusive_k, fu_capabilities_all_k);
     if (st::failed(executor_status)) {
         fmt::println(stderr, "Failed to spawn {} threads", settings.threads.value);
         return 1;
@@ -478,7 +479,7 @@ int main(int argc, char** argv) {
     ustore_database_describe(&describe);
 
     // Point reads of random keys of the ingest, while a sampler reads the depth the drives see.
-    auto blobs_reads = [&](util::ram_executor_t& readers, std::string const& name, std::size_t batch) {
+    auto blobs_reads = [&](fu::pool_t& readers, std::string const& name, std::size_t batch) {
         if (!settings.regex_filter.selects(name)) return;
         std::atomic<bool> reading {true}, reported {false};
         std::uint64_t depth_sum = 0, depth_samples = 0, depth_peak = 0;
@@ -522,7 +523,7 @@ int main(int argc, char** argv) {
     };
     for (std::size_t const batch : {std::size_t {32}, std::size_t {1024}})
         blobs_reads(executor, fmt::format("pubchem_blobs_read_batch{}", batch), batch);
-    auto [readers, readers_status] = util::ram_executor_t::make(32, util::caller_exclusivity_t::caller_inclusive_k);
+    auto [readers, readers_status] = util::spawn_pool(topology, 32, fu::caller_inclusive_k, fu_capabilities_all_k);
     if (!st::failed(readers_status)) blobs_reads(readers, "pubchem_blobs_read_single_32_threads", 1);
     for (std::size_t const depth : {std::size_t {32}, std::size_t {1024}}) {
         std::string const strings_name = fmt::format("pubchem_strings_read_batch{}", depth);

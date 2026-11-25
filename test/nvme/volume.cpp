@@ -623,11 +623,12 @@ case_result_t test_mount_fits_the_descriptor_limit(char const* directory) {
             auto [queues, queues_status] = util::nvme_queues_t::make(util::io_transport_t::blocking_k,
                                                                      util::blocking_queues_config_k, anywhere);
             if (queues_status.failed()) ::_exit(1);
-            auto const [opened, open_status] = util::open_resources<atomic_reference, waiter_t>(
-                config, util::nvme_queues_ref_t {&queues, 0});
+            resources_t opened {config.memory_limit, config.gpu_memory_limit};
+            util::status_t const open_status = util::open_resources(opened, config,
+                                                                    util::nvme_queues_ref_t {&queues, 0});
             if (open_status.failed()) ::_exit(open_status.code == wanted ? 0 : 1);
             std::size_t runs = 0;
-            [[maybe_unused]] util::status_t const visited = opened->storage.visit([&](auto& mount) noexcept {
+            [[maybe_unused]] util::status_t const visited = opened.storage.visit([&](auto& mount) noexcept {
                 runs = mount.volume().runs_capacity();
                 return util::status_t {};
             });

@@ -364,7 +364,7 @@ An executor owns the threads that run calls and the scratch they use, and a `NUL
 It serves one call at a time, and nothing queues: a call on an executor serving another, from any thread, finishes at once with `ustore_status_contended_k`, as does a call whose arena, transaction or cursor serves another call.
 A blocking call on an executor runs on the calling thread, a deferred one is delegated to the executor's first thread, which serves it in the caller's place, and every fork splits the call's batch over the other threads.
 
-- `ustore_executor_for_ram` spawns caller-exclusive threads near the NUMA nodes its `ram` options name, every node the process may allocate on for `NULL`, where zero threads take 7/8 of the cores those nodes hold.
+- `ustore_executor_for_ram` spawns caller-exclusive threads near the NUMA nodes its `ram` options name, every node the process may allocate on for `NULL`, where zero threads take all but one in eight of the cores those nodes hold.
 - `ustore_executor_for_nvme` spawns the threads of the NVMe engine near its `ram` domains or the drives its `nvme` paths name, and its `nvme` options tell every database opened on it how to move bytes; an NVMe database refuses a RAM executor with `ustore_status_device_k`.
 - `ustore_executor_for_vram` queues every call on one stream of a CUDA device, and serves the reads and scans an engine computes there, refusing changes with `ustore_status_unsupported_k`.
 

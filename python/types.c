@@ -2524,25 +2524,25 @@ static PyObject* executor_made(PyObject* type, ustore_executor_t handle, ustore_
     return (PyObject*)instance;
 }
 
-static char const doc_Executor_for_ram[] =                                                       //
-    "for_ram(threads=0, *, memory_domains=None, scratch_limit=0) answers an executor of host\n"  //
-    "threads.\n"                                                                                 //
-    "\n"                                                                                         //
-    "Runs the calls of the RAM, RocksDB and LevelDB engines, keeping the scratch of every\n"     //
-    "thread on its local memory domain and every arena it makes on the first one named. Calls\n" //
-    "`ustore_executor_for_ram`.\n"                                                               //
-    "\n"                                                                                         //
-    "Args:\n"                                                                                    //
-    "  threads (int, optional): Threads to spawn; zero takes 7/8 of the cores the memory\n"      //
-    "    domains hold, leaving the rest to blocking callers and the engines' own background\n"   //
-    "    work.\n"                                                                                //
-    "  memory_domains (Sequence[int], optional): NUMA nodes the threads stay near and keep\n"    //
-    "    their memory on; None derives every node the process may allocate on.\n"                //
-    "  scratch_limit (int, optional): Bytes of scratch each thread's calls carve from, past\n"   //
-    "    which a call raises OutOfMemoryError; zero takes 16 GiB.\n"                             //
-    "Returns:\n"                                                                                 //
-    "  Executor: The new executor.\n"                                                            //
-    "Raises:\n"                                                                                  //
+static char const doc_Executor_for_ram[] =                                                        //
+    "for_ram(threads=0, *, memory_domains=None, scratch_limit=0) answers an executor of host\n"   //
+    "threads.\n"                                                                                  //
+    "\n"                                                                                          //
+    "Runs the calls of the RAM, RocksDB and LevelDB engines, keeping the scratch of every\n"      //
+    "thread on its local memory domain and every arena it makes on the first one named. Calls\n"  //
+    "`ustore_executor_for_ram`.\n"                                                                //
+    "\n"                                                                                          //
+    "Args:\n"                                                                                     //
+    "  threads (int, optional): Threads to spawn; zero takes all but one in eight of the cores\n" //
+    "    the memory domains hold, less the caller's, leaving the rest to blocking callers and\n"  //
+    "    the engines' own background work.\n"                                                     //
+    "  memory_domains (Sequence[int], optional): NUMA nodes the threads stay near and keep\n"     //
+    "    their memory on; None derives every node the process may allocate on.\n"                 //
+    "  scratch_limit (int, optional): Bytes of scratch each thread's calls carve from, past\n"    //
+    "    which a call raises OutOfMemoryError; zero takes 16 GiB.\n"                              //
+    "Returns:\n"                                                                                  //
+    "  Executor: The new executor.\n"                                                             //
+    "Raises:\n"                                                                                   //
     "  InvalidArgumentError: A memory domain names no NUMA node.";
 
 static PyObject* Executor_for_ram(PyObject* type, PyObject* const* arguments, Py_ssize_t positional_arguments_count,

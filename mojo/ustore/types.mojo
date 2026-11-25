@@ -1007,7 +1007,7 @@ struct Executor:
         Args:
             library: The loaded engine, kept so the shared object stays mapped.
             ram: The memory domains it serves; copied, not viewed.
-            threads: Threads to spawn; zero takes 7/8 of the cores those domains hold.
+            threads: Threads to spawn; zero takes all but one in eight of the cores those domains hold.
             cpu_class_ceiling: The newest class its threads may confine their waits and atomics to, narrowed to what the CPU runs, so a class it lacks is never refused; `UNKNOWN` sets none.
 
         Raises:

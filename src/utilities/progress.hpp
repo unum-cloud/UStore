@@ -165,7 +165,7 @@ status_t run_plan(void* plan, view_t const& runner, progress_ticks_t& ticks) noe
                 if (ran.failed() && failed_once.compare_exchange_strong(unfailed, true, std::memory_order_acq_rel))
                     first = ran;
             };
-            if (st::failed(executor->pool.view().for_n_dynamic(tasks.size(), run_task)))
+            if (fu::failed(executor->threads.for_n_dynamic(tasks.size(), run_task)))
                 return {status_code_t::internal_k, "The executor's idle pool refused a fork"};
             if (first.failed()) return first;
         }

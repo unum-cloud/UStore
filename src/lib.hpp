@@ -45,7 +45,6 @@
 
 #pragma once
 
-#include <cassert> // `assert`
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`, `std::uintptr_t`
 
@@ -363,7 +362,7 @@ bool decode_call(arguments_type_ const& arguments, view_t& view) noexcept {
 template <typename arguments_type_>
     requires a_cursor_walker<arguments_type_>
 bool decode_call(arguments_type_ const& arguments, view_t& view) noexcept {
-    return decode_view(arguments.cursor->cursor.view, view);
+    return decode_view(arguments.cursor->walk.view, view);
 }
 
 /** Takes one more hold on @p handle, a database, a transaction or a snapshot, so it outlives the caller's free. */
@@ -418,9 +417,8 @@ constexpr bool outlasted_by_ingests =
            ustore_database_compact_t, ustore_database_flush_t>;
 
 /** Refuses with @c contended_k while an ingest is open on @p database, changing nothing. */
-inline util::status_t refuse_open_ingests(ustore_database_handle_t const& database) noexcept {
-    std::uint32_t& open_ingests = const_cast<std::uint32_t&>(database.open_ingests);
-    if (floor_atomic_ref<std::uint32_t> {open_ingests}.load(std::memory_order_acquire))
+inline util::status_t refuse_open_ingests(ustore_database_handle_t& database) noexcept {
+    if (floor_atomic_ref<std::uint32_t> {database.open_ingests}.load(std::memory_order_acquire))
         return {util::status_code_t::contended_k, "An ingest is open on the database"};
     return {};
 }
@@ -855,9 +853,9 @@ util::status_t list_cursor_keys(engine_t const& engine, ustore_database_t databa
     resume = cursor.position;
     ustore_key_t const* const start = std::get_if<ustore_key_t>(&cursor.position);
     if (!start || !wanted) return {};
-    return list_matched_keys<scan_type_>(engine.host, database, cursor.cursor.collection, *start,
+    return list_matched_keys<scan_type_>(engine.host, database, cursor.walk.collection, *start,
                                          cursor.end_key ? std::addressof(*cursor.end_key) : nullptr,
-                                         cursor.cursor.direction, wanted, match, arena, view, survivors, resume);
+                                         cursor.walk.direction, wanted, match, arena, view, survivors, resume);
 }
 
 #pragma endregion Cursors
@@ -907,9 +905,6 @@ inline bool take(claim_t& word) noexcept { return host_verbs().take(&word); }
 /** Hands @p word back to the next call. */
 inline void release(claim_t& word) noexcept { host_verbs().release(&word); }
 
-/** Waits until no call holds @p word. */
-inline void wait_while_claimed(claim_t const& word) noexcept { host_verbs().wait_while_claimed(&word); }
-
 /** The arena @p arguments fill, or null for a call without outputs in one. */
 template <typename arguments_type_>
 ustore_arena_t arena_of(arguments_type_ const& arguments) noexcept {
@@ -932,7 +927,7 @@ std::array<std::uint32_t*, 3> named_calls_of(arguments_type_ const& arguments) n
     ustore_arena_t const arena = arena_of(arguments);
     ustore_database_t const database = database_of(arguments);
     std::uint32_t* viewed = nullptr;
-    if constexpr (a_cursor_walker<arguments_type_>) viewed = &arguments.cursor->cursor.named_calls;
+    if constexpr (a_cursor_walker<arguments_type_>) viewed = &arguments.cursor->walk.named_calls;
     else if constexpr (a_call_feeding_ingest<arguments_type_>) viewed = &arguments.ingest->named_calls;
     else if constexpr (std::is_same_v<arguments_type_, ustore_database_compact_t>)
         viewed = arguments.plan && *arguments.plan ? &(*arguments.plan)->named_calls : nullptr;
@@ -973,7 +968,7 @@ inline void lower_named_calls(std::array<std::uint32_t*, 3> const& counts) noexc
 /** The claim of the cursor @p arguments pull or of the ingest they feed, or null for neither. */
 template <typename arguments_type_>
 claim_t* handle_claim_of(arguments_type_ const& arguments) noexcept {
-    if constexpr (a_cursor_walker<arguments_type_>) return &arguments.cursor->cursor.claim;
+    if constexpr (a_cursor_walker<arguments_type_>) return &arguments.cursor->walk.claim;
     else if constexpr (a_call_feeding_ingest<arguments_type_>) return &arguments.ingest->claim;
     else return nullptr;
 }
@@ -1026,68 +1021,53 @@ bool reads_from_arena(arguments_type_ const& arguments, ustore_arena_t arena) no
     return false;
 }
 
-/** Claims the arena, the cursor or ingest and the transaction of @p arguments, holding none when
- *  one serves another call, and refusing a call that needs an arena, a cursor or an ingest and
- *  names none, whose arena lives where its executor does not compute, or whose inputs lie inside
- *  the arena it rewinds. */
-template <typename arguments_type_>
-util::status_t take_claims(arguments_type_ const& arguments) noexcept {
-    if constexpr (a_call_pulling_cursor<arguments_type_>)
-        if (!arguments.cursor) return {util::status_code_t::invalid_argument_k, "The call needs a cursor"};
-    if constexpr (a_call_feeding_ingest<arguments_type_>)
-        if (!arguments.ingest) return {util::status_code_t::invalid_argument_k, "The ingest is missing"};
-    ustore_arena_t const arena = arena_of(arguments);
-    if constexpr (a_call_filling_arena<arguments_type_>) {
-        if (!arena) return {util::status_code_t::invalid_argument_k, "The call needs an arena for its outputs"};
-        if (!arena_serves(arguments.executor, arena))
-            return {util::status_code_t::device_k, "The arena lives where another executor computes"};
-        if (!take(arena->claim)) return {util::status_code_t::contended_k, "The arena serves another call"};
-        if (reads_from_arena(arguments, arena)) {
-            release(arena->claim);
-            return {util::status_code_t::invalid_argument_k, "Input lies inside the arena the call rewinds"};
-        }
-    }
-    claim_t* const handle = handle_claim_of(arguments);
-    if (handle && !take(*handle)) {
-        if (arena) release(arena->claim);
-        return {util::status_code_t::contended_k, a_call_feeding_ingest<arguments_type_>
-                                                      ? "The ingest serves another call"
-                                                      : "The cursor serves another pull"};
-    }
-    ustore_transaction_t const transaction = transaction_of(arguments);
-    if (transaction && !take(transaction->claim)) {
-        if (arena) release(arena->claim);
-        if (handle) release(*handle);
-        return {util::status_code_t::contended_k, "The transaction serves another call"};
-    }
-    return {};
-}
-
-/** The claims of the arena, the cursor and the transaction of @p arguments, each null when
- *  absent. */
-template <typename arguments_type_>
-std::array<claim_t*, 3> claims_of(arguments_type_ const& arguments) noexcept {
-    ustore_arena_t const arena = arena_of(arguments);
-    ustore_transaction_t const transaction = transaction_of(arguments);
-    return {arena ? &arena->claim : nullptr, handle_claim_of(arguments), transaction ? &transaction->claim : nullptr};
-}
-
 /** Hands every one of @p claims that is not null back to the next call. */
 inline void release(std::array<claim_t*, 3> const& claims) noexcept {
     for (claim_t* const claim : claims)
         if (claim) release(*claim);
 }
 
-/** Releases the claims of @p arguments once the engine returned. */
+/** Claims the arena, the cursor or ingest and the transaction of @p arguments, answering the claims
+ *  it took, or holding none when one serves another call, and refusing a call that needs an arena,
+ *  a cursor or an ingest and names none, whose arena lives where its executor does not compute, or
+ *  whose inputs lie inside the arena it rewinds. */
 template <typename arguments_type_>
-void release_claims(arguments_type_ const& arguments) noexcept {
-    release(claims_of(arguments));
+util::expected<std::array<claim_t*, 3>> take_claims(arguments_type_ const& arguments) noexcept {
+    using util::status_code_t, util::status_t;
+    if constexpr (a_call_pulling_cursor<arguments_type_>)
+        if (!arguments.cursor) return status_t {status_code_t::invalid_argument_k, "The call needs a cursor"};
+    if constexpr (a_call_feeding_ingest<arguments_type_>)
+        if (!arguments.ingest) return status_t {status_code_t::invalid_argument_k, "The ingest is missing"};
+    std::array<claim_t*, 3> claims {};
+    if constexpr (a_call_filling_arena<arguments_type_>) {
+        ustore_arena_t const arena = arguments.arena;
+        if (!arena) return status_t {status_code_t::invalid_argument_k, "The call needs an arena for its outputs"};
+        if (!arena_serves(arguments.executor, arena))
+            return status_t {status_code_t::device_k, "The arena lives where another executor computes"};
+        if (!take(arena->claim)) return status_t {status_code_t::contended_k, "The arena serves another call"};
+        claims[0] = &arena->claim;
+        if (reads_from_arena(arguments, arena))
+            return release(claims),
+                   status_t {status_code_t::invalid_argument_k, "Input lies inside the arena the call rewinds"};
+    }
+    claim_t* const handle = handle_claim_of(arguments);
+    if (handle && !take(*handle))
+        return release(claims), status_t {status_code_t::contended_k, a_call_feeding_ingest<arguments_type_>
+                                                                          ? "The ingest serves another call"
+                                                                          : "The cursor serves another pull"};
+    claims[1] = handle;
+    ustore_transaction_t const transaction = transaction_of(arguments);
+    if (transaction && !take(transaction->claim))
+        return release(claims), status_t {status_code_t::contended_k, "The transaction serves another call"};
+    claims[2] = transaction ? &transaction->claim : nullptr;
+    return claims;
 }
 
-/** Finishes @p arguments with @p status without serving them, releasing the claims the router took. */
+/** Finishes @p arguments with @p status without serving them, releasing the @p claims the router
+ *  took. */
 template <typename arguments_type_>
-void refuse(arguments_type_& arguments, util::status_t status) noexcept {
-    release_claims(arguments);
+void refuse(arguments_type_& arguments, std::array<claim_t*, 3> const& claims, util::status_t status) noexcept {
+    release(claims);
     finish(*arguments.outcome, status);
 }
 
@@ -1110,8 +1090,10 @@ inline void free_compact_plan(ustore_database_compact_plan_t plan) noexcept {
     delete plan;
 }
 
-/** Finishes a plan's finish with @p status without serving it, freeing the plan all the same. */
-inline void refuse(ustore_database_compact_plan_finish_t& arguments, util::status_t status) noexcept {
+/** Finishes a plan's finish with @p status without serving it, freeing the plan all the same; it
+ *  takes no claims, and must stay a better match than the template so the plan is never leaked. */
+inline void refuse(ustore_database_compact_plan_finish_t& arguments, std::array<claim_t*, 3> const&,
+                   util::status_t status) noexcept {
     free_compact_plan(arguments.plan);
     finish(*arguments.outcome, status);
 }
@@ -1663,7 +1645,7 @@ util::status_t serve(arguments_type_ const& arguments, view_t const& runner) noe
         if (database->access == access_t::read_only_k)
             return {util::status_code_t::read_only_k, "The database was opened read-only"};
     if constexpr (a_cursor_walker<arguments_type_>)
-        if (arguments.cursor->cursor.database != database)
+        if (arguments.cursor->walk.database != database)
             return {util::status_code_t::invalid_argument_k, "The cursor walks another database"};
     if constexpr (a_call_naming_collections<arguments_type_>)
         if (arguments.count && !arguments.collections.data)
@@ -1698,7 +1680,7 @@ util::status_t serve(arguments_type_ const& arguments, view_t const& runner) noe
                 if (util::status_t const opened = open_device_call(arguments, executor...); opened.failed())
                     return opened;
             if constexpr (a_cursor_walker<arguments_type_>)
-                return with_call_stamp(engine, database, &arguments.cursor->cursor.collection, view,
+                return with_call_stamp(engine, database, &arguments.cursor->walk.collection, view,
                                        [&](view_t const& pinned) noexcept {
                                            return pull(engine, arguments, *arguments.cursor, pinned, executor...);
                                        });
@@ -1718,13 +1700,20 @@ util::status_t serve(arguments_type_ const& arguments, view_t const& runner) noe
 /** Whether deferred calls on @p executor are delegated to its pool thread 0: a caller-exclusive
  *  pool has one of its own, while an inclusive one, as a VRAM executor's is, runs on its caller. */
 inline bool delegates(ustore_executor_handle_t const& executor) noexcept {
-    return executor.pool.view().caller_exclusivity() == util::caller_exclusivity_t::caller_exclusive_k;
+    return executor.threads.caller_exclusivity() == fu::caller_exclusive_k;
 }
 
 /** Waits until the dispatch of the last call delegated on @p executor has left pool thread 0, or
  *  returns at once on a pool that never delegates. */
-inline void join_delegated(ustore_executor_handle_t const& executor) noexcept {
-    if (delegates(executor)) executor.pool.view().unsafe_join(0);
+inline void join_delegated(ustore_executor_handle_t& executor) noexcept {
+    if (delegates(executor)) executor.threads.unsafe_join(0);
+}
+
+/** Takes the claim of @p executor once no call holds it, then joins the slice thread 0 may still be
+ *  leaving, so the caller alone joins, parks or frees its pool. */
+inline void take_idle_claim(ustore_executor_handle_t& executor) noexcept {
+    while (!take(executor.holding_call.claim)) host_verbs().wait_while_claimed(&executor.holding_call.claim);
+    join_delegated(executor);
 }
 
 /** Whether the calling thread serves the body of the call holding @p executor, so waiting on the
@@ -1854,26 +1843,25 @@ using server_of = util::status_t (*)(call_type_&, view_t const&) noexcept;
 /** Serves @p call with @p serve_ in the scratch and on the thread @p runner names, then releases
  *  the claims it took and finishes its outcome. */
 template <typename call_type_, server_of<call_type_> serve_>
-void run(call_type_* call, view_t const& runner) noexcept {
-    std::array<claim_t*, 3> const claims = claims_of(*call);
+void run(call_type_* call, std::array<claim_t*, 3> const& claims, view_t const& runner) noexcept {
     util::status_t const status = serve_(*call, runner);
     release(claims);
     finish(*call->outcome, status);
 }
 
-/** Runs @p call on the calling thread over a scratch made for it alone and empty queues, as a call
- *  without an executor keeping either needs: the scratch's first page lies on the stack, and the
- *  blocks it grows into, like the blocks an NVMe path gives the queues on its first read or write,
- *  are freed once the call is final. */
+/** Runs @p call on the calling thread over a scratch made for it alone, and over a blocking queue
+ *  set that opens only if the call reaches its data through queues, as a call without an executor
+ *  keeping either needs: the scratch's first page lies on the stack, and the blocks it grows into
+ *  and the queues are freed once the call is final. */
 template <typename call_type_, server_of<call_type_> serve_>
-void run_alone(call_type_* call) noexcept {
+void run_alone(call_type_* call, std::array<claim_t*, 3> const& claims) noexcept {
+    util::nvme_queues_t queues;
     alignas(util::arena_alignment_k) util::byte_t page[util::arena_page_bytes_k];
     util::arena_block_t* const first = new (page)
         util::arena_block_t {nullptr, sizeof(page), sizeof(util::arena_block_t)};
     ustore_arena_handle_t scratch {.memory = util::host_blocks_t {.newest = first}};
-    util::nvme_queues_t queues;
     std::array<std::uint32_t*, 3> const named_calls = raise_named_calls(*call);
-    run<call_type_, serve_>(call, view_t {.scratch = &scratch, .queues = &queues});
+    run<call_type_, serve_>(call, claims, view_t {.scratch = &scratch, .queues = &queues});
     lower_named_calls(named_calls);
     util::arena_free_blocks(scratch, first);
 }
@@ -1893,17 +1881,17 @@ void serve_delegated(void* context, std::size_t thread, std::size_t) noexcept {
 /** Runs @p call on the calling thread, alone or holding its executor, or delegates it to the pool's
  *  thread 0, as its executor and completion ask; a call finding the executor held is refused. */
 template <typename call_type_, server_of<call_type_> serve_>
-void dispatch(call_type_* call) noexcept {
+void dispatch(call_type_* call, std::array<claim_t*, 3> const& claims) noexcept {
     ustore_executor_handle_t* const executor = call->executor;
-    if (util::status_t const refused = admit_executor(*call); refused.failed()) return refuse(*call, refused);
-    if (!executor) return run_alone<call_type_, serve_>(call);
+    if (util::status_t const refused = admit_executor(*call); refused.failed()) return refuse(*call, claims, refused);
+    if (!executor) return run_alone<call_type_, serve_>(call, claims);
     holding_call_t& holding = executor->holding_call;
     if (!take(holding.claim))
-        return refuse(*call, {util::status_code_t::contended_k, "Another call holds the executor"});
+        return refuse(*call, claims, {util::status_code_t::contended_k, "Another call holds the executor"});
     join_delegated(*executor);
     holding.outcome = call->outcome;
     holding.named_calls = raise_named_calls(*call);
-    holding.claims = claims_of(*call);
+    holding.claims = claims;
     host_verbs().publish(call->outcome, ustore_status_deferred_k, std::memory_order_relaxed);
     if (call->completion == ustore_completion_blocking_k || !delegates(*executor)) {
         floor_atomic_ref<std::thread::id> {holding.body_thread}.store(std::this_thread::get_id(),
@@ -1914,9 +1902,8 @@ void dispatch(call_type_* call) noexcept {
     holding.delegated_arguments.template emplace<call_type_>(*call);
     // Thread 0 may end the call before this returns, so the token stays local; joins pass zero
     fu_generation_t generation = 0;
-    [[maybe_unused]] st::status_t const dispatched = executor->pool.view().unsafe_for_threads(
-        &serve_delegated<call_type_, serve_>, executor, generation);
-    assert(!st::failed(dispatched) && "The pool is idle once joined under the executor claim");
+    if (fu::failed(executor->threads.unsafe_for_threads(&serve_delegated<call_type_, serve_>, executor, generation)))
+        holding.recorded = {util::status_code_t::contended_k, "The pool runs another dispatch"}, end_call(*executor);
 }
 
 /** Leaves the outputs of @p arguments null or zero and claims what they hold, then dispatches them
@@ -1924,9 +1911,9 @@ void dispatch(call_type_* call) noexcept {
 template <typename arguments_type_>
 void route(arguments_type_* arguments) noexcept {
     if constexpr (a_call_clearing_outputs<arguments_type_>) clear_outputs(*arguments);
-    if (util::status_t const claimed = take_claims(*arguments); claimed.failed())
-        return finish(*arguments->outcome, claimed);
-    dispatch<arguments_type_, &serve_deferred<arguments_type_>>(arguments);
+    auto const [claims, take_status] = take_claims(*arguments);
+    if (take_status.failed()) return finish(*arguments->outcome, take_status);
+    dispatch<arguments_type_, &serve_deferred<arguments_type_>>(arguments, claims);
 }
 
 /**
@@ -1945,7 +1932,7 @@ void route_init(arguments_type_* arguments) noexcept {
         if (arguments->directory.length && !arguments->directory.data)
             return finish(*arguments->outcome,
                           {util::status_code_t::invalid_argument_k, "A directory with a length needs its bytes"});
-    dispatch<arguments_type_, &serve_open<arguments_type_, open_>>(arguments);
+    dispatch<arguments_type_, &serve_open<arguments_type_, open_>>(arguments, {});
 }
 
 #pragma endregion Routing
@@ -2046,16 +2033,16 @@ inline void route_compaction(ustore_database_compact_t* arguments) noexcept {
     ustore_database_compact_plan_t const plan = arguments->plan ? *arguments->plan : nullptr;
     if (util::status_t const refused = admit_compaction(*arguments, plan); refused.failed())
         return finish(*arguments->outcome, refused);
-    if (util::status_t const claimed = take_claims(*arguments); claimed.failed())
-        return finish(*arguments->outcome, claimed);
-    dispatch<ustore_database_compact_t, &serve_compaction>(arguments);
+    auto const [claims, take_status] = take_claims(*arguments);
+    if (take_status.failed()) return finish(*arguments->outcome, take_status);
+    dispatch<ustore_database_compact_t, &serve_compaction>(arguments, claims);
 }
 
 /** Routes a plan's finish as a compaction is routed, freeing the plan whatever the call answers. */
 inline void route_compaction_finish(ustore_database_compact_plan_finish_t* arguments) noexcept {
     if (util::status_t const refused = admit_compaction(*arguments, arguments->plan); refused.failed())
-        return refuse(*arguments, refused);
-    dispatch<ustore_database_compact_plan_finish_t, &serve_compaction_finish>(arguments);
+        return refuse(*arguments, {}, refused);
+    dispatch<ustore_database_compact_plan_finish_t, &serve_compaction_finish>(arguments, {});
 }
 
 #pragma endregion Compaction Plans
@@ -2132,17 +2119,17 @@ util::expected<cursor_type_*> open_cursor(arguments_type_ const& arguments) noex
     cursor_type_* const cursor = new (std::nothrow) cursor_type_ {};
     if (!cursor) return util::status_t {util::status_code_t::out_of_memory_k, "No room for the cursor"};
     auto [opened, opened_status] = open_cursor_engine<verbs_type_, scan_type_>(engine_of(database), arguments.executor,
-                                                                               arguments, &cursor->cursor.compiled);
+                                                                               arguments, &cursor->walk.compiled);
     if (opened_status.failed()) {
-        util::arena_free_blocks(cursor->cursor.compiled);
+        util::arena_free_blocks(cursor->walk.compiled);
         delete cursor;
         return opened_status;
     }
     cursor->engine = opened;
-    cursor->cursor.database = database;
-    cursor->cursor.view = arguments.view;
-    cursor->cursor.collection = arguments.collection;
-    cursor->cursor.direction = arguments.direction;
+    cursor->walk.database = database;
+    cursor->walk.view = arguments.view;
+    cursor->walk.collection = arguments.collection;
+    cursor->walk.direction = arguments.direction;
     if constexpr (an_init_ending_at_key<arguments_type_>)
         if (arguments.end_key) cursor->end_key = *arguments.end_key;
     take_hold(database);
@@ -2155,13 +2142,13 @@ util::expected<cursor_type_*> open_cursor(arguments_type_ const& arguments) noex
 template <typename cursor_type_>
 void free_cursor(cursor_type_* cursor) noexcept {
     if (!cursor) return;
-    wait_named_calls(cursor->cursor.named_calls);
+    wait_named_calls(cursor->walk.named_calls);
     view_t view;
-    decode_view(cursor->cursor.view, view);
+    decode_view(cursor->walk.view, view);
     release_parent(view.transaction);
     release_parent(view.snapshot);
-    release_hold(cursor->cursor.database);
-    util::arena_free_blocks(cursor->cursor.compiled);
+    release_hold(cursor->walk.database);
+    util::arena_free_blocks(cursor->walk.compiled);
     delete cursor;
 }
 
@@ -2174,7 +2161,7 @@ using namespace unum::ustore;
 /** What @c ustore_blobs_cursor_t points to: a walk over the keys of one blobs collection, resumed
  *  at the key after the last one it handed out. */
 struct ustore_blobs_cursor_handle_t {
-    cursor_t cursor;
+    cursor_t walk;
 
     /** The first key in the walk's direction the next pull may hand out, or the end of the walk. */
     std::variant<ustore_key_t, exhausted_t> position;
@@ -2189,7 +2176,7 @@ struct ustore_blobs_cursor_handle_t {
 /** What @c ustore_docs_cursor_t points to: a walk over the keys of one documents collection,
  *  resumed as the blobs walk is. */
 struct ustore_docs_cursor_handle_t {
-    cursor_t cursor;
+    cursor_t walk;
 
     /** The first key in the walk's direction the next pull may hand out, or the end of the walk. */
     std::variant<ustore_key_t, exhausted_t> position;
@@ -2200,14 +2187,14 @@ struct ustore_docs_cursor_handle_t {
     /** The verbs and the match of the residency the walk computes at. */
     cursor_engines<docs_verbs> engine;
 
-    /** The columns every pull gathers, copied into @c cursor.compiled at init. */
+    /** The columns every pull gathers, copied into @c walk.compiled at init. */
     docs_columns_t columns;
 };
 
 /** What @c ustore_pages_cursor_t points to: a walk over the keys of one pages collection, resumed
  *  as the blobs walk is. */
 struct ustore_pages_cursor_handle_t {
-    cursor_t cursor;
+    cursor_t walk;
 
     /** The first key in the walk's direction the next pull may hand out, or the end of the walk. */
     std::variant<ustore_key_t, exhausted_t> position;
@@ -2222,7 +2209,7 @@ struct ustore_pages_cursor_handle_t {
 /** What @c ustore_graph_vertices_cursor_t points to: a walk over the vertices of one graph
  *  collection, resumed as the blobs walk is. */
 struct ustore_graph_vertices_cursor_handle_t {
-    cursor_t cursor;
+    cursor_t walk;
 
     /** The first key in the walk's direction the next pull may hand out, or the end of the walk. */
     std::variant<ustore_key_t, exhausted_t> position;
@@ -2239,7 +2226,7 @@ struct ustore_graph_vertices_cursor_handle_t {
 struct ustore_strings_cursor_handle_t {
 
     /** What the walk holds and reads. */
-    cursor_t cursor;
+    cursor_t walk;
 
     /** The prefix every string the walk hands out starts with. */
     sz::string_t prefix;
@@ -2261,6 +2248,6 @@ struct ustore_strings_cursor_handle_t {
  *  collection it reads, and its engine's state, which holds the pinned stamp and the position of
  *  the next pull. */
 struct ustore_changes_cursor_handle_t {
-    cursor_t cursor;
+    cursor_t walk;
     void* state = nullptr;
 };

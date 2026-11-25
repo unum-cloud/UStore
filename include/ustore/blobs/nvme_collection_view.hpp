@@ -211,23 +211,33 @@ class published_view {
 
     /** The view published last, whose runs and their bytes are visible to the caller in whole. */
     [[nodiscard]] view_t const* load() const noexcept {
-        return atomic_reference_<view_t const* const> {view_}.load(std::memory_order_acquire);
+        return atomic_reference_<view_t* const> {view_}.load(std::memory_order_acquire);
+    }
+
+    /** The view published last, which only the publisher, as its owner, may change. */
+    [[nodiscard]] view_t* owned() const noexcept {
+        // Relaxed, since only the publisher stores this word and it reads its own last store.
+        return atomic_reference_<view_t* const> {view_}.load(std::memory_order_relaxed);
     }
 
     /** Publishes @p newer and answers the view it replaces, which the caller frees once every reader that entered
      *  before has left. */
-    view_t const* replace(view_t const& newer) noexcept {
-        atomic_reference_<view_t const*> const word {view_};
+    view_t* replace(view_t& newer) noexcept {
+        atomic_reference_<view_t*> const word {view_};
         // Relaxed, since only the publisher stores this word and it reads its own last store.
-        view_t const* const older = word.load(std::memory_order_relaxed);
+        view_t* const older = word.load(std::memory_order_relaxed);
         word.store(&newer, std::memory_order_release);
         return older;
     }
 
+    /** Forgets the view and answers it for the caller to free, which only an owner no reader
+     *  reaches may do. */
+    view_t* release() noexcept { return std::exchange(view_, nullptr); }
+
   private:
 
     /** The published view, on a line of its own so a publication evicts no neighbour readers hold. */
-    alignas(fu::default_alignment_k) view_t const* view_ = nullptr;
+    alignas(fu::default_alignment_k) view_t* view_ = nullptr;
 };
 
 /** One thread's announcement, alone on its lines, so a reader entering writes nothing another reader writes. */

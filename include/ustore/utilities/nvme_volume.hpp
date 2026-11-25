@@ -918,13 +918,13 @@ class basic_slotted_volume {
 
     /** The extent @p file names, which the mount has already credited to its slot. */
     expected<medium_extent_t> open(manifest_file_t const& file) noexcept {
-        raw_medium_t const& medium = media_[file.medium];
-        std::uint32_t const index = static_cast<std::uint32_t>((file.offset - medium.base) / slot_bytes_k);
+        raw_medium_t const& raw = media_[file.medium];
+        std::uint32_t const index = static_cast<std::uint32_t>((file.offset - raw.base) / slot_bytes_k);
         medium_extent_t placed;
-        placed.medium = medium.medium.reference();
+        placed.medium = raw.medium.reference();
         placed.extent = extent_t {file.offset, round_up_to_multiple(file.bytes, portable_alignment_k)};
         placed.data_directory = file.medium;
-        placed.placement = medium.slots.handle_of(index);
+        placed.placement = raw.slots.handle_of(index);
         return placed;
     }
 
@@ -942,11 +942,11 @@ class basic_slotted_volume {
         }
         if (chosen == media_.size())
             return status_t {status_code_t::capacity_exhausted_k, "No raw medium has room for that run"};
-        raw_medium_t& medium = media_[chosen];
-        auto [placed, allocate_status] = medium.slots.allocate(rounded);
+        raw_medium_t& raw = media_[chosen];
+        auto [placed, allocate_status] = raw.slots.allocate(rounded);
         if (allocate_status.failed()) return allocate_status;
-        placed.medium = medium.medium.reference();
-        placed.extent.offset += medium.base;
+        placed.medium = raw.medium.reference();
+        placed.extent.offset += raw.base;
         return placed;
     }
 
@@ -955,10 +955,10 @@ class basic_slotted_volume {
      *  and a slot left empty is zeroed and deallocated. */
     void deallocate(medium_extent_t const& extent) noexcept {
         if (extent.data_directory >= media_.size()) return;
-        raw_medium_t& medium = media_[extent.data_directory];
+        raw_medium_t& raw = media_[extent.data_directory];
         // A run left unzeroed is a run a recovery may take back, never a run the manifest names.
-        [[maybe_unused]] st::status_t const remembered = medium.dropped.push_back(medium_extent_t {extent});
-        medium.slots.deallocate(extent);
+        [[maybe_unused]] st::status_t const remembered = raw.dropped.push_back(medium_extent_t {extent});
+        raw.slots.deallocate(extent);
     }
 
     /** Gives @p extent back after the next publication that succeeds, for a run the manifest on
@@ -982,7 +982,8 @@ class basic_slotted_volume {
         std::uint64_t const idle = manifest_owner_.manifest_offset == regions ? regions + manifest_region_bytes_k
                                                                               : regions;
         basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, channel, first.medium.reference()};
-        if (status_t const written = write_bytes_(writer, idle, std::as_bytes(json), first.block_bytes);
+        if (status_t const written = write_bytes_(writer, idle, std::as_bytes(json),
+                                                  first.medium.logical_block_bytes());
             written.failed())
             return written;
         if (status_t const durable = writer.make_durable(); durable.failed()) return durable;
@@ -1012,7 +1013,7 @@ class basic_slotted_volume {
     /** Bytes every raw medium still offers. */
     [[nodiscard]] std::uint64_t free_bytes() const noexcept {
         std::uint64_t free = 0;
-        for (raw_medium_t const& medium : media_) free += medium.slots.free_bytes();
+        for (raw_medium_t const& raw : media_) free += raw.slots.free_bytes();
         return free;
     }
 
@@ -1023,10 +1024,9 @@ class basic_slotted_volume {
     status_t unmount() noexcept {
         if (!disk_) return {};
         status_t first;
-        for (raw_medium_t& medium : media_)
-            if (medium.medium.held())
-                if (status_t const closed = disk_->unregister_medium(medium.medium);
-                    closed.failed() && first.succeeded())
+        for (raw_medium_t& raw : media_)
+            if (raw.medium.held())
+                if (status_t const closed = disk_->unregister_medium(raw.medium); closed.failed() && first.succeeded())
                     first = closed;
         media_.clear();
         disk_ = nullptr;
@@ -1035,13 +1035,12 @@ class basic_slotted_volume {
 
   private:
 
-    /** One raw medium: its registration, where its first slot begins, its logical block,
-     *  and its slots. */
+    /** One raw medium: its registration, which knows its logical block, where its first slot
+     *  begins, and its slots. */
     struct raw_medium_t {
         file_lock_t claims;
         registered_medium_t medium;
         std::uint64_t base = 0;
-        std::uint64_t block_bytes = 0;
         slot_allocator_t slots;
 
         /** Runs given back since the last publication, whose first pages it zeroes. */
@@ -1087,31 +1086,31 @@ class basic_slotted_volume {
         auto [registered, register_status] = disk_->register_medium(request);
         if (register_status.failed()) return register_status;
 
-        raw_medium_t medium;
-        medium.claims = std::move(claims);
-        medium.medium = std::move(registered);
-        medium.base = address.byte_base;
-        medium.block_bytes = medium.medium.logical_block_bytes();
-        std::uint64_t const capacity = medium.medium.capacity();
+        raw_medium_t raw;
+        raw.claims = std::move(claims);
+        raw.medium = std::move(registered);
+        raw.base = address.byte_base;
+        std::uint64_t const block_bytes = raw.medium.logical_block_bytes();
+        std::uint64_t const capacity = raw.medium.capacity();
         status_t refused;
-        if (medium.block_bytes < sizeof(slot_owner_block_t) || medium.block_bytes > slot_payload_offset_k)
+        if (block_bytes < sizeof(slot_owner_block_t) || block_bytes > slot_payload_offset_k)
             refused = {status_code_t::unsupported_k, "A raw medium's block fits no owner block"};
-        else if (medium.base % medium.block_bytes != 0 || medium.base > capacity)
+        else if (raw.base % block_bytes != 0 || raw.base > capacity)
             refused = {status_code_t::invalid_argument_k, "A raw medium's base is misplaced"};
         // Another tool's file marks only the first slot it spans, so slots come from a named length
-        else if (address.byte_limit == 0 || address.byte_limit > capacity - medium.base)
+        else if (address.byte_limit == 0 || address.byte_limit > capacity - raw.base)
             refused = {status_code_t::invalid_argument_k, "A raw medium needs a fitting length"};
         std::uint64_t const usable = refused.failed() ? 0 : address.byte_limit;
         if (refused.succeeded()) {
             auto [slots, make_status] = slot_allocator_t::make(index, static_cast<std::size_t>(usable / slot_bytes_k),
                                                                allocator_);
             if (make_status.failed()) refused = make_status;
-            else medium.slots = std::move(slots);
+            else raw.slots = std::move(slots);
         }
-        if (refused.succeeded() && media_.push_back(std::move(medium)) != st::status_t::success_k)
+        if (refused.succeeded() && media_.push_back(std::move(raw)) != st::status_t::success_k)
             refused = {status_code_t::out_of_memory_k, "No room for another raw medium"};
-        if (refused.failed() && medium.medium.held()) [[maybe_unused]]
-            status_t const closed = disk_->unregister_medium(medium.medium);
+        if (refused.failed() && raw.medium.held()) [[maybe_unused]]
+            status_t const closed = disk_->unregister_medium(raw.medium);
         return refused;
     }
 
@@ -1164,11 +1163,12 @@ class basic_slotted_volume {
             (owner.manifest_offset != regions && owner.manifest_offset != regions + manifest_region_bytes_k))
             return {status_code_t::malformed_k, "The manifest slot points outside its regions"};
         st::vector<char> text;
-        std::uint64_t const rounded = round_up_to_multiple(owner.manifest_bytes, first.block_bytes);
+        std::uint64_t const rounded = round_up_to_multiple(owner.manifest_bytes, first.medium.logical_block_bytes());
         if (text.resize(static_cast<std::size_t>(rounded)) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room to read the manifest"};
         basic_read_pipeline<disk_type_> reader {*disk_, channel, first.medium.reference()};
-        std::uint64_t const block_bytes = round_down_to_multiple(channel.requests().buffer_bytes(), first.block_bytes);
+        std::uint64_t const block_bytes = round_down_to_multiple(channel.requests().buffer_bytes(),
+                                                                 first.medium.logical_block_bytes());
         std::uint64_t offered = 0;
         status_t held;
         auto sink = [&](completed_buffer_t const& completed) noexcept {
@@ -1201,34 +1201,34 @@ class basic_slotted_volume {
     status_t credit_(manifest_file_t const& file) noexcept {
         if (file.medium >= media_.size())
             return {status_code_t::malformed_k, "The manifest names an unmounted data directory"};
-        raw_medium_t& medium = media_[file.medium];
-        std::uint64_t const slots_end = medium.base + medium.slots.size() * slot_bytes_k;
-        if (file.offset < medium.base || file.offset > slots_end || file.bytes > slots_end - file.offset)
+        raw_medium_t& raw = media_[file.medium];
+        std::uint64_t const slots_end = raw.base + raw.slots.size() * slot_bytes_k;
+        if (file.offset < raw.base || file.offset > slots_end || file.bytes > slots_end - file.offset)
             return {status_code_t::malformed_k, "The manifest names bytes outside the slots"};
-        std::uint64_t const inside = file.offset - medium.base;
+        std::uint64_t const inside = file.offset - raw.base;
         std::uint32_t const index = static_cast<std::uint32_t>(inside / slot_bytes_k);
         std::uint64_t const offset = inside % slot_bytes_k;
         std::uint64_t const bytes = round_up_to_multiple(file.bytes, portable_alignment_k);
         if (offset < slot_payload_offset_k || offset % portable_alignment_k != 0 || bytes > slot_bytes_k - offset)
             return {status_code_t::malformed_k, "The manifest names a run past a slot"};
-        medium.slots.credit(index, offset, bytes);
+        raw.slots.credit(index, offset, bytes);
         return {};
     }
 
     /** Reads every owner block of medium @p index, then frees zero and leftover slots and
      *  refuses misplaced ones. */
     status_t scan_slots_(io_channel_t& channel, std::size_t index) noexcept {
-        raw_medium_t& medium = media_[index];
-        std::uint32_t const count = static_cast<std::uint32_t>(medium.slots.size());
+        raw_medium_t& raw = media_[index];
+        std::uint32_t const count = static_cast<std::uint32_t>(raw.slots.size());
         st::vector<owner_t> owners;
         if (owners.resize(count, owner_t::foreign_k) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room to classify a medium's slots"};
         std::uint32_t const first_scanned = index == 0 ? 1 : 0;
         // The reader gives the queue pair back before the writer below takes it.
         {
-            basic_read_pipeline<disk_type_> reader {*disk_, channel, medium.medium.reference()};
+            basic_read_pipeline<disk_type_> reader {*disk_, channel, raw.medium.reference()};
             if (status_t const read = read_owner_blocks_(
-                    reader, medium, first_scanned, count,
+                    reader, raw, first_scanned, count,
                     [&](std::uint32_t slot, slot_owner_block_t const& block) noexcept {
                         if (is_zero_(block)) owners[slot] = owner_t::free_k;
                         else if (block.magic != slot_owner_magic_k || block.database != manifest_.id)
@@ -1239,39 +1239,38 @@ class basic_slotted_volume {
                 return read;
         }
 
-        basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, channel, medium.medium.reference()};
+        basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, channel, raw.medium.reference()};
         for (std::uint32_t slot = count; slot != first_scanned; --slot) {
             std::uint32_t const at = slot - 1;
-            bool const named = medium.slots.slot(at).live_bytes != 0;
+            bool const named = raw.slots.slot(at).live_bytes != 0;
             if (owners[at] == owner_t::misplaced_k)
                 return {status_code_t::malformed_k, "The data directories are listed in another order"};
             if (named && owners[at] != owner_t::ours_k)
                 return {status_code_t::malformed_k, "The manifest names an unknown slot"};
             if (owners[at] == owner_t::ours_k && !named)
-                if (status_t const zeroed = free_on_device_(writer, medium, at); zeroed.failed()) return zeroed;
-            if (owners[at] == owner_t::free_k || (owners[at] == owner_t::ours_k && !named)) medium.slots.release(at);
+                if (status_t const zeroed = free_on_device_(writer, raw, at); zeroed.failed()) return zeroed;
+            if (owners[at] == owner_t::free_k || (owners[at] == owner_t::ours_k && !named)) raw.slots.release(at);
         }
-        medium.slots.reopen_packed();
+        raw.slots.reopen_packed();
         return writer.make_durable();
     }
 
     /** Writes the owner block of every slot of medium @p index taken since the last publication,
      *  and zeroes and deallocates every one freed. */
     status_t write_touched_(io_channel_t& channel, std::size_t index) noexcept {
-        raw_medium_t& medium = media_[index];
-        basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, channel, medium.medium.reference()};
+        raw_medium_t& raw = media_[index];
+        basic_write_pipeline<disk_type_, waiter_type_> writer {*disk_, channel, raw.medium.reference()};
         slot_owner_block_t const owner = owner_block_(static_cast<std::uint32_t>(index));
         // A slot vacated since a run was dropped has its owner block zeroed below, and may hold a
         // newer run already.
-        for (medium_extent_t const& dropped : medium.dropped)
-            if (medium.slots.holds(dropped.placement))
+        for (medium_extent_t const& dropped : raw.dropped)
+            if (raw.slots.holds(dropped.placement))
                 if (status_t const zeroed = zero_first_page_(writer, dropped.extent.offset); zeroed.failed())
                     return zeroed;
-        medium.dropped.clear();
-        if (status_t const drained = medium.slots.drain_touched([&](std::uint32_t slot, slot_change_t change) noexcept {
-                return change == slot_change_t::taken_k
-                           ? write_owner_block_(writer, medium, slot_base_(medium, slot), &owner)
-                           : free_on_device_(writer, medium, slot);
+        raw.dropped.clear();
+        if (status_t const drained = raw.slots.drain_touched([&](std::uint32_t slot, slot_change_t change) noexcept {
+                return change == slot_change_t::taken_k ? write_owner_block_(writer, raw, slot_base_(raw, slot), &owner)
+                                                        : free_on_device_(writer, raw, slot);
             });
             drained.failed())
             return drained;
@@ -1280,10 +1279,10 @@ class basic_slotted_volume {
 
     /** Zeroes the owner block of @p slot and deallocates its payload, leaving the zeroed
      *  block in place. */
-    status_t free_on_device_(basic_write_pipeline<disk_type_, waiter_type_>& writer, raw_medium_t const& medium,
+    status_t free_on_device_(basic_write_pipeline<disk_type_, waiter_type_>& writer, raw_medium_t const& raw,
                              std::uint32_t slot) noexcept {
-        std::uint64_t const base = slot_base_(medium, slot);
-        if (status_t const zeroed = write_owner_block_(writer, medium, base, nullptr); zeroed.failed()) return zeroed;
+        std::uint64_t const base = slot_base_(raw, slot);
+        if (status_t const zeroed = write_owner_block_(writer, raw, base, nullptr); zeroed.failed()) return zeroed;
         return writer.enqueue_deallocate(extent_t {base + slot_payload_offset_k, slot_bytes_k - slot_payload_offset_k});
     }
 
@@ -1301,15 +1300,15 @@ class basic_slotted_volume {
     }
 
     /** Stages @p owner, or zeroes when null, over the first logical block at @p offset. */
-    static status_t write_owner_block_(basic_write_pipeline<disk_type_, waiter_type_>& writer,
-                                       raw_medium_t const& medium, std::uint64_t offset,
-                                       slot_owner_block_t const* owner) noexcept {
+    static status_t write_owner_block_(basic_write_pipeline<disk_type_, waiter_type_>& writer, raw_medium_t const& raw,
+                                       std::uint64_t offset, slot_owner_block_t const* owner) noexcept {
         auto [block, acquire_status] = writer.acquire_buffer_or_poll();
         if (acquire_status.failed()) return acquire_status;
         std::span<byte_t> const bytes = block.bytes();
-        std::memset(bytes.data(), 0, static_cast<std::size_t>(medium.block_bytes));
+        std::memset(bytes.data(), 0, static_cast<std::size_t>(raw.medium.logical_block_bytes()));
         if (owner) std::memcpy(bytes.data(), owner, sizeof(slot_owner_block_t));
-        if (status_t const queued = writer.enqueue_write(std::move(block), extent_t {offset, medium.block_bytes});
+        if (status_t const queued = writer.enqueue_write(std::move(block),
+                                                         extent_t {offset, raw.medium.logical_block_bytes()});
             queued.failed())
             return queued;
         return writer.submit();
@@ -1339,10 +1338,10 @@ class basic_slotted_volume {
         return {};
     }
 
-    /** Reads the owner blocks of slots @p begin up to @p end of @p medium, handing each
+    /** Reads the owner blocks of slots @p begin up to @p end of @p raw, handing each
      *  to @p visitor. */
     template <typename visitor_type_>
-    static status_t read_owner_blocks_(basic_read_pipeline<disk_type_>& reader, raw_medium_t const& medium,
+    static status_t read_owner_blocks_(basic_read_pipeline<disk_type_>& reader, raw_medium_t const& raw,
                                        std::uint32_t begin, std::uint32_t end, visitor_type_&& visitor) noexcept {
         status_t held;
         auto sink = [&](completed_buffer_t const& completed) noexcept {
@@ -1357,8 +1356,8 @@ class basic_slotted_volume {
         for (std::uint32_t slot = begin; slot != end; ++slot) {
             while (!reader.can_enqueue())
                 if (status_t const polled = reader.poll_one_completion(sink); polled.failed()) return polled;
-            if (status_t const queued = reader.enqueue_read(extent_t {slot_base_(medium, slot), medium.block_bytes},
-                                                            slot);
+            if (status_t const queued = reader.enqueue_read(
+                    extent_t {slot_base_(raw, slot), raw.medium.logical_block_bytes()}, slot);
                 queued.failed())
                 return queued;
             if (status_t const submitted = reader.submit(); submitted.failed()) return submitted;
@@ -1367,8 +1366,8 @@ class basic_slotted_volume {
         return held;
     }
 
-    [[nodiscard]] static std::uint64_t slot_base_(raw_medium_t const& medium, std::uint32_t slot) noexcept {
-        return medium.base + std::uint64_t {slot} * slot_bytes_k;
+    [[nodiscard]] static std::uint64_t slot_base_(raw_medium_t const& raw, std::uint32_t slot) noexcept {
+        return raw.base + std::uint64_t {slot} * slot_bytes_k;
     }
 
     [[nodiscard]] static bool is_zero_(slot_owner_block_t const& block) noexcept {

@@ -315,9 +315,10 @@ class hip_module_t {
 template <typename module_type_>
 struct kernel_table;
 
-/** The stream every call on one AMD device queues on, the event it waits on, the device's class, and the ceiling on
- *  the scratch those calls walk with. Work is queued, never waited on but by @c wait, so one host thread keeps the
- *  device fed. */
+/** The stream every call on one AMD device queues on, the event it waits on, the device's class,
+ *  and the ceiling on the scratch those calls walk with. Work is queued, never waited on but by
+ *  @c wait, so one host thread keeps the device fed. Nothing here is claimed: the C ABI's executor
+ *  claim admits one caller at a time, and a header-only user sharing it must too. */
 class hip_executor_t {
   public:
     static constexpr gpu_vendor_t vendor_k = gpu_vendor_t::amd_k;

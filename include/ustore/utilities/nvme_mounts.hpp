@@ -30,7 +30,6 @@
 #include <cstring> // `std::memcpy`
 
 #include <limits>      // `std::numeric_limits`
-#include <memory>      // `std::shared_ptr`, `std::make_shared`
 #include <new>         // placement `new`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
@@ -39,9 +38,9 @@
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
-#include "ustore/utilities/nvme_channels.hpp" // `io_channel_config_t`
-#include "ustore/utilities/nvme_disks.hpp"    // `blocking_files_disk`, `memory_disk`
-#include "ustore/utilities/nvme_queues.hpp"   // `io_transport_t`, `probed_transport`
+#include "ustore/utilities/nvme_channels.hpp"         // `io_channel_config_t`
+#include "ustore/utilities/nvme_disks.hpp"            // `blocking_files_disk`, `memory_disk`
+#include "ustore/utilities/nvme_queues.hpp"           // `io_transport_t`, `probed_transport`
 #include "ustore/utilities/nvme_linux_aio_disk.hpp"   // `linux_aio_files_disk`, `linux_aio_probe_t`
 #include "ustore/utilities/nvme_linux_spdk_disk.hpp"  // `linux_spdk_disk`, `linux_spdk_environment`
 #include "ustore/utilities/nvme_linux_uring_disk.hpp" // `linux_uring_files_disk`, `linux_uring_probe_t`
@@ -408,8 +407,7 @@ class basic_storage_mount {
         volume.data_directories = std::span<data_address_t const> {addresses.data_directories};
         volume.runs_capacity = runs_capacity;
         volume.access = config.access;
-        if (!queues.queues) return {status_code_t::invalid_argument_k, "A call names its queues"};
-        auto [channels, media_status] = queues.queues->both_channels_with_disk_media(queues.thread_index, disk_);
+        auto [channels, media_status] = queues.both_channels(disk_);
         if (media_status.failed()) return media_status;
         auto [opened, mount_status] = volume_t::mount(disk_, *channels.writing, volume, allocator_t {constraint});
         [[maybe_unused]] status_t const drained = disk_.drain(channels.writing->queue_pair());
@@ -703,53 +701,23 @@ struct shared_resources {
         : memory_constraint(memory_limit), gpu_memory_constraint(gpu_memory_limit) {}
 };
 
-/** The resources of one database, held by the database and every collection and buffer charged
- *  to its budgets. */
-template <template <typename> typename atomic_reference_, typename waiter_type_>
-using resources_shared_ptr = std::shared_ptr<shared_resources<atomic_reference_, waiter_type_>>;
-
-/** Constructs @p object_type_ in memory charged to the host budget, or returns an empty pointer
- *  once it runs out. */
-template <typename object_type_, template <typename> typename atomic_reference_, typename waiter_type_,
-          typename... argument_types_>
-std::shared_ptr<object_type_> make_constrained_shared(
-    resources_shared_ptr<atomic_reference_, waiter_type_> const& resources, argument_types_&&... arguments) noexcept {
-    constrained_allocator<byte_t, atomic_reference_> allocator {resources->memory_constraint};
-    auto* const pointer = reinterpret_cast<object_type_*>(allocator.allocate(sizeof(object_type_)));
-    if (!pointer) return {};
-
-    auto deleter = [allocator](object_type_* constructed) mutable {
-        constructed->~object_type_();
-        allocator.deallocate(bytes_of(constructed, 1).data(), sizeof(object_type_));
-    };
-    return std::shared_ptr<object_type_>(new (pointer) object_type_(std::forward<argument_types_>(arguments)...),
-                                         deleter);
-}
-
 /**
  *  @brief Mounts the storage of one database over the manifest and the data directories
- *      @p config names.
+ *      @p config names, into @p resources, whose budgets the caller sized from @p config.
+ *  @param[in,out] resources The resources the database holds, which outlive every collection
+ *      and buffer charged to them and whose destructor tears the mount down in build order.
  *  @param[in] config Budgets, the manifest and the data directories to mount.
  *  @param[in] queues The opening call's queue set, which reads the manifest.
- *  @return The resources, whose destructor tears the mount down in the order it was built in.
  */
 template <template <typename> typename atomic_reference_, typename waiter_type_>
-expected<resources_shared_ptr<atomic_reference_, waiter_type_>> open_resources(resources_config_t const& config,
-                                                                               nvme_queues_ref_t queues) noexcept {
-    if (config.manifest.empty()) return status_t {status_code_t::invalid_argument_k, "A database needs a manifest"};
-
-    using resources_t = shared_resources<atomic_reference_, waiter_type_>;
-    resources_shared_ptr<atomic_reference_, waiter_type_> resources = std::make_shared<resources_t>(
-        config.memory_limit, config.gpu_memory_limit);
-    if (resources->gpu_devices.resize(config.gpu_devices.size()) != st::status_t::success_k)
-        return status_t {status_code_t::out_of_memory_k, "No room to list the usable GPUs"};
+status_t open_resources(shared_resources<atomic_reference_, waiter_type_>& resources, resources_config_t const& config,
+                        nvme_queues_ref_t queues) noexcept {
+    if (config.manifest.empty()) return {status_code_t::invalid_argument_k, "A database needs a manifest"};
+    if (resources.gpu_devices.resize(config.gpu_devices.size()) != st::status_t::success_k)
+        return {status_code_t::out_of_memory_k, "No room to list the usable GPUs"};
     for (std::size_t index = 0; index != config.gpu_devices.size(); ++index)
-        resources->gpu_devices[index] = config.gpu_devices[index];
-
-    if (status_t const mounted = resources->storage.mount(config, resources->memory_constraint, queues);
-        mounted.failed())
-        return mounted;
-    return resources;
+        resources.gpu_devices[index] = config.gpu_devices[index];
+    return resources.storage.mount(config, resources.memory_constraint, queues);
 }
 
 #pragma endregion Shared Resources

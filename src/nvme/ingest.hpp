@@ -171,7 +171,7 @@ struct ingest_state {
     typename basic_database_of<cpu_class_>::ingest_t database_ingest;
     ingest_path_t path;
 
-    ~ingest_state() noexcept { database.store->drop_ingest(database_ingest); }
+    ~ingest_state() noexcept { database.store.drop_ingest(database_ingest); }
 };
 
 /** Hands the rows of a sorted append of blobs, documents or pages to the store, which lays them
@@ -187,7 +187,7 @@ status_t write_deltas(ingest_state<cpu_class_>& ingest, sorted_keyed_ingest_t& p
     for (std::size_t row = 0; row != rows.size(); ++row)
         new (&deltas[row])
             keyed_delta_t {stored_of(rows.keys[row].uuid), delta_view_t {delta_kind_t::write_k, values[row]}};
-    status_t const written = ingest.database.store->write_ingest(
+    status_t const written = ingest.database.store.write_ingest(
         ingest.database_ingest, std::span<keyed_delta_t const> {deltas}, nvme_queues_of(view));
     if (written.succeeded()) path.placement.sequence += static_cast<std::uint32_t>(rows.size());
     return written;
@@ -252,8 +252,7 @@ status_t write_strings(ingest_state<cpu_class_>& ingest, keyed_rows_t const& row
     auto [deltas, deltas_status] = arena_allocate<string_delta_t>(scratch, rows.size());
     if (deltas_status.failed()) return deltas_status;
     for (std::size_t row = 0; row != rows.size(); ++row) new (&deltas[row]) string_delta_t {string_delta_of(rows, row)};
-    return ingest.database.store->write_ingest(ingest.database_ingest, std::span<string_delta_t const> {deltas},
-                                               queues);
+    return ingest.database.store.write_ingest(ingest.database_ingest, std::span<string_delta_t const> {deltas}, queues);
 }
 
 /** Holds the strings of an unsorted append, each string and its key copied, until the finish. */
@@ -307,8 +306,8 @@ status_t write_held(ingest_state<cpu_class_>& ingest, path_type_& path, ustore_a
                                                                 strings_kit_t::sort_order, strings::keep_t::last_k,
                                                                 arena_allocator<string_delta_t> {scratch});
         if (sort_status.failed()) return sort_status;
-        return ingest.database.store->write_ingest(ingest.database_ingest,
-                                                   std::span<string_delta_t const> {path.deltas.data(), kept}, queues);
+        return ingest.database.store.write_ingest(ingest.database_ingest,
+                                                  std::span<string_delta_t const> {path.deltas.data(), kept}, queues);
     }
     else if constexpr (std::is_same_v<path_type_, held_edges_ingest_t>) {
         st::vector<vertex_chain_t, arena_allocator<vertex_chain_t>> chains {{scratch}};
@@ -320,14 +319,14 @@ status_t write_held(ingest_state<cpu_class_>& ingest, path_type_& path, ustore_a
         for (std::size_t index = 0; index != chains.size(); ++index)
             new (&deltas[index]) keyed_delta_t {stored_of(chains[index].vertex.uuid),
                                                 delta_view_t {delta_kind_t::change_k, chains[index].records}};
-        return ingest.database.store->write_ingest(ingest.database_ingest, std::span<keyed_delta_t const> {deltas},
-                                                   queues);
+        return ingest.database.store.write_ingest(ingest.database_ingest, std::span<keyed_delta_t const> {deltas},
+                                                  queues);
     }
     else if constexpr (std::is_same_v<path_type_, held_keyed_ingest_t>) {
         auto [deltas, order_status] = order_held_deltas<strings_kit_t>(path, scratch);
         if (order_status.failed()) return order_status;
-        return ingest.database.store->write_ingest(ingest.database_ingest, std::span<keyed_delta_t const> {deltas},
-                                                   queues);
+        return ingest.database.store.write_ingest(ingest.database_ingest, std::span<keyed_delta_t const> {deltas},
+                                                  queues);
     }
     else return {};
 }
@@ -347,8 +346,8 @@ status_t ingest_init(ustore_ingest_init_t const& arguments, view_t const& view) 
         ingest_state<cpu_class_> {.database = database,
                                   .collection = arguments.collection,
                                   .path = ingest_path_of(entry.modality, arguments.order, &(*arguments.ingest)->kept)};
-    status_t const begun = database.store->begin_ingest(any_collection_id_t {arguments.collection},
-                                                        ingest->database_ingest);
+    status_t const begun = database.store.begin_ingest(any_collection_id_t {arguments.collection},
+                                                       ingest->database_ingest);
     if (begun.failed()) {
         std::destroy_at(ingest);
         return begun;
@@ -400,8 +399,8 @@ status_t ingest_finish(ustore_ingest_finish_t const& arguments, view_t const& vi
         },
         ingest.path);
     if (wrote.failed()) return wrote;
-    ingest_outcome_t const landed = ingest.database.store->publish_ingest(ingest.database_ingest, arguments.durability,
-                                                                          nvme_queues_of(view));
+    ingest_outcome_t const landed = ingest.database.store.publish_ingest(ingest.database_ingest, arguments.durability,
+                                                                         nvme_queues_of(view));
     if (landed.stamp == invalid_transaction_stamp_k) return landed.status;
     if (arguments.commit_stamp) *arguments.commit_stamp = landed.stamp;
     // The ingest has landed, so a compaction it left due is met again by the next write making room

@@ -23,7 +23,7 @@
 
 #include "ustore/ustore.hpp"
 
-#include "ustore/utilities/ram_device.hpp" // `caller_exclusivity_t`, `ram_executor_t`
+#include "ustore/utilities/ram_device.hpp" // `spawn_pool`, `harvest_topology`
 
 #include "abi/fixture.hpp" // `check_length`, `check_equalities`, `round_trip`, `triplet_t`
 #include "harness.hpp"     // `run_test_case`, `expect_true`, `expect_equal`, `expect_status`, `spin_until`
@@ -310,11 +310,12 @@ case_result_t test_database_named_collections_race(config_t const& config) {
         else if (create_status == status_code_t::already_exists_k)
             fu::standard_atomic_ref<std::size_t> {refused}.store_add(1, std::memory_order_relaxed);
     };
-    auto [executor, executor_status] = util::ram_executor_t::make(threads_count,
-                                                                  util::caller_exclusivity_t::caller_inclusive_k);
+    auto [topology, topology_status] = util::harvest_topology();
+    auto [executor, executor_status] = util::spawn_pool(topology, threads_count, fu::caller_inclusive_k,
+                                                        fu_capabilities_all_k);
     expect_true(!st::failed(executor_status));
     if (st::failed(executor_status)) return {};
-    expect_true(st::succeeded(executor.for_threads(task)));
+    expect_true(!fu::failed(executor.for_threads(task)));
 
     expect_equal(created, 1u);
     expect_equal(refused, threads_count - 1);
@@ -973,9 +974,10 @@ case_result_t test_database_snapshot_with_threads(config_t const& config) {
         }
     };
 
-    auto [executor, executor_status] = util::ram_executor_t::make(2, util::caller_exclusivity_t::caller_inclusive_k);
+    auto [topology, topology_status] = util::harvest_topology();
+    auto [executor, executor_status] = util::spawn_pool(topology, 2, fu::caller_inclusive_k, fu_capabilities_all_k);
     if (!expect_true(!st::failed(executor_status))) return {};
-    expect_true(st::succeeded(executor.for_threads(task)));
+    expect_true(!fu::failed(executor.for_threads(task)));
     return {};
 }
 
@@ -1229,8 +1231,8 @@ void resize_values(resizing_writer_t& writer) noexcept {
  *  one stamp, so all of one result come from one commit. */
 void test_blobs_read_one_stamp_under_resizes(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    auto [writing_thread, thread_status] = util::ram_executor_t::make(1,
-                                                                      util::caller_exclusivity_t::caller_exclusive_k);
+    auto [topology, topology_status] = util::harvest_topology();
+    auto [writing_thread, thread_status] = util::spawn_pool(topology, 1, fu::caller_exclusive_k, fu_capabilities_all_k);
     auto [arena, arena_status] = arena_t::make();
     if (!expect_true(!open_status.failed() && !st::failed(thread_status) && !arena_status.failed())) return;
     auto [collection, collection_status] = create_collection(database.handle(), "one_stamp.blobs",
@@ -1240,10 +1242,15 @@ void test_blobs_read_one_stamp_under_resizes(config_t const& config) {
     write_text(database.handle(), collection, keys, "seed");
 
     resizing_writer_t writer {.database = database.handle(), .collection = collection, .keys = keys};
-    auto const [generation, start_status] = writing_thread.start<&resize_values>(writer);
-    expect_true(!st::failed(start_status));
+    fu_generation_t generation = 0;
+    fu::status_t const start_status = writing_thread.unsafe_for_threads(
+        [](fu_lambda_context_t context, std::size_t, std::size_t) noexcept {
+            resize_values(*static_cast<resizing_writer_t*>(context));
+        },
+        &writer, generation);
+    expect_true(!fu::failed(start_status));
     std::size_t mixed = 0;
-    for (std::size_t round = 0; !st::failed(start_status) && round != 2000; ++round) {
+    for (std::size_t round = 0; !fu::failed(start_status) && round != 2000; ++round) {
         read_columns_t columns;
         ustore_outcome_t outcome {};
         ustore_blobs_read_t read = read_of(database.handle(), collection, keys, columns, arena.handle(), outcome);
@@ -1253,7 +1260,7 @@ void test_blobs_read_one_stamp_under_resizes(config_t const& config) {
         for (std::size_t index = 1; index != keys.size(); ++index) mixed += columns.value(index) != first;
     }
     fu::standard_atomic_ref<std::uint32_t> {writer.stopped}.store(1, std::memory_order_release);
-    if (!st::failed(start_status)) writing_thread.join(generation);
+    if (!fu::failed(start_status)) writing_thread.unsafe_join(generation);
     expect_equal(mixed, 0u);
 }
 
@@ -1300,8 +1307,8 @@ void swap_halves(swapping_writer_t& writer) noexcept {
  *  halves of the keys in each commit, lists and reads at one stamp, so it keeps one half. */
 case_result_t test_blobs_filtered_scan_one_stamp_under_swaps(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    auto [writing_thread, thread_status] = util::ram_executor_t::make(1,
-                                                                      util::caller_exclusivity_t::caller_exclusive_k);
+    auto [topology, topology_status] = util::harvest_topology();
+    auto [writing_thread, thread_status] = util::spawn_pool(topology, 1, fu::caller_exclusive_k, fu_capabilities_all_k);
     auto [arena, arena_status] = arena_t::make();
     if (!expect_true(!open_status.failed() && !st::failed(thread_status) && !arena_status.failed())) return {};
     if (!probed(database.supports_transactions())) return case_result_t::skipped(needs_transactions_k);
@@ -1314,10 +1321,15 @@ case_result_t test_blobs_filtered_scan_one_stamp_under_swaps(config_t const& con
     std::string_view const pattern = "apple";
     std::array<std::uint32_t, 2> const pattern_offsets {0, static_cast<std::uint32_t>(pattern.size())};
     swapping_writer_t writer {.database = database.handle(), .collection = collection, .lower = lower, .upper = upper};
-    auto const [generation, start_status] = writing_thread.start<&swap_halves>(writer);
-    expect_true(!st::failed(start_status));
+    fu_generation_t generation = 0;
+    fu::status_t const start_status = writing_thread.unsafe_for_threads(
+        [](fu_lambda_context_t context, std::size_t, std::size_t) noexcept {
+            swap_halves(*static_cast<swapping_writer_t*>(context));
+        },
+        &writer, generation);
+    expect_true(!fu::failed(start_status));
     std::size_t torn = 0;
-    for (std::size_t round = 0; !st::failed(start_status) && round != 2000; ++round) {
+    for (std::size_t round = 0; !fu::failed(start_status) && round != 2000; ++round) {
         ustore_outcome_t outcome {};
         ustore_length_t const* offsets = nullptr;
         ustore_key_t const* found = nullptr;
@@ -1337,7 +1349,7 @@ case_result_t test_blobs_filtered_scan_one_stamp_under_swaps(config_t const& con
         torn += !one_half;
     }
     fu::standard_atomic_ref<std::uint32_t> {writer.stopped}.store(1, std::memory_order_release);
-    if (!st::failed(start_status)) writing_thread.join(generation);
+    if (!fu::failed(start_status)) writing_thread.unsafe_join(generation);
     expect_equal(torn, 0u);
     return {};
 }

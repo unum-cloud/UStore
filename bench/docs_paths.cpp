@@ -273,7 +273,7 @@ enum class resolver_t { yyjson_k, subdocuments_k };
 
 /** Runs one row: each call resolves the next batch of the corpus with @p resolver, then
  *  fills @p columns. */
-row_t run_row(util::ram_executor_t& executor, docs_paths_settings_t const& settings, corpus_t const& corpus,
+row_t run_row(fu::pool_t& executor, docs_paths_settings_t const& settings, corpus_t const& corpus,
               std::string_view name, std::span<column_t const> columns, resolver_t resolver) noexcept {
     std::size_t const batch_size = fu::min_of(settings.batch_size.value, settings.documents.value);
     std::array<std::string_view, columns_k.size()> fields;
@@ -322,7 +322,8 @@ int main(int argc, char** argv) {
     }};
     std::array<char const*, 2> const variables {"USTORE_DOCUMENTS", "USTORE_BATCH_SIZE"};
     read_bench_settings(argc, argv, settings, flags, variables);
-    auto [executor, executor_status] = util::ram_executor_t::make(1, util::caller_exclusivity_t::caller_inclusive_k);
+    auto [topology, topology_status] = util::harvest_topology();
+    auto [executor, executor_status] = util::spawn_pool(topology, 1, fu::caller_inclusive_k, fu_capabilities_all_k);
     if (st::failed(executor_status)) {
         fmt::println(stderr, "Failed to pin the calling thread");
         return 1;

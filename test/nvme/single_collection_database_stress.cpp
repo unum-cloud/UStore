@@ -196,7 +196,7 @@ void concurrent_operations_keep_their_values(mount_type_ const& mount, stored_va
     if (make_status.failed()) return;
 
     auto [store, open_status] = database_t::open(*stack->volume, *stack->writing, *stack->merging,
-                                                 stress_config(value_size, value_max_size), stack->fixture->resources);
+                                                 stress_config(value_size, value_max_size), *stack->fixture->resources);
     expect_true(open_status.succeeded());
     if (open_status.failed()) return;
     stored_value_size_t const widest = store->value_max_size();

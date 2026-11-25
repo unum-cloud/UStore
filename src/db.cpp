@@ -120,8 +120,8 @@ util::status_t open_changes_cursor(engine_t const& engine, ustore_changes_cursor
         return {util::status_code_t::unsupported_k, "The engine keeps no stamps for changes"};
     auto* const cursor = new (std::nothrow) ustore_changes_cursor_handle_t {};
     if (!cursor) return {util::status_code_t::out_of_memory_k, "No room for the change feed"};
-    cursor->cursor.database = arguments.database;
-    cursor->cursor.collection = arguments.collection;
+    cursor->walk.database = arguments.database;
+    cursor->walk.collection = arguments.collection;
     if (util::status_t const opened = engine.database->changes_cursor_init(arguments, cursor, view); opened.failed()) {
         delete cursor;
         return opened;
@@ -160,7 +160,8 @@ util::status_t open_ingest(ustore_ingest_init_t& arguments, view_t const& runner
     if (!engine.database->ingest_init) return {util::status_code_t::unsupported_k, "The engine ingests nothing"};
     if (util::status_t const refused = refuse_device_ingests(runner); refused.failed()) return refused;
     if (util::status_t const seeded = reserve_scratches(runner, 0); seeded.failed()) return seeded;
-    fu_memory_domain_id_t const memory_domain = runner.executor ? runner.executor->memory_domain : 0;
+    fu_memory_domain_id_t const memory_domain =
+        runner.executor ? util::host_blocks_of(&runner.executor->scratches.back())->memory_domain : 0;
     auto* const ingest = new (std::nothrow)
         ustore_ingest_handle_t {.engine = &engine,
                                 .database = database,
@@ -231,9 +232,9 @@ util::status_t finish_ingest(ustore_ingest_finish_t& arguments, view_t const& ru
  *  with their completion. */
 template <typename arguments_type_, auto serve_>
 void route_ingest(arguments_type_* arguments) noexcept {
-    if (util::status_t const claimed = take_claims(*arguments); claimed.failed())
-        return finish(*arguments->outcome, claimed);
-    dispatch<arguments_type_, serve_>(arguments);
+    auto const [claims, take_status] = take_claims(*arguments);
+    if (take_status.failed()) return finish(*arguments->outcome, take_status);
+    dispatch<arguments_type_, serve_>(arguments, claims);
 }
 
 void ustore_database_describe(ustore_database_describe_t* arguments) { route(arguments); }
@@ -336,8 +337,8 @@ void ustore_changes_cursor_next(ustore_changes_cursor_next_t* arguments) { route
 
 void ustore_changes_cursor_free(ustore_changes_cursor_t cursor) {
     if (!cursor) return;
-    wait_named_calls(cursor->cursor.named_calls);
-    ustore_database_t const database = cursor->cursor.database;
+    wait_named_calls(cursor->walk.named_calls);
+    ustore_database_t const database = cursor->walk.database;
     if (cursor->state) engine_of(database).database->changes_cursor_free(cursor);
     delete cursor;
     release_hold(database);

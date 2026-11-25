@@ -1103,7 +1103,7 @@ class linux_spdk_disk {
      *  over a fabric. */
     [[nodiscard]] int memory_domain() const noexcept {
         spdk_pci_device* const device = controller_ ? spdk_nvme_ctrlr_get_pci_device(controller_) : nullptr;
-        return device ? spdk_pci_device_get_socket_id(device) : -1;
+        return device ? spdk_pci_device_get_numa_id(device) : -1;
     }
 
     /** What this disk accepts, which the namespace's sector size and the controller's limits fix. */
@@ -1425,16 +1425,7 @@ class linux_spdk_disk {
     status_t drain(queue_ref_t const& queue_pair) noexcept {
         auto [queue, queue_status] = queue_of_(queue_pair);
         if (queue_status.failed()) return queue_status;
-        std::array<completion_t, drain_batch_k> discarded {};
-        for (std::size_t spins = 0; spins != drain_spin_limit_k; ++spins) {
-            if (outstanding_requests_(*queue) == 0) return {};
-            auto [moved, poll_completions_status] = poll_completions(queue_pair, std::span<completion_t> {discarded});
-            if (poll_completions_status.failed()) return poll_completions_status;
-            if (moved != 0) continue;
-            if (spins == drain_patience_k) cancel(queue_pair);
-            waiter_type_ {}(&spins, spins, std::size_t {0});
-        }
-        return {status_code_t::io_k, "The queue would not drain"};
+        return drain_by_polling<waiter_type_>(*this, queue_pair);
     }
 
 #pragma endregion Ring
@@ -1533,15 +1524,6 @@ class linux_spdk_disk {
 
     /** Namespaces one disk registers at once. */
     static constexpr std::uint16_t targets_limit_k = 16;
-
-    /** Completions one drain discards at a time. */
-    static constexpr std::size_t drain_batch_k = 32;
-
-    /** Fruitless polls a drain tolerates before it asks the controller to abort what is left. */
-    static constexpr std::size_t drain_patience_k = 1024;
-
-    /** Reaps a drain performs before it calls the queue pair broken. */
-    static constexpr std::size_t drain_spin_limit_k = std::size_t {1} << 24;
 
     /** The index that names no slot, in a free list and in a chain alike. */
     static constexpr std::uint32_t no_entry_k = linux_spdk_queue_t::no_entry_k;

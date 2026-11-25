@@ -370,7 +370,7 @@ util::expected<std::unique_ptr<typename database_types<typename mount_type_::fix
         stack->volume = std::move(volume);
     }
 
-    stack->store = std::unique_ptr<database_t> {new (std::nothrow) database_t {stack->fixture->resources}};
+    stack->store = std::unique_ptr<database_t> {new (std::nothrow) database_t {*stack->fixture->resources}};
     if (!stack->store) return util::status_t {util::status_code_t::out_of_memory_k, "The database did not fit"};
     if (util::status_t const mounted = stack->store->mount(
             stack->volume, util::nvme_queues_ref_t {&stack->fixture->queues, 0}, test_database_config());

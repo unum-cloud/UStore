@@ -470,7 +470,8 @@ class metal_stream_t {
 /** The queue every call on one Apple device commits to, the device's class, and the ceiling on
  *  the scratch those calls walk with. Work is committed, never waited on but by @c wait, so one
  *  host thread keeps the device fed; memory is unified, so a copy waits for the queue and runs
- *  on the host. */
+ *  on the host. Nothing here is claimed: the C ABI's executor claim admits one caller at a
+ *  time, and a header-only user sharing it must too. */
 class metal_executor_t {
   public:
     static constexpr gpu_vendor_t vendor_k = gpu_vendor_t::apple_k;

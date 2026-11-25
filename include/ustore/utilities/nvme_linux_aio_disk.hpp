@@ -333,7 +333,7 @@ class linux_aio_files_disk {
         reported.memory_alignment = memory != 0 ? memory : unregistered;
         reported.offset_alignment = offset != 0 ? offset : unregistered;
         reported.length_granularity = reported.offset_alignment;
-        reported.max_transfer_bytes = max_transfer_bytes_k;
+        reported.max_transfer_bytes = native_transfer_bytes_k;
         reported.depth_limit = linux_aio_queue_t::depth_ceiling_k;
         reported.media_limit = static_cast<std::uint16_t>(media_.size());
         reported.reaches_gpu_memory = false;
@@ -612,16 +612,7 @@ class linux_aio_files_disk {
         }
         linux_aio_queue_t const* const queue = queue_of_(queue_pair);
         if (!queue) return {status_code_t::invalid_argument_k, "The queue is of another transport"};
-        std::array<completion_t, drain_batch_k> discarded {};
-        for (std::size_t spins = 0; spins != drain_spin_limit_k; ++spins) {
-            if (outstanding_requests_(*queue) == 0) return {};
-            auto [moved, poll_completions_status] = poll_completions(queue_pair, std::span<completion_t> {discarded});
-            if (poll_completions_status.failed()) return poll_completions_status;
-            if (moved != 0) continue;
-            if (spins == drain_patience_k) cancel(queue_pair);
-            waiter_type_ {}(&spins, spins, std::size_t {0});
-        }
-        return {status_code_t::io_k, "The queue would not drain"};
+        return drain_by_polling<waiter_type_>(*this, queue_pair);
     }
 
 #pragma endregion Ring
@@ -676,18 +667,6 @@ class linux_aio_files_disk {
         /** Alignment this filesystem demands of an extent's offset and its length. */
         std::uint64_t offset_alignment = portable_alignment_k;
     };
-
-    /** The largest extent one control block holds, kept well inside the kernel's own limit. */
-    static constexpr std::uint64_t max_transfer_bytes_k = 1024ull * 1024ull * 1024ull;
-
-    /** Completions one drain discards at a time. */
-    static constexpr std::size_t drain_batch_k = 32;
-
-    /** Fruitless polls a drain tolerates before it stops what is still held back. */
-    static constexpr std::size_t drain_patience_k = 1024;
-
-    /** Polls a drain performs before it calls the context broken. */
-    static constexpr std::size_t drain_spin_limit_k = std::size_t {1} << 24;
 
     /** Grows @p elements to @p count default slots, reporting an allocation failure as a status. */
     template <typename element_type_>
@@ -921,7 +900,7 @@ class linux_aio_files_disk {
         if (memory.empty()) return {status_code_t::invalid_argument_k, "The request names no registered range"};
         if (request.buffer.offset > memory.size() || request.extent.length > memory.size() - request.buffer.offset)
             return {status_code_t::invalid_argument_k, "The request runs past its registered range"};
-        if (request.extent.length > max_transfer_bytes_k)
+        if (request.extent.length > native_transfer_bytes_k)
             return {status_code_t::invalid_argument_k, "The request is larger than one transfer"};
         byte_t const* const address = memory.data() + request.buffer.offset;
         if (!is_address_aligned(address, medium->memory_alignment) ||

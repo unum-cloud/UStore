@@ -171,7 +171,7 @@ util::expected<typename database_type_::database_unique_ptr_t> open_over(
     auto [volume, mount_status] = stack.fixture->mount_volume(*stack.writing);
     if (mount_status.failed()) return mount_status;
     *stack.volume = std::move(volume);
-    return database_type_::open(*stack.volume, *stack.writing, *stack.merging, config, stack.fixture->resources);
+    return database_type_::open(*stack.volume, *stack.writing, *stack.merging, config, *stack.fixture->resources);
 }
 
 #pragma endregion Fixtures

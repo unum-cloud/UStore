@@ -253,7 +253,7 @@ template <typename stack_type_>
 util::expected<std::unique_ptr<typename stack_type_::database_t>> open_database(stack_type_& stack) noexcept {
     using database_t = typename stack_type_::database_t;
     if (util::status_t const remounted = remount_volume(stack); remounted.failed()) return remounted;
-    auto store = std::unique_ptr<database_t> {new (std::nothrow) database_t {stack.fixture->resources}};
+    auto store = std::unique_ptr<database_t> {new (std::nothrow) database_t {*stack.fixture->resources}};
     if (!store) return util::status_t {util::status_code_t::out_of_memory_k, "The database did not fit"};
     if (util::status_t const mounted = store->mount(stack.volume, util::nvme_queues_ref_t {&stack.fixture->queues, 0},
                                                     test_database_config());
@@ -562,7 +562,7 @@ case_result_t test_catalog_survives_reopen(mount_type_ const& mount) {
     using numbers_only_t = typename types_t::template basic_database_of<
         typename types_t::template blobs_store_of<value_layout_t::inline_12_bytes_k>>;
     {
-        numbers_only_t narrow {stack->fixture->resources};
+        numbers_only_t narrow {*stack->fixture->resources};
         expect_true(remount_volume(*stack).succeeded());
         expect_status(
             narrow.mount(stack->volume, util::nvme_queues_ref_t {&stack->fixture->queues, 0}, test_database_config()),
@@ -575,7 +575,7 @@ case_result_t test_catalog_survives_reopen(mount_type_ const& mount) {
         typename types_t::template blobs_store_of<value_layout_t::fixed_width_k>,
         typename types_t::template blobs_store_of<value_layout_t::inline_12_bytes_k>>;
     {
-        reordered_t reordered {stack->fixture->resources};
+        reordered_t reordered {*stack->fixture->resources};
         expect_true(remount_volume(*stack).succeeded());
         expect_true(
             reordered.mount(stack->volume, util::nvme_queues_ref_t {&stack->fixture->queues, 0}, test_database_config())
@@ -1340,7 +1340,7 @@ util::status_t open_archive(fixture_type_& fixture, util::io_channel_t& channel,
         fixture.disk, channel, config, volume_allocator_t {fixture.resources->memory_constraint});
     if (mount_status.failed()) return mount_status;
     volume = std::move(mounted);
-    store.reset(new (std::nothrow) typename types_type_::database_t {fixture.resources});
+    store.reset(new (std::nothrow) typename types_type_::database_t {*fixture.resources});
     if (!store) return {util::status_code_t::out_of_memory_k, "The database did not fit"};
     return store->mount(volume, util::nvme_queues_ref_t {&fixture.queues, 0}, test_database_config(), {}, digester);
 }

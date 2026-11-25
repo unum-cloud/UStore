@@ -222,8 +222,8 @@ void clear_collection(ustore_database_t database, ustore_collection_id_t collect
 }
 
 /** Imports every listed file as documents, each thread over its own contiguous share of the files. */
-void bench_docs_import(util::ram_executor_t& executor, tabular_t const& tabular,
-                       tabular_graph_settings_t const& settings, std::string_view name) {
+void bench_docs_import(fu::pool_t& executor, tabular_t const& tabular, tabular_graph_settings_t const& settings,
+                       std::string_view name) {
     print(run_pass(executor, name, tabular.files.size(), [&](loop_t& loop, std::size_t) noexcept {
         ustore_outcome_t outcome {};
         for (std::size_t file : loop) {
@@ -243,8 +243,8 @@ void bench_docs_import(util::ram_executor_t& executor, tabular_t const& tabular,
 }
 
 /** Imports every listed file as a graph, each thread over its own contiguous share of the files. */
-void bench_graph_import(util::ram_executor_t& executor, tabular_t const& tabular,
-                        tabular_graph_settings_t const& settings, std::string_view name) {
+void bench_graph_import(fu::pool_t& executor, tabular_t const& tabular, tabular_graph_settings_t const& settings,
+                        std::string_view name) {
     print(run_pass(executor, name, tabular.files.size(), [&](loop_t& loop, std::size_t) noexcept {
         ustore_outcome_t outcome {};
         for (std::size_t file : loop) {
@@ -266,8 +266,8 @@ void bench_graph_import(util::ram_executor_t& executor, tabular_t const& tabular
 }
 
 /** Exports the documents once from every thread, each into its own file. */
-void bench_docs_export(util::ram_executor_t& executor, tabular_t const& tabular,
-                       tabular_graph_settings_t const& settings, std::string_view name) {
+void bench_docs_export(fu::pool_t& executor, tabular_t const& tabular, tabular_graph_settings_t const& settings,
+                       std::string_view name) {
     print(run_pass(executor, name, executor.threads_count(), [&](loop_t& loop, std::size_t thread) noexcept {
         sz::string_t output;
         if (!export_path(output, settings, "tabular_graph_docs", thread))
@@ -292,8 +292,8 @@ void bench_docs_export(util::ram_executor_t& executor, tabular_t const& tabular,
 }
 
 /** Exports the graph once from every thread, each into its own file. */
-void bench_graph_export(util::ram_executor_t& executor, tabular_t const& tabular,
-                        tabular_graph_settings_t const& settings, std::string_view name) {
+void bench_graph_export(fu::pool_t& executor, tabular_t const& tabular, tabular_graph_settings_t const& settings,
+                        std::string_view name) {
     print(run_pass(executor, name, executor.threads_count(), [&](loop_t& loop, std::size_t thread) noexcept {
         sz::string_t output;
         sz::string_t source;
@@ -397,8 +397,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    auto [executor, executor_status] = util::ram_executor_t::make(settings.threads.value,
-                                                                  util::caller_exclusivity_t::caller_inclusive_k);
+    auto [topology, topology_status] = util::harvest_topology();
+    auto [executor, executor_status] = util::spawn_pool(topology, settings.threads.value, fu::caller_inclusive_k,
+                                                        fu_capabilities_all_k);
     if (st::failed(executor_status)) {
         fmt::println(stderr, "Failed to spawn {} threads", settings.threads.value);
         ustore_database_free(tabular.database);

@@ -453,7 +453,7 @@ static int documents_from_objects(PyObject* objects, documents_t* documents) {
 typedef struct docs_write_call_t {
 
     /** What the call keeps until it finishes. */
-    ustore_py_call_t call;
+    ustore_py_call_t kept;
 
     /** The keys to write, empty when every key is read out of its own document. */
     ustore_py_keys_t keys;
@@ -479,7 +479,7 @@ static void docs_write_release(void* erased) {
     ustore_py_keys_release(&call->keys);
     Py_CLEAR(call->field);
     Py_CLEAR(call->id_field);
-    ustore_py_call_release(&call->call);
+    ustore_py_call_release(&call->kept);
 }
 
 static ustore_py_verb_t const docs_write_verb = {sizeof(docs_write_call_t), docs_write_submit,
@@ -500,16 +500,16 @@ static int documents_match(documents_t const* documents, size_t count) {
 static PyObject* documents_write(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
                                  ustore_key_t const* keys, size_t count, ustore_docs_field_type_t type,
                                  ustore_docs_modification_t modification, docs_write_call_t* call) {
-    call->call.collection = options->collection;
+    call->kept.collection = options->collection;
     call->field_view = cached_bytes(call->field);
     ustore_docs_write_t write = {
         .database = context->database_handle,
         .executor = ustore_py_context_executor(context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context->completion,
         .transaction = context->transaction,
         .count = count,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .keys = {keys, sizeof(ustore_key_t)},
         .id_field = cached_bytes(call->id_field),
         .values = call->documents.texts.contents.view,
@@ -760,21 +760,21 @@ ustore_py_verb_t const ustore_py_docs_read_drawn_verb = {sizeof(ustore_py_read_c
 PyObject* ustore_py_docs_read(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
                               ustore_docs_field_type_t type, ustore_py_verb_t const* verb, ustore_py_read_call_t* call,
                               PyObject* arena) {
-    if (ustore_py_arena_from_object(arena, &call->call.arena) != 0) return ustore_py_call_discard(context, verb, call);
-    call->call.collection = options->collection;
+    if (ustore_py_arena_from_object(arena, &call->kept.arena) != 0) return ustore_py_call_discard(context, verb, call);
+    call->kept.collection = options->collection;
     call->field_view = cached_bytes(call->field);
     ustore_docs_read_t read = {
         .database = context->database_handle,
         .executor = ustore_py_context_executor(context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context->completion,
         .view = context->view,
         .count = call->keys.count,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .keys = {call->keys.keys, sizeof(ustore_key_t)},
         .presences = &call->presences,
         .values = &call->values,
-        .arena = ustore_py_arena_handle(call->call.arena),
+        .arena = ustore_py_arena_handle(call->kept.arena),
         .outputs_type = type,
     };
     if (call->field) read.fields = ustore_py_strings_repeated(&call->field_view);
@@ -863,7 +863,7 @@ char const doc_docs_gist[] =                                                    
 typedef struct gist_call_t {
 
     /** What the call keeps until it finishes. */
-    ustore_py_call_t call;
+    ustore_py_call_t kept;
 
     /** The documents to inspect. */
     ustore_py_keys_t keys;
@@ -896,7 +896,7 @@ static PyObject* gist_answer(void* erased) {
 static void gist_release(void* erased) {
     gist_call_t* const call = (gist_call_t*)erased;
     ustore_py_keys_release(&call->keys);
-    ustore_py_call_release(&call->call);
+    ustore_py_call_release(&call->kept);
 }
 
 static ustore_py_verb_t const gist_verb = {sizeof(gist_call_t), gist_submit, gist_answer, gist_release};
@@ -917,21 +917,21 @@ PyObject* ustore_py_api_docs_gist(PyObject* self, PyObject* const* arguments, Py
     gist_call_t* const call = ustore_py_call_open(&context, &gist_verb, &stack);
     if (!call) return NULL;
     if (ustore_py_keys_from_object(arguments[0], &call->keys) != 0 ||
-        ustore_py_arena_from_object(arguments[1], &call->call.arena) != 0)
+        ustore_py_arena_from_object(arguments[1], &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, &gist_verb, call);
-    call->call.collection = options.collection;
+    call->kept.collection = options.collection;
     ustore_docs_gist_t gist = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .view = context.view,
         .count = call->keys.count,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .keys = {call->keys.keys, sizeof(ustore_key_t)},
         .fields = &call->fields,
         .written = &call->written,
-        .arena = ustore_py_arena_handle(call->call.arena),
+        .arena = ustore_py_arena_handle(call->kept.arena),
     };
     return ustore_py_call_run(&context, &gist_verb, call, &gist);
 }
@@ -1092,7 +1092,7 @@ char const doc_docs_gather[] =                                                  
 typedef struct gather_call_t {
 
     /** What the call keeps until it finishes. */
-    ustore_py_call_t call;
+    ustore_py_call_t kept;
 
     /** The documents, the rows of every column. */
     ustore_py_keys_t keys;
@@ -1117,7 +1117,7 @@ static void gather_submit(void* arguments) { ustore_docs_gather((ustore_docs_gat
 
 static PyObject* gather_answer(void* erased) {
     gather_call_t const* const call = (gather_call_t const*)erased;
-    return ustore_py_columns_new(call->call.arena, call->columns, call->fields_held, call->types, call->fields_count,
+    return ustore_py_columns_new(call->kept.arena, call->columns, call->fields_held, call->types, call->fields_count,
                                  call->keys.count);
 }
 
@@ -1129,7 +1129,7 @@ static void gather_release(void* erased) {
     call->field_views = NULL;
     call->types = NULL;
     Py_CLEAR(call->fields_held);
-    ustore_py_call_release(&call->call);
+    ustore_py_call_release(&call->kept);
 }
 
 static ustore_py_verb_t const gather_verb = {sizeof(gather_call_t), gather_submit, gather_answer, gather_release};
@@ -1153,22 +1153,22 @@ PyObject* ustore_py_api_docs_gather(PyObject* self, PyObject* const* arguments, 
                                                  &call->field_views, &call->types, &call->fields_count);
     size_t const fields_count = call->fields_count;
     if (failed || ustore_py_keys_from_object(arguments[0], &call->keys) != 0 ||
-        ustore_py_arena_from_object(arguments[3], &call->call.arena) != 0)
+        ustore_py_arena_from_object(arguments[3], &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, &gather_verb, call);
-    call->call.collection = options.collection;
+    call->kept.collection = options.collection;
     ustore_docs_gather_t gather = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
-        .outcome = &call->call.outcome,
+        .outcome = &call->kept.outcome,
         .completion = context.completion,
         .view = context.view,
         .count = call->keys.count,
-        .collections = {&call->call.collection, 0},
+        .collections = {&call->kept.collection, 0},
         .keys = {call->keys.keys, sizeof(ustore_key_t)},
         .fields_count = fields_count,
         .fields = ustore_py_strings_each(call->field_views),
         .columns = &call->columns,
-        .arena = ustore_py_arena_handle(call->call.arena),
+        .arena = ustore_py_arena_handle(call->kept.arena),
         .outputs_types = call->types,
     };
     return ustore_py_call_run(&context, &gather_verb, call, &gather);

@@ -665,7 +665,7 @@ class Executor:
         cls, threads: int = 0, *, memory_domains: Sequence[int] | None = None, scratch_limit: int = 0
     ) -> Self:
         """Host threads for the RAM, RocksDB and LevelDB engines near `memory_domains`, every NUMA node for None, where
-        zero threads take 7/8 of the cores those nodes hold, each carving its calls' scratch from at most
+        zero threads take all but one in eight of the cores those nodes hold, each carving its calls' scratch from at most
         `scratch_limit` bytes, 16 GiB for zero. Calls `ustore_executor_for_ram`."""
 
     @classmethod

@@ -273,7 +273,7 @@ class test_transaction_t {
     /** The widths the sole collection admits, which every write is checked against. */
     static constexpr transaction_deltas_t::value_widths_t widths_k {value_bytes_k, 0};
 
-    test_transaction_t(registry_t& registry, transaction_deltas_t&& deltas, resources_shared_ptr_t resources) noexcept
+    test_transaction_t(registry_t& registry, transaction_deltas_t&& deltas, resources_t& resources) noexcept
         : core_(registry, std::move(deltas), resources) {}
 
     test_transaction_t(test_transaction_t const&) = delete;
@@ -347,7 +347,7 @@ using transaction_t = test_transaction_t;
 struct fixture_t {
 
     /** The budget every transaction is charged to. */
-    resources_shared_ptr_t resources;
+    resources_t resources {1ull << 30, 0};
 
     /** The collection every commit of the fixture lands in. */
     test_store_t store;
@@ -355,8 +355,7 @@ struct fixture_t {
     /** The registry under test. */
     registry_t registry;
 
-    fixture_t() noexcept
-        : resources(std::make_shared<resources_t>(1ull << 30, 0)), store(), registry(store, resources) {}
+    fixture_t() noexcept : store(), registry(store, resources) {}
 
     /** A transaction, or nothing when the registry refuses it. */
     util::expected<std::unique_ptr<transaction_t>> open() noexcept {
@@ -378,7 +377,7 @@ constexpr collection_id_t other_collection_k {util::uuid_from_integer(8)};
 /** The last delta of a key wins inside its own collection alone, an empty value reads back empty, a value past the
  *  collection's width is refused, and every byte returns to the budget once the deltas die. */
 static void test_deltas_read_back_per_collection() {
-    resources_shared_ptr_t const resources = std::make_shared<resources_t>(1ull << 20, 0);
+    resources_t resources {1ull << 20, 0};
     {
         transaction_deltas_t deltas(deltas_bytes_k, deltas_max_count_k, resources);
         transaction_deltas_t::value_widths_t const widths {0, 4};
@@ -410,14 +409,14 @@ static void test_deltas_read_back_per_collection() {
         expect_equal(std::size_t {size}, std::size_t {0});
         expect_status(deltas.select(collection_k, 2, into, size), util::status_code_t::not_found_k);
     }
-    expect_equal(resources->memory_constraint.used(), std::size_t {0});
+    expect_equal(resources.memory_constraint.used(), std::size_t {0});
 }
 
 /** Deltas holding as many keys as they admit refuse the next key with @c capacity_exhausted_k,
  *  keep the rest, and name the shape that key wanted, which a transaction of its own grows to
  *  while any other refusal stands. */
 static void test_deltas_refuse_past_their_bound() {
-    resources_shared_ptr_t const resources = std::make_shared<resources_t>(1ull << 20, 0);
+    resources_t resources {1ull << 20, 0};
     constexpr std::size_t bound_k = 8;
     transaction_deltas_t deltas(deltas_bytes_k, bound_k, resources);
     transaction_deltas_t::value_widths_t const widths {value_bytes_k, 0};

@@ -25,7 +25,7 @@
 
 #include "ustore/ustore.hpp"
 
-#include "ustore/utilities/ram_device.hpp" // `caller_exclusivity_t`, `ram_executor_t`
+#include "ustore/utilities/ram_device.hpp" // `spawn_pool`, `harvest_topology`
 
 #include "abi/fixture.hpp" // `write_text`, `held_scan_t`, `wait_held`, `open_cursor`, `pull_of`, `expect_page`
 #include "harness.hpp"     // `finish_test_run`, `expect_true`, `expect_equal`, `expect_near`, `expect_status`
@@ -216,8 +216,8 @@ case_result_t test_cursor_free_waits(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     if (!expect_true(!open_status.failed())) return {};
     auto [executor, spawn_status] = spawn_executor();
-    auto [freeing_thread, thread_status] = util::ram_executor_t::make(1,
-                                                                      util::caller_exclusivity_t::caller_exclusive_k);
+    auto [topology, topology_status] = util::harvest_topology();
+    auto [freeing_thread, thread_status] = util::spawn_pool(topology, 1, fu::caller_exclusive_k, fu_capabilities_all_k);
     auto [collection, create_status] = create_collection(database.handle(), "cursor.free", ustore_modality_blobs_k);
     if (!expect_true(!spawn_status.failed() && !st::failed(thread_status) && !create_status.failed())) return {};
     auto [arena, arena_status] = arena_t::make({.executor = executor});
@@ -238,13 +238,18 @@ case_result_t test_cursor_free_waits(config_t const& config) {
     wait_held(held);
 
     cursor_freeing_t freeing {.cursor = cursor, .stage = &held.stage};
-    auto const [generation, start_status] = freeing_thread.start<&free_cursor>(freeing);
-    expect_true(!st::failed(start_status));
+    fu_generation_t generation = 0;
+    fu::status_t const start_status = freeing_thread.unsafe_for_threads(
+        [](fu_lambda_context_t context, std::size_t, std::size_t) noexcept {
+            free_cursor(*static_cast<cursor_freeing_t*>(context));
+        },
+        &freeing, generation);
+    expect_true(!fu::failed(start_status));
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     expect_true(fu::standard_atomic_ref<std::uint32_t> {freeing.freed}.load(std::memory_order_acquire) == 0);
 
     fu::standard_atomic_ref<hold_stage_t> {held.stage}.store(hold_stage_t::released_k, std::memory_order_release);
-    if (!st::failed(start_status)) freeing_thread.join(generation);
+    if (!fu::failed(start_status)) freeing_thread.unsafe_join(generation);
     else free_cursor(freeing);
     expect_true(freeing.stage_after_free == hold_stage_t::returned_k);
     expect_true(ustore_outcome_wait(&outcome) == ustore_status_success_k);
