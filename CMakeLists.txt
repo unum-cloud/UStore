@@ -149,26 +149,27 @@ add_subdirectory(cpp)
 
 # The reusable templates of `include/ustore/`, header-only, with the include paths of the siblings and the third-party
 # headers they reach into. The package installs UStore's own headers alone, so a consumer brings each sibling's.
-add_library(ustore_templates INTERFACE)
-add_library(ustore::templates ALIAS ustore_templates)
-set_target_properties(ustore_templates PROPERTIES EXPORT_NAME templates)
+add_library(ustore_header INTERFACE)
+add_library(ustore::header ALIAS ustore_header)
+set_target_properties(ustore_header PROPERTIES EXPORT_NAME header)
 # MSVC reads BOM-less UTF-8 in the system code page, so consumers of these Unicode-commented headers need `/utf-8`.
 target_compile_options(
-    ustore_templates INTERFACE "$<$<OR:$<COMPILE_LANG_AND_ID:C,MSVC>,$<COMPILE_LANG_AND_ID:CXX,MSVC>>:/utf-8>"
+    ustore_header INTERFACE "$<$<OR:$<COMPILE_LANG_AND_ID:C,MSVC>,$<COMPILE_LANG_AND_ID:CXX,MSVC>>:/utf-8>"
 )
-target_compile_features(ustore_templates INTERFACE cxx_std_20)
+target_compile_features(ustore_header INTERFACE cxx_std_20)
 target_include_directories(
-    ustore_templates
-    INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/c> $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-              $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    ustore_header INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
+                            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 target_include_directories(
-    ustore_templates SYSTEM INTERFACE $<BUILD_INTERFACE:${yyjson_SOURCE_DIR}/src>
-                                      $<BUILD_INTERFACE:${fmt_SOURCE_DIR}/include>
+    ustore_header SYSTEM INTERFACE $<BUILD_INTERFACE:${yyjson_SOURCE_DIR}/src>
+                                   $<BUILD_INTERFACE:${fmt_SOURCE_DIR}/include>
 )
+# The executor's pool is ForkUnion's C++ SDK, `fu::pool_t`, and the strings are StringZilla's, each bringing its archive
 target_link_libraries(
-    ustore_templates INTERFACE $<BUILD_INTERFACE:forkunion::header> $<BUILD_INTERFACE:smashtable::header>
-                               $<BUILD_INTERFACE:stringzilla::header> $<BUILD_INTERFACE:ustore_sanitizers>
+    ustore_header INTERFACE ustore_abi $<BUILD_INTERFACE:forkunion::cpp> $<BUILD_INTERFACE:smashtable::header>
+                            $<BUILD_INTERFACE:stringzilla::header> $<BUILD_INTERFACE:stringzilla::cpp>
+                            $<BUILD_INTERFACE:ustore_sanitizers>
 )
 
 include(cmake/ustore_gpu.cmake)
@@ -369,8 +370,8 @@ if (${USTORE_WITH_NVME})
     add_library(ustore_nvme_compaction OBJECT "${CMAKE_CURRENT_SOURCE_DIR}/src/nvme/compaction.cpp")
     target_link_libraries(
         ustore_nvme_compaction
-        PUBLIC $<BUILD_INTERFACE:smashtable::header> $<BUILD_INTERFACE:forkunion::header>
-        PRIVATE $<BUILD_INTERFACE:ustore_templates>
+        PUBLIC $<BUILD_INTERFACE:smashtable::header>
+        PRIVATE $<BUILD_INTERFACE:ustore_header>
     )
     target_include_directories(ustore_nvme_compaction PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     set_target_properties(ustore_nvme_compaction PROPERTIES POSITION_INDEPENDENT_CODE ON)
@@ -448,7 +449,11 @@ foreach (class_ IN LISTS ustore_nvidia_classes_ ustore_amd_classes_ ustore_apple
         ustore_vram_${class_} SYSTEM
         PRIVATE $<TARGET_PROPERTY:smashtable::header,INTERFACE_INCLUDE_DIRECTORIES>
                 $<TARGET_PROPERTY:forkunion::header,INTERFACE_INCLUDE_DIRECTORIES>
+                $<TARGET_PROPERTY:forkunion::abi,INTERFACE_INCLUDE_DIRECTORIES>
+                $<TARGET_PROPERTY:forkunion::cpp,INTERFACE_INCLUDE_DIRECTORIES>
                 $<TARGET_PROPERTY:stringzilla::header,INTERFACE_INCLUDE_DIRECTORIES>
+                $<TARGET_PROPERTY:stringzilla::abi,INTERFACE_INCLUDE_DIRECTORIES>
+                $<TARGET_PROPERTY:stringzilla::cpp,INTERFACE_INCLUDE_DIRECTORIES>
     )
     target_compile_definitions(
         ustore_vram_${class_} PRIVATE ${ustore_class_${class_}_gates_} ${ustore_class_${class_}_floor_off_}
@@ -533,7 +538,7 @@ foreach (library_ IN ITEMS ustore_static ustore_shared ${ustore_compiled_objects
         ${library_} PRIVATE $<BUILD_INTERFACE:forkunion::cpu_capabilities_compiled>
                             $<BUILD_INTERFACE:stringzilla::cpu_capabilities_compiled>
     )
-    target_link_libraries(${library_} PUBLIC $<BUILD_INTERFACE:ustore_sanitizers>)
+    target_link_libraries(${library_} PUBLIC $<BUILD_INTERFACE:forkunion::cpp> $<BUILD_INTERFACE:ustore_sanitizers>)
     # The engine sees the C ABI and its templates; a consumer of the C++ SDK links `ustore::cpp`, which carries it.
     target_include_directories(
         ${library_}
@@ -566,10 +571,10 @@ if (${USTORE_BUILD_PYTHON})
 endif ()
 
 # `find_package(ustore)` names the C headers `ustore::abi`, the C++ SDK carrying them and the archive `ustore::cpp`, the
-# header-only templates `ustore::templates`, and the libraries `ustore::shared`, which links every engine inside, and
+# header-only templates `ustore::header`, and the libraries `ustore::shared`, which links every engine inside, and
 # `ustore::static`, beside the engine archives it links, `ustore::rocksdb`, `ustore::leveldb` and `ustore::uring`. The
 # archive holds the device merger, whose consumers also link the static CUDA runtime it calls where it has one.
-set(ustore_install_sdk_targets_ ustore_abi ustore_cpp ustore_templates ustore_static ustore_shared
+set(ustore_install_sdk_targets_ ustore_abi ustore_cpp ustore_header ustore_static ustore_shared
                                 ${ustore_engine_archives_}
 )
 set(ustore_static_dependencies_)

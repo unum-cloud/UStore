@@ -57,7 +57,7 @@ The `metal` preset builds them on macOS, and off Apple platforms the same switch
 - __`ustore_shared`__, aliased `ustore::shared`, links the same libraries privately, compiles with `USTORE_EXPORTING`, hands its consumers `USTORE_SHARED`, and exports only the functions `USTORE_EXPORT` marks, as hidden visibility, a `ustore_*` version script on Linux, Android and FreeBSD and `-exported_symbol,_ustore_*` on macOS keep every other symbol inside.
 
 `c/test.c` builds against both, as `ustore_test_c` and `ustore_test_c_shared`, and CTest runs both.
-`USTORE_INSTALL` installs the two libraries, the headers, a `.pc` file and a CMake package under `lib/cmake/ustore`, which `find_package(ustore)` reads as `ustore::abi`, `ustore::templates`, `ustore::static`, `ustore::shared` and `ustore::cpp`, the C++ SDK linking the C headers and the archive.
+`USTORE_INSTALL` installs the two libraries, the headers, a `.pc` file and a CMake package under `lib/cmake/ustore`, which `find_package(ustore)` reads as `ustore::abi`, `ustore::header`, `ustore::static`, `ustore::shared` and `ustore::cpp`, the C++ SDK linking the C headers and the archive.
 The install splits into components: `sdk` holds both libraries with the engines' archives, `c/ustore/`, `cpp/ustore/`, the package and the license, and `templates` the header-only `include/ustore/`.
 `cpack --config build_release/CPackConfig.cmake` archives the `sdk` component alone, stripped, as the preview SDK `ustore-<version>-<platform>-sdk.tar.gz`, a ZIP on Windows.
 A function the headers declare without `USTORE_EXPORT` links against the archive but is missing from the shared library, so every new declaration holds it.

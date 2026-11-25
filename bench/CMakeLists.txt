@@ -20,7 +20,7 @@ add_executable(ustore_bench_docs_paths docs_paths.cpp)
 target_link_libraries(
     ustore_bench_docs_paths
     PRIVATE smashtable::header
-            forkunion::static
+            forkunion::cpp
             stringzilla::static
             yyjson
             fmt::fmt
@@ -41,7 +41,7 @@ if (${USTORE_WITH_NVME})
     add_executable(ustore_bench_nvme_single_collection_database nvme_single_collection_database.cpp)
     target_link_libraries(
         ustore_bench_nvme_single_collection_database
-        PRIVATE ustore::templates
+        PRIVATE ustore::header
                 forkunion::static
                 smashtable::header
                 stringzilla::static

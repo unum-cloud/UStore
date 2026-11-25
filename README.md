@@ -80,7 +80,7 @@ target_link_libraries(my_app PRIVATE ustore::cpp)
 ```
 
 `ustore::cpp` carries the C++ SDK, the C headers of `ustore::abi` and `ustore::static`, an archive that links the storage engines' archives installed beside it.
-`ustore::shared` exports the C ABI alone, `ustore::templates` names the header-only templates, and `-DUSTORE_INSTALL=ON` installs them all with a CMake package for `find_package(ustore)`.
+`ustore::shared` exports the C ABI alone, `ustore::header` names the header-only templates, and `-DUSTORE_INSTALL=ON` installs them all with a CMake package for `find_package(ustore)`.
 The program opens a database in memory, writes a blob, a document and an edge in one transaction, and reads them back, as every binding's Quickstart does.
 
 ```cpp

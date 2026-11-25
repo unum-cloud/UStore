@@ -52,7 +52,7 @@ if (${USTORE_WITH_NVME})
         target_include_directories(${storage_exe_} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         target_link_libraries(
             ${storage_exe_}
-            PRIVATE ustore::templates
+            PRIVATE ustore::header
                     forkunion::static
                     smashtable::header
                     stringzilla::static
@@ -108,7 +108,7 @@ if (${USTORE_WITH_NVME})
         target_compile_features(ustore_test_nvme_${suite_name_} PRIVATE cxx_std_20)
         target_link_libraries(
             ustore_test_nvme_${suite_name_}
-            PRIVATE ustore_templates
+            PRIVATE ustore_header
                     forkunion::static
                     smashtable::header
                     stringzilla::static
@@ -153,7 +153,7 @@ target_compile_features(ustore_test_nvme_compaction_host PRIVATE cxx_std_20)
 # parses through yyjson
 target_link_libraries(
     ustore_test_nvme_compaction_host
-    PRIVATE ustore_templates
+    PRIVATE ustore_header
             smashtable::header
             forkunion::static
             stringzilla::header
@@ -172,7 +172,7 @@ if (ustore_device_compaction_)
     )
     target_include_directories(ustore_test_nvme_compaction PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_compile_features(ustore_test_nvme_compaction PRIVATE cxx_std_20)
-    target_link_libraries(ustore_test_nvme_compaction PRIVATE ustore::static ustore_templates fmt::fmt ustore_warnings)
+    target_link_libraries(ustore_test_nvme_compaction PRIVATE ustore::static ustore_header fmt::fmt ustore_warnings)
     add_test(NAME ustore_test_nvme_compaction COMMAND ustore_test_nvme_compaction)
     list(APPEND ustore_gpu_tests_ ustore_test_nvme_compaction)
 endif ()
@@ -269,13 +269,13 @@ foreach (test_name_ IN ITEMS ${ustore_utilities_test_names_})
     add_executable(ustore_test_utilities_${test_name_} utilities/${test_name_}.cpp)
     target_include_directories(ustore_test_utilities_${test_name_} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(
-        ustore_test_utilities_${test_name_} PRIVATE ustore::templates forkunion::static fmt::fmt ustore_warnings
+        ustore_test_utilities_${test_name_} PRIVATE ustore::header forkunion::static fmt::fmt ustore_warnings
     )
     add_test(NAME ustore_test_utilities_${test_name_} COMMAND ustore_test_utilities_${test_name_})
 endforeach ()
 
 # The pages and docs templates call StringZilla's dispatched kernels, which a header-only StringZilla answers with
-# `sz_missing_library_k`, so these suites link its compiled library instead of `ustore::templates`
+# `sz_missing_library_k`, so these suites link its compiled library instead of `ustore::header`
 set(ustore_templates_test_paths_ "pages/element_tree" "pages/page_fold" "docs/json_paths")
 foreach (test_path_ IN ITEMS ${ustore_templates_test_paths_})
     string(REPLACE "/" "_" test_name_ ${test_path_})
@@ -285,7 +285,7 @@ foreach (test_path_ IN ITEMS ${ustore_templates_test_paths_})
     target_link_libraries(
         ustore_test_${test_name_}
         PRIVATE smashtable::header
-                forkunion::static
+                forkunion::cpp
                 stringzilla::static
                 yyjson
                 fmt::fmt
@@ -297,21 +297,21 @@ endforeach ()
 
 # The graph fold calls no StringZilla kernel, so its suite builds against the header target alone
 add_executable(ustore_test_graph_adjacency_fold graph/adjacency_fold.cpp)
-target_link_libraries(ustore_test_graph_adjacency_fold PRIVATE ustore::templates fmt::fmt ustore_warnings)
+target_link_libraries(ustore_test_graph_adjacency_fold PRIVATE ustore::header fmt::fmt ustore_warnings)
 target_include_directories(ustore_test_graph_adjacency_fold PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME ustore_test_graph_adjacency_fold COMMAND ustore_test_graph_adjacency_fold)
 
 # The runs of strings build against the header target alone
 add_executable(ustore_test_strings_nvme_memory_run strings/nvme_memory_run.cpp)
 target_link_libraries(
-    ustore_test_strings_nvme_memory_run PRIVATE ustore::templates forkunion::static fmt::fmt ustore_warnings
+    ustore_test_strings_nvme_memory_run PRIVATE ustore::header forkunion::static fmt::fmt ustore_warnings
 )
 target_include_directories(ustore_test_strings_nvme_memory_run PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME ustore_test_strings_nvme_memory_run COMMAND ustore_test_strings_nvme_memory_run)
 
 # Memory runs and their views call no StringZilla kernel either, and need only SmashTable's headers
 add_executable(ustore_test_blobs_nvme_memory_run blobs/nvme_memory_run.cpp)
-target_link_libraries(ustore_test_blobs_nvme_memory_run PRIVATE ustore::templates fmt::fmt ustore_warnings)
+target_link_libraries(ustore_test_blobs_nvme_memory_run PRIVATE ustore::header fmt::fmt ustore_warnings)
 target_include_directories(ustore_test_blobs_nvme_memory_run PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 add_test(NAME ustore_test_blobs_nvme_memory_run COMMAND ustore_test_blobs_nvme_memory_run)
 
@@ -369,7 +369,7 @@ if (${USTORE_BUILD_TOOLS})
     add_executable(ustore_test_tools_arrow_ipc tools/arrow_ipc.cpp)
     target_include_directories(ustore_test_tools_arrow_ipc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(
-        ustore_test_tools_arrow_ipc PRIVATE ustore::templates forkunion::static fmt::fmt ustore_warnings
+        ustore_test_tools_arrow_ipc PRIVATE ustore::header forkunion::static fmt::fmt ustore_warnings
     )
     add_test(NAME ustore_test_tools_arrow_ipc COMMAND ustore_test_tools_arrow_ipc)
     add_executable(
