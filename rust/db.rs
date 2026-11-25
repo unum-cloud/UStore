@@ -2620,7 +2620,8 @@ impl Description {
 ///
 /// No two processes may open one directory at once, and the handle is shared across threads freely;
 /// the transactions taken from it are not. Dropping it waits for every deferred call naming it to
-/// finish and writes nothing, so [`Database::flush`] makes buffered commits durable before it.
+/// finish and never flushes: commits made with [`Durability::Buffered`] and not yet flushed are not
+/// on disk, so call [`Database::flush`] first.
 #[derive(Debug)]
 pub struct Database {
     handle: ffi::ustore_database_t,

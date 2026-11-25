@@ -182,8 +182,8 @@ def test_remove_takes_a_bare_key(view, blobs):
 @pytest.mark.any_engine
 @pytest.mark.parametrize("values", [[b"a", b"b"], [b"a", b"b", b"c", b"d"]], ids=["short", "long"])
 def test_rejects_mismatched_batch_widths(view, blobs, values: list[bytes]):
-    """A batch of values longer or shorter than its keys raises ValueError."""
-    with pytest.raises(ValueError):  # noqa: PT011
+    """A batch of values longer or shorter than its keys raises InvalidArgumentError."""
+    with pytest.raises(ustore.InvalidArgumentError):
         view.write([1, 2, 3], values, collection=blobs)
 
 

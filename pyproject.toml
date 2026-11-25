@@ -150,6 +150,11 @@ convention = "google"
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"
 
+[tool.ruff.lint.flake8-pytest-style]
+# A test never matches an error's wording, as CONTRIBUTING.md bans `match=`, so a refusal the binding raises as a plain
+# ValueError is asserted by its class alone; the other broad classes still need a narrower one.
+raises-require-match-for = ["BaseException", "Exception", "OSError", "IOError", "EnvironmentError", "socket.error"]
+
 [tool.ruff.lint.isort]
 # The package is ours, so it sorts after the third-party block rather than inside it.
 known-first-party = ["ustore"]

@@ -663,12 +663,13 @@ static void Database_dealloc(Database* self) {
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
 
-static char const doc_Database_close[] =                                                       //
-    "close() answers None.\n"                                                                  //
-    "\n"                                                                                       //
-    "Closes the database once every deferred call on it finishes, writing nothing: a commit\n" //
-    "reaches the disk only through `flush()` or `Durability.FLUSHED`. Transactions and\n"      //
-    "snapshots it opened keep working, as each holds the database open until it closes too.";
+static char const doc_Database_close[] =                                                        //
+    "close() answers None.\n"                                                                   //
+    "\n"                                                                                        //
+    "Closes the database once every deferred call on it finishes, and never flushes: commits\n" //
+    "made with `Durability.BUFFERED` and not yet flushed are not on disk, so call `flush()`\n"  //
+    "first. Transactions and snapshots it opened keep working, as each holds the database\n"    //
+    "open until it closes too.";
 
 static PyObject* Database_close(PyObject* self, PyObject* Py_UNUSED(ignored)) {
     database_close((Database*)self);

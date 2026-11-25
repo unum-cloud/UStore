@@ -86,10 +86,10 @@ A snapshot hands out the read-only twin of every collection, such as `docs_read_
 
 ```cpp
 auto [blobs, create_status] = db.create<us::blobs_collection_t>("blobs");
-us::expected<us::docs_collection_t> people = db.find_or_create<us::docs_collection_t>("people");
-us::expected<us::blobs_collection_t> same = db.find("blobs");
-us::expected<us::graph_collection_t> refused = db.find<us::graph_collection_t>("blobs"); // invalid_argument_k
-us::expected<us::blobs_collection_t> named = db["articles"];                                 // not_found_k when absent
+auto [people, people_status] = db.find_or_create<us::docs_collection_t>("people");
+auto [same, same_status] = db.find("blobs");
+auto [refused, refused_status] = db.find<us::graph_collection_t>("blobs"); // invalid_argument_k
+auto [named, named_status] = db["articles"];                               // not_found_k when absent
 auto [present, probe_status] = db.contains("articles");
 ```
 
@@ -102,10 +102,10 @@ Given an `arena_t&`, as `blobs.read(keys, arena)` or `blobs[keys].value(arena)`,
 
 ```cpp
 us::status_t status = blobs[us::key_from_integer(42)].assign("purpose of life");
-us::expected<us::owned_value_t> value = blobs[us::key_from_integer(42)].value();
+auto [value, value_status] = blobs[us::key_from_integer(42)].value();
 
 status = blobs[{us::key_from_integer(43), us::key_from_integer(44)}].assign("same value");
-us::expected<bool> present = blobs[us::key_from_integer(43)].present();
+auto [present, present_status] = blobs[us::key_from_integer(43)].present();
 status = blobs[us::key_from_integer(43)].remove();
 
 auto [arena, arena_status] = us::arena_t::make();
@@ -119,9 +119,9 @@ A `strings_collection_t` keys arbitrary bytes by variable-length strings, kept i
 ```cpp
 auto [words, words_status] = db.create<us::strings_collection_t>("words");
 status = words.assign("apple", us::key_from_integer(1));
-us::expected<ustore_key_t> apple = words.value("apple");
-us::expected<us::strings_view_t> page = words.prefixed_page("ap", 16, arena);
-us::expected<std::size_t> count = words.size("ap");
+auto [apple, apple_status] = words.value("apple");
+auto [page, page_status] = words.prefixed_page("ap", 16, arena);
+auto [count, count_status] = words.size("ap");
 ```
 
 `ingest` opens an `ingest_t` that lands every row appended to it as one commit of its own, joining no transaction, and `finish` answers that commit's stamp.
@@ -132,7 +132,7 @@ auto [ingest, ingest_status] = db.ingest(blobs.handle(), ustore_ingest_unsorted_
 std::array<ustore_key_t, 2> rows {us::key_from_integer(2), us::key_from_integer(1)};
 std::array<std::string_view, 2> bytes {"two", "one"};
 status = ingest.append(rows, bytes); // copied before the call returns
-us::expected<us::commit_stamp_t> landed = ingest.finish();
+auto [landed, finish_status] = ingest.finish();
 ```
 
 ## Scans
@@ -174,8 +174,8 @@ auto [batches, batches_status] = rows.next(256, arena, executor); // each batch 
 A `changes_cursor_t` is a feed of what was committed to one collection after a stamp, oldest first, which pins that stamp as a snapshot does.
 
 ```cpp
-us::expected<std::span<ustore_key_t const>> drawn = people.sample(16, arena);
-us::expected<us::size_estimates_t> bounds = people.measure(us::smallest_key_k, us::largest_key_k, arena);
+auto [drawn, sample_status] = people.sample(16, arena);
+auto [bounds, measure_status] = people.measure(us::smallest_key_k, us::largest_key_k, arena);
 auto [feed, feed_status] = db.changes_cursor(blobs.handle(), committed_at);
 auto [changes, changes_status] = feed.next_pairs(256, arena, executor); // or on the calling thread without one
 ```
@@ -208,8 +208,8 @@ if (probe_status.failed() || !transactional) return;
 auto [transaction, transaction_status] = db.transaction();
 auto [inside, inside_status] = transaction.find("blobs");
 status = inside[us::key_from_integer(42)].assign("written inside a transaction");
-us::expected<us::read_stamp_t> staged = transaction.stage();
-us::expected<us::commit_stamp_t> committed = transaction.commit();
+auto [staged, stage_status] = transaction.stage();
+auto [committed, commit_status] = transaction.commit();
 ```
 
 ## Snapshots
@@ -219,7 +219,8 @@ us::expected<us::commit_stamp_t> committed = transaction.commit();
 
 ```cpp
 auto [snapshot, snapshot_status] = db.snapshot();
-auto [pinned, pinned_status] = snapshot.find("blobs").value[us::key_from_integer(42)].value();
+auto [pinned_blobs, find_status] = snapshot.find("blobs");
+auto [pinned, pinned_status] = pinned_blobs[us::key_from_integer(42)].value();
 us::read_stamp_t const at = snapshot.read_stamp();
 ```
 
@@ -233,7 +234,7 @@ Besides `assign`, a reference offers `insert`, `update`, `upsert`, `patch` and `
 auto [people, people_status] = db.create<us::docs_collection_t>("people");
 status = people[us::key_from_integer(1)].assign(R"({"person": "Alice", "age": 27})");
 status = people[us::key_from_integer(1)].patch(R"([{"op": "replace", "path": "/age", "value": 28}])");
-us::expected<us::owned_value_t> person =
+auto [person, person_status] =
     people[us::collection_key_field_t {us::key_from_integer(1), "/person"}].value(ustore_docs_field_type_string_k);
 
 auto header = us::make_table_header().with<std::int32_t>("age").with<std::string_view>("person");
@@ -250,7 +251,7 @@ auto [pages, pages_status] = db.create<us::pages_collection_t>("pages");
 std::array<ustore_key_t, 1> page {us::key_from_integer(7)};
 std::array<std::string_view, 1> markup {"<doc><p>one</p></doc>"}, fragment {"<p>two</p>"};
 status = pages.import(page, markup);
-us::expected<us::keys_view_t> landed = pages.insert(page, fragment, arena); // at the front of the root
+auto [landed, insert_status] = pages.insert(page, fragment, arena); // at the front of the root
 ```
 
 ## Graphs
@@ -268,7 +269,7 @@ auto [similar, similar_status] = graph.neighbors(us::key_from_integer(1), arena)
 for (ustore_key_t const neighbor : similar) visit(neighbor);
 std::array<ustore_key_t, 3> vertices {us::key_from_integer(1), us::key_from_integer(7), us::key_from_integer(2)};
 auto [presences, present_status] = graph.present(vertices, arena);
-us::expected<ustore_vertex_degree_t> degree = graph.degree(us::key_from_integer(2));
+auto [degree, degree_status] = graph.degree(us::key_from_integer(2));
 auto [leaving, leaving_status] = graph.read_edges(vertices, arena);
 ```
 
@@ -354,7 +355,7 @@ status = executor.drain(ustore_mood_parked_k);
 
 ```cpp
 std::array<ustore_gpu_device_t, 8> devices {};
-us::expected<std::size_t> count = us::gpu_devices(devices); // may exceed what fits
+auto [count, count_status] = us::gpu_devices(devices); // may exceed what fits
 ```
 
 ## Batches and Arenas
@@ -396,14 +397,14 @@ The converters of `c/ustore/arrow.h` view an Arrow column as a call's input in p
 #include <ustore/arrow.hpp>
 
 auto [values, read_status] = blobs.read(keys, arena);
-us::expected<us::arrow_export_t> strings = us::strings_view_to_arrow(values, arena);
-ArrowSchema& schema = strings.value.schema();          // `binary` or `large_binary`
-ArrowArray const& array = strings.value.array().array; // the arena's own buffers
-us::expected<us::values_view_t> back = us::strings_view_from_arrow(schema, array);
+auto [strings, export_status] = us::strings_view_to_arrow(values, arena);
+ArrowSchema& schema = strings.schema();          // `binary` or `large_binary`
+ArrowArray const& array = strings.array().array; // the arena's own buffers
+auto [back, back_status] = us::strings_view_from_arrow(schema, array);
 
 auto header = us::make_table_header().with<std::int32_t>("age").with<std::string_view>("person");
 auto [table, gather_status] = people.gather(keys, header, other);
-us::expected<us::arrow_export_t> ages = us::docs_column_view_to_arrow(table.column(0), other);
+auto [ages, ages_status] = us::docs_column_view_to_arrow(table.column(0), other);
 ```
 
 `keys_view_from_arrow` and `strings_view_from_arrow` read keys and strings, and `keys_view_to_arrow`, `strings_view_to_arrow` and `docs_column_view_to_arrow` write keys, strings and gathered columns.
@@ -417,7 +418,7 @@ us::expected<us::arrow_export_t> ages = us::docs_column_view_to_arrow(table.colu
 `supports_transactions` and `supports_snapshots` read the description, so a describe that fails answers its status rather than a capability.
 
 ```cpp
-us::expected<ustore_database_description_t> description = db.describe();
+auto [description, describe_status] = db.describe();
 status = db.clear(ustore_drop_pairs_k);
 us::database_compact_plan_t plan;
 status = db.compact(within_budget, &plan); // a cancel leaves the plan live

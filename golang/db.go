@@ -751,9 +751,9 @@ func databaseOf(handle C.ustore_database_t, err error) (*Database, error) {
 }
 
 // Close releases the database once every transaction, snapshot, cursor and ingest holding it is
-// closed, waiting for every deferred call naming it. It writes nothing to disk, so a Flush comes
-// first for commits made with [DurabilityBuffered]. It is idempotent, and a closed database must
-// not be used again.
+// closed, waiting for every deferred call naming it. It never flushes: commits made with
+// [DurabilityBuffered] and not yet flushed are not on disk, so call [DatabaseOn.Flush] first. It is
+// idempotent, and a closed database must not be used again.
 func (database *Database) Close() error {
 	if database == nil || database.handle == nil {
 		return nil

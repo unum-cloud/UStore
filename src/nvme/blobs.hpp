@@ -378,7 +378,9 @@ enum class task_end_t : std::uint8_t {
  *  values on its thread's channel at the places the walk found them, and narrows and appends them
  *  to its batch. A walk through a transaction merges its own writes and records what it watches,
  *  which the calling thread watches once the tasks end. The tasks cover consecutive ranges, so the
- *  next pull resumes past the first task that filled, or at the first that never ran.
+ *  next pull resumes past the first task that filled, or at the first that never ran. A known
+ *  limit: a pull whose match reads values runs as one task, as the match's engine serves one call
+ *  at a time.
  */
 template <cpu_class_t cpu_class_, typename sink_type_>
 status_t scan_values(ustore_blobs_scan_t const& arguments, sink_type_& sink, view_t const& view) noexcept {

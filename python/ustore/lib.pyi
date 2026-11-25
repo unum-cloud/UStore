@@ -1776,9 +1776,9 @@ class Database(_Writes, _Receivers):
         traceback: TracebackType | None = None,
     ) -> None: ...
     def close(self) -> None:
-        """Closes the database once every deferred call on it finished, writing nothing, so a commit reaches the disk
-        only through `flush` or `Durability.FLUSHED`, while its open transactions and snapshots keep working, each
-        holding the database open until it closes too."""
+        """Closes the database once every deferred call on it finished, and never flushes: commits made with
+        `Durability.BUFFERED` and not yet flushed are not on disk, so call `flush` first. Its open transactions and
+        snapshots keep working, each holding the database open until it closes too."""
 
     def clear(self, mode: DropMode, /) -> None:
         """Empties every collection at once: its pairs, every collection with its name, or its values."""

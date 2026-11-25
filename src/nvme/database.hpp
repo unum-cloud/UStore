@@ -2539,14 +2539,13 @@ void transaction_free(ustore_transaction_t transaction) noexcept {
     close_reader(state);
 }
 
-/** Frees @p database without any I/O, which every transaction and snapshot of it must
- *  precede, refusing while one is open, as its pin would outlive the ledger; commits not yet
- *  flushed are lost. */
+/** Frees @p database without any I/O; commits not yet flushed are lost. Every transaction and
+ *  snapshot holds the database's handle and closes its reader before giving that hold back, so the
+ *  router runs this only after the last of them, with @c open_readers at zero. */
 template <cpu_class_t cpu_class_>
 void database_free(ustore_database_t database) noexcept {
     database_state<cpu_class_>* const state = state_of<database_state<cpu_class_>>(database);
-    if (state && atomic_ref_of<cpu_class_, std::size_t> {state->open_readers}.load(std::memory_order_acquire) != 0)
-        return;
+    assert(state->open_readers == 0 && "The router frees a database only after its last reader closes");
     delete state;
 }
 

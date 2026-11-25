@@ -438,7 +438,7 @@ def test_multigraph_keys(attributed):
 @pytest.mark.any_engine
 def test_attributes_never_share_the_graph_collection(view):
     """Attributes kept in the graph's own collection raise ValueError."""
-    with pytest.raises(ValueError):  # noqa: PT011
+    with pytest.raises(ValueError):
         Graph(view, "graph", nodes="graph")
 
 
@@ -446,7 +446,7 @@ def test_attributes_never_share_the_graph_collection(view):
 def test_attributes_need_a_collection(graphs):
     """An attribute on a view without an attribute collection raises ValueError."""
     ours, _ = graphs
-    with pytest.raises(ValueError):  # noqa: PT011
+    with pytest.raises(ValueError):
         ours.add_edge(1, 2, weight=1)
 
 

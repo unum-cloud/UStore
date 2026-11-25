@@ -11,7 +11,7 @@ import struct
 import numpy as np
 import pytest
 
-from ustore import FieldType, UnsupportedError
+from ustore import FieldType, InvalidArgumentError, UnsupportedError
 from ustore.table_view import WRITE_TYPES, Table
 
 COLUMN_DTYPES = {
@@ -220,11 +220,11 @@ def test_gather_holds_its_arena(view, docs, arena):
     assert bytes(column) == UUID_BYTES
 
 
-@pytest.mark.parametrize("field_type", [FieldType.NULL, 128])
-def test_gather_refuses_unconvertible_types(view, docs, arena, field_type: FieldType | int):
-    """A gather converts into scalars, UUIDs, strings, bytes or JSON, and into no other type or value."""
+@pytest.mark.parametrize(("field_type", "error"), [(FieldType.NULL, InvalidArgumentError), (128, ValueError)])
+def test_gather_refuses_unconvertible_types(view, docs, arena, field_type: FieldType | int, error: type[ValueError]):
+    """A gather converts only into scalars, UUIDs, strings, bytes or JSON, refusing a type the C ABI names or not."""
     view.docs_write([0], "{}", collection=docs)
-    with pytest.raises(ValueError):  # noqa: PT011
+    with pytest.raises(error):
         view.docs_gather([0], ["v"], field_type, arena, collection=docs)
 
 
@@ -271,7 +271,7 @@ def test_table_column_of_objects_still_writes_json(view, docs, arena):
 def test_table_column_of_the_wrong_length(view, docs):
     """A column shorter than the rows it would fill is refused before anything is written."""
     table = Table.from_records(view, [{"n": row} for row in range(3)], collection=docs)
-    with pytest.raises(ValueError):  # noqa: PT011
+    with pytest.raises(ValueError):
         table["v"] = np.zeros(2, dtype=np.float64)
 
 

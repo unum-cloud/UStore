@@ -58,5 +58,5 @@ def test_paged_empty_view(view, docs):
 @pytest.mark.parametrize("page", [0, -1])
 def test_page_must_hold_a_row(people, page: int):
     """A page holds at least one row, so a page size below one is refused."""
-    with pytest.raises(ValueError):  # noqa: PT011
+    with pytest.raises(ValueError):
         people.to_pandas(page=page)

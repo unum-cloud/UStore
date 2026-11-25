@@ -1995,8 +1995,8 @@ struct Database(BlobsVerbs, DatabaseVerbs, DocsVerbs, GraphVerbs, Movable, Pages
         )
 
     def __deinit__(deinit self):
-        """Closes the database once nothing holds it open, writing nothing: commits not yet flushed are lost.
-        Calls `ustore_database_free`.
+        """Closes the database once nothing holds it open, and never flushes: commits made with
+        `Durability.BUFFERED` and not yet flushed are not on disk, so call `flush` first. Calls `ustore_database_free`.
 
         The loader reference is surrendered only after the call, so Mojo cannot `dlclose` the engine
         between the load of the entry point and the branch to it.

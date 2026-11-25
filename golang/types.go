@@ -982,7 +982,7 @@ func (call *call) status() Status {
 	return Status(C.ustore_outcome_status(call.outcome()))
 }
 
-// settle waits until the call is final, releases everything it call, and reports its failure, the
+// settle waits until the call is final, releases everything it pinned, and reports its failure, the
 // same every time it is asked.
 func (call *call) settle() error {
 	if call.status() == StatusDeferred {

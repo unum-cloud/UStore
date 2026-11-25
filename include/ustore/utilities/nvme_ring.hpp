@@ -80,12 +80,6 @@ class countdown {
         remaining_reference_().store_add(parts, std::memory_order_relaxed);
     }
 
-    /** Whether every part has reported, or one of them has failed. */
-    bool has_finished() const noexcept {
-        if (code_reference_().load(std::memory_order_acquire) != 0) return true;
-        return remaining_reference_().load(std::memory_order_acquire) <= 0;
-    }
-
     /** Whether any part reported a failure. */
     bool has_failed() const noexcept { return code_reference_().load(std::memory_order_acquire) != 0; }
 
@@ -186,9 +180,6 @@ class notifier {
 
     /** Whether any part reported a failure. */
     bool has_failed() const noexcept { return countdown_.has_failed(); }
-
-    /** Whether every part has reported, or one of them has failed. */
-    bool has_finished() const noexcept { return countdown_.has_finished(); }
 
     /** Whether the parts still owed have fallen to @p threshold or below. */
     bool test(std::int32_t threshold) const noexcept { return countdown_.test(threshold); }
