@@ -392,10 +392,12 @@ void ustore_executor_drain(ustore_executor_drain_t* arguments) {
     while (executor->claim.held()) std::this_thread::yield();
 }
 
-void ustore_executor_free(ustore_executor_t executor) {
-    if (!executor) return;
+ustore_status_t ustore_executor_free(ustore_executor_t executor) {
+    if (!executor) return ustore_status_success_k;
+    if (executor->arenas.load(std::memory_order_acquire) != 0) return ustore_status_contended_k;
     while (executor->claim.held()) std::this_thread::yield();
     delete executor;
+    return ustore_status_success_k;
 }
 
 #pragma endregion Executors
@@ -409,6 +411,14 @@ void ustore_arena_init(ustore_arena_init_t* arguments) {
     *arguments->arena = nullptr;
     auto* const arena = new (std::nothrow) ustore_arena_handle_t {};
     if (!arena) return call.refuse(ustore_status_out_of_memory_k, "Failed to allocate the arena");
+    if (ustore_executor_t const executor = arguments->executor) {
+        std::uint32_t seen = executor->arenas.load(std::memory_order_relaxed);
+        do
+            if (seen == (std::numeric_limits<std::uint32_t>::max)())
+                return delete arena, call.refuse(ustore_status_overflow_k, "The executor counts too many arenas");
+        while (!executor->arenas.compare_exchange_weak(seen, seen + 1, std::memory_order_acq_rel));
+        arena->executor = executor;
+    }
     *arguments->arena = arena;
 }
 
@@ -417,7 +427,9 @@ ustore_status_t ustore_arena_free(ustore_arena_t arena) {
     wait_named(arena->named_calls);
     if (arena->exports.load(std::memory_order_acquire) != 0) return ustore_status_contended_k;
     while (arena->claim.held()) std::this_thread::yield();
+    ustore_executor_t const executor = arena->executor;
     delete arena;
+    if (executor) executor->arenas.fetch_sub(1, std::memory_order_release);
     return ustore_status_success_k;
 }
 

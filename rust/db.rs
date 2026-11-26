@@ -806,7 +806,7 @@ pub(crate) mod ffi {
         pub fn ustore_executor_for_vram(arguments: *mut ustore_executor_for_vram_t);
         pub fn ustore_gpu_devices(arguments: *mut ustore_gpu_devices_t);
         pub fn ustore_executor_drain(arguments: *mut ustore_executor_drain_t);
-        pub fn ustore_executor_free(executor: ustore_executor_t);
+        pub fn ustore_executor_free(executor: ustore_executor_t) -> ustore_status_t;
 
         pub fn ustore_arena_init(arguments: *mut ustore_arena_init_t);
         pub fn ustore_arena_describe(arguments: *mut ustore_arena_describe_t);
@@ -4469,7 +4469,8 @@ impl Executor {
 impl Drop for Executor {
     fn drop(&mut self) {
         // SAFETY: the handle came from a successful creation and is freed once, which drains every call first.
-        unsafe { ffi::ustore_executor_free(self.handle) };
+        // Arenas borrow the executor, so none lives here and the free cannot be refused.
+        let _status = unsafe { ffi::ustore_executor_free(self.handle) };
     }
 }
 

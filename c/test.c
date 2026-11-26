@@ -359,6 +359,22 @@ static void test_readme_quickstart(void) {
     ustore_database_free(db);
 }
 
+/** An executor refuses to be freed while an arena made with it lives, a RAM one included, and
+ *  frees once that arena is gone. */
+static void test_executor_free_with_live_arena(void) {
+    ustore_outcome_t outcome = {0};
+    ustore_executor_t executor = NULL;
+    ustore_executor_for_ram(&(ustore_executor_for_ram_t) {.executor = &executor, .outcome = &outcome, .threads = 1});
+    expect_success_at(&outcome, __FILE__, __LINE__);
+    ustore_arena_t arena = NULL;
+    ustore_arena_init(&(ustore_arena_init_t) {.arena = &arena, .executor = executor, .outcome = &outcome});
+    expect_success_at(&outcome, __FILE__, __LINE__);
+    expect_(ustore_executor_free(executor) == ustore_status_contended_k);
+    expect_(ustore_arena_free(arena) == ustore_status_success_k);
+    expect_(ustore_executor_free(executor) == ustore_status_success_k);
+    expect_(ustore_executor_free(NULL) == ustore_status_success_k);
+}
+
 /** Every call of the C ABI once per shape of its arguments, on one in-memory database. */
 static void test_every_argument_shape_lands(void) {
     ustore_outcome_t outcome = {0};
@@ -619,7 +635,7 @@ static void test_every_argument_shape_lands(void) {
     ustore_executor_for_ram_t spawn = {.executor = &executor, .outcome = &outcome, .ram = {NULL, 0}, .threads = 1};
     ustore_executor_for_ram(&spawn);
     expect_success_at(&outcome, __FILE__, __LINE__);
-    ustore_executor_free(executor);
+    expect_(ustore_executor_free(executor) == ustore_status_success_k);
 
     // Edges take strided sources and targets, and a read takes one role for every vertex
     ustore_collection_id_t graph = {{{0}}};
@@ -781,7 +797,7 @@ static void test_every_argument_shape_lands(void) {
     finish_plan.plan = NULL;
     ustore_database_compact_plan_finish(&finish_plan);
     expect_(outcome.status == ustore_status_invalid_argument_k);
-    ustore_executor_free(compactor);
+    expect_(ustore_executor_free(compactor) == ustore_status_success_k);
     ustore_database_clear_t clear = {.database = database, .outcome = &outcome, .mode = ustore_drop_pairs_k};
     ustore_database_clear(&clear);
     expect_success_at(&outcome, __FILE__, __LINE__);
@@ -831,6 +847,9 @@ int main(int argc, char** argv) {
     finish_test_case(NULL);
     start_test_case("test_every_argument_shape_lands");
     test_every_argument_shape_lands();
+    finish_test_case(NULL);
+    start_test_case("test_executor_free_with_live_arena");
+    test_executor_free_with_live_arena();
     finish_test_case(NULL);
     return finish_test_run();
 }

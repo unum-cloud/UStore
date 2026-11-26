@@ -525,7 +525,7 @@ case_result_t test_database_cpu_class_ceiling(config_t const& config) {
     ustore_executor_for_ram(&spawn);
     expect_success(outcome);
     expect_true(executor != nullptr);
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
     return {};
 }
 
@@ -1603,7 +1603,7 @@ case_result_t test_database_view_refusals(config_t const& config) {
     ustore_database_compact(&compact);
     expect_status(status_of(outcome), status_code_t::read_only_k);
     expect_true(plan == nullptr && phase.phase == ustore_phase_none_k);
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
     ustore_database_free(database);
     return {};
 }
@@ -2236,8 +2236,8 @@ case_result_t test_compact_plan_resumes(config_t const& config) {
         expect_true(tape_written(columns.values) && columns.value(0) == "second");
     }
     ustore_database_free(other);
-    ustore_executor_free(other_executor);
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(other_executor) == ustore_status_success_k);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
     return {};
 }
 
@@ -2349,7 +2349,8 @@ void test_progress_serialized(config_t const& config) {
     std::size_t const calls = scanned.calls + compacted.calls;
     std::this_thread::sleep_for(std::chrono::milliseconds(20));
     expect_equal(scanned.calls + compacted.calls, calls);
-    ustore_executor_free(executor);
+    arena = {};
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
 }
 
 #pragma endregion Progress

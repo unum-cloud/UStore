@@ -1492,6 +1492,10 @@ struct ustore_executor_handle_t {
     /** The one call that holds the executor, from its claim to its end. */
     holding_call_t holding_call;
 
+    /** Arenas made with the executor and not yet freed, which refuse its free; through the floor
+     *  class's reference, as any thread may make or free one. */
+    std::uint32_t arenas = 0;
+
     /** Nothing beyond the pool on RAM, one reading and one writing ring per pool thread and the
      *  holding call on NVMe, the devices and their streams on VRAM of any vendor; the variant is
      *  the kind tag, so no second word can disagree. */

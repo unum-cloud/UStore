@@ -223,7 +223,7 @@ struct device_call_t {
         : device_call_t(std::array {static_cast<std::int32_t>(ordinal)}) {}
     ~device_call_t() noexcept {
         ustore_arena_free(arena);
-        ustore_executor_free(executor);
+        expect_true(ustore_executor_free(executor) == ustore_status_success_k);
     }
 };
 
@@ -385,7 +385,7 @@ void test_vram_class_ceiling(std::size_t ordinal, ustore_gpu_device_t listed) {
             .outcome = &outcome,
             .vram = {.devices = &device, .devices_count = 1, .gpu_class_ceiling = gpu_class_ceiling}};
         ustore_executor_for_vram(&spawn);
-        ustore_executor_free(executor);
+        expect_true(ustore_executor_free(executor) == ustore_status_success_k);
         return outcome.status;
     };
     expect_true(spawned_under(listed.gpu_class) == ustore_status_success_k);
@@ -920,7 +920,7 @@ case_result_t test_vram_streams_end_deferred_reads(std::size_t ordinal, ustore_g
             expect_true(std::string_view {reinterpret_cast<char const*>(data + offset), expected.size()} == expected);
         }
     expect_true(ustore_arena_free(arena) == ustore_status_success_k);
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
     return {};
 }
 
@@ -976,7 +976,7 @@ case_result_t test_vram_every_device(std::vector<std::int32_t> ordinals) {
                                                 ? ustore_host_access_readable_k
                                                 : ustore_host_access_refused_k));
     ustore_arena_free(arena);
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
     return {};
 }
 
@@ -1011,7 +1011,7 @@ case_result_t test_vram_adopted_streams(std::vector<std::int32_t> ordinals, std:
                                           .vram = {.devices = named.data(), .devices_count = named.size()},
                                           .streams = streams.empty() ? nullptr : streams.data()};
         ustore_executor_for_vram(&spawn);
-        ustore_executor_free(executor);
+        expect_true(ustore_executor_free(executor) == ustore_status_success_k);
         return outcome.status;
     };
     std::int32_t const first = ordinals[0], second = ordinals[1];

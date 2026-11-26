@@ -1197,12 +1197,16 @@ USTORE_EXPORT void ustore_executor_drain(ustore_executor_drain_t* arguments);
 
 /**
  *  @brief Waits until no call holds the executor and its device ran the work queued on its stream,
- *      releases its scratch and frees it; @c NULL is safe, and it cannot fail, so takes no outcome.
- *  @param[in,out] executor The executor to be freed; invalid afterwards.
+ *      releases its scratch and frees it; @c NULL is safe.
+ *  @param[in,out] executor The executor to be freed; invalid afterwards, unless it is refused.
  *
- *  Every arena it made must be freed first.
+ *  A thread must not free an executor another thread still submits to.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_contended_k An arena made with it lives, as @c ustore_arena_free answers
+ *    while an export is open, and nothing is freed.
  */
-USTORE_EXPORT void ustore_executor_free(ustore_executor_t executor);
+USTORE_EXPORT ustore_status_t ustore_executor_free(ustore_executor_t executor);
 
 /**
  *  @brief Memory the library writes every output whose length scales with a call into, reused

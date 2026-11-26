@@ -583,7 +583,7 @@ void test_docs_gather_in_flights(config_t const& config) {
     st::vector<std::string_view> documents;
     if (!expect_true(st::succeeded(keys.resize(count_k)) && st::succeeded(written_keys.resize(count_k)) &&
                      st::succeeded(texts.resize(count_k)) && st::succeeded(documents.resize(count_k))))
-        return ustore_executor_free(executor);
+        return void(ustore_executor_free(executor));
     std::size_t written = 0;
     for (std::size_t row = 0; row != count_k; ++row) {
         keys[row] = key_from_integer(row);
@@ -655,7 +655,7 @@ void test_docs_gather_in_flights(config_t const& config) {
     };
     ustore_docs_gather(&gather);
     expect_success(outcome);
-    if (!expect_true(columns != nullptr)) return ustore_executor_free(executor);
+    if (!expect_true(columns != nullptr)) return void(ustore_executor_free(executor));
     expect_columns();
 
     // A watching transaction gathers every flight as the head does
@@ -666,7 +666,7 @@ void test_docs_gather_in_flights(config_t const& config) {
         expect_success(outcome);
         if (expect_true(columns != nullptr)) expect_columns();
     }
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
 }
 
 #pragma endregion Documents Modality
@@ -930,7 +930,7 @@ void test_docs_cursor_batches_cross_run_fences(config_t const& config) {
     st::vector<pulled_row_t> none;
     expect_equal(pull_rows(database.handle(), executor, cursor, arena.handle(), 1000, none), std::size_t {0});
     ustore_docs_cursor_free(cursor);
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
 }
 
 /** A descending cursor walks the fenced runs from the largest key down, every key left once. */
@@ -948,7 +948,7 @@ void test_docs_cursor_batches_descend(config_t const& config) {
                                                    ustore_scan_descending_k);
     expect_rows(pull_all_rows(database.handle(), executor, cursor, arena.handle(), 48).rows, left, fenced_age);
     ustore_docs_cursor_free(cursor);
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
 }
 
 /** Counts the calls of a predicate admitting even keys, which the executor's threads
@@ -989,7 +989,7 @@ void test_docs_cursor_predicates_run_in_tasks(config_t const& config) {
         expect_true(counted.calls != 0 && counted.asked >= even.size());
         ustore_docs_cursor_free(cursor);
     }
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
 }
 
 /** A cursor through a watching transaction walks the transaction's own writes and removals merged
@@ -1001,7 +1001,7 @@ case_result_t test_docs_cursor_transaction_watches_its_tasks(config_t const& con
     auto [executor, executor_status] = spawn_executor(4);
     if (!expect_true(open_status.succeeded() && arena_status.succeeded() && executor_status.succeeded())) return {};
     if (!probed(database.supports_transactions())) {
-        ustore_executor_free(executor);
+        expect_true(ustore_executor_free(executor) == ustore_status_success_k);
         return case_result_t::skipped(needs_transactions_k);
     }
     auto [collection, collection_status] = create_collection(database.handle(), "watches.docs", ustore_modality_docs_k);
@@ -1034,7 +1034,7 @@ case_result_t test_docs_cursor_transaction_watches_its_tasks(config_t const& con
     expect_true(outcome.status != ustore_status_success_k, "the commit conflicts with a watched key, status {}",
                 static_cast<int>(outcome.status));
     ustore_transaction_free(transaction);
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
     return {};
 }
 

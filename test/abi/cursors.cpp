@@ -256,7 +256,8 @@ case_result_t test_cursor_free_waits(config_t const& config) {
     expect_true(freeing.stage_after_free == hold_stage_t::returned_k);
     expect_true(ustore_outcome_wait(&outcome) == ustore_status_success_k);
     expect_page(pulled, keys, "held");
-    ustore_executor_free(executor);
+    arena = {};
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
     return {};
 }
 

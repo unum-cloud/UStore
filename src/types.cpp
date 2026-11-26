@@ -712,12 +712,16 @@ void ustore_executor_drain(ustore_executor_drain_t* arguments) {
     finish(outcome, {});
 }
 
-void ustore_executor_free(ustore_executor_t executor) {
-    if (!executor) return;
+ustore_status_t ustore_executor_free(ustore_executor_t executor) {
+    if (!executor) return ustore_status_success_k;
+    // A refusal never waits: the count is read before the claim
+    if (floor_atomic_ref<std::uint32_t const> {executor->arenas}.load(std::memory_order_acquire) != 0)
+        return ustore_status_contended_k;
     // The claim dies with the handle
     take_idle_claim(*executor);
     for (ustore_arena_handle_t& scratch : executor->scratches) util::arena_free_blocks(scratch);
     delete executor;
+    return ustore_status_success_k;
 }
 
 void ustore_arena_init(ustore_arena_init_t* arguments) {
@@ -729,8 +733,9 @@ void ustore_arena_init(ustore_arena_init_t* arguments) {
     if (!arena) return finish(outcome, {util::status_code_t::out_of_memory_k, "No room for the arena"});
     // Nothing is allocated until the first call writes, on the memory domain or the first device
     // its executor names
-    arena->executor = arguments->executor;
-    if (ustore_executor_t const executor = arguments->executor)
+    ustore_executor_t const executor = arguments->executor;
+    arena->executor = executor;
+    if (executor)
         std::visit(
             [&]<typename kind_type_>(kind_type_ const& kind) noexcept {
                 if constexpr (util::a_gpu_executor<kind_type_>)
@@ -741,6 +746,12 @@ void ustore_arena_init(ustore_arena_init_t* arguments) {
                         .memory_domain = util::host_blocks_of(&executor->scratches.back())->memory_domain};
             },
             executor->device);
+    // Every arena made with an executor counts, RAM included
+    std::uint32_t constexpr most_k = (std::numeric_limits<std::uint32_t>::max)();
+    if (executor && fu::atomic_fetch_add_if_at_most(floor_atomic_ref<std::uint32_t> {executor->arenas}, 1u, most_k,
+                                                    std::memory_order_acq_rel) == most_k)
+        return destroy_arena(arena),
+               finish(outcome, {util::status_code_t::overflow_k, "The executor counts too many arenas"});
     *arguments->arena = arena;
     finish(outcome, {});
 }
@@ -750,7 +761,10 @@ ustore_status_t ustore_arena_free(ustore_arena_t arena) {
     wait_named_calls(arena->named_calls);
     if (floor_atomic_ref<std::uint32_t const>(arena->exports).load(std::memory_order_acquire) != 0)
         return ustore_status_contended_k;
+    ustore_executor_t const executor = arena->executor;
     destroy_arena(arena);
+    // Last, after the memory went back through the executor
+    if (executor) floor_atomic_ref<std::uint32_t> {executor->arenas}.fetch_sub(1, std::memory_order_release);
     return ustore_status_success_k;
 }
 

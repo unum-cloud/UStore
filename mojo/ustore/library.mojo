@@ -114,7 +114,6 @@ from ustore.db import (
 )
 from ustore.types import (
     ArenaDescribe,
-    ArenaFree,
     ArenaInit,
     BytesView,
     CaseSensitivity,
@@ -141,6 +140,7 @@ from ustore.types import (
     Phase,
     Release,
     Status,
+    StatusRelease,
     Transport,
     Verb,
     ViewOf,
@@ -228,10 +228,10 @@ struct Symbols:
     var executor_for_nvme: ExecutorForNvme
     var executor_for_vram: ExecutorForVram
     var executor_drain: ExecutorDrain
-    var executor_free: Release
+    var executor_free: StatusRelease
     var arena_init: ArenaInit
     var arena_describe: ArenaDescribe
-    var arena_free: ArenaFree
+    var arena_free: StatusRelease
 
     var predicate_cost_name: NameOf
     var predicate_cost_from_name: FromName
@@ -398,10 +398,10 @@ struct Symbols:
         self.executor_for_nvme = _resolve[ExecutorForNvme](handle, "ustore_executor_for_nvme")
         self.executor_for_vram = _resolve[ExecutorForVram](handle, "ustore_executor_for_vram")
         self.executor_drain = _resolve[ExecutorDrain](handle, "ustore_executor_drain")
-        self.executor_free = _resolve[Release](handle, "ustore_executor_free")
+        self.executor_free = _resolve[StatusRelease](handle, "ustore_executor_free")
         self.arena_init = _resolve[ArenaInit](handle, "ustore_arena_init")
         self.arena_describe = _resolve[ArenaDescribe](handle, "ustore_arena_describe")
-        self.arena_free = _resolve[ArenaFree](handle, "ustore_arena_free")
+        self.arena_free = _resolve[StatusRelease](handle, "ustore_arena_free")
 
         self.predicate_cost_name = _resolve[NameOf](handle, "ustore_predicate_cost_name")
         self.predicate_cost_from_name = _resolve[FromName](handle, "ustore_predicate_cost_from_name")
@@ -429,9 +429,15 @@ struct Symbols:
         self.phase_from_name = _resolve[FromName](handle, "ustore_phase_from_name")
         self.database_init_ram = _resolve[Verb[DatabaseInitRamArguments]](handle, "ustore_database_init_ram")
         self.database_open_ram = _resolve[Verb[DatabaseOpenRamArguments]](handle, "ustore_database_open_ram")
-        self.database_open_rocksdb = _resolve[Verb[DatabaseOpenRocksdbArguments]](handle, "ustore_database_open_rocksdb")
-        self.database_view_rocksdb = _resolve[Verb[DatabaseOpenRocksdbArguments]](handle, "ustore_database_view_rocksdb")
-        self.database_open_leveldb = _resolve[Verb[DatabaseOpenLeveldbArguments]](handle, "ustore_database_open_leveldb")
+        self.database_open_rocksdb = _resolve[Verb[DatabaseOpenRocksdbArguments]](
+            handle, "ustore_database_open_rocksdb"
+        )
+        self.database_view_rocksdb = _resolve[Verb[DatabaseOpenRocksdbArguments]](
+            handle, "ustore_database_view_rocksdb"
+        )
+        self.database_open_leveldb = _resolve[Verb[DatabaseOpenLeveldbArguments]](
+            handle, "ustore_database_open_leveldb"
+        )
         self.database_open_nvme = _resolve[Verb[DatabaseOpenNvmeArguments]](handle, "ustore_database_open_nvme")
         self.database_view_nvme = _resolve[Verb[DatabaseViewNvmeArguments]](handle, "ustore_database_view_nvme")
         self.database_describe = _resolve[Verb[DatabaseDescribeArguments]](handle, "ustore_database_describe")
@@ -469,7 +475,9 @@ struct Symbols:
         self.blobs_read = _resolve[Verb[BlobsReadArguments]](handle, "ustore_blobs_read")
         self.blobs_scan = _resolve[Verb[BlobsScanArguments]](handle, "ustore_blobs_scan")
         self.blobs_cursor_init = _resolve[Verb[BlobsCursorInitArguments]](handle, "ustore_blobs_cursor_init")
-        self.blobs_cursor_next = _resolve[Verb[CursorNextArguments["ustore_blobs_cursor_next"]]](handle, "ustore_blobs_cursor_next")
+        self.blobs_cursor_next = _resolve[Verb[CursorNextArguments["ustore_blobs_cursor_next"]]](
+            handle, "ustore_blobs_cursor_next"
+        )
         self.blobs_cursor_free = _resolve[Release](handle, "ustore_blobs_cursor_free")
         self.blobs_sample = _resolve[Verb[SampleArguments["ustore_blobs_sample"]]](handle, "ustore_blobs_sample")
         self.blobs_measure = _resolve[Verb[MeasureArguments["ustore_blobs_measure"]]](handle, "ustore_blobs_measure")
@@ -508,16 +516,30 @@ struct Symbols:
         self.vertex_role_name = _resolve[NameOf](handle, "ustore_vertex_role_name")
         self.vertex_role_from_name = _resolve[FromName](handle, "ustore_vertex_role_from_name")
         self.graph_read_edges = _resolve[Verb[GraphReadEdgesArguments]](handle, "ustore_graph_read_edges")
-        self.graph_write_edges = _resolve[Verb[GraphEdgesArguments["ustore_graph_write_edges"]]](handle, "ustore_graph_write_edges")
-        self.graph_remove_edges = _resolve[Verb[GraphEdgesArguments["ustore_graph_remove_edges"]]](handle, "ustore_graph_remove_edges")
+        self.graph_write_edges = _resolve[Verb[GraphEdgesArguments["ustore_graph_write_edges"]]](
+            handle, "ustore_graph_write_edges"
+        )
+        self.graph_remove_edges = _resolve[Verb[GraphEdgesArguments["ustore_graph_remove_edges"]]](
+            handle, "ustore_graph_remove_edges"
+        )
         self.graph_write_vertices = _resolve[Verb[GraphWriteVerticesArguments]](handle, "ustore_graph_write_vertices")
-        self.graph_remove_vertices = _resolve[Verb[GraphRemoveVerticesArguments]](handle, "ustore_graph_remove_vertices")
+        self.graph_remove_vertices = _resolve[Verb[GraphRemoveVerticesArguments]](
+            handle, "ustore_graph_remove_vertices"
+        )
         self.graph_scan_vertices = _resolve[Verb[GraphScanVerticesArguments]](handle, "ustore_graph_scan_vertices")
-        self.graph_vertices_cursor_init = _resolve[Verb[GraphVerticesCursorInitArguments]](handle, "ustore_graph_vertices_cursor_init")
-        self.graph_vertices_cursor_next = _resolve[Verb[GraphVerticesCursorNextArguments]](handle, "ustore_graph_vertices_cursor_next")
+        self.graph_vertices_cursor_init = _resolve[Verb[GraphVerticesCursorInitArguments]](
+            handle, "ustore_graph_vertices_cursor_init"
+        )
+        self.graph_vertices_cursor_next = _resolve[Verb[GraphVerticesCursorNextArguments]](
+            handle, "ustore_graph_vertices_cursor_next"
+        )
         self.graph_vertices_cursor_free = _resolve[Release](handle, "ustore_graph_vertices_cursor_free")
-        self.graph_sample_vertices = _resolve[Verb[SampleArguments["ustore_graph_sample_vertices"]]](handle, "ustore_graph_sample_vertices")
-        self.graph_measure_vertices = _resolve[Verb[MeasureArguments["ustore_graph_measure_vertices"]]](handle, "ustore_graph_measure_vertices")
+        self.graph_sample_vertices = _resolve[Verb[SampleArguments["ustore_graph_sample_vertices"]]](
+            handle, "ustore_graph_sample_vertices"
+        )
+        self.graph_measure_vertices = _resolve[Verb[MeasureArguments["ustore_graph_measure_vertices"]]](
+            handle, "ustore_graph_measure_vertices"
+        )
 
         self.page_encoding_name = _resolve[NameOf](handle, "ustore_page_encoding_name")
         self.page_encoding_from_name = _resolve[FromName](handle, "ustore_page_encoding_from_name")
@@ -527,7 +549,9 @@ struct Symbols:
         self.pages_move = _resolve[Verb[PagesMoveArguments]](handle, "ustore_pages_move")
         self.pages_splice = _resolve[Verb[PagesSpliceArguments]](handle, "ustore_pages_splice")
         self.pages_set_attributes = _resolve[Verb[PagesSetAttributesArguments]](handle, "ustore_pages_set_attributes")
-        self.pages_remove_attributes = _resolve[Verb[PagesRemoveAttributesArguments]](handle, "ustore_pages_remove_attributes")
+        self.pages_remove_attributes = _resolve[Verb[PagesRemoveAttributesArguments]](
+            handle, "ustore_pages_remove_attributes"
+        )
         self.pages_read = _resolve[Verb[PagesReadArguments]](handle, "ustore_pages_read")
         self.pages_scan = _resolve[Verb[FilteredScanArguments["ustore_pages_scan"]]](handle, "ustore_pages_scan")
         self.pages_cursor_init = _resolve[Verb[FilteredCursorInitArguments]](handle, "ustore_pages_cursor_init")

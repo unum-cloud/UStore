@@ -381,6 +381,7 @@ ustore_executor_free(executor);
 ```
 
 `cpu_class_ceiling` caps the CPU class the threads confine their waits and atomics to, intersected with what the machine runs, and `ustore_executor_drain` waits until no call holds the executor, then parks or spins its threads.
+`ustore_executor_free` answers `ustore_status_contended_k`, freeing nothing, while an arena made with it lives.
 
 ### Inclusive and Exclusive Executors
 

@@ -340,7 +340,7 @@ The deferred database also finds, creates, drops and lists collections, and desc
 An executor owns the threads that run calls, serves one call at a time, and is shared by any number of databases, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#executors) describe.
 `executor_t::for_ram` spawns host threads, `for_nvme` the NVMe engine's rings, and `for_vram` one stream per GPU it names, opened or adopted from the caller and destroyed with it, and the owner frees the executor on destruction, waiting for the calls naming it.
 Closing a database or dropping its handle writes nothing to disk, so `flush` on an executor makes commits with `ustore_durability_buffered_k` durable first.
-Every arena is freed before the executor that made it, so declare the executor first and its arenas after it, and their destructors run in that order.
+Every arena is freed before the executor that made it, so declare the executor first and its arenas after it, and their destructors run in that order; the executor's free refuses while an arena lives, which Debug builds assert.
 Opening blocks, as every constructor does: `init_ram`, `open_ram`, `open_rocksdb`, `view_rocksdb`, `open_leveldb`, `open_nvme` and `view_nvme` take the executor to block on as their last argument, and an NVMe database moves bytes as the placement of an NVMe executor names.
 
 ```cpp
@@ -362,6 +362,7 @@ auto [count, count_status] = us::gpu_devices(devices); // may exceed what fits
 
 Shorthand and verbs trade convenience for reuse, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#batches-and-arenas) describe: `blobs[key].value()` reads into a one-off arena its answer owns and frees on destruction, while a verb given an `arena_t&` reuses it.
 Every call rewinds its arena, so its views last until the next call given that arena; to keep them longer, pass that call another arena.
+Views are plain spans that nothing invalidates, so check `arena.describe().host_access` before host code reads one, and copy what you keep instead of holding a span across calls.
 Keys come as `ustore_key_t`, spelled from integers by `key_from_integer`, and a batch is a `std::array`, a `std::span`, an initializer list or a `strided` range, while a batch of strings is a contiguous run of string views or a `strings_view_t` a call exported.
 
 ```cpp

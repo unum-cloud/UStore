@@ -156,7 +156,8 @@ void test_arena_failed_outputs_null(config_t const& config) {
     ustore_blobs_scan(&scan);
     expect_status(outcome, status_code_t::invalid_argument_k);
     expect_true(!offsets);
-    ustore_executor_free(executor);
+    arena = {};
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
 }
 
 /** Whether @p output starts at a multiple of 64 bytes, where every output of an arena starts. */
@@ -795,7 +796,8 @@ void test_executor_deferred_round_trip(config_t const& config) {
         expect_equal(columns.presences[0], 0b111);
         for (std::size_t index = 0; index != keys.size(); ++index) expect_equal(columns.value(index), "value");
     }
-    ustore_executor_free(executor);
+    executor_arena = {};
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
 }
 
 /** A deferred call runs from the copy its submission took, so the caller may scribble over its
@@ -813,7 +815,7 @@ void test_executor_copied_submission(config_t const&) {
     release_held(held);
     auto const* const scribbled = reinterpret_cast<unsigned char const*>(&held.scan);
     expect_true(std::all_of(scribbled, scribbled + sizeof(held.scan), [](unsigned char byte) { return byte == 0xA5; }));
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
 }
 
 /** Writes @c stored_value_k under @p key in @p collection as a blocking call on @p executor,
@@ -879,7 +881,7 @@ void test_arena_free_waits(config_t const&) {
     else free_arena(freeing);
     expect_true(freeing.stage_after_free == hold_stage_t::returned_k);
     expect_true(ustore_outcome_wait(&held.outcome) == ustore_status_success_k);
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
 }
 
 /** A call on an executor another call holds finishes contended at once, deferred or blocking, and a
@@ -903,7 +905,7 @@ void test_executor_held_contended(config_t const& config) {
     expect_true(held.drained == ustore_status_contended_k);
     release_held(held);
     expect_true(write_blocking(database.handle(), blobs, key, executor) == ustore_status_success_k);
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
 }
 
 /** Runs the blocking scan @p held is armed with on the calling thread, which its callback holds. */
@@ -944,7 +946,7 @@ void test_executor_contended_from_another_thread(config_t const& config) {
     expect_success(held.outcome);
     submit_writes(database.handle(), blobs, executor, {&key, 1}, {&outcome, 1});
     expect_true(ustore_outcome_wait(&outcome) == ustore_status_success_k);
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
 }
 
 /** A deferred call on a caller-exclusive executor finishes while its caller only polls its status,
@@ -983,7 +985,8 @@ void test_executor_finishes_by_polling(config_t const& config) {
     ustore_blobs_read(&read);
     expect_success(outcome);
     expect_true(columns.presences && columns.presences[0] == 0b111);
-    ustore_executor_free(executor);
+    arena = {};
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
 }
 
 /** A caller that sees a deferred call final may submit the next one at once, naming the same arena,
@@ -1016,7 +1019,8 @@ void test_executor_submit_after_wait(config_t const& config) {
     }
     expect_equal(contended, 0u);
     expect_equal(failed, 0u);
-    ustore_executor_free(executor);
+    arena = {};
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
 }
 
 /** A drain waits for the call holding the executor, then applies its mood: after a parked drain the
@@ -1040,7 +1044,7 @@ void test_executor_drain(config_t const& config) {
         expect_success(outcome);
         expect_true(ustore_outcome_wait(&written) == ustore_status_success_k);
     }
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
 }
 
 /** A call naming an arena an unfinished call holds finishes contended, and so does one on a
@@ -1075,7 +1079,7 @@ void test_executor_contended_arena(config_t const&) {
     expect_success(outcome);
     ustore_blobs_scan(&on_transaction);
     expect_success(outcome);
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
 }
 
 /** A call on a host executor given an arena on a device is refused with @c ustore_status_device_k,
@@ -1122,7 +1126,7 @@ void test_outcome_wait_blocks(config_t const&) {
     stage.store(hold_stage_t::released_k, std::memory_order_release);
     expect_true(ustore_outcome_wait(&held.outcome) == ustore_status_success_k);
     expect_true(stage.load(std::memory_order_acquire) == hold_stage_t::returned_k);
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
 }
 
 /** Freeing a database waits for the deferred call naming it, past the moment its callback returns,
@@ -1141,7 +1145,7 @@ void test_database_free_waits(config_t const&) {
     ustore_database_free(&held.database);
     expect_true(stage.load(std::memory_order_acquire) == hold_stage_t::returned_k);
     expect_true(ustore_outcome_wait(&held.outcome) == ustore_status_success_k);
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
 }
 
 /** Freeing a database waits for a call naming it on no executor, held inside its callback on
@@ -1212,7 +1216,7 @@ case_result_t test_database_init_on_executor(config_t const& config) {
         expect_true(tape_written(columns.values) && columns.value(0) == "value");
     }
     ustore_database_free(database);
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
     return {};
 }
 
@@ -1293,7 +1297,7 @@ void test_executor_sliced_read(config_t const& config) {
         expect_true(std::memcmp(offsets, alone_offsets, (keys_k + 1) * sizeof(ustore_length_t)) == 0);
         expect_true(std::memcmp(found, alone_keys, alone_offsets[keys_k] * sizeof(ustore_key_t)) == 0);
     }
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
 }
 
 /** A read of one field and a gather of one column over more documents than one word of tasks
@@ -1401,7 +1405,7 @@ void test_executor_sliced_docs(config_t const& config) {
         expect_true(std::memcmp(alone.columns[0].scalars, sliced.columns[0].scalars, docs_k * sizeof(std::int32_t)) ==
                     0);
     }
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
 }
 
 /** An ingest named on a queue set of four threads keeps its state on the queue set's memory
@@ -1425,7 +1429,7 @@ case_result_t test_executor_sliced_ingest(config_t const& config) {
                                .order = ustore_ingest_sorted_k};
     ustore_ingest_init(&init);
     if (outcome.status == ustore_status_unsupported_k) {
-        ustore_executor_free(executor);
+        expect_true(ustore_executor_free(executor) == ustore_status_success_k);
         return case_result_t::skipped("needs an engine that ingests");
     }
     if (!expect_success(outcome)) return {};
@@ -1463,7 +1467,7 @@ case_result_t test_executor_sliced_ingest(config_t const& config) {
     expect_true(ustore_outcome_wait(&outcome) == ustore_status_success_k);
     expect_true(stamp != 0);
     ustore_ingest_free(ingest);
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
     return {};
 }
 
@@ -1562,7 +1566,8 @@ void test_executor_scratch_limit(config_t const& config) {
         read.executor = executor;
         ustore_blobs_read(&read);
         expect_status(outcome, scratch_limit ? status_code_t::out_of_memory_k : status_code_t::success_k);
-        ustore_executor_free(executor);
+        arena = {};
+        expect_true(ustore_executor_free(executor) == ustore_status_success_k);
     }
 }
 
@@ -1636,7 +1641,7 @@ case_result_t test_executor_sliced_graph(config_t const& config) {
         expect_true(std::memcmp(alone.offsets, sliced.offsets, (vertices_k + 1) * sizeof(ustore_length_t)) == 0);
         expect_true(std::memcmp(alone.edges, sliced.edges, 3 * alone.offsets[vertices_k] * sizeof(ustore_key_t)) == 0);
     }
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
     return {};
 }
 
@@ -1713,7 +1718,7 @@ case_result_t test_executor_sliced_strings(config_t const& config) {
             expect_equal(util::chars_of(util::tape_string(sliced_strings, index)),
                          util::chars_of(util::tape_string(alone_strings, index)));
     }
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
     return {};
 }
 
@@ -1742,13 +1747,14 @@ void test_executor_memory_domains(config_t const&) {
     auto [arena, arena_status] = arena_t::make({.executor = executor});
     expect_true(!arena_status.failed());
     if (!arena_status.failed()) expect_equal(util::host_blocks_of(arena.handle())->memory_domain, known);
-    ustore_executor_free(executor);
+    arena = {};
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
 
     // Zero threads take 7/8 of the cores of every domain the process may allocate on
     ustore_executor_for_ram_t derived {.executor = &executor, .outcome = &outcome};
     ustore_executor_for_ram(&derived);
     expect_success(outcome);
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
 }
 
 /** An NVMe database refuses a RAM executor with @c ustore_status_device_k before claiming it, so a
@@ -1779,8 +1785,8 @@ void test_executor_residency(config_t const& config) {
     ustore_database_flush_t flush {.database = database, .executor = nvme, .outcome = &outcome};
     ustore_database_flush(&flush);
     expect_success(outcome);
-    ustore_executor_free(nvme);
-    ustore_executor_free(ram);
+    expect_true(ustore_executor_free(nvme) == ustore_status_success_k);
+    expect_true(ustore_executor_free(ram) == ustore_status_success_k);
     ustore_database_free(database);
 }
 

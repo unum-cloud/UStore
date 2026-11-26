@@ -1503,7 +1503,7 @@ void test_blobs_read_shuffled(config_t const& config) {
     auto [executor, executor_status] = spawn_executor();
     if (!expect_true(executor_status.succeeded())) return;
     auto [arena, arena_status] = arena_t::make();
-    if (!expect_true(arena_status.succeeded())) return ustore_executor_free(executor);
+    if (!expect_true(arena_status.succeeded())) return void(ustore_executor_free(executor));
 
     // Keys from 384 up are never written, and every value is its own index spelled out
     constexpr std::size_t written_k = 384;
@@ -1544,7 +1544,7 @@ void test_blobs_read_shuffled(config_t const& config) {
             if (!expect_equal(present, key < written_k, "request {}", request) || !present) continue;
             expect_equal(columns.value(request), values[key].substr(request % 2), "request {}", request);
         }
-    ustore_executor_free(executor);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
 }
 
 int main(int argc, char** argv) {

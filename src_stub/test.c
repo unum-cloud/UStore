@@ -448,7 +448,7 @@ static void test_engines_beyond_ram_are_refused(void) {
     foreign.cpu_class_ceiling = ustore_cpu_class_ibm_power10_k;
     ustore_executor_for_ram(&foreign);
     expect_status_at(outcome, ustore_status_success_k, __FILE__, __LINE__);
-    ustore_executor_free(executor);
+    expect_(ustore_executor_free(executor) == ustore_status_success_k);
     ustore_database_t capped = NULL;
     ustore_database_init_ram_t capping = {.database = &capped,
                                           .outcome = &outcome,
@@ -1008,8 +1008,8 @@ static void test_every_modality_round_trips(void) {
     }
 
     ustore_arena_free(arena);
-    ustore_executor_free(executor);
-    ustore_executor_free(other);
+    expect_(ustore_executor_free(executor) == ustore_status_success_k);
+    expect_(ustore_executor_free(other) == ustore_status_success_k);
     ustore_database_free(database);
 }
 

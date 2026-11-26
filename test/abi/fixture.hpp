@@ -247,10 +247,11 @@ inline ustore_continuation_t hold_until_released(ustore_size_t, ustore_size_t, v
 }
 
 /** Readies @p held for @p executor with @p completion, reading through @p view, its callback
- *  holding the scan once submitted, so the executor, the arena and the view stay claimed. */
+ *  holding the scan once submitted, so the executor, the arena and the view stay claimed. The
+ *  arena is host pages no executor counts, so a case frees its executor while the arena lives. */
 inline bool arm_held(held_scan_t& held, ustore_executor_t executor, ustore_view_t view,
                      ustore_completion_t completion) noexcept {
-    auto [arena, arena_status] = arena_t::make({.executor = executor});
+    auto [arena, arena_status] = arena_t::make();
     if (!expect_true(!arena_status.failed())) return false;
     held.arena = std::move(arena);
     held.executor = executor;

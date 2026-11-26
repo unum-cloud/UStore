@@ -482,8 +482,8 @@ comptime Verb[Arguments: AnyType] = def(Pointer[Arguments, MutAnyOrigin]) thin a
 comptime Release = def(Address) thin abi("C") -> None
 """The positional `_free` family; `NULL` is safe."""
 
-comptime ArenaFree = def(Address) thin abi("C") -> c_int
-"""`ustore_arena_free`, which answers `CONTENDED` and frees nothing while an Arrow export is open."""
+comptime StatusRelease = def(Address) thin abi("C") -> c_int
+"""The arena and executor `_free`: `contended`, with nothing freed, while an export is open or an arena lives."""
 
 comptime OutcomeStatus = def(Pointer[Outcome, MutAnyOrigin]) thin abi("C") -> c_int
 """`ustore_outcome_wait` and `ustore_outcome_status`: an outcome's status, the first once it is final."""
@@ -523,7 +523,9 @@ def _cross[Arguments: ImplicitlyCopyable & Deinitable, //](arguments: Arguments,
     verb(slot.unsafe_origin_cast[MutAnyOrigin]())
 
 
-def _caller_slot[T: AnyType, origin: MutOrigin, //](slot: Optional[Pointer[T, origin]]) -> Optional[Pointer[T, MutUntrackedOrigin]]:
+def _caller_slot[
+    T: AnyType, origin: MutOrigin, //
+](slot: Optional[Pointer[T, origin]]) -> Optional[Pointer[T, MutUntrackedOrigin]]:
     """A caller's output slot with its view erased, as the C layout names it."""
     if case .Some(pointer) = slot:
         return pointer.unsafe_origin_cast[MutUntrackedOrigin]()
@@ -965,7 +967,9 @@ struct VramOptions[origin: ImmOrigin = ImmUntrackedOrigin](ImplicitlyCopyable):
     def on[devices_origin: ImmOrigin, //](devices: Span[Int32, devices_origin]) -> VramOptions[devices_origin]:
         """Names the devices explicitly, viewing the caller's array for the call."""
         return VramOptions[devices_origin](
-            Pointer[Int32, devices_origin](unsafe_from_address=Int(devices.unsafe_ptr())), len(devices), GPUClass.UNKNOWN
+            Pointer[Int32, devices_origin](unsafe_from_address=Int(devices.unsafe_ptr())),
+            len(devices),
+            GPUClass.UNKNOWN,
         )
 
     def arguments(self) -> VramOptionsArguments:
@@ -998,7 +1002,10 @@ struct ExecutorDrainArguments(ImplicitlyCopyable):
 
 
 def _created(
-    library: Library, outcome: Pointer[Outcome, MutUntrackedOrigin], created: Pointer[Address, MutUntrackedOrigin], detail: StaticString
+    library: Library,
+    outcome: Pointer[Outcome, MutUntrackedOrigin],
+    created: Pointer[Address, MutUntrackedOrigin],
+    detail: StaticString,
 ) raises Error -> Address:
     """The handle a creating verb wrote, or its failure raised."""
     library._check(outcome.unsafe_origin_cast[MutAnyOrigin]()[], detail)
@@ -1035,9 +1042,10 @@ struct Executor:
 
         The loader reference is surrendered only after the call: reading the entry point is the
         last use of `library`, so without the trailing move Mojo would `dlclose` the engine between
-        the load and the branch to it.
+        the load and the branch to it. Every arena's origin holds the executor, so none lives here
+        and the status is dropped.
         """
-        self.library.symbols().executor_free(self.address)
+        _ = self.library.symbols().executor_free(self.address)
         _ = self.library^
 
     @staticmethod
@@ -1066,7 +1074,9 @@ struct Executor:
         var outcome = stack_allocation[1, Outcome]().unsafe_origin_cast[MutUntrackedOrigin]()
         outcome[] = Outcome()
         _cross(
-            ExecutorForRamArguments(created, outcome, ram.arguments(), c_size_t(threads), cpu_class_ceiling, c_size_t(0)),
+            ExecutorForRamArguments(
+                created, outcome, ram.arguments(), c_size_t(threads), cpu_class_ceiling, c_size_t(0)
+            ),
             library.symbols().executor_for_ram,
         )
         return Self(library=library, address=_created(library, outcome, created, "ustore_executor_for_ram"))
@@ -1318,7 +1328,9 @@ def _served[origin: MutOrigin](arena: Pointer[Arena[ImmUntrackedOrigin], origin]
     return served[]._generation
 
 
-def _readable[origin: MutOrigin](arena: Pointer[Arena[ImmUntrackedOrigin], origin], generation: Int, detail: StaticString) raises Error:
+def _readable[
+    origin: MutOrigin
+](arena: Pointer[Arena[ImmUntrackedOrigin], origin], generation: Int, detail: StaticString) raises Error:
     """Refuses a host read of a result over memory the host may not read, or over an arena a later call rewound."""
     if arena[]._host_access != HostAccess.READABLE:
         raise Error(Status.DEVICE, detail)
@@ -1331,7 +1343,7 @@ def _readable[origin: MutOrigin](arena: Pointer[Arena[ImmUntrackedOrigin], origi
 # region Calls
 
 
-struct Unwritten(Deferrable, Defaultable, ImplicitlyCopyable):
+struct Unwritten(Defaultable, Deferrable, ImplicitlyCopyable):
     """The outputs of a verb that writes nothing but its outcome, and its result."""
 
     comptime Written = Unwritten
@@ -1345,7 +1357,7 @@ struct Unwritten(Deferrable, Defaultable, ImplicitlyCopyable):
         pass
 
 
-trait Deferrable(Movable, Deinitable):
+trait Deferrable(Deinitable, Movable):
     """What a verb's caller reads once the call is final, built from what the engine wrote."""
 
     comptime Written: ImplicitlyCopyable & Defaultable & Deinitable
@@ -1356,7 +1368,7 @@ trait Deferrable(Movable, Deinitable):
         ...
 
 
-trait Arguments(ImplicitlyCopyable, Deinitable):
+trait Arguments(Deinitable, ImplicitlyCopyable):
     """One verb's argument structure, laid out as the ABI declares it, with its inputs already set."""
 
     comptime Written: ImplicitlyCopyable & Defaultable & Deinitable
@@ -1438,7 +1450,9 @@ struct _Crossing[A: Arguments, R: Deferrable, origin: MutOrigin, inputs: ImmOrig
     var arena: Optional[Pointer[Arena[ImmUntrackedOrigin], Self.origin]]
     var count: Int
 
-    def __init__(out self, arguments: Self.A, arena: Optional[Pointer[Arena[ImmUntrackedOrigin], Self.origin]], count: Int):
+    def __init__(
+        out self, arguments: Self.A, arena: Optional[Pointer[Arena[ImmUntrackedOrigin], Self.origin]], count: Int
+    ):
         """Wraps a verb's arguments with the arena it rewinds, if any."""
         self.arguments = arguments
         self.arena = arena
@@ -1537,7 +1551,9 @@ struct Deferred[C: Call, origin: ImmOrigin]:
     def __deinit__(deinit self):
         """Waits until the call is final, then frees what the call owned. Calls `ustore_outcome_wait`."""
         if self.call:
-            var slots = Pointer[CallSlots[Self.C.Outputs], MutAnyOrigin](unsafe_from_address=Int(Pointer(to=self.slots)))
+            var slots = Pointer[CallSlots[Self.C.Outputs], MutAnyOrigin](
+                unsafe_from_address=Int(Pointer(to=self.slots))
+            )
             _ = self.library.symbols().outcome_wait(Pointer(to=slots[].outcome))
             _ = self.call.take().conclude(slots[].outputs, self.generation)
         _ = self.library^

@@ -15,6 +15,7 @@
  */
 #pragma once
 
+#include <cassert> // `assert`
 #include <climits> // `CHAR_BIT`
 #include <cstddef> // `std::size_t`, `std::ptrdiff_t`, `std::byte`
 #include <cstdint> // `std::uint8_t`, `std::uint64_t`
@@ -826,6 +827,7 @@ class strings_view_t {
     /** The string at @p index, below @c size, whose offsets never decrease, as every call writes
      *  them. */
     std::string_view operator[](std::size_t index) const noexcept {
+        assert(index < count_ && "The string lies past what the call exported");
         std::size_t const begin = offset_(index), end = offset_(index + 1);
         return {data_() + begin, end - begin};
     }
@@ -1635,10 +1637,17 @@ struct values_arg_extractor<strings_type_> {
 
 #pragma region Executors and Arenas
 
+/** Frees @p executor as its owner dies, which every arena made with it refuses while it lives;
+ *  declaring the executor before its arenas destroys them first. */
+inline void free_executor(ustore_executor_t executor) noexcept {
+    [[maybe_unused]] ustore_status_t const freed = ustore_executor_free(executor);
+    assert(freed == ustore_status_success_k && "Every arena made with the executor dies before it");
+}
+
 /** Owns one executor, the threads or I/O rings that run calls on any number of databases, one at a
  *  time; an empty one runs every call on the caller's own thread. */
 class executor_t {
-    owner<ustore_executor_t, ustore_executor_free> owner_;
+    owner<ustore_executor_t, free_executor> owner_;
 
   public:
     ustore_executor_t handle() const noexcept { return owner_.handle(); }

@@ -146,6 +146,9 @@ struct ustore_executor_handle_t {
     bool for_nvme = false;
     ustore_nvme_options_t nvme {};
     ustore_size_t threads = 1;
+
+    /** Arenas made with the executor and not yet freed, which refuse its free. */
+    named_calls_t arenas {0};
 };
 
 /** What @c ustore_arena_t names: host blocks every call rewinds, each 64-byte aligned as
@@ -156,6 +159,9 @@ struct ustore_arena_handle_t {
 
     /** Views of the arena's outputs handed to consumers and not yet closed. */
     named_calls_t exports {0};
+
+    /** The executor the arena was made with, which counts it until its free. */
+    ustore_executor_t executor = nullptr;
 
     struct block_t {
         std::byte* data = nullptr;
