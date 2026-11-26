@@ -187,6 +187,10 @@ impl ArrowDeviceArray {
 }
 
 /// One column exported as Arrow in place, viewing the arena it sits in until dropped.
+///
+/// The arena must outlive every column exported from it: while one is unreleased, the arena's next
+/// call answers [`Status::Contended`](crate::Status::Contended), and dropping the arena frees
+/// nothing, leaving it allocated until the process ends.
 #[derive(Debug)]
 pub struct ArrowExport<'arena> {
     pub(crate) schema: ArrowSchema,
@@ -210,7 +214,8 @@ impl ArrowExport<'_> {
     ///
     /// # Safety
     ///
-    /// The arena must outlive the release of both, which no lifetime checks any more.
+    /// The arena must outlive the release of both, which no lifetime checks any more; an arena
+    /// dropped earlier stays allocated until the process ends.
     pub unsafe fn into_parts(self) -> (ArrowSchema, ArrowDeviceArray) {
         (self.schema, self.array)
     }

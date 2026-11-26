@@ -61,6 +61,12 @@ func TestStatusesRoundTripAndMatch(t *testing.T) {
 	if status, err := ustore.StatusFromName("config-mismatch"); err != nil || status != ustore.StatusConfigMismatch {
 		t.Fatalf("read back %v, %v", status, err)
 	}
+	if status, err := ustore.StatusFromName("overflow"); err != nil || status != ustore.StatusOverflow {
+		t.Fatalf("read back %v, %v", status, err)
+	}
+	if ustore.HostAccessRefused.String() != "refused" || ustore.HostAccessReadable.String() != "readable" {
+		t.Fatalf("host access spelled %v and %v", ustore.HostAccessRefused, ustore.HostAccessReadable)
+	}
 	if _, err := ustore.MoodFromName("sleepy"); !errors.Is(err, ustore.StatusInvalidArgument) {
 		t.Fatalf("an unknown spelling answered %v", err)
 	}
@@ -88,7 +94,8 @@ func TestArenasLiveOnTheHost(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the arena must describe itself: %v", err)
 	}
-	if description.Residency != ustore.ResidencyRam || description.Device != -1 {
+	host := ustore.ArenaDescription{Residency: ustore.ResidencyRam, Device: -1, Vendor: ustore.GPUVendorUnknown, VendorOrdinal: -1, HostAccess: ustore.HostAccessReadable}
+	if description != host {
 		t.Fatalf("described %+v", description)
 	}
 }

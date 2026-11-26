@@ -1088,6 +1088,9 @@ util::expected<std::array<claim_t*, 3>> take_claims(arguments_type_ const& argum
             return status_t {status_code_t::device_k, "The arena lives where another executor computes"};
         if (!take(arena->claim)) return status_t {status_code_t::contended_k, "The arena serves another call"};
         claims[0] = &arena->claim;
+        // The claim is taken before the count is read, as an export counts before reading the claim
+        if (floor_atomic_ref<std::uint32_t const>(arena->exports).load(std::memory_order_seq_cst) != 0)
+            return release(claims), status_t {status_code_t::contended_k, "An export of the arena's outputs is open"};
         if (reads_from_arena(arguments, arena))
             return release(claims),
                    status_t {status_code_t::invalid_argument_k, "Input lies inside the arena the call rewinds"};

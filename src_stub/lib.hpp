@@ -232,6 +232,10 @@ inline ustore_arena_handle_t* claim_arena(call_t& call, ustore_arena_t arena,
         return nullptr;
     }
     if (!call.claim(&arena->claim, "Another call holds the arena")) return nullptr;
+    if (arena->exports.load(std::memory_order_seq_cst) != 0) {
+        call.refuse(ustore_status_contended_k, "An export of the arena's outputs is open");
+        return nullptr;
+    }
     for (void const* input : inputs)
         if (input && arena->contains(input)) {
             call.refuse(ustore_status_invalid_argument_k, "Input lies inside the arena the call rewinds");

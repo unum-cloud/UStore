@@ -1395,7 +1395,7 @@ void expect_spellings(char const* (*name_of)(enum_type_),
 
 /** Every status spelling reads back as its status, while a name no status holds is refused. */
 void test_status_names(config_t const&) {
-    expect_spellings(ustore_status_name, ustore_status_from_name, 20);
+    expect_spellings(ustore_status_name, ustore_status_from_name, 21);
     expect_true(std::string_view {ustore_status_name(ustore_status_deferred_k)} == "deferred");
     expect_true(std::string_view {ustore_status_name(ustore_status_config_mismatch_k)} == "config-mismatch");
     expect_true(std::string_view {ustore_status_name(ustore_status_read_only_k)} == "read-only");
@@ -1405,8 +1405,11 @@ void test_status_names(config_t const&) {
  *  rest. */
 void test_closed_set_names(config_t const&) {
     expect_spellings(ustore_cpu_class_name, ustore_cpu_class_from_name, 12);
-    expect_spellings(ustore_gpu_vendor_name, ustore_gpu_vendor_from_name, 3);
-    expect_spellings(ustore_gpu_class_name, ustore_gpu_class_from_name, 11);
+    expect_spellings(ustore_gpu_vendor_name, ustore_gpu_vendor_from_name, 4);
+    expect_true(std::string_view {ustore_host_access_name(ustore_host_access_refused_k)} == "refused");
+    expect_true(std::string_view {ustore_host_access_name(ustore_host_access_readable_k)} == "readable");
+    expect_spellings(ustore_gpu_class_name, ustore_gpu_class_from_name, 12);
+    expect_true(std::string_view {ustore_gpu_class_name(ustore_gpu_class_unknown_k)} == "unknown");
     expect_spellings(ustore_mood_name, ustore_mood_from_name, 2);
     expect_spellings(ustore_durability_name, ustore_durability_from_name, 2);
     expect_spellings(ustore_watch_name, ustore_watch_from_name, 2);

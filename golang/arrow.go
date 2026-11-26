@@ -90,8 +90,8 @@ func StringsViewFromArrow(schema *ArrowSchema, array *ArrowArray) (Tape, error) 
 }
 
 // KeysViewToArrow exports keys a call wrote into arena as one fixed_size_binary(16) column tagged
-// arrow.uuid, in place, living until the arena's next call or close; release both outputs after
-// reading them.
+// arrow.uuid, in place; until both outputs are released, the arena's next call and Close answer
+// [StatusContended], so release them after reading.
 func KeysViewToArrow(keys []Key, arena *Arena, schema *ArrowSchema, array *ArrowDeviceArray) error {
 	view := C.ustore_keys_view_t{data: (*C.ustore_key_t)(unsafe.Pointer(unsafe.SliceData(keys))), stride: C.ustore_size_t(unsafe.Sizeof(Key{}))}
 	outputs, err := arena.lower()
@@ -102,7 +102,8 @@ func KeysViewToArrow(keys []Key, arena *Arena, schema *ArrowSchema, array *Arrow
 }
 
 // StringsViewToArrow exports strings a call wrote into arena as one binary or large binary column,
-// in place when the tape already has layout, living until the arena's next call or close.
+// in place when the tape already has layout; until both outputs are released, the arena's next call
+// and Close answer [StatusContended].
 func StringsViewToArrow(strings Strings, layout StringsLayout, arena *Arena, schema *ArrowSchema, array *ArrowDeviceArray) error {
 	outputs, err := arena.lower()
 	if err != nil {
@@ -112,8 +113,8 @@ func StringsViewToArrow(strings Strings, layout StringsLayout, arena *Arena, sch
 }
 
 // DocsColumnViewToArrow exports one column a gather of fieldType wrote into arena as an Arrow
-// column whose validity buffer is the column's validities, living until the arena's next call or
-// close.
+// column whose validity buffer is the column's validities; until both outputs are released, the
+// arena's next call and Close answer [StatusContended].
 func DocsColumnViewToArrow(column DocsColumn, fieldType DocsFieldType, arena *Arena, schema *ArrowSchema, array *ArrowDeviceArray) error {
 	outputs, err := arena.lower()
 	if err != nil {

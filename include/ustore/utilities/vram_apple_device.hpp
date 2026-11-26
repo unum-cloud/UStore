@@ -744,6 +744,16 @@ struct metal_executor_t {
         }
 
         /**
+         *  @brief Orders this stream after everything @p other committed so far. Metal has no
+         *      event entry here, so it waits on @p other from the host, and the follow is done
+         *      once it returns.
+         *
+         *  @par Statuses:
+         *  - @c device_k @p other names no device, or the device failed its work.
+         */
+        status_t follow(stream_t& other) noexcept { return other.wait(); }
+
+        /**
          *  @brief Allocates @p bytes of shared storage on this stream's device through its buffer
          *      registry, answering their host address, which kernels reach too.
          *

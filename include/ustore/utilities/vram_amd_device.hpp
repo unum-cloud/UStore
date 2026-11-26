@@ -640,6 +640,23 @@ struct hip_executor_t {
         }
 
         /**
+         *  @brief Queues on this stream a wait for everything @p other queued so far, marking it
+         *      with its device bound, so work here follows work there without the host waiting;
+         *      the two may sit on different devices.
+         *
+         *  @par Statuses:
+         *  - @c device_k A device could not be bound, or the driver refused the mark or the wait.
+         */
+        status_t follow(stream_t& other) noexcept {
+            if (status_t const bound = other.bind(); bound.failed()) return bound;
+            if (status_t const recorded = other.event.record(other.handle); recorded.failed()) return recorded;
+            if (status_t const bound = bind(); bound.failed()) return bound;
+            if (handle.api().stream_wait_event(handle, other.event, 0) != hip_success_k)
+                return {status_code_t::device_k, "The stream refused to wait on the mark"};
+            return {};
+        }
+
+        /**
          *  @brief Queues an allocation of @p bytes in this stream's order, its device current,
          *      answering its address.
          *

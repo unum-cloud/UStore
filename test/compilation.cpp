@@ -600,22 +600,27 @@ void test_wrappers_arrow(config_t const& config) {
     expect_true(!people.write(keys, documents).failed());
 
     // Values a read exported cross out and back without a copy
-    auto [read, read_status] = blobs.read(keys, arena);
-    if (!expect_true(!read_status.failed())) return;
-    auto [strings_column, strings_export_status] = strings_view_to_arrow(read, arena);
-    if (!expect_true(!strings_export_status.failed() && strings_column.array().array.length == 2)) return;
-    auto [strings_back, strings_back_status] = strings_view_from_arrow(strings_column.schema(),
-                                                                       strings_column.array().array);
-    if (!expect_true(!strings_back_status.failed() && strings_back.size() == 2)) return;
-    expect_true(std::string_view {strings_back[0]} == "left" && std::string_view {strings_back[1]} == "right");
+    {
+        auto [read, read_status] = blobs.read(keys, arena);
+        if (!expect_true(!read_status.failed())) return;
+        auto [strings_column, strings_export_status] = strings_view_to_arrow(read, arena);
+        if (!expect_true(!strings_export_status.failed() && strings_column.array().array.length == 2)) return;
+        auto [strings_back, strings_back_status] = strings_view_from_arrow(strings_column.schema(),
+                                                                           strings_column.array().array);
+        if (!expect_true(!strings_back_status.failed() && strings_back.size() == 2)) return;
+        expect_true(std::string_view {strings_back[0]} == "left" && std::string_view {strings_back[1]} == "right");
+    }
 
     // Sampled keys sit in the arena, so they export in place
-    auto [drawn, drawn_status] = people.sample(8, arena);
-    expect_true(!drawn_status.failed() && drawn.size() == 2);
-    auto [keys_column, keys_export_status] = keys_view_to_arrow(drawn, arena);
-    if (!expect_true(!keys_export_status.failed() && std::string_view {keys_column.schema().format} == "w:16")) return;
-    auto [keys_back, keys_back_status] = keys_view_from_arrow(keys_column.schema(), keys_column.array().array);
-    expect_true(!keys_back_status.failed() && keys_back.size() == 2 && keys_back[0] == drawn[0]);
+    {
+        auto [drawn, drawn_status] = people.sample(8, arena);
+        expect_true(!drawn_status.failed() && drawn.size() == 2);
+        auto [keys_column, keys_export_status] = keys_view_to_arrow(drawn, arena);
+        if (!expect_true(!keys_export_status.failed() && std::string_view {keys_column.schema().format} == "w:16"))
+            return;
+        auto [keys_back, keys_back_status] = keys_view_from_arrow(keys_column.schema(), keys_column.array().array);
+        expect_true(!keys_back_status.failed() && keys_back.size() == 2 && keys_back[0] == drawn[0]);
+    }
 
     // A gathered column exports with its validities
     auto header = make_table_header().with<std::int32_t>("age");

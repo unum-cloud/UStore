@@ -74,6 +74,7 @@ enum class status_code_t : int {
     device_k = ustore_status_device_k,
     malformed_k = ustore_status_malformed_k,
     internal_k = ustore_status_internal_k,
+    overflow_k = ustore_status_overflow_k,
     uninitialized_k = ustore_status_uninitialized_k,
     config_mismatch_k = ustore_status_config_mismatch_k,
     contended_k = ustore_status_contended_k,
@@ -1683,10 +1684,16 @@ expected<owner_type_> opened_(void (*verb)(arguments_type_*), arguments_type_ ar
     return opened_<owner_type_>(verb, arguments, field);
 }
 
+/** Frees @p arena as its owner dies, which an open export of its outputs refuses, leaving it to the
+ *  export's holder, who closes every export before the owner dies. */
+inline void free_arena(ustore_arena_t arena) noexcept {
+    [[maybe_unused]] ustore_status_t const freed = ustore_arena_free(arena);
+}
+
 /** Owns one arena made where an executor computes, which calls fill with results and which is
  *  freed before the executor that made it; every call writing outputs into it rewinds it first. */
 class arena_t {
-    owner<ustore_arena_t, ustore_arena_free> owner_;
+    owner<ustore_arena_t, free_arena> owner_;
 
   public:
     ustore_arena_t handle() const noexcept { return owner_.handle(); }

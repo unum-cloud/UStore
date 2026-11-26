@@ -334,6 +334,8 @@ static void test_enums_spell_and_parse_as_the_library_names_them(void) {
     expect_(strcmp(ustore_gpu_vendor_name(ustore_gpu_vendor_apple_k), "apple") == 0);
     expect_(ustore_gpu_vendor_from_name(bytes_of("apple"), &vendor) == ustore_status_success_k &&
             vendor == ustore_gpu_vendor_apple_k);
+    expect_(strcmp(ustore_host_access_name(ustore_host_access_readable_k), "readable") == 0);
+    expect_(strcmp(ustore_host_access_name((ustore_host_access_t)7), "unrecognized") == 0);
     ustore_gpu_class_t gpu_class = ustore_gpu_class_unknown_k;
     char const* const apple_classes[] = {"apple-metal7", "apple-metal9", "apple-metal10"};
     for (int index = 0; index != 3; ++index) {

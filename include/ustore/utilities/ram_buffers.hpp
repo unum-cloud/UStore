@@ -138,6 +138,13 @@ struct ustore_arena_handle_t {
     /** Executor calls naming the arena that have not ended, through the floor class's reference. */
     std::uint32_t named_calls = 0;
 
+    /** Views of the arena's outputs handed to consumers and not yet closed, through the floor
+     *  class's reference; while any is open, no call rewinds the arena and it is not freed. */
+    std::uint32_t exports = 0;
+
+    /** The executor that made the arena, which outlives it, or null for the calling thread. */
+    ustore_executor_t executor = nullptr;
+
     /** Host pages for the calls of a host executor, or one device's memory for those of a VRAM executor. */
     std::variant<host_blocks_t, cuda_blocks_t, hip_blocks_t, metal_blocks_t> memory;
 };

@@ -668,6 +668,20 @@ def test_an_executor_serves_the_memory_domains_named(database, blobs, tmp_path, 
             ustore.Executor.for_vram()
 
 
+DEVICE_MEMORY_GPUS = [gpu for gpu in ustore.gpu_devices() if gpu.vendor is not ustore.GPUVendor.APPLE]
+
+
+@pytest.mark.any_engine
+@pytest.mark.skipif(not DEVICE_MEMORY_GPUS, reason="No GPU whose memory the host cannot read")
+def test_an_arena_in_device_memory_refuses_host_reads(database, blobs):
+    """An arena of a VRAM executor holds memory the host may not read, so a verb answering through it raises."""
+    with ustore.Executor.for_vram(devices=[DEVICE_MEMORY_GPUS[0].ordinal]) as executor:
+        arena = ustore.Arena(executor)
+        with pytest.raises(ustore.DeviceError):
+            database.read([1], arena, collection=blobs)
+        del arena
+
+
 def test_a_database_opens_on_an_executor(engine: str, tmp_path):
     """A constructor given an executor blocks on it, and one given a closed executor opens nothing."""
     with (

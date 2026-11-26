@@ -264,6 +264,7 @@ executor.drain(Mood.SPINNING)  # waits, then keeps its threads hot
 Every verb takes a batch, and its shortest packed input sets how many tasks it holds, so the library never reads past a view.
 Fixed-width inputs are strided views, `KeysView`, `CollectionsView`, `LengthsView` and `VertexRolesView`, made from a span with `.of(...)` or from one element repeated for every task with `.repeating(...)`, and ragged inputs are `StringsView` tapes of 32-bit or 64-bit offsets.
 Every output whose length only the call knows lands in an `Arena`, and each call rewinds it, so the previous call's views die and reading one raises `Status.INVALID_ARGUMENT`, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#batches-and-arenas) describe.
+`Arena.describe` reports the residency, the device and its vendor, and the `HostAccess`: managed memory and Apple's shared memory read in place, while a view over memory the host may not read raises `Status.DEVICE`.
 
 ```mojo
 var arena = Arena(library)  # host pages for the calling thread

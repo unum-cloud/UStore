@@ -132,6 +132,7 @@ err = database.CollectionDrop(people, ustore.DropCollection)
 Keys are `[]Key`, viewed in place, and values are a `Tape`: bytes end to end around one more offset than values, as Apache Arrow lays them out.
 `TapeOf` packs strings or byte slices into a fresh tape, while `U32Tape` and `U64Tape` view bytes and offsets the caller already holds, without a copy.
 A read answers `Values`, which addresses the tape in the arena rather than copying out of it, reports a missing key as absent, and passes the whole batch back through `Values.Tape`, so a tape a read wrote is written again as it is.
+Since every result views the arena as Go slices, a verb into an arena whose `Describe` reports `HostAccessRefused` fails with `StatusDevice` before it runs, while managed memory and Apple's shared memory read in place.
 A write carries values and nothing else, so an empty value is still a value, and `BlobsRemove` removes keys, or ranges given end keys.
 
 ```go
@@ -363,7 +364,7 @@ fmt.Println(ustore.VersionName()) // the library the program runs against, such 
 
 ## Apache Arrow
 
-The converters of `c/ustore/arrow.h` view an Arrow column as a call's input in place, and export what a call wrote into an arena as a column in place, living until the arena's next call or close:
+The converters of `c/ustore/arrow.h` view an Arrow column as a call's input in place, and export what a call wrote into an arena as a column in place, and until the column is released the arena's next call and `Close` answer `StatusContended`:
 
 ```go
 scanned, err := database.BlobsScan(people, 100, found, nil)

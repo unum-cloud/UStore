@@ -59,15 +59,17 @@ struct claim_t {
     /** The outcome of the call holding the claim, or null while free. */
     std::atomic<void const*> holder {nullptr};
 
-    /** Takes the claim for @p owner, or answers true when @p owner already holds it. */
+    /** Takes the claim for @p owner, or answers true when @p owner already holds it. Taking and
+     *  reading the claim are sequentially consistent, as an arena's export count and its claim
+     *  are each stored before the other is read. */
     bool take(void const* owner) noexcept {
         void const* expected = nullptr;
-        if (holder.compare_exchange_strong(expected, owner, std::memory_order_acquire, std::memory_order_relaxed))
+        if (holder.compare_exchange_strong(expected, owner, std::memory_order_seq_cst, std::memory_order_seq_cst))
             return true;
         return expected == owner;
     }
     void release() noexcept { holder.store(nullptr, std::memory_order_release); }
-    bool held() const noexcept { return holder.load(std::memory_order_acquire) != nullptr; }
+    bool held() const noexcept { return holder.load(std::memory_order_seq_cst) != nullptr; }
 };
 
 /** The calls naming a handle, which its free waits out. */
@@ -151,6 +153,9 @@ struct ustore_executor_handle_t {
 struct ustore_arena_handle_t {
     claim_t claim;
     named_calls_t named_calls {0};
+
+    /** Views of the arena's outputs handed to consumers and not yet closed. */
+    named_calls_t exports {0};
 
     struct block_t {
         std::byte* data = nullptr;

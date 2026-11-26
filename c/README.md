@@ -406,9 +406,11 @@ ustore_arena_t arena = NULL;
 ustore_arena_init(&(ustore_arena_init_t){.arena = &arena, .outcome = &outcome, .executor = executor});
 ustore_arena_description_t where = {0};
 ustore_arena_describe(&(ustore_arena_describe_t){.arena = arena, .outcome = &outcome, .description = &where});
-assert(where.residency == ustore_residency_ram_k);
+assert(where.residency == ustore_residency_ram_k && where.host_access == ustore_host_access_readable_k);
 ustore_arena_free(arena); // waits until every deferred call naming the arena is final
 ```
+
+A description names the device by its position in `ustore_gpu_devices` and by its vendor and that vendor's own number, which Arrow and DLPack take, and says whether host code may read the pages: never on NVIDIA and AMD device memory, always on host pages and Apple's shared memory.
 
 The outputs stay valid until the next call given that arena; to keep them past it, pass that call another arena.
 A `NULL` arena is refused with `ustore_status_invalid_argument_k`, an arena serves one call at a time, and a call that fails, is cancelled or has nothing to report leaves its outputs `NULL`.

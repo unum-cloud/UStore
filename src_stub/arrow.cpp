@@ -57,24 +57,29 @@ constexpr auto uuid_metadata_k = [] {
     return bytes;
 }();
 
-/** The buffers an exported column points at, which its @c release frees with it. */
+/** The buffers an exported column points at, which its @c release frees with it, and the arena
+ *  whose export that @c release closes. */
 struct exported_column_t {
     std::array<void const*, 3> buffers {};
+    ustore_arena_t arena = nullptr;
 };
 
 void release_exported_schema(ArrowSchema* schema) noexcept { schema->release = nullptr; }
 
 void release_exported_column(ArrowArray* array) noexcept {
-    delete static_cast<exported_column_t*>(array->private_data);
+    auto* const column = static_cast<exported_column_t*>(array->private_data);
+    ustore_arena_export_close(column->arena);
+    delete column;
     array->release = nullptr;
 }
 
-/** Exports @p rows rows of @p buffers, laid out as @p format says, into @p schema and @p array. */
-ustore_status_t export_column(std::size_t rows, std::array<void const*, 3> buffers, std::int64_t buffers_count,
-                              char const* format, char const* metadata, ArrowSchema* schema,
+/** Exports @p rows rows of @p buffers out of @p arena, laid out as @p format says, into @p schema
+ *  and @p array, keeping the export of @p arena its caller opened until the array's @c release. */
+ustore_status_t export_column(ustore_arena_t arena, std::size_t rows, std::array<void const*, 3> buffers,
+                              std::int64_t buffers_count, char const* format, char const* metadata, ArrowSchema* schema,
                               ArrowDeviceArray* array) noexcept {
-    auto* const column = new (std::nothrow) exported_column_t {buffers};
-    if (!column) return ustore_status_out_of_memory_k;
+    auto* const column = new (std::nothrow) exported_column_t {buffers, arena};
+    if (!column) return ustore_arena_export_close(arena), ustore_status_out_of_memory_k;
     *schema = {};
     schema->format = format, schema->name = "", schema->metadata = metadata;
     schema->release = &release_exported_schema;
@@ -226,20 +231,24 @@ ustore_status_t ustore_keys_view_to_arrow(ustore_keys_view_t keys, ustore_size_t
                                           ArrowSchema* schema, ArrowDeviceArray* array) {
     if (!arena || !schema || !array || (count && !keys.data)) return ustore_status_invalid_argument_k;
     std::size_t const rows = static_cast<std::size_t>(count);
+    // The export opens before anything is copied, so no call refills the arena between the two
+    if (ustore_status_t const opened = ustore_arena_export_open(arena); opened != ustore_status_success_k)
+        return opened;
     void const* data = count ? static_cast<void const*>(keys.data) : no_rows_k;
     if (count > 1 && keys.stride != sizeof(ustore_key_t)) {
         // Strided keys, like the triples of edges, are copied dense behind the call's outputs
         // under the claim
-        if (!arena->claim.take(arena)) return ustore_status_contended_k;
+        if (!arena->claim.take(arena)) return ustore_arena_export_close(arena), ustore_status_contended_k;
         auto* const dense = reinterpret_cast<ustore_key_t*>(arena->allocate(rows * sizeof(ustore_key_t)));
         for (std::size_t index = 0; dense && index != rows; ++index)
             dense[index] = strided_element(keys.data, keys.stride, index);
         arena->claim.release();
-        if (!dense) return ustore_status_out_of_memory_k;
+        if (!dense) return ustore_arena_export_close(arena), ustore_status_out_of_memory_k;
         data = dense;
     }
-    else if (!arena_holds(*arena, keys.data, rows * sizeof(ustore_key_t))) return ustore_status_invalid_argument_k;
-    return export_column(rows, {nullptr, data, nullptr}, 2, "w:16", uuid_metadata_k.data(), schema, array);
+    else if (!arena_holds(*arena, keys.data, rows * sizeof(ustore_key_t)))
+        return ustore_arena_export_close(arena), ustore_status_invalid_argument_k;
+    return export_column(arena, rows, {nullptr, data, nullptr}, 2, "w:16", uuid_metadata_k.data(), schema, array);
 }
 
 ustore_status_t ustore_strings_view_to_arrow(ustore_strings_view_t strings, ustore_size_t count,
@@ -256,30 +265,36 @@ ustore_status_t ustore_strings_view_to_arrow(ustore_strings_view_t strings, usto
     if (count && !offsets) return ustore_status_invalid_argument_k;
     char const* const format = layout == ustore_strings_u64_tape_k ? "Z" : "z";
     std::size_t const rows = static_cast<std::size_t>(count);
+    // The export opens before anything is copied, so no call refills the arena between the two
+    if (ustore_status_t const opened = ustore_arena_export_open(arena); opened != ustore_status_success_k)
+        return opened;
     if (!count || layout == strings.layout) {
-        if (count && !arena_holds_tape(*arena, strings, rows)) return ustore_status_invalid_argument_k;
+        if (count && !arena_holds_tape(*arena, strings, rows))
+            return ustore_arena_export_close(arena), ustore_status_invalid_argument_k;
         void const* const exported_offsets = count ? offsets : no_rows_k;
         void const* const exported_data = data ? static_cast<void const*>(data) : no_rows_k;
-        return export_column(rows, {nullptr, exported_offsets, exported_data}, 3, format, nullptr, schema, array);
+        return export_column(arena, rows, {nullptr, exported_offsets, exported_data}, 3, format, nullptr, schema,
+                             array);
     }
-    if (!offsets_held(*arena, offsets, rows, wide ? 8 : 4)) return ustore_status_invalid_argument_k;
+    if (!offsets_held(*arena, offsets, rows, wide ? 8 : 4))
+        return ustore_arena_export_close(arena), ustore_status_invalid_argument_k;
     std::uint64_t const first = wide ? strings.data.u64_tape.offsets[0] : strings.data.u32_tape.offsets[0];
     std::uint64_t const end = wide ? strings.data.u64_tape.offsets[rows] : strings.data.u32_tape.offsets[rows];
     if (!wide || end - first <= 0xFFFFFFFFull) {
         // A tape of the other width has its offsets converted behind the call's outputs, counted
         // from its first byte
-        if (!arena->claim.take(arena)) return ustore_status_contended_k;
+        if (!arena->claim.take(arena)) return ustore_arena_export_close(arena), ustore_status_contended_k;
         void const* converted =
             wide
                 ? static_cast<void const*>(convert_offsets<std::uint32_t>(*arena, strings.data.u64_tape.offsets, rows))
                 : static_cast<void const*>(convert_offsets<std::uint64_t>(*arena, strings.data.u32_tape.offsets, rows));
         arena->claim.release();
-        if (!converted) return ustore_status_out_of_memory_k;
+        if (!converted) return ustore_arena_export_close(arena), ustore_status_out_of_memory_k;
         data = data ? data + first : data;
         void const* const exported_data = data ? static_cast<void const*>(data) : no_rows_k;
-        return export_column(rows, {nullptr, converted, exported_data}, 3, format, nullptr, schema, array);
+        return export_column(arena, rows, {nullptr, converted, exported_data}, 3, format, nullptr, schema, array);
     }
-    return ustore_status_capacity_exhausted_k;
+    return ustore_arena_export_close(arena), ustore_status_capacity_exhausted_k;
 }
 
 ustore_status_t ustore_docs_column_view_to_arrow(ustore_docs_column_view_t const* column, ustore_size_t count,
@@ -293,8 +308,11 @@ ustore_status_t ustore_docs_column_view_to_arrow(ustore_docs_column_view_t const
     if (rows && !texts && !column->scalars) return ustore_status_invalid_argument_k;
     if (rows && texts && !arena_holds_tape(*arena, column->strings, rows)) return ustore_status_invalid_argument_k;
 
-    // Every column takes the claim, as a boolean or text one copies its conversion past the outputs
-    if (!arena->claim.take(arena)) return ustore_status_contended_k;
+    // The export opens before anything is copied, so no call refills the arena between the two, and
+    // every column takes the claim, as a boolean or text one copies its conversion past the outputs
+    if (ustore_status_t const opened = ustore_arena_export_open(arena); opened != ustore_status_success_k)
+        return opened;
+    if (!arena->claim.take(arena)) return ustore_arena_export_close(arena), ustore_status_contended_k;
     std::array<void const*, 3> buffers {column->validities, column->scalars, nullptr};
     ustore_status_t status = ustore_status_success_k;
     if (rows && type == ustore_docs_field_type_bool_k) {
@@ -317,9 +335,9 @@ ustore_status_t ustore_docs_column_view_to_arrow(ustore_docs_column_view_t const
         else status = drop_terminators(*arena, column->strings.data.u32_tape.offsets, bytes, rows, buffers);
     }
     arena->claim.release();
-    if (status != ustore_status_success_k) return status;
+    if (status != ustore_status_success_k) return ustore_arena_export_close(arena), status;
     if (!rows) buffers = {nullptr, no_rows_k, texts ? no_rows_k : nullptr};
     char const* const format = docs_column_format(type, column->strings.layout);
     char const* const metadata = type == ustore_docs_field_type_uuid_k ? uuid_metadata_k.data() : nullptr;
-    return export_column(rows, buffers, texts ? 3 : 2, format, metadata, schema, array);
+    return export_column(arena, rows, buffers, texts ? 3 : 2, format, metadata, schema, array);
 }

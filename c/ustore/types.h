@@ -38,7 +38,10 @@
  *  return, whatever its completion.
  *
  *  An executor runs one call at a time. A call that finds another one holding its executor, from
- *  any thread, finishes @c ustore_status_contended_k without running.
+ *  any thread, finishes @c ustore_status_contended_k without running. An Arrow export that
+ *  converts an arena's outputs on a VRAM executor's device holds that executor while it converts,
+ *  so a call the executor already accepted, deferred ones included, may finish
+ *  @c ustore_status_contended_k then, without running.
  *
  *  A deferred call on a caller-exclusive executor returns once handed to the executor's thread 0,
  *  which runs it there, forks included, and finishes it, so polling alone sees it final. A deferred
@@ -346,8 +349,8 @@ typedef struct ustore_strings_view_t {
 /**
  *  @brief What went wrong, in one vocabulary shared by every engine and binding.
  *
- *  Shared statuses hold USearch's numbers, 0 to 19, leaving 3, 4, 5 and 11 unused, and UStore's
- *  own start at 20. Statuses fall into five categories: resources, input, state, interruptions and
+ *  Shared statuses hold USearch's numbers, 0 to 19, leaving 3, 4 and 5 unused, and UStore's own
+ *  start at 20. Statuses fall into five categories: resources, input, state, interruptions and
  *  defects. Any verb that allocates, binds a device or touches a file may also return a resources
  *  status; any verb taking a progress callback may return an interruption. A verb's own block
  *  lists only what its contract adds.
@@ -379,6 +382,9 @@ typedef enum ustore_status_t {
 
     /** The engine failed in a way no other status names, which points at a defect. */
     ustore_status_internal_k = 10,
+
+    /** A count passed what its word holds, like the open exports of one arena. */
+    ustore_status_overflow_k = 11,
 
     /** The call needs a database or transaction that was never opened. */
     ustore_status_uninitialized_k = 12,
@@ -950,7 +956,7 @@ USTORE_EXPORT ustore_status_t ustore_gds_from_name(ustore_bytes_view_t name, ust
 /** The GPU vendors one binary drives at once, each through a runtime opened on first use. */
 typedef enum ustore_gpu_vendor_t {
 
-    /** No vendor, as an unrecognized spelling reads back. */
+    /** No vendor, which host pages and a device no driver reports hold. */
     ustore_gpu_vendor_unknown_k = 0,
 
     /** NVIDIA, through the CUDA driver when one is installed. */
@@ -1248,12 +1254,34 @@ typedef struct ustore_arena_init_t {
 USTORE_EXPORT void ustore_arena_init(ustore_arena_init_t* arguments);
 
 /**
- *  @brief Frees the arena and every output in it; @c NULL is safe, and it cannot fail, so takes no outcome.
- *  @param[in,out] arena The arena to be freed; invalid afterwards.
+ *  @brief Frees the arena and every output in it, once every deferred call naming it is final;
+ *      @c NULL is safe.
+ *  @param[in,out] arena The arena to be freed; invalid afterwards, unless the free is refused.
  *
- *  Waits until every deferred call naming the arena is final.
+ *  @par Statuses:
+ *  - @c ustore_status_contended_k An export of the arena's outputs is open, and nothing is freed.
  */
-USTORE_EXPORT void ustore_arena_free(ustore_arena_t arena);
+USTORE_EXPORT ustore_status_t ustore_arena_free(ustore_arena_t arena);
+
+/**
+ *  @brief Opens one export of @p arena's outputs, a view a consumer reads in place: until the
+ *      matching @c ustore_arena_export_close, every call naming the arena answers
+ *      @c ustore_status_contended_k before it claims its executor, and the arena's free refuses.
+ *  @param[in,out] arena The arena whose outputs a view hands out.
+ *
+ *  A binding opens one export per view it hands to a consumer and closes it from that view's
+ *  deleter or release callback; describing the arena answers as usual meanwhile.
+ *
+ *  @par Statuses:
+ *  - @c ustore_status_invalid_argument_k The @p arena is @c NULL.
+ *  - @c ustore_status_contended_k A call holds the arena.
+ *  - @c ustore_status_overflow_k The arena holds as many open exports as 32 bits count.
+ */
+USTORE_EXPORT ustore_status_t ustore_arena_export_open(ustore_arena_t arena);
+
+/** Closes one export @c ustore_arena_export_open opened on @p arena, from any thread and in any
+ *  order; @c NULL or an arena with no open export is left as it is. */
+USTORE_EXPORT void ustore_arena_export_close(ustore_arena_t arena);
 
 /** Where an arena's outputs live, as @c ustore_arena_describe reports it. */
 typedef enum ustore_residency_t {
@@ -1269,7 +1297,29 @@ typedef enum ustore_residency_t {
 
 } ustore_residency_t;
 
-/** Where an arena's outputs live. */
+/** Whether host code may read an arena's pages in place. */
+typedef enum ustore_host_access_t {
+
+    /** Host code must not read the pages, which only their device's code reaches. */
+    ustore_host_access_refused_k = 0,
+
+    /** Host code reads the pages in place: host, pinned, managed or Apple's shared memory. */
+    ustore_host_access_readable_k = 1,
+
+} ustore_host_access_t;
+
+/** The canonical spelling of a host access, as @c ustore_host_access_readable_k spells "readable",
+ *  or "unrecognized". */
+USTORE_EXPORT char const* ustore_host_access_name(ustore_host_access_t host_access);
+
+/**
+ *  @brief Where an arena's outputs live, and whether host code may read them.
+ *
+ *  The device type an export names follows from these fields alone. VRAM that host code may not
+ *  read is the device's own memory, and VRAM it may read is managed memory on NVIDIA and shared
+ *  memory on Apple. RAM with a @c device of zero or more is host memory page-locked for that
+ *  device, and RAM with a @c device of -1 is plain host memory.
+ */
 typedef struct ustore_arena_description_t {
 
     /** RAM for host pages, VRAM for one device's memory. */
@@ -1277,6 +1327,15 @@ typedef struct ustore_arena_description_t {
 
     /** The UStore ordinal of the device as @c ustore_gpu_devices lists it, or -1 for host pages. */
     int32_t device;
+
+    /** The vendor of that device as the listing reports it, or unknown for host pages. */
+    ustore_gpu_vendor_t vendor;
+
+    /** The vendor's own number of the device, as Arrow and DLPack name it, or -1 for host pages. */
+    int32_t vendor_ordinal;
+
+    /** Whether host code may read the pages in place. */
+    ustore_host_access_t host_access;
 } ustore_arena_description_t;
 
 /** The arguments of @c ustore_arena_describe. */

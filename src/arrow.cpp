@@ -92,6 +92,9 @@ inline constexpr std::array<char, metadata_capacity_k> uuid_metadata_k = encode_
 /** What an exported column owns: the buffers it points at. */
 struct exported_column_t {
     std::array<void const*, 3> buffers {};
+
+    /** The arena whose outputs the column views, whose export the column's release closes. */
+    ustore_arena_t arena = nullptr;
 };
 
 /** The device runs of @p arena, with the Arrow device type and ordinal they live on, null
@@ -223,45 +226,30 @@ util::expected<converted_offsets_t> convert_through(executor_type_& executor, ut
     return converted_offsets_t {carved.data(), first};
 }
 
-/** Spawns an executor on the device @p arena lives on for one export, as the C call names none, and
- *  hands @p visitor that device and the arena's runs on it. */
+/** Hands @p visitor the first stream of the executor that made @p arena, under that executor's
+ *  claim, and the arena's runs on its device, answering contended while a call holds that one. */
 template <typename visitor_type_>
 ustore_status_t visit_export_executor(ustore_arena_t arena, visitor_type_&& visitor) noexcept {
-    device_arena_t const device = device_arena_of(arena);
-    gpu_vendor_t const vendor = device.type == ARROW_DEVICE_CUDA   ? gpu_vendor_t::nvidia_k
-                                : device.type == ARROW_DEVICE_ROCM ? gpu_vendor_t::amd_k
-                                                                   : gpu_vendor_t::apple_k;
-    gpu_runtime_t& runtime = gpu_runtime();
-    std::size_t listed = runtime.devices_count;
-    for (std::size_t position = 0; position != runtime.devices_count; ++position)
-        if (runtime.devices[position].vendor == vendor &&
-            runtime.devices[position].vendor_ordinal == static_cast<std::uint32_t>(device.device))
-            listed = position;
-    if (listed == runtime.devices_count) return ustore_status_device_k;
-    gpu_class_t const gpu_class = pick_gpu_class(vendor, runtime.loaded[listed], gpu_class_t::unknown_k);
-    if (gpu_class == gpu_class_t::unknown_k) return ustore_status_unsupported_k;
-    util::gpu_executor_t spawned;
-    if (util::status_t const status = spawn_vram_executor(runtime, {&runtime.devices[listed], 1}, gpu_class, 0, {},
-                                                          spawned);
-        status.failed())
-        return static_cast<ustore_status_t>(status.code);
+    if (!arena->executor) return ustore_status_device_k;
     return std::visit(
-        [&]<typename executor_type_>(executor_type_& executor) noexcept -> ustore_status_t {
-            if constexpr (std::is_same_v<executor_type_, std::monostate>) return ustore_status_device_k;
+        [&]<typename kind_type_>(kind_type_& executor) noexcept -> ustore_status_t {
+            if constexpr (!util::a_gpu_executor<kind_type_>) return ustore_status_device_k;
             else {
                 auto [claim, claim_status] = executor.claim();
                 if (claim_status.failed()) return static_cast<ustore_status_t>(claim_status.code);
                 util::device_blocks_t* const blocks = device_blocks_of(arena, executor.stream(0));
                 if (!blocks) return ustore_status_device_k;
+                if (util::status_t const bound = executor.stream(0).bind(); bound.failed())
+                    return static_cast<ustore_status_t>(bound.code);
                 return visitor(executor.stream(0), *blocks);
             }
         },
-        spawned);
+        arena->executor->device);
 }
 
-/** Converts the device tape @p strings of @p rows strings as @c convert_on_host does, through an
- *  executor spawned on the arena's device for this export alone: the offsets come down into its
- *  bounce, convert there and go back up behind the call's outputs. */
+/** Converts the device tape @p strings of @p rows strings as @c convert_on_host does, through the
+ *  executor that made the arena: the offsets come down into its bounce, convert there and go back
+ *  up behind the call's outputs. */
 util::expected<converted_offsets_t> convert_on_device(ustore_arena_t arena, ustore_strings_view_t const& strings,
                                                       std::size_t rows) noexcept {
     if (!arena_holds_tape(arena, strings, rows)) return util::status_code_t::invalid_argument_k;
@@ -288,8 +276,8 @@ ustore_status_t densify_on_host(ustore_arena_t arena, util::strided_rows_t& rows
     return ustore_status_success_k;
 }
 
-/** Copies the strided @p rows of a device arena dense behind the call's outputs, through an
- *  executor spawned on the arena's device for this export alone, pointing them at the copy. */
+/** Copies the strided @p rows of a device arena dense behind the call's outputs, through the
+ *  executor that made the arena, pointing them at the copy. */
 ustore_status_t densify_on_device(ustore_arena_t arena, util::strided_rows_t& rows) noexcept {
     std::size_t const spanned = static_cast<std::size_t>((rows.rows - 1) * rows.stride + rows.row_bytes);
     if (!arena_holds(arena, rows.source, spanned)) return ustore_status_invalid_argument_k;
@@ -311,17 +299,19 @@ ustore_status_t densify_on_device(ustore_arena_t arena, util::strided_rows_t& ro
 void release_exported_schema(ArrowSchema* schema) noexcept { schema->release = nullptr; }
 
 void release_exported_column(ArrowArray* array) noexcept {
-    delete static_cast<exported_column_t*>(array->private_data);
+    auto* const column = static_cast<exported_column_t*>(array->private_data);
+    ustore_arena_export_close(column->arena);
+    delete column;
     array->release = nullptr;
 }
 
 /** Exports @p rows rows of @p buffers out of @p arena, laid out as @p format says, into @p schema
- *  and @p array. */
+ *  and @p array, keeping the export of @p arena its caller opened until the array's @c release. */
 ustore_status_t export_column(ustore_arena_t arena, std::size_t rows, std::array<void const*, 3> buffers,
                               std::int64_t buffers_count, char const* format, char const* metadata, ArrowSchema* schema,
                               ArrowDeviceArray* array) noexcept {
-    auto* const column = new (std::nothrow) exported_column_t {buffers};
-    if (!column) return ustore_status_out_of_memory_k;
+    auto* const column = new (std::nothrow) exported_column_t {buffers, arena};
+    if (!column) return ustore_arena_export_close(arena), ustore_status_out_of_memory_k;
     *schema = {.format = format,
                .name = "",
                .metadata = metadata,
@@ -534,21 +524,24 @@ ustore_status_t ustore_strings_view_from_arrow(ArrowSchema const* schema, ArrowA
 ustore_status_t ustore_keys_view_to_arrow(ustore_keys_view_t keys, ustore_size_t count, ustore_arena_t arena,
                                           ArrowSchema* schema, ArrowDeviceArray* array) {
     if (!arena || !schema || !array || (count && !keys.data)) return ustore_status_invalid_argument_k;
+    // The export opens before anything is carved, so no call refills the arena between the two
+    if (ustore_status_t const opened = ustore_arena_export_open(arena); opened != ustore_status_success_k)
+        return opened;
     void const* data = count ? static_cast<void const*>(keys.data) : no_rows_k;
     if (count > 1 && keys.stride != sizeof(ustore_key_t)) {
         // Strided keys, like the triples of edges, are carved dense behind the call's outputs under the claim
-        if (!take(arena->claim)) return ustore_status_contended_k;
+        if (!take(arena->claim)) return ustore_arena_export_close(arena), ustore_status_contended_k;
         std::size_t const rows = static_cast<std::size_t>(count);
         util::strided_rows_t strided_keys {util::bytes_of(keys.data, 1).data(), keys.stride, sizeof(ustore_key_t), rows,
                                            nullptr};
         ustore_status_t const status = device_arena_of(arena).blocks ? densify_on_device(arena, strided_keys)
                                                                      : densify_on_host(arena, strided_keys);
         release(arena->claim);
-        if (status != ustore_status_success_k) return status;
+        if (status != ustore_status_success_k) return ustore_arena_export_close(arena), status;
         data = strided_keys.dense;
     }
     else if (!arena_holds(arena, keys.data, static_cast<std::size_t>(count) * sizeof(ustore_key_t)))
-        return ustore_status_invalid_argument_k;
+        return ustore_arena_export_close(arena), ustore_status_invalid_argument_k;
     return export_column(arena, count, {nullptr, data, nullptr}, 2, "w:16", uuid_metadata_k.data(), schema, array);
 }
 
@@ -566,8 +559,12 @@ ustore_status_t ustore_strings_view_to_arrow(ustore_strings_view_t strings, usto
     if (count && !offsets) return ustore_status_invalid_argument_k;
     char const* const format = layout == ustore_strings_u64_tape_k ? "Z" : "z";
     std::size_t const rows = static_cast<std::size_t>(count);
+    // The export opens before anything is carved, so no call refills the arena between the two
+    if (ustore_status_t const opened = ustore_arena_export_open(arena); opened != ustore_status_success_k)
+        return opened;
     if (!count || layout == strings.layout) {
-        if (count && !arena_holds_tape(arena, strings, rows)) return ustore_status_invalid_argument_k;
+        if (count && !arena_holds_tape(arena, strings, rows))
+            return ustore_arena_export_close(arena), ustore_status_invalid_argument_k;
         void const* const exported_offsets = count ? offsets : no_rows_k;
         void const* const exported_data = data ? static_cast<void const*>(data) : no_rows_k;
         return export_column(arena, count, {nullptr, exported_offsets, exported_data}, 3, format, nullptr, schema,
@@ -575,11 +572,12 @@ ustore_status_t ustore_strings_view_to_arrow(ustore_strings_view_t strings, usto
     }
 
     // A tape of the other width is converted behind the call's outputs under the claim, narrowed from its first byte
-    if (!take(arena->claim)) return ustore_status_contended_k;
+    if (!take(arena->claim)) return ustore_arena_export_close(arena), ustore_status_contended_k;
     auto const [converted, convert_status] = device_arena_of(arena).blocks ? convert_on_device(arena, strings, rows)
                                                                            : convert_on_host(arena, strings, rows);
     release(arena->claim);
-    if (convert_status.failed()) return static_cast<ustore_status_t>(convert_status.code);
+    if (convert_status.failed())
+        return ustore_arena_export_close(arena), static_cast<ustore_status_t>(convert_status.code);
     void const* const exported_data = data ? static_cast<void const*>(data + converted.first) : no_rows_k;
     return export_column(arena, count, {nullptr, converted.offsets, exported_data}, 3, format, nullptr, schema, array);
 }
@@ -593,8 +591,11 @@ ustore_status_t ustore_docs_column_view_to_arrow(ustore_docs_column_view_t const
     bool const device = device_arena_of(arena).blocks != nullptr;
     ustore_docs_column_view_t view = device ? ustore_docs_column_view_t {} : *column;
 
-    // Every column takes the claim, as a boolean or text one carves its conversion past the outputs
-    if (!take(arena->claim)) return ustore_status_contended_k;
+    // The export opens before anything is carved, so no call refills the arena between the two, and
+    // every column takes the claim, as a boolean or text one carves its conversion past the outputs
+    if (ustore_status_t const opened = ustore_arena_export_open(arena); opened != ustore_status_success_k)
+        return opened;
+    if (!take(arena->claim)) return ustore_arena_export_close(arena), ustore_status_contended_k;
     column_buffers_t buffers {};
     ustore_status_t status = ustore_status_success_k;
     if (!device && rows)
@@ -638,7 +639,7 @@ ustore_status_t ustore_docs_column_view_to_arrow(ustore_docs_column_view_t const
                     buffers);
             });
     release(arena->claim);
-    if (status != ustore_status_success_k) return status;
+    if (status != ustore_status_success_k) return ustore_arena_export_close(arena), status;
 
     bool const texts = !docs::field_size_bytes(type);
     if (!rows) buffers = {nullptr, no_rows_k, nullptr};

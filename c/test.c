@@ -380,6 +380,9 @@ static void test_every_argument_shape_lands(void) {
     expect_success_at(&outcome, __FILE__, __LINE__);
     expect_(arena_description.residency == ustore_residency_ram_k);
     expect_(arena_description.device == -1);
+    expect_(arena_description.vendor == ustore_gpu_vendor_unknown_k);
+    expect_(arena_description.vendor_ordinal == -1);
+    expect_(arena_description.host_access == ustore_host_access_readable_k);
 
     // No collection exists until one is created, and every call names the collections it addresses
     ustore_collection_id_t blobs = {{{0}}};
@@ -801,6 +804,8 @@ static void test_every_argument_shape_lands(void) {
     expect_(strcmp(ustore_gpu_vendor_name(ustore_gpu_vendor_apple_k), "apple") == 0);
     expect_(ustore_gpu_vendor_from_name(bytes_of("apple"), &read_vendor) == ustore_status_success_k &&
             read_vendor == ustore_gpu_vendor_apple_k);
+    expect_(strcmp(ustore_host_access_name(ustore_host_access_readable_k), "readable") == 0);
+    expect_(strcmp(ustore_host_access_name(ustore_host_access_refused_k), "refused") == 0);
     ustore_gpu_class_t const apple_classes[] = {ustore_gpu_class_apple_metal7_k, ustore_gpu_class_apple_metal9_k,
                                                 ustore_gpu_class_apple_metal10_k};
     char const* const apple_class_names[] = {"apple-metal7", "apple-metal9", "apple-metal10"};

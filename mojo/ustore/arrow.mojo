@@ -1,8 +1,9 @@
 """Apache Arrow through its C data interface: the keys, strings and gathered columns a call wrote into
 an arena exported in place, and Arrow columns read in place as the inputs of a call.
 
-An export lives until the arena's next call or free, like every other output view, and its release
-frees only the array's own nodes, which an `ArrowExport` runs when it goes out of scope. The schema
+Until an export is released, the arena's next call raises `CONTENDED` and its free frees nothing,
+and its release frees only the array's own nodes, which an `ArrowExport` runs when it goes out of
+scope. The schema
 and array addresses an export answers are `struct ArrowSchema*` and `struct ArrowDeviceArray*`,
 for any consumer of the C data interface to import.
 
@@ -138,7 +139,8 @@ comptime ColumnToArrow = def(
 struct ArrowExport(Movable, Sized):
     """One Arrow column a call's arena holds, exported in place, released when it goes out of scope.
 
-    It reads the arena until the arena's next call or free, so it is consumed before then.
+    The arena must outlive it: until it is released, the arena's next call raises `CONTENDED`, and
+    an arena freed earlier frees nothing, staying allocated until the process ends.
     """
 
     var schema: ArrowSchema

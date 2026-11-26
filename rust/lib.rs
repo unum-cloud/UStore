@@ -226,8 +226,8 @@ pub use db::{
     Admission, Arena, ArenaDescription, Blocking, CPUClass, CaseSensitivity, ChangeKind, Changes, ChangesCursor,
     ChangesCursorConfig, CollectionID, Collections, CommitStamp, CompactConfig, CompactPlan, CursorOn, DataDirectory,
     Database, Deferred, DeferredOn, Deferring, Description, DropMode, Durability, Engine, Error, Executor, GPUClass,
-    GPUDevice, GPUVendor, Gds, IOOptions, Isolation, Key, KeyRange, LevelDBOptions, Matching, Modality, Mood,
-    NVMEOptions, NVMEViewOptions, On, PatternKind, Phase, PhaseProgress, Predicate, PredicateCost, Progress,
+    GPUDevice, GPUVendor, Gds, HostAccess, IOOptions, Isolation, Key, KeyRange, LevelDBOptions, Matching, Modality,
+    Mood, NVMEOptions, NVMEViewOptions, On, PatternKind, Phase, PhaseProgress, Predicate, PredicateCost, Progress,
     RAMOptions, ReadStamp, Residency, Result, RocksDBOptions, SaveConfig, ScanDirection, ScanMode, Snapshot, Status,
     Tape, Transaction, Transport, UUID, ViewVerbs, Watch, gpu_devices, key_unknown, version,
 };

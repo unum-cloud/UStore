@@ -453,6 +453,9 @@ pub(crate) mod ffi {
     pub struct ustore_arena_description_t {
         pub residency: ustore_enum_t,
         pub device: i32,
+        pub vendor: ustore_enum_t,
+        pub vendor_ordinal: i32,
+        pub host_access: ustore_enum_t,
     }
 
     #[repr(C)]
@@ -788,6 +791,7 @@ pub(crate) mod ffi {
         pub fn ustore_gds_from_name(name: ustore_bytes_view_t, gds: *mut ustore_enum_t) -> ustore_status_t;
         pub fn ustore_gpu_vendor_name(vendor: ustore_enum_t) -> *const c_char;
         pub fn ustore_gpu_vendor_from_name(name: ustore_bytes_view_t, vendor: *mut ustore_enum_t) -> ustore_status_t;
+        pub fn ustore_host_access_name(host_access: ustore_enum_t) -> *const c_char;
         pub fn ustore_gpu_class_name(gpu_class: ustore_enum_t) -> *const c_char;
         pub fn ustore_gpu_class_from_name(name: ustore_bytes_view_t, gpu_class: *mut ustore_enum_t) -> ustore_status_t;
         pub fn ustore_transport_name(transport: ustore_enum_t) -> *const c_char;
@@ -836,7 +840,7 @@ pub(crate) mod ffi {
         pub fn ustore_transaction_commit(arguments: *mut ustore_transaction_commit_t);
         pub fn ustore_transaction_rollback(arguments: *mut ustore_transaction_rollback_t);
 
-        pub fn ustore_arena_free(arena: ustore_arena_t);
+        pub fn ustore_arena_free(arena: ustore_arena_t) -> ustore_status_t;
         pub fn ustore_transaction_free(transaction: ustore_transaction_t);
         pub fn ustore_snapshot_free(snapshot: ustore_snapshot_t);
 
@@ -872,6 +876,8 @@ pub enum Status {
     Malformed = 9,
     /// The engine failed in a way no other status names.
     Internal = 10,
+    /// A count passed what its word holds, like the open exports of one arena.
+    Overflow = 11,
     /// The call needs a database or transaction that was never opened.
     Uninitialized = 12,
     /// The handles or arguments are each well-formed but cannot be joined.
@@ -909,6 +915,7 @@ impl Status {
             7 => Status::Io,
             8 => Status::Device,
             9 => Status::Malformed,
+            11 => Status::Overflow,
             12 => Status::Uninitialized,
             13 => Status::ConfigMismatch,
             14 => Status::Contended,
@@ -1648,7 +1655,7 @@ impl<'executor> Arena<'executor> {
         describe_arena(self.handle)
     }
 
-    /// Refuses device memory, which no host accessor may read.
+    /// Refuses memory host code may not read, before any accessor views it.
     pub(crate) fn host(&self) -> Result<()> {
         host_arena(self.handle)
     }
@@ -1667,15 +1674,16 @@ fn describe_arena(handle: ffi::ustore_arena_t) -> Result<ArenaDescription> {
         residency: Residency::from_raw(description.residency)
             .ok_or(fail(Status::Malformed, "the arena names no known residency"))?,
         device: u32::try_from(description.device).ok(),
+        vendor: GPUVendor::from_raw(description.vendor).unwrap_or(GPUVendor::Unknown),
+        vendor_ordinal: u32::try_from(description.vendor_ordinal).ok(),
+        host_access: HostAccess::from_raw(description.host_access)
+            .ok_or(fail(Status::Malformed, "the arena names no known host access"))?,
     })
 }
 
-/// Refuses an arena of device memory, which no host accessor may read.
+/// Refuses an arena whose memory host code may not read, before any accessor views it.
 pub(crate) fn host_arena(handle: ffi::ustore_arena_t) -> Result<()> {
-    match describe_arena(handle)?.residency {
-        Residency::Vram => Err(fail(Status::Device, "the outputs are device memory")),
-        Residency::Ram => Ok(()),
-    }
+    describe_arena(handle)?.host()
 }
 
 /// Where an [`Arena`]'s outputs live.
@@ -1698,6 +1706,33 @@ impl Residency {
     }
 }
 
+/// Whether host code may read an [`Arena`]'s outputs, which every accessor checks first.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum HostAccess {
+    /// Host code must not read the pages.
+    Refused = 0,
+    /// Host, pinned, managed and Apple's shared memory, which the calling thread reads in place.
+    Readable = 1,
+}
+
+impl HostAccess {
+    fn from_raw(raw: ffi::ustore_enum_t) -> Option<Self> {
+        match raw {
+            0 => Some(HostAccess::Refused),
+            1 => Some(HostAccess::Readable),
+            _ => None,
+        }
+    }
+}
+
+impl fmt::Display for HostAccess {
+    /// Calls `ustore_host_access_name`.
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(spelling(ffi::ustore_host_access_name, *self as ffi::ustore_enum_t))
+    }
+}
+
 /// Where an [`Arena`]'s outputs live, as [`Arena::describe`] reports it.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct ArenaDescription {
@@ -1705,6 +1740,22 @@ pub struct ArenaDescription {
     pub residency: Residency,
     /// The device's ordinal, as [`gpu_devices`] lists it; `None` for host pages.
     pub device: Option<u32>,
+    /// The vendor whose memory it is, as [`gpu_devices`] reports it; `Unknown` for host pages.
+    pub vendor: GPUVendor,
+    /// The vendor's own device number, which Arrow and DLPack name; `None` for host pages.
+    pub vendor_ordinal: Option<u32>,
+    /// Whether host code may read the outputs: host, pinned, managed and Apple's shared memory.
+    pub host_access: HostAccess,
+}
+
+impl ArenaDescription {
+    /// Refuses memory host code may not read with [`Status::Device`], before a host slice views it.
+    pub(crate) fn host(&self) -> Result<()> {
+        match self.host_access {
+            HostAccess::Refused => Err(fail(Status::Device, "the outputs are memory the host may not read")),
+            HostAccess::Readable => Ok(()),
+        }
+    }
 }
 
 /// An address a call holds into memory it owns, or into an output the library exports into its arena, which moves
@@ -1732,7 +1783,9 @@ unsafe impl<Value> Sync for Address<Value> {}
 impl Drop for Arena<'_> {
     fn drop(&mut self) {
         // SAFETY: the handle came from the library and is freed once, after the calls still writing into it.
-        unsafe { ffi::ustore_arena_free(self.handle) };
+        // A free refused while an Arrow export is open leaves the arena to that export rather than
+        // freeing what its consumer reads; every other view borrows the arena.
+        let _ = unsafe { ffi::ustore_arena_free(self.handle) };
     }
 }
 
@@ -2053,6 +2106,8 @@ impl FromStr for Gds {
 /// The vendor whose runtime drives a GPU, as `ustore_gpu_vendor_t` spells it, like "amd".
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum GPUVendor {
+    /// No vendor, which host pages report.
+    Unknown = 0,
     /// NVIDIA, through the CUDA driver.
     Nvidia = 1,
     /// AMD, through the HIP runtime.
@@ -2064,6 +2119,7 @@ pub enum GPUVendor {
 impl GPUVendor {
     fn from_raw(raw: ffi::ustore_enum_t) -> Option<Self> {
         match raw {
+            0 => Some(GPUVendor::Unknown),
             1 => Some(GPUVendor::Nvidia),
             2 => Some(GPUVendor::Amd),
             3 => Some(GPUVendor::Apple),
@@ -5409,6 +5465,9 @@ mod tests {
         assert_eq!("merge".parse::<Modification>(), Ok(Modification::Merge));
         assert_eq!(Engine::NVME.to_string().parse::<Engine>(), Ok(Engine::NVME));
         assert_eq!(GPUVendor::Apple.to_string(), "apple");
+        assert_eq!("unknown".parse::<GPUVendor>(), Ok(GPUVendor::Unknown));
+        assert_eq!(HostAccess::Refused.to_string(), "refused");
+        assert_eq!(HostAccess::Readable.to_string(), "readable");
         assert_eq!(GPUClass::AppleMetal10.to_string(), "apple-metal10");
         assert_eq!("apple-metal7".parse::<GPUClass>(), Ok(GPUClass::AppleMetal7));
         assert_eq!(ScanMode::Unordered.to_string().parse::<ScanMode>(), Ok(ScanMode::Unordered));
@@ -5712,10 +5771,31 @@ mod tests {
     /// One arena serves every verb in turn, whether an executor made it or it serves the calling thread.
     #[test]
     fn arenas_of_host_executors_describe_host_pages() {
-        let host = ArenaDescription { residency: Residency::Ram, device: None };
+        let host = ArenaDescription {
+            residency: Residency::Ram,
+            device: None,
+            vendor: GPUVendor::Unknown,
+            vendor_ordinal: None,
+            host_access: HostAccess::Readable,
+        };
         assert_eq!(Arena::new().unwrap().describe(), Ok(host));
         let executor = Executor::for_ram(&[], 2).unwrap();
         assert_eq!(Arena::new_in(&executor).unwrap().describe(), Ok(host));
+    }
+
+    /// Host reads follow `host_access`, not residency: device memory refuses, shared memory reads.
+    #[test]
+    fn host_reads_of_device_memory_refuse() {
+        let device = ArenaDescription {
+            residency: Residency::Vram,
+            device: Some(0),
+            vendor: GPUVendor::Nvidia,
+            vendor_ordinal: Some(0),
+            host_access: HostAccess::Refused,
+        };
+        assert_eq!(device.host().map_err(|error| error.status), Err(Status::Device));
+        let shared = ArenaDescription { vendor: GPUVendor::Apple, host_access: HostAccess::Readable, ..device };
+        assert_eq!(shared.host(), Ok(()));
     }
 
     #[test]
@@ -5919,6 +5999,7 @@ mod tests {
         assert_eq!("cancelled".parse::<Status>(), Ok(Status::Cancelled));
         assert_eq!("read-only".parse::<Status>(), Ok(Status::ReadOnly));
         assert_eq!("config-mismatch".parse::<Status>(), Ok(Status::ConfigMismatch));
+        assert_eq!("overflow".parse::<Status>(), Ok(Status::Overflow));
         assert_eq!("deferred".parse::<Status>(), Ok(Status::Deferred));
 
         // Success is left to `Result`, so it parses as no failure, and a status a newer library added reads as an

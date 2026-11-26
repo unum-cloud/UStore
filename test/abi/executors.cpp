@@ -1502,6 +1502,45 @@ void test_arena_refuses_its_own_inputs(config_t const& config) {
     expect_true(scanned[keys.size() - 1] == keys.back());
 }
 
+/** An open export of an arena's outputs refuses every call naming the arena and its free, both as
+ *  contended and leaving the outputs in place, until the last export closes. */
+void test_arena_exports_hold_outputs(config_t const& config) {
+    auto [database, open_status] = open_database<database_t>(config);
+    if (!expect_true(open_status.succeeded())) return;
+    auto [blobs, blobs_status] = create_collection(database.handle(), "arena_exports.blobs", ustore_modality_blobs_k);
+    std::array<ustore_key_t, 4> keys {};
+    for (std::size_t index = 0; index != keys.size(); ++index) keys[index] = key_from_integer(index);
+    ustore_arena_t arena = nullptr;
+    ustore_outcome_t outcome {};
+    ustore_arena_init_t init {.arena = &arena, .outcome = &outcome};
+    ustore_arena_init(&init);
+    if (!expect_success(outcome) || !expect_true(blobs_status.succeeded()) ||
+        !write_text(database.handle(), blobs, keys, "v"))
+        return;
+    read_columns_t columns;
+    ustore_blobs_read_t read = read_of(database.handle(), blobs, keys, columns, arena, outcome);
+    ustore_blobs_read(&read);
+    if (!expect_success(outcome)) return;
+    std::string_view const exported = columns.value(0);
+
+    expect_true(ustore_arena_export_open(nullptr) == ustore_status_invalid_argument_k);
+    expect_true(ustore_arena_export_open(arena) == ustore_status_success_k);
+    expect_true(ustore_arena_export_open(arena) == ustore_status_success_k);
+    ustore_blobs_read(&read);
+    expect_status(outcome, status_code_t::contended_k);
+    expect_true(ustore_arena_free(arena) == ustore_status_contended_k);
+    ustore_arena_export_close(arena);
+    expect_true(ustore_arena_free(arena) == ustore_status_contended_k);
+    ustore_arena_export_close(arena);
+    // Closing past the last export changes nothing, and the exported outputs read as they were
+    ustore_arena_export_close(arena);
+    ustore_arena_export_close(nullptr);
+    expect_true(exported == "v");
+    ustore_blobs_read(&read);
+    expect_success(outcome);
+    expect_true(ustore_arena_free(arena) == ustore_status_success_k);
+}
+
 /** An executor whose threads keep 4 KB of scratch each refuses a read staging more than that with
  *  out_of_memory, which the same read on the default limit serves. */
 void test_executor_scratch_limit(config_t const& config) {
@@ -2063,6 +2102,7 @@ int main(int argc, char** argv) {
     run_test_case(engine_label_t {"test_executor_scratch_limit"}.c_str(), test_executor_scratch_limit, config);
     run_test_case(engine_label_t {"test_arena_refuses_its_own_inputs"}.c_str(), test_arena_refuses_its_own_inputs,
                   config);
+    run_test_case(engine_label_t {"test_arena_exports_hold_outputs"}.c_str(), test_arena_exports_hold_outputs, config);
     run_test_case(engine_label_t {"test_executor_sliced_graph"}.c_str(), test_executor_sliced_graph, config);
     run_test_case(engine_label_t {"test_executor_sliced_strings"}.c_str(), test_executor_sliced_strings, config);
     run_test_case(engine_label_t {"test_executor_memory_domains"}.c_str(), test_executor_memory_domains, config);

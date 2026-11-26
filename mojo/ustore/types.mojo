@@ -92,6 +92,8 @@ struct Status(Equatable, ImplicitlyCopyable, TrivialRegisterPassable):
     """Stored or supplied data could not be decoded."""
     comptime INTERNAL = Self(10)
     """The engine failed in a way no other status names, which points at a defect."""
+    comptime OVERFLOW = Self(11)
+    """A count passed what its word holds, like the open exports of one arena."""
     comptime UNINITIALIZED = Self(12)
     """The call needs a database or transaction that was never opened."""
     comptime CONFIG_MISMATCH = Self(13)
@@ -479,6 +481,9 @@ comptime Verb[Arguments: AnyType] = def(Pointer[Arguments, MutAnyOrigin]) thin a
 
 comptime Release = def(Address) thin abi("C") -> None
 """The positional `_free` family; `NULL` is safe."""
+
+comptime ArenaFree = def(Address) thin abi("C") -> c_int
+"""`ustore_arena_free`, which answers `CONTENDED` and frees nothing while an Arrow export is open."""
 
 comptime OutcomeStatus = def(Pointer[Outcome, MutAnyOrigin]) thin abi("C") -> c_int
 """`ustore_outcome_wait` and `ustore_outcome_status`: an outcome's status, the first once it is final."""
@@ -1011,8 +1016,6 @@ struct Executor:
     """The loaded engine, held so its symbol table outlives every call made through the handle."""
     var address: Address
     """The opaque `ustore_executor_t` every verb hands back to the engine; `NULL_ADDRESS` runs inline."""
-    var vram: Bool
-    """Whether it drives a GPU, so the arenas it makes hold device memory."""
 
     def __init__(out self, library: Library):
         """The caller-thread executor, which every verb accepts.
@@ -1020,13 +1023,12 @@ struct Executor:
         Args:
             library: The loaded engine, kept so the shared object stays mapped.
         """
-        self = Self(library=library, address=NULL_ADDRESS, vram=False)
+        self = Self(library=library, address=NULL_ADDRESS)
 
-    def __init__(out self, *, library: Library, address: Address, vram: Bool):
+    def __init__(out self, *, library: Library, address: Address):
         """Adopts a handle that is already spawned, which is how the factories hand one back."""
         self.library = library
         self.address = address
-        self.vram = vram
 
     def __deinit__(deinit self):
         """Drains every call, then frees the executor. Calls `ustore_executor_free`.
@@ -1067,7 +1069,7 @@ struct Executor:
             ExecutorForRamArguments(created, outcome, ram.arguments(), c_size_t(threads), cpu_class_ceiling, c_size_t(0)),
             library.symbols().executor_for_ram,
         )
-        return Self(library=library, address=_created(library, outcome, created, "ustore_executor_for_ram"), vram=False)
+        return Self(library=library, address=_created(library, outcome, created, "ustore_executor_for_ram"))
 
     @staticmethod
     def for_nvme[
@@ -1102,7 +1104,7 @@ struct Executor:
             ),
             library.symbols().executor_for_nvme,
         )
-        return Self(library=library, address=_created(library, outcome, created, "ustore_executor_for_nvme"), vram=False)
+        return Self(library=library, address=_created(library, outcome, created, "ustore_executor_for_nvme"))
 
     @staticmethod
     def for_vram[
@@ -1143,7 +1145,7 @@ struct Executor:
             ExecutorForVramArguments(created, outcome, vram.arguments(), streams, c_size_t(scratch_limit), gds),
             library.symbols().executor_for_vram,
         )
-        return Self(library=library, address=_created(library, outcome, created, "ustore_executor_for_vram"), vram=True)
+        return Self(library=library, address=_created(library, outcome, created, "ustore_executor_for_vram"))
 
     def drain(self, mood: Mood = Mood.PARKED) raises Error:
         """Waits until no call holds the executor, then parks its threads or keeps them spinning.
@@ -1183,7 +1185,19 @@ struct Residency(Equatable, ImplicitlyCopyable, TrivialRegisterPassable):
     comptime RAM = Self(1)
     """Host pages, which the calling thread reads in place."""
     comptime VRAM = Self(2)
-    """One device's memory, which only that device's code reads."""
+    """One device's memory, which host code reads only where its `HostAccess` is `READABLE`."""
+
+
+@fieldwise_init
+struct HostAccess(Equatable, ImplicitlyCopyable, TrivialRegisterPassable):
+    """Whether host code may read an arena's outputs, `ustore_host_access_t`."""
+
+    var code: c_int
+    """The raw `ustore_host_access_t` value the ABI exchanges."""
+    comptime REFUSED = Self(0)
+    """Host code must not read the pages."""
+    comptime READABLE = Self(1)
+    """Host, pinned, managed and Apple's shared memory, which the calling thread reads in place."""
 
 
 @fieldwise_init
@@ -1194,10 +1208,16 @@ struct ArenaDescription(Defaultable, ImplicitlyCopyable):
     """RAM for host pages, VRAM for one device's memory."""
     var device: Int32
     """The ordinal of the device, as `Library.gpu_devices` lists it, or -1 for host pages."""
+    var vendor: GPUVendor
+    """The vendor whose memory it is, as `Library.gpu_devices` reports it, `UNKNOWN` for host pages."""
+    var vendor_ordinal: Int32
+    """The vendor's own device number, which Arrow and DLPack name, or -1 for host pages."""
+    var host_access: HostAccess
+    """Whether host code may read the outputs, as it may host, pinned, managed and Apple's shared memory."""
 
     def __init__(out self):
-        """Zeroes both fields, which is what a failed report leaves."""
-        self = Self(Residency.UNKNOWN, 0)
+        """Zeroes every field, which is what a failed report leaves."""
+        self = Self(Residency.UNKNOWN, 0, GPUVendor.UNKNOWN, 0, HostAccess.REFUSED)
 
 
 @fieldwise_init
@@ -1229,7 +1249,7 @@ struct Arena[origin: ImmOrigin]:
     outlives the executor that made it: its origin views that executor, so Mojo frees the arena first.
 
     A result refuses every read with `INVALID_ARGUMENT` once a later call rewinds its arena, and a
-    result over a device arena refuses every host read with `DEVICE`.
+    result over memory the host may not read refuses every host read with `DEVICE`.
 
     Parameters:
         origin: The executor that made it, untracked for `Arena(library)`, which no executor made.
@@ -1239,8 +1259,8 @@ struct Arena[origin: ImmOrigin]:
     """The loaded engine, held so the release can still reach `ustore_arena_free`."""
     var _address: Address
     """The `ustore_arena_t`, never null."""
-    var _vram: Bool
-    """Whether its memory is a GPU's, so a host read of it is refused rather than made."""
+    var _host_access: HostAccess
+    """Whether host code may read its memory, as the library described it at init, so a refused read is never made."""
     var _generation: Int
     """Calls the engine took on it so far, which every result records to know when a later one rewound it."""
 
@@ -1249,7 +1269,7 @@ struct Arena[origin: ImmOrigin]:
         var address = _arena_init(library, NULL_ADDRESS)
         self._library = library
         self._address = address
-        self._vram = False
+        self._host_access = HostAccess.READABLE
         self._generation = 0
 
     def __init__(out self, ref[Self.origin] executor: Executor) raises Error:
@@ -1258,25 +1278,25 @@ struct Arena[origin: ImmOrigin]:
         var address = _arena_init(executor.library, executor.address)
         self._library = executor.library
         self._address = address
-        self._vram = executor.vram
+        self._host_access = HostAccess.REFUSED
         self._generation = 0
+        # The executor decided the placement once, so one description holds for every call
+        self._host_access = self.describe().host_access
 
     def __deinit__(deinit self):
         """Frees the arena and every output in it. Calls `ustore_arena_free`.
 
-        The loader reference is surrendered only after the call, for the reason `Executor` records.
+        A destructor cannot raise, so a free refused while an Arrow export is open is dropped, and
+        the arena stays allocated until the process ends. The loader reference is surrendered only
+        after the call, for the reason `Executor` records.
         """
-        self._library.symbols().arena_free(self._address)
+        _ = self._library.symbols().arena_free(self._address)
         _ = self._library^
 
     def _pointer(ref self) -> Pointer[Arena[ImmUntrackedOrigin], origin_of(self)]:
         """This arena as every call and result holds it, whichever executor made it; its own origin
         already keeps that executor alive."""
         return Pointer(to=self).unsafe_bitcast[Arena[ImmUntrackedOrigin]]()
-
-    def vram(self) -> Bool:
-        """Whether its memory is a GPU's, which host reads refuse. Binding-only."""
-        return self._vram
 
     def describe(self) raises Error -> ArenaDescription:
         """Where the arena's outputs live, as the library reports it. Calls `ustore_arena_describe`."""
@@ -1299,8 +1319,8 @@ def _served[origin: MutOrigin](arena: Pointer[Arena[ImmUntrackedOrigin], origin]
 
 
 def _readable[origin: MutOrigin](arena: Pointer[Arena[ImmUntrackedOrigin], origin], generation: Int, detail: StaticString) raises Error:
-    """Refuses a host read of a result over device memory, or over an arena a later call rewound."""
-    if arena[]._vram:
+    """Refuses a host read of a result over memory the host may not read, or over an arena a later call rewound."""
+    if arena[]._host_access != HostAccess.READABLE:
         raise Error(Status.DEVICE, detail)
     if arena[]._generation != generation:
         raise Error(Status.INVALID_ARGUMENT, detail)

@@ -152,6 +152,7 @@ enum class status_code_t : int {
     device_k = ustore_status_device_k,
     malformed_k = ustore_status_malformed_k,
     internal_k = ustore_status_internal_k,
+    overflow_k = ustore_status_overflow_k,
     uninitialized_k = ustore_status_uninitialized_k,
     config_mismatch_k = ustore_status_config_mismatch_k,
     contended_k = ustore_status_contended_k,

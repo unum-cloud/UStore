@@ -13,6 +13,7 @@
  */
 #include <sys/stat.h> // `stat` - the memory domains the system lists
 
+#include <limits> // `std::numeric_limits`
 #include <string> // `std::to_string`
 
 #include "lib.hpp"
@@ -59,6 +60,7 @@ constexpr spelling<ustore_status_t> status_names_k[] {
     {ustore_status_device_k, "device"},
     {ustore_status_malformed_k, "malformed"},
     {ustore_status_internal_k, "internal"},
+    {ustore_status_overflow_k, "overflow"},
     {ustore_status_uninitialized_k, "uninitialized"},
     {ustore_status_config_mismatch_k, "config-mismatch"},
     {ustore_status_contended_k, "contended"},
@@ -89,13 +91,20 @@ constexpr spelling<ustore_gds_t> gds_names_k[] {
     {ustore_gds_compatibility_k, "compatibility"},
 };
 
+constexpr spelling<ustore_host_access_t> host_access_names_k[] {
+    {ustore_host_access_refused_k, "refused"},
+    {ustore_host_access_readable_k, "readable"},
+};
+
 constexpr spelling<ustore_gpu_vendor_t> gpu_vendor_names_k[] {
+    {ustore_gpu_vendor_unknown_k, "unknown"},
     {ustore_gpu_vendor_nvidia_k, "nvidia"},
     {ustore_gpu_vendor_amd_k, "amd"},
     {ustore_gpu_vendor_apple_k, "apple"},
 };
 
 constexpr spelling<ustore_gpu_class_t> gpu_class_names_k[] {
+    {ustore_gpu_class_unknown_k, "unknown"},
     {ustore_gpu_class_nvidia_ampere_k, "nvidia-ampere"},
     {ustore_gpu_class_nvidia_ada_k, "nvidia-ada"},
     {ustore_gpu_class_nvidia_hopper_k, "nvidia-hopper"},
@@ -266,6 +275,9 @@ ustore_status_t ustore_outcome_wait(ustore_outcome_t* outcome) {
 
 ustore_status_t ustore_outcome_status(ustore_outcome_t* outcome) { return load_status(outcome); }
 
+/** Spells a host access, which a caller is only ever answered, so no name reads it back. */
+char const* ustore_host_access_name(ustore_host_access_t value) { return name_in(host_access_names_k, value); }
+
 #define spell_names_(type_, prefix_, table_)                                               \
     char const* ustore_##prefix_##_name(type_ value) { return name_in(table_, value); }    \
     ustore_status_t ustore_##prefix_##_from_name(ustore_bytes_view_t name, type_* value) { \
@@ -400,18 +412,37 @@ void ustore_arena_init(ustore_arena_init_t* arguments) {
     *arguments->arena = arena;
 }
 
-void ustore_arena_free(ustore_arena_t arena) {
-    if (!arena) return;
+ustore_status_t ustore_arena_free(ustore_arena_t arena) {
+    if (!arena) return ustore_status_success_k;
+    if (arena->exports.load(std::memory_order_acquire) != 0) return ustore_status_contended_k;
     wait_named(arena->named_calls);
     while (arena->claim.held()) std::this_thread::yield();
     delete arena;
+    return ustore_status_success_k;
+}
+
+ustore_status_t ustore_arena_export_open(ustore_arena_t arena) {
+    if (!arena) return ustore_status_invalid_argument_k;
+    std::uint32_t seen = arena->exports.load(std::memory_order_relaxed);
+    do
+        if (seen == (std::numeric_limits<std::uint32_t>::max)()) return ustore_status_overflow_k;
+    while (!arena->exports.compare_exchange_weak(seen, seen + 1, std::memory_order_seq_cst));
+    if (arena->claim.held()) return ustore_arena_export_close(arena), ustore_status_contended_k;
+    return ustore_status_success_k;
+}
+
+void ustore_arena_export_close(ustore_arena_t arena) {
+    if (!arena) return;
+    std::uint32_t seen = arena->exports.load(std::memory_order_relaxed);
+    while (seen != 0 && !arena->exports.compare_exchange_weak(seen, seen - 1, std::memory_order_release)) {}
 }
 
 void ustore_arena_describe(ustore_arena_describe_t* arguments) {
     call_t call(arguments->outcome);
     if (!arguments->arena || !arguments->description)
         return call.refuse(ustore_status_invalid_argument_k, "The call needs an arena and a description output");
-    *arguments->description = {ustore_residency_ram_k, -1};
+    *arguments->description = {ustore_residency_ram_k, -1, ustore_gpu_vendor_unknown_k, -1,
+                               ustore_host_access_readable_k};
 }
 
 #pragma endregion Arenas

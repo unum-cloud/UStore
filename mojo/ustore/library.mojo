@@ -114,6 +114,7 @@ from ustore.db import (
 )
 from ustore.types import (
     ArenaDescribe,
+    ArenaFree,
     ArenaInit,
     BytesView,
     CaseSensitivity,
@@ -131,6 +132,7 @@ from ustore.types import (
     GPUDevices,
     GPUDevicesArguments,
     GPUVendor,
+    HostAccess,
     Mood,
     NameOf,
     Outcome,
@@ -218,6 +220,7 @@ struct Symbols:
     var gds_from_name: FromName
     var gpu_vendor_name: NameOf
     var gpu_vendor_from_name: FromName
+    var host_access_name: NameOf
     var gpu_class_name: NameOf
     var gpu_class_from_name: FromName
     var gpu_devices: GPUDevices
@@ -228,7 +231,7 @@ struct Symbols:
     var executor_free: Release
     var arena_init: ArenaInit
     var arena_describe: ArenaDescribe
-    var arena_free: Release
+    var arena_free: ArenaFree
 
     var predicate_cost_name: NameOf
     var predicate_cost_from_name: FromName
@@ -387,6 +390,7 @@ struct Symbols:
         self.gds_from_name = _resolve[FromName](handle, "ustore_gds_from_name")
         self.gpu_vendor_name = _resolve[NameOf](handle, "ustore_gpu_vendor_name")
         self.gpu_vendor_from_name = _resolve[FromName](handle, "ustore_gpu_vendor_from_name")
+        self.host_access_name = _resolve[NameOf](handle, "ustore_host_access_name")
         self.gpu_class_name = _resolve[NameOf](handle, "ustore_gpu_class_name")
         self.gpu_class_from_name = _resolve[FromName](handle, "ustore_gpu_class_from_name")
         self.gpu_devices = _resolve[GPUDevices](handle, "ustore_gpu_devices")
@@ -397,7 +401,7 @@ struct Symbols:
         self.executor_free = _resolve[Release](handle, "ustore_executor_free")
         self.arena_init = _resolve[ArenaInit](handle, "ustore_arena_init")
         self.arena_describe = _resolve[ArenaDescribe](handle, "ustore_arena_describe")
-        self.arena_free = _resolve[Release](handle, "ustore_arena_free")
+        self.arena_free = _resolve[ArenaFree](handle, "ustore_arena_free")
 
         self.predicate_cost_name = _resolve[NameOf](handle, "ustore_predicate_cost_name")
         self.predicate_cost_from_name = _resolve[FromName](handle, "ustore_predicate_cost_from_name")
@@ -673,6 +677,10 @@ struct Library(ImplicitlyCopyable):
     def gpu_vendor_from_name(self, name: StringSlice) raises Error -> GPUVendor:
         """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_gpu_vendor_from_name`."""
         return GPUVendor(self._read_name(self.symbols().gpu_vendor_from_name, name, "ustore_gpu_vendor_from_name"))
+
+    def host_access_name(self, host_access: HostAccess) -> String:
+        """The engine's spelling of a host access. Calls `ustore_host_access_name`."""
+        return text_at(self.symbols().host_access_name(host_access.code))
 
     def gpu_class_name(self, gpu_class: GPUClass) -> String:
         """The engine's spelling of a GPU class. Calls `ustore_gpu_class_name`."""

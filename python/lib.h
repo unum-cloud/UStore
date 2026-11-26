@@ -836,7 +836,7 @@ PyObject* ustore_py_arena_new(ustore_executor_t executor);
  *  @brief Reads the @c Arena @p object a call writes into, which rewinds it: every result over its
  *      previous outputs goes stale.
  *  @param[out] arena A new reference to the @c Arena.
- *  @return 0 on success, -1 with an exception set for anything but an @c Arena of host pages.
+ *  @return 0 on success, -1 with an exception set for anything but an @c Arena the host may read.
  */
 int ustore_py_arena_from_object(PyObject* object, PyObject** arena);
 

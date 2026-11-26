@@ -900,6 +900,11 @@ case_result_t test_vram_every_device(std::vector<std::int32_t> ordinals) {
     if (expect_success(outcome)) ustore_arena_describe(&describe);
     expect_success(outcome);
     expect_true(description.residency == ustore_residency_vram_k && description.device == ordinals.front());
+    // Only Apple's shared runs are host-readable; NVIDIA and AMD runs are the device's own memory
+    expect_true(description.vendor != ustore_gpu_vendor_unknown_k && description.vendor_ordinal >= 0);
+    expect_true(description.host_access == (description.vendor == ustore_gpu_vendor_apple_k
+                                                ? ustore_host_access_readable_k
+                                                : ustore_host_access_refused_k));
     ustore_arena_free(arena);
     ustore_executor_free(executor);
     return {};

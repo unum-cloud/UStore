@@ -150,6 +150,7 @@ from ustore.types import (
     GPUClass,
     GPUDevice,
     GPUVendor,
+    HostAccess,
     Mood,
     NvmeOptions,
     Patterns,

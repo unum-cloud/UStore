@@ -749,12 +749,15 @@ void test_arrow_exports_read_in_place(config_t const& config) {
 
     expect_true(cell_of(read_values, 0) == first_value);
     expect_true(cell_of(read_keys.data[39]) == cell_of(util::key_from_integer(40)));
+    // Each exported array holds the arena, which no free releases until the last array is released
+    expect_equal(ustore_arena_free(arena), ustore_status_contended_k);
     key_array.array.release(&key_array.array);
     expect_true(cell_of(read_values, 39) == "value-40");
+    expect_equal(ustore_arena_free(arena), ustore_status_contended_k);
     value_array.array.release(&value_array.array);
     key_schema.release(&key_schema);
     value_schema.release(&value_schema);
-    ustore_arena_free(arena);
+    expect_equal(ustore_arena_free(arena), ustore_status_success_k);
     ustore_blobs_cursor_free(cursor);
 }
 

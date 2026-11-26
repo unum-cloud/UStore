@@ -98,6 +98,8 @@ const (
 	StatusMalformed Status = C.ustore_status_malformed_k
 	// StatusInternal means the engine failed in a way no other status names.
 	StatusInternal Status = C.ustore_status_internal_k
+	// StatusOverflow means a count passed what its word holds, like the open exports of one arena.
+	StatusOverflow Status = C.ustore_status_overflow_k
 	// StatusUninitialized means the call needs a handle that was never opened or is closed.
 	StatusUninitialized Status = C.ustore_status_uninitialized_k
 	// StatusConfigMismatch means the handles or arguments are each well-formed but cannot be joined.
@@ -463,9 +465,26 @@ const (
 	ResidencyUnknown Residency = C.ustore_residency_unknown_k
 	// ResidencyRam is host pages, which Go code reads in place.
 	ResidencyRam Residency = C.ustore_residency_ram_k
-	// ResidencyVram is one device's memory, which no Go code may read.
+	// ResidencyVram is one device's memory, which Go code reads only where its [HostAccess] is
+	// [HostAccessReadable].
 	ResidencyVram Residency = C.ustore_residency_vram_k
 )
+
+// HostAccess is whether Go code may read an arena's outputs, which every verb checks before it
+// views them as Go slices.
+type HostAccess int32
+
+const (
+	// HostAccessRefused is memory host code must not read.
+	HostAccessRefused HostAccess = C.ustore_host_access_refused_k
+	// HostAccessReadable is host, pinned, managed and Apple's shared memory, read in place.
+	HostAccessReadable HostAccess = C.ustore_host_access_readable_k
+)
+
+// String renders the host access as the library spells it.
+func (access HostAccess) String() string {
+	return C.GoString(C.ustore_host_access_name(C.ustore_host_access_t(access)))
+}
 
 // endregion: Enums
 
@@ -910,6 +929,24 @@ type ArenaDescription struct {
 	// Device is the ordinal of the GPU holding the outputs, as [GPUDevices] lists it, or -1 for host
 	// pages.
 	Device int32
+	// Vendor is the vendor whose memory it is, as [GPUDevices] reports it, [GPUVendorUnknown] for
+	// host pages.
+	Vendor GPUVendor
+	// VendorOrdinal is the vendor's own device number, which Arrow and DLPack name, or -1 for host
+	// pages.
+	VendorOrdinal int32
+	// HostAccess is whether Go code may read the outputs, as it may host, pinned, managed and
+	// Apple's shared memory.
+	HostAccess HostAccess
+}
+
+// host refuses memory host code may not read with [StatusDevice], so no verb views it as a Go
+// slice.
+func (description ArenaDescription) host() error {
+	if description.HostAccess != HostAccessReadable {
+		return fail(StatusDevice, "the outputs are memory the host may not read")
+	}
+	return nil
 }
 
 // The library writes the description in place, so the two layouts must agree.
@@ -930,6 +967,19 @@ func (arena *Arena) Describe() (ArenaDescription, error) {
 	}
 	C.ustore_arena_describe(arguments)
 	return block(&call, nil)
+}
+
+// host refuses an arena whose memory the host may not read before a verb writes into it, since
+// every result wraps the arena's outputs as Go slices; a nil arena is left to the verb to refuse.
+func (arena *Arena) host() error {
+	if arena == nil || arena.handle == nil {
+		return nil
+	}
+	description, err := arena.Describe()
+	if err != nil {
+		return err
+	}
+	return description.host()
 }
 
 // endregion: Arenas
@@ -1164,13 +1214,16 @@ func (arena *Arena) lower() (C.ustore_arena_t, error) {
 }
 
 // Close releases the memory, waiting for every deferred call naming the arena, and ends every view
-// over it; it comes before the Close of the executor that made the arena. It is idempotent, and a
-// closed arena must not be used again.
+// over it; it comes before the Close of the executor that made the arena. While an Arrow export of
+// its outputs is unreleased it fails with [StatusContended] and frees nothing, so a later Close
+// retries. It is idempotent, and a closed arena must not be used again.
 func (arena *Arena) Close() error {
 	if arena == nil || arena.handle == nil {
 		return nil
 	}
-	C.ustore_arena_free(arena.handle)
+	if status := C.ustore_arena_free(arena.handle); status != C.ustore_status_success_k {
+		return fail(Status(status), "an export of the arena's outputs is still open")
+	}
 	arena.handle = nil
 	return nil
 }
@@ -1294,10 +1347,13 @@ type childReceiver[Child, Parent comparable] struct {
 }
 
 // lowerInto reports the handles a pull hands across, refusing a closed child, parent, executor or
-// arena before C dereferences them.
+// arena before C dereferences them, and an arena whose memory the host may not read.
 func (on childReceiver[Child, Parent]) lowerInto(arena *Arena) (Child, Parent, C.ustore_executor_t, C.ustore_arena_t, error) {
 	var none Parent
 	child, executor, outputs, err := on.receiver.lowerInto(arena)
+	if err == nil {
+		err = arena.host()
+	}
 	if err != nil {
 		return child, none, executor, outputs, err
 	}

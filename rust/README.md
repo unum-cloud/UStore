@@ -311,6 +311,7 @@ executor.drain(Mood::Parked)?;
 Every output whose length scales with the call lands in an `Arena`, and the verb answers a view over it, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#batches-and-arenas) describe.
 `Arena::new_in(&executor)` places one where that executor computes, holding the executor so the arena never outlives it, and `Arena::new()` on host pages, and a call rewinds it, keeping its high-water mark, so a steady loop allocates once.
 Every verb takes `&mut Arena` last and its result views it, so the call that would overwrite a live result does not compile; to keep one result while making the next, pass the next call another arena.
+`Arena::describe` reports the residency, the device and its vendor, and the `HostAccess`: managed memory and Apple's shared memory read in place, while memory the host may not read refuses every host view with `Status::Device`.
 A `Key` is sixteen bytes ordered as their bytes, converting from `[u8; 16]`, a `UUID`, or a `u64` or `u128` spelled big-endian, and a batch of keys is anything that reads as `&[Key]`.
 
 ```rust
@@ -342,7 +343,7 @@ println!("{}", ustore::version()); // the library the program runs against, such
 
 ## Apache Arrow
 
-The converters of `c/ustore/arrow.h` view an Arrow column as a call's input in place, and export what a call wrote into an arena as a column in place, living until the arena's next call:
+The converters of `c/ustore/arrow.h` view an Arrow column as a call's input in place, and export what a call wrote into an arena as a column in place, which the arena outlives: until the column is released, the arena's next call answers `Status::Contended`, and an arena dropped earlier stays allocated until the process ends:
 
 ```rust
 let columns = [Column::new::<u64>("born"), Column::new::<Text>("name")];

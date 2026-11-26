@@ -203,6 +203,7 @@ These principles hold in `include/` and `src/`, and the other three libraries st
    - A VRAM executor reads through the blocking queues it owns and queues device work on the streams it owns, one per device, opened or adopted at its creation.
    - A caller's stream is adopted and destroyed with the executor; a null or default stream, a device named twice beside streams, or streams beside no named device answer `invalid_argument`, while devices of more than one vendor or a stream on another device than its entry names answer `config_mismatch`.
    - One call runs per executor; a second answers `contended`. Code that holds a GPU executor and drives its streams takes its `claim()` once at its top, in `include/` or `src/`; code handed only a `stream_t&` takes none, and a verb a claimed verb calls never claims again. Freeing an arena is the one exception: it takes no claim, since it first waits out every call naming the arena, so its chunks belong to no running call, and a stream accepts their frees from any thread.
+   - An export pins its arena: `ustore_arena_export_open` counts each view handed to a consumer, until its release calls `ustore_arena_export_close`, and while any is open every call naming the arena and its free answer `contended`; the Arrow exports open and close their own.
    - GPU-scheduling types, the runtime, the vendor stream and event owners, `stream_t`, the vendor executors and their concepts, live in the `Shared VRAM` regions of `include/ustore/utilities/vram_device.hpp`, its vendor headers and `src/lib.hpp`, the same text in USearch, UForm and UStore apart from the project prefix, which `.githooks/selftest --siblings` compares.
    - A stream queues and a device describes: a `stream_t` holds one listed GPU's queuing state, and every device fact lives once in `gpu_runtime_t`, never copied into an executor.
 8. One word per concept, the same in all four libraries.
@@ -292,7 +293,7 @@ Each header lists a verb's refusals under `@par Statuses` in this order and in t
 
 Statuses 0 to 19 hold the same numbers and meanings in every Unum library: success 0, deferred 1, out_of_memory 2, shape_mismatch 3, unsupported_layout 4, unknown_kind 5, read_only 6, io 7, device 8, malformed 9, internal 10, overflow 11, uninitialized 12, config_mismatch 13, contended 14, cancelled 15, unsupported 16, invalid_argument 17, not_found 18, already_exists 19.
 A library leaves out the ones it cannot answer but never renumbers the rest, and numbers its own statuses from 20.
-Every enum the C interface names, statuses included, has a `ustore_*_name` answering "unrecognized" for a value it does not know and a `ustore_*_from_name(view, &out)` answering `invalid_argument` for a name it does not know, leaving `out` as it was.
+Every enum the C interface names, statuses included, has a `ustore_*_name` answering "unrecognized" for a value it does not know; one a caller can pass in also has a `ustore_*_from_name(view, &out)` answering `invalid_argument` for a name it does not know, leaving `out` as it was.
 CPU and GPU class values are ABI: each class keeps the number USearch gives the same hardware, written explicitly, with unused numbers reserved rather than reused.
 `ustore_version_name` answers the full version, pre-release suffix included, in the engine and in the stub alike.
 

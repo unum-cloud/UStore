@@ -259,11 +259,11 @@ static int arena_described(PyObject* arena, ustore_arena_description_t* descript
     return ustore_py_raise_on_outcome(&outcome);
 }
 
-/** 0 when the library reports @p arena as host pages, or -1 with a @c DeviceError set otherwise. */
+/** 0 when the library reports @p arena as memory the host may read, or -1 raising a DeviceError. */
 static int arena_readable(PyObject* arena) {
     ustore_arena_description_t description = {0};
     if (arena_described(arena, &description) != 0) return -1;
-    if (description.residency != ustore_residency_vram_k) return 0;
+    if (description.host_access == ustore_host_access_readable_k) return 0;
     return ustore_py_raise(ustore_status_device_k,
                            "The arena lives in the memory of device %d, which Python cannot read",
                            (int)description.device);
@@ -528,27 +528,10 @@ PyObject* ustore_py_dlpack_device(PyObject* arena) {
     ustore_arena_description_t description = {0};
     if (arena_described(arena, &description) != 0) return NULL;
     if (description.residency != ustore_residency_vram_k) return dlpack_device_pair(kDLCPU, 0);
-    ustore_gpu_device_t devices[128];
-    ustore_size_t count = 0;
-    ustore_outcome_t outcome = {0};
-    ustore_gpu_devices_t listing = {
-        .outcome = &outcome,
-        .devices = devices,
-        .devices_capacity = sizeof(devices) / sizeof(devices[0]),
-        .devices_count = &count,
-    };
-    ustore_gpu_devices(&listing);
-    if (ustore_py_raise_on_outcome(&outcome) != 0) return NULL;
-    if (description.device < 0 || (ustore_size_t)description.device >= count ||
-        (ustore_size_t)description.device >= listing.devices_capacity) {
-        ustore_py_raise(ustore_status_device_k, "No device holds the ordinal %d of the arena", (int)description.device);
-        return NULL;
-    }
-    ustore_gpu_device_t const* const device = &devices[description.device];
-    DLDeviceType const device_type = device->vendor == ustore_gpu_vendor_amd_k     ? kDLROCM
-                                     : device->vendor == ustore_gpu_vendor_apple_k ? kDLMetal
-                                                                                   : kDLCUDA;
-    return dlpack_device_pair(device_type, device->vendor_ordinal);
+    DLDeviceType const device_type = description.vendor == ustore_gpu_vendor_amd_k     ? kDLROCM
+                                     : description.vendor == ustore_gpu_vendor_apple_k ? kDLMetal
+                                                                                       : kDLCUDA;
+    return dlpack_device_pair(device_type, (unsigned long)description.vendor_ordinal);
 }
 
 /**

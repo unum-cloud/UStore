@@ -611,9 +611,13 @@ func (receiver storeReceiver[Handle]) lower() (C.ustore_database_t, C.ustore_exe
 	return receiver.database, executor, err
 }
 
-// lowerInto is lower for a verb writing into arena, refusing a closed one too.
+// lowerInto is lower for a verb writing into arena, refusing a closed one too, and one whose
+// memory the host may not read.
 func (receiver storeReceiver[Handle]) lowerInto(arena *Arena) (C.ustore_database_t, C.ustore_executor_t, C.ustore_arena_t, error) {
 	_, executor, outputs, err := receiver.receiver.lowerInto(arena)
+	if err == nil {
+		err = arena.host()
+	}
 	return receiver.database, executor, outputs, err
 }
 

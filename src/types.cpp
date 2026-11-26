@@ -13,12 +13,14 @@
 
 #include <algorithm>   // `std::any_of`, `std::find`
 #include <array>       // `std::array`
+#include <limits>      // `std::numeric_limits`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
 #include <utility>     // `std::move`
 #include <variant>     // `std::variant`, `std::get_if`, `std::visit`
 
+#include <forkunion/atomics.hpp>       // `fu::atomic_fetch_add_if_at_most`, `fu::atomic_fetch_sub_if_at_least`
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/types.h" // `ustore_executor_for_ram_t`, `ustore_arena_init_t`, `ustore_version`, `USTORE_OS_LINUX_`
@@ -48,6 +50,7 @@ constexpr enumerator_spelling<ustore_status_t> status_names_k[] {
     {ustore_status_device_k, "device"},
     {ustore_status_malformed_k, "malformed"},
     {ustore_status_internal_k, "internal"},
+    {ustore_status_overflow_k, "overflow"},
     {ustore_status_uninitialized_k, "uninitialized"},
     {ustore_status_config_mismatch_k, "config-mismatch"},
     {ustore_status_contended_k, "contended"},
@@ -75,8 +78,15 @@ constexpr enumerator_spelling<ustore_gds_t> gds_names_k[] {
     {ustore_gds_compatibility_k, "compatibility"},
 };
 
+/** The canonical spelling of every host access. */
+constexpr enumerator_spelling<ustore_host_access_t> host_access_names_k[] {
+    {ustore_host_access_refused_k, "refused"},
+    {ustore_host_access_readable_k, "readable"},
+};
+
 /** The canonical spelling of every GPU vendor. */
 constexpr enumerator_spelling<ustore_gpu_vendor_t> gpu_vendor_names_k[] {
+    {ustore_gpu_vendor_unknown_k, "unknown"},
     {ustore_gpu_vendor_nvidia_k, "nvidia"},
     {ustore_gpu_vendor_amd_k, "amd"},
     {ustore_gpu_vendor_apple_k, "apple"},
@@ -84,6 +94,7 @@ constexpr enumerator_spelling<ustore_gpu_vendor_t> gpu_vendor_names_k[] {
 
 /** The canonical spelling of every GPU class. */
 constexpr enumerator_spelling<ustore_gpu_class_t> gpu_class_names_k[] {
+    {ustore_gpu_class_unknown_k, "unknown"},
     {ustore_gpu_class_nvidia_ampere_k, "nvidia-ampere"},
     {ustore_gpu_class_nvidia_ada_k, "nvidia-ada"},
     {ustore_gpu_class_nvidia_hopper_k, "nvidia-hopper"},
@@ -447,6 +458,10 @@ char const* ustore_gds_name(ustore_gds_t gds) { return name_in(gds_names_k, gds)
 ustore_status_t ustore_gds_from_name(ustore_bytes_view_t name, ustore_gds_t* gds) {
     return value_in(gds_names_k, name, gds);
 }
+char const* ustore_host_access_name(ustore_host_access_t host_access) {
+    return name_in(host_access_names_k, host_access);
+}
+
 char const* ustore_gpu_vendor_name(ustore_gpu_vendor_t vendor) { return name_in(gpu_vendor_names_k, vendor); }
 ustore_status_t ustore_gpu_vendor_from_name(ustore_bytes_view_t name, ustore_gpu_vendor_t* vendor) {
     return value_in(gpu_vendor_names_k, name, vendor);
@@ -714,6 +729,7 @@ void ustore_arena_init(ustore_arena_init_t* arguments) {
     if (!arena) return finish(outcome, {util::status_code_t::out_of_memory_k, "No room for the arena"});
     // Nothing is allocated until the first call writes, on the memory domain or the first device
     // its executor names
+    arena->executor = arguments->executor;
     if (ustore_executor_t const executor = arguments->executor)
         std::visit(
             [&]<typename kind_type_>(kind_type_ const& kind) noexcept {
@@ -729,10 +745,34 @@ void ustore_arena_init(ustore_arena_init_t* arguments) {
     finish(outcome, {});
 }
 
-void ustore_arena_free(ustore_arena_t arena) {
-    if (!arena) return;
+ustore_status_t ustore_arena_free(ustore_arena_t arena) {
+    if (!arena) return ustore_status_success_k;
+    if (floor_atomic_ref<std::uint32_t const>(arena->exports).load(std::memory_order_acquire) != 0)
+        return ustore_status_contended_k;
     wait_named_calls(arena->named_calls);
     destroy_arena(arena);
+    return ustore_status_success_k;
+}
+
+ustore_status_t ustore_arena_export_open(ustore_arena_t arena) {
+    if (!arena) return ustore_status_invalid_argument_k;
+    std::uint32_t constexpr most_k = (std::numeric_limits<std::uint32_t>::max)();
+    if (fu::atomic_fetch_add_if_at_most(floor_atomic_ref<std::uint32_t>(arena->exports), 1u, most_k,
+                                        std::memory_order_seq_cst) == most_k)
+        return ustore_status_overflow_k;
+    // A call takes the claim, then reads the count; the export raises the count, then reads the
+    // claim, so of the two racing, one sees the other
+    if (floor_atomic_ref<claim_t const>(arena->claim).load(std::memory_order_seq_cst) == claim_t::held_k) {
+        ustore_arena_export_close(arena);
+        return ustore_status_contended_k;
+    }
+    return ustore_status_success_k;
+}
+
+void ustore_arena_export_close(ustore_arena_t arena) {
+    if (!arena) return;
+    fu::atomic_fetch_sub_if_at_least(floor_atomic_ref<std::uint32_t>(arena->exports), 1u, 0u,
+                                     std::memory_order_release);
 }
 
 void ustore_arena_describe(ustore_arena_describe_t* arguments) {
@@ -742,9 +782,11 @@ void ustore_arena_describe(ustore_arena_describe_t* arguments) {
         return finish(outcome,
                       {util::status_code_t::invalid_argument_k, "The call needs an arena and description output"});
     ustore_arena_description_t& description = *arguments->description;
-    description = {ustore_residency_ram_k, -1};
+    description = {ustore_residency_ram_k, -1, ustore_gpu_vendor_unknown_k, -1, ustore_host_access_readable_k};
     gpu_vendor_t vendor = gpu_vendor_t::nvidia_k;
     std::int32_t vendor_ordinal = -1;
+    // NVIDIA and AMD runs are the device's own memory; Apple's are shared storage the host reads
+    ustore_host_access_t host_access = ustore_host_access_refused_k;
     if (cuda_blocks_t const* const cuda = std::get_if<cuda_blocks_t>(&arena->memory)) vendor_ordinal = cuda->device;
     if (hip_blocks_t const* const hip = std::get_if<hip_blocks_t>(&arena->memory)) {
         vendor = gpu_vendor_t::amd_k;
@@ -753,9 +795,10 @@ void ustore_arena_describe(ustore_arena_describe_t* arguments) {
     if (metal_blocks_t const* const metal = std::get_if<metal_blocks_t>(&arena->memory)) {
         vendor = gpu_vendor_t::apple_k;
         vendor_ordinal = metal->device;
+        host_access = ustore_host_access_readable_k;
     }
     if (vendor_ordinal < 0) return finish(outcome, {});
-    description.residency = ustore_residency_vram_k;
+    description = {ustore_residency_vram_k, -1, static_cast<ustore_gpu_vendor_t>(vendor), vendor_ordinal, host_access};
     std::span<gpu_device_t const> const devices = gpu_devices();
     for (std::size_t position = 0; position != devices.size(); ++position)
         if (devices[position].vendor == vendor &&

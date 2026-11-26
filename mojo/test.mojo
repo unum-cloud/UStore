@@ -31,6 +31,7 @@ from ustore import (
     Executor,
     GPUClass,
     GPUVendor,
+    HostAccess,
     Key,
     KeysView,
     Library,
@@ -147,6 +148,7 @@ def test_enums_spell_and_parse_as_the_library_names_them() raises:
     var library = Library()
     assert_equal(library.version()[0], 1)
     assert_equal(library.status_name(Status.NOT_FOUND), "not-found")
+    assert_true(library.status_from_name("overflow") == Status.OVERFLOW)
     assert_true(library.status_from_name("not-found") == Status.NOT_FOUND)
     with assert_raises():
         _ = library.durability_from_name("bogus")
@@ -154,6 +156,8 @@ def test_enums_spell_and_parse_as_the_library_names_them() raises:
     assert_equal(library.phase_name(Phase.MERGE), "merge")
     assert_true(library.phase_from_name("reclaim") == Phase.RECLAIM)
     assert_equal(library.gpu_vendor_name(GPUVendor.APPLE), "apple")
+    assert_equal(library.host_access_name(HostAccess.REFUSED), "refused")
+    assert_equal(library.host_access_name(HostAccess.READABLE), "readable")
     assert_true(library.gpu_class_from_name("apple-metal9") == GPUClass.APPLE_METAL9)
 
 
@@ -170,7 +174,10 @@ def test_blobs_write_read_and_scan() raises:
     db.write(CollectionsView.repeating(people), KeysView.of(keys), StringsView.of(values.bytes, values.offsets))
 
     var arena = Arena(library)
-    assert_true(arena.describe().residency == Residency.RAM)
+    var description = arena.describe()
+    assert_true(description.residency == Residency.RAM and description.device == -1)
+    assert_true(description.vendor == GPUVendor.UNKNOWN and description.vendor_ordinal == -1)
+    assert_true(description.host_access == HostAccess.READABLE)
     var asked: List[Key] = [Key(2), Key(9)]
     var read = db.read(CollectionsView.repeating(people), KeysView.of(asked), arena)
     assert_true(read.present(0))
@@ -204,6 +211,29 @@ def test_a_later_call_retires_earlier_results() raises:
     except error:
         refused = error.status
     assert_true(refused == Status.INVALID_ARGUMENT, "a rewound result must refuse reads")
+
+
+def test_host_reads_of_device_memory_refuse() raises:
+    """A result over memory the host may not read refuses every host read, as a device arena's would;
+    the stub makes only host arenas, so the arena is marked as one the library described as refused."""
+    if not _library_is_present():
+        _skipped(library_missing_k)
+        return
+    var library = Library()
+    var db = Database.init_ram(Executor(library))
+    var people = db.collection_create("", Modality.BLOBS)
+    var key = Key(1)
+    var values = _Tape(["one"])
+    db.write(CollectionsView.repeating(people), KeysView.repeating(key), StringsView.of(values.bytes, values.offsets))
+    var arena = Arena(library)
+    arena._host_access = HostAccess.REFUSED
+    var read = db.read(CollectionsView.repeating(people), KeysView.repeating(key), arena)
+    var refused = Status.SUCCESS
+    try:
+        _ = read.present(0)
+    except error:
+        refused = error.status
+    assert_true(refused == Status.DEVICE, "a host read of device memory must refuse")
 
 
 def test_strings_map_onto_keys() raises:
@@ -770,6 +800,7 @@ def main() raises:
     suite.test[test_enums_spell_and_parse_as_the_library_names_them]()
     suite.test[test_blobs_write_read_and_scan]()
     suite.test[test_a_later_call_retires_earlier_results]()
+    suite.test[test_host_reads_of_device_memory_refuse]()
     suite.test[test_strings_map_onto_keys]()
     suite.test[test_docs_write_and_read]()
     suite.test[test_graph_edges_round_trip]()

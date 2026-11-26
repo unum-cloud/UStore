@@ -7,6 +7,7 @@
 package ustore_test
 
 import (
+	"errors"
 	"slices"
 	"testing"
 
@@ -26,6 +27,10 @@ func TestArrowColumnsRoundTrip(t *testing.T) {
 	}
 	defer schema.Release()
 	defer array.Release()
+	// The open export holds the arena, so a Close frees nothing and the fixture's Close retries it
+	if err := arena.Close(); !errors.Is(err, ustore.StatusContended) {
+		t.Fatalf("closing an exported arena answered %v", err)
+	}
 	viewed, err := ustore.KeysViewFromArrow(&schema, array.Array())
 	if err != nil || !slices.Equal(viewed, keys(1, 2, 3)) {
 		t.Fatalf("viewed %v, %v", viewed, err)
