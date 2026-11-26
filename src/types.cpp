@@ -747,9 +747,9 @@ void ustore_arena_init(ustore_arena_init_t* arguments) {
 
 ustore_status_t ustore_arena_free(ustore_arena_t arena) {
     if (!arena) return ustore_status_success_k;
+    wait_named_calls(arena->named_calls);
     if (floor_atomic_ref<std::uint32_t const>(arena->exports).load(std::memory_order_acquire) != 0)
         return ustore_status_contended_k;
-    wait_named_calls(arena->named_calls);
     destroy_arena(arena);
     return ustore_status_success_k;
 }
