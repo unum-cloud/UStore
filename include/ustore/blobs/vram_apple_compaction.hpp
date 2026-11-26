@@ -37,7 +37,7 @@
 
 namespace unum::ustore::blobs {
 
-using utilities::bytes_of;
+using util::bytes_of;
 
 /**
  *  @brief The device compactor a database's merges run on an Apple device, made once at open over
@@ -57,7 +57,7 @@ class metal_compactor_t {
     /** Binds a compactor to @p executor, which outlives it, reading run sections
      *  through @p sections; refused with @c unsupported_k where the executor's device
      *  loaded no bundle of the library's kernels. */
-    static expected<metal_compactor_t> make(utilities::metal_executor_t& executor,
+    static expected<metal_compactor_t> make(util::metal_executor_t& executor,
                                             device_sections_reader_t sections = {}) noexcept;
 
     /** Holds nothing, as a moved-from compactor does. */
@@ -89,8 +89,7 @@ class metal_compactor_t {
      *  whose scratch would pass the executor's limit, or whose planned runs outgrow what the
      *  merge leaves free, refuses with @c out_of_memory_heap_k, so the tree merges on the host.
      */
-    template <typename key_slot_type_, utilities::a_fold fold_type_, typename device_fold_type_,
-              typename allocator_type_>
+    template <typename key_slot_type_, util::a_fold fold_type_, typename device_fold_type_, typename allocator_type_>
         requires a_compactable_key_slot<key_slot_type_>
     st::status_t compact(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_type_> const> upper,
                          std::span<sorted_run_index_view<key_slot_type_> const> lower,
@@ -119,8 +118,7 @@ class metal_compactor_t {
 
   private:
     /** As @c compact, for a key slot the bundles export merge kernels for. */
-    template <typename key_slot_type_, utilities::a_fold fold_type_, typename device_fold_type_,
-              typename allocator_type_>
+    template <typename key_slot_type_, util::a_fold fold_type_, typename device_fold_type_, typename allocator_type_>
         requires a_compactable_key_slot<key_slot_type_>
     st::status_t compact_on_device_(compaction_kind_t kind,
                                     std::span<sorted_run_index_view<key_slot_type_> const> upper,
@@ -137,11 +135,11 @@ class metal_compactor_t {
     template <typename record_type_>
     st::expected<packed_counts_t> pack_(char const* name, merge_pack_regions<record_type_> const& regions) noexcept;
 
-    metal_compactor_t(utilities::metal_executor_t& executor, device_sections_reader_t sections) noexcept
+    metal_compactor_t(util::metal_executor_t& executor, device_sections_reader_t sections) noexcept
         : executor_(&executor), sections_(sections) {}
 
     /** The stream every merge queues on, the executor's first. */
-    utilities::metal_executor_t::stream_t& stream_() const noexcept { return executor_->stream(0); }
+    util::metal_executor_t::stream_t& stream_() const noexcept { return executor_->stream(0); }
 
     /** Carves @p count elements off the compactor's device blocks, counting the runs it opens, null
      *  when it cannot. */
@@ -150,14 +148,14 @@ class metal_compactor_t {
 
     /** The caller's executor, which every merge queues on and allocates through, valid until
      *  the compactor is destroyed. */
-    utilities::metal_executor_t* executor_ = nullptr;
+    util::metal_executor_t* executor_ = nullptr;
 
     /** The transport run sections read through, empty where every run uploads from its memory. */
     device_sections_reader_t sections_;
 
     /** The device runs every merge carves its regions from, owned, rewound per merge to the
      *  newest and largest. */
-    utilities::device_blocks_t blocks_ {};
+    util::device_blocks_t blocks_ {};
 
     /** Device allocations the blocks made. */
     std::uint64_t device_allocations_ = 0;
@@ -171,7 +169,7 @@ class metal_compactor_t {
 template <typename element_type_>
 element_type_* metal_compactor_t::carve_(std::size_t count) noexcept {
     std::uint32_t const held = blocks_.count;
-    auto const [carved, status] = utilities::carve_runs<element_type_>(
+    auto const [carved, status] = util::carve_runs<element_type_>(
         blocks_, stream_(), count, [&](std::size_t bytes) noexcept { return stream_().allocate_async(bytes); });
     device_allocations_ += blocks_.count - held;
     return status.failed() ? nullptr : carved.data();
@@ -182,17 +180,17 @@ st::expected<packed_counts_t> metal_compactor_t::pack_(char const* name,
                                                        merge_pack_regions<record_type_> const& regions) noexcept {
     using st::status_t;
     // Few enough tiles that each sums the bytes of the ones before it, as many as a chain's blocks
-    std::uint64_t const tile = round_up_to_multiple(
-        divide_round_up(regions.records_count, utilities::chain_blocks_max_k), std::uint64_t {256});
+    std::uint64_t const tile = round_up_to_multiple(divide_round_up(regions.records_count, util::chain_blocks_max_k),
+                                                    std::uint64_t {256});
     std::uint32_t const tiles = static_cast<std::uint32_t>(divide_round_up(regions.records_count, tile));
     std::uint64_t* const counts = carve_<std::uint64_t>(std::size_t {tiles} + 1);
     std::uint64_t* const tile_bytes = carve_<std::uint64_t>(tiles);
     std::uint64_t* const survivors_count = carve_<std::uint64_t>(1);
     if (!counts || !tile_bytes || !survivors_count) return status_t::out_of_memory_heap_k;
-    status_t status = executor_status(utilities::count_flagged(stream_(), regions.flags, regions.records_count,
-                                                               static_cast<std::uint32_t>(tile), tiles, counts));
+    status_t status = executor_status(util::count_flagged(stream_(), regions.flags, regions.records_count,
+                                                          static_cast<std::uint32_t>(tile), tiles, counts));
     if (status != status_t::success_k) return status;
-    status = executor_status(utilities::launch(
+    status = executor_status(util::launch(
         stream_(), stream_().kernels->function(name), tiles, merge_block_threads_k, 0u, regions.merged, regions.flags,
         regions.records_count, regions.replaced, regions.replacements, regions.replaced_count,
         static_cast<std::uint64_t const*>(counts), static_cast<std::uint32_t>(tile), tiles, regions.survivors,
@@ -200,15 +198,15 @@ st::expected<packed_counts_t> metal_compactor_t::pack_(char const* name,
     if (status != status_t::success_k) return status;
     // Value offsets scan within each tile, so every tile past the first adds the bytes before it
     if (regions.prefix != nullptr && tiles > 1)
-        status = executor_status(utilities::launch(stream_(), stream_().kernels->function("ustore_merge_offsets_apple"),
-                                                   tiles, merge_block_threads_k, 0u,
-                                                   static_cast<std::uint64_t const*>(counts), tiles,
-                                                   static_cast<std::uint64_t const*>(tile_bytes), regions.prefix));
+        status = executor_status(util::launch(stream_(), stream_().kernels->function("ustore_merge_offsets_apple"),
+                                              tiles, merge_block_threads_k, 0u,
+                                              static_cast<std::uint64_t const*>(counts), tiles,
+                                              static_cast<std::uint64_t const*>(tile_bytes), regions.prefix));
     if (status != status_t::success_k) return status;
     return packed_counts_t {survivors_count};
 }
 
-template <typename key_slot_type_, utilities::a_fold fold_type_, typename device_fold_type_, typename allocator_type_>
+template <typename key_slot_type_, util::a_fold fold_type_, typename device_fold_type_, typename allocator_type_>
     requires a_compactable_key_slot<key_slot_type_>
 st::status_t metal_compactor_t::compact(compaction_kind_t kind,
                                         std::span<sorted_run_index_view<key_slot_type_> const> upper,
@@ -224,7 +222,7 @@ st::status_t metal_compactor_t::compact(compaction_kind_t kind,
     else return st::status_t::invalid_argument_k;
 }
 
-template <typename key_slot_type_, utilities::a_fold fold_type_, typename device_fold_type_, typename allocator_type_>
+template <typename key_slot_type_, util::a_fold fold_type_, typename device_fold_type_, typename allocator_type_>
     requires a_compactable_key_slot<key_slot_type_>
 st::status_t metal_compactor_t::compact_on_device_(
     compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_type_> const> upper,
@@ -276,11 +274,11 @@ st::status_t metal_compactor_t::compact_on_device_(
     // The reader registered the newest run, which a rewind keeps, unless a merge opened more
     // after its sections
     if (blocks_.count > 1) sections_.release();
-    utilities::rewind(blocks_, stream_());
+    util::rewind(blocks_, stream_());
 
     // The sections land first, in one region, so the reader registers the run holding it and
     // reads into it
-    std::size_t const page = static_cast<std::size_t>(utilities::portable_alignment_k);
+    std::size_t const page = static_cast<std::size_t>(util::portable_alignment_k);
     byte_t* const region = sizing.at != 0 ? carve_<byte_t>(static_cast<std::size_t>(sizing.at) + page) : nullptr;
     if (sizing.at != 0 && !region) return status_t::out_of_memory_heap_k;
     std::uintptr_t const sections_base = round_up_to_multiple<std::uintptr_t>(reinterpret_cast<std::uintptr_t>(region),
@@ -326,7 +324,7 @@ st::status_t metal_compactor_t::compact_on_device_(
               device_section_read_t {run_extents.volume, run_extents.value_offsets, into(sections.value_offsets),
                                      run_extents.run},
               device_section_read_t {run_extents.volume, run_extents.trailer, into(sections.trailer), run_extents.run},
-              device_section_read_t {run_extents.volume, sections.keys ? run_extents.keys : utilities::extent_t {},
+              device_section_read_t {run_extents.volume, sections.keys ? run_extents.keys : util::extent_t {},
                                      sections.keys ? into(sections.keys) : 0, run_extents.run}})
             if (!read.extent.empty() && reads_.push_back(device_section_read_t {read}) != status_t::success_k)
                 return false;
@@ -525,8 +523,8 @@ st::status_t metal_compactor_t::compact_on_device_(
         std::size_t carved = blocks_.used;
         for (std::uint32_t block = 0; block + 1 != blocks_.count; ++block) carved += blocks_.blocks[block].capacity;
         sections_.release();
-        utilities::rewind(blocks_, stream_());
-        if (carve_<byte_t>(carved)) utilities::rewind(blocks_, stream_());
+        util::rewind(blocks_, stream_());
+        if (carve_<byte_t>(carved)) util::rewind(blocks_, stream_());
     }
 
     // The prefix is the new runs' value offsets, and the copy plan coalesces the survivors'

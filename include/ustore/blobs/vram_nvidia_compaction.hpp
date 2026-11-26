@@ -44,7 +44,7 @@ class cuda_compactor_t {
     /** Binds a compactor to @p executor, which outlives it, reading run sections
      *  through @p sections; refused with @c unsupported_k where the executor's device
      *  loaded no bundle of the library's kernels. */
-    static expected<cuda_compactor_t> make(utilities::cuda_executor_t& executor,
+    static expected<cuda_compactor_t> make(util::cuda_executor_t& executor,
                                            device_sections_reader_t sections = {}) noexcept;
 
     /** Holds nothing, as a moved-from compactor does. */
@@ -76,8 +76,7 @@ class cuda_compactor_t {
      *  whose scratch would pass the executor's limit, or whose planned runs outgrow what the
      *  merge leaves free, refuses with @c out_of_memory_heap_k, so the tree merges on the host.
      */
-    template <typename key_slot_type_, utilities::a_fold fold_type_, typename device_fold_type_,
-              typename allocator_type_>
+    template <typename key_slot_type_, util::a_fold fold_type_, typename device_fold_type_, typename allocator_type_>
         requires a_compactable_key_slot<key_slot_type_>
     st::status_t compact(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_type_> const> upper,
                          std::span<sorted_run_index_view<key_slot_type_> const> lower,
@@ -106,8 +105,7 @@ class cuda_compactor_t {
 
   private:
     /** As @c compact, for a key slot the bundles export merge kernels for. */
-    template <typename key_slot_type_, utilities::a_fold fold_type_, typename device_fold_type_,
-              typename allocator_type_>
+    template <typename key_slot_type_, util::a_fold fold_type_, typename device_fold_type_, typename allocator_type_>
         requires a_compactable_key_slot<key_slot_type_>
     st::status_t compact_on_device_(compaction_kind_t kind,
                                     std::span<sorted_run_index_view<key_slot_type_> const> upper,
@@ -123,11 +121,11 @@ class cuda_compactor_t {
     template <typename record_type_>
     st::expected<packed_counts_t> pack_(char const* name, merge_pack_regions<record_type_> const& regions) noexcept;
 
-    cuda_compactor_t(utilities::cuda_executor_t& executor, device_sections_reader_t sections) noexcept
+    cuda_compactor_t(util::cuda_executor_t& executor, device_sections_reader_t sections) noexcept
         : executor_(&executor), sections_(sections) {}
 
     /** The stream every merge queues on, the executor's first. */
-    utilities::cuda_executor_t::stream_t& stream_() const noexcept { return executor_->stream(0); }
+    util::cuda_executor_t::stream_t& stream_() const noexcept { return executor_->stream(0); }
 
     /** Carves @p count elements off the compactor's device blocks, counting the runs it opens, null
      *  when it cannot. */
@@ -136,14 +134,14 @@ class cuda_compactor_t {
 
     /** The caller's executor, which every merge queues on and allocates through, valid until
      *  the compactor is destroyed. */
-    utilities::cuda_executor_t* executor_ = nullptr;
+    util::cuda_executor_t* executor_ = nullptr;
 
     /** The transport run sections read through, empty where every run uploads from its memory. */
     device_sections_reader_t sections_;
 
     /** The device runs every merge carves its regions from, owned, rewound per merge to the
      *  newest and largest. */
-    utilities::device_blocks_t blocks_ {};
+    util::device_blocks_t blocks_ {};
 
     /** Device allocations the blocks made. */
     std::uint64_t device_allocations_ = 0;

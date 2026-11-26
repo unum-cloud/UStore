@@ -394,7 +394,7 @@ class pinned_bounce {
     void rewind() noexcept {
         host_blocks_t& blocks = std::get<host_blocks_t>(arena_.memory);
         unpin(blocks.newest);
-        utilities::rewind(blocks);
+        util::rewind(blocks);
     }
 
     /** Pins every block grown since the last pin. */

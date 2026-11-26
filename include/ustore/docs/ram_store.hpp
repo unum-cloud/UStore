@@ -20,7 +20,7 @@ using document_pair_t = st::mapping<ustore_key_t, blobs::document_text_t>;
 
 /** A documents collection: every key mapped onto the JSON text of its document, edited in place. */
 template <blobs::isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
-using documents_by_key_store = blobs::ordered_store<document_pair_t, utilities::uuid_order_t, utilities::uuid_hash_t,
-                                                    isolation_, atomic_reference_, waiter_type_>;
+using documents_by_key_store = blobs::ordered_store<document_pair_t, util::uuid_order_t, util::uuid_hash_t, isolation_,
+                                                    atomic_reference_, waiter_type_>;
 
 } // namespace unum::ustore::docs

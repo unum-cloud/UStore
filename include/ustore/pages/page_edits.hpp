@@ -29,8 +29,8 @@
 
 namespace unum::ustore::pages {
 
-using utilities::bytes_of;
-using utilities::chars_of;
+using util::bytes_of;
+using util::chars_of;
 
 /** The kind of an edit, named after the call that makes it and numbered as its serialized form spells it. */
 enum class modification_t : std::uint8_t {

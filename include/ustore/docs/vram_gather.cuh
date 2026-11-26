@@ -110,7 +110,7 @@ struct gather_texts_t {
     ustore_length_t* lengths = nullptr;
 
     /** Every row's length, which the tape kernels scan into @c offsets. */
-    utilities::tape_source_t* measured = nullptr;
+    util::tape_source_t* measured = nullptr;
 
     /** Where every row's bytes start, and the bytes, written once the measured rows are scanned. */
     std::uint64_t const* offsets = nullptr;

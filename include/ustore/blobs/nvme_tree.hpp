@@ -75,25 +75,25 @@
 
 namespace unum::ustore::blobs {
 
-using utilities::a_disk;
-using utilities::a_serializable_value;
-using utilities::constrained_allocator;
-using utilities::fields_storage_requirements;
-using utilities::load;
-using utilities::load_fields;
-using utilities::medium_reference_t;
-using utilities::pooled_buffer_t;
-using utilities::resource_constraint;
-using utilities::resources_config_t;
-using utilities::save;
-using utilities::save_fields;
-using utilities::storage_requirements;
-using utilities::string_t;
-using utilities::string_view_t;
-using utilities::uuid_from_text;
-using utilities::uuid_generator;
-using utilities::uuid_text_length_k;
-using utilities::uuid_to_text;
+using util::a_disk;
+using util::a_serializable_value;
+using util::constrained_allocator;
+using util::fields_storage_requirements;
+using util::load;
+using util::load_fields;
+using util::medium_reference_t;
+using util::pooled_buffer_t;
+using util::resource_constraint;
+using util::resources_config_t;
+using util::save;
+using util::save_fields;
+using util::storage_requirements;
+using util::string_t;
+using util::string_view_t;
+using util::uuid_from_text;
+using util::uuid_generator;
+using util::uuid_text_length_k;
+using util::uuid_to_text;
 
 #pragma region Names
 
@@ -343,12 +343,12 @@ class lsm_tree {
      *  @param[in] slot_bytes The unit levels and runs are sized by, which only tests shrink.
      */
     static expected<lsm_tree> mount(volume_t& volume, lsm_tree_config_t const& config, run_pool_t& runs,
-                                    std::uint64_t slot_bytes = utilities::slot_bytes_k) noexcept {
+                                    std::uint64_t slot_bytes = util::slot_bytes_k) noexcept {
         // The enlarge factor sizes every level and level zero's run count alike, so a tree without one has no shape
         if (config.level_enlarge_factor < storage_limits_t::level_min_enlarge_factor_k ||
             config.level_enlarge_factor > storage_limits_t::level_max_enlarge_factor_k)
             return status_t {status_code_t::invalid_argument_k, "The level growth factor is out of bounds"};
-        if (slot_bytes <= utilities::slot_payload_offset_k)
+        if (slot_bytes <= util::slot_payload_offset_k)
             return status_t {status_code_t::invalid_argument_k, "A slot holds more than its owner block"};
         lsm_tree tree;
         tree.volume_ = &volume;
@@ -464,7 +464,7 @@ class lsm_tree {
             lsm_tree_position_t const& position = positions[request];
             return taken.level(position.level_number).value_window(position.level_position);
         };
-        auto [located, located_status] = utilities::arena_allocate<located_value_t>(scratch, positions.size());
+        auto [located, located_status] = util::arena_allocate<located_value_t>(scratch, positions.size());
         if (located_status.failed()) return located_status;
         std::size_t located_count = 0;
         std::size_t reads_bound = 0;
@@ -485,7 +485,7 @@ class lsm_tree {
             return left.run != right.run ? left.run < right.run : left.offset < right.offset;
         });
 
-        auto [reads, reads_status] = utilities::arena_allocate<located_read_t>(scratch, reads_bound);
+        auto [reads, reads_status] = util::arena_allocate<located_read_t>(scratch, reads_bound);
         if (reads_status.failed()) return reads_status;
         std::size_t reads_count = 0;
         std::uint64_t open_begin = 0;
@@ -745,7 +745,7 @@ class lsm_tree {
      *      @p reading_channel and @p writing_channel.
      *  @return What the pass did, or the status that stopped it with the current level set untouched.
      */
-    template <utilities::a_fold fold_type_, typename device_fold_type_>
+    template <util::a_fold fold_type_, typename device_fold_type_>
     expected<compaction_outcome_t> compact(
         io_channel_t& reading_channel, io_channel_t& writing_channel, std::span<merge_buffers_t> buffers,
         compaction_placement_t placement, compactor_ref_t const& compactor, cancellation_t const* cancellation,
@@ -772,7 +772,7 @@ class lsm_tree {
      *  manifest it found never promised, and those land nowhere else, so dropping them all leaves
      *  only commits that landed whole.
      */
-    template <utilities::a_fold fold_type_>
+    template <util::a_fold fold_type_>
     status_t truncate_above(io_channel_t& reading_channel, io_channel_t& writing_channel,
                             std::span<merge_buffers_t> buffers, std::uint64_t ceiling, fold_type_ const& fold,
                             lsm_tree_publication_hook_t const& published = lsm_tree_publication_hook_t {}) noexcept {
@@ -1179,7 +1179,7 @@ class lsm_tree {
         request.collection = config_.collection;
         sorted_run_config_t const& values = config_.lsm_level_0.sorted_run;
         request.value_max_size = is_fixed(value_layout_k) ? values.value_size : values.value_max_size;
-        request.run_bytes_limit = slot_bytes_ - utilities::slot_payload_offset_k;
+        request.run_bytes_limit = slot_bytes_ - util::slot_payload_offset_k;
         request.placement = placement;
         request.compactor = compactor;
         request.cancellation = cancellation;

@@ -770,7 +770,7 @@ class basic_directory_volume {
             return {status_code_t::out_of_memory_k, "No room to list the manifest runs"};
         for (manifest_file_t const& file : manifest_.files) [[maybe_unused]]
             st::status_t const placed = named.push_back(st::assume_reserved, uuid128_t {file.run});
-        utilities::radix_sort(
+        util::radix_sort(
             std::span<uuid128_t> {named}, uuid128_t::size_bytes_k,
             [](uuid128_t const& run, std::size_t digit) noexcept -> std::size_t { return run.bytes[digit]; },
             [](uuid128_t const& first, uuid128_t const& second) noexcept { return first < second; });

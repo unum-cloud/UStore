@@ -295,7 +295,7 @@ class any_files_disk {
      *  the held transport can and polling where it cannot. */
     expected<std::size_t> wait_completions(queue_ref_t const& queue_pair, std::span<completion_t> into) noexcept {
         return std::visit(
-            [&](auto& disk) noexcept { return utilities::wait_completions<waiter_type_>(disk, queue_pair, into); },
+            [&](auto& disk) noexcept { return util::wait_completions<waiter_type_>(disk, queue_pair, into); },
             probed_disk_);
     }
 

@@ -30,16 +30,16 @@
 
 namespace unum::ustore::blobs {
 
-using utilities::a_serializable_value;
-using utilities::load;
-using utilities::resources_config_t;
-using utilities::save_fields;
-using utilities::storage_requirements;
-using utilities::string_t;
-using utilities::string_view_t;
-using utilities::uuid_from_text;
-using utilities::uuid_text_length_k;
-using utilities::uuid_to_text;
+using util::a_serializable_value;
+using util::load;
+using util::resources_config_t;
+using util::save_fields;
+using util::storage_requirements;
+using util::string_t;
+using util::string_view_t;
+using util::uuid_from_text;
+using util::uuid_text_length_k;
+using util::uuid_to_text;
 
 #pragma region Background States
 
@@ -131,7 +131,7 @@ struct database_config_t {
 
     /** How the database treats its volume: @c read_only_k adopts the manifest as it lies and
      *  publishes nothing, neither truncating torn commits at mount nor flushing at unmount. */
-    utilities::medium_access_t access = utilities::medium_access_t::create_read_write_k;
+    util::medium_access_t access = util::medium_access_t::create_read_write_k;
 };
 
 /** Limits of one single-collection database: its collection and its transactions. */

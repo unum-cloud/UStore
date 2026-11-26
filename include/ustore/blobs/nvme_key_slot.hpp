@@ -38,24 +38,24 @@
 
 namespace unum::ustore::blobs {
 
-using utilities::buffer_alignment_k;
-using utilities::byte_t;
-using utilities::bytes_span_t;
-using utilities::bytes_view_t;
-using utilities::delta_kind_t;
-using utilities::disk_id_t;
-using utilities::divide_round_up;
-using utilities::expected;
-using utilities::file_id_t;
-using utilities::heap_allocator;
-using utilities::round_down_to_multiple;
-using utilities::round_up_to_multiple;
-using utilities::status_code_t;
-using utilities::status_t;
-using utilities::to_status;
-using utilities::u32_t;
-using utilities::u64_t;
-using utilities::uuid128_t;
+using util::buffer_alignment_k;
+using util::byte_t;
+using util::bytes_span_t;
+using util::bytes_view_t;
+using util::delta_kind_t;
+using util::disk_id_t;
+using util::divide_round_up;
+using util::expected;
+using util::file_id_t;
+using util::heap_allocator;
+using util::round_down_to_multiple;
+using util::round_up_to_multiple;
+using util::status_code_t;
+using util::status_t;
+using util::to_status;
+using util::u32_t;
+using util::u64_t;
+using util::uuid128_t;
 
 #pragma region Identifiers and Layouts
 
@@ -805,7 +805,7 @@ struct storage_limits_t {
     static constexpr std::size_t memory_runs_min_bytes_k = 1024;
 
     /** A flush drains up to twice the memory-run bound, which one run must still hold. */
-    static constexpr std::size_t memory_runs_max_bytes_k = utilities::slot_bytes_k / 4;
+    static constexpr std::size_t memory_runs_max_bytes_k = util::slot_bytes_k / 4;
     static constexpr std::size_t memory_runs_min_deltas_k = 16;
     static constexpr std::size_t memory_runs_max_deltas_k = 1024 * 1024;
     static constexpr std::size_t transaction_min_bytes_k = 1;
@@ -814,7 +814,7 @@ struct storage_limits_t {
     static constexpr std::size_t transaction_max_deltas_k = memory_runs_max_deltas_k;
     static constexpr std::size_t level_min_enlarge_factor_k = 2;
     static constexpr std::size_t level_max_enlarge_factor_k = 64;
-    static constexpr std::size_t sorted_run_file_max_size_k = utilities::sorted_run_bytes_max_k;
+    static constexpr std::size_t sorted_run_file_max_size_k = util::sorted_run_bytes_max_k;
     static constexpr std::size_t value_max_size_k = fu::max_of(fixed_value_max_size_k, variable_value_max_size_k);
 };
 

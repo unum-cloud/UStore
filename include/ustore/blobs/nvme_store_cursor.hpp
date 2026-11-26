@@ -41,7 +41,7 @@ namespace unum::ustore::blobs {
  *  starts at for as long as it lives.
  */
 template <typename key_slot_type_, typename volume_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_, utilities::a_fold fold_type_, typename device_fold_type_, typename row_kit_type_>
+          typename waiter_type_, util::a_fold fold_type_, typename device_fold_type_, typename row_kit_type_>
 class nvme_store_cursor {
   public:
 
@@ -214,7 +214,7 @@ class nvme_store_cursor {
             return segment;
         };
 
-        st::vector<segment_t, utilities::arena_allocator<segment_t>> segments {{scratch}};
+        st::vector<segment_t, util::arena_allocator<segment_t>> segments {{scratch}};
         std::size_t runs = view.memory_runs.runs().size();
         for (std::size_t number = 0; number != levels.size(); ++number) runs += levels.level(number).size();
         if (segments.reserve(runs) != st::status_t::success_k)
@@ -259,7 +259,7 @@ class nvme_store_cursor {
         };
         std::size_t const tasks_capacity = starts.size();
         std::uint64_t const samples_wanted = 8 * tasks_capacity;
-        st::vector<sample_t, utilities::arena_allocator<sample_t>> samples {{scratch}};
+        st::vector<sample_t, util::arena_allocator<sample_t>> samples {{scratch}};
         if (samples.reserve(samples_wanted + segments.size()) != st::status_t::success_k)
             return status_t {status_code_t::out_of_memory_k, "A split could not hold its samples"};
         for (segment_t const& segment : segments) {
@@ -664,7 +664,7 @@ class nvme_store_cursor {
             places_[filled_].level_number = value_place_t::folded_k;
             entry.state = source_->find_folded_(reading_(), entry.stored_key, entry.size);
         }
-        else if (utilities::removes(kind)) entry.state = lookup_result_t::removed_k;
+        else if (util::removes(kind)) entry.state = lookup_result_t::removed_k;
         else {
             entry.state = lookup_result_t::written_k;
             entry.size = static_cast<stored_value_size_t>(size);
@@ -738,13 +738,13 @@ class nvme_store_cursor {
     /** Per memory run of the view, newest first, the next sorted position an ascending walk visits,
      *  or one past the last position a descending walk is yet to visit, keeping its room from page
      *  to page, as the level cursors do. */
-    st::vector<std::size_t, utilities::arena_allocator<std::size_t>> memory_positions_;
+    st::vector<std::size_t, util::arena_allocator<std::size_t>> memory_positions_;
 
     /** The order the walk hands its keys out in. */
     scan_direction_t direction_ = scan_direction_t::ascending_k;
 
     /** One cursor per run of level zero and one per sorted level the view names. */
-    st::vector<level_cursor_t, utilities::arena_allocator<level_cursor_t>> cursors_;
+    st::vector<level_cursor_t, util::arena_allocator<level_cursor_t>> cursors_;
 
     /** The keys of the page, then the key the next page starts at. */
     std::array<entry_t, page_keys_k + 1> page_ {};

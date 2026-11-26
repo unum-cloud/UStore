@@ -216,7 +216,7 @@ __device__ void keep_sorted_chain(half_edge_record_t const* records, std::uint32
         std::uint32_t const position = base + threadIdx.x;
         bool const keeps = position < length &&
                            keeps_sorted(records, sorted, position, newest_removal, newest_operation);
-        utilities::block_scanned_t const scan = scan_type_::template block_exclusive<block_threads_>(keeps ? 1 : 0);
+        util::block_scanned_t const scan = scan_type_::template block_exclusive<block_threads_>(keeps ? 1 : 0);
         if (keeps) kept[start + written + scan.before] = sorted[position];
         written += scan.total;
     }
@@ -271,18 +271,18 @@ __device__ void fold_write(half_edge_record_t const* records, std::uint32_t cons
                            std::uint32_t const* kept_counts, std::uint32_t chains_count, std::uint64_t tickets,
                            half_edge_record_t removal, half_edge_record_t* composed, std::uint64_t* offsets,
                            std::uint64_t* chain) noexcept {
-    std::uint64_t const ticket = utilities::chain_ticket(chain);
-    std::uint64_t const tile = utilities::divide_round_up(std::uint64_t {chains_count}, tickets);
+    std::uint64_t const ticket = util::chain_ticket(chain);
+    std::uint64_t const tile = util::divide_round_up(std::uint64_t {chains_count}, tickets);
     std::uint64_t const first = ticket * tile < chains_count ? ticket * tile : chains_count;
     std::uint64_t const end = first + tile < chains_count ? first + tile : chains_count;
     std::uint64_t count = 0;
     for (std::uint64_t index = first + threadIdx.x; index < end; index += block_threads_) count += kept_counts[index];
-    std::uint64_t before = utilities::chain_offset(chain, ticket, tickets,
-                                                   scan_type_::template block_exclusive<block_threads_>(count).total);
+    std::uint64_t before = util::chain_offset(chain, ticket, tickets,
+                                              scan_type_::template block_exclusive<block_threads_>(count).total);
     for (std::uint64_t base = first; base < end; base += block_threads_) {
         std::uint64_t const index = base + threadIdx.x;
         std::uint64_t const thread_kept_count = index < end ? kept_counts[index] : 0;
-        utilities::block_scanned_t const scan = scan_type_::template block_exclusive<block_threads_>(thread_kept_count);
+        util::block_scanned_t const scan = scan_type_::template block_exclusive<block_threads_>(thread_kept_count);
         if (index < end) {
             std::uint64_t const offset = before + scan.before;
             offsets[index] = offset;
@@ -336,13 +336,13 @@ struct fold_regions_t {
 template <typename executor_type_>
 st::status_t launch_sort_steps(executor_type_& executor, fold_regions_t const& regions) noexcept {
     unsigned const blocks_count = static_cast<unsigned>(
-        fu::min_of(utilities::divide_round_up(regions.spilled_indices, std::uint64_t {2 * fold_block_threads_k}),
+        fu::min_of(util::divide_round_up(regions.spilled_indices, std::uint64_t {2 * fold_block_threads_k}),
                    std::uint64_t {65535}));
     // The launch of a stride below the block's threads finishes every stride below it
     for (std::uint32_t size = 2; size <= regions.spilled_width; size *= 2)
         for (std::uint32_t stride = size / 2; stride; stride = stride >= fold_block_threads_k ? stride / 2 : 0)
-            if (utilities::launch(executor, executor.kernels->function("ustore_fold_sort_step"), blocks_count,
-                                  fold_block_threads_k, 0u, regions.records, regions.spill, size, stride)
+            if (util::launch(executor, executor.kernels->function("ustore_fold_sort_step"), blocks_count,
+                             fold_block_threads_k, 0u, regions.records, regions.spill, size, stride)
                     .failed())
                 return st::status_t::unknown_k;
     return st::status_t::success_k;
@@ -361,20 +361,19 @@ st::status_t launch_folds(executor_type_& executor, blocks_type_&, fold_regions_
         return status_t::unknown_k;
     if (status_t const sorted = launch_sort_steps(executor, regions); sorted != status_t::success_k) return sorted;
     unsigned const blocks_count = regions.chains_count < 65535 ? regions.chains_count : 65535;
-    if (utilities::launch(executor, executor.kernels->function("ustore_fold_chains"), blocks_count,
-                          fold_block_threads_k, static_cast<unsigned>(regions.width * sizeof(std::uint32_t)),
-                          regions.records, regions.starts, regions.chains_count, regions.spill, regions.kept,
-                          regions.kept_counts)
+    if (util::launch(executor, executor.kernels->function("ustore_fold_chains"), blocks_count, fold_block_threads_k,
+                     static_cast<unsigned>(regions.width * sizeof(std::uint32_t)), regions.records, regions.starts,
+                     regions.chains_count, regions.spill, regions.kept, regions.kept_counts)
             .failed())
         return status_t::unknown_k;
     std::uint64_t const tickets = fu::min_of(
-        utilities::divide_round_up(std::uint64_t {regions.chains_count}, std::uint64_t {fold_block_threads_k}),
-        utilities::chain_blocks_max_k);
-    if (utilities::launch(executor, executor.kernels->function("ustore_fold_write"), static_cast<unsigned>(tickets),
-                          fold_block_threads_k, 0u, regions.records, regions.starts,
-                          static_cast<std::uint32_t const*>(regions.kept),
-                          static_cast<std::uint32_t const*>(regions.kept_counts), regions.chains_count, tickets,
-                          regions.removal, regions.composed, regions.offsets, regions.offsets + regions.chains_count)
+        util::divide_round_up(std::uint64_t {regions.chains_count}, std::uint64_t {fold_block_threads_k}),
+        util::chain_blocks_max_k);
+    if (util::launch(executor, executor.kernels->function("ustore_fold_write"), static_cast<unsigned>(tickets),
+                     fold_block_threads_k, 0u, regions.records, regions.starts,
+                     static_cast<std::uint32_t const*>(regions.kept),
+                     static_cast<std::uint32_t const*>(regions.kept_counts), regions.chains_count, tickets,
+                     regions.removal, regions.composed, regions.offsets, regions.offsets + regions.chains_count)
             .failed())
         return status_t::unknown_k;
     return status_t::success_k;
@@ -384,41 +383,40 @@ st::status_t launch_folds(executor_type_& executor, blocks_type_&, fold_regions_
  *  launch flags the places every chain kept, the select over @p blocks lists them, and the second
  *  writes every one. */
 template <typename blocks_type_>
-st::status_t launch_folds(utilities::metal_executor_t::stream_t& executor, blocks_type_& blocks,
+st::status_t launch_folds(util::metal_executor_t::stream_t& executor, blocks_type_& blocks,
                           fold_regions_t const& regions) noexcept {
     using st::status_t;
     // Few enough tiles that the select's one scanning threadgroup walks them quickly
-    std::uint32_t const tile = static_cast<std::uint32_t>(utilities::round_up_to_multiple(
-        utilities::divide_round_up(std::uint64_t {regions.records_count}, utilities::chain_blocks_max_k),
-        std::uint64_t {256}));
+    std::uint32_t const tile = static_cast<std::uint32_t>(util::round_up_to_multiple(
+        util::divide_round_up(std::uint64_t {regions.records_count}, util::chain_blocks_max_k), std::uint64_t {256}));
     std::uint32_t const tiles = static_cast<std::uint32_t>(
-        utilities::divide_round_up(std::uint64_t {regions.records_count}, std::uint64_t {tile}));
-    auto const [flags, flags_status] = utilities::carve<std::uint8_t>(blocks, executor, regions.records_count);
-    auto const [counts, counts_status] = utilities::carve<std::uint64_t>(blocks, executor, std::size_t {tiles} + 1);
-    auto const [selected, selected_status] = utilities::carve<std::uint32_t>(blocks, executor, regions.records_count);
+        util::divide_round_up(std::uint64_t {regions.records_count}, std::uint64_t {tile}));
+    auto const [flags, flags_status] = util::carve<std::uint8_t>(blocks, executor, regions.records_count);
+    auto const [counts, counts_status] = util::carve<std::uint64_t>(blocks, executor, std::size_t {tiles} + 1);
+    auto const [selected, selected_status] = util::carve<std::uint32_t>(blocks, executor, regions.records_count);
     if (flags_status.failed() || counts_status.failed() || selected_status.failed())
         return status_t::out_of_memory_heap_k;
     if (status_t const sorted = launch_sort_steps(executor, regions); sorted != status_t::success_k) return sorted;
     unsigned const blocks_count = regions.chains_count < 65535 ? regions.chains_count : 65535;
     // Metal binds threadgroup memory in multiples of 16 bytes
-    unsigned const sorted_bytes = utilities::round_up_to_multiple(regions.width * 4u, 16u);
-    if (utilities::launch(executor, executor.kernels->function("ustore_fold_chains"), blocks_count,
-                          fold_block_threads_k, sorted_bytes, regions.records, regions.starts, regions.chains_count,
-                          regions.spill, regions.kept, regions.kept_counts, flags.data())
+    unsigned const sorted_bytes = util::round_up_to_multiple(regions.width * 4u, 16u);
+    if (util::launch(executor, executor.kernels->function("ustore_fold_chains"), blocks_count, fold_block_threads_k,
+                     sorted_bytes, regions.records, regions.starts, regions.chains_count, regions.spill, regions.kept,
+                     regions.kept_counts, flags.data())
             .failed())
         return status_t::unknown_k;
-    if (utilities::select_flagged(executor, static_cast<std::uint8_t const*>(flags.data()), regions.records_count, tile,
-                                  tiles, counts.data(), selected.data())
+    if (util::select_flagged(executor, static_cast<std::uint8_t const*>(flags.data()), regions.records_count, tile,
+                             tiles, counts.data(), selected.data())
             .failed())
         return status_t::unknown_k;
     std::uint64_t const groups = fu::min_of(
-        utilities::divide_round_up(std::uint64_t {regions.records_count}, std::uint64_t {fold_block_threads_k}),
+        util::divide_round_up(std::uint64_t {regions.records_count}, std::uint64_t {fold_block_threads_k}),
         std::uint64_t {65535});
-    if (utilities::launch(executor, executor.kernels->function("ustore_fold_write"), static_cast<unsigned>(groups),
-                          fold_block_threads_k, 0u, regions.records, regions.starts,
-                          static_cast<std::uint32_t const*>(regions.kept), regions.chains_count, tiles, regions.removal,
-                          regions.composed, regions.offsets, static_cast<std::uint32_t const*>(selected.data()),
-                          static_cast<std::uint64_t const*>(counts.data()))
+    if (util::launch(executor, executor.kernels->function("ustore_fold_write"), static_cast<unsigned>(groups),
+                     fold_block_threads_k, 0u, regions.records, regions.starts,
+                     static_cast<std::uint32_t const*>(regions.kept), regions.chains_count, tiles, regions.removal,
+                     regions.composed, regions.offsets, static_cast<std::uint32_t const*>(selected.data()),
+                     static_cast<std::uint64_t const*>(counts.data()))
             .failed())
         return status_t::unknown_k;
     return status_t::success_k;
@@ -430,7 +428,7 @@ st::status_t vram_adjacency_fold_t::compose(executor_type_& executor, blocks_typ
                                             std::span<std::uint64_t const> chain_starts, st::vector<byte_t>& composed,
                                             st::vector<std::uint64_t>& composed_offsets) const noexcept {
     using st::status_t;
-    auto const device_status = [](utilities::status_t const status) noexcept {
+    auto const device_status = [](util::status_t const status) noexcept {
         return status.failed() ? status_t::unknown_k : status_t::success_k;
     };
 
@@ -441,7 +439,7 @@ st::status_t vram_adjacency_fold_t::compose(executor_type_& executor, blocks_typ
     for (std::uint64_t& offset : composed_offsets) offset = 0;
 
     // The widest chain one block sorts in its shared memory, past which chains spill
-    std::uint32_t const shared_bytes = utilities::shared_memory_per_block_bytes(executor);
+    std::uint32_t const shared_bytes = util::shared_memory_per_block_bytes(executor);
     std::uint32_t shared_width = 1;
     while (fold_sort_fits(shared_bytes, shared_width * 2)) shared_width *= 2;
 
@@ -482,7 +480,7 @@ st::status_t vram_adjacency_fold_t::compose(executor_type_& executor, blocks_typ
     // The chains gather back to back into the pinned bounce, which the device reads at the
     // bus's full speed
     auto const bounce = [&executor]<typename element_type_>(std::size_t count) noexcept {
-        auto [carved, carve_status] = utilities::arena_allocate<element_type_>(executor.memory.bounce.arena(), count);
+        auto [carved, carve_status] = util::arena_allocate<element_type_>(executor.memory.bounce.arena(), count);
         return carve_status.failed() ? static_cast<element_type_*>(nullptr) : carved.data();
     };
     std::size_t const records_count = static_cast<std::size_t>(total);
@@ -519,7 +517,7 @@ st::status_t vram_adjacency_fold_t::compose(executor_type_& executor, blocks_typ
     spilled_starts[spilled_chains_count] = spilled_indices;
 
     auto const device = [&]<typename element_type_>(std::size_t elements) noexcept {
-        auto const [carved, carved_status] = utilities::carve<element_type_>(blocks, executor, elements);
+        auto const [carved, carved_status] = util::carve<element_type_>(blocks, executor, elements);
         return carved_status.failed() ? static_cast<element_type_*>(nullptr) : carved.data();
     };
     half_edge_record_t* const records = device.template operator()<half_edge_record_t>(records_count);

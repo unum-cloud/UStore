@@ -36,14 +36,14 @@
 
 namespace unum::ustore::docs {
 
-using utilities::arena_allocate;
-using utilities::arena_grow;
-using utilities::byte_t;
-using utilities::expected;
-using utilities::status_code_t;
-using utilities::status_t;
-using utilities::uuid_text_length_k;
-using utilities::value_view_t;
+using util::arena_allocate;
+using util::arena_grow;
+using util::byte_t;
+using util::expected;
+using util::status_code_t;
+using util::status_t;
+using util::uuid_text_length_k;
+using util::value_view_t;
 
 #pragma region Number Formatting
 
@@ -480,7 +480,7 @@ status_t extract_keys(documents_type_ const& documents, std::string_view id_fiel
         if (status.failed()) return status;
         yyjson_val* const identifier = json_lookup(yyjson_doc_get_root(document.handle), id_field);
         if (yyjson_is_uint(identifier)) {
-            keys[index] = utilities::key_from_integer(yyjson_get_uint(identifier));
+            keys[index] = util::key_from_integer(yyjson_get_uint(identifier));
             continue;
         }
         bool const is_uuid = yyjson_is_str(identifier) &&

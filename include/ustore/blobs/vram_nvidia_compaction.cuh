@@ -43,7 +43,7 @@
 
 namespace unum::ustore::blobs {
 
-using utilities::bytes_of;
+using util::bytes_of;
 
 /** Threads of every block a merge launches. */
 inline constexpr unsigned merge_block_threads_k = 256;
@@ -455,9 +455,9 @@ __device__ void merge_pack(located_key_slot<key_slot_type_> const* merged, std::
                            std::uint64_t tickets, located_key_slot<key_slot_type_>* survivors, std::uint64_t* prefix,
                            std::uint8_t* shares, std::uint64_t* chains) noexcept {
     using record_t = located_key_slot<key_slot_type_>;
-    using utilities::block_scanned_t;
-    std::uint64_t const ticket = utilities::chain_ticket(chains);
-    std::uint64_t const tile = utilities::divide_round_up(records_count, tickets);
+    using util::block_scanned_t;
+    std::uint64_t const ticket = util::chain_ticket(chains);
+    std::uint64_t const tile = util::divide_round_up(records_count, tickets);
     std::uint64_t const first = ticket * tile < records_count ? ticket * tile : records_count;
     std::uint64_t const end = first + tile < records_count ? first + tile : records_count;
 
@@ -466,8 +466,8 @@ __device__ void merge_pack(located_key_slot<key_slot_type_> const* merged, std::
         if (flags[index]) ++kept, bytes += merge_packed(merged, index, replaced, replacements, replaced_count).size;
     std::uint64_t const kept_total = scan_type_::template block_exclusive<block_threads_>(kept).total;
     std::uint64_t const bytes_total = scan_type_::template block_exclusive<block_threads_>(bytes).total;
-    std::uint64_t kept_before = utilities::chain_offset(chains, ticket, tickets, kept_total);
-    std::uint64_t bytes_before = utilities::chain_offset(chains + 1, ticket, tickets, bytes_total);
+    std::uint64_t kept_before = util::chain_offset(chains, ticket, tickets, kept_total);
+    std::uint64_t bytes_before = util::chain_offset(chains + 1, ticket, tickets, bytes_total);
     if (ticket == 0 && threadIdx.x == 0 && prefix != nullptr) prefix[0] = 0;
 
     for (std::uint64_t base = first; base < end; base += block_threads_) {
@@ -561,16 +561,16 @@ template <unsigned block_threads_, typename scan_type_>
 __device__ void merge_strings_pack(strings_version_t const* merged, std::uint8_t const* flags,
                                    std::uint64_t records_count, std::uint64_t tickets, strings_version_t* survivors,
                                    std::uint64_t* chain) noexcept {
-    using utilities::block_scanned_t;
-    std::uint64_t const ticket = utilities::chain_ticket(chain);
-    std::uint64_t const tile = utilities::divide_round_up(records_count, tickets);
+    using util::block_scanned_t;
+    std::uint64_t const ticket = util::chain_ticket(chain);
+    std::uint64_t const tile = util::divide_round_up(records_count, tickets);
     std::uint64_t const first = ticket * tile < records_count ? ticket * tile : records_count;
     std::uint64_t const end = first + tile < records_count ? first + tile : records_count;
 
     std::uint64_t kept = 0;
     for (std::uint64_t index = first + threadIdx.x; index < end; index += block_threads_) kept += flags[index] != 0;
     std::uint64_t const kept_total = scan_type_::template block_exclusive<block_threads_>(kept).total;
-    std::uint64_t kept_before = utilities::chain_offset(chain, ticket, tickets, kept_total);
+    std::uint64_t kept_before = util::chain_offset(chain, ticket, tickets, kept_total);
 
     for (std::uint64_t base = first; base < end; base += block_threads_) {
         std::uint64_t const index = base + threadIdx.x;
@@ -594,14 +594,14 @@ inline st::status_t executor_status(status_t status) noexcept {
 
 /** Carves @p count elements off @p executor's bounce for one merge, which the
  *  next merge rewinds. */
-template <typename element_type_, utilities::a_gpu_stream executor_type_>
+template <typename element_type_, util::a_gpu_stream executor_type_>
 element_type_* carve_bounce(executor_type_& executor, std::size_t count) noexcept {
-    auto [carved, status] = utilities::arena_allocate<element_type_>(executor.memory.bounce.arena(), count);
+    auto [carved, status] = util::arena_allocate<element_type_>(executor.memory.bounce.arena(), count);
     return status.failed() ? nullptr : carved.data();
 }
 
 /** Queues uploading @p count elements from host @p source to device @p target on @p executor. */
-template <typename element_type_, utilities::a_gpu_stream executor_type_>
+template <typename element_type_, util::a_gpu_stream executor_type_>
 st::status_t upload(executor_type_& executor, element_type_* target, element_type_ const* source,
                     std::size_t count) noexcept {
     if (count == 0) return st::status_t::success_k;
@@ -610,7 +610,7 @@ st::status_t upload(executor_type_& executor, element_type_* target, element_typ
 }
 
 /** Queues downloading @p count elements from device @p source to host @p target on @p executor. */
-template <typename element_type_, utilities::a_gpu_stream executor_type_>
+template <typename element_type_, util::a_gpu_stream executor_type_>
 st::status_t download(executor_type_& executor, element_type_* target, element_type_ const* source,
                       std::size_t count) noexcept {
     if (count == 0) return st::status_t::success_k;
@@ -621,13 +621,13 @@ st::status_t download(executor_type_& executor, element_type_* target, element_t
 
 /** Queues kernel @p name of @p executor's bundle over @p items items, one thread each, as
  *  many blocks of @c merge_block_threads_k as cover them up to @p blocks_limit. */
-template <utilities::a_gpu_stream executor_type_, typename... argument_types_>
+template <util::a_gpu_stream executor_type_, typename... argument_types_>
 st::status_t launch_over(executor_type_& executor, char const* name, std::uint64_t items, std::uint64_t blocks_limit,
                          argument_types_... arguments) noexcept {
     std::uint64_t const blocks = fu::min_of(divide_round_up(items, std::uint64_t {merge_block_threads_k}),
                                             blocks_limit);
-    return executor_status(utilities::launch(executor, executor.kernels->function(name), static_cast<unsigned>(blocks),
-                                             merge_block_threads_k, 0u, arguments...));
+    return executor_status(util::launch(executor, executor.kernels->function(name), static_cast<unsigned>(blocks),
+                                        merge_block_threads_k, 0u, arguments...));
 }
 
 /** Bumps aligned regions off one address, which a merge runs once from zero to size its sections,
@@ -682,7 +682,7 @@ run_sections<key_slot_type_> carve_sections(sorted_run_index_view<key_slot_type_
     if (preferred == sections_source_t::volume_k && (!extents.cells.empty() || gathers) && !extents.trailer.empty())
         sections.source = sections_source_t::volume_k;
     std::uint64_t const cells_count = view.key_slots_count;
-    std::size_t const page = static_cast<std::size_t>(utilities::portable_alignment_k);
+    std::size_t const page = static_cast<std::size_t>(util::portable_alignment_k);
     if (sections.source == sections_source_t::volume_k) {
         if (gathers) {
             sections.keys = cursor.take<std::uint64_t>(
@@ -733,8 +733,8 @@ constexpr std::size_t saved_words(sorted_run_index_view<key_slot_type_> const& v
  *  With @c no_device_fold_t every chain of the merge folds there.
  */
 template <typename key_slot_type_, typename fold_type_, typename device_fold_type_, typename allocator_type_,
-          utilities::a_gpu_stream executor_type_>
-st::status_t fold_survivors(executor_type_& executor, utilities::device_blocks_t& blocks, compaction_kind_t kind,
+          util::a_gpu_stream executor_type_>
+st::status_t fold_survivors(executor_type_& executor, util::device_blocks_t& blocks, compaction_kind_t kind,
                             compaction_stamps_t const& stamps, std::uint64_t sorted_runs_count,
                             std::uint64_t value_stride, located_key_slot<key_slot_type_> const* merged,
                             std::uint8_t const* flags, std::uint64_t merged_count, fold_type_ const& fold,
@@ -761,8 +761,8 @@ st::status_t fold_survivors(executor_type_& executor, utilities::device_blocks_t
         if (!kept[index] && records[index].kind == delta_kind_t::remove_k)
             kept[index] = survives(index != 0 ? records + index - 1 : nullptr, records[index], kind, stamps);
 
-    utilities::local_arena_t arena;
-    utilities::arena_allocator<byte_t> arena_bytes = arena.allocator();
+    util::local_arena_t arena;
+    util::arena_allocator<byte_t> arena_bytes = arena.allocator();
     auto const value_of = [&](record_t const& record, std::span<byte_t const>& bytes) noexcept {
         bytes = {};
         if (record.kind == delta_kind_t::remove_k) return status_t::success_k;
@@ -850,7 +850,7 @@ st::status_t fold_survivors(executor_type_& executor, utilities::device_blocks_t
 template <typename element_type_>
 element_type_* cuda_compactor_t::carve_(std::size_t count) noexcept {
     std::uint32_t const held = blocks_.count;
-    auto const [carved, status] = utilities::carve_runs<element_type_>(
+    auto const [carved, status] = util::carve_runs<element_type_>(
         blocks_, stream_(), count, [&](std::size_t bytes) noexcept { return stream_().allocate_async(bytes); });
     device_allocations_ += blocks_.count - held;
     return status.failed() ? nullptr : carved.data();
@@ -866,7 +866,7 @@ st::expected<packed_counts_t> cuda_compactor_t::pack_(char const* name,
         stream_().fill_async(reinterpret_cast<std::uintptr_t>(chains), byte_t {0}, 2 * sizeof(std::uint64_t)));
     if (zeroed != status_t::success_k) return zeroed;
     std::uint64_t const tickets = fu::min_of(
-        divide_round_up(regions.records_count, std::uint64_t {merge_block_threads_k}), utilities::chain_blocks_max_k);
+        divide_round_up(regions.records_count, std::uint64_t {merge_block_threads_k}), util::chain_blocks_max_k);
     status_t const launched = launch_over(stream_(), name, tickets * merge_block_threads_k, tickets, regions.merged,
                                           regions.flags, regions.records_count, regions.replaced, regions.replacements,
                                           regions.replaced_count, tickets, regions.survivors, regions.prefix,
@@ -875,7 +875,7 @@ st::expected<packed_counts_t> cuda_compactor_t::pack_(char const* name,
     return packed_counts_t {chains};
 }
 
-template <typename key_slot_type_, utilities::a_fold fold_type_, typename device_fold_type_, typename allocator_type_>
+template <typename key_slot_type_, util::a_fold fold_type_, typename device_fold_type_, typename allocator_type_>
     requires a_compactable_key_slot<key_slot_type_>
 st::status_t cuda_compactor_t::compact(compaction_kind_t kind,
                                        std::span<sorted_run_index_view<key_slot_type_> const> upper,
@@ -891,7 +891,7 @@ st::status_t cuda_compactor_t::compact(compaction_kind_t kind,
     else return st::status_t::invalid_argument_k;
 }
 
-template <typename key_slot_type_, utilities::a_fold fold_type_, typename device_fold_type_, typename allocator_type_>
+template <typename key_slot_type_, util::a_fold fold_type_, typename device_fold_type_, typename allocator_type_>
     requires a_compactable_key_slot<key_slot_type_>
 st::status_t cuda_compactor_t::compact_on_device_(compaction_kind_t kind,
                                                   std::span<sorted_run_index_view<key_slot_type_> const> upper,
@@ -945,11 +945,11 @@ st::status_t cuda_compactor_t::compact_on_device_(compaction_kind_t kind,
     // The reader registered the newest run, which a rewind keeps, unless a merge opened more
     // after its sections
     if (blocks_.count > 1) sections_.release();
-    utilities::rewind(blocks_, stream_());
+    util::rewind(blocks_, stream_());
 
     // The sections land first, in one region, so the reader registers the run holding it and
     // reads into it
-    std::size_t const page = static_cast<std::size_t>(utilities::portable_alignment_k);
+    std::size_t const page = static_cast<std::size_t>(util::portable_alignment_k);
     byte_t* const region = sizing.at != 0 ? carve_<byte_t>(static_cast<std::size_t>(sizing.at) + page) : nullptr;
     if (sizing.at != 0 && !region) return status_t::out_of_memory_heap_k;
     std::uintptr_t const sections_base = round_up_to_multiple<std::uintptr_t>(reinterpret_cast<std::uintptr_t>(region),
@@ -995,7 +995,7 @@ st::status_t cuda_compactor_t::compact_on_device_(compaction_kind_t kind,
               device_section_read_t {run_extents.volume, run_extents.value_offsets, into(sections.value_offsets),
                                      run_extents.run},
               device_section_read_t {run_extents.volume, run_extents.trailer, into(sections.trailer), run_extents.run},
-              device_section_read_t {run_extents.volume, sections.keys ? run_extents.keys : utilities::extent_t {},
+              device_section_read_t {run_extents.volume, sections.keys ? run_extents.keys : util::extent_t {},
                                      sections.keys ? into(sections.keys) : 0, run_extents.run}})
             if (!read.extent.empty() && reads_.push_back(device_section_read_t {read}) != status_t::success_k)
                 return false;
@@ -1194,8 +1194,8 @@ st::status_t cuda_compactor_t::compact_on_device_(compaction_kind_t kind,
         std::size_t carved = blocks_.used;
         for (std::uint32_t block = 0; block + 1 != blocks_.count; ++block) carved += blocks_.blocks[block].capacity;
         sections_.release();
-        utilities::rewind(blocks_, stream_());
-        if (carve_<byte_t>(carved)) utilities::rewind(blocks_, stream_());
+        util::rewind(blocks_, stream_());
+        if (carve_<byte_t>(carved)) util::rewind(blocks_, stream_());
     }
 
     // The prefix is the new runs' value offsets, and the copy plan coalesces the survivors'

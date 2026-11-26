@@ -39,8 +39,8 @@
 
 namespace unum::ustore::blobs {
 
-using utilities::delta_kind_t;
-using utilities::delta_view_t;
+using util::delta_kind_t;
+using util::delta_view_t;
 
 /** Where the bytes of one delta sit: the buffer among those its run views, and the first byte
  *  inside it. */
@@ -143,7 +143,7 @@ class sealed_deltas {
                                         std::span<byte_t const> caller_bytes = {}) noexcept {
         if (deltas.empty() && ranges.empty())
             return status_t {status_code_t::invalid_argument_k, "A seal needs a delta or range"};
-        utilities::sort_by_stored_key(deltas);
+        util::sort_by_stored_key(deltas);
         std::uint64_t total_bytes = 0;
         std::uint8_t least_kind = deltas.empty() ? 0 : static_cast<std::uint8_t>(deltas[0].delta.kind);
         std::uint8_t greatest_kind = least_kind;
@@ -606,10 +606,10 @@ expected<range_tombstones<typename run_type_::stored_key_t, allocator_type_>> ga
  *  keys and bytes, and locate the bytes among the runs' buffers in order, so the runs outlive them
  *  until a merged run inherits their buffers or a flushed one is written.
  */
-template <typename run_type_, utilities::a_fold fold_type_, typename versions_type_>
+template <typename run_type_, util::a_fold fold_type_, typename versions_type_>
 status_t kept_versions(std::span<run_type_ const* const> runs, compaction_stamps_t const& survival,
                        fold_type_ const& fold, versions_type_& versions,
-                       utilities::arena_allocator<byte_t>& arena) noexcept {
+                       util::arena_allocator<byte_t>& arena) noexcept {
     using version_t = stamped_delta<typename run_type_::stored_key_t>;
     std::size_t count = 0;
     std::size_t tombstones = 0;
@@ -622,7 +622,7 @@ status_t kept_versions(std::span<run_type_ const* const> runs, compaction_stamps
     using tournament_allocator_t =
         typename std::allocator_traits<typename versions_type_::allocator_type>::template rebind_alloc<std::uint32_t>;
     st::vector<std::size_t, positions_allocator_t> positions {positions_allocator_t {versions.get_allocator()}};
-    utilities::loser_tree<tournament_allocator_t> tournament {tournament_allocator_t {versions.get_allocator()}};
+    util::loser_tree<tournament_allocator_t> tournament {tournament_allocator_t {versions.get_allocator()}};
     // A merge views all its runs' buffers in order, so a location counts those before its run.
     constexpr bool located = requires(run_type_ const& run) { run.deltas().bases(); };
     st::vector<std::uint32_t, tournament_allocator_t> first_buffers {tournament_allocator_t {versions.get_allocator()}};
@@ -677,7 +677,7 @@ status_t kept_versions(std::span<run_type_ const* const> runs, compaction_stamps
         }
         delta_view_t& newer = versions[kept - 1].delta;
         if (newer.kind != delta_kind_t::change_k) continue;
-        auto [folded, fold_status] = utilities::fold_delta_pair(fold, newer, versions[index].delta, arena);
+        auto [folded, fold_status] = util::fold_delta_pair(fold, newer, versions[index].delta, arena);
         if (fold_status.failed()) return fold_status;
         newer = folded;
     }

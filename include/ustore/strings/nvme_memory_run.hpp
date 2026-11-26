@@ -63,12 +63,12 @@ using blobs::storage_limits_t;
 using blobs::stored_value_offset_t;
 using blobs::transaction_stamp_t;
 using blobs::unwritten_stamp_k;
-using utilities::byte_t;
-using utilities::delta_kind_t;
-using utilities::delta_view_t;
-using utilities::expected;
-using utilities::status_code_t;
-using utilities::status_t;
+using util::byte_t;
+using util::delta_kind_t;
+using util::delta_view_t;
+using util::expected;
+using util::status_code_t;
+using util::status_t;
 
 /** Orders the string under @p first_head against the one under @p second_head, reading the tails only when two
  *  heads of longer strings tie, which unsigned byte order of the whole strings agrees with. */

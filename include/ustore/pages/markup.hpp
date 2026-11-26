@@ -44,10 +44,10 @@
 
 namespace unum::ustore::pages {
 
-using utilities::a_strings_kit;
-using utilities::stringzilla_refusal;
-using utilities::stringzilla_view;
-using utilities::tape_string;
+using util::a_strings_kit;
+using util::stringzilla_refusal;
+using util::stringzilla_view;
+using util::tape_string;
 
 /** The encoding a page or a fragment is imported from or rendered into, numbered as @c ustore_page_encoding_t. */
 enum class page_encoding_t : std::uint8_t {

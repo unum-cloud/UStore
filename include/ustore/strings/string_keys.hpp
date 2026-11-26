@@ -26,10 +26,10 @@
 
 namespace unum::ustore::strings {
 
-using utilities::blob_t;
-using utilities::byte_t;
-using utilities::bytes_of;
-using utilities::chars_of;
+using util::blob_t;
+using util::byte_t;
+using util::bytes_of;
+using util::chars_of;
 
 /** A string of a strings collection, or the name of a collection, owning its bytes. */
 struct string_key_t {
@@ -58,7 +58,7 @@ struct string_key_order_t {
 
 /** Hashes a string through the kit's StringZilla kernel, spreading the strings of a collection
  *  over every partition. */
-template <utilities::a_strings_kit strings_kit_type_>
+template <util::a_strings_kit strings_kit_type_>
 struct string_key_hash {
     std::size_t operator()(string_key_t const& stored) const noexcept {
         std::string_view const text = stored.view();

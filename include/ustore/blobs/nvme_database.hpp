@@ -60,17 +60,17 @@
 
 namespace unum::ustore::blobs {
 
-using utilities::io_transport_t;
-using utilities::manifest_collection_t;
-using utilities::manifest_file_t;
-using utilities::manifest_no_collection_k;
-using utilities::manifest_t;
-using utilities::medium_extent_t;
-using utilities::nvme_queues_ref_t;
-using utilities::path_max_bytes_k;
-using utilities::sha256_t;
-using utilities::thread_channels_t;
-using utilities::volume_config_t;
+using util::io_transport_t;
+using util::manifest_collection_t;
+using util::manifest_file_t;
+using util::manifest_no_collection_k;
+using util::manifest_t;
+using util::medium_extent_t;
+using util::nvme_queues_ref_t;
+using util::path_max_bytes_k;
+using util::sha256_t;
+using util::thread_channels_t;
+using util::volume_config_t;
 
 #pragma region Database Snapshot
 
@@ -354,7 +354,7 @@ class database_transaction {
      *  A change reads nothing, so it watches nothing, and two transactions changing one key both commit; a caller
      *  whose change depends on what it read watches that key itself.
      */
-    template <utilities::a_fold fold_type_>
+    template <util::a_fold fold_type_>
     status_t change(any_collection_id_t const& id, stored_key_t stored_key, stored_value_view_t delta,
                     fold_type_ const& fold) noexcept {
         if (!core_.started()) return {status_code_t::invalid_argument_k, "That transaction is staged"};
@@ -614,7 +614,7 @@ struct ingest_outcome_t {
 /** Whether a store lays rows of @p row_type_ out as the runs of an ingest. */
 template <typename store_type_, typename row_type_>
 concept a_row_ingesting_store = requires(
-    store_type_& store, utilities::io_channel_t& channel, std::span<row_type_ const> rows,
+    store_type_& store, util::io_channel_t& channel, std::span<row_type_ const> rows,
     typename store_type_::ingest_runs_t& ingested) { store.write_ingest(channel, rows, ingested); };
 
 /** Whether a store weighs the memory a sealed commit of @p sealed_type_ leaves its memory runs. */
@@ -822,7 +822,7 @@ class basic_database {
         {
             auto [claimed, claim_status] = claim_channels_(queues);
             if (claim_status.failed()) first = claim_status;
-            else if (config_.access != utilities::medium_access_t::read_only_k) {
+            else if (config_.access != util::medium_access_t::read_only_k) {
                 for (std::size_t index = 0; index != collections_.size(); ++index)
                     if (status_t const flushed = std::visit(
                             [&](auto& held) noexcept { return held.flush(claimed.writing()); },
@@ -1179,7 +1179,7 @@ class basic_database {
         auto const count = [&](std::size_t, std::uint64_t offset, std::span<byte_t const> bytes) noexcept {
             measured = fu::max_of<std::uint64_t>(measured, offset + bytes.size());
         };
-        utilities::local_arena_t scratch;
+        util::local_arena_t scratch;
         if (status_t const selected = select(read, scratch.allocator().arena,
                                              std::span<stored_key_t const> {&stored_key, 1},
                                              std::span<lookup_result_t> {&folded, 1}, count, queues);
@@ -1243,7 +1243,7 @@ class basic_database {
                     nvme_queues_ref_t queues = {}) noexcept {
         auto [read, read_status] = read_collection(id, stamp, queues.thread_index);
         if (read_status.failed()) return read_status;
-        utilities::local_arena_t scratch;
+        util::local_arena_t scratch;
         return select(read, scratch.allocator().arena, stored_keys, results, sink, queues);
     }
 
@@ -1425,9 +1425,9 @@ class basic_database {
                                                         typename store_type_::device_fold_t, row_kit_type_>;
                     auto [scanner, over_status] = scanner_t::over(collection, reading, scratch, from, direction);
                     if (over_status.failed()) return over_status;
-                    st::vector<stored_key_t, utilities::arena_allocator<stored_key_t>> keys {{scratch}};
-                    st::vector<stored_value_size_t, utilities::arena_allocator<stored_value_size_t>> sizes {{scratch}};
-                    st::vector<value_place_t, utilities::arena_allocator<value_place_t>> places {{scratch}};
+                    st::vector<stored_key_t, util::arena_allocator<stored_key_t>> keys {{scratch}};
+                    st::vector<stored_value_size_t, util::arena_allocator<stored_value_size_t>> sizes {{scratch}};
+                    st::vector<value_place_t, util::arena_allocator<value_place_t>> places {{scratch}};
                     for (;;) {
                         keys.clear(), sizes.clear(), places.clear();
                         auto [within, filled_status] = fill_round_(scanner, read, bound, direction, round_bytes, keys,
@@ -2170,7 +2170,7 @@ class basic_database {
             return status_t {status_code_t::out_of_memory_k, "No room to index the target's runs"};
         for (manifest_file_t const& file : held.files) [[maybe_unused]]
             st::status_t const indexed = held_by_run.push_back(st::assume_reserved, &file);
-        utilities::radix_sort(
+        util::radix_sort(
             std::span<manifest_file_t const*> {held_by_run}, uuid128_t::size_bytes_k,
             [](manifest_file_t const* file, std::size_t digit) noexcept -> std::size_t {
                 return file->run.bytes[digit];
@@ -2881,7 +2881,7 @@ class basic_database {
         char from[path_max_bytes_k], to[path_max_bytes_k];
         if (volume_->file_path(source.extent.data_directory, source.file.run, from).succeeded() &&
             into.file_path(0, source.file.run, to).succeeded()) {
-            auto [landing, landing_status] = utilities::link_or_copy_file(from, to);
+            auto [landing, landing_status] = util::link_or_copy_file(from, to);
             if (landing_status.failed()) return landing_status;
             manifest_file_t linked = source.file;
             linked.medium = 0;
@@ -2962,9 +2962,9 @@ class basic_database {
         std::uint64_t hashed = 0;
 
         status_t held;
-        auto sink = [&](utilities::completed_buffer_t const& completed) noexcept {
+        auto sink = [&](util::completed_buffer_t const& completed) noexcept {
             if (held.failed()) return;
-            if (status_t const whole = utilities::require_completed_in_full(completed); whole.failed()) {
+            if (status_t const whole = util::require_completed_in_full(completed); whole.failed()) {
                 held = whole;
                 return;
             }
@@ -3120,7 +3120,7 @@ class basic_database {
         // the truncation's manifest promise it.
         if (status_t const resumed = ledger_.resume(durable_stamp); resumed.failed()) return resumed;
         // A reader pins the durable stamp at most, so it never sees a torn commit it leaves on disk
-        if (config_.access == utilities::medium_access_t::read_only_k) return publish_collections_();
+        if (config_.access == util::medium_access_t::read_only_k) return publish_collections_();
         manifest_write_t recording {this, &claimed.reading()};
         lsm_tree_publication_hook_t published;
         published.notify = &record_manifest_;

@@ -38,8 +38,8 @@
 namespace unum::ustore::pages {
 
 /** A write holds a dense tree, a removal nothing, and a change a chain of edits. */
-using utilities::delta_kind_t;
-using utilities::delta_view_t;
+using util::delta_kind_t;
+using util::delta_view_t;
 
 /** A page being folded: its tree and whether it exists. */
 template <typename allocator_type_>
@@ -184,8 +184,7 @@ struct page_fold_t {
                 if (view_status.failed()) return view_status;
                 status = growth_status(edits.push_back(import_edit({}, view.root_key(), delta.bytes)));
             }
-            else if (utilities::removes(delta.kind))
-                status = growth_status(edits.push_back(remove_edit({}, nil_key_k)));
+            else if (util::removes(delta.kind)) status = growth_status(edits.push_back(remove_edit({}, nil_key_k)));
             else
                 status = for_each_edit(delta.bytes, [&](edit_t const& edit) noexcept -> status_t {
                     return growth_status(edits.push_back(edit_t(edit)));
@@ -298,6 +297,6 @@ struct page_fold_t {
     }
 };
 
-static_assert(utilities::a_fold<page_fold_t>);
+static_assert(util::a_fold<page_fold_t>);
 
 } // namespace unum::ustore::pages

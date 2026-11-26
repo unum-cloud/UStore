@@ -42,10 +42,10 @@ struct vram_adjacency_fold_t {
      *  chain sorts in one block's shared memory where it fits, and across blocks otherwise.
      *
      *  @tparam executor_type_ The stream the work queues on, as in
-     *      @c utilities::cuda_executor_t::stream_t, @c utilities::hip_executor_t::stream_t or
-     *      @c utilities::metal_executor_t::stream_t.
+     *      @c util::cuda_executor_t::stream_t, @c util::hip_executor_t::stream_t or
+     *      @c util::metal_executor_t::stream_t.
      *  @tparam blocks_type_ The device runs the compose carves from, as
-     *      in @c utilities::device_blocks_t.
+     *      in @c util::device_blocks_t.
      *
      *  @par Statuses:
      *  - @c status_code_t::invalid_argument_k A delta is no change, or holds a ragged or

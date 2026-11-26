@@ -27,12 +27,12 @@
 
 namespace unum::ustore::blobs {
 
-using utilities::blob_t;
-using utilities::status_code_t;
-using utilities::status_t;
-using utilities::uuid_hash_t;
-using utilities::uuid_order_t;
-using utilities::value_view_t;
+using util::blob_t;
+using util::status_code_t;
+using util::status_t;
+using util::uuid_hash_t;
+using util::uuid_order_t;
+using util::value_view_t;
 
 /** The status every SmashTable call answers with. */
 using store_status_t = st::status_t;

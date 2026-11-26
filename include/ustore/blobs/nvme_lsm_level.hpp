@@ -24,8 +24,8 @@
 
 namespace unum::ustore::blobs {
 
-using utilities::constrained_allocator;
-using utilities::resource_constraint;
+using util::constrained_allocator;
+using util::resource_constraint;
 
 #pragma region LSM Level
 

@@ -40,15 +40,15 @@
 
 namespace unum::ustore::docs {
 
-using utilities::a_strings_kit;
-using utilities::arena_allocator;
-using utilities::bytes_of;
-using utilities::chars_of;
-using utilities::growth_status;
-using utilities::stringzilla_allocator;
-using utilities::stringzilla_refusal;
-using utilities::stringzilla_view;
-using utilities::tape_string;
+using util::a_strings_kit;
+using util::arena_allocator;
+using util::bytes_of;
+using util::chars_of;
+using util::growth_status;
+using util::stringzilla_allocator;
+using util::stringzilla_refusal;
+using util::stringzilla_view;
+using util::tape_string;
 
 #pragma region Field Translation
 

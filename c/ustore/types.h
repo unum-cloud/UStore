@@ -346,11 +346,11 @@ typedef struct ustore_strings_view_t {
 /**
  *  @brief What went wrong, in one vocabulary shared by every engine and binding.
  *
- *  Shared statuses hold USearch's numbers, leaving 3, 4, 5 and 11 unused, and UStore's own start
- *  at 18. Statuses fall into five categories: resources, input, state, interruptions and defects.
- *  Any verb that allocates, binds a device or touches a file may also return a resources status;
- *  any verb taking a progress callback may return an interruption. A verb's own block lists only
- *  what its contract adds.
+ *  Shared statuses hold USearch's numbers, 0 to 19, leaving 3, 4, 5 and 11 unused, and UStore's
+ *  own start at 20. Statuses fall into five categories: resources, input, state, interruptions and
+ *  defects. Any verb that allocates, binds a device or touches a file may also return a resources
+ *  status; any verb taking a progress callback may return an interruption. A verb's own block
+ *  lists only what its contract adds.
  */
 typedef enum ustore_status_t {
 

@@ -68,9 +68,9 @@
 
 namespace unum::ustore::blobs {
 
-using utilities::constrained_allocator;
-using utilities::constrained_buffer;
-using utilities::resource_constraint;
+using util::constrained_allocator;
+using util::constrained_buffer;
+using util::resource_constraint;
 
 #pragma region Store
 
@@ -147,7 +147,7 @@ enum class scan_direction_t : std::uint8_t {
 /** Keys one page of a scan holds, as many as one page of memory does, which bounds how long a commit waits. */
 template <typename stored_key_type_>
 constexpr std::size_t scan_page_keys() noexcept {
-    return utilities::arena_page_bytes_k / sizeof(scan_entry<stored_key_type_>);
+    return util::arena_page_bytes_k / sizeof(scan_entry<stored_key_type_>);
 }
 
 /** The runs an unordered scan of one store walks one at a time: every level's runs in order, then the memory runs
@@ -203,7 +203,7 @@ struct sized_sink {
 };
 
 template <typename key_slot_type_, typename volume_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_, utilities::a_fold fold_type_, typename device_fold_type_,
+          typename waiter_type_, util::a_fold fold_type_, typename device_fold_type_,
           typename row_kit_type_ = st::native_row_kit_t>
 class nvme_store_cursor;
 
@@ -242,7 +242,7 @@ class nvme_store_cursor;
  *  @tparam row_kit_type_ The SmashTable kit the memory runs' trees search with.
  */
 template <typename key_slot_type_, typename volume_type_, template <typename> typename atomic_reference_,
-          typename waiter_type_, utilities::a_fold fold_type_, typename device_fold_type_,
+          typename waiter_type_, util::a_fold fold_type_, typename device_fold_type_,
           typename row_kit_type_ = st::native_row_kit_t>
 class nvme_store {
   public:
@@ -542,7 +542,7 @@ class nvme_store {
                     std::span<lookup_result_t> results, sink_type_&& sink, transaction_stamp_t stamp = head_stamp_k,
                     std::size_t thread_index = 0) const noexcept {
         reader_t const inside = runs_.enter(thread_index);
-        utilities::local_arena_t scratch;
+        util::local_arena_t scratch;
         return select(channel, runs_.reading(stamp), scratch.allocator().arena, stored_keys, results, sink);
     }
 
@@ -558,10 +558,10 @@ class nvme_store {
     status_t read_placed(io_channel_t& channel, reading_t const& read, ustore_arena_t scratch,
                          std::span<stored_key_t const> stored_keys, std::span<value_place_t const> places,
                          std::span<std::size_t const> picked, sink_type_&& sink) const noexcept {
-        auto [positions, positions_status] = utilities::arena_allocate<lsm_tree_position_t>(scratch, picked.size());
-        auto [located, located_status] = utilities::arena_allocate<std::size_t>(scratch, picked.size());
-        auto [folded_keys, folded_keys_status] = utilities::arena_allocate<stored_key_t>(scratch, picked.size());
-        auto [folded, folded_status] = utilities::arena_allocate<std::size_t>(scratch, picked.size());
+        auto [positions, positions_status] = util::arena_allocate<lsm_tree_position_t>(scratch, picked.size());
+        auto [located, located_status] = util::arena_allocate<std::size_t>(scratch, picked.size());
+        auto [folded_keys, folded_keys_status] = util::arena_allocate<stored_key_t>(scratch, picked.size());
+        auto [folded, folded_status] = util::arena_allocate<std::size_t>(scratch, picked.size());
         if (positions_status.failed() || located_status.failed() || folded_keys_status.failed() ||
             folded_status.failed())
             return {status_code_t::out_of_memory_k, "No room to track a round's values"};
@@ -597,7 +597,7 @@ class nvme_store {
                 return read_status;
         }
         if (!folded_count) return {};
-        auto [results, results_status] = utilities::arena_allocate<lookup_result_t>(scratch, folded_count);
+        auto [results, results_status] = util::arena_allocate<lookup_result_t>(scratch, folded_count);
         if (results_status.failed()) return results_status;
         auto relay = [&](std::size_t request, std::uint64_t offset, std::span<byte_t const> bytes) noexcept {
             landed_(sink, folded[request], offset, bytes);
@@ -619,12 +619,11 @@ class nvme_store {
 
         // The tree reads at the positions the lookups found, each deferred key's request and size
         // beside them, and a key whose newest version is a change folds once they retired.
-        auto [deferred_positions, positions_status] = utilities::arena_allocate<lsm_tree_position_t>(
-            scratch, stored_keys.size());
-        auto [deferred_requests, requests_status] = utilities::arena_allocate<std::size_t>(scratch, stored_keys.size());
-        auto [deferred_sizes, sizes_status] = utilities::arena_allocate<stored_value_size_t>(scratch,
-                                                                                             stored_keys.size());
-        auto [folded_requests, folded_status] = utilities::arena_allocate<std::size_t>(scratch, stored_keys.size());
+        auto [deferred_positions, positions_status] = util::arena_allocate<lsm_tree_position_t>(scratch,
+                                                                                                stored_keys.size());
+        auto [deferred_requests, requests_status] = util::arena_allocate<std::size_t>(scratch, stored_keys.size());
+        auto [deferred_sizes, sizes_status] = util::arena_allocate<stored_value_size_t>(scratch, stored_keys.size());
+        auto [folded_requests, folded_status] = util::arena_allocate<std::size_t>(scratch, stored_keys.size());
         if (positions_status.failed() || requests_status.failed() || sizes_status.failed() || folded_status.failed())
             return {status_code_t::out_of_memory_k, "No room to track the batch keys"};
         std::size_t deferred = 0;
@@ -676,7 +675,7 @@ class nvme_store {
                                   std::span<std::size_t const> {folded_requests.first(folded)}, results, sink);
 
         // The bytes every key owed are counted here and compared once the reads have run.
-        auto [delivered, delivered_status] = utilities::arena_allocate<std::uint64_t>(scratch, deferred);
+        auto [delivered, delivered_status] = util::arena_allocate<std::uint64_t>(scratch, deferred);
         if (delivered_status.failed()) return delivered_status;
         for (std::uint64_t& bytes : delivered) bytes = 0;
 
@@ -752,7 +751,7 @@ class nvme_store {
                         sink_type_& sink) const noexcept {
         if (cache_.capacity() == 0) return false;
         if (cached_value.size() < wanted) {
-            auto [grown, grown_status] = utilities::arena_allocate<byte_t>(scratch, wanted);
+            auto [grown, grown_status] = util::arena_allocate<byte_t>(scratch, wanted);
             if (grown_status.failed()) return false;
             cached_value = grown;
         }
@@ -888,7 +887,7 @@ class nvme_store {
         stored_key = run.stored_key(sorted);
         // Versions of one key hold distinct stamps, so the stamp tells the drawn version apart
         if (!read.view->memory_runs.find(stored_key, read.stamp, found, version)) return false;
-        return version == run.stamp(sorted) && !utilities::removes(found.kind) &&
+        return version == run.stamp(sorted) && !util::removes(found.kind) &&
                !hidden_in_memory_(read, stored_key, version);
     }
 
@@ -957,12 +956,12 @@ class nvme_store {
             if (selected.size() < bound) {
                 [[maybe_unused]] st::status_t const placed = selected.push_back(st::assume_reserved,
                                                                                 located_change_t {located});
-                utilities::heap_sift_up(std::span<located_change_t> {selected}, earlier);
+                util::heap_sift_up(std::span<located_change_t> {selected}, earlier);
                 return;
             }
             if (!earlier(located, selected.front())) return;
             selected.front() = located;
-            utilities::heap_sift_down(std::span<located_change_t> {selected}, 0, earlier);
+            util::heap_sift_down(std::span<located_change_t> {selected}, 0, earlier);
         };
         auto gather_ranges = [&]<typename tombstones_type_>(tombstones_type_ const& held) noexcept {
             for (std::size_t index = 0; index != held.size(); ++index) {
@@ -997,11 +996,11 @@ class nvme_store {
             }
 
         // A commit's meeting ranges, like clipped merge pieces, walk as one, so keys return once.
-        utilities::heap_sort(std::span<stamped_range_t> {ranges},
-                             [](stamped_range_t const& first, stamped_range_t const& second) noexcept {
-                                 if (first.stamp != second.stamp) return first.stamp < second.stamp;
-                                 return first.range.start < second.range.start;
-                             });
+        util::heap_sort(std::span<stamped_range_t> {ranges},
+                        [](stamped_range_t const& first, stamped_range_t const& second) noexcept {
+                            if (first.stamp != second.stamp) return first.stamp < second.stamp;
+                            return first.range.start < second.range.start;
+                        });
         std::size_t joined = 0;
         for (std::size_t index = 0; index != ranges.size(); ++index) {
             stamped_range_t& last = ranges[joined == 0 ? 0 : joined - 1];
@@ -1012,7 +1011,7 @@ class nvme_store {
             ranges[joined++] = ranges[index];
         }
         // Each range's walk carves its run cursors here.
-        utilities::local_arena_t walks;
+        util::local_arena_t walks;
         for (std::size_t index = 0; index != joined; ++index) {
             stamped_range_t const& removed = ranges[index];
             if (removed.stamp > read.stamp) continue;
@@ -1035,7 +1034,7 @@ class nvme_store {
             }
         }
 
-        utilities::heap_sort(std::span<located_change_t> {selected}, earlier);
+        util::heap_sort(std::span<located_change_t> {selected}, earlier);
         for (located_change_t const& located : selected) {
             auto read_value = [&](std::span<byte_t> into) noexcept {
                 return read_change_(channel, levels, located, into);
@@ -1361,8 +1360,8 @@ class nvme_store {
             drained_t drained {runs_.constraint()};
             stamped_deltas_t versions {constrained_allocator<stamped_delta_t, atomic_reference_> {runs_.constraint()}};
             // The values a flush folds sit here until the run is written, beside the runs' own.
-            utilities::local_arena_t folded;
-            utilities::arena_allocator<byte_t> folded_bytes = folded.allocator();
+            util::local_arena_t folded;
+            util::arena_allocator<byte_t> folded_bytes = folded.allocator();
             if (status_t const kept = kept_versions(flushed, survival, fold_, versions, folded_bytes); kept.failed())
                 return kept;
             auto [tombstones, tombstones_status] = gathered_range_tombstones(flushed, st::default_allocator<byte_t> {});
@@ -1708,7 +1707,7 @@ class nvme_store {
     /** Bytes the change @p located holds, zero for a removal. */
     [[nodiscard]] static std::uint64_t change_bytes_(level_set_t const& levels,
                                                      located_change_t const& located) noexcept {
-        if (utilities::removes(located.change.kind)) return 0;
+        if (util::removes(located.change.kind)) return 0;
         if (located.memory_run)
             return located.memory_run
                 ->delta(static_cast<std::size_t>(located.position.level_position.key_slot_position))
@@ -1892,11 +1891,11 @@ class nvme_store {
      */
     template <typename bytes_of_type_>
     expected<lookup_result_t> fold_versions_(reading_t const& read, stored_key_t stored_key, bytes_of_type_&& bytes_of,
-                                             utilities::arena_allocator<byte_t>& arena,
+                                             util::arena_allocator<byte_t>& arena,
                                              std::span<byte_t const>& value) const noexcept {
         value = {};
-        st::vector<delta_view_t, utilities::arena_allocator<delta_view_t>> chain {
-            utilities::arena_allocator<delta_view_t> {arena}};
+        st::vector<delta_view_t, util::arena_allocator<delta_view_t>> chain {
+            util::arena_allocator<delta_view_t> {arena}};
         delta_view_t closing {delta_kind_t::remove_k, {}};
         bool closed = false;
         for (transaction_stamp_t at = read.stamp;;) {
@@ -1942,7 +1941,7 @@ class nvme_store {
         }
         if (chain.empty()) {
             if (!closed) return lookup_result_t::missing_k;
-            if (utilities::removes(closing.kind)) return lookup_result_t::removed_k;
+            if (util::removes(closing.kind)) return lookup_result_t::removed_k;
             value = closing.bytes;
             return lookup_result_t::written_k;
         }
@@ -1959,8 +1958,8 @@ class nvme_store {
      *  level whose values sit apart from their key slots answers @c incomplete_k. */
     [[nodiscard]] lookup_result_t find_folded_(reading_t const& read, stored_key_t stored_key,
                                                stored_value_size_t& size) const noexcept {
-        utilities::local_arena_t scratch;
-        utilities::arena_allocator<byte_t> arena = scratch.allocator();
+        util::local_arena_t scratch;
+        util::arena_allocator<byte_t> arena = scratch.allocator();
         std::span<byte_t const> value;
         auto bytes_of = [](auto const& run, std::uint64_t position,
                            std::span<byte_t const>& bytes) noexcept -> status_t {
@@ -1981,7 +1980,7 @@ class nvme_store {
      *  from the key slot. */
     template <typename run_type_>
     static status_t read_bytes_(io_channel_t& channel, run_type_ const& run, std::uint64_t position,
-                                utilities::arena_allocator<byte_t>& arena, std::span<byte_t const>& bytes) noexcept {
+                                util::arena_allocator<byte_t>& arena, std::span<byte_t const>& bytes) noexcept {
         if constexpr (holds_values_inline_k) {
             key_slot_t const& slot = run.key_slot(position);
             bytes = std::span<byte_t const> {slot.data, slot.size};
@@ -2002,8 +2001,8 @@ class nvme_store {
     /** As @c select answers for a key whose newest version is a change, reading the chain's values on @p channel. */
     status_t select_folded_(io_channel_t& channel, reading_t const& read, stored_key_t stored_key,
                             std::span<byte_t> into, stored_value_size_t& size) const noexcept {
-        utilities::local_arena_t scratch;
-        utilities::arena_allocator<byte_t> arena = scratch.allocator();
+        util::local_arena_t scratch;
+        util::arena_allocator<byte_t> arena = scratch.allocator();
         std::span<byte_t const> value;
         auto bytes_of = [&](auto const& run, std::uint64_t position, std::span<byte_t const>& bytes) noexcept {
             return read_bytes_(channel, run, position, arena, bytes);
@@ -2023,7 +2022,7 @@ class nvme_store {
     status_t select_folded_(io_channel_t& channel, reading_t const& read, ustore_arena_t scratch,
                             std::span<stored_key_t const> stored_keys, std::span<std::size_t const> requests,
                             std::span<lookup_result_t> results, sink_type_& sink) const noexcept {
-        utilities::arena_allocator<byte_t> arena {scratch};
+        util::arena_allocator<byte_t> arena {scratch};
         for (std::size_t const request : requests) {
             std::span<byte_t const> value;
             auto bytes_of = [&](auto const& run, std::uint64_t position, std::span<byte_t const>& bytes) noexcept {
@@ -2056,7 +2055,7 @@ class nvme_store {
      *  last, or the longer one at a shared start, which only an empty value before it can take.
      */
     [[nodiscard]] static std::span<keyed_delta_t> last_of_each_key_(deltas_t& deltas) noexcept {
-        utilities::sort_by_stored_key(std::span<keyed_delta_t> {deltas});
+        util::sort_by_stored_key(std::span<keyed_delta_t> {deltas});
         std::size_t kept = 0;
         for (keyed_delta_t const& delta : deltas) {
             if (kept == 0 || deltas[kept - 1].stored_key != delta.stored_key) {
@@ -2123,7 +2122,7 @@ class nvme_store {
 
     /** Whether a run of @p key_slots key slots and @p values bytes outgrows one slot. */
     [[nodiscard]] static bool ingested_run_overflows_(std::uint64_t key_slots, std::uint64_t values) noexcept {
-        return ingested_run_bytes_(key_slots, values) > utilities::sorted_run_bytes_max_k;
+        return ingested_run_bytes_(key_slots, values) > util::sorted_run_bytes_max_k;
     }
 
     /** Whether a flushed run of @p key_slots key slots, @p values bytes of values and
@@ -2136,7 +2135,7 @@ class nvme_store {
             key_slots + portable_alignment_k);
         std::uint64_t const ranges = round_up_to_multiple(sorted_run_layout_t::range_tombstones_bytes(tombstones),
                                                           portable_alignment_k);
-        return run + ranges > utilities::sorted_run_bytes_max_k;
+        return run + ranges > util::sorted_run_bytes_max_k;
     }
 
     /** Writes the rows @p ingested laid out as one run of stamp zero, and empties the layout for the next. */

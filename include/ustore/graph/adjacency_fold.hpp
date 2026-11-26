@@ -51,15 +51,15 @@
 
 namespace unum::ustore::graph {
 
-using utilities::byte_t;
-using utilities::compare_128;
-using utilities::delta_kind_t;
-using utilities::delta_view_t;
-using utilities::expected;
-using utilities::intersect_sorted_128;
-using utilities::smallest_key_k;
-using utilities::status_code_t;
-using utilities::status_t;
+using util::byte_t;
+using util::compare_128;
+using util::delta_kind_t;
+using util::delta_view_t;
+using util::expected;
+using util::intersect_sorted_128;
+using util::smallest_key_k;
+using util::status_code_t;
+using util::status_t;
 
 #pragma region Half Edges
 
@@ -262,8 +262,8 @@ inline constexpr std::size_t delta_neighbor_offset_k = 0, delta_edge_offset_k = 
                              delta_reserved_offset_k = 42;
 
 /** Bytes one serialized record takes: its fields padded to a multiple of an identifier's 16 bytes. */
-inline constexpr std::size_t half_edge_delta_bytes_k = utilities::round_up_to_multiple(delta_reserved_offset_k,
-                                                                                       sizeof(id_entity_t));
+inline constexpr std::size_t half_edge_delta_bytes_k = util::round_up_to_multiple(delta_reserved_offset_k,
+                                                                                  sizeof(id_entity_t));
 
 static_assert(half_edge_delta_bytes_k == 48, "the layout in the file header");
 
@@ -538,7 +538,7 @@ class neighbor_cursor_t {
     half_edge_cursor_t half_edges_;
 };
 
-static_assert(utilities::a_sorted_128_cursor<neighbor_cursor_t>);
+static_assert(util::a_sorted_128_cursor<neighbor_cursor_t>);
 
 #pragma endregion Merging Cursor
 
@@ -575,7 +575,7 @@ inline std::size_t sequenced_digit(sequenced_record_t const& entry, std::size_t 
         return std::to_integer<std::size_t>(entry.record[offset]);
     }
     std::size_t const sequence_digit = digit - (2 * id_bytes_k + 2);
-    return utilities::word_byte(entry.sequence, sizeof(std::uint64_t) - sizeof(std::uint32_t) + sequence_digit);
+    return util::word_byte(entry.sequence, sizeof(std::uint64_t) - sizeof(std::uint32_t) + sequence_digit);
 }
 
 /** How many bytes @c sequenced_digit reads. */
@@ -670,8 +670,8 @@ struct adjacency_fold_t {
             for (std::size_t index = 0; index != chain.size(); ++index, ++count)
                 new (entries + count) sequenced_record_t {chain.record(index), static_cast<std::uint32_t>(count)};
         }
-        utilities::radix_sort(std::span<sequenced_record_t> {entries, total}, sequenced_digits_k, sequenced_digit,
-                              sequenced_less);
+        util::radix_sort(std::span<sequenced_record_t> {entries, total}, sequenced_digits_k, sequenced_digit,
+                         sequenced_less);
 
         // The newest removal of the vertex sorts last among the leading ones and cuts everything older
         std::size_t index = 0;
@@ -715,7 +715,7 @@ struct adjacency_fold_t {
     }
 };
 
-static_assert(utilities::a_fold<adjacency_fold_t>);
+static_assert(util::a_fold<adjacency_fold_t>);
 
 #pragma endregion Fold
 

@@ -79,9 +79,7 @@ struct half_edge_order_t {
 
 /** Hashes a half-edge by its vertex alone, so the run of one vertex stays in one partition. */
 struct half_edge_hash_t {
-    std::size_t operator()(half_edge_t const& entry) const noexcept {
-        return utilities::uuid_hash_t {}(entry.vertex.uuid);
-    }
+    std::size_t operator()(half_edge_t const& entry) const noexcept { return util::uuid_hash_t {}(entry.vertex.uuid); }
 };
 
 } // namespace unum::ustore::graph

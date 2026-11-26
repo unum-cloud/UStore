@@ -29,9 +29,9 @@ namespace unum::ustore::graph {
 using blobs::store_status_t;
 using blobs::translate;
 using blobs::walk_control_t;
-using utilities::arena_allocator;
-using utilities::edge_t;
-using utilities::status_t;
+using util::arena_allocator;
+using util::edge_t;
+using util::status_t;
 
 /** A graph collection: every vertex once and every edge twice, under each of its vertices,
  *  with no values. */

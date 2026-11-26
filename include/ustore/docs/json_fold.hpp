@@ -50,12 +50,12 @@
 
 namespace unum::ustore::docs {
 
-using utilities::arena_allocator;
-using utilities::bytes_of;
-using utilities::chars_of;
-using utilities::delta_kind_t;
-using utilities::delta_view_t;
-using utilities::growth_status;
+using util::arena_allocator;
+using util::bytes_of;
+using util::chars_of;
+using util::delta_kind_t;
+using util::delta_view_t;
+using util::growth_status;
 
 #pragma region Deltas
 
@@ -128,7 +128,7 @@ inline expected<std::span<byte_t const>> encode_deltas(std::span<json_delta_t co
             return status_t {status_code_t::capacity_exhausted_k, "A delta's field or value passes 4 GiB"};
         total += encoded_size(delta);
     }
-    auto [chain, status] = utilities::arena_allocate<byte_t>(arena, total);
+    auto [chain, status] = util::arena_allocate<byte_t>(arena, total);
     if (status.failed()) return status;
     byte_t* output = chain.data();
     for (json_delta_t const& delta : deltas) output = encode_into(delta, output);
@@ -609,7 +609,7 @@ struct json_fold_t {
     }
 };
 
-static_assert(utilities::a_fold<json_fold_t>);
+static_assert(util::a_fold<json_fold_t>);
 
 #pragma endregion Fold
 

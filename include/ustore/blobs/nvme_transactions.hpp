@@ -51,10 +51,10 @@
 
 namespace unum::ustore::blobs {
 
-using utilities::constrained_allocator;
-using utilities::notifier;
-using utilities::nvme_queues_ref_t;
-using utilities::shared_resources;
+using util::constrained_allocator;
+using util::notifier;
+using util::nvme_queues_ref_t;
+using util::shared_resources;
 
 #pragma region Transaction Deltas
 
@@ -233,7 +233,7 @@ class transaction_deltas {
     /** Writes @p change, a change delta of @p fold, under @p stored_key of @p id, folded
      *  after whatever the deltas hold for the key, keeping that delta's watch and taking none
      *  of its own. */
-    template <utilities::a_fold fold_type_>
+    template <util::a_fold fold_type_>
     inline status_t change(collection_id_t id, value_widths_t widths, stored_key_t stored_key,
                            stored_value_view_t change, fold_type_ const& fold) noexcept;
 
@@ -637,7 +637,7 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     status_t listed;
     [[maybe_unused]] st::status_t const walked = collection->stored_values.for_each([&](auto const& entry) noexcept {
         if (listed.succeeded() && range.covers(entry.key()))
-            listed = utilities::growth_status(inside.push_back(stored_key_t {entry.key()}));
+            listed = util::growth_status(inside.push_back(stored_key_t {entry.key()}));
     });
     if (listed.failed()) return listed;
     for (stored_key_t const& stored_key : inside) {
@@ -664,7 +664,7 @@ transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_ty
 
 template <typename stored_key_type_, template <typename> typename atomic_reference_, typename waiter_type_,
           typename row_kit_type_>
-template <utilities::a_fold fold_type_>
+template <util::a_fold fold_type_>
 inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_type_, row_kit_type_>::change(
     collection_id_t id, value_widths_t widths, stored_key_t stored_key, stored_value_view_t change,
     fold_type_ const& fold) noexcept {
@@ -678,8 +678,8 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     // A change composes with a held change and applies to a held write or removal, so one delta
     // per key reaches the seal, and a lone one is composed too, so every held chain reads in the
     // fold's own order
-    utilities::local_arena_t scratch;
-    utilities::arena_allocator<byte_t> arena = scratch.allocator();
+    util::local_arena_t scratch;
+    util::arena_allocator<byte_t> arena = scratch.allocator();
     delta_view_t const newer {delta_kind_t::change_k, change};
     delta_view_t older;
     bool const held = delta(id, stored_key, older);
@@ -688,7 +688,7 @@ inline status_t transaction_deltas<stored_key_type_, atomic_reference_, waiter_t
     if (removed_in_range) older = delta_view_t {delta_kind_t::remove_k, {}};
     delta_view_t folded {delta_kind_t::change_k, {}};
     if (held || removed_in_range) {
-        auto [paired, pair_status] = utilities::fold_delta_pair(fold, newer, older, arena);
+        auto [paired, pair_status] = util::fold_delta_pair(fold, newer, older, arena);
         if (pair_status.failed()) return pair_status;
         folded = paired;
     }

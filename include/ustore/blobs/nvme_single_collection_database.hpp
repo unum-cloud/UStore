@@ -42,11 +42,11 @@
 
 namespace unum::ustore::blobs {
 
-using utilities::manifest_collection_t;
-using utilities::manifest_file_t;
-using utilities::manifest_no_collection_k;
-using utilities::manifest_t;
-using utilities::medium_extent_t;
+using util::manifest_collection_t;
+using util::manifest_file_t;
+using util::manifest_no_collection_k;
+using util::manifest_t;
+using util::medium_extent_t;
 
 /** The ID a single-collection transaction files its deltas under, the nil UUID, as the database has one collection. */
 inline constexpr collection_id_t single_collection_id_k {};

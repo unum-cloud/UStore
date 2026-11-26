@@ -37,12 +37,12 @@
 
 namespace unum::ustore::graph {
 
-using utilities::collection_key_t;
-using utilities::missing_length_k;
-using utilities::neighborship_t;
-using utilities::trivial_erase;
-using utilities::trivial_insert;
-using utilities::value_view_t;
+using util::collection_key_t;
+using util::missing_length_k;
+using util::neighborship_t;
+using util::trivial_erase;
+using util::trivial_insert;
+using util::value_view_t;
 
 /** Bytes of the header of a vertex value, its outgoing and its incoming degree. */
 

@@ -21,14 +21,14 @@
 
 namespace unum::ustore::blobs {
 
-using utilities::bytes_of;
+using util::bytes_of;
 
 #pragma region Merge
 
 template <typename element_type_>
 element_type_* hip_compactor_t::carve_(std::size_t count) noexcept {
     std::uint32_t const held = blocks_.count;
-    auto const [carved, status] = utilities::carve_runs<element_type_>(
+    auto const [carved, status] = util::carve_runs<element_type_>(
         blocks_, stream_(), count, [&](std::size_t bytes) noexcept { return stream_().allocate_async(bytes); });
     device_allocations_ += blocks_.count - held;
     return status.failed() ? nullptr : carved.data();
@@ -44,7 +44,7 @@ st::expected<packed_counts_t> hip_compactor_t::pack_(char const* name,
         stream_().fill_async(reinterpret_cast<std::uintptr_t>(chains), byte_t {0}, 2 * sizeof(std::uint64_t)));
     if (zeroed != status_t::success_k) return zeroed;
     std::uint64_t const tickets = fu::min_of(
-        divide_round_up(regions.records_count, std::uint64_t {merge_block_threads_k}), utilities::chain_blocks_max_k);
+        divide_round_up(regions.records_count, std::uint64_t {merge_block_threads_k}), util::chain_blocks_max_k);
     status_t const launched = launch_over(stream_(), name, tickets * merge_block_threads_k, tickets, regions.merged,
                                           regions.flags, regions.records_count, regions.replaced, regions.replacements,
                                           regions.replaced_count, tickets, regions.survivors, regions.prefix,
@@ -53,7 +53,7 @@ st::expected<packed_counts_t> hip_compactor_t::pack_(char const* name,
     return packed_counts_t {chains};
 }
 
-template <typename key_slot_type_, utilities::a_fold fold_type_, typename device_fold_type_, typename allocator_type_>
+template <typename key_slot_type_, util::a_fold fold_type_, typename device_fold_type_, typename allocator_type_>
     requires a_compactable_key_slot<key_slot_type_>
 st::status_t hip_compactor_t::compact(compaction_kind_t kind,
                                       std::span<sorted_run_index_view<key_slot_type_> const> upper,
@@ -69,7 +69,7 @@ st::status_t hip_compactor_t::compact(compaction_kind_t kind,
     else return st::status_t::invalid_argument_k;
 }
 
-template <typename key_slot_type_, utilities::a_fold fold_type_, typename device_fold_type_, typename allocator_type_>
+template <typename key_slot_type_, util::a_fold fold_type_, typename device_fold_type_, typename allocator_type_>
     requires a_compactable_key_slot<key_slot_type_>
 st::status_t hip_compactor_t::compact_on_device_(compaction_kind_t kind,
                                                  std::span<sorted_run_index_view<key_slot_type_> const> upper,
@@ -123,11 +123,11 @@ st::status_t hip_compactor_t::compact_on_device_(compaction_kind_t kind,
     // The reader registered the newest run, which a rewind keeps, unless a merge opened more
     // after its sections
     if (blocks_.count > 1) sections_.release();
-    utilities::rewind(blocks_, stream_());
+    util::rewind(blocks_, stream_());
 
     // The sections land first, in one region, so the reader registers the run holding it and
     // reads into it
-    std::size_t const page = static_cast<std::size_t>(utilities::portable_alignment_k);
+    std::size_t const page = static_cast<std::size_t>(util::portable_alignment_k);
     byte_t* const region = sizing.at != 0 ? carve_<byte_t>(static_cast<std::size_t>(sizing.at) + page) : nullptr;
     if (sizing.at != 0 && !region) return status_t::out_of_memory_heap_k;
     std::uintptr_t const sections_base = round_up_to_multiple<std::uintptr_t>(reinterpret_cast<std::uintptr_t>(region),
@@ -173,7 +173,7 @@ st::status_t hip_compactor_t::compact_on_device_(compaction_kind_t kind,
               device_section_read_t {run_extents.volume, run_extents.value_offsets, into(sections.value_offsets),
                                      run_extents.run},
               device_section_read_t {run_extents.volume, run_extents.trailer, into(sections.trailer), run_extents.run},
-              device_section_read_t {run_extents.volume, sections.keys ? run_extents.keys : utilities::extent_t {},
+              device_section_read_t {run_extents.volume, sections.keys ? run_extents.keys : util::extent_t {},
                                      sections.keys ? into(sections.keys) : 0, run_extents.run}})
             if (!read.extent.empty() && reads_.push_back(device_section_read_t {read}) != status_t::success_k)
                 return false;
@@ -372,8 +372,8 @@ st::status_t hip_compactor_t::compact_on_device_(compaction_kind_t kind,
         std::size_t carved = blocks_.used;
         for (std::uint32_t block = 0; block + 1 != blocks_.count; ++block) carved += blocks_.blocks[block].capacity;
         sections_.release();
-        utilities::rewind(blocks_, stream_());
-        if (carve_<byte_t>(carved)) utilities::rewind(blocks_, stream_());
+        util::rewind(blocks_, stream_());
+        if (carve_<byte_t>(carved)) util::rewind(blocks_, stream_());
     }
 
     // The prefix is the new runs' value offsets, and the copy plan coalesces the survivors'

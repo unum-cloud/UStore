@@ -21,7 +21,7 @@ using page_pair_t = st::mapping<ustore_key_t, blobs::page_tree_bytes_t>;
 /** A pages collection: every key mapped onto the dense element tree of its page,
  *  edited in place. */
 template <blobs::isolation_t isolation_, template <typename> typename atomic_reference_, typename waiter_type_>
-using pages_by_key_store = blobs::ordered_store<page_pair_t, utilities::uuid_order_t, utilities::uuid_hash_t,
-                                                isolation_, atomic_reference_, waiter_type_>;
+using pages_by_key_store = blobs::ordered_store<page_pair_t, util::uuid_order_t, util::uuid_hash_t, isolation_,
+                                                atomic_reference_, waiter_type_>;
 
 } // namespace unum::ustore::pages

@@ -38,7 +38,7 @@
 
 namespace unum::ustore::blobs {
 
-using utilities::delta_view_t;
+using util::delta_view_t;
 
 /**
  *  @brief The runs one collection's readers see, newest first, which nothing changes once it is published.

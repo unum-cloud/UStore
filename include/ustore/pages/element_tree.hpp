@@ -47,11 +47,11 @@ namespace st = ashvardanian::smashtable;
 
 #pragma region Vocabulary
 
-using utilities::byte_t;
-using utilities::expected;
-using utilities::growth_status;
-using utilities::status_code_t;
-using utilities::status_t;
+using util::byte_t;
+using util::expected;
+using util::growth_status;
+using util::status_code_t;
+using util::status_t;
 
 /** The key of an element, where the page key doubles as the key of the root and all zeros is Nil. */
 struct element_key_t {

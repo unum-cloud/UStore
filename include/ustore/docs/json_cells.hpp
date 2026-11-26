@@ -32,7 +32,7 @@
 
 namespace unum::ustore::docs {
 
-using utilities::uuid_text_length_k;
+using util::uuid_text_length_k;
 
 #pragma region Conversions
 

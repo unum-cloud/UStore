@@ -74,10 +74,10 @@ using blobs::stamp_pin;
 using blobs::stored_value_size_t;
 using blobs::transaction_share_t;
 using blobs::value_layout_t;
-using utilities::constrained_allocator;
-using utilities::io_channel_t;
-using utilities::nvme_queues_ref_t;
-using utilities::resource_constraint;
+using util::constrained_allocator;
+using util::io_channel_t;
+using util::nvme_queues_ref_t;
+using util::resource_constraint;
 
 #pragma region Keys
 
@@ -150,7 +150,7 @@ struct listed_string_t {
  *      its strings through.
  */
 template <typename volume_type_, template <typename> typename atomic_reference_, typename waiter_type_,
-          utilities::a_strings_kit strings_kit_type_>
+          util::a_strings_kit strings_kit_type_>
 class nvme_store {
   public:
 
@@ -168,7 +168,7 @@ class nvme_store {
     using volume_t = volume_type_;
 
     /** What a delta of this store does, which is always a whole value or a removal. */
-    using fold_t = utilities::last_write_fold_t;
+    using fold_t = util::last_write_fold_t;
 
     /** The key a caller addresses this store by. */
     using stored_key_t = std::string_view;
@@ -400,7 +400,7 @@ class nvme_store {
         level_set_t const& levels = *view.levels;
         std::size_t runs = view.memory_runs.runs().size();
         for (std::size_t number = 0; number != levels.size(); ++number) runs += levels.level(number).size();
-        st::vector<cursor_t, utilities::arena_allocator<cursor_t>>& cursors = page.cursors;
+        st::vector<cursor_t, util::arena_allocator<cursor_t>>& cursors = page.cursors;
         cursors.clear();
         if (cursors.reserve(runs) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "No room for a cursor per run"};
@@ -475,8 +475,8 @@ class nvme_store {
         level_set_t const& levels = *view.levels;
         std::size_t runs = view.memory_runs.runs().size();
         for (std::size_t number = 0; number != levels.size(); ++number) runs += levels.level(number).size();
-        st::vector<cursor_t, utilities::arena_allocator<cursor_t>>& cursors = page.cursors;
-        st::vector<std::uint64_t, utilities::arena_allocator<std::uint64_t>>& starts = page.starts;
+        st::vector<cursor_t, util::arena_allocator<cursor_t>>& cursors = page.cursors;
+        st::vector<std::uint64_t, util::arena_allocator<std::uint64_t>>& starts = page.starts;
         cursors.clear();
         if (cursors.reserve(runs) != st::status_t::success_k ||
             starts.resize(st::assume_uninitialized, runs) != st::status_t::success_k)
@@ -748,8 +748,8 @@ class nvme_store {
                                compaction_stamps_t const& survival,
                                lsm_tree_publication_hook_t const& published) noexcept -> status_t {
             stamped_deltas_t versions;
-            utilities::local_arena_t folded;
-            utilities::arena_allocator<byte_t> folded_bytes = folded.allocator();
+            util::local_arena_t folded;
+            util::arena_allocator<byte_t> folded_bytes = folded.allocator();
             if (status_t const kept = kept_versions(flushed, survival, fold_, versions, folded_bytes); kept.failed())
                 return kept;
             drained_t drained;
@@ -981,19 +981,19 @@ class nvme_store {
             : texts {{scratch}}, listed {{scratch}}, whole {{scratch}}, cursors {{scratch}}, starts {{scratch}} {}
 
         /** The strings back to back. */
-        st::vector<char, utilities::arena_allocator<char>> texts;
+        st::vector<char, util::arena_allocator<char>> texts;
 
         /** Where each string sits in @c texts, in order. */
-        st::vector<listed_string_t, utilities::arena_allocator<listed_string_t>> listed;
+        st::vector<listed_string_t, util::arena_allocator<listed_string_t>> listed;
 
         /** A string put back together from a head and a tail before it lands in @c texts. */
-        st::vector<char, utilities::arena_allocator<char>> whole;
+        st::vector<char, util::arena_allocator<char>> whole;
 
         /** One cursor per run the page merges. */
-        st::vector<cursor_t, utilities::arena_allocator<cursor_t>> cursors;
+        st::vector<cursor_t, util::arena_allocator<cursor_t>> cursors;
 
         /** Where each cursor of a descending page starts on the string it lists. */
-        st::vector<std::uint64_t, utilities::arena_allocator<std::uint64_t>> starts;
+        st::vector<std::uint64_t, util::arena_allocator<std::uint64_t>> starts;
 
         /** Strings the page lists. */
         [[nodiscard]] std::size_t size() const noexcept { return listed.size(); }
@@ -1272,9 +1272,9 @@ class nvme_store {
         using strings_layout_t = typename sorted_run_t::strings_layout_t;
         std::uint64_t const keys = tails + key_slots * head_prefix_bytes_k;
         std::uint64_t const layers = 2 * sizeof(st::key128_t) * (tails / head_prefix_bytes_k + key_slots);
-        std::uint64_t const bytes = strings_layout_t::blob_bytes(key_slots, keys, utilities::portable_alignment_k,
-                                                                 key_slots + utilities::portable_alignment_k, layers);
-        return bytes > utilities::sorted_run_bytes_max_k;
+        std::uint64_t const bytes = strings_layout_t::blob_bytes(key_slots, keys, util::portable_alignment_k,
+                                                                 key_slots + util::portable_alignment_k, layers);
+        return bytes > util::sorted_run_bytes_max_k;
     }
 
     /** Writes the cells, stamps, kinds and tails laid out so far as one run of stamp zero into @p runs, and empties
@@ -1289,7 +1289,7 @@ class nvme_store {
                                                    std::span<std::uint32_t const> {drained.tail_offsets},
                                                    std::span<byte_t const> {drained.tails}};
         auto [written, write_status] = sorted_run_t::write(
-            runs_.tree().volume(), channel, runs_.config().lsm_tree.collection, utilities::uuid_generator(),
+            runs_.tree().volume(), channel, runs_.config().lsm_tree.collection, util::uuid_generator(),
             std::span<key_slot_t const> {drained.key_slots}, std::span<std::uint64_t const> {drained.stamps},
             std::span<std::uint8_t const> {drained.kinds}, 0, {}, {}, key_slot_t::size, tails);
         if (write_status.failed()) {

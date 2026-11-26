@@ -51,8 +51,8 @@
 
 namespace unum::ustore::blobs {
 
-using utilities::delta_view_t;
-using utilities::loser_tree;
+using util::delta_view_t;
+using util::loser_tree;
 
 #pragma region Vocabulary
 
@@ -111,7 +111,7 @@ struct key_tails_column_t {
         if (offsets.empty()) return {};
         std::size_t const begin = offsets[static_cast<std::size_t>(position)];
         std::size_t const end = offsets[static_cast<std::size_t>(position) + 1];
-        return utilities::chars_of(bytes.subspan(begin, end - begin));
+        return util::chars_of(bytes.subspan(begin, end - begin));
     }
 };
 
@@ -145,13 +145,13 @@ struct sorted_run_extents_t {
     std::uint32_t volume = 0;
 
     /** The index section: every cell, empty for a run whose cells are its keys alone. */
-    utilities::extent_t cells;
+    util::extent_t cells;
 
     /** The value offsets section, empty but for a variable width. */
-    utilities::extent_t value_offsets;
+    util::extent_t value_offsets;
 
     /** The trailer: the saved stamps column, then the saved kinds column @c kinds_begin bytes in. */
-    utilities::extent_t trailer;
+    util::extent_t trailer;
 
     /** Where the saved kinds start inside the trailer. */
     std::uint64_t kinds_begin = 0;
@@ -161,13 +161,13 @@ struct sorted_run_extents_t {
     std::uint64_t assigned_stamp = 0;
 
     /** The section of the saved key tree, which a run of keys alone is read through. */
-    utilities::extent_t keys;
+    util::extent_t keys;
 
     /** Where the tree's leaf rows start inside @c keys. */
     std::uint64_t leaves_begin = 0;
 
     /** The run's ID, which names its file on a directory volume. */
-    utilities::uuid128_t run {};
+    util::uuid128_t run {};
 };
 
 /** The keys from @c start up to @c end, exclusive, which one range removal hides. */
@@ -1436,9 +1436,9 @@ std::size_t union_sorted_keys(first_reader_type_&& read_first, std::size_t first
 #pragma region Host
 
 /** The compactor's status for a fold that refused a chain, which only running out of memory is not a refusal. */
-inline st::status_t fold_refusal(utilities::status_t const& refused) noexcept {
-    return refused == utilities::status_code_t::out_of_memory_k ? st::status_t::out_of_memory_heap_k
-                                                                : st::status_t::invalid_argument_k;
+inline st::status_t fold_refusal(util::status_t const& refused) noexcept {
+    return refused == util::status_code_t::out_of_memory_k ? st::status_t::out_of_memory_heap_k
+                                                           : st::status_t::invalid_argument_k;
 }
 
 /** The versions a merge folds into a surviving change, and whether its chain applies onto nothing. */
@@ -1488,17 +1488,17 @@ constexpr folded_versions_t folded_versions(compaction_kind_t kind, compaction_s
  *  @param[in,out] arena Where the bytes the fold reads and writes are allocated.
  *  @param[out] folded What the change folds to, a write, a removal or a change, its bytes in @p arena or a record.
  */
-template <typename record_type_, utilities::a_fold fold_type_, typename value_of_type_>
+template <typename record_type_, util::a_fold fold_type_, typename value_of_type_>
 st::status_t fold_versions(fold_type_ const& fold, record_type_ const* merged, std::uint64_t head,
                            folded_versions_t const& versions, value_of_type_&& value_of,
-                           utilities::arena_allocator<byte_t>& arena, delta_view_t& folded) noexcept {
+                           util::arena_allocator<byte_t>& arena, delta_view_t& folded) noexcept {
     folded = delta_view_t {delta_kind_t::change_k, {}};
     if (st::status_t const read = value_of(merged[head], folded.bytes); read != st::status_t::success_k) return read;
     for (std::uint64_t older = head + 1; older != versions.end && folded.kind == delta_kind_t::change_k; ++older) {
         delta_view_t version {located_of(merged[older]).kind, {}};
         if (st::status_t const read = value_of(merged[older], version.bytes); read != st::status_t::success_k)
             return read;
-        auto [pair, fold_status] = utilities::fold_delta_pair(fold, folded, version, arena);
+        auto [pair, fold_status] = util::fold_delta_pair(fold, folded, version, arena);
         if (fold_status.failed()) return fold_refusal(fold_status);
         folded = pair;
     }
@@ -1539,8 +1539,7 @@ struct host_compactor_t {
      *  - @c capacity_exhausted_k A folded value outgrows its inline key slot or the 32-bit sizes.
      *  - @c out_of_memory_heap_k A buffer could not grow.
      */
-    template <typename key_slot_type_, utilities::a_fold fold_type_, typename value_reader_type_,
-              typename allocator_type_>
+    template <typename key_slot_type_, util::a_fold fold_type_, typename value_reader_type_, typename allocator_type_>
         requires a_compactable_key_slot<key_slot_type_>
     st::status_t compact(compaction_kind_t kind, std::span<sorted_run_index_view<key_slot_type_> const> upper,
                          std::span<sorted_run_index_view<key_slot_type_> const> lower,
@@ -1623,8 +1622,8 @@ struct host_compactor_t {
         status_t status = output.merge_tournament.reset(static_cast<std::uint32_t>(sorted_runs_count), precedes);
         if (status != status_t::success_k) return status;
 
-        utilities::local_arena_t arena;
-        utilities::arena_allocator<byte_t> arena_bytes = arena.allocator();
+        util::local_arena_t arena;
+        util::arena_allocator<byte_t> arena_bytes = arena.allocator();
         auto const value_of = [&](record_t const& record, std::span<byte_t const>& bytes) noexcept {
             bytes = {};
             if (located_of(record).kind == delta_kind_t::remove_k) return status_t::success_k;
@@ -1781,51 +1780,50 @@ class fold_ref_t {
   public:
 
     /** Views @p fold, which must outlive every call. */
-    template <utilities::a_fold fold_type_>
+    template <util::a_fold fold_type_>
     explicit fold_ref_t(fold_type_ const& fold) noexcept
         : fold_(&fold), apply_(&apply_through_<fold_type_>), compose_(&compose_through_<fold_type_>),
           closes_(&closes_through_<fold_type_>) {}
 
     /** The value @p base becomes once @p deltas apply, as the viewed fold answers it. */
-    expected<std::span<byte_t const>> apply(std::span<byte_t const> base,
-                                            std::span<utilities::delta_view_t const> deltas,
-                                            utilities::arena_allocator<byte_t>& arena) const noexcept {
+    expected<std::span<byte_t const>> apply(std::span<byte_t const> base, std::span<util::delta_view_t const> deltas,
+                                            util::arena_allocator<byte_t>& arena) const noexcept {
         return apply_(fold_, base, deltas, arena);
     }
 
     /** One delta standing for @p deltas, as the viewed fold answers it. */
-    expected<std::span<byte_t const>> compose(std::span<utilities::delta_view_t const> deltas,
-                                              utilities::arena_allocator<byte_t>& arena) const noexcept {
+    expected<std::span<byte_t const>> compose(std::span<util::delta_view_t const> deltas,
+                                              util::arena_allocator<byte_t>& arena) const noexcept {
         return compose_(fold_, deltas, arena);
     }
 
     /** Whether no delta older than @p delta matters, as the viewed fold answers it. */
-    bool closes(utilities::delta_view_t const& delta) const noexcept { return closes_(fold_, delta); }
+    bool closes(util::delta_view_t const& delta) const noexcept { return closes_(fold_, delta); }
 
   private:
     using apply_t = expected<std::span<byte_t const>> (*)(void const*, std::span<byte_t const>,
-                                                          std::span<utilities::delta_view_t const>,
-                                                          utilities::arena_allocator<byte_t>&) noexcept;
-    using compose_t = expected<std::span<byte_t const>> (*)(void const*, std::span<utilities::delta_view_t const>,
-                                                            utilities::arena_allocator<byte_t>&) noexcept;
-    using closes_t = bool (*)(void const*, utilities::delta_view_t const&) noexcept;
+                                                          std::span<util::delta_view_t const>,
+                                                          util::arena_allocator<byte_t>&) noexcept;
+    using compose_t = expected<std::span<byte_t const>> (*)(void const*, std::span<util::delta_view_t const>,
+                                                            util::arena_allocator<byte_t>&) noexcept;
+    using closes_t = bool (*)(void const*, util::delta_view_t const&) noexcept;
 
     template <typename fold_type_>
     static expected<std::span<byte_t const>> apply_through_(void const* fold, std::span<byte_t const> base,
-                                                            std::span<utilities::delta_view_t const> deltas,
-                                                            utilities::arena_allocator<byte_t>& arena) noexcept {
+                                                            std::span<util::delta_view_t const> deltas,
+                                                            util::arena_allocator<byte_t>& arena) noexcept {
         return static_cast<fold_type_ const*>(fold)->apply(base, deltas, arena);
     }
 
     template <typename fold_type_>
     static expected<std::span<byte_t const>> compose_through_(void const* fold,
-                                                              std::span<utilities::delta_view_t const> deltas,
-                                                              utilities::arena_allocator<byte_t>& arena) noexcept {
+                                                              std::span<util::delta_view_t const> deltas,
+                                                              util::arena_allocator<byte_t>& arena) noexcept {
         return static_cast<fold_type_ const*>(fold)->compose(deltas, arena);
     }
 
     template <typename fold_type_>
-    static bool closes_through_(void const* fold, utilities::delta_view_t const& delta) noexcept {
+    static bool closes_through_(void const* fold, util::delta_view_t const& delta) noexcept {
         return static_cast<fold_type_ const*>(fold)->closes(delta);
     }
 
@@ -1842,7 +1840,7 @@ class fold_ref_t {
     closes_t closes_ = nullptr;
 };
 
-static_assert(utilities::a_fold<fold_ref_t>);
+static_assert(util::a_fold<fold_ref_t>);
 
 /** A viewed reader of the values a fold reads, called as @c host_compactor_t calls its own, so one
  *  device compaction compiled per key slot serves a reader of any type. */
@@ -1859,24 +1857,23 @@ class located_value_reader {
         : context_(&reader), read_(&read_through_<reader_type_>) {}
 
     /** Views the bytes of @p record in @p bytes, allocating any it reads from @p arena. */
-    st::status_t operator()(located_key_slot<key_slot_type_> const& record, utilities::arena_allocator<byte_t>& arena,
+    st::status_t operator()(located_key_slot<key_slot_type_> const& record, util::arena_allocator<byte_t>& arena,
                             std::span<byte_t const>& bytes) const noexcept {
         return read_(context_, record, arena, bytes);
     }
 
   private:
     using read_t = st::status_t (*)(void const*, located_key_slot<key_slot_type_> const&,
-                                    utilities::arena_allocator<byte_t>&, std::span<byte_t const>&) noexcept;
+                                    util::arena_allocator<byte_t>&, std::span<byte_t const>&) noexcept;
 
     template <typename reader_type_>
     static st::status_t read_through_(void const* context, located_key_slot<key_slot_type_> const& record,
-                                      utilities::arena_allocator<byte_t>& arena,
-                                      std::span<byte_t const>& bytes) noexcept {
+                                      util::arena_allocator<byte_t>& arena, std::span<byte_t const>& bytes) noexcept {
         return (*static_cast<reader_type_ const*>(context))(record, arena, bytes);
     }
 
-    static st::status_t refuse_(void const*, located_key_slot<key_slot_type_> const&,
-                                utilities::arena_allocator<byte_t>&, std::span<byte_t const>&) noexcept {
+    static st::status_t refuse_([[maybe_unused]] void const* reader, located_key_slot<key_slot_type_> const&,
+                                util::arena_allocator<byte_t>&, std::span<byte_t const>&) noexcept {
         return st::status_t::invalid_argument_k;
     }
 
@@ -1895,13 +1892,13 @@ struct device_section_read_t {
     std::uint32_t volume = 0;
 
     /** The section's range of that medium, aligned as an unbuffered read takes it. */
-    utilities::extent_t extent;
+    util::extent_t extent;
 
     /** Where the bytes land, counted from the start of the scratch. */
     std::uint64_t into = 0;
 
     /** The run's ID, which names its file on a directory volume. */
-    utilities::uuid128_t run {};
+    util::uuid128_t run {};
 };
 
 /** A viewed transport moving run sections from their volumes into a device compactor's scratch, so
@@ -1973,12 +1970,12 @@ class device_sections_reader_t {
  *  @tparam volume_type_ The directory volume naming the run files, or @c void for raw media alone.
  */
 template <typename disk_type_, typename waiter_type_, typename volume_type_ = void>
-    requires utilities::a_disk<disk_type_>
+    requires util::a_disk<disk_type_>
 class ring_sections_reader {
   public:
 
     /** Requests one batch keeps in flight. */
-    static constexpr utilities::queue_depth_t depth_k = 32;
+    static constexpr util::queue_depth_t depth_k = 32;
 
     /** Bytes one request moves at most, so a section of any size stays within one transfer of the ring. */
     static constexpr std::uint64_t request_bytes_k = std::uint64_t {64} << 20;
@@ -1986,7 +1983,7 @@ class ring_sections_reader {
     /** Takes @p disk in, reading volume @c i from the medium @p media[i] names, and acquires a
      *  queue pair of it. */
     static expected<ring_sections_reader> make(disk_type_&& disk,
-                                               std::span<utilities::medium_options_t const> media) noexcept {
+                                               std::span<util::medium_options_t const> media) noexcept {
         ring_sections_reader reader;
         reader.disk_ = std::move(disk);
         if (reader.media_.resize(media.size()) != st::status_t::success_k)
@@ -2016,8 +2013,8 @@ class ring_sections_reader {
     ring_sections_reader(ring_sections_reader&& other) noexcept
         : disk_(std::move(other.disk_)), media_(std::move(other.media_)), runs_(std::move(other.runs_)),
           volume_(std::exchange(other.volume_, nullptr)), queue_(std::move(other.queue_)),
-          queue_pair_(queue_, utilities::queue_id_t {0}), registered_(std::move(other.registered_)) {
-        other.queue_pair_ = utilities::queue_ref_t {};
+          queue_pair_(queue_, util::queue_id_t {0}), registered_(std::move(other.registered_)) {
+        other.queue_pair_ = util::queue_ref_t {};
     }
     ring_sections_reader(ring_sections_reader const&) = delete;
     ring_sections_reader& operator=(ring_sections_reader const&) = delete;
@@ -2026,18 +2023,18 @@ class ring_sections_reader {
         release();
         if (queue_pair_.held()) [[maybe_unused]]
             status_t const drained = disk_.drain(queue_pair_);
-        for (utilities::registered_medium_t& medium : media_)
+        for (util::registered_medium_t& medium : media_)
             if (medium.held()) [[maybe_unused]]
                 status_t const detached = disk_.unregister_medium(medium);
     }
 
     /** Reads every one of @p reads into @p scratch, registering it first when it is new, one batch at a time. */
     st::status_t read(std::span<device_section_read_t const> reads, std::span<byte_t> scratch) noexcept {
-        using utilities::completion_t;
-        using utilities::request_t;
+        using util::completion_t;
+        using util::request_t;
         if (registered_.held() && registered_.bytes().data() != scratch.data()) release();
         if (!registered_.held()) {
-            auto [registered, status] = disk_.register_memory(scratch, utilities::memory_space_t::gpu_k);
+            auto [registered, status] = disk_.register_memory(scratch, util::memory_space_t::gpu_k);
             if (status.failed()) return st::status_t::input_output_k;
             registered_ = std::move(registered);
         }
@@ -2053,9 +2050,9 @@ class ring_sections_reader {
                 std::uint64_t const length = left < request_bytes_k ? left : request_bytes_k;
                 auto [medium, medium_status] = medium_of_(section);
                 if (medium_status.failed()) return st::status_t::input_output_k;
-                requests[staged] = utilities::read_request(
-                    medium, utilities::extent_t {section.extent.offset + done, length},
-                    registered_.reference(section.into + done), queue_pair_.token(static_cast<std::uint32_t>(staged)));
+                requests[staged] = util::read_request(medium, util::extent_t {section.extent.offset + done, length},
+                                                      registered_.reference(section.into + done),
+                                                      queue_pair_.token(static_cast<std::uint32_t>(staged)));
                 ++staged;
                 done += length;
                 if (done == section.extent.length) ++read, done = 0;
@@ -2066,7 +2063,7 @@ class ring_sections_reader {
                 if (submit_status.failed()) return st::status_t::input_output_k;
                 submitted += accepted;
             }
-            auto [completed, poll_status] = utilities::poll_completions_at_least<waiter_type_>(
+            auto [completed, poll_status] = util::poll_completions_at_least<waiter_type_>(
                 disk_, queue_pair_, std::span<completion_t> {completions}, staged);
             if (poll_status.failed() || completed != staged) return st::status_t::input_output_k;
             for (std::size_t index = 0; index != staged; ++index)
@@ -2092,20 +2089,20 @@ class ring_sections_reader {
         auto [queue, make_queue_status] = disk_type_::queue_t::make(depth_k, {});
         if (make_queue_status.failed()) return make_queue_status;
         queue_ = std::move(queue);
-        queue_pair_ = utilities::queue_ref_t {queue_, utilities::queue_id_t {0}};
+        queue_pair_ = util::queue_ref_t {queue_, util::queue_id_t {0}};
         return disk_.register_media(queue_pair_);
     }
     /** One run file a merge reads, registered at its first section. */
     struct run_medium_t {
-        utilities::uuid128_t run {};
-        utilities::registered_medium_t medium;
+        util::uuid128_t run {};
+        util::registered_medium_t medium;
     };
 
     /** Whether a directory volume names the run files, rather than raw media alone. */
     static constexpr bool reads_run_files_k = !std::is_void_v<volume_type_>;
 
     /** The medium @p section is read from: its volume's on raw media, else its run's file. */
-    expected<utilities::medium_reference_t> medium_of_(device_section_read_t const& section) noexcept {
+    expected<util::medium_reference_t> medium_of_(device_section_read_t const& section) noexcept {
         if constexpr (reads_run_files_k)
             if (volume_) return run_medium_of_(section);
         if (section.volume >= media_.size())
@@ -2114,17 +2111,17 @@ class ring_sections_reader {
     }
 
     /** The file of the run @p section names, registered at its first section. */
-    expected<utilities::medium_reference_t> run_medium_of_(device_section_read_t const& section) noexcept {
+    expected<util::medium_reference_t> run_medium_of_(device_section_read_t const& section) noexcept {
         // A merge reads a handful of runs, which a scan finds sooner than a table would.
         for (run_medium_t const& known : runs_)
             if (known.run == section.run) return known.medium.reference();
-        char path[utilities::path_max_bytes_k];
+        char path[util::path_max_bytes_k];
         if (status_t const named = volume_->file_path(static_cast<std::uint16_t>(section.volume), section.run, path);
             named.failed())
             return named;
-        utilities::medium_options_t request;
+        util::medium_options_t request;
         request.name = path;
-        request.access = utilities::medium_access_t::read_only_k;
+        request.access = util::medium_access_t::read_only_k;
         auto [registered, status] = disk_.register_medium(request);
         if (status.failed()) return status;
         if (runs_.push_back(run_medium_t {section.run, std::move(registered)}) != st::status_t::success_k)
@@ -2136,7 +2133,7 @@ class ring_sections_reader {
     disk_type_ disk_;
 
     /** The medium of every volume, by volume, on raw media. */
-    st::vector<utilities::registered_medium_t> media_;
+    st::vector<util::registered_medium_t> media_;
 
     /** The run files the current merge read, on a directory volume. */
     st::vector<run_medium_t> runs_;
@@ -2148,10 +2145,10 @@ class ring_sections_reader {
     typename disk_type_::queue_t queue_;
 
     /** The handle on @c queue_ the disk reads it through. */
-    utilities::queue_ref_t queue_pair_;
+    util::queue_ref_t queue_pair_;
 
     /** The scratch the reads land in, as the ring registered it. */
-    utilities::registered_memory_t registered_;
+    util::registered_memory_t registered_;
 };
 
 /** The device regions the pack of one merge reads and writes, on every vendor's device. */

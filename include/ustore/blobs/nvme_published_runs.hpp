@@ -48,9 +48,9 @@
 
 namespace unum::ustore::blobs {
 
-using utilities::constrained_allocator;
-using utilities::nvme_queues_ref_t;
-using utilities::resource_constraint;
+using util::constrained_allocator;
+using util::nvme_queues_ref_t;
+using util::resource_constraint;
 
 /** One object the thread holding the leader word unpublished, linked inside the object's own room until that thread
  *  lets the word go and frees it, so unpublishing allocates nothing and cannot fail. */
@@ -498,9 +498,9 @@ class commit_ledger {
                 if (into.push_back(transaction_stamp_t {pin->stamp_}) != st::status_t::success_k)
                     return {status_code_t::out_of_memory_k, "No room to list the stamps readers pin"};
         }
-        utilities::radix_sort(
+        util::radix_sort(
             std::span<transaction_stamp_t> {into}, sizeof(transaction_stamp_t),
-            [](transaction_stamp_t stamp, std::size_t digit) noexcept { return utilities::word_byte(stamp, digit); },
+            [](transaction_stamp_t stamp, std::size_t digit) noexcept { return util::word_byte(stamp, digit); },
             [](transaction_stamp_t first, transaction_stamp_t second) noexcept { return first < second; });
         std::size_t kept = 0;
         for (std::size_t index = 0; index != into.size(); ++index)
@@ -1331,7 +1331,7 @@ class published_runs {
      *  @note The owner serializes it with flushes, compactions and truncations of the store, and
      *      the calling thread is inside no epoch.
      */
-    template <utilities::a_fold fold_type_>
+    template <util::a_fold fold_type_>
     status_t merge_memory_runs(fold_type_ const& fold) noexcept {
         std::size_t const fan_in = config_.lsm_tree.level_enlarge_factor;
         // Every pass reuses the room the first one grew.
@@ -1341,8 +1341,8 @@ class published_runs {
         st::vector<memory_run_handle_t> away;
         stamped_deltas_t versions {constrained_allocator<stamped_delta_t, atomic_reference_> {*constraint_}};
         // The changes a merge folds sit here until the merged run copies them.
-        utilities::local_arena_t folded;
-        utilities::arena_allocator<byte_t> folded_bytes = folded.allocator();
+        util::local_arena_t folded;
+        util::arena_allocator<byte_t> folded_bytes = folded.allocator();
         if (group.resize(fan_in) != st::status_t::success_k || away.reserve(fan_in) != st::status_t::success_k)
             return {status_code_t::out_of_memory_k, "A merge could not list its memory runs"};
         for (;;) {
@@ -1357,7 +1357,7 @@ class published_runs {
             if (status_t const listed = ledger_->pinned_readers(readers); listed.failed()) return listed;
             away.clear();
             versions.clear();
-            utilities::arena_rewind(folded_bytes.arena);
+            util::arena_rewind(folded_bytes.arena);
             // Claimed before the merge is built, so a full pool skips it, leaving the runs to the
             // flush the stall runs.
             auto [record, claim_status] = memory_runs_.try_claim();
@@ -1451,7 +1451,7 @@ class published_runs {
      *  @param[in] fan_out The threads a merge on the host fans its slices out over, or one slice on
      *      the calling thread.
      */
-    template <utilities::a_fold fold_type_, typename device_fold_type_>
+    template <util::a_fold fold_type_, typename device_fold_type_>
     expected<compaction_outcome_t> compact(io_channel_t& reading_channel, io_channel_t& writing_channel,
                                            std::span<merge_buffers_t> buffers, compactor_ref_t const& compactor,
                                            fold_type_ const& fold, device_fold_type_ const& device_fold,
@@ -1513,7 +1513,7 @@ class published_runs {
     }
 
     /** Drops every version a mount found stamped above @p ceiling, which only a store holding no memory run takes. */
-    template <utilities::a_fold fold_type_>
+    template <util::a_fold fold_type_>
     status_t truncate_above(io_channel_t& reading_channel, io_channel_t& writing_channel,
                             std::span<merge_buffers_t> buffers, transaction_stamp_t ceiling, fold_type_ const& fold,
                             lsm_tree_publication_hook_t const& published) noexcept {

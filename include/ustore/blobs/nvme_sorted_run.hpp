@@ -98,19 +98,19 @@
 
 namespace unum::ustore::blobs {
 
-using utilities::basic_read_pipeline;
-using utilities::basic_write_pipeline;
-using utilities::bytes_of;
-using utilities::chars_of;
-using utilities::completed_buffer_t;
-using utilities::completion_t;
-using utilities::extent_t;
-using utilities::io_channel_t;
-using utilities::magic_of;
-using utilities::medium_extent_t;
-using utilities::portable_alignment_k;
-using utilities::request_t;
-using utilities::request_tag_t;
+using util::basic_read_pipeline;
+using util::basic_write_pipeline;
+using util::bytes_of;
+using util::chars_of;
+using util::completed_buffer_t;
+using util::completion_t;
+using util::extent_t;
+using util::io_channel_t;
+using util::magic_of;
+using util::medium_extent_t;
+using util::portable_alignment_k;
+using util::request_t;
+using util::request_tag_t;
 
 #pragma region Vocabulary
 
@@ -1187,7 +1187,7 @@ class lsm_sorted_run {
     {
         std::size_t const begin = key_offsets_[static_cast<std::size_t>(position)];
         std::size_t const end = key_offsets_[static_cast<std::size_t>(position) + 1];
-        return utilities::chars_of(std::span<byte_t const> {keys_}.subspan(begin, end - begin));
+        return util::chars_of(std::span<byte_t const> {keys_}.subspan(begin, end - begin));
     }
 
     /** One offset per string of a run of strings into @c key_tape and one past the last: an
@@ -1842,7 +1842,7 @@ class lsm_sorted_run {
     [[nodiscard]] static std::string_view key_of_(strings_sections_t const& sections, std::uint64_t position) noexcept {
         std::size_t const begin = sections.key_offsets[static_cast<std::size_t>(position)];
         std::size_t const end = sections.key_offsets[static_cast<std::size_t>(position) + 1];
-        return utilities::chars_of(std::span<byte_t const> {sections.keys}.subspan(begin, end - begin));
+        return util::chars_of(std::span<byte_t const> {sections.keys}.subspan(begin, end - begin));
     }
 
     /** Stages the heads, the values, the key offsets, the key tape and the layers of a
@@ -2105,7 +2105,7 @@ class lsm_sorted_run {
                                                                  std::span<request_t const> {batch});
             if (submit_status.failed()) return submit_status;
             if (taken != 1) return {status_code_t::io_k, "The ring would not take an index read"};
-            auto [completed, wait_completions_status] = utilities::wait_completions<waiter_type_>(
+            auto [completed, wait_completions_status] = util::wait_completions<waiter_type_>(
                 volume_->disk(), channel.queue_pair(), channel.completion_buffer());
             if (wait_completions_status.failed()) return wait_completions_status;
             if (completed == 0) return {status_code_t::io_k, "An index read never completed"};

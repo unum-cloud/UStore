@@ -38,12 +38,12 @@
 
 namespace unum::ustore::blobs {
 
-using utilities::a_disk;
-using utilities::load;
-using utilities::medium_reference_t;
-using utilities::memory_reference_t;
-using utilities::pooled_buffer_t;
-using utilities::uuid_generator;
+using util::a_disk;
+using util::load;
+using util::medium_reference_t;
+using util::memory_reference_t;
+using util::pooled_buffer_t;
+using util::uuid_generator;
 
 #pragma region LSM Level Merger
 
@@ -523,7 +523,7 @@ class lsm_level_merger {
      *  @return The new runs in ascending order, or the status that stopped the merge with every new
      *      run already given back.
      */
-    template <utilities::a_fold fold_type_, typename device_fold_type_>
+    template <util::a_fold fold_type_, typename device_fold_type_>
     static expected<merged_runs_t> merge(volume_t& volume, run_pool_t& runs, io_channel_t& reading_channel,
                                          io_channel_t& writing_channel, merge_request_t const& request,
                                          fold_type_ const& fold, device_fold_type_ const& device_fold) noexcept {
@@ -550,7 +550,7 @@ class lsm_level_merger {
      *  and the calling thread hands every run to the pool in key order. A merge of one slice runs
      *  each step on the calling thread over the channels it was handed.
      */
-    template <utilities::a_fold fold_type_, typename device_fold_type_>
+    template <util::a_fold fold_type_, typename device_fold_type_>
     static expected<merged_runs_t> merge_fixed_(volume_t& volume, run_pool_t& runs, io_channel_t& reading_channel,
                                                 io_channel_t& writing_channel, merge_request_t const& request,
                                                 fold_type_ const& fold, device_fold_type_ const& device_fold) noexcept {
@@ -570,7 +570,7 @@ class lsm_level_merger {
         // A fold reads its changes' values over a slice's channel, from their runs, one at a time
         auto const value_reader = [&runs, &sources](io_channel_t& reading) noexcept {
             return [&runs, &sources, &reading](located_key_slot<key_slot_t> const& record,
-                                               utilities::arena_allocator<byte_t>& arena,
+                                               util::arena_allocator<byte_t>& arena,
                                                std::span<byte_t const>& bytes) noexcept {
                 std::size_t const size = runs[sources[record.sorted_run].index].value_window(record.position).bytes;
                 byte_t* const into = size != 0 ? arena.allocate(size) : nullptr;
@@ -1155,7 +1155,7 @@ class lsm_level_merger {
      *  device compactor reads. */
     [[nodiscard]] static sorted_run_extents_t extents_of_(sorted_run_t const& run) noexcept {
         medium_extent_t const& blob = run.extent();
-        if (blob.medium.medium_id == utilities::registered_medium_id_t::unregistered_k)
+        if (blob.medium.medium_id == util::registered_medium_id_t::unregistered_k)
             return {.assigned_stamp = run.assigned_stamp()};
         sorted_run_header_t const& header = run.header();
         std::uint64_t const count = header.key_slots_count;
@@ -1559,7 +1559,7 @@ class lsm_level_merger {
                                                   st::vector<pooled_buffer_t>& window_blocks) noexcept {
         st::vector<source_window_t>& windows = buffers.source_windows;
         std::size_t const sources_count = windows.size();
-        utilities::buffer_pool_t& streams = reading_channel.streams();
+        util::buffer_pool_t& streams = reading_channel.streams();
         std::size_t const free_blocks = streams.available_buffers();
         std::size_t const per_block = divide_round_up(fu::max_of<std::size_t>(sources_count, 1),
                                                       fu::max_of<std::size_t>(free_blocks, 1));
@@ -1707,7 +1707,7 @@ class lsm_level_merger {
             if (span.length != end - begin)
                 return {status_code_t::malformed_k, "A source run ends inside its value window"};
             std::uint64_t const half_offset = index * half_bytes;
-            bool const shared = window.place.memory_id != utilities::registered_memory_id_t::unregistered_k;
+            bool const shared = window.place.memory_id != util::registered_memory_id_t::unregistered_k;
             std::uint64_t const step = shared ? span.length : read_block;
             for (std::uint64_t offset = 0; offset < span.length;) {
                 if (shared ? !reader.can_enqueue_into() : !reader.can_enqueue()) {
