@@ -1047,6 +1047,32 @@ void test_executor_drain(config_t const& config) {
     expect_true(ustore_executor_free(executor) == ustore_status_success_k);
 }
 
+/** A host executor drives no stream, so naming, following or checking one is unsupported, while
+ *  missing arguments are refused first. */
+void test_executor_streams_on_host(config_t const&) {
+    auto [executor, spawn_status] = spawn_executor();
+    if (!expect_true(!spawn_status.failed())) return;
+    ustore_outcome_t outcome {};
+    void* stream = &outcome;
+    ustore_executor_stream_t named {.executor = executor, .outcome = &outcome, .stream = &stream};
+    ustore_executor_stream(&named);
+    expect_status(outcome, status_code_t::unsupported_k);
+    expect_true(stream == nullptr);
+    named.executor = nullptr;
+    ustore_executor_stream(&named);
+    expect_status(outcome, status_code_t::invalid_argument_k);
+    ustore_executor_follow_t follow {.executor = executor, .stream = &outcome, .outcome = &outcome};
+    ustore_executor_follow(&follow);
+    expect_status(outcome, status_code_t::unsupported_k);
+    follow.stream = nullptr;
+    ustore_executor_follow(&follow);
+    expect_status(outcome, status_code_t::invalid_argument_k);
+    ustore_executor_accepts_t accepts {.executor = executor, .stream = &outcome, .outcome = &outcome};
+    ustore_executor_accepts(&accepts);
+    expect_status(outcome, status_code_t::unsupported_k);
+    expect_true(ustore_executor_free(executor) == ustore_status_success_k);
+}
+
 /** A call naming an arena an unfinished call holds finishes contended, and so does one on a
  *  transaction it reads through, each on the calling thread, until the holding call ends. */
 void test_executor_contended_arena(config_t const&) {
@@ -2095,6 +2121,7 @@ int main(int argc, char** argv) {
                   config);
     run_test_case(engine_label_t {"test_executor_submit_after_wait"}.c_str(), test_executor_submit_after_wait, config);
     run_test_case(engine_label_t {"test_executor_drain"}.c_str(), test_executor_drain, config);
+    run_test_case(engine_label_t {"test_executor_streams_on_host"}.c_str(), test_executor_streams_on_host, config);
     run_test_case(engine_label_t {"test_executor_contended_arena"}.c_str(), test_executor_contended_arena, config);
     run_test_case(engine_label_t {"test_executor_arena_on_device"}.c_str(), test_executor_arena_on_device, config);
     run_test_case(engine_label_t {"test_outcome_wait_blocks"}.c_str(), test_outcome_wait_blocks, config);

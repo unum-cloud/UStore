@@ -1,5 +1,11 @@
 # The CPython extension `ustore.lib`, which `scikit-build-core` drives from `pyproject.toml`.
 
+# A build with the stand-in links it instead, so the Python suites run their refusal paths against the stub too.
+set(ustore_python_library_ ustore::static)
+if (USTORE_BUILD_STUB)
+    set(ustore_python_library_ ustore::static_stub)
+endif ()
+
 find_package(Python 3.12 REQUIRED COMPONENTS Interpreter Development.Module)
 
 # Module glue first, then the shared vocabulary, then one file per header of the C ABI.
@@ -34,7 +40,7 @@ target_include_directories(ustore_python PRIVATE ${PROJECT_SOURCE_DIR}/c ${CMAKE
 
 # The one library holds every engine the build enables, with the `USTORE_WITH_*` switches `engines_compiled` reads,
 # and documents convert to and from Python objects through the yyjson it already holds.
-target_link_libraries(ustore_python PRIVATE ustore::static yyjson::yyjson ustore_warnings)
+target_link_libraries(ustore_python PRIVATE ${ustore_python_library_} yyjson::yyjson ustore_warnings)
 # The module's one export is its init function; the archives linked inside, UStore's own and its siblings', fmt and
 # yyjson among them, keep their symbols to themselves.
 set_target_properties(ustore_python PROPERTIES C_VISIBILITY_PRESET hidden VISIBILITY_INLINES_HIDDEN ON)

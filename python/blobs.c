@@ -142,7 +142,7 @@ PyObject* ustore_py_api_read(PyObject* self, PyObject* const* arguments, Py_ssiz
     ustore_py_read_call_t stack;
     ustore_py_read_call_t* const call = ustore_py_call_open(&context, &ustore_py_read_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_keys_from_object(arguments[0], &call->keys) != 0)
+    if (ustore_py_keys_from_object(arguments[0], ustore_py_context_executor(&context), &call->keys) != 0)
         return ustore_py_call_discard(&context, &ustore_py_read_verb, call);
     call->offset = offset;
     call->limit = limit;
@@ -156,7 +156,7 @@ PyObject* ustore_py_api_read(PyObject* self, PyObject* const* arguments, Py_ssiz
  */
 static PyObject* values_read_once(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
                                   ustore_py_verb_t const* verb, ustore_py_read_call_t* call) {
-    PyObject* const arena = ustore_py_arena_new(ustore_py_context_executor(context));
+    PyObject* const arena = ustore_py_arena_new(context->executor);
     if (!arena) return ustore_py_call_discard(context, verb, call);
     PyObject* const answer = ustore_py_values_read(context, options, verb, call, arena);
     Py_DECREF(arena);
@@ -234,7 +234,7 @@ PyObject* ustore_py_value_contains(ustore_py_context_t const* context, ustore_py
     ustore_py_read_call_t stack;
     ustore_py_read_call_t* const call = one_key_open(context, &contains_verb, key, &stack);
     if (!call) return NULL;
-    PyObject* const arena = ustore_py_arena_new(ustore_py_context_executor(context));
+    PyObject* const arena = ustore_py_arena_new(context->executor);
     int const claimed = arena ? ustore_py_arena_from_object(arena, &call->kept.arena) : -1;
     Py_XDECREF(arena);
     if (claimed != 0) return ustore_py_call_discard(context, &contains_verb, call);
@@ -276,8 +276,9 @@ PyObject* ustore_py_api_contains(PyObject* self, PyObject* const* arguments, Py_
 
 #pragma region Writes
 
-int ustore_py_contents_from_object(PyObject* object, size_t count, ustore_py_contents_t* batch) {
-    int const tape = ustore_py_contents_from_tape(object, batch);
+int ustore_py_contents_from_object(PyObject* object, ustore_executor_t executor, size_t count,
+                                   ustore_py_contents_t* batch) {
+    int const tape = ustore_py_contents_from_tape(object, executor, batch);
     if (tape < 0) return -1;
     if (tape && batch->count != count) {
         ustore_py_raise(ustore_status_invalid_argument_k, "Got a tape of %zu values for %zu keys", batch->count, count);
@@ -359,9 +360,10 @@ static void remove_release(void* erased) {
     ustore_py_call_release(&call->kept);
 }
 
-int ustore_py_ends_from_object(PyObject* object, ustore_py_keys_t const* starts, ustore_py_keys_t* ends) {
+int ustore_py_ends_from_object(PyObject* object, ustore_executor_t executor, ustore_py_keys_t const* starts,
+                               ustore_py_keys_t* ends) {
     if (!object) return 0;
-    if (ustore_py_keys_from_subscript(object, ends) < 0) return -1;
+    if (ustore_py_keys_from_subscript(object, executor, ends) < 0) return -1;
     if (ends->count == starts->count) return 0;
     return ustore_py_raise(ustore_status_invalid_argument_k, "Got %zu ends for %zu starts", ends->count, starts->count);
 }
@@ -450,8 +452,9 @@ PyObject* ustore_py_api_write(PyObject* self, PyObject* const* arguments, Py_ssi
     ustore_py_write_call_t stack;
     ustore_py_write_call_t* const call = ustore_py_call_open(&context, &ustore_py_write_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_keys_from_object(arguments[0], &call->keys) != 0 ||
-        ustore_py_contents_from_object(arguments[1], call->keys.count, &call->contents) != 0)
+    if (ustore_py_keys_from_object(arguments[0], ustore_py_context_executor(&context), &call->keys) != 0 ||
+        ustore_py_contents_from_object(arguments[1], ustore_py_context_executor(&context), call->keys.count,
+                                       &call->contents) != 0)
         return ustore_py_call_discard(&context, &ustore_py_write_verb, call);
     return ustore_py_values_write(&context, &options, call);
 }
@@ -527,8 +530,8 @@ PyObject* ustore_py_api_remove(PyObject* self, PyObject* const* arguments, Py_ss
     ustore_py_remove_call_t stack;
     ustore_py_remove_call_t* const call = ustore_py_call_open(&context, &ustore_py_remove_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_keys_from_subscript(arguments[0], &call->keys) < 0 ||
-        ustore_py_ends_from_object(ends, &call->keys, &call->ends) != 0)
+    if (ustore_py_keys_from_subscript(arguments[0], ustore_py_context_executor(&context), &call->keys) < 0 ||
+        ustore_py_ends_from_object(ends, ustore_py_context_executor(&context), &call->keys, &call->ends) != 0)
         return ustore_py_call_discard(&context, &ustore_py_remove_verb, call);
     return ustore_py_values_remove(&context, &options, ustore_modality_blobs_k, call);
 }
@@ -1056,8 +1059,8 @@ PyObject* ustore_py_api_scan_batch(PyObject* self, PyObject* const* arguments, P
     keys_call_t stack;
     keys_call_t* const call = ustore_py_call_open(&context, &scan_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_keys_from_object(arguments[0], &call->starts) != 0 ||
-        ustore_py_ends_from_object(ends, &call->starts, &call->ends) != 0)
+    if (ustore_py_keys_from_object(arguments[0], ustore_py_context_executor(&context), &call->starts) != 0 ||
+        ustore_py_ends_from_object(ends, ustore_py_context_executor(&context), &call->starts, &call->ends) != 0)
         return ustore_py_call_discard(&context, &scan_verb, call);
     call->direction = direction;
     return keys_scan(&context, &options, ustore_modality_blobs_k, wanted, mode, progress, &match, call, arguments[2]);
@@ -1441,31 +1444,6 @@ typedef struct Cursor {
     ustore_docs_field_type_t* types;
 } Cursor;
 
-/** The keys one pull wrote into an arena, and their values when it asked, viewed until the arena rewinds. */
-typedef struct Page {
-
-    /** The object header every instance holds. */
-    PyObject ob_base;
-
-    /** The @c Arena the keys live in, kept alive so they outlive every other name for them. */
-    PyObject* arena;
-
-    /** The keys, in ascending order. */
-    ustore_key_t const* keys;
-
-    /** Keys the page holds. */
-    size_t count;
-
-    /** The @c Values of the keys, or None when the pull asked for none. */
-    PyObject* values;
-
-    /** The shape the keys export: keys, then the sixteen bytes of each. */
-    Py_ssize_t shape[2];
-
-    /** The strides matching @c shape. */
-    Py_ssize_t strides[2];
-} Page;
-
 static char const doc_Page[] =                                                                  //
     "The keys one pull of a Cursor wrote into an `Arena`, viewing it until it rewinds.\n"       //
     "\n"                                                                                        //
@@ -1521,18 +1499,20 @@ static char const doc_Page_values[] = "The Values of the keys when the pull aske
 
 static PyObject* Page_get_values(Page* self, void* Py_UNUSED(closure)) { return Py_NewRef(self->values); }
 
-static PyObject* Page_dlpack_device(Page* self, PyObject* Py_UNUSED(unused)) {
-    return ustore_py_dlpack_device(self->arena);
-}
-
 static PyMethodDef Page_methods[] = {
+    {"__arrow_c_array__", (PyCFunction)(void (*)(void))ustore_py_arrow_c_array, ustore_py_method_flags_k,
+     ustore_py_arrow_c_array_doc},
+    {"__arrow_c_device_array__", (PyCFunction)(void (*)(void))ustore_py_arrow_c_device_array, ustore_py_method_flags_k,
+     ustore_py_arrow_c_device_array_doc},
     {"__dlpack__", (PyCFunction)(void (*)(void))ustore_py_dlpack, ustore_py_method_flags_k, ustore_py_dlpack_doc},
-    {"__dlpack_device__", (PyCFunction)Page_dlpack_device, METH_NOARGS, ustore_py_dlpack_device_doc},
+    {"__dlpack_device__", ustore_py_dlpack_device_answer, METH_NOARGS, ustore_py_dlpack_device_doc},
     {NULL, NULL, 0, NULL},
 };
 
 static PyGetSetDef Page_getset[] = {
     {"values", (getter)Page_get_values, NULL, doc_Page_values, NULL},
+    {"__cuda_array_interface__", (getter)ustore_py_cuda_array_interface, NULL, ustore_py_cuda_array_interface_doc,
+     NULL},
     {NULL, NULL, NULL, NULL, NULL},
 };
 

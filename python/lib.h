@@ -99,6 +99,7 @@
 #include <stdatomic.h> // the thread answering a deferred call, and an Arrow export's live count
 #include <stddef.h>    // `size_t`
 
+#include <dlpack.h> // `DLDevice`, from the vendored DLPack header beside this file
 #include <yyjson.h> // `yyjson_val`, `yyjson_mut_doc`
 
 #include "ustore/ustore.h"
@@ -268,8 +269,44 @@ extern char const ustore_py_gpu_devices_doc[];
 PyObject* ustore_py_dlpack(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
                            PyObject* keyword_names_tuple);
 
-/** Answers @c __dlpack_device__ for outputs in @p arena, as the library reports where it lives. */
-PyObject* ustore_py_dlpack_device(PyObject* arena);
+/**
+ *  @brief The DLPack device of the outputs @p description places, which every export reads.
+ *
+ *  Plain host pages are @c kDLCPU; host pages with a device are page-locked for it,
+ *  @c kDLCUDAHost or @c kDLROCMHost; VRAM the host may read is NVIDIA's managed memory,
+ *  @c kDLCUDAManaged; and VRAM it may not is @c kDLCUDA or @c kDLROCM. Apple's shared memory is
+ *  @c kDLCPU, as no Metal exchange is spoken yet. The ordinal is the vendor's own, and Arrow
+ *  numbers the device types alike.
+ */
+DLDevice ustore_py_dlpack_device(ustore_arena_description_t const* description);
+
+/** Answers @c __dlpack_device__ of the output view @p self, from where its arena lives. */
+PyObject* ustore_py_dlpack_device_answer(PyObject* self, PyObject* unused);
+
+/** Answers @c __arrow_c_array__ over the byte rows of @p self as <tt>fixed_size_binary</tt>. */
+PyObject* ustore_py_arrow_c_array(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                  PyObject* keyword_names_tuple);
+
+/** Answers @c __arrow_c_device_array__ over what @c __arrow_c_array__ of @p self exports. */
+PyObject* ustore_py_arrow_c_device_array(PyObject* self, PyObject* const* arguments,
+                                         Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple);
+
+/** Answers @c __arrow_c_stream__ as a stream of the batch @c __arrow_c_array__ answers. */
+PyObject* ustore_py_arrow_c_stream(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                   PyObject* keyword_names_tuple);
+
+/** Orders the calls of @p executor after a foreign producer, its @p event or its @p stream, then
+ *  waits for it from the host, as the host may read what it writes; 0, or -1 raising. */
+int ustore_py_executor_follow_and_drain(ustore_executor_t executor, void* event, void* stream);
+
+/** Answers @c __cuda_array_interface__ of @p self, raising AttributeError but for NVIDIA memory. */
+PyObject* ustore_py_cuda_array_interface(PyObject* self, void* closure);
+
+/** The docstrings of the shared exports above. */
+extern char const ustore_py_arrow_c_array_doc[];
+extern char const ustore_py_arrow_c_device_array_doc[];
+extern char const ustore_py_arrow_c_stream_doc[];
+extern char const ustore_py_cuda_array_interface_doc[];
 
 /** The docstring of every @c __dlpack__. */
 extern char const ustore_py_dlpack_doc[];
@@ -391,6 +428,8 @@ typedef struct Executor {
  *
  *  Every result over its outputs stays valid until the next call naming it rewinds it.
  */
+struct dlpack_export_t;
+
 typedef struct Arena {
 
     /** The object header every instance holds. */
@@ -398,6 +437,13 @@ typedef struct Arena {
 
     /** The arena, freed once the object dies, which waits in C for the deferred calls naming it. */
     ustore_arena_t handle;
+
+    /** The executor whose calls the arena serves, held so it frees after the arena, or NULL. */
+    Executor* executor;
+
+    /** Dropped DLPack exports whose consumer stream the arena's stream could not follow yet, still
+     *  open, which the next call naming the arena or its dealloc follows and closes first. */
+    _Atomic(struct dlpack_export_t*) unfollowed;
 } Arena;
 
 /** What a call addresses and how it runs, fixed per receiver: the header of every argument struct. */
@@ -543,8 +589,8 @@ typedef struct ustore_py_keys_t {
     /** Whether a buffer was viewed and must be released. */
     int viewed;
 
-    /** The DLPack capsule whose tensor backs @c keys when the caller exported one, or NULL. */
-    PyObject* dlpack;
+    /** The capsule, Arrow capsules or CUDA array keeping imported @c keys readable, or NULL. */
+    PyObject* held;
 
     /** Storage for a batch that fits without the heap. */
     ustore_key_t inline_keys[ustore_py_keys_inline_k];
@@ -588,7 +634,7 @@ typedef struct ustore_py_contents_t {
     /** Whether the values repeat for every task or stand one per task. */
     ustore_py_contents_spread_t spread;
 
-    /** The capsule of the Arrow array whose tape the call reads, held until it finishes, or NULL. */
+    /** The capsules of the Arrow array whose tape the call reads, held until it ends, or NULL. */
     PyObject* held;
 
     /** The one heap block the views and the buffers share, or NULL when they sit inline. */
@@ -682,6 +728,31 @@ typedef struct Keys {
     /** The strides matching @c shape. */
     Py_ssize_t strides[2];
 } Keys;
+
+/** The keys one pull wrote into an arena, with their values when asked, viewed until it rewinds. */
+typedef struct Page {
+
+    /** The object header every instance holds. */
+    PyObject ob_base;
+
+    /** The @c Arena the keys live in, kept alive so they outlive every other name for them. */
+    PyObject* arena;
+
+    /** The keys, in ascending order. */
+    ustore_key_t const* keys;
+
+    /** Keys the page holds. */
+    size_t count;
+
+    /** The @c Values of the keys, or None when the pull asked for none. */
+    PyObject* values;
+
+    /** The shape the keys export: keys, then the sixteen bytes of each. */
+    Py_ssize_t shape[2];
+
+    /** The strides matching @c shape. */
+    Py_ssize_t strides[2];
+} Page;
 
 /**
  *  @brief The typed columns one gather wrote into an arena, viewed until it rewinds.
@@ -827,10 +898,11 @@ int ustore_py_register_errors(PyObject* module);
  *  Shorthand with no place for an arena passes one of these to its verb and drops its own reference
  *  at once, so the arena dies with the call that named it.
  *
- *  @param[in] executor The executor whose calls it serves, or NULL for calls on the calling thread.
+ *  @param[in] executor The executor whose calls it serves, held by the arena, or NULL for calls on
+ *      the calling thread.
  *  @return A new reference, or NULL with an exception set.
  */
-PyObject* ustore_py_arena_new(ustore_executor_t executor);
+PyObject* ustore_py_arena_new(Executor* executor);
 
 /**
  *  @brief Reads the @c Arena @p object a call writes into, which rewinds it: every result over its
@@ -1013,7 +1085,7 @@ int ustore_py_is_one_key(PyObject* object);
  *  @param[out] batch The keys and whatever storage gathering them needed.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
-int ustore_py_keys_from_object(PyObject* object, ustore_py_keys_t* batch);
+int ustore_py_keys_from_object(PyObject* object, ustore_executor_t executor, ustore_py_keys_t* batch);
 
 /**
  *  @brief Gathers one key or a batch of them, the way `view[key]` and `view[[keys]]` differ.
@@ -1021,7 +1093,7 @@ int ustore_py_keys_from_object(PyObject* object, ustore_py_keys_t* batch);
  *  @param[out] batch The keys, one inline for a single key.
  *  @return 1 for one key, 0 for a batch, or -1 with an exception set.
  */
-int ustore_py_keys_from_subscript(PyObject* object, ustore_py_keys_t* batch);
+int ustore_py_keys_from_subscript(PyObject* object, ustore_executor_t executor, ustore_py_keys_t* batch);
 
 /**
  *  @brief Releases whatever @c ustore_py_keys_from_object acquired.
@@ -1088,7 +1160,7 @@ int ustore_py_contents_reserve(ustore_py_contents_t* batch, size_t count, ustore
  *  @param[out] batch The batch holding the tape and whatever keeps it alive.
  *  @return 1 for a tape, 0 for anything else, or -1 with an exception set.
  */
-int ustore_py_contents_from_tape(PyObject* object, ustore_py_contents_t* batch);
+int ustore_py_contents_from_tape(PyObject* object, ustore_executor_t executor, ustore_py_contents_t* batch);
 
 /**
  *  @brief Releases every buffer @p batch viewed, the block they shared and the tape it held.
@@ -1366,7 +1438,8 @@ PyObject* ustore_py_document_contains(ustore_py_context_t const* context, ustore
  *  @param[out] batch The viewed runs the ABI reads, and the layout they travel with.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
-int ustore_py_contents_from_object(PyObject* object, size_t count, ustore_py_contents_t* batch);
+int ustore_py_contents_from_object(PyObject* object, ustore_executor_t executor, size_t count,
+                                   ustore_py_contents_t* batch);
 
 /** An upsert of a batch of values, which its caller gathers in place. */
 typedef struct ustore_py_write_call_t {
@@ -1412,7 +1485,8 @@ extern ustore_py_verb_t const ustore_py_remove_verb;
  *  @param[in] object The ends, or NULL for none, which leaves @p ends empty.
  *  @return 0 on success, -1 with an exception set when they fail to read or count unlike @p starts.
  */
-int ustore_py_ends_from_object(PyObject* object, ustore_py_keys_t const* starts, ustore_py_keys_t* ends);
+int ustore_py_ends_from_object(PyObject* object, ustore_executor_t executor, ustore_py_keys_t const* starts,
+                               ustore_py_keys_t* ends);
 
 /** The view of @p ends, or a zeroed one when it holds none. */
 ustore_keys_view_t ustore_py_ends_view(ustore_py_keys_t const* ends);

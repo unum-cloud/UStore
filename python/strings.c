@@ -319,7 +319,7 @@ PyObject* ustore_py_api_strings_write(PyObject* self, PyObject* const* arguments
     strings_call_t stack;
     strings_call_t* const call = ustore_py_call_open(&context, &strings_write_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_keys_from_object(arguments[1], &call->keys) != 0 ||
+    if (ustore_py_keys_from_object(arguments[1], ustore_py_context_executor(&context), &call->keys) != 0 ||
         ustore_py_texts_from_object(arguments[0], "strings", NULL, NULL, &call->texts) != 0)
         return ustore_py_call_discard(&context, &strings_write_verb, call);
     ustore_py_contents_t const* const contents = &call->texts.contents;

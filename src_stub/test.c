@@ -446,6 +446,28 @@ static void test_engines_beyond_ram_are_refused(void) {
     foreign.cpu_class_ceiling = ustore_cpu_class_ibm_power10_k;
     ustore_executor_for_ram(&foreign);
     expect_status_at(outcome, ustore_status_success_k, __FILE__, __LINE__);
+
+    // A host executor drives no stream, so naming, following or checking one is unsupported
+    void* stream = (void*)1;
+    ustore_executor_stream_t named = {.executor = executor, .outcome = &outcome, .stream = &stream};
+    ustore_executor_stream(&named);
+    expect_status_at(outcome, ustore_status_unsupported_k, __FILE__, __LINE__);
+    expect_(stream == NULL);
+    named.stream = NULL;
+    ustore_executor_stream(&named);
+    expect_status_at(outcome, ustore_status_invalid_argument_k, __FILE__, __LINE__);
+    ustore_executor_follow_t follow = {.executor = executor, .stream = (void*)1, .outcome = &outcome};
+    ustore_executor_follow(&follow);
+    expect_status_at(outcome, ustore_status_unsupported_k, __FILE__, __LINE__);
+    follow.event = (void*)1;
+    ustore_executor_follow(&follow);
+    expect_status_at(outcome, ustore_status_invalid_argument_k, __FILE__, __LINE__);
+    ustore_executor_accepts_t accepts = {.executor = executor, .stream = (void*)1, .outcome = &outcome};
+    ustore_executor_accepts(&accepts);
+    expect_status_at(outcome, ustore_status_unsupported_k, __FILE__, __LINE__);
+    accepts.executor = NULL;
+    ustore_executor_accepts(&accepts);
+    expect_status_at(outcome, ustore_status_invalid_argument_k, __FILE__, __LINE__);
     expect_(ustore_executor_free(executor) == ustore_status_success_k);
     ustore_database_t capped = NULL;
     ustore_database_init_ram_t capping = {.database = &capped,

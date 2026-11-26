@@ -256,8 +256,7 @@ static PyObject* Collection_sample(Collection* self, PyObject* wanted_object) {
                                    "sample() and then read() on the deferred view") != 0)
         return NULL;
 
-    ustore_executor_t const executor = ustore_py_context_executor(&context);
-    PyObject* const drawing = ustore_py_arena_new(executor);
+    PyObject* const drawing = ustore_py_arena_new(context.executor);
     PyObject* const drawn = drawing ? ustore_py_keys_sample(&context, &options, held, wanted, drawing) : NULL;
     Py_XDECREF(drawing);
     if (!drawn) return NULL;
@@ -267,9 +266,9 @@ static PyObject* Collection_sample(Collection* self, PyObject* wanted_object) {
     ustore_py_verb_t const* const verb = documents ? &ustore_py_docs_read_drawn_verb : &ustore_py_read_drawn_verb;
     ustore_py_read_call_t call;
     ustore_py_call_open(&context, verb, &call);
-    PyObject* const reading = ustore_py_arena_new(executor);
+    PyObject* const reading = ustore_py_arena_new(context.executor);
     PyObject* values = NULL;
-    if (!reading || ustore_py_keys_from_object(drawn, &call.keys) != 0)
+    if (!reading || ustore_py_keys_from_object(drawn, ustore_py_context_executor(&context), &call.keys) != 0)
         values = ustore_py_call_discard(&context, verb, &call);
     else if (documents)
         values = ustore_py_docs_read(&context, &options, ustore_docs_field_type_json_k, verb, &call, reading);
@@ -430,7 +429,7 @@ static int collection_view_remove(CollectionView* self, PyObject* key, ustore_mo
     ustore_py_remove_call_t call;
     ustore_py_call_open(&context, &ustore_py_remove_verb, &call);
     ustore_py_verb_options_t options;
-    if (ustore_py_keys_from_subscript(key, &call.keys) < 0 ||
+    if (ustore_py_keys_from_subscript(key, ustore_py_context_executor(&context), &call.keys) < 0 ||
         collection_resolve(self->collection, modality, &context, &options) != 0) {
         ustore_py_call_discard(&context, &ustore_py_remove_verb, &call);
         return -1;
@@ -450,7 +449,7 @@ static ustore_py_read_call_t* collection_view_read_open(CollectionView* self, Py
     if (ustore_py_context_from_object(self->collection->view, context) != 0) return NULL;
     ustore_py_read_call_t* const call = ustore_py_call_open(context, verb, stack);
     if (!call) return NULL;
-    int const one = ustore_py_keys_from_subscript(key, &call->keys);
+    int const one = ustore_py_keys_from_subscript(key, ustore_py_context_executor(context), &call->keys);
     if (one < 0 || collection_resolve(self->collection, modality, context, options) != 0) {
         ustore_py_call_discard(context, verb, call);
         return NULL;
@@ -467,7 +466,7 @@ static PyObject* BlobsView_subscript(CollectionView* self, PyObject* key) {
     ustore_py_read_call_t* const call = collection_view_read_open(self, key, ustore_modality_blobs_k, verb, &context,
                                                                   &options, &stack);
     if (!call) return NULL;
-    PyObject* const arena = ustore_py_arena_new(ustore_py_context_executor(&context));
+    PyObject* const arena = ustore_py_arena_new(context.executor);
     if (!arena) return ustore_py_call_discard(&context, verb, call);
     PyObject* const answer = ustore_py_values_read(&context, &options, verb, call, arena);
     Py_DECREF(arena);
@@ -482,14 +481,17 @@ static int BlobsView_ass_subscript(CollectionView* self, PyObject* key, PyObject
         return -1;
     ustore_py_write_call_t call;
     ustore_py_call_open(&context, &ustore_py_write_verb, &call);
-    int const one = ustore_py_keys_from_subscript(key, &call.keys);
+    int const one = ustore_py_keys_from_subscript(key, ustore_py_context_executor(&context), &call.keys);
     // One key takes one bytes-like value, and a batch one per key or one for every key.
     int gathered = one < 0 ? -1 : 0;
     if (one > 0) {
         gathered = ustore_py_contents_reserve(&call.contents, 1, ustore_py_contents_per_task_k);
         if (gathered == 0) gathered = ustore_py_contents_view(value, &call.contents);
     }
-    else if (one == 0) { gathered = ustore_py_contents_from_object(value, call.keys.count, &call.contents); }
+    else if (one == 0) {
+        gathered = ustore_py_contents_from_object(value, ustore_py_context_executor(&context), call.keys.count,
+                                                  &call.contents);
+    }
 
     ustore_py_verb_options_t options;
     if (gathered != 0 || collection_resolve(self->collection, ustore_modality_blobs_k, &context, &options) != 0) {
@@ -512,7 +514,7 @@ static PyObject* docs_view_read(CollectionView* self, PyObject* key, ustore_py_v
     ustore_py_read_call_t* const call = collection_view_read_open(self, key, ustore_modality_docs_k, verb, &context,
                                                                   &options, &stack);
     if (!call) return NULL;
-    PyObject* const arena = ustore_py_arena_new(ustore_py_context_executor(&context));
+    PyObject* const arena = ustore_py_arena_new(context.executor);
     if (!arena) return ustore_py_call_discard(&context, verb, call);
     PyObject* const answer = ustore_py_docs_read(&context, &options, ustore_docs_field_type_json_k, verb, call, arena);
     Py_DECREF(arena);
@@ -528,7 +530,7 @@ static int docs_view_write(CollectionView* self, PyObject* key, PyObject* docume
                                 "docs_write(keys, documents, collection=...)", &context) != 0)
         return -1;
     ustore_py_keys_t keys;
-    int const one = ustore_py_keys_from_subscript(key, &keys);
+    int const one = ustore_py_keys_from_subscript(key, ustore_py_context_executor(&context), &keys);
     if (one < 0) return -1;
     // One key takes its document whole, even a list, so it travels as a batch of one.
     PyObject* const batch = one && spelling == ustore_py_documents_as_objects_k ? PyTuple_Pack(1, documents)

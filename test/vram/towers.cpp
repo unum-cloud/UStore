@@ -1052,6 +1052,89 @@ case_result_t test_vram_adopted_streams(std::vector<std::int32_t> ordinals, std:
     return {};
 }
 
+/** The executor names its HIP stream, accepts it back and refuses one on another device, and
+ *  queues waits on a foreign stream and a foreign event, refusing a wait naming neither or both
+ *  and a position past its streams. */
+case_result_t test_vram_names_streams(std::vector<std::int32_t> ordinals, std::vector<ustore_gpu_device_t> devices) {
+    using set_device_t = int (*)(int);
+    using create_t = int (*)(void**, unsigned);
+    using destroy_t = int (*)(void*);
+    util::shared_library_t const runtime = util::shared_library_t::open("libamdhip64.so");
+    set_device_t set_device = nullptr;
+    create_t create_stream = nullptr, create_event = nullptr;
+    destroy_t destroy_stream = nullptr, destroy_event = nullptr;
+    if (!expect_true(runtime.resolve("hipSetDevice", set_device) &&
+                     runtime.resolve("hipStreamCreateWithFlags", create_stream) &&
+                     runtime.resolve("hipStreamDestroy", destroy_stream) &&
+                     runtime.resolve("hipEventCreateWithFlags", create_event) &&
+                     runtime.resolve("hipEventDestroy", destroy_event)))
+        return {};
+    auto const stream_on = [&](std::int32_t ordinal) noexcept {
+        void* stream = nullptr;
+        if (set_device(static_cast<int>(devices[static_cast<std::size_t>(ordinal)].vendor_ordinal)) != 0 ||
+            create_stream(&stream, 1) != 0)
+            return static_cast<void*>(nullptr);
+        return stream;
+    };
+    device_call_t call {static_cast<std::size_t>(ordinals[0])};
+    if (!expect_true(call.status.succeeded())) return {};
+    ustore_outcome_t outcome {};
+
+    // The executor's own stream is named, and sits on its own device
+    void* own = nullptr;
+    ustore_executor_stream_t named {.executor = call.executor, .outcome = &outcome, .stream = &own};
+    ustore_executor_stream(&named);
+    expect_success(outcome);
+    expect_true(own != nullptr);
+    void* past = &outcome;
+    named.position = 1, named.stream = &past;
+    ustore_executor_stream(&named);
+    expect_true(outcome.status == ustore_status_invalid_argument_k && past == nullptr);
+    ustore_executor_accepts_t accepts {.executor = call.executor, .stream = own, .outcome = &outcome};
+    ustore_executor_accepts(&accepts);
+    expect_success(outcome);
+    void* const elsewhere = stream_on(ordinals[1]);
+    accepts.stream = elsewhere;
+    ustore_executor_accepts(&accepts);
+    expect_true(outcome.status == ustore_status_config_mismatch_k);
+    // The null and per-thread handles name the current device's default streams, meaning this one's
+    for (std::uintptr_t const special : {std::uintptr_t {0}, std::uintptr_t {2}}) {
+        accepts.stream = reinterpret_cast<void*>(special);
+        ustore_executor_accepts(&accepts);
+        expect_success(outcome);
+    }
+
+    // A foreign stream or event on the same device is followed without the host waiting
+    void* const foreign = stream_on(ordinals[0]);
+    void* event = nullptr;
+    expect_true(create_event(&event, 0) == 0);
+    ustore_executor_follow_t follow {.executor = call.executor, .stream = foreign, .outcome = &outcome};
+    ustore_executor_follow(&follow);
+    expect_success(outcome);
+    // The event is passed as Arrow's `sync_event` holds it, through a pointer, where a null one
+    // leaves nothing to wait for
+    follow.stream = nullptr, follow.event = &event;
+    ustore_executor_follow(&follow);
+    expect_success(outcome);
+    void* no_event = nullptr;
+    follow.event = &no_event;
+    ustore_executor_follow(&follow);
+    expect_success(outcome);
+    follow.event = &event, follow.stream = foreign;
+    ustore_executor_follow(&follow);
+    expect_true(outcome.status == ustore_status_invalid_argument_k);
+    // A stream on another device can't take this stream's mark, though its events can be followed
+    follow.event = nullptr, follow.stream = elsewhere;
+    ustore_executor_follow(&follow);
+    expect_true(outcome.status == ustore_status_config_mismatch_k);
+    follow.stream = nullptr, follow.event = &event, follow.position = 1;
+    ustore_executor_follow(&follow);
+    expect_true(outcome.status == ustore_status_invalid_argument_k);
+    for (void* const stream : {elsewhere, foreign}) expect_true(destroy_stream(stream) == 0);
+    expect_true(destroy_event(event) == 0);
+    return {};
+}
+
 /** Admits the keys spelling even integers, at either predicate cost. */
 void admit_even_keys(ustore_key_t const* keys, ustore_admission_t* admissions, ustore_size_t count, void*) {
     for (std::size_t index = 0; index != count; ++index)
@@ -1331,8 +1414,10 @@ int main(int argc, char** argv) {
         ustore_gpu_device_t const& first = devices[static_cast<std::size_t>(ordinals.front())];
         if (static_cast<std::size_t>(ordinals.front()) == first_known)
             run_test_case((prefix + "every_device").c_str(), test_vram_every_device, ordinals);
-        if (vendor == ustore_gpu_vendor_amd_k)
+        if (vendor == ustore_gpu_vendor_amd_k) {
             run_test_case((prefix + "adopted_streams").c_str(), test_vram_adopted_streams, ordinals, devices);
+            run_test_case((prefix + "names_streams").c_str(), test_vram_names_streams, ordinals, devices);
+        }
         run_test_case((prefix + "matching_across_devices").c_str(), test_vram_matching, ordinals, first, config);
     }
     return finish_test_run();

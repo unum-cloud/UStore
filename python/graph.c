@@ -107,9 +107,11 @@ static int edge_batches_from_args(ustore_py_context_t const* context, char const
         edges_object = arguments[arguments_progress];
     }
 
-    if (ustore_py_keys_from_object(arguments[0], &batches->sources) != 0) return -1;
-    if (ustore_py_keys_from_object(arguments[1], &batches->targets) != 0 ||
-        (edges_object != Py_None && ustore_py_keys_from_object(edges_object, &batches->edges) != 0)) {
+    if (ustore_py_keys_from_object(arguments[0], ustore_py_context_executor(context), &batches->sources) != 0)
+        return -1;
+    if (ustore_py_keys_from_object(arguments[1], ustore_py_context_executor(context), &batches->targets) != 0 ||
+        (edges_object != Py_None &&
+         ustore_py_keys_from_object(edges_object, ustore_py_context_executor(context), &batches->edges) != 0)) {
         edge_batches_release(batches);
         return -1;
     }
@@ -401,7 +403,7 @@ static PyObject* edges_read(PyObject* self, char const* name, ustore_py_verb_t c
     edges_read_call_t stack;
     edges_read_call_t* const call = ustore_py_call_open(&context, verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_keys_from_object(arguments[0], &call->vertices) != 0 ||
+    if (ustore_py_keys_from_object(arguments[0], ustore_py_context_executor(&context), &call->vertices) != 0 ||
         ustore_py_arena_from_object(arguments[1], &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, verb, call);
     call->role = role;
@@ -461,7 +463,7 @@ PyObject* ustore_py_api_graph_contains(PyObject* self, PyObject* const* argument
     if (!call) return NULL;
     call->vertices.keys = call->vertices.inline_keys;
     call->vertices.count = 1;
-    PyObject* const arena = ustore_py_arena_new(ustore_py_context_executor(&context));
+    PyObject* const arena = ustore_py_arena_new(context.executor);
     if (!arena || ustore_py_key_from_object(arguments[0], call->vertices.inline_keys) != 0 ||
         ustore_py_arena_from_object(arena, &call->kept.arena) != 0) {
         Py_XDECREF(arena);
@@ -541,7 +543,7 @@ PyObject* ustore_py_api_graph_write_vertices(PyObject* self, PyObject* const* ar
     vertices_write_call_t stack;
     vertices_write_call_t* const call = ustore_py_call_open(&context, &vertices_write_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_keys_from_object(arguments[0], &call->vertices) != 0)
+    if (ustore_py_keys_from_object(arguments[0], ustore_py_context_executor(&context), &call->vertices) != 0)
         return ustore_py_call_discard(&context, &vertices_write_verb, call);
     call->kept.collection = options.collection;
     ustore_graph_write_vertices_t write = {
@@ -596,8 +598,8 @@ PyObject* ustore_py_api_graph_remove_vertices(PyObject* self, PyObject* const* a
     vertices_write_call_t stack;
     vertices_write_call_t* const call = ustore_py_call_open(&context, &vertices_remove_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_keys_from_object(arguments[0], &call->vertices) != 0 ||
-        ustore_py_ends_from_object(given[1], &call->vertices, &call->ends) != 0)
+    if (ustore_py_keys_from_object(arguments[0], ustore_py_context_executor(&context), &call->vertices) != 0 ||
+        ustore_py_ends_from_object(given[1], ustore_py_context_executor(&context), &call->vertices, &call->ends) != 0)
         return ustore_py_call_discard(&context, &vertices_remove_verb, call);
     call->role = (ustore_vertex_role_t)role;
     call->kept.collection = options.collection;
@@ -738,18 +740,20 @@ static PyObject* Neighborhoods_get_degrees(Neighborhoods* self, void* Py_UNUSED(
     return degrees;
 }
 
-static PyObject* Neighborhoods_dlpack_device(Neighborhoods* self, PyObject* Py_UNUSED(unused)) {
-    return ustore_py_dlpack_device(self->arena);
-}
-
 static PyMethodDef Neighborhoods_methods[] = {
+    {"__arrow_c_array__", (PyCFunction)(void (*)(void))ustore_py_arrow_c_array, ustore_py_method_flags_k,
+     ustore_py_arrow_c_array_doc},
+    {"__arrow_c_device_array__", (PyCFunction)(void (*)(void))ustore_py_arrow_c_device_array, ustore_py_method_flags_k,
+     ustore_py_arrow_c_device_array_doc},
     {"__dlpack__", (PyCFunction)(void (*)(void))ustore_py_dlpack, ustore_py_method_flags_k, ustore_py_dlpack_doc},
-    {"__dlpack_device__", (PyCFunction)Neighborhoods_dlpack_device, METH_NOARGS, ustore_py_dlpack_device_doc},
+    {"__dlpack_device__", ustore_py_dlpack_device_answer, METH_NOARGS, ustore_py_dlpack_device_doc},
     {NULL, NULL, 0, NULL},
 };
 
 static PyGetSetDef Neighborhoods_getset[] = {
     {"degrees", (getter)Neighborhoods_get_degrees, NULL, doc_Neighborhoods_degrees, NULL},
+    {"__cuda_array_interface__", (getter)ustore_py_cuda_array_interface, NULL, ustore_py_cuda_array_interface_doc,
+     NULL},
     {NULL, NULL, NULL, NULL, NULL},
 };
 

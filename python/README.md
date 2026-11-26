@@ -280,7 +280,7 @@ with ustore.Executor.for_ram(8, memory_domains=[0]) as executor:
 
 Every output whose length only the call knows lands in a `ustore.Arena` you pass, and the verb answers a view over it without copying, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#batches-and-arenas) describe.
 Each call rewinds its arena, so the previous call's views read whatever it then holds, undetected, and a steady loop allocates once; to keep a result past the next call, pass that call another arena.
-A `memoryview` over an output pins the arena until released, and the result types export DLPack too.
+A `memoryview` over an output pins the arena until released, and the result types export DLPack too; while a DLPack capsule or an Arrow array of an output lives, a call naming its arena raises `ContendedError`.
 A key is a `uuid.UUID`, its text, sixteen raw bytes, or a non-negative integer read as `uuid.UUID(int=n)`, and a batch passes without a copy as a contiguous array of 16-byte records or converts from 64-bit integers.
 
 ```python
@@ -298,7 +298,7 @@ Shorthand such as `get`, `contains` and `view[name].blobs[key]` makes a one-off 
 ## Errors
 
 Every failure raises a subclass of `ustore.Error`, itself a `RuntimeError`, holding the status the C ABI reported as its `status` attribute, a `ustore.Status` member.
-Each status has its own class, which also derives the built-in naming the same fault: `NotFoundError` is a `KeyError`, `InvalidArgumentError` a `ValueError`, `UnsupportedError` a `NotImplementedError`, `InputOutputError` an `OSError`, and `CapacityExhaustedError` an `OverflowError`.
+Each status has its own class, which also derives the built-in naming the same fault: `NotFoundError` is a `KeyError`, `InvalidArgumentError` a `ValueError`, `UnsupportedError` a `NotImplementedError`, `InputOutputError` an `OSError`, and both `CapacityExhaustedError` and `CapacityOverflowError` an `OverflowError`.
 `WriteConflictError`, `ReadConflictError` and `PhantomConflictError` share `ConflictError`, the one clause a retry loop needs.
 A closed handle raises `UninitializedError`, and an argument of the wrong Python type raises `TypeError`.
 
@@ -331,8 +331,13 @@ database.import_arrow(table, collection="copies")  # every batch's columns read 
 database.ingest_arrow(table, collection="copies", order="sorted")  # or landed as one commit
 ```
 
-`Values.__arrow_c_array__` exports a read as `binary` or `large_binary`, `Columns.__arrow_c_array__` a gather through `ustore_docs_column_view_to_arrow`, and `Collection.__arrow_c_stream__` the collection through `ustore_keys_view_to_arrow` and `ustore_strings_view_to_arrow`.
-`import_arrow` and `ingest_arrow` read keys and strings through `ustore_keys_view_from_arrow` and `ustore_strings_view_from_arrow`, from an object answering `__arrow_c_stream__` or `__arrow_c_array__`.
+`Values.__arrow_c_array__` exports a read as `binary` or `large_binary`, `Keys`, `Page` and `Neighborhoods` their rows as `fixed_size_binary`, `Columns.__arrow_c_array__` a gather through `ustore_docs_column_view_to_arrow`, with `Columns.__arrow_c_stream__` as a stream of that one batch, and `Collection.__arrow_c_stream__` the collection through `ustore_keys_view_to_arrow` and `ustore_strings_view_to_arrow`.
+Each of those results also answers `__arrow_c_device_array__` on the device `__dlpack_device__` names, and the CUDA Array Interface only for NVIDIA device or managed memory.
+`import_arrow` and `ingest_arrow` read keys and strings through `ustore_keys_view_from_arrow` and `ustore_strings_view_from_arrow`, from an object answering `__arrow_c_device_stream__`, `__arrow_c_stream__`, `__arrow_c_device_array__` or `__arrow_c_array__`, in that order of preference, and refuse a device batch the host cannot read or one still producing on a sync event.
+A batch of keys takes DLPack first, a versioned capsule before a legacy one, then an Arrow device array, a host one, the CUDA Array Interface and the buffer protocol.
+A DLPack producer is handed the first stream of the call's executor, and a producer still writing, through an Arrow `sync_event` or a CUDA Array Interface `stream`, is followed on that stream and waited for from the host before the keys are read.
+Apple's shared memory crosses as host memory, and Metal tensors or arrays offered as inputs raise `UnsupportedError`, as no Metal exchange is supported yet.
+A `stream` handed to `__dlpack__` must sit on the output's device, and once the consumer drops the capsule, the arena's next call waits for the work queued on that stream before it rewinds.
 
 ## Platform Notes
 

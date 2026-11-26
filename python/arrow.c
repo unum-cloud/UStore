@@ -13,28 +13,35 @@
 
 #pragma region Sources
 
-/** A schema and one batch moved out of the capsules of @c __arrow_c_array__, answered as a stream of one batch. */
-typedef struct single_batch_stream_t {
+/** What an import's stream pulls from when its source exports no host stream: a device stream,
+ *  or one batch moved out of @c __arrow_c_device_array__ or @c __arrow_c_array__. */
+typedef struct stream_source_t {
 
     /** The schema of the batch, owned until the stream is released. */
     struct ArrowSchema schema;
 
     /** The batch, owned until the stream hands it out or is released. */
     struct ArrowArray batch;
-} single_batch_stream_t;
+
+    /** The stream moved out of @c __arrow_c_device_stream__, owned until the stream is released. */
+    struct ArrowDeviceArrayStream device;
+
+    /** What the last pull of @c device refused, or NULL. */
+    char const* refusal;
+} stream_source_t;
 
 /** Lets go of nothing, as the schema a single-batch stream answers views the one it owns. */
 static void single_schema_release(struct ArrowSchema* schema) { schema->release = NULL; }
 
 static int single_get_schema(struct ArrowArrayStream* stream, struct ArrowSchema* out) {
-    single_batch_stream_t const* const single = (single_batch_stream_t const*)stream->private_data;
+    stream_source_t const* const single = (stream_source_t const*)stream->private_data;
     *out = single->schema;
     out->release = single_schema_release;
     return 0;
 }
 
 static int single_get_next(struct ArrowArrayStream* stream, struct ArrowArray* out) {
-    single_batch_stream_t* const single = (single_batch_stream_t*)stream->private_data;
+    stream_source_t* const single = (stream_source_t*)stream->private_data;
     *out = single->batch;
     single->batch.release = NULL;
     return 0;
@@ -43,9 +50,50 @@ static int single_get_next(struct ArrowArrayStream* stream, struct ArrowArray* o
 static char const* single_get_last_error(struct ArrowArrayStream* Py_UNUSED(stream)) { return NULL; }
 
 static void single_release(struct ArrowArrayStream* stream) {
-    single_batch_stream_t* const single = (single_batch_stream_t*)stream->private_data;
+    stream_source_t* const single = (stream_source_t*)stream->private_data;
     if (single->schema.release) single->schema.release(&single->schema);
     if (single->batch.release) single->batch.release(&single->batch);
+    stream->release = NULL;
+}
+
+/** Whether the host reads memory of the Arrow @p device_type in place, as every import does. */
+static int arrow_host_readable(ArrowDeviceType device_type) {
+    return device_type == ARROW_DEVICE_CPU || device_type == ARROW_DEVICE_CUDA_HOST ||
+           device_type == ARROW_DEVICE_ROCM_HOST || device_type == ARROW_DEVICE_CUDA_MANAGED;
+}
+
+static int device_get_schema(struct ArrowArrayStream* stream, struct ArrowSchema* out) {
+    stream_source_t* const source = (stream_source_t*)stream->private_data;
+    return source->device.get_schema(&source->device, out);
+}
+
+/** Pulls the next device batch, refusing one the host cannot read or one with a sync event. */
+static int device_get_next(struct ArrowArrayStream* stream, struct ArrowArray* out) {
+    stream_source_t* const source = (stream_source_t*)stream->private_data;
+    struct ArrowDeviceArray batch = {0};
+    source->refusal = NULL;
+    int const failed = source->device.get_next(&source->device, &batch);
+    if (failed) return failed;
+    if (batch.array.release && (!arrow_host_readable(batch.device_type) || batch.sync_event)) {
+        batch.array.release(&batch.array);
+        // A batch's sync event would be followed from inside the call, which holds the executor.
+        source->refusal = batch.device_type == ARROW_DEVICE_METAL ? "Metal exchange through Arrow is not supported yet"
+                          : batch.sync_event ? "An Arrow device batch still producing on a sync event is refused"
+                                             : "An Arrow device batch lives where the host cannot read it";
+        return EINVAL;
+    }
+    *out = batch.array;
+    return 0;
+}
+
+static char const* device_get_last_error(struct ArrowArrayStream* stream) {
+    stream_source_t* const source = (stream_source_t*)stream->private_data;
+    return source->refusal ? source->refusal : source->device.get_last_error(&source->device);
+}
+
+static void device_release(struct ArrowArrayStream* stream) {
+    stream_source_t* const source = (stream_source_t*)stream->private_data;
+    if (source->device.release) source->device.release(&source->device);
     stream->release = NULL;
 }
 
@@ -72,13 +120,33 @@ static int call_optional_method(PyObject* source, char const* name, PyObject** a
 }
 
 /**
- *  @brief Moves the stream @p source exports into @p stream, or the one array it exports into @p single, which
- *      @p stream then answers, leaving every capsule released.
- *  @return 0 on success, -1 with an exception set otherwise.
+ *  @brief Moves what @p exporter exports into @p stream, trying a device stream, a host stream, a
+ *      device array and a host array in turn, where a stream of one array or of device batches
+ *      reads through @p source.
+ *  @return 0 on success, -1 with an exception set otherwise, leaving every capsule released.
  */
-static int stream_from_object(PyObject* source, struct ArrowArrayStream* stream, single_batch_stream_t* single) {
+static int stream_from_object(PyObject* exporter, ustore_executor_t executor, struct ArrowArrayStream* stream,
+                              stream_source_t* source) {
     PyObject* answer = NULL;
-    int const streamed = call_optional_method(source, "__arrow_c_stream__", &answer);
+    int const device_streamed = call_optional_method(exporter, "__arrow_c_device_stream__", &answer);
+    if (device_streamed < 0) return -1;
+    if (device_streamed) {
+        struct ArrowDeviceArrayStream* const exported = capsule_pointer(answer, "arrow_device_array_stream",
+                                                                        "__arrow_c_device_stream__");
+        if (exported) {
+            source->device = *exported;
+            exported->release = NULL;
+            *stream = (struct ArrowArrayStream) {.get_schema = device_get_schema,
+                                                 .get_next = device_get_next,
+                                                 .get_last_error = device_get_last_error,
+                                                 .release = device_release,
+                                                 .private_data = source};
+        }
+        Py_DECREF(answer);
+        return exported ? 0 : -1;
+    }
+
+    int const streamed = call_optional_method(exporter, "__arrow_c_stream__", &answer);
     if (streamed < 0) return -1;
     if (streamed) {
         struct ArrowArrayStream* const exported = capsule_pointer(answer, "arrow_array_stream", "__arrow_c_stream__");
@@ -90,32 +158,52 @@ static int stream_from_object(PyObject* source, struct ArrowArrayStream* stream,
         return exported ? 0 : -1;
     }
 
-    int const arrayed = call_optional_method(source, "__arrow_c_array__", &answer);
-    if (arrayed < 0) return -1;
+    static char const* const methods[2] = {"__arrow_c_device_array__", "__arrow_c_array__"};
+    int arrayed = 0, host = 0;
+    for (; host != 2 && !arrayed; host += !arrayed) {
+        arrayed = call_optional_method(exporter, methods[host], &answer);
+        if (arrayed < 0) return -1;
+    }
     if (!arrayed) {
         PyErr_Format(PyExc_TypeError,
-                     "An Arrow source exports __arrow_c_stream__ or __arrow_c_array__, and %S has none",
-                     Py_TYPE(source));
+                     "An Arrow source exports __arrow_c_device_stream__, __arrow_c_stream__, " //
+                     "__arrow_c_device_array__ or __arrow_c_array__, and %S has none",
+                     Py_TYPE(exporter));
         return -1;
     }
+    char const* const name = host ? "arrow_array" : "arrow_device_array";
     struct ArrowSchema* schema = NULL;
-    struct ArrowArray* array = NULL;
+    void* pointer = NULL;
     if (PyTuple_Check(answer) && PyTuple_GET_SIZE(answer) == 2) {
-        schema = capsule_pointer(PyTuple_GET_ITEM(answer, 0), "arrow_schema", "__arrow_c_array__");
-        array = schema ? capsule_pointer(PyTuple_GET_ITEM(answer, 1), "arrow_array", "__arrow_c_array__") : NULL;
+        schema = capsule_pointer(PyTuple_GET_ITEM(answer, 0), "arrow_schema", methods[host]);
+        pointer = schema ? capsule_pointer(PyTuple_GET_ITEM(answer, 1), name, methods[host]) : NULL;
     }
-    else PyErr_SetString(PyExc_TypeError, "__arrow_c_array__ must answer a schema capsule and an array capsule");
-    if (array) {
-        single->schema = *schema, schema->release = NULL;
-        single->batch = *array, array->release = NULL;
-        stream->get_schema = single_get_schema;
-        stream->get_next = single_get_next;
-        stream->get_last_error = single_get_last_error;
-        stream->release = single_release;
-        stream->private_data = single;
+    else PyErr_Format(PyExc_TypeError, "%s must answer a schema capsule and an array capsule", methods[host]);
+    struct ArrowDeviceArray* const device_array = host ? NULL : (struct ArrowDeviceArray*)pointer;
+    struct ArrowArray* const array = host ? (struct ArrowArray*)pointer : device_array ? &device_array->array : NULL;
+    if (device_array && device_array->device_type == ARROW_DEVICE_METAL) {
+        ustore_py_raise(ustore_status_unsupported_k, "Metal exchange through Arrow is not supported yet");
+        pointer = NULL;
+    }
+    else if (device_array && !arrow_host_readable(device_array->device_type)) {
+        ustore_py_raise(ustore_status_device_k, "An Arrow array on device type %d is none the host reads",
+                        (int)device_array->device_type);
+        pointer = NULL;
+    }
+    else if (device_array && device_array->sync_event &&
+             ustore_py_executor_follow_and_drain(executor, device_array->sync_event, NULL) != 0)
+        pointer = NULL;
+    if (pointer) {
+        source->schema = *schema, schema->release = NULL;
+        source->batch = *array, array->release = NULL;
+        *stream = (struct ArrowArrayStream) {.get_schema = single_get_schema,
+                                             .get_next = single_get_next,
+                                             .get_last_error = single_get_last_error,
+                                             .release = single_release,
+                                             .private_data = source};
     }
     Py_DECREF(answer);
-    return array ? 0 : -1;
+    return pointer ? 0 : -1;
 }
 
 #pragma endregion Sources
@@ -669,6 +757,54 @@ PyObject* ustore_py_stream_export(ustore_py_context_t const* context, ustore_col
     return capsule;
 }
 
+/** Releases the one batch an exported stream still holds, and frees the source it reads through. */
+static void single_export_release(struct ArrowArrayStream* stream) {
+    stream_source_t* const source = (stream_source_t*)stream->private_data;
+    single_release(stream);
+    PyMem_RawFree(source);
+}
+
+char const ustore_py_arrow_c_stream_doc[] =                                                     //
+    "__arrow_c_stream__(requested_schema=None) answers an `arrow_array_stream` capsule.\n"      //
+    "\n"                                                                                        //
+    "The stream holds the one batch `__arrow_c_array__` exports, so `pyarrow.table(columns)`\n" //
+    "and `pyarrow.RecordBatchReader.from_stream` read the rows in place. A requested schema\n"  //
+    "is ignored.";
+
+PyObject* ustore_py_arrow_c_stream(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
+                                   PyObject* keyword_names_tuple) {
+    PyObject* requested = Py_None;
+    if (ustore_py_optional_argument("__arrow_c_stream__", arguments, positional_arguments_count, keyword_names_tuple, 0,
+                                    "requested_schema", &requested) != 0)
+        return NULL;
+    PyObject* const capsules = PyObject_CallMethod(self, "__arrow_c_array__", NULL);
+    if (!capsules) return NULL;
+    struct ArrowArrayStream* const stream = PyMem_Calloc(1, sizeof(struct ArrowArrayStream));
+    stream_source_t* const source = (stream_source_t*)PyMem_RawCalloc(1, sizeof(stream_source_t));
+    if (!stream || !source) {
+        PyMem_Free(stream);
+        PyMem_RawFree(source);
+        Py_DECREF(capsules);
+        return PyErr_NoMemory();
+    }
+    struct ArrowSchema* const schema = PyCapsule_GetPointer(PyTuple_GET_ITEM(capsules, 0), "arrow_schema");
+    struct ArrowArray* const array = PyCapsule_GetPointer(PyTuple_GET_ITEM(capsules, 1), "arrow_array");
+    source->schema = *schema, schema->release = NULL;
+    source->batch = *array, array->release = NULL;
+    Py_DECREF(capsules);
+    *stream = (struct ArrowArrayStream) {.get_schema = single_get_schema,
+                                         .get_next = single_get_next,
+                                         .get_last_error = single_get_last_error,
+                                         .release = single_export_release,
+                                         .private_data = source};
+    PyObject* const capsule = PyCapsule_New(stream, "arrow_array_stream", stream_capsule_free);
+    if (!capsule) {
+        stream->release(stream);
+        PyMem_Free(stream);
+    }
+    return capsule;
+}
+
 #pragma endregion Exports
 
 #pragma region Imports
@@ -784,8 +920,8 @@ typedef struct arrow_call_t {
     /** The stream the loop reads, released once the loop ends. */
     struct ArrowArrayStream stream;
 
-    /** The schema and batch @c stream answers for a source of one array. */
-    single_batch_stream_t single;
+    /** What @c stream reads through for a source of one array or of device batches. */
+    stream_source_t source;
 
     /** Output slot for the rows written. */
     ustore_size_t written;
@@ -1088,7 +1224,7 @@ PyObject* ustore_py_api_import_arrow(PyObject* self, PyObject* const* arguments,
     arrow_call_t* const call = ustore_py_call_open(&context, &import_verb, &stack);
     if (!call) return NULL;
     call->kept.collection = options.collection;
-    if (stream_from_object(arguments[0], &call->stream, &call->single) != 0)
+    if (stream_from_object(arguments[0], ustore_py_context_executor(&context), &call->stream, &call->source) != 0)
         return ustore_py_call_discard(&context, &import_verb, call);
     import_loop_t loop = {
         .arrow = {.database = context.database_handle,
@@ -1120,7 +1256,7 @@ PyObject* ustore_py_api_ingest_arrow(PyObject* self, PyObject* const* arguments,
     arrow_call_t* const call = ustore_py_call_open(&context, &ingest_verb, &stack);
     if (!call) return NULL;
     call->kept.collection = options.collection;
-    if (stream_from_object(arguments[0], &call->stream, &call->single) != 0)
+    if (stream_from_object(arguments[0], ustore_py_context_executor(&context), &call->stream, &call->source) != 0)
         return ustore_py_call_discard(&context, &ingest_verb, call);
     ingest_loop_t loop = {
         .arrow = {.database = context.database_handle,

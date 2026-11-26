@@ -6,6 +6,7 @@ Author: Ash Vardanian
 Date: September 18, 2026
 """
 
+import ctypes
 import threading
 
 import numpy as np
@@ -103,6 +104,105 @@ class DLPackOnly:
 
     def __dlpack_device__(self) -> tuple[int, int]:
         return self.array.__dlpack_device__()
+
+
+def capsule_named(capsule: object, name: bytes) -> bool:
+    """Whether `capsule` is a PyCapsule holding a pointer under `name`."""
+    is_valid = ctypes.pythonapi.PyCapsule_IsValid
+    is_valid.argtypes, is_valid.restype = [ctypes.py_object, ctypes.c_char_p], ctypes.c_int
+    return is_valid(capsule, name) == 1
+
+
+def test_a_dlpack_export_answers_the_version_asked(populated, blobs, arena):
+    """A `max_version` of 1 or above answers a versioned capsule, and none answers a legacy one, both read in place."""
+    found = populated.scan_batch([1, 9], 2, arena, collection=blobs)
+    assert capsule_named(found.__dlpack__(max_version=(1, 0)), b"dltensor_versioned")
+    assert capsule_named(found.__dlpack__(), b"dltensor")
+    assert np.from_dlpack(found).tobytes() == bytes(memoryview(found))
+
+
+@pytest.mark.parametrize(
+    ("options", "failure"),
+    [
+        ({"stream": 1}, ValueError),
+        ({"stream": 0}, ValueError),
+        ({"stream": "default"}, TypeError),
+        ({"stream": True}, TypeError),
+        ({"dl_device": (2, 0)}, BufferError),
+        ({"copy": True}, BufferError),
+    ],
+    ids=["stream-1", "stream-0", "stream-text", "stream-bool", "foreign-device", "copy"],
+)
+def test_a_dlpack_export_checks_its_arguments(populated, blobs, arena, options, failure):
+    """Host outputs take no stream but None or -1, and refuse a copy or a device other than their own."""
+    found = populated.scan_batch([1, 9], 2, arena, collection=blobs)
+    found.__dlpack__(stream=None, dl_device=(1, 0))
+    found.__dlpack__(stream=-1)
+    with pytest.raises(failure):
+        found.__dlpack__(**options)
+
+
+def test_a_live_export_refuses_a_rewind(populated, blobs, arena):
+    """While a DLPack export of its outputs lives, a call naming the arena is refused, and once released it runs."""
+    found = populated.scan_batch([1, 9], 2, arena, collection=blobs)
+    exported = np.from_dlpack(found)
+    with pytest.raises(ustore.ContendedError):
+        populated.scan(1, 100, arena, collection=blobs)
+    del exported
+    populated.scan(1, 100, arena, collection=blobs)
+
+
+def test_host_outputs_have_no_cuda_array_interface(populated, blobs, arena):
+    """The CUDA Array Interface describes NVIDIA memory alone, so host outputs lack the attribute."""
+    found = populated.scan_batch([1, 9], 2, arena, collection=blobs)
+    assert not hasattr(found, "__cuda_array_interface__")
+
+
+class LegacyDLPack:
+    """Exports a NumPy array through DLPack as an exporter older than 1.0 does, knowing no `max_version`."""
+
+    def __init__(self, array: np.ndarray) -> None:
+        self.array = array
+
+    def __dlpack__(self, stream=None):
+        return self.array.__dlpack__(stream=stream)
+
+    def __dlpack_device__(self) -> tuple[int, int]:
+        return self.array.__dlpack_device__()
+
+
+class CudaArrayOnly:
+    """Describes host memory through the CUDA Array Interface alone, as a CUDA array describes its own."""
+
+    def __init__(self, array: np.ndarray, stream: int | None = None) -> None:
+        self.array = array
+        self.__cuda_array_interface__ = {
+            "shape": array.shape,
+            "typestr": array.dtype.str,
+            "data": (array.ctypes.data, True),
+            "strides": None,
+            "version": 3,
+            "stream": stream,
+        }
+
+
+KEY_BYTES = np.frombuffer(b"".join(key.bytes for key in keys([2, 10])), dtype=np.uint8).reshape(2, 16).copy()
+
+
+@pytest.mark.parametrize(
+    "starts",
+    [LegacyDLPack(np.array([2, 10], dtype=np.int64)), LegacyDLPack(KEY_BYTES), CudaArrayOnly(KEY_BYTES)],
+    ids=["legacy-i64", "legacy-bytes", "cuda-array-interface"],
+)
+def test_scan_batch_takes_starts_through_every_protocol(populated, blobs, arena, starts):
+    """Starts arrive through a legacy DLPack exporter and the CUDA Array Interface as through the buffer protocol."""
+    assert runs(populated.scan_batch(starts, 2, arena, collection=blobs)) == [[2, 3], [10, 11]]
+
+
+def test_a_cuda_array_still_producing_needs_a_gpu_executor(populated, blobs, arena):
+    """A CUDA array naming a stream may still be written, and only a GPU executor's stream can wait for it."""
+    with pytest.raises(ustore.UnsupportedError):
+        populated.scan_batch(CudaArrayOnly(KEY_BYTES, stream=7), 2, arena, collection=blobs)
 
 
 @pytest.mark.parametrize(

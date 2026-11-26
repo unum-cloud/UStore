@@ -622,7 +622,8 @@ PyObject* ustore_py_api_docs_write(PyObject* self, PyObject* const* arguments, P
     // A fixed-width type given a buffer is a column of scalars, which splits in place per key.
     int const columnar = field_type_width((ustore_docs_field_type_t)type) != 0 && arguments[0] != Py_None &&
                          !PyUnicode_Check(arguments[1]) && PyObject_CheckBuffer(arguments[1]);
-    if (arguments[0] != Py_None && ustore_py_keys_from_object(arguments[0], &call->keys) != 0)
+    if (arguments[0] != Py_None &&
+        ustore_py_keys_from_object(arguments[0], ustore_py_context_executor(&context), &call->keys) != 0)
         return ustore_py_call_discard(&context, &docs_write_verb, call);
     int const gathered = columnar
                              ? scalars_from_object(arguments[1], (ustore_docs_field_type_t)type, call->keys.count,
@@ -679,8 +680,8 @@ PyObject* ustore_py_api_docs_remove(PyObject* self, PyObject* const* arguments, 
     ustore_py_remove_call_t stack;
     ustore_py_remove_call_t* const call = ustore_py_call_open(&context, &ustore_py_remove_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_keys_from_subscript(arguments[0], &call->keys) < 0 ||
-        ustore_py_ends_from_object(ends, &call->keys, &call->ends) != 0)
+    if (ustore_py_keys_from_subscript(arguments[0], ustore_py_context_executor(&context), &call->keys) < 0 ||
+        ustore_py_ends_from_object(ends, ustore_py_context_executor(&context), &call->keys, &call->ends) != 0)
         return ustore_py_call_discard(&context, &ustore_py_remove_verb, call);
     return ustore_py_values_remove(&context, &options, ustore_modality_docs_k, call);
 }
@@ -796,7 +797,7 @@ PyObject* ustore_py_document_contains(ustore_py_context_t const* context, ustore
     call->keys.inline_keys[0] = *key;
     call->keys.keys = call->keys.inline_keys;
     call->keys.count = 1;
-    PyObject* const arena = ustore_py_arena_new(ustore_py_context_executor(context));
+    PyObject* const arena = ustore_py_arena_new(context->executor);
     PyObject* const answer = arena ? ustore_py_docs_read(context, options, ustore_docs_field_type_json_k,
                                                          &docs_contains_verb, call, arena)
                                    : ustore_py_call_discard(context, &docs_contains_verb, call);
@@ -839,7 +840,7 @@ PyObject* ustore_py_api_docs_read(PyObject* self, PyObject* const* arguments, Py
     ustore_py_read_call_t* const call = ustore_py_call_open(&context, &ustore_py_docs_read_verb, &stack);
     if (!call) return NULL;
     call->field = Py_XNewRef(field);
-    if (ustore_py_keys_from_object(arguments[0], &call->keys) != 0)
+    if (ustore_py_keys_from_object(arguments[0], ustore_py_context_executor(&context), &call->keys) != 0)
         return ustore_py_call_discard(&context, &ustore_py_docs_read_verb, call);
     return ustore_py_docs_read(&context, &options, (ustore_docs_field_type_t)type, &ustore_py_docs_read_verb, call,
                                arguments[1]);
@@ -916,7 +917,7 @@ PyObject* ustore_py_api_docs_gist(PyObject* self, PyObject* const* arguments, Py
     gist_call_t stack;
     gist_call_t* const call = ustore_py_call_open(&context, &gist_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_keys_from_object(arguments[0], &call->keys) != 0 ||
+    if (ustore_py_keys_from_object(arguments[0], ustore_py_context_executor(&context), &call->keys) != 0 ||
         ustore_py_arena_from_object(arguments[1], &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, &gist_verb, call);
     call->kept.collection = options.collection;
@@ -1152,7 +1153,7 @@ PyObject* ustore_py_api_docs_gather(PyObject* self, PyObject* const* arguments, 
     int const failed = ustore_py_columns_request(arguments[1], arguments[2], "outputs_types", &call->fields_held,
                                                  &call->field_views, &call->types, &call->fields_count);
     size_t const fields_count = call->fields_count;
-    if (failed || ustore_py_keys_from_object(arguments[0], &call->keys) != 0 ||
+    if (failed || ustore_py_keys_from_object(arguments[0], ustore_py_context_executor(&context), &call->keys) != 0 ||
         ustore_py_arena_from_object(arguments[3], &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, &gather_verb, call);
     call->kept.collection = options.collection;
@@ -1406,11 +1407,8 @@ static int columns_export_children(Columns* self, columns_export_t* exported) {
             ustore_py_raise(status, "Failed to export a gathered column");
             return -1;
         }
+        // Every arena a Python call writes into is one the host reads, as the call checked.
         exported->arrays[index] = column.array;
-        if (column.device_type != ARROW_DEVICE_CPU) {
-            PyErr_SetString(PyExc_ValueError, "A column the gather left on a device exports through C alone");
-            return -1;
-        }
         exported->schemas[index].name = PyUnicode_AsUTF8(PyTuple_GET_ITEM(self->fields, (Py_ssize_t)index));
         if (!exported->schemas[index].name) return -1;
         exported->schema_children[index] = &exported->schemas[index];
@@ -1493,6 +1491,10 @@ static PyObject* Columns_arrow_c_array(Columns* self, PyObject* const* Py_UNUSED
 static PyMethodDef Columns_methods[] = {
     {"__arrow_c_array__", (PyCFunction)(void (*)(void))Columns_arrow_c_array, ustore_py_method_flags_k,
      doc_Columns_arrow_c_array},
+    {"__arrow_c_device_array__", (PyCFunction)(void (*)(void))ustore_py_arrow_c_device_array, ustore_py_method_flags_k,
+     ustore_py_arrow_c_device_array_doc},
+    {"__arrow_c_stream__", (PyCFunction)(void (*)(void))ustore_py_arrow_c_stream, ustore_py_method_flags_k,
+     ustore_py_arrow_c_stream_doc},
     {"validities", (PyCFunction)(void (*)(void))Columns_validities, METH_O, doc_Columns_validities},
     {"conversions", (PyCFunction)(void (*)(void))Columns_conversions, METH_O, doc_Columns_conversions},
     {"collisions", (PyCFunction)(void (*)(void))Columns_collisions, METH_O, doc_Columns_collisions},

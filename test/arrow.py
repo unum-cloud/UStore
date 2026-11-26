@@ -114,3 +114,56 @@ def test_gathered_columns_export_as_a_struct_array(database: ustore.Database) ->
     assert exported.type.names == ["name", "born"]
     assert exported.field("name").to_pylist() == ["Ada", "Alan"]
     assert exported.field("born").to_pylist() == [1815, None]
+
+
+class DeviceArrayOnly:
+    """Exports an Arrow array through `__arrow_c_device_array__` alone, as a device library does."""
+
+    def __init__(self, source) -> None:
+        self.source = source
+
+    def __arrow_c_device_array__(self, requested_schema=None, **kwargs):
+        return self.source.__arrow_c_device_array__(requested_schema, **kwargs)
+
+
+def test_gathered_columns_export_as_a_stream_of_rows(database: ustore.Database) -> None:
+    """A gather is one batch of rows, so it exports an Arrow stream a table reads, and a device array on the CPU."""
+    database.collection_create("people", modality=ustore.Modality.DOCS)
+    database.docs_write([1, 2], ['{"name": "Ada", "born": 1815}', '{"name": "Alan"}'], collection="people")
+    arena = ustore.Arena()
+    types = (ustore.FieldType.STRING, ustore.FieldType.I64)
+    columns = database.docs_gather([1, 2], ["name", "born"], types, arena, collection="people")
+    table = pyarrow.RecordBatchReader.from_stream(columns).read_all()
+    assert table.column("name").to_pylist() == ["Ada", "Alan"]
+    assert table.column("born").to_pylist() == [1815, None]
+    device = pyarrow.Array._import_from_c_device_capsule(*columns.__arrow_c_device_array__())
+    assert device.field("name").to_pylist() == ["Ada", "Alan"]
+    del table, device
+
+
+def test_keys_export_as_fixed_size_binary(database: ustore.Database) -> None:
+    """A tape of keys exports as 16-byte items, which a batch takes back in place, through either Arrow array."""
+    write_posters(database, 8)
+    arena = ustore.Arena()
+    found = database.scan_batch([1, 5], 2, arena, collection="posters")
+    exported = pyarrow.array(found)
+    assert exported.type == pyarrow.binary(16)
+    assert exported.to_pylist() == [key(index).bytes for index in (1, 2, 5, 6)]
+    device = pyarrow.Array._import_from_c_device_capsule(*found.__arrow_c_device_array__())
+    assert device.equals(exported)
+    starts = pyarrow.array([key(2).bytes, key(6).bytes], type=pyarrow.binary(16))
+    for source in (starts, DeviceArrayOnly(starts), pyarrow.array([2, 6], type=pyarrow.int64())):
+        found_again = database.scan_batch(source, 1, ustore.Arena(), collection="posters")
+        assert [found_again[task][0] for task in range(2)] == [key(2), key(6)]
+    del exported, device
+
+
+def test_device_arrays_import(database: ustore.Database) -> None:
+    """Values and whole batches arrive through `__arrow_c_device_array__` as through `__arrow_c_array__`."""
+    rows = [(key(index), bytes([index]) * index) for index in range(1, 11)]
+    database.collection_create("copies", modality=ustore.Modality.BLOBS)
+    batch = table_of(rows).to_batches()[0]
+    assert database.import_arrow(DeviceArrayOnly(batch), collection="copies") == len(rows)
+    values = pyarrow.array([b"x", b"yy"], type=pyarrow.binary())
+    database.write([key(1), key(2)], DeviceArrayOnly(values), collection="copies")
+    assert [database.get(index, collection="copies") for index in (1, 2)] == [b"x", b"yy"]

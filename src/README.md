@@ -141,6 +141,7 @@ The router refuses a compaction and a plan's finish before taking any claim, so 
 Every handle, arenas and ingests included, counts the calls naming it in `named_calls`, raised at the call's claim and lowered at its end, with or without an executor, and each free waits for zero, so no binding keeps counts of its own.
 A transaction, a snapshot and a cursor each hold their database open, and a cursor also holds the transaction or snapshot it reads through, so every free drops one hold and the last one frees the handle through its engine.
 `ustore_executor_drain` takes the claim through `take_idle_claim` once it is free, parks an owned pool for `ustore_mood_parked_k` and releases the claim, and `ustore_executor_free` takes it the same way before freeing the scratch, the claim dying with the handle.
+`ustore_executor_follow` tries the claim instead, answering `contended` while a call holds it, then takes the GPU executor's own claim, as a device Arrow export does.
 
 Cursors live in `src/lib.hpp`, `src/blobs.cpp` and `src/strings.cpp` with no engine slot.
 A pull calls the engine's scan slot into the call's scratch, then its read slot into the caller's arena when values are asked for, and copies the keys or the strings into the arena, so the arena holds only outputs.

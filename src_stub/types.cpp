@@ -399,6 +399,31 @@ void ustore_executor_drain(ustore_executor_drain_t* arguments) {
     while (executor->claim.held()) std::this_thread::yield();
 }
 
+/* Every executor of the stub computes on host threads, as it opens no device, so none drives a
+ * stream */
+
+void ustore_executor_stream(ustore_executor_stream_t* arguments) {
+    call_t call(arguments->outcome);
+    if (arguments->stream) *arguments->stream = nullptr;
+    if (!arguments->executor || !arguments->stream)
+        return call.refuse(ustore_status_invalid_argument_k, "The call needs an executor and an output for the stream");
+    call.refuse(ustore_status_unsupported_k, "A host executor drives no stream");
+}
+
+void ustore_executor_follow(ustore_executor_follow_t* arguments) {
+    call_t call(arguments->outcome);
+    if (!arguments->executor || !arguments->event == !arguments->stream)
+        return call.refuse(ustore_status_invalid_argument_k,
+                           "The call needs an executor and either an event or a stream to follow");
+    call.refuse(ustore_status_unsupported_k, "A host executor drives no stream");
+}
+
+void ustore_executor_accepts(ustore_executor_accepts_t* arguments) {
+    call_t call(arguments->outcome);
+    if (!arguments->executor) return call.refuse(ustore_status_invalid_argument_k, "The call needs an executor");
+    call.refuse(ustore_status_unsupported_k, "A host executor drives no stream");
+}
+
 ustore_status_t ustore_executor_free(ustore_executor_t executor) {
     if (!executor) return ustore_status_success_k;
     if (executor->arenas.load(std::memory_order_acquire) != 0) return ustore_status_contended_k;

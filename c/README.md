@@ -382,6 +382,7 @@ ustore_executor_free(executor);
 
 `cpu_class_ceiling` caps the CPU class the threads confine their waits and atomics to, intersected with what the machine runs, and `ustore_executor_drain` waits until no call holds the executor, then parks or spins its threads.
 `ustore_executor_free` answers `ustore_status_contended_k`, freeing nothing, while an arena made with it lives.
+A VRAM executor shares its streams with other libraries: `ustore_executor_stream` names the native stream at a position, `ustore_executor_accepts` checks that a consumer's stream sits on the same device, and `ustore_executor_follow` queues a wait for a foreign event or stream, so the next call reads a producer's memory once it is written, without the host waiting.
 
 ### Inclusive and Exclusive Executors
 

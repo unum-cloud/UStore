@@ -717,6 +717,132 @@ void ustore_executor_drain(ustore_executor_drain_t* arguments) {
     finish(outcome, {});
 }
 
+/** Visits the GPU executor @p executor and its stream at @p position, refusing a host executor and
+ *  a position past its streams. */
+template <typename visitor_type_>
+static util::status_t visit_executor_stream(ustore_executor_handle_t* executor, std::size_t position,
+                                            visitor_type_&& visitor) noexcept {
+    if (!executor) return {util::status_code_t::invalid_argument_k, "The call needs an executor"};
+    return std::visit(
+        [&]<typename kind_type_>(kind_type_& kind) noexcept -> util::status_t {
+            if constexpr (!util::a_gpu_executor<kind_type_>)
+                return {util::status_code_t::unsupported_k, "A host executor drives no stream"};
+            else if (position >= kind.size())
+                return {util::status_code_t::invalid_argument_k, "No stream of the executor holds the position"};
+            else return visitor(kind, kind.stream(position));
+        },
+        executor->device);
+}
+
+/** Answers whether the foreign stream @p foreign sits on the device @p stream queues on. The null,
+ *  legacy and per-thread handles name the default streams of whichever device is current, which a
+ *  consumer means as this device's, so they pass without asking the driver. */
+static util::status_t foreign_stream_on_device(util::cuda_executor_t::stream_t& stream, void* foreign) noexcept {
+    if (reinterpret_cast<std::uintptr_t>(foreign) <= 2) return {};
+    util::cuda_api_t const& api = stream.handle.api();
+    util::cuda_context_handle_t context = nullptr;
+    if (api.stream_get_context(static_cast<util::cuda_stream_handle_t>(foreign), &context) != util::cuda_success_k)
+        return {util::status_code_t::device_k, "The driver could not name the stream's context"};
+    if (context != api.primary_contexts[stream.ordinal])
+        return {util::status_code_t::config_mismatch_k, "The stream sits on another device"};
+    return {};
+}
+
+static util::status_t foreign_stream_on_device(util::hip_executor_t::stream_t& stream, void* foreign) noexcept {
+    if (reinterpret_cast<std::uintptr_t>(foreign) <= 2) return {};
+    int device = -1;
+    if (stream.handle.api().stream_get_device(static_cast<util::hip_stream_handle_t>(foreign), &device) !=
+        util::hip_success_k)
+        return {util::status_code_t::device_k, "The runtime could not name the stream's device"};
+    if (device < 0 || static_cast<std::size_t>(device) != stream.ordinal)
+        return {util::status_code_t::config_mismatch_k, "The stream sits on another device"};
+    return {};
+}
+
+/** Queues on @p stream a wait for the foreign event @p event points at, or for what the foreign
+ *  @p foreign queued so far, through the stream's own event, its device bound, as @c follow_foreign
+ *  asks it to; a null event behind @p event leaves nothing to wait for. */
+template <typename stream_handle_type_, typename event_handle_type_, auto success_, typename stream_type_>
+static util::status_t queue_foreign_wait(stream_type_& stream, void* event, void* foreign) noexcept {
+    if (util::status_t const bound = stream.bind(); bound.failed()) return bound;
+    event_handle_type_ awaited = nullptr;
+    if (foreign) {
+        // The mark is this stream's own event, which a driver records only on its device's streams
+        if (util::status_t const placed = foreign_stream_on_device(stream, foreign); placed.failed()) return placed;
+        if (stream.event.record(static_cast<stream_handle_type_>(foreign)).failed())
+            return {util::status_code_t::device_k, "The foreign stream refused the mark"};
+        awaited = static_cast<event_handle_type_>(stream.event);
+    }
+    else awaited = *static_cast<event_handle_type_ const*>(event);
+    if (!awaited) return {}; // Arrow's producer had nothing left to wait for
+    if (stream.handle.api().stream_wait_event(stream.handle, awaited, 0) != success_)
+        return {util::status_code_t::device_k, "The stream refused the foreign wait"};
+    return {};
+}
+
+static util::status_t follow_foreign(util::cuda_executor_t::stream_t& stream, void* event, void* foreign) noexcept {
+    return queue_foreign_wait<util::cuda_stream_handle_t, util::cuda_event_handle_t, util::cuda_success_k>(
+        stream, event, foreign);
+}
+
+static util::status_t follow_foreign(util::hip_executor_t::stream_t& stream, void* event, void* foreign) noexcept {
+    return queue_foreign_wait<util::hip_stream_handle_t, util::hip_event_handle_t, util::hip_success_k>(stream, event,
+                                                                                                        foreign);
+}
+
+void ustore_executor_stream(ustore_executor_stream_t* arguments) {
+    ustore_outcome_t& outcome = *arguments->outcome;
+    if (!arguments->stream)
+        return finish(outcome, {util::status_code_t::invalid_argument_k, "The call needs an output for the stream"});
+    *arguments->stream = nullptr;
+    finish(outcome,
+           visit_executor_stream(arguments->executor, static_cast<std::size_t>(arguments->position),
+                                 [&]<typename kind_type_>(kind_type_&, typename kind_type_::stream_t& stream) noexcept {
+                                     if constexpr (std::is_same_v<kind_type_, util::metal_executor_t>)
+                                         *arguments->stream = stream.handle.queue();
+                                     else if constexpr (std::is_same_v<kind_type_, util::cuda_executor_t>)
+                                         *arguments->stream = static_cast<util::cuda_stream_handle_t>(stream.handle);
+                                     else *arguments->stream = static_cast<util::hip_stream_handle_t>(stream.handle);
+                                     return util::status_t {};
+                                 }));
+}
+
+void ustore_executor_follow(ustore_executor_follow_t* arguments) {
+    ustore_outcome_t& outcome = *arguments->outcome;
+    ustore_executor_handle_t* const executor = arguments->executor;
+    if (!executor || !arguments->event == !arguments->stream)
+        return finish(outcome, {util::status_code_t::invalid_argument_k,
+                                "The call needs an executor and either an event or a stream to follow"});
+    // The wait queues on a stream a call may drive, so it holds the executor as a call does
+    if (!take(executor->holding_call.claim))
+        return finish(outcome, {util::status_code_t::contended_k, "A call holds the executor"});
+    util::status_t const followed = visit_executor_stream(
+        executor, static_cast<std::size_t>(arguments->position),
+        [&]<typename kind_type_>(kind_type_& kind, typename kind_type_::stream_t& stream) noexcept -> util::status_t {
+            if constexpr (std::is_same_v<kind_type_, util::metal_executor_t>)
+                return {util::status_code_t::unsupported_k, "A Metal queue waits on no foreign mark"};
+            else {
+                auto [claim, claim_status] = kind.claim();
+                if (claim_status.failed()) return claim_status;
+                return follow_foreign(stream, arguments->event, arguments->stream);
+            }
+        });
+    release(executor->holding_call.claim);
+    finish(outcome, followed);
+}
+
+void ustore_executor_accepts(ustore_executor_accepts_t* arguments) {
+    ustore_outcome_t& outcome = *arguments->outcome;
+    finish(outcome,
+           visit_executor_stream(
+               arguments->executor, static_cast<std::size_t>(arguments->position),
+               [&]<typename kind_type_>(kind_type_&, typename kind_type_::stream_t& stream) noexcept -> util::status_t {
+                   if constexpr (std::is_same_v<kind_type_, util::metal_executor_t>)
+                       return {util::status_code_t::unsupported_k, "A Metal queue names no foreign stream's device"};
+                   else return foreign_stream_on_device(stream, arguments->stream);
+               }));
+}
+
 ustore_status_t ustore_executor_free(ustore_executor_t executor) {
     if (!executor) return ustore_status_success_k;
     // A refusal never waits: the count is read before the claim

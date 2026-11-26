@@ -55,6 +55,8 @@ static struct {
      "An executor, arena or transaction serving another call refused the call instead of waiting."},
     {ustore_status_cancelled_k, "ustore.CancelledError", &ErrorType, NULL,
      "A progress callback stopped the call, which unwound and published nothing."},
+    {ustore_status_overflow_k, "ustore.CapacityOverflowError", &ErrorType, &PyExc_OverflowError,
+     "A count or size outgrew the integer holding it, like the open exports of one arena."},
     {ustore_status_unsupported_k, "ustore.UnsupportedError", &ErrorType, &PyExc_NotImplementedError,
      "The engine or this build does not implement what the call asks for."},
     {ustore_status_invalid_argument_k, "ustore.InvalidArgumentError", &ErrorType, &PyExc_ValueError,
@@ -195,10 +197,12 @@ static char const doc_Arena[] =                                                 
     "    the arena is freed; None serves the calling thread.";
 
 /** A new arena of @p type made where @p executor computes, or NULL with an exception set. */
-static PyObject* arena_made(PyTypeObject* type, ustore_executor_t executor) {
+static PyObject* arena_made(PyTypeObject* type, Executor* executor) {
+    if (executor && !executor->handle)
+        return ustore_py_raise(ustore_status_uninitialized_k, "The executor is closed"), NULL;
     ustore_arena_t handle = NULL;
     ustore_outcome_t outcome = {0};
-    ustore_arena_init_t init = {.arena = &handle, .executor = executor, .outcome = &outcome};
+    ustore_arena_init_t init = {.arena = &handle, .executor = executor ? executor->handle : NULL, .outcome = &outcome};
     ustore_arena_init(&init);
     if (ustore_py_raise_on_outcome(&outcome) != 0) return NULL;
     Arena* const arena = (Arena*)type->tp_alloc(type, 0);
@@ -207,10 +211,11 @@ static PyObject* arena_made(PyTypeObject* type, ustore_executor_t executor) {
         return NULL;
     }
     arena->handle = handle;
+    arena->executor = (Executor*)Py_XNewRef((PyObject*)executor);
     return (PyObject*)arena;
 }
 
-PyObject* ustore_py_arena_new(ustore_executor_t executor) { return arena_made(&ArenaType, executor); }
+PyObject* ustore_py_arena_new(Executor* executor) { return arena_made(&ArenaType, executor); }
 
 static PyObject* Arena_tp_new(PyTypeObject* type, PyObject* arguments, PyObject* keywords) {
     Py_ssize_t const positional_arguments_count = PyTuple_GET_SIZE(arguments);
@@ -224,18 +229,11 @@ static PyObject* Arena_tp_new(PyTypeObject* type, PyObject* arguments, PyObject*
         PyErr_Format(PyExc_TypeError, "Expected an Executor or None, got %S", Py_TYPE(executor_object));
         return NULL;
     }
-    ustore_executor_t const executor = ((Executor*)executor_object)->handle;
-    if (executor) return arena_made(type, executor);
-    ustore_py_raise(ustore_status_uninitialized_k, "The executor is closed");
-    return NULL;
+    return arena_made(type, (Executor*)executor_object);
 }
 
-static void Arena_dealloc(Arena* self) {
-    Py_BEGIN_ALLOW_THREADS;
-    ustore_arena_free(self->handle);
-    Py_END_ALLOW_THREADS;
-    Py_TYPE(self)->tp_free((PyObject*)self);
-}
+static void Arena_dealloc(Arena* self);
+static ustore_status_t arena_follow_unfollowed(Arena* arena);
 
 PyTypeObject ArenaType = {
     PyVarObject_HEAD_INIT(NULL, 0) //
@@ -276,6 +274,10 @@ int ustore_py_arena_from_object(PyObject* object, PyObject** arena) {
     }
     // Every answer reads its outputs on the host, so a device arena is refused before the call.
     if (arena_readable(object) != 0) return -1;
+    // Dropped exports still open wait for their consumers' kernels, which may still read the memory
+    ustore_status_t const followed = arena_follow_unfollowed((Arena*)object);
+    if (followed != ustore_status_success_k)
+        return ustore_py_raise(followed, "the arena's stream could not wait for a dropped export's consumer");
     *arena = Py_NewRef(object);
     return 0;
 }
@@ -286,61 +288,51 @@ ustore_arena_t ustore_py_arena_handle(PyObject* arena) { return ((Arena*)arena)-
 
 #pragma region DLPack
 
-/** The DLPack device types a batch is taken from, host, CUDA, ROCm and CUDA managed memory,
- *  and Metal, which an Apple arena reports. */
-typedef enum { kDLCPU = 1, kDLCUDA = 2, kDLMetal = 8, kDLROCM = 10, kDLCUDAManaged = 13 } DLDeviceType;
+DLDevice ustore_py_dlpack_device(ustore_arena_description_t const* description) {
+    int32_t const ordinal = description->vendor_ordinal;
+    if (description->residency != ustore_residency_vram_k) {
+        if (description->device >= 0 && description->vendor == ustore_gpu_vendor_nvidia_k)
+            return (DLDevice) {kDLCUDAHost, ordinal};
+        if (description->device >= 0 && description->vendor == ustore_gpu_vendor_amd_k)
+            return (DLDevice) {kDLROCMHost, ordinal};
+        return (DLDevice) {kDLCPU, 0};
+    }
+    // No Metal exchange is spoken yet, so Apple's shared memory exports as the host memory it is
+    if (description->vendor == ustore_gpu_vendor_apple_k) return (DLDevice) {kDLCPU, 0};
+    // DLPack names no managed memory on ROCm, so a managed AMD arena reports its device
+    if (description->vendor == ustore_gpu_vendor_amd_k) return (DLDevice) {kDLROCM, ordinal};
+    return (DLDevice) {description->host_access == ustore_host_access_readable_k ? kDLCUDAManaged : kDLCUDA, ordinal};
+}
 
-/** Where a DLPack tensor lives. */
-typedef struct {
-    DLDeviceType device_type;
-    int32_t device_id;
-} DLDevice;
+/** The @c Arena an output view reads, which every view keeps alive. */
+static PyObject* view_arena(PyObject* view) {
+    PyTypeObject const* const type = Py_TYPE(view);
+    if (type == &ValuesType) return ((Values*)view)->arena;
+    if (type == &KeysType) return ((Keys*)view)->arena;
+    if (type == &PageType) return ((Page*)view)->arena;
+    if (type == &NeighborhoodsType) return ((Neighborhoods*)view)->arena;
+    if (type == &ColumnsType) return ((Columns*)view)->arena;
+    return ((Span*)view)->arena;
+}
 
-/** The DLPack type codes the struct-module formats of our buffers map onto. */
-typedef enum { kDLInt = 0, kDLUInt = 1, kDLFloat = 2, kDLBool = 6 } DLDataTypeCode;
+/** The DLPack device of the outputs @p view reads, or -1 with an exception set. */
+static int view_device(PyObject* view, DLDevice* device) {
+    ustore_arena_description_t description = {0};
+    if (arena_described(view_arena(view), &description) != 0) return -1;
+    *device = ustore_py_dlpack_device(&description);
+    return 0;
+}
 
-/** One DLPack element type. */
-typedef struct {
-    uint8_t code;
-    uint8_t bits;
-    uint16_t lanes;
-} DLDataType;
+/** Opens one export of the arena @p view reads, refusing every call naming it until the export
+ *  closes, or -1 raising a ContendedError while a call holds it. */
+static int view_export_open(PyObject* view) {
+    ustore_status_t const status = ustore_arena_export_open(ustore_py_arena_handle(view_arena(view)));
+    if (status == ustore_status_success_k) return 0;
+    return ustore_py_raise(status, "The arena exports nothing while a call holds it");
+}
 
-/** One DLPack tensor, with shape and strides counted in elements. */
-typedef struct {
-    void* data;
-    DLDevice device;
-    int32_t ndim;
-    DLDataType dtype;
-    int64_t* shape;
-    int64_t* strides;
-    uint64_t byte_offset;
-} DLTensor;
-
-/** The tensor a "dltensor" capsule holds, which its consumer deletes. */
-typedef struct DLManagedTensor {
-    DLTensor dl_tensor;
-    void* manager_ctx;
-    void (*deleter)(struct DLManagedTensor* self);
-} DLManagedTensor;
-
-/** The DLPack version a "dltensor_versioned" capsule holds. */
-typedef struct {
-    uint32_t major;
-    uint32_t minor;
-} DLPackVersion;
-
-/** The tensor a "dltensor_versioned" capsule holds, which its consumer deletes. */
-typedef struct DLManagedTensorVersioned {
-    DLPackVersion version;
-    void* manager_ctx;
-    void (*deleter)(struct DLManagedTensorVersioned* self);
-    uint64_t flags;
-    DLTensor dl_tensor;
-} DLManagedTensorVersioned;
-
-/** The flag of a versioned tensor its consumer must not write. */
-static uint64_t const dlpack_flag_read_only_k = 1;
+/** Closes the export @c view_export_open opened on the arena @p view reads. */
+static void view_export_close(PyObject* view) { ustore_arena_export_close(ustore_py_arena_handle(view_arena(view))); }
 
 /** What one exported capsule keeps until its consumer deletes it: the buffer pinning the arena and
  *  the geometry. */
@@ -355,6 +347,13 @@ typedef struct dlpack_export_t {
     /** The buffer the exporter answered, held until released. */
     Py_buffer view;
 
+    /** The stream the consumer's kernels read the tensor on, which the arena's stream follows
+     *  before the export closes, or NULL when the consumer named none. */
+    void* consumer_stream;
+
+    /** The next export on the arena's @c unfollowed stack, once this one waits there. */
+    struct dlpack_export_t* next;
+
     /** Items along every dimension. */
     int64_t shape[3];
 
@@ -362,13 +361,95 @@ typedef struct dlpack_export_t {
     int64_t strides[3];
 } dlpack_export_t;
 
-/** Releases the buffer, taking the interpreter, as a consumer may delete from a thread
- *  of its own. */
+/** Orders the first stream of @p arena 's executor after the consumer's @p stream, if any. */
+static ustore_status_t arena_follow(Arena* arena, void* stream) {
+    if (!stream) return ustore_status_success_k;
+    ustore_outcome_t outcome = {0};
+    ustore_executor_follow_t follow = {
+        .executor = arena->executor ? arena->executor->handle : NULL,
+        .position = 0,
+        .stream = stream,
+        .outcome = &outcome,
+    };
+    ustore_executor_follow(&follow);
+    return outcome.status;
+}
+
+/** Pushes the exports @p first through @p last onto the @c unfollowed stack of @p arena. */
+static void arena_push_unfollowed(Arena* arena, dlpack_export_t* first, dlpack_export_t* last) {
+    last->next = atomic_load(&arena->unfollowed);
+    while (!atomic_compare_exchange_weak(&arena->unfollowed, &last->next, first)) {}
+}
+
+/** Follows and closes every export on the @c unfollowed stack of @p arena, answering the first
+ *  failed follow's status with that export and the rest pushed back. */
+static ustore_status_t arena_follow_unfollowed(Arena* arena) {
+    dlpack_export_t* exported = atomic_exchange(&arena->unfollowed, NULL);
+    while (exported) {
+        ustore_status_t const followed = arena_follow(arena, exported->consumer_stream);
+        if (followed != ustore_status_success_k) {
+            dlpack_export_t* last = exported;
+            while (last->next) last = last->next;
+            arena_push_unfollowed(arena, exported, last);
+            return followed;
+        }
+        dlpack_export_t* const next = exported->next;
+        ustore_arena_export_close(arena->handle);
+        PyMem_RawFree(exported);
+        exported = next;
+    }
+    return ustore_status_success_k;
+}
+
+static void Arena_dealloc(Arena* self) {
+    ustore_status_t const followed = arena_follow_unfollowed(self);
+    if (followed != ustore_status_success_k) {
+        // The consumers' streams can't be followed, so the arena waits for its own work instead
+        ustore_outcome_t outcome = {0};
+        ustore_executor_drain_t drain = {.executor = self->executor ? self->executor->handle : NULL,
+                                         .outcome = &outcome,
+                                         .mood = ustore_mood_parked_k};
+        Py_BEGIN_ALLOW_THREADS;
+        if (drain.executor) ustore_executor_drain(&drain);
+        Py_END_ALLOW_THREADS;
+        for (dlpack_export_t* exported = atomic_exchange(&self->unfollowed, NULL); exported;) {
+            dlpack_export_t* const next = exported->next;
+            ustore_arena_export_close(self->handle);
+            PyMem_RawFree(exported);
+            exported = next;
+        }
+        PyObject* const pending = PyErr_GetRaisedException();
+        ustore_py_raise(followed, "the arena was freed before its stream could wait for a dropped export's consumer");
+        PyErr_WriteUnraisable(NULL);
+        PyErr_SetRaisedException(pending);
+    }
+    Py_BEGIN_ALLOW_THREADS;
+    ustore_arena_free(self->handle);
+    Py_END_ALLOW_THREADS;
+    Py_CLEAR(self->executor);
+    Py_TYPE(self)->tp_free((PyObject*)self);
+}
+
+/** Closes the export, or leaves it for the arena's next user to follow and close, taking the
+ *  interpreter, as a consumer may delete from a thread of its own. */
 static void dlpack_export_free(dlpack_export_t* exported) {
     PyGILState_STATE const state = PyGILState_Ensure();
-    PyBuffer_Release(&exported->view);
+    // The consumer's kernels may still read the memory, so the arena's stream waits for them first
+    PyObject* const owner = exported->view.obj;
+    Arena* const arena = (Arena*)view_arena(owner);
+    if (arena_follow(arena, exported->consumer_stream) == ustore_status_contended_k) {
+        // A call on another arena holds the executor: the export stays open until the arena's next
+        // user follows the stream, and the buffer goes, as the stack must not keep the arena alive
+        Py_buffer view = exported->view;
+        arena_push_unfollowed(arena, exported, exported);
+        PyBuffer_Release(&view);
+    }
+    else {
+        view_export_close(owner);
+        PyBuffer_Release(&exported->view);
+        PyMem_RawFree(exported);
+    }
     PyGILState_Release(state);
-    PyMem_RawFree(exported);
 }
 
 static void dlpack_legacy_deleter(DLManagedTensor* self) { dlpack_export_free((dlpack_export_t*)self->manager_ctx); }
@@ -396,15 +477,40 @@ char const ustore_py_dlpack_doc[] =                                             
     "\n"                                                                                    //
     "The capsule holds this object and its arena until the consumer deletes it, so\n"       //
     "`numpy.from_dlpack`, `torch.from_dlpack` and their peers read the outputs in place.\n" //
-    "A `max_version` of 1 or above answers a versioned capsule flagged read-only.\n"        //
+    "A `max_version` of 1 or above answers a versioned capsule flagged read-only. The\n"    //
+    "call that wrote the outputs is final, so no `stream` waits on anything; it is still\n" //
+    "checked as the standard spells it for the device: None or -1 anywhere, and a stream\n" //
+    "only on a CUDA or ROCm device, where CUDA refuses 0 and a handle must sit on the\n"    //
+    "outputs' device. Once the consumer deletes the capsule, the arena's next call waits\n" //
+    "for the work queued on that stream before it rewinds the memory.\n"                    //
     "\n"                                                                                    //
     "Raises:\n"                                                                             //
     "  BufferError: A copy was asked for, or a device other than the outputs' own.\n"       //
-    "  DeviceError: The outputs live in device memory.";
+    "  TypeError: The stream is not an integer.\n"                                          //
+    "  ValueError: The stream names nothing on the outputs' device.";
 
-char const ustore_py_dlpack_device_doc[] =                                                    //
-    "__dlpack_device__() answers the DLPack device type and ordinal of the outputs: (1, 0)\n" //
-    "for host pages, (2, ordinal) for an NVIDIA device and (10, ordinal) for an AMD one.";
+char const ustore_py_dlpack_device_doc[] =                                                     //
+    "__dlpack_device__() answers the DLPack device type and ordinal of the outputs: (1, 0)\n"  //
+    "for host pages, (3, ordinal) or (11, ordinal) for host pages page-locked for an NVIDIA\n" //
+    "or AMD device, and (13, ordinal) for NVIDIA managed memory, the ordinal being the\n"      //
+    "vendor's own. Apple's shared memory answers (1, 0), as no Metal exchange is spoken yet.";
+
+/** A tuple of two integers, @p first and @p second, or NULL raising. */
+static PyObject* integers_pair(long first, long second) {
+    PyObject* const pair = PyTuple_New(2);
+    if (!pair) return NULL;
+    PyTuple_SET_ITEM(pair, 0, PyLong_FromLong(first));
+    PyTuple_SET_ITEM(pair, 1, PyLong_FromLong(second));
+    if (PyTuple_GET_ITEM(pair, 0) && PyTuple_GET_ITEM(pair, 1)) return pair;
+    Py_DECREF(pair);
+    return NULL;
+}
+
+PyObject* ustore_py_dlpack_device_answer(PyObject* self, PyObject* Py_UNUSED(unused)) {
+    DLDevice device;
+    if (view_device(self, &device) != 0) return NULL;
+    return integers_pair((long)device.device_type, (long)device.device_id);
+}
 
 /** Reads one keyword of @c __dlpack__ into @p values, in the order stream, max_version, dl_device,
  *  copy. */
@@ -429,6 +535,52 @@ static int dlpack_arguments(PyObject* const* arguments, Py_ssize_t positional_ar
     return 0;
 }
 
+/**
+ *  @brief Checks the @p stream a consumer passes for outputs of @p arena on @p device, as the
+ *      DLPack standard spells it, and that a stream handle sits on the arena's device.
+ *  @param[out] consumer_stream The stream the consumer's kernels read on, or NULL for None, -1 and
+ *      the default stream of ROCm.
+ *  @return 0, or -1 raising.
+ */
+static int dlpack_stream_check(PyObject* stream, PyObject* arena, DLDevice device, void** consumer_stream) {
+    *consumer_stream = NULL;
+    if (stream == Py_None) return 0;
+    if (!PyLong_Check(stream) || PyBool_Check(stream)) {
+        PyErr_Format(PyExc_TypeError, "stream must be an integer or None, got %S", Py_TYPE(stream));
+        return -1;
+    }
+    int overflowed = 0;
+    long long const handle = PyLong_AsLongLongAndOverflow(stream, &overflowed);
+    if (handle == -1 && PyErr_Occurred()) return -1;
+    if (handle == -1 && !overflowed) return 0;
+    int const cuda = device.device_type == kDLCUDA || device.device_type == kDLCUDAManaged;
+    int const rocm = device.device_type == kDLROCM;
+    if (!overflowed && !(cuda && handle > 0) && !(rocm && handle >= 0)) {
+        PyErr_Format(PyExc_ValueError, "stream %S names no stream on DLPack device (%d, %d)", stream,
+                     (int)device.device_type, (int)device.device_id);
+        return -1;
+    }
+    void* const named = PyLong_AsVoidPtr(stream);
+    if (!named && PyErr_Occurred()) return -1;
+    Executor* const executor = ((Arena*)arena)->executor;
+    if (!executor || !executor->handle) return ustore_py_raise(ustore_status_uninitialized_k, "the executor is closed");
+    if (overflowed || (cuda && handle > 2) || (rocm && handle > 0)) { // a handle rather than a default stream
+        ustore_outcome_t outcome = {0};
+        ustore_executor_accepts_t accepts = {.executor = executor->handle,
+                                             .position = 0,
+                                             .stream = named,
+                                             .outcome = &outcome};
+        ustore_executor_accepts(&accepts);
+        if (outcome.status == ustore_status_config_mismatch_k) {
+            PyErr_Format(PyExc_ValueError, "stream %S sits on another device than the outputs", stream);
+            return -1;
+        }
+        if (ustore_py_raise_on_outcome(&outcome) != 0) return -1;
+    }
+    *consumer_stream = named;
+    return 0;
+}
+
 /** The DLPack type of items spelled by the struct-module @p format, @p itemsize bytes each. */
 static DLDataType dlpack_type_of(char const* format, Py_ssize_t itemsize) {
     char const kind = format ? format[0] : 'B';
@@ -445,6 +597,11 @@ PyObject* ustore_py_dlpack(PyObject* self, PyObject* const* arguments, Py_ssize_
     if (dlpack_arguments(arguments, positional_arguments_count, keyword_names_tuple, values) != 0) return NULL;
     PyObject* const max_version = values[1];
     PyObject* const dl_device = values[2];
+    DLDevice device;
+    void* consumer_stream = NULL;
+    if (view_device(self, &device) != 0 ||
+        dlpack_stream_check(values[0], view_arena(self), device, &consumer_stream) != 0)
+        return NULL;
     int const copied = values[3] == Py_None ? 0 : PyObject_IsTrue(values[3]);
     if (copied < 0) return NULL;
     if (copied) {
@@ -452,13 +609,17 @@ PyObject* ustore_py_dlpack(PyObject* self, PyObject* const* arguments, Py_ssize_
         return NULL;
     }
     if (dl_device != Py_None) {
-        long const type = PyTuple_Check(dl_device) && PyTuple_GET_SIZE(dl_device) == 2
-                              ? PyLong_AsLong(PyTuple_GET_ITEM(dl_device, 0))
-                              : -1;
-        long const ordinal = type == kDLCPU ? PyLong_AsLong(PyTuple_GET_ITEM(dl_device, 1)) : -1;
-        if (PyErr_Occurred()) return NULL;
-        if (type != kDLCPU || ordinal != 0) {
-            PyErr_SetString(PyExc_BufferError, "The outputs export only on the device they live on, (1, 0)");
+        int const paired = PyTuple_Check(dl_device) && PyTuple_GET_SIZE(dl_device) == 2;
+        long const type = paired ? PyLong_AsLong(PyTuple_GET_ITEM(dl_device, 0)) : -1;
+        long const ordinal = paired ? PyLong_AsLong(PyTuple_GET_ITEM(dl_device, 1)) : -1;
+        if (!paired || PyErr_Occurred()) {
+            PyErr_Clear();
+            PyErr_SetString(PyExc_TypeError, "dl_device must be a (device type, ordinal) tuple");
+            return NULL;
+        }
+        if (type != (long)device.device_type || ordinal != (long)device.device_id) {
+            PyErr_Format(PyExc_BufferError, "The outputs export only on the device they live on, (%d, %d)",
+                         (int)device.device_type, (int)device.device_id);
             return NULL;
         }
     }
@@ -471,14 +632,20 @@ PyObject* ustore_py_dlpack(PyObject* self, PyObject* const* arguments, Py_ssize_
             PyErr_SetString(PyExc_TypeError, "max_version must be a (major, minor) tuple");
         if (PyErr_Occurred()) return NULL;
     }
-    int const versioned = major >= 1;
+    int const versioned = major >= DLPACK_MAJOR_VERSION;
 
     dlpack_export_t* const exported = (dlpack_export_t*)PyMem_RawCalloc(1, sizeof(dlpack_export_t));
     if (!exported) return PyErr_NoMemory();
-    if (PyObject_GetBuffer(self, &exported->view, PyBUF_RECORDS_RO) != 0) {
+    if (view_export_open(self) != 0) {
         PyMem_RawFree(exported);
         return NULL;
     }
+    if (PyObject_GetBuffer(self, &exported->view, PyBUF_RECORDS_RO) != 0) {
+        view_export_close(self);
+        PyMem_RawFree(exported);
+        return NULL;
+    }
+    exported->consumer_stream = consumer_stream;
     Py_buffer const* const view = &exported->view;
     for (int dimension = 0; dimension != view->ndim; ++dimension) {
         exported->shape[dimension] = (int64_t)view->shape[dimension];
@@ -487,7 +654,7 @@ PyObject* ustore_py_dlpack(PyObject* self, PyObject* const* arguments, Py_ssize_
     DLTensor* const tensor = versioned ? &exported->managed.versioned.dl_tensor : &exported->managed.legacy.dl_tensor;
     *tensor = (DLTensor) {
         .data = view->buf,
-        .device = {kDLCPU, 0},
+        .device = device,
         .ndim = view->ndim,
         .dtype = dlpack_type_of(view->format, view->itemsize),
         .shape = exported->shape,
@@ -495,10 +662,10 @@ PyObject* ustore_py_dlpack(PyObject* self, PyObject* const* arguments, Py_ssize_
         .byte_offset = 0,
     };
     if (versioned) {
-        exported->managed.versioned.version = (DLPackVersion) {1, 0};
+        exported->managed.versioned.version = (DLPackVersion) {DLPACK_MAJOR_VERSION, DLPACK_MINOR_VERSION};
         exported->managed.versioned.manager_ctx = exported;
         exported->managed.versioned.deleter = dlpack_versioned_deleter;
-        exported->managed.versioned.flags = dlpack_flag_read_only_k;
+        exported->managed.versioned.flags = DLPACK_FLAG_BITMASK_READ_ONLY;
     }
     else {
         exported->managed.legacy.manager_ctx = exported;
@@ -506,74 +673,155 @@ PyObject* ustore_py_dlpack(PyObject* self, PyObject* const* arguments, Py_ssize_
     }
     PyObject* const capsule = PyCapsule_New(&exported->managed, versioned ? "dltensor_versioned" : "dltensor",
                                             dlpack_capsule_free);
-    if (!capsule) {
-        PyBuffer_Release(&exported->view);
-        PyMem_RawFree(exported);
-    }
+    if (!capsule) dlpack_export_free(exported);
     return capsule;
 }
 
-/** The @c __dlpack_device__ pair of a device type and its ordinal. */
-static PyObject* dlpack_device_pair(long type, unsigned long ordinal) {
-    PyObject* const pair = PyTuple_New(2);
-    if (!pair) return NULL;
-    PyTuple_SET_ITEM(pair, 0, PyLong_FromLong(type));
-    PyTuple_SET_ITEM(pair, 1, PyLong_FromUnsignedLong(ordinal));
-    if (PyTuple_GET_ITEM(pair, 0) && PyTuple_GET_ITEM(pair, 1)) return pair;
-    Py_DECREF(pair);
-    return NULL;
+/** Deletes the tensor of a capsule @c dlpack_import consumed, once its holder drops it. */
+static void dlpack_import_free(PyObject* capsule) {
+    if (PyCapsule_IsValid(capsule, "used_dltensor_versioned")) {
+        DLManagedTensorVersioned* const managed = (DLManagedTensorVersioned*)PyCapsule_GetPointer(
+            capsule, "used_dltensor_versioned");
+        if (managed->deleter) managed->deleter(managed);
+    }
+    else if (PyCapsule_IsValid(capsule, "used_dltensor")) {
+        DLManagedTensor* const managed = (DLManagedTensor*)PyCapsule_GetPointer(capsule, "used_dltensor");
+        if (managed->deleter) managed->deleter(managed);
+    }
 }
 
-PyObject* ustore_py_dlpack_device(PyObject* arena) {
-    ustore_arena_description_t description = {0};
-    if (arena_described(arena, &description) != 0) return NULL;
-    if (description.residency != ustore_residency_vram_k) return dlpack_device_pair(kDLCPU, 0);
-    DLDeviceType const device_type = description.vendor == ustore_gpu_vendor_amd_k     ? kDLROCM
-                                     : description.vendor == ustore_gpu_vendor_apple_k ? kDLMetal
-                                                                                       : kDLCUDA;
-    return dlpack_device_pair(device_type, (unsigned long)description.vendor_ordinal);
+/** The DLPack @c stream a consumer running on @p executor passes: the native handle of its first
+ *  stream, so a producer still writing is ordered before the call reads, or None without one. */
+static PyObject* executor_stream_object(ustore_executor_t executor) {
+    if (!executor) return Py_NewRef(Py_None);
+    void* stream = NULL;
+    ustore_outcome_t outcome = {0};
+    ustore_executor_stream_t named = {.executor = executor, .position = 0, .outcome = &outcome, .stream = &stream};
+    ustore_executor_stream(&named);
+    if (outcome.status == ustore_status_unsupported_k || (outcome.status == ustore_status_success_k && !stream))
+        return Py_NewRef(Py_None);
+    if (ustore_py_raise_on_outcome(&outcome) != 0) return NULL;
+    return PyLong_FromVoidPtr(stream);
+}
+
+int ustore_py_executor_follow_and_drain(ustore_executor_t executor, void* event, void* stream) {
+    if (!executor)
+        return ustore_py_raise(ustore_status_unsupported_k, "Data still being produced needs a GPU executor to wait");
+    ustore_outcome_t outcome = {0};
+    ustore_executor_follow_t follow = {.executor = executor,
+                                       .position = 0,
+                                       .event = event,
+                                       .stream = stream,
+                                       .outcome = &outcome};
+    ustore_executor_drain_t drain = {.executor = executor, .outcome = &outcome, .mood = ustore_mood_parked_k};
+    Py_BEGIN_ALLOW_THREADS;
+    ustore_executor_follow(&follow);
+    if (outcome.status == ustore_status_success_k) ustore_executor_drain(&drain);
+    Py_END_ALLOW_THREADS;
+    return ustore_py_raise_on_outcome(&outcome);
+}
+
+/** Calls @p exporter with @p stream for a versioned capsule when @p versioned, or NULL raising. */
+static PyObject* dlpack_call(PyObject* exporter, PyObject* stream, int versioned) {
+    PyObject* const max_version = versioned ? integers_pair(DLPACK_MAJOR_VERSION, DLPACK_MINOR_VERSION) : NULL;
+    PyObject* const stream_name = PyUnicode_InternFromString("stream");
+    PyObject* const version_name = versioned ? PyUnicode_InternFromString("max_version") : NULL;
+    PyObject* const names = !stream_name ? NULL
+                            : versioned  ? (version_name ? PyTuple_Pack(2, stream_name, version_name) : NULL)
+                                         : PyTuple_Pack(1, stream_name);
+    PyObject* const values[2] = {stream, max_version};
+    PyObject* const capsule = names && (max_version || !versioned) ? PyObject_Vectorcall(exporter, values, 0, names)
+                                                                   : NULL;
+    Py_XDECREF(names);
+    Py_XDECREF(version_name);
+    Py_XDECREF(stream_name);
+    Py_XDECREF(max_version);
+    return capsule;
 }
 
 /**
- *  @brief Takes the DLPack tensor @p object exports, when it exports one from host, CUDA, ROCm or
- *      CUDA managed memory.
- *  @param[out] tensor The tensor, alive until @c dlpack_import_release is handed the answer.
- *  @return The renamed capsule owning the tensor, or NULL and no exception for an object without
- *      a DLPack export of its own.
+ *  @brief Takes the DLPack tensor @p object exports, asking for a versioned capsule first and a
+ *      legacy one from an exporter older than DLPack 1.0, from any device of the table
+ *      @c ustore_py_dlpack_device derives.
+ *  @param[out] tensor The tensor, alive until the answer is dropped.
+ *  @return The renamed capsule owning the tensor; NULL and no exception for an object without a
+ *      DLPack export or one refusing this layout, which leaves the batch to the next route; NULL
+ *      raising when the export fails otherwise.
  */
-static PyObject* dlpack_import(PyObject* object, DLTensor const** tensor) {
+static PyObject* dlpack_import(PyObject* object, ustore_executor_t executor, DLTensor const** tensor) {
     PyObject* const exporter = PyObject_GetAttrString(object, "__dlpack__");
-    PyObject* const stream = exporter ? PyUnicode_InternFromString("stream") : NULL;
-    PyObject* const names = stream ? PyTuple_Pack(1, stream) : NULL;
-    Py_XDECREF(stream);
-    PyObject* const capsule = names ? PyObject_Vectorcall(exporter, (PyObject* const[]) {Py_None}, 0, names) : NULL;
-    Py_XDECREF(names);
-    Py_XDECREF(exporter);
-    // NumPy refuses to export 16-byte items, which leaves the batch to the buffer protocol.
-    DLManagedTensor* const managed = capsule && PyCapsule_IsValid(capsule, "dltensor")
-                                         ? (DLManagedTensor*)PyCapsule_GetPointer(capsule, "dltensor")
-                                         : NULL;
-    if (!managed || PyCapsule_SetName(capsule, "used_dltensor") != 0) {
-        Py_XDECREF(capsule);
+    if (!exporter) {
+        if (!PyErr_ExceptionMatches(PyExc_AttributeError)) return NULL;
         PyErr_Clear();
         return NULL;
     }
-    switch (managed->dl_tensor.device.device_type) {
+    PyObject* const stream = executor_stream_object(executor);
+    if (!stream) {
+        Py_DECREF(exporter);
+        return NULL;
+    }
+    PyObject* capsule = dlpack_call(exporter, stream, 1);
+    // An exporter older than DLPack 1.0 knows no `max_version`, and says so with a plain TypeError.
+    PyObject* const refusal = capsule ? NULL : PyErr_GetRaisedException();
+    if (refusal && Py_IS_TYPE(refusal, (PyTypeObject*)PyExc_TypeError)) {
+        Py_DECREF(refusal);
+        capsule = dlpack_call(exporter, stream, 0);
+    }
+    else if (refusal) PyErr_SetRaisedException(refusal);
+    Py_DECREF(stream);
+    Py_DECREF(exporter);
+    // NumPy refuses 16-byte items and PyArrow fixed-size binary, which leaves the next route.
+    if (!capsule) {
+        if (PyErr_ExceptionMatches(PyExc_BufferError) || PyErr_ExceptionMatches(PyExc_TypeError)) PyErr_Clear();
+        return NULL;
+    }
+    int const versioned = PyCapsule_IsValid(capsule, "dltensor_versioned");
+    if (!versioned && !PyCapsule_IsValid(capsule, "dltensor")) {
+        Py_DECREF(capsule);
+        PyErr_SetString(PyExc_TypeError, "__dlpack__ must answer a capsule named 'dltensor' or 'dltensor_versioned'");
+        return NULL;
+    }
+    void* const managed = PyCapsule_GetPointer(capsule, versioned ? "dltensor_versioned" : "dltensor");
+    // Renamed, the capsule is ours, and dropping it deletes the tensor.
+    if (PyCapsule_SetName(capsule, versioned ? "used_dltensor_versioned" : "used_dltensor") != 0 ||
+        PyCapsule_SetDestructor(capsule, dlpack_import_free) != 0) {
+        Py_DECREF(capsule);
+        return NULL;
+    }
+    DLPackVersion const version = versioned ? ((DLManagedTensorVersioned*)managed)->version
+                                            : (DLPackVersion) {DLPACK_MAJOR_VERSION, 0};
+    if (version.major != DLPACK_MAJOR_VERSION) {
+        Py_DECREF(capsule);
+        PyErr_Format(PyExc_BufferError, "A DLPack %u.%u tensor has a major version this build cannot read",
+                     (unsigned)version.major, (unsigned)version.minor);
+        return NULL;
+    }
+    // Every import only reads the tensor, so a read-only one passes as it is.
+    DLTensor const* const found = versioned ? &((DLManagedTensorVersioned*)managed)->dl_tensor
+                                            : &((DLManagedTensor*)managed)->dl_tensor;
+    switch (found->device.device_type) {
     case kDLCPU:
     case kDLCUDA:
+    case kDLCUDAHost:
+    case kDLCUDAManaged:
     case kDLROCM:
-    case kDLCUDAManaged: *tensor = &managed->dl_tensor; return capsule;
+    case kDLROCMHost: *tensor = found; return capsule;
+    case kDLMetal:
+        ustore_py_raise(ustore_status_unsupported_k, "Metal exchange through DLPack is not supported yet");
+        break;
+    default:
+        ustore_py_raise(ustore_status_device_k, "A DLPack tensor on device type %d is none UStore reads",
+                        (int)found->device.device_type);
+        break;
     }
-    managed->deleter(managed);
     Py_DECREF(capsule);
     return NULL;
 }
 
-/** Deletes the tensor of a capsule @c dlpack_import answered, and drops the capsule. */
-static void dlpack_import_release(PyObject* capsule) {
-    DLManagedTensor* const managed = (DLManagedTensor*)PyCapsule_GetPointer(capsule, "used_dltensor");
-    if (managed->deleter) managed->deleter(managed);
-    Py_DECREF(capsule);
+/** Whether the host may read memory on @p device in place. */
+static int dlpack_host_readable(DLDevice device) {
+    return device.device_type == kDLCPU || device.device_type == kDLCUDAHost || device.device_type == kDLROCMHost ||
+           device.device_type == kDLCUDAManaged;
 }
 
 #pragma endregion DLPack
@@ -765,30 +1013,189 @@ typedef enum keys_route_t {
 
 /** Tries the DLPack routes: packed 16-byte keys are viewed wherever they live, as the library
  *  classifies the address, and packed 64-bit integers convert where the host reads them. */
-static keys_route_t keys_from_dlpack(PyObject* object, ustore_py_keys_t* batch) {
+static keys_route_t keys_from_dlpack(PyObject* object, ustore_executor_t executor, ustore_py_keys_t* batch) {
     DLTensor const* tensor = NULL;
-    PyObject* const capsule = dlpack_import(object, &tensor);
-    if (!capsule) return keys_route_sequence_k;
+    PyObject* const capsule = dlpack_import(object, executor, &tensor);
+    if (!capsule) return PyErr_Occurred() ? keys_route_failed_k : keys_route_sequence_k;
     int64_t const rows = tensor->ndim >= 1 ? tensor->shape[0] : 0;
     int64_t const* const strides = tensor->strides;
     int const integral = (tensor->dtype.code == kDLInt || tensor->dtype.code == kDLUInt) && tensor->dtype.lanes == 1;
     char const* const data = (char const*)tensor->data + tensor->byte_offset;
     if (integral && tensor->dtype.bits == 8 && tensor->ndim == 2 && tensor->shape[1] == (int64_t)sizeof(ustore_key_t) &&
         (!strides || (strides[1] == 1 && (strides[0] == (int64_t)sizeof(ustore_key_t) || rows <= 1)))) {
-        batch->dlpack = capsule;
+        batch->held = capsule;
         batch->count = (size_t)rows;
         batch->keys = rows ? (ustore_key_t*)data : NULL;
         return keys_route_viewed_k;
     }
-    int const readable = tensor->device.device_type == kDLCPU || tensor->device.device_type == kDLCUDAManaged;
-    if (!readable || !integral || tensor->dtype.bits != 64 || tensor->ndim != 1 ||
+    if (!dlpack_host_readable(tensor->device) || !integral || tensor->dtype.bits != 64 || tensor->ndim != 1 ||
         (strides && strides[0] != 1 && rows > 1)) {
-        dlpack_import_release(capsule);
+        Py_DECREF(capsule);
         return keys_route_sequence_k;
     }
     int const converted = keys_from_integers(data, (size_t)rows, tensor->dtype.code == kDLInt, batch);
-    dlpack_import_release(capsule);
+    Py_DECREF(capsule);
     return converted == 0 ? keys_route_converted_k : keys_route_failed_k;
+}
+
+/** The one Arrow array an object exports, with its device and the capsules owning it. */
+typedef struct arrow_import_t {
+    struct ArrowSchema const* schema;
+    struct ArrowArray const* array;
+    DLDevice device;
+    PyObject* capsules;
+} arrow_import_t;
+
+/**
+ *  @brief Takes the one Arrow array @p object exports, through @c __arrow_c_device_array__ first
+ *      and @c __arrow_c_array__ otherwise, from any device @c ustore_py_dlpack_device derives.
+ *      A device array still producing on its sync event is waited for through @p executor.
+ *  @return 1 with @p imported filled, its capsules owned by the caller; 0 when @p object exports
+ *      neither; -1 raising when the export fails or its producer cannot be waited for.
+ */
+static int arrow_import(PyObject* object, ustore_executor_t executor, arrow_import_t* imported) {
+    static char const* const methods[2] = {"__arrow_c_device_array__", "__arrow_c_array__"};
+    for (int host = 0; host != 2; ++host) {
+        PyObject* const exporter = PyObject_GetAttrString(object, methods[host]);
+        if (!exporter) {
+            if (!PyErr_ExceptionMatches(PyExc_AttributeError)) return -1;
+            PyErr_Clear();
+            continue;
+        }
+        PyObject* const capsules = PyObject_CallNoArgs(exporter);
+        Py_DECREF(exporter);
+        if (!capsules) return -1;
+        char const* const name = host ? "arrow_array" : "arrow_device_array";
+        int const paired = PyTuple_Check(capsules) && PyTuple_GET_SIZE(capsules) == 2 &&
+                           PyCapsule_IsValid(PyTuple_GET_ITEM(capsules, 0), "arrow_schema") &&
+                           PyCapsule_IsValid(PyTuple_GET_ITEM(capsules, 1), name);
+        if (!paired) {
+            Py_DECREF(capsules);
+            PyErr_Format(PyExc_TypeError, "%s must answer an 'arrow_schema' capsule and an '%s' capsule", methods[host],
+                         name);
+            return -1;
+        }
+        imported->schema = PyCapsule_GetPointer(PyTuple_GET_ITEM(capsules, 0), "arrow_schema");
+        void* const pointer = PyCapsule_GetPointer(PyTuple_GET_ITEM(capsules, 1), name);
+        imported->capsules = capsules;
+        if (host) {
+            imported->array = (struct ArrowArray const*)pointer;
+            imported->device = (DLDevice) {kDLCPU, 0};
+            return 1;
+        }
+        struct ArrowDeviceArray const* const device_array = (struct ArrowDeviceArray const*)pointer;
+        imported->array = &device_array->array;
+        imported->device = (DLDevice) {(DLDeviceType)device_array->device_type, (int32_t)device_array->device_id};
+        int failed = 0;
+        switch (imported->device.device_type) {
+        case kDLCPU: imported->device.device_id = 0; break;
+        case kDLCUDA:
+        case kDLCUDAHost:
+        case kDLCUDAManaged:
+        case kDLROCM:
+        case kDLROCMHost: break;
+        case kDLMetal:
+            failed = ustore_py_raise(ustore_status_unsupported_k, "Metal exchange through Arrow is not supported yet");
+            break;
+        default:
+            failed = ustore_py_raise(ustore_status_device_k, "An Arrow array on device type %d is none UStore reads",
+                                     (int)imported->device.device_type);
+            break;
+        }
+        if (!failed && device_array->sync_event)
+            failed = ustore_py_executor_follow_and_drain(executor, device_array->sync_event, NULL);
+        if (!failed) return 1;
+        Py_DECREF(capsules);
+        return -1;
+    }
+    return 0;
+}
+
+/** Whether the Arrow @p array holds a null, which only a validity bitmap with a zero bit spells. */
+static int arrow_holds_null(struct ArrowArray const* array) {
+    uint8_t const* const validities = array->n_buffers ? (uint8_t const*)array->buffers[0] : NULL;
+    if (!validities || array->null_count == 0) return 0;
+    for (int64_t index = array->offset; index != array->offset + array->length; ++index)
+        if (!((validities[index / 8] >> (index % 8)) & 1)) return 1;
+    return 0;
+}
+
+/** Tries the Arrow routes: <tt>fixed_size_binary(16)</tt> keys are viewed where they live, as the
+ *  library classifies their address, and 64-bit integers convert where the host reads them. */
+static keys_route_t keys_from_arrow(PyObject* object, ustore_executor_t executor, ustore_py_keys_t* batch) {
+    arrow_import_t imported = {0};
+    int const found = arrow_import(object, executor, &imported);
+    if (found <= 0) return found ? keys_route_failed_k : keys_route_sequence_k;
+    struct ArrowArray const* const array = imported.array;
+    char const* const format = imported.schema->format;
+    int const records = strcmp(format, "w:16") == 0;
+    int const integers = strcmp(format, "l") == 0 || strcmp(format, "L") == 0;
+    keys_route_t route = keys_route_sequence_k;
+    if ((!records && !integers) || array->n_buffers != 2) route = keys_route_sequence_k;
+    else if (dlpack_host_readable(imported.device) && arrow_holds_null(array)) {
+        ustore_py_raise(ustore_status_invalid_argument_k, "An Arrow array of keys holds a null");
+        route = keys_route_failed_k;
+    }
+    else if (records) {
+        batch->count = (size_t)array->length;
+        batch->keys = array->length ? (ustore_key_t*)array->buffers[1] + array->offset : NULL;
+        batch->held = Py_NewRef(imported.capsules);
+        route = keys_route_viewed_k;
+    }
+    else if (dlpack_host_readable(imported.device))
+        route = keys_from_integers((int64_t const*)array->buffers[1] + array->offset, (size_t)array->length,
+                                   format[0] == 'l', batch) == 0
+                    ? keys_route_converted_k
+                    : keys_route_failed_k;
+    Py_DECREF(imported.capsules);
+    return route;
+}
+
+/** Tries the CUDA Array Interface, viewing packed 16-byte keys wherever they live, as the library
+ *  classifies the address: <tt>(keys, 16)</tt> bytes or <tt>(keys,)</tt> 16-byte records. */
+static keys_route_t keys_from_cuda_array_interface(PyObject* object, ustore_executor_t executor,
+                                                   ustore_py_keys_t* batch) {
+    PyObject* const described = PyObject_GetAttrString(object, "__cuda_array_interface__");
+    if (!described) {
+        if (!PyErr_ExceptionMatches(PyExc_AttributeError)) return keys_route_failed_k;
+        PyErr_Clear();
+        return keys_route_sequence_k;
+    }
+    PyObject* const data = PyDict_Check(described) ? PyDict_GetItemString(described, "data") : NULL;
+    PyObject* const shape = PyDict_Check(described) ? PyDict_GetItemString(described, "shape") : NULL;
+    PyObject* const typestr = PyDict_Check(described) ? PyDict_GetItemString(described, "typestr") : NULL;
+    PyObject* const strides = PyDict_Check(described) ? PyDict_GetItemString(described, "strides") : NULL;
+    PyObject* const stream = PyDict_Check(described) ? PyDict_GetItemString(described, "stream") : NULL;
+    keys_route_t route = keys_route_sequence_k;
+    if (!data || !shape || !typestr || !PyTuple_Check(data) || PyTuple_GET_SIZE(data) != 2 || !PyTuple_Check(shape) ||
+        !PyUnicode_Check(typestr)) {
+        PyErr_SetString(PyExc_TypeError, "__cuda_array_interface__ must hold data, shape and typestr");
+        route = keys_route_failed_k;
+    }
+    else if (stream && stream != Py_None &&
+             (!PyLong_Check(stream) ||
+              ustore_py_executor_follow_and_drain(executor, NULL, PyLong_AsVoidPtr(stream)) != 0)) {
+        if (!PyErr_Occurred()) PyErr_SetString(PyExc_TypeError, "A CUDA Array Interface stream is an integer");
+        route = keys_route_failed_k;
+    }
+    else {
+        Py_ssize_t const dimensions = PyTuple_GET_SIZE(shape);
+        long long const rows = dimensions ? PyLong_AsLongLong(PyTuple_GET_ITEM(shape, 0)) : 0;
+        long long const width = dimensions == 2 ? PyLong_AsLongLong(PyTuple_GET_ITEM(shape, 1)) : 0;
+        int const bytes = dimensions == 2 && width == (long long)sizeof(ustore_key_t) &&
+                          PyUnicode_CompareWithASCIIString(typestr, "|u1") == 0;
+        int const records = dimensions == 1 && PyUnicode_CompareWithASCIIString(typestr, "|V16") == 0;
+        void* const address = PyLong_AsVoidPtr(PyTuple_GET_ITEM(data, 0));
+        if (PyErr_Occurred()) route = keys_route_failed_k;
+        else if ((bytes || records) && (!strides || strides == Py_None)) {
+            batch->count = (size_t)rows;
+            batch->keys = rows ? (ustore_key_t*)address : NULL;
+            batch->held = Py_NewRef(object);
+            route = keys_route_viewed_k;
+        }
+    }
+    Py_DECREF(described);
+    return route;
 }
 
 /**
@@ -824,7 +1231,7 @@ static keys_route_t keys_from_buffer(PyObject* object, ustore_py_keys_t* batch) 
     return keys_route_sequence_k;
 }
 
-int ustore_py_keys_from_object(PyObject* object, ustore_py_keys_t* batch) {
+int ustore_py_keys_from_object(PyObject* object, ustore_executor_t executor, ustore_py_keys_t* batch) {
     memset(batch, 0, sizeof(*batch));
     // Text and bytes are sequences too, and iterating one would answer a key per character
     if (ustore_py_is_one_key(object)) {
@@ -832,7 +1239,10 @@ int ustore_py_keys_from_object(PyObject* object, ustore_py_keys_t* batch) {
         return -1;
     }
 
-    keys_route_t route = keys_from_dlpack(object, batch);
+    // DLPack, Arrow, the CUDA Array Interface, then the buffer protocol, as USearch and UForm.
+    keys_route_t route = keys_from_dlpack(object, executor, batch);
+    if (route == keys_route_sequence_k) route = keys_from_arrow(object, executor, batch);
+    if (route == keys_route_sequence_k) route = keys_from_cuda_array_interface(object, executor, batch);
     if (route == keys_route_sequence_k) route = keys_from_buffer(object, batch);
     switch (route) {
     case keys_route_viewed_k:
@@ -859,8 +1269,8 @@ int ustore_py_keys_from_object(PyObject* object, ustore_py_keys_t* batch) {
     return 0;
 }
 
-int ustore_py_keys_from_subscript(PyObject* object, ustore_py_keys_t* batch) {
-    if (!ustore_py_is_one_key(object)) return ustore_py_keys_from_object(object, batch) == 0 ? 0 : -1;
+int ustore_py_keys_from_subscript(PyObject* object, ustore_executor_t executor, ustore_py_keys_t* batch) {
+    if (!ustore_py_is_one_key(object)) return ustore_py_keys_from_object(object, executor, batch) == 0 ? 0 : -1;
     memset(batch, 0, sizeof(*batch));
     if (ustore_py_key_from_object(object, &batch->inline_keys[0]) != 0) return -1;
     batch->keys = batch->inline_keys;
@@ -870,10 +1280,9 @@ int ustore_py_keys_from_subscript(PyObject* object, ustore_py_keys_t* batch) {
 
 void ustore_py_keys_release(ustore_py_keys_t* batch) {
     if (batch->viewed) PyBuffer_Release(&batch->buffer);
-    if (batch->dlpack) dlpack_import_release(batch->dlpack);
+    Py_CLEAR(batch->held);
     if (batch->owned) PyMem_Free(batch->owned);
     batch->viewed = 0;
-    batch->dlpack = NULL;
     batch->owned = NULL;
     batch->keys = NULL;
     batch->count = 0;
@@ -1024,40 +1433,19 @@ static int contents_from_pair(PyObject* object, ustore_py_contents_t* batch) {
     return 1;
 }
 
-/** Whether an Arrow array holds a null, which its validity bitmap marks with an unset bit. */
-static int arrow_holds_null(struct ArrowArray const* array) {
-    uint8_t const* const validities = (uint8_t const*)array->buffers[0];
-    if (!validities || array->null_count == 0) return 0;
-    for (int64_t index = array->offset; index != array->offset + array->length; ++index)
-        if (!((validities[index / 8] >> (index % 8)) & 1)) return 1;
-    return 0;
-}
-
 /** Reads an Arrow array of binary or text as a tape: 1 for one, 0 when @p object exports none, -1 failing. */
-static int contents_from_arrow(PyObject* object, ustore_py_contents_t* batch) {
-    PyObject* const exporter = PyObject_GetAttrString(object, "__arrow_c_array__");
-    if (!exporter) {
-        if (!PyErr_ExceptionMatches(PyExc_AttributeError)) return -1;
-        PyErr_Clear();
-        return 0;
-    }
-    PyObject* const capsules = PyObject_CallNoArgs(exporter);
-    Py_DECREF(exporter);
-    if (!capsules) return -1;
-    struct ArrowSchema const* schema = NULL;
-    struct ArrowArray const* array = NULL;
-    if (PyTuple_Check(capsules) && PyTuple_GET_SIZE(capsules) == 2) {
-        schema = PyCapsule_GetPointer(PyTuple_GET_ITEM(capsules, 0), "arrow_schema");
-        array = schema ? PyCapsule_GetPointer(PyTuple_GET_ITEM(capsules, 1), "arrow_array") : NULL;
-    }
-    char const* const format = array ? schema->format : "";
+static int contents_from_arrow(PyObject* object, ustore_executor_t executor, ustore_py_contents_t* batch) {
+    arrow_import_t imported = {0};
+    int const found = arrow_import(object, executor, &imported);
+    if (found <= 0) return found;
+    struct ArrowArray const* const array = imported.array;
+    char const* const format = imported.schema->format;
     int const narrow = strcmp(format, "z") == 0 || strcmp(format, "u") == 0;
     int const wide = strcmp(format, "Z") == 0 || strcmp(format, "U") == 0;
     int read = -1;
-    if (!array) {
-        if (!PyErr_Occurred())
-            PyErr_SetString(PyExc_TypeError, "__arrow_c_array__ must answer a schema capsule and an array capsule");
-    }
+    if (!dlpack_host_readable(imported.device))
+        ustore_py_raise(ustore_status_device_k, "An Arrow array of values on device type %d is none the host reads",
+                        (int)imported.device.device_type);
     else if (!narrow && !wide)
         PyErr_Format(PyExc_TypeError,
                      "An Arrow array of values is binary, large_binary, string or large_string, not of format '%s'",
@@ -1069,8 +1457,8 @@ static int contents_from_arrow(PyObject* object, ustore_py_contents_t* batch) {
         ustore_py_raise(ustore_status_invalid_argument_k,
                         "An Arrow array of values holds a null; remove() removes keys");
     else {
-        // The capsule releases the array's buffers once it dies, so holding it keeps the tape readable.
-        batch->held = Py_NewRef(PyTuple_GET_ITEM(capsules, 1));
+        // The capsules free the array's buffers once they die, so holding them keeps it readable.
+        batch->held = Py_NewRef(imported.capsules);
         batch->count = (size_t)array->length;
         uint8_t const* const data = (uint8_t const*)array->buffers[2];
         if (narrow) {
@@ -1085,11 +1473,11 @@ static int contents_from_arrow(PyObject* object, ustore_py_contents_t* batch) {
         }
         read = 1;
     }
-    Py_DECREF(capsules);
+    Py_DECREF(imported.capsules);
     return read;
 }
 
-int ustore_py_contents_from_tape(PyObject* object, ustore_py_contents_t* batch) {
+int ustore_py_contents_from_tape(PyObject* object, ustore_executor_t executor, ustore_py_contents_t* batch) {
     // The common batches are builtins no Arrow exporter derives from, so they skip the lookup of its method.
     if (PyList_CheckExact(object) || PyBytes_CheckExact(object) || PyByteArray_CheckExact(object) ||
         PyUnicode_CheckExact(object) || PyDict_CheckExact(object))
@@ -1098,7 +1486,7 @@ int ustore_py_contents_from_tape(PyObject* object, ustore_py_contents_t* batch) 
     batch->views = batch->inline_views;
     batch->buffers = batch->inline_buffers;
     int const read = PyTuple_CheckExact(object) ? contents_from_pair(object, batch)
-                                                : contents_from_arrow(object, batch);
+                                                : contents_from_arrow(object, executor, batch);
     if (read < 0) ustore_py_contents_release(batch);
     return read;
 }
@@ -1135,7 +1523,7 @@ static int text_view(PyObject* object, ustore_py_text_serializer_t serializer, v
 int ustore_py_texts_from_object(PyObject* object, char const* argument, ustore_py_text_serializer_t serializer,
                                 void* state, ustore_py_texts_t* texts) {
     memset(texts, 0, sizeof(*texts));
-    int const tape = ustore_py_contents_from_tape(object, &texts->contents);
+    int const tape = ustore_py_contents_from_tape(object, NULL, &texts->contents);
     if (tape != 0) return tape < 0 ? -1 : 0;
 
     int const one = PyUnicode_Check(object) || PyObject_CheckBuffer(object) || PyDict_Check(object);
@@ -1225,13 +1613,9 @@ static int Span_getbuffer(Span* self, Py_buffer* view, int flags) {
                                  self->shape, self->strides, flags);
 }
 
-static PyObject* Span_dlpack_device(Span* self, PyObject* Py_UNUSED(unused)) {
-    return ustore_py_dlpack_device(self->arena);
-}
-
 static PyMethodDef Span_methods[] = {
     {"__dlpack__", (PyCFunction)(void (*)(void))ustore_py_dlpack, ustore_py_method_flags_k, ustore_py_dlpack_doc},
-    {"__dlpack_device__", (PyCFunction)Span_dlpack_device, METH_NOARGS, ustore_py_dlpack_device_doc},
+    {"__dlpack_device__", ustore_py_dlpack_device_answer, METH_NOARGS, ustore_py_dlpack_device_doc},
     {NULL, NULL, 0, NULL},
 };
 
@@ -1358,6 +1742,7 @@ static void values_schema_release(struct ArrowSchema* schema) { schema->release 
 static void values_array_release(struct ArrowArray* array) {
     values_export_t* const exported = (values_export_t*)array->private_data;
     PyGILState_STATE const state = PyGILState_Ensure();
+    view_export_close((PyObject*)exported->owner);
     Py_DECREF(exported->owner);
     PyGILState_Release(state);
     PyMem_RawFree(exported);
@@ -1407,6 +1792,12 @@ static PyObject* Values_arrow_c_array(Values* self, PyObject* const* Py_UNUSED(a
         PyErr_NoMemory();
         return NULL;
     }
+    if (view_export_open((PyObject*)self) != 0) {
+        PyMem_RawFree(exported);
+        PyMem_RawFree(array);
+        PyMem_RawFree(schema);
+        return NULL;
+    }
 
     int const narrow = self->tape.layout == ustore_strings_u32_tape_k;
     void const* const offsets = narrow ? (void const*)self->tape.data.u32_tape.offsets
@@ -1448,20 +1839,20 @@ static PyObject* Values_arrow_c_array(Values* self, PyObject* const* Py_UNUSED(a
     return capsules;
 }
 
-static PyObject* Values_dlpack_device(Values* self, PyObject* Py_UNUSED(unused)) {
-    return ustore_py_dlpack_device(self->arena);
-}
-
 static PyMethodDef Values_methods[] = {
     {"__arrow_c_array__", (PyCFunction)(void (*)(void))Values_arrow_c_array, ustore_py_method_flags_k,
      doc_Values_arrow_c_array},
+    {"__arrow_c_device_array__", (PyCFunction)(void (*)(void))ustore_py_arrow_c_device_array, ustore_py_method_flags_k,
+     ustore_py_arrow_c_device_array_doc},
     {"__dlpack__", (PyCFunction)(void (*)(void))ustore_py_dlpack, ustore_py_method_flags_k, ustore_py_dlpack_doc},
-    {"__dlpack_device__", (PyCFunction)Values_dlpack_device, METH_NOARGS, ustore_py_dlpack_device_doc},
+    {"__dlpack_device__", ustore_py_dlpack_device_answer, METH_NOARGS, ustore_py_dlpack_device_doc},
     {NULL, NULL, 0, NULL},
 };
 
 static PyGetSetDef Values_getset[] = {
     {"lengths", (getter)Values_get_lengths, NULL, doc_Values_lengths, NULL},
+    {"__cuda_array_interface__", (getter)ustore_py_cuda_array_interface, NULL, ustore_py_cuda_array_interface_doc,
+     NULL},
     {NULL, NULL, NULL, NULL, NULL},
 };
 
@@ -1576,19 +1967,21 @@ static PyObject* Keys_get_scores(Keys* self, void* Py_UNUSED(closure)) {
     return scores;
 }
 
-static PyObject* Keys_dlpack_device(Keys* self, PyObject* Py_UNUSED(unused)) {
-    return ustore_py_dlpack_device(self->arena);
-}
-
 static PyMethodDef Keys_methods[] = {
+    {"__arrow_c_array__", (PyCFunction)(void (*)(void))ustore_py_arrow_c_array, ustore_py_method_flags_k,
+     ustore_py_arrow_c_array_doc},
+    {"__arrow_c_device_array__", (PyCFunction)(void (*)(void))ustore_py_arrow_c_device_array, ustore_py_method_flags_k,
+     ustore_py_arrow_c_device_array_doc},
     {"__dlpack__", (PyCFunction)(void (*)(void))ustore_py_dlpack, ustore_py_method_flags_k, ustore_py_dlpack_doc},
-    {"__dlpack_device__", (PyCFunction)Keys_dlpack_device, METH_NOARGS, ustore_py_dlpack_device_doc},
+    {"__dlpack_device__", ustore_py_dlpack_device_answer, METH_NOARGS, ustore_py_dlpack_device_doc},
     {NULL, NULL, 0, NULL},
 };
 
 static PyGetSetDef Keys_getset[] = {
     {"counts", (getter)Keys_get_counts, NULL, doc_Keys_counts, NULL},
     {"scores", (getter)Keys_get_scores, NULL, doc_Keys_scores, NULL},
+    {"__cuda_array_interface__", (getter)ustore_py_cuda_array_interface, NULL, ustore_py_cuda_array_interface_doc,
+     NULL},
     {NULL, NULL, NULL, NULL, NULL},
 };
 
@@ -1617,6 +2010,207 @@ PyTypeObject KeysType = {
 };
 
 #pragma endregion Key Tapes
+
+#pragma region Interchange Exports
+
+/** What one Arrow array over the buffer of an output view keeps until Arrow releases it. */
+typedef struct buffer_export_t {
+
+    /** The buffer the view answered, holding the view and its arena. */
+    Py_buffer view;
+
+    /** No validity, then the bytes of every row. */
+    void const* buffers[2];
+} buffer_export_t;
+
+/** Frees the <tt>fixed_size_binary</tt> format the schema spells. */
+static void buffer_schema_release(struct ArrowSchema* schema) {
+    PyMem_RawFree(schema->private_data);
+    schema->release = NULL;
+}
+
+/** Releases the buffer, taking the interpreter, as a consumer may release from any thread. */
+static void buffer_array_release(struct ArrowArray* array) {
+    buffer_export_t* const exported = (buffer_export_t*)array->private_data;
+    PyGILState_STATE const state = PyGILState_Ensure();
+    view_export_close(exported->view.obj);
+    PyBuffer_Release(&exported->view);
+    PyGILState_Release(state);
+    PyMem_RawFree(exported);
+    array->release = NULL;
+}
+
+/** The capsules @c __arrow_c_array__ answers over @p schema and @p array, or NULL raising. */
+static PyObject* arrow_capsules(struct ArrowSchema* schema, struct ArrowArray* array) {
+    PyObject* const schema_capsule = PyCapsule_New(schema, "arrow_schema", values_schema_capsule_free);
+    PyObject* const array_capsule = schema_capsule ? PyCapsule_New(array, "arrow_array", values_array_capsule_free)
+                                                   : NULL;
+    if (!schema_capsule) {
+        schema->release(schema);
+        PyMem_RawFree(schema);
+    }
+    if (!array_capsule) {
+        array->release(array);
+        PyMem_RawFree(array);
+    }
+    PyObject* const capsules = array_capsule ? PyTuple_Pack(2, schema_capsule, array_capsule) : NULL;
+    Py_XDECREF(schema_capsule);
+    Py_XDECREF(array_capsule);
+    return capsules;
+}
+
+/** 0 when an Arrow export got at most the ignored @c requested_schema, or -1 raising. */
+static int arrow_export_arguments(char const* method, Py_ssize_t positional_arguments_count,
+                                  PyObject* keyword_names_tuple) {
+    Py_ssize_t const keyword_names_count = keyword_names_tuple ? PyTuple_GET_SIZE(keyword_names_tuple) : 0;
+    int const named = keyword_names_count == 1 &&
+                      PyUnicode_CompareWithASCIIString(PyTuple_GET_ITEM(keyword_names_tuple, 0), "requested_schema") ==
+                          0;
+    if (positional_arguments_count + keyword_names_count <= 1 && (!keyword_names_count || named)) return 0;
+    PyErr_Format(PyExc_TypeError, "%s() takes at most the 'requested_schema' argument", method);
+    return -1;
+}
+
+char const ustore_py_arrow_c_array_doc[] =                                                   //
+    "__arrow_c_array__(requested_schema=None) answers the schema and array PyCapsules.\n"    //
+    "\n"                                                                                     //
+    "Exports every row of the buffer as one Arrow `fixed_size_binary` item: 16 bytes per\n"  //
+    "key, or 48 per edge of three keys. The array reads the arena in place and keeps this\n" //
+    "object and its arena alive until Arrow releases it. A requested schema is ignored.";
+
+PyObject* ustore_py_arrow_c_array(PyObject* self, PyObject* const* Py_UNUSED(arguments),
+                                  Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
+    if (arrow_export_arguments("__arrow_c_array__", positional_arguments_count, keyword_names_tuple) != 0) return NULL;
+    struct ArrowSchema* const schema = (struct ArrowSchema*)PyMem_RawCalloc(1, sizeof(struct ArrowSchema));
+    struct ArrowArray* const array = (struct ArrowArray*)PyMem_RawCalloc(1, sizeof(struct ArrowArray));
+    buffer_export_t* const exported = (buffer_export_t*)PyMem_RawCalloc(1, sizeof(buffer_export_t));
+    char* const format = (char*)PyMem_RawCalloc(1, 32);
+    if (!schema || !array || !exported || !format) {
+        PyMem_RawFree(format);
+        PyMem_RawFree(exported);
+        PyMem_RawFree(array);
+        PyMem_RawFree(schema);
+        return PyErr_NoMemory();
+    }
+    int const opened = view_export_open(self) == 0;
+    if (!opened || PyObject_GetBuffer(self, &exported->view, PyBUF_C_CONTIGUOUS) != 0) {
+        if (opened) view_export_close(self);
+        PyMem_RawFree(format);
+        PyMem_RawFree(exported);
+        PyMem_RawFree(array);
+        PyMem_RawFree(schema);
+        return NULL;
+    }
+    Py_buffer const* const view = &exported->view;
+    // Every view exporting no Arrow type of its own is rows of bytes, laid out in C order.
+    Py_ssize_t const rows = view->ndim ? view->shape[0] : 0;
+    snprintf(format, 32, "w:%zd", view->ndim > 1 ? view->strides[0] : view->itemsize);
+    *schema =
+        (struct ArrowSchema) {.format = format, .name = "", .release = buffer_schema_release, .private_data = format};
+    exported->buffers[1] = view->buf;
+    *array = (struct ArrowArray) {.length = (int64_t)rows,
+                                  .null_count = 0,
+                                  .n_buffers = 2,
+                                  .buffers = exported->buffers,
+                                  .release = buffer_array_release,
+                                  .private_data = exported};
+    return arrow_capsules(schema, array);
+}
+
+/** Releases the array a device array holds, unless a consumer moved it out, and frees it. */
+static void device_array_capsule_free(PyObject* capsule) {
+    struct ArrowDeviceArray* const device_array = (struct ArrowDeviceArray*)PyCapsule_GetPointer(capsule,
+                                                                                                 "arrow_device_array");
+    if (device_array->array.release) device_array->array.release(&device_array->array);
+    PyMem_RawFree(device_array);
+}
+
+char const ustore_py_arrow_c_device_array_doc[] =                                               //
+    "__arrow_c_device_array__(requested_schema=None, **kwargs) answers the schema and device\n" //
+    "array PyCapsules.\n"                                                                       //
+    "\n"                                                                                        //
+    "Exports what `__arrow_c_array__` exports, tagged with the device `__dlpack_device__`\n"    //
+    "names: the CPU with ordinal -1 for plain host pages, and the vendor's device type and\n"   //
+    "ordinal otherwise. The call that wrote the outputs is final, so no sync event is set.";
+
+PyObject* ustore_py_arrow_c_device_array(PyObject* self, PyObject* const* Py_UNUSED(arguments),
+                                         Py_ssize_t Py_UNUSED(positional_arguments_count),
+                                         PyObject* Py_UNUSED(keyword_names_tuple)) {
+    DLDevice device;
+    if (view_device(self, &device) != 0) return NULL;
+    PyObject* const capsules = PyObject_CallMethod(self, "__arrow_c_array__", NULL);
+    if (!capsules) return NULL;
+    struct ArrowDeviceArray* const device_array = (struct ArrowDeviceArray*)PyMem_RawCalloc(
+        1, sizeof(struct ArrowDeviceArray));
+    if (!device_array) {
+        Py_DECREF(capsules);
+        return PyErr_NoMemory();
+    }
+    struct ArrowArray* const array = (struct ArrowArray*)PyCapsule_GetPointer(PyTuple_GET_ITEM(capsules, 1),
+                                                                              "arrow_array");
+    device_array->array = *array;
+    array->release = NULL;
+    device_array->device_type = (ArrowDeviceType)device.device_type;
+    device_array->device_id = device.device_type == kDLCPU ? -1 : (int64_t)device.device_id;
+    PyObject* const device_capsule = PyCapsule_New(device_array, "arrow_device_array", device_array_capsule_free);
+    if (!device_capsule) {
+        device_array->array.release(&device_array->array);
+        PyMem_RawFree(device_array);
+        Py_DECREF(capsules);
+        return NULL;
+    }
+    PyObject* const answer = PyTuple_Pack(2, PyTuple_GET_ITEM(capsules, 0), device_capsule);
+    Py_DECREF(device_capsule);
+    Py_DECREF(capsules);
+    return answer;
+}
+
+char const ustore_py_cuda_array_interface_doc[] =                                                //
+    "The CUDA Array Interface, version 3, of outputs in NVIDIA device or managed memory, with\n" //
+    "no stream, as the call that wrote them is final; any other memory has none, and reading\n"  //
+    "the attribute raises AttributeError.";
+
+PyObject* ustore_py_cuda_array_interface(PyObject* self, void* Py_UNUSED(closure)) {
+    DLDevice device;
+    if (view_device(self, &device) != 0) return NULL;
+    if (device.device_type != kDLCUDA && device.device_type != kDLCUDAManaged) {
+        PyErr_SetString(PyExc_AttributeError, "Only NVIDIA device or managed memory has __cuda_array_interface__");
+        return NULL;
+    }
+    Py_buffer view;
+    if (PyObject_GetBuffer(self, &view, PyBUF_RECORDS_RO) != 0) return NULL;
+    char const kind = view.format ? view.format[0] : 'B';
+    char const code = kind == '?' ? 'b' : strchr("efd", kind) ? 'f' : strchr("bhilqn", kind) ? 'i' : 'u';
+    char typestr[8];
+    snprintf(typestr, sizeof(typestr), "%c%c%zd", view.itemsize == 1 ? '|' : '<', code, view.itemsize);
+    PyObject* shape = PyTuple_New(view.ndim);
+    for (int dimension = 0; shape && dimension != view.ndim; ++dimension) {
+        PyObject* const items = PyLong_FromSsize_t(view.shape[dimension]);
+        if (!items) Py_CLEAR(shape);
+        else PyTuple_SET_ITEM(shape, dimension, items);
+    }
+    PyObject* const address = PyLong_FromVoidPtr(view.buf);
+    PyBuffer_Release(&view);
+    PyObject* const data = address ? PyTuple_Pack(2, address, Py_True) : NULL;
+    PyObject* const typestr_object = PyUnicode_FromString(typestr);
+    PyObject* const version = PyLong_FromLong(3);
+    PyObject* described = shape && data && typestr_object && version ? PyDict_New() : NULL;
+    if (described && (PyDict_SetItemString(described, "shape", shape) != 0 ||
+                      PyDict_SetItemString(described, "typestr", typestr_object) != 0 ||
+                      PyDict_SetItemString(described, "data", data) != 0 ||
+                      PyDict_SetItemString(described, "strides", Py_None) != 0 ||
+                      PyDict_SetItemString(described, "version", version) != 0 ||
+                      PyDict_SetItemString(described, "stream", Py_None) != 0))
+        Py_CLEAR(described);
+    Py_XDECREF(version);
+    Py_XDECREF(typestr_object);
+    Py_XDECREF(data);
+    Py_XDECREF(address);
+    Py_XDECREF(shape);
+    return described;
+}
+
+#pragma endregion Interchange Exports
 
 #pragma region Closed Sets
 
@@ -2202,9 +2796,9 @@ static void Batch_dealloc(Batch* self) {
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
 
-static PyObject* Batch_get_handler(Batch* self, void* closure) { return Py_NewRef(self->handler); }
+static PyObject* Batch_get_handler(Batch* self, void* Py_UNUSED(closure)) { return Py_NewRef(self->handler); }
 
-static PyObject* Batch_get_cost(Batch* self, void* closure) {
+static PyObject* Batch_get_cost(Batch* self, void* Py_UNUSED(closure)) {
     return ustore_py_enum_to_object(ustore_py_enum_predicate_cost_k, (int)self->cost);
 }
 

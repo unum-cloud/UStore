@@ -58,7 +58,8 @@ typedef struct spread_keys_t {
  *  @param[in] argument The argument to name in a failure.
  *  @return 0 on success, -1 with an exception set otherwise.
  */
-static int spread_keys_from_object(PyObject* object, char const* argument, tasks_t* tasks, spread_keys_t* keys) {
+static int spread_keys_from_object(PyObject* object, ustore_executor_t executor, char const* argument, tasks_t* tasks,
+                                   spread_keys_t* keys) {
     memset(keys, 0, sizeof(*keys));
     keys->spread = ustore_py_contents_broadcast_k;
     if (!object) {
@@ -66,7 +67,7 @@ static int spread_keys_from_object(PyObject* object, char const* argument, tasks
         keys->batch.count = 1;
         return 0;
     }
-    int const one = ustore_py_keys_from_subscript(object, &keys->batch);
+    int const one = ustore_py_keys_from_subscript(object, executor, &keys->batch);
     if (one < 0) return -1;
     if (!one) keys->spread = ustore_py_contents_per_task_k;
     return tasks_fold(tasks, keys->batch.count, keys->spread, argument);
@@ -352,7 +353,9 @@ static edit_call_t* edit_open(PyObject* self, char const* name, ustore_py_verb_t
     if (!call) return NULL;
     call->tasks.count = 1;
     call->kept.collection = options->collection;
-    if (spread_keys_from_object(arguments[0], "pages", &call->tasks, &call->pages) == 0) return call;
+    if (spread_keys_from_object(arguments[0], ustore_py_context_executor(context), "pages", &call->tasks,
+                                &call->pages) == 0)
+        return call;
     ustore_py_call_discard(context, verb, call);
     return NULL;
 }
@@ -453,12 +456,15 @@ PyObject* ustore_py_api_pages_insert(PyObject* self, PyObject* const* arguments,
                                         keyword_names_tuple, 2, insert_keywords, &context, &options, &keywords, &stack);
     if (!call) return NULL;
     if (spread_texts_from_object(arguments[1], "fragments", &call->tasks, &call->values) != 0 ||
-        spread_keys_from_object(keywords.elements, "elements", &call->tasks, &call->elements) != 0 ||
-        spread_keys_from_object(keywords.parents, "parents", &call->tasks, &call->parents) != 0 ||
-        spread_keys_from_object(keywords.anchors, "anchors", &call->tasks, &call->anchors) != 0)
+        spread_keys_from_object(keywords.elements, ustore_py_context_executor(&context), "elements", &call->tasks,
+                                &call->elements) != 0 ||
+        spread_keys_from_object(keywords.parents, ustore_py_context_executor(&context), "parents", &call->tasks,
+                                &call->parents) != 0 ||
+        spread_keys_from_object(keywords.anchors, ustore_py_context_executor(&context), "anchors", &call->tasks,
+                                &call->anchors) != 0)
         return ustore_py_call_discard(&context, &insert_verb, call);
     // The arena only holds the effective keys out, so it dies with the call that named it.
-    PyObject* const arena = ustore_py_arena_new(ustore_py_context_executor(&context));
+    PyObject* const arena = ustore_py_arena_new(context.executor);
     int const claimed = arena ? ustore_py_arena_from_object(arena, &call->kept.arena) : -1;
     Py_XDECREF(arena);
     if (claimed != 0) return ustore_py_call_discard(&context, &insert_verb, call);
@@ -523,8 +529,10 @@ PyObject* ustore_py_api_pages_remove(PyObject* self, PyObject* const* arguments,
         PyErr_SetString(PyExc_TypeError, "A removal of page ranges removes whole pages, so it takes no elements");
         return ustore_py_call_discard(&context, &remove_verb, call);
     }
-    if ((elements && spread_keys_from_object(elements, "elements", &call->tasks, &call->elements) != 0) ||
-        (keywords.ends && spread_keys_from_object(keywords.ends, "ends", &call->tasks, &call->ends) != 0))
+    if ((elements && spread_keys_from_object(elements, ustore_py_context_executor(&context), "elements", &call->tasks,
+                                             &call->elements) != 0) ||
+        (keywords.ends && spread_keys_from_object(keywords.ends, ustore_py_context_executor(&context), "ends",
+                                                  &call->tasks, &call->ends) != 0))
         return ustore_py_call_discard(&context, &remove_verb, call);
     // Without elements every task names its page, which removes the whole page
     ustore_keys_view_t removed_elements = spread_keys_view(elements ? &call->elements : &call->pages);
@@ -578,9 +586,12 @@ PyObject* ustore_py_api_pages_move(PyObject* self, PyObject* const* arguments, P
     edit_call_t* const call = edit_open(self, "pages_move", &move_verb, arguments, positional_arguments_count,
                                         keyword_names_tuple, 2, move_keywords, &context, &options, &keywords, &stack);
     if (!call) return NULL;
-    if (spread_keys_from_object(arguments[1], "elements", &call->tasks, &call->elements) != 0 ||
-        spread_keys_from_object(keywords.parents, "parents", &call->tasks, &call->parents) != 0 ||
-        spread_keys_from_object(keywords.anchors, "anchors", &call->tasks, &call->anchors) != 0)
+    if (spread_keys_from_object(arguments[1], ustore_py_context_executor(&context), "elements", &call->tasks,
+                                &call->elements) != 0 ||
+        spread_keys_from_object(keywords.parents, ustore_py_context_executor(&context), "parents", &call->tasks,
+                                &call->parents) != 0 ||
+        spread_keys_from_object(keywords.anchors, ustore_py_context_executor(&context), "anchors", &call->tasks,
+                                &call->anchors) != 0)
         return ustore_py_call_discard(&context, &move_verb, call);
     ustore_pages_move_t move = {
         .database = context.database_handle,
@@ -628,7 +639,8 @@ PyObject* ustore_py_api_pages_splice(PyObject* self, PyObject* const* arguments,
     edit_call_t* const call = edit_open(self, "pages_splice", &splice_verb, arguments, positional_arguments_count,
                                         keyword_names_tuple, 5, no_keywords, &context, &options, &keywords, &stack);
     if (!call) return NULL;
-    if (spread_keys_from_object(arguments[1], "elements", &call->tasks, &call->elements) != 0 ||
+    if (spread_keys_from_object(arguments[1], ustore_py_context_executor(&context), "elements", &call->tasks,
+                                &call->elements) != 0 ||
         spread_lengths_from_object(arguments[2], "starts", &call->tasks, &call->text_starts) != 0 ||
         spread_lengths_from_object(arguments[3], "lengths", &call->tasks, &call->text_lengths) != 0 ||
         spread_texts_from_object(arguments[4], "texts", &call->tasks, &call->values) != 0)
@@ -680,7 +692,8 @@ PyObject* ustore_py_api_pages_set_attributes(PyObject* self, PyObject* const* ar
                                         positional_arguments_count, keyword_names_tuple, 4, no_keywords, &context,
                                         &options, &keywords, &stack);
     if (!call) return NULL;
-    if (spread_keys_from_object(arguments[1], "elements", &call->tasks, &call->elements) != 0 ||
+    if (spread_keys_from_object(arguments[1], ustore_py_context_executor(&context), "elements", &call->tasks,
+                                &call->elements) != 0 ||
         spread_texts_from_object(arguments[2], "fields", &call->tasks, &call->fields) != 0 ||
         spread_texts_from_object(arguments[3], "values", &call->tasks, &call->values) != 0)
         return ustore_py_call_discard(&context, &set_attributes_verb, call);
@@ -729,7 +742,8 @@ PyObject* ustore_py_api_pages_remove_attributes(PyObject* self, PyObject* const*
                                         positional_arguments_count, keyword_names_tuple, 3, no_keywords, &context,
                                         &options, &keywords, &stack);
     if (!call) return NULL;
-    if (spread_keys_from_object(arguments[1], "elements", &call->tasks, &call->elements) != 0 ||
+    if (spread_keys_from_object(arguments[1], ustore_py_context_executor(&context), "elements", &call->tasks,
+                                &call->elements) != 0 ||
         spread_texts_from_object(arguments[2], "fields", &call->tasks, &call->fields) != 0)
         return ustore_py_call_discard(&context, &remove_attributes_verb, call);
     ustore_pages_remove_attributes_t remove = {
@@ -824,8 +838,10 @@ PyObject* ustore_py_api_pages_read(PyObject* self, PyObject* const* arguments, P
     read_call_t* const call = ustore_py_call_open(&context, &read_verb, &stack);
     if (!call) return NULL;
     call->tasks.count = 1;
-    if (spread_keys_from_object(arguments[0], "pages", &call->tasks, &call->pages) != 0 ||
-        spread_keys_from_object(keywords.elements, "elements", &call->tasks, &call->elements) != 0 ||
+    if (spread_keys_from_object(arguments[0], ustore_py_context_executor(&context), "pages", &call->tasks,
+                                &call->pages) != 0 ||
+        spread_keys_from_object(keywords.elements, ustore_py_context_executor(&context), "elements", &call->tasks,
+                                &call->elements) != 0 ||
         ustore_py_arena_from_object(arguments[1], &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, &read_verb, call);
     call->kept.collection = options.collection;

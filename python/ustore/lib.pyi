@@ -91,6 +91,7 @@ class Status(IntEnum):
     DEVICE = 8
     MALFORMED = 9
     INTERNAL = 10
+    OVERFLOW = 11
     UNINITIALIZED = 12
     CONFIG_MISMATCH = 13
     CONTENDED = 14
@@ -356,6 +357,9 @@ class PhantomConflictError(ConflictError):
 class CapacityExhaustedError(Error, OverflowError):
     """A hard design ceiling was reached."""
 
+class CapacityOverflowError(Error, OverflowError):
+    """A count or size outgrew the integer holding it, like the open exports of one arena."""
+
 class DeviceError(Error):
     """A device could not be selected or claimed, or the executor, database and arena of a call live apart."""
 
@@ -415,7 +419,18 @@ class Values:
         it, so `numpy.from_dlpack` reads it in place."""
 
     def __dlpack_device__(self) -> tuple[int, int]:
-        """The DLPack device of the arena: (1, 0) for host pages, (2, ordinal) for NVIDIA, (10, ordinal) for AMD."""
+        """The DLPack device of the arena: (1, 0) for host pages, (3, ordinal) or (11, ordinal) for pages page-locked
+        for NVIDIA or AMD, and (13, ordinal) for NVIDIA managed memory; Apple's shared memory answers (1, 0)."""
+
+    def __arrow_c_device_array__(
+        self, requested_schema: object | None = None, **kwargs: object
+    ) -> tuple[object, object]:
+        """The schema and device array PyCapsules of what `__arrow_c_array__` exports, tagged with the arena's
+        device and no sync event."""
+
+    @property
+    def __cuda_array_interface__(self) -> dict[str, Any]:
+        """The CUDA Array Interface of outputs in NVIDIA device or managed memory; AttributeError for any other."""
 
 class Keys:
     """The keys one batch scan or sample wrote into an `Arena`, viewing it until it rewinds."""
@@ -426,6 +441,9 @@ class Keys:
     def __len__(self) -> int: ...
     def __getitem__(self, task: int) -> tuple[UUID, ...]: ...
     def __buffer__(self, flags: int) -> memoryview: ...
+    def __arrow_c_array__(self, requested_schema: object | None = None) -> tuple[object, object]:
+        """The schema and array PyCapsules of every row as Arrow `fixed_size_binary`, exported in place."""
+
     def __dlpack__(
         self,
         *,
@@ -438,7 +456,18 @@ class Keys:
         it, so `numpy.from_dlpack` reads it in place."""
 
     def __dlpack_device__(self) -> tuple[int, int]:
-        """The DLPack device of the arena: (1, 0) for host pages, (2, ordinal) for NVIDIA, (10, ordinal) for AMD."""
+        """The DLPack device of the arena: (1, 0) for host pages, (3, ordinal) or (11, ordinal) for pages page-locked
+        for NVIDIA or AMD, and (13, ordinal) for NVIDIA managed memory; Apple's shared memory answers (1, 0)."""
+
+    def __arrow_c_device_array__(
+        self, requested_schema: object | None = None, **kwargs: object
+    ) -> tuple[object, object]:
+        """The schema and device array PyCapsules of what `__arrow_c_array__` exports, tagged with the arena's
+        device and no sync event."""
+
+    @property
+    def __cuda_array_interface__(self) -> dict[str, Any]:
+        """The CUDA Array Interface of outputs in NVIDIA device or managed memory; AttributeError for any other."""
 
 @final
 class Page:
@@ -454,6 +483,9 @@ class Page:
     def __buffer__(self, flags: int) -> memoryview:
         """The keys as an array of shape (keys, 16) bytes, pinning the arena until released."""
 
+    def __arrow_c_array__(self, requested_schema: object | None = None) -> tuple[object, object]:
+        """The schema and array PyCapsules of every row as Arrow `fixed_size_binary`, exported in place."""
+
     def __dlpack__(
         self,
         *,
@@ -466,7 +498,18 @@ class Page:
         it, so `numpy.from_dlpack` reads it in place."""
 
     def __dlpack_device__(self) -> tuple[int, int]:
-        """The DLPack device of the arena: (1, 0) for host pages, (2, ordinal) for NVIDIA, (10, ordinal) for AMD."""
+        """The DLPack device of the arena: (1, 0) for host pages, (3, ordinal) or (11, ordinal) for pages page-locked
+        for NVIDIA or AMD, and (13, ordinal) for NVIDIA managed memory; Apple's shared memory answers (1, 0)."""
+
+    def __arrow_c_device_array__(
+        self, requested_schema: object | None = None, **kwargs: object
+    ) -> tuple[object, object]:
+        """The schema and device array PyCapsules of what `__arrow_c_array__` exports, tagged with the arena's
+        device and no sync event."""
+
+    @property
+    def __cuda_array_interface__(self) -> dict[str, Any]:
+        """The CUDA Array Interface of outputs in NVIDIA device or managed memory; AttributeError for any other."""
 
 @final
 class Cursor:
@@ -535,6 +578,14 @@ class Columns:
     def __arrow_c_array__(self, requested_schema: object | None = None) -> tuple[object, object]:
         """A struct array with one child per field, named by it, valid until the arena's next call."""
 
+    def __arrow_c_device_array__(
+        self, requested_schema: object | None = None, **kwargs: object
+    ) -> tuple[object, object]:
+        """The struct array of `__arrow_c_array__` as an Arrow device array on the arena's device."""
+
+    def __arrow_c_stream__(self, requested_schema: object | None = None) -> object:
+        """A stream of the one batch of rows `__arrow_c_array__` exports, so `pyarrow.table` reads it in place."""
+
     def validities(self, field: int) -> memoryview:
         """The bitmap of documents whose value was found and converted."""
 
@@ -552,6 +603,9 @@ class Neighborhoods:
     def __len__(self) -> int: ...
     def __getitem__(self, vertex: int) -> tuple[tuple[UUID, UUID, UUID], ...] | None: ...
     def __buffer__(self, flags: int) -> memoryview: ...
+    def __arrow_c_array__(self, requested_schema: object | None = None) -> tuple[object, object]:
+        """The schema and array PyCapsules of every row as Arrow `fixed_size_binary`, exported in place."""
+
     def __dlpack__(
         self,
         *,
@@ -564,7 +618,18 @@ class Neighborhoods:
         it, so `numpy.from_dlpack` reads it in place."""
 
     def __dlpack_device__(self) -> tuple[int, int]:
-        """The DLPack device of the arena: (1, 0) for host pages, (2, ordinal) for NVIDIA, (10, ordinal) for AMD."""
+        """The DLPack device of the arena: (1, 0) for host pages, (3, ordinal) or (11, ordinal) for pages page-locked
+        for NVIDIA or AMD, and (13, ordinal) for NVIDIA managed memory; Apple's shared memory answers (1, 0)."""
+
+    def __arrow_c_device_array__(
+        self, requested_schema: object | None = None, **kwargs: object
+    ) -> tuple[object, object]:
+        """The schema and device array PyCapsules of what `__arrow_c_array__` exports, tagged with the arena's
+        device and no sync event."""
+
+    @property
+    def __cuda_array_interface__(self) -> dict[str, Any]:
+        """The CUDA Array Interface of outputs in NVIDIA device or managed memory; AttributeError for any other."""
 
 # endregion: Arenas and Result Tapes
 
@@ -665,9 +730,7 @@ class Executor:
     """The threads that run calls, shared by any number of databases."""
 
     @classmethod
-    def for_ram(
-        cls, threads: int = 0, *, memory_domains: Sequence[int] | None = None, scratch_limit: int = 0
-    ) -> Self:
+    def for_ram(cls, threads: int = 0, *, memory_domains: Sequence[int] | None = None, scratch_limit: int = 0) -> Self:
         """Host threads for the RAM, RocksDB and LevelDB engines near `memory_domains`, every NUMA node for None, where
         zero threads take all but one in eight of the cores those nodes hold, each carving its calls' scratch from at most
         `scratch_limit` bytes, 16 GiB for zero. Calls `ustore_executor_for_ram`."""
