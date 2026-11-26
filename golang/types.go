@@ -1029,7 +1029,7 @@ func (call *call) pin(pointer unsafe.Pointer) unsafe.Pointer {
 }
 
 // pinSlice pins the backing array of a slice of length elements at data until the call is final,
-// and passes an empty slice as nil.
+// and answers nil for an empty slice.
 func (call *call) pinSlice(data unsafe.Pointer, length int) unsafe.Pointer {
 	if length == 0 {
 		return nil

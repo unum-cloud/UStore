@@ -384,12 +384,12 @@ FIXTURE
 run_precommit
 expect_acceptance "quoted header beside the including file"
 
-stage_fixture_with_header bench/nested/probe.cpp <<'FIXTURE'
+stage_fixture_with_header samples/nested/probe.cpp <<'FIXTURE'
 #include <vector>
 
 #include "../harness.h"
 FIXTURE
-stage_sibling_with_header bench/harness.h <<'FIXTURE'
+stage_sibling_with_header samples/harness.h <<'FIXTURE'
 int harness(void);
 FIXTURE
 run_precommit
@@ -541,7 +541,7 @@ struct probe_t {
 FIXTURE
 
 assert_rejects "bare trailing doc marker" "with a trailing marker" include/$project_directory/probe.h <<'FIXTURE'
-static int const probe_value = 1; //< The value.
+extern int probe_value; //< The value.
 FIXTURE
 
 assert_rejects "trailing field comment" "on its own line's tail" include/$project_directory/probe.h <<'FIXTURE'
@@ -760,15 +760,30 @@ assert_accepts "member named in a one-line body, and a concept" include/$project
 struct probe_t {
 
     /** Grows the storage, keeping the identifier space from @c id_space in step. */
-    void resize(int count) { id_space(count); }
+    void resize(int count) noexcept { id_space(count); }
 
     /** The identifier space. */
-    int id_space(int count);
+    int id_space(int count) noexcept;
 };
 
 /** Types whose alignment fits @c max_align_t. */
 template <typename type_>
 concept an_aligned_type = requires(type_ value) { alignof(type_) <= alignof(max_align_t); };
+FIXTURE
+
+assert_rejects "suffixed variable template" "suffixes a variable template" test/probe.cpp <<'FIXTURE'
+/** Half-precision types, judged against an error bound. */
+template <typename scalar_type_>
+constexpr bool bounded_k = sizeof(scalar_type_) == 2;
+FIXTURE
+
+assert_accepts "bare variable template and a suffixed constant" test/probe.cpp <<'FIXTURE'
+/** Half-precision types, judged against an error bound. */
+template <typename scalar_type_>
+constexpr bool bounded = sizeof(scalar_type_) == 2;
+
+/** The tolerance every bounded type shares. */
+constexpr double tolerance_k = 1e-3;
 FIXTURE
 
 assert_rejects "tag right below a body paragraph" "starts a tag section right below a body paragraph" include/$project_directory/probe.h <<'FIXTURE'
@@ -797,6 +812,43 @@ assert_rejects "continuation aligned under the tag text" "misaligns a continuati
  *  @brief Probes a value whose summary is long enough to wrap, spelling out every constraint it
  *         keeps across the call.
  *  @param[in] value The value.
+ */
+int probe(int value);
+FIXTURE
+
+assert_rejects "bullet continuation hanging past its text" "misaligns a continuation line" include/$project_directory/probe.h <<'FIXTURE'
+/**
+ *  @brief Probes a value.
+ *
+ *  - @c first_k, whose description is long enough to wrap, spelling out every constraint that it
+ *      keeps across the call.
+ */
+int probe(void);
+FIXTURE
+
+assert_rejects "bullet past three lines" "writes a list item past three lines" include/$project_directory/probe.h <<'FIXTURE'
+/**
+ *  @brief Lists the rejected experiments.
+ *
+ *  - @c rcpps_k with Newton-Raphson refinement: fast reciprocal approximation, ~4 cycles, with one
+ *    refinement iteration for ~22-bit precision, tested as an alternative to VDIVPS, ~11 cycles.
+ *    Did not improve performance combined with Estrin's scheme, likely because the division is not
+ *    on the critical path when processing large arrays of inputs.
+ */
+int probe(void);
+FIXTURE
+
+assert_accepts "hanging tag and bullet continuations" include/$project_directory/probe.h <<'FIXTURE'
+/**
+ *  @brief Probes a value whose summary is long enough to wrap, spelling out every constraint it
+ *      keeps across the call.
+ *  @param[in] value The value, whose description is also long enough to wrap onto another line of
+ *      its own, with room to spare.
+ *
+ *  - @c first_k, whose description is long enough to wrap, spelling out every constraint that it
+ *    keeps across the call.
+ *  - @c second_k, whose description is long enough to wrap, spelling out every constraint that it
+ *    keeps across the call.
  */
 int probe(int value);
 FIXTURE
@@ -1256,6 +1308,18 @@ assert_accepts "paragraph wrapped narrow throughout" include/$project_directory/
 int probe(void);
 FIXTURE
 
+assert_accepts "filled paragraph and a line ending in a colon" include/$project_directory/probe.h <<'FIXTURE'
+/**
+ *  @brief Quantization keeps i16 from saturating, as the worst pair sum stays below the limit, and
+ *      XOR-0x80 turns signed queries unsigned.
+ *
+ *  The two steps are:
+ *  - @c quantize_k scales the values.
+ *  - @c correct_k removes the bias.
+ */
+int probe(void);
+FIXTURE
+
 assert_rejects "abbreviated register role" "abbreviates a word this project spells out" include/$project_directory/probe.h <<'FIXTURE'
 static inline int probe(int sum_hi) { return sum_hi; }
 FIXTURE
@@ -1267,7 +1331,7 @@ FIXTURE
 
 assert_accepts "a foreign macro keeps its abbreviation" include/$project_directory/probe.hpp <<'FIXTURE'
 #include <asm/hwprobe.h>
-inline bool zabha(unsigned long extensions) { return extensions & RISCV_HWPROBE_EXT_ZABHA; }
+inline bool zabha(unsigned long extensions) noexcept { return extensions & RISCV_HWPROBE_EXT_ZABHA; }
 FIXTURE
 
 assert_accepts "a standard name deep in a std:: chain keeps its abbreviation" test/probe.cpp <<'FIXTURE'
@@ -1509,18 +1573,28 @@ assert_accepts "equation in plain prose, and a lone marked name" include/probe.h
 int probe(int value);
 FIXTURE
 
+assert_accepts "suffixed constants inside a function template's body" test/probe.cpp <<'FIXTURE'
+template <typename indexes_type_>
+std::size_t probe(u64_t seed) {
+    using key_t = typename indexes_type_::key_t;
+    constexpr std::size_t samples_k = 32;
+    constexpr std::size_t wanted_k = 10;
+    return samples_k + wanted_k + seed;
+}
+FIXTURE
+
 # endregion Doxygen Block Fixtures
 
 # region C and C++ Idiom Fixtures
 
 assert_rejects "unpinned string split" "splits a string literal" include/$project_directory/probe.h <<'FIXTURE'
 static char const *const probe_text = "first half "
-                                      "second half";
+                                "second half";
 FIXTURE
 
 assert_accepts "pinned string split" include/$project_directory/probe.h <<'FIXTURE'
 static char const *const probe_text = "first half " //
-                                      "second half";
+                                "second half";
 FIXTURE
 
 stage_edited_fixture include/$project_directory/probe.h 's/^#pragma once$/#pragma once\n#define PROBE_FIRST "first"/; s/^int settled(void);$/"second";/'
@@ -1614,11 +1688,11 @@ static char const *const probe_names[] = {"first", "second",   "third"};
 FIXTURE
 
 assert_rejects "unqualified memcpy" "unqualified memcpy" include/probe.hpp <<'FIXTURE'
-inline void probe(char *to, char const *from) { memcpy(to, from, 8); }
+inline void probe(void *to, void const *from) { memcpy(to, from, 8); }
 FIXTURE
 
 assert_rejects "unqualified memcpy behind a return" "unqualified memcpy" include/probe.hpp <<'FIXTURE'
-inline void *probe(char *to, char const *from) { return memcpy(to, from, 8); }
+inline void *probe(void *to, void const *from) { return memcpy(to, from, 8); }
 FIXTURE
 
 assert_accepts "a function named memcpy, declared and defined" include/probe.hpp <<'FIXTURE'
@@ -1687,7 +1761,7 @@ FIXTURE
 
 assert_accepts "qualified memcpy, and prose naming the bare forms" include/probe.hpp <<'FIXTURE'
 /** Copies eight bytes with @c std::memcpy, never an unqualified memcpy or a pragma mark. */
-inline void probe(char *to, char const *from) { std::memcpy(to, from, 8); }
+inline void probe(void *to, void const *from) { std::memcpy(to, from, 8); }
 FIXTURE
 
 assert_rejects "raw platform predefine" "reads a raw platform predefine" include/$project_directory/probe.h <<'FIXTURE'
@@ -1742,14 +1816,14 @@ static int probe(void) { return 1; }
 FIXTURE
 
 assert_rejects "std::max call" "which <windows.h> defines as macros" include/$project_directory/probe.hpp <<'FIXTURE'
-static inline int probe(int count, int size) { return std::max(count, size); }
+static inline int probe(int count, int size) noexcept { return std::max(count, size); }
 FIXTURE
 
 assert_rejects "parenthesized std::min" "which <windows.h> defines as macros" include/$project_directory/probe.hpp <<'FIXTURE'
-static inline int probe(int count, int size) { return (std::min)(count, size); }
+static inline int probe(int count, int size) noexcept { return (std::min)(count, size); }
 FIXTURE
 
-assert_rejects "unparenthesized numeric_limits max" "which <windows.h> defines as macros" tools/probe.cpp <<'FIXTURE'
+assert_rejects "unparenthesized numeric_limits max" "which <windows.h> defines as macros" test/probe.cpp <<'FIXTURE'
 static int probe() noexcept { return std::numeric_limits<int>::max(); }
 FIXTURE
 
@@ -1760,13 +1834,13 @@ FIXTURE
 
 assert_accepts "helpers, parenthesized limits, lowest, and min or max in prose and strings" include/$project_directory/probe.hpp <<'FIXTURE'
 /** The larger of @p count and @p size, like <tt>std::max(count, size)</tt>, below the int maximum. */
-static inline int probe(int count, int size) {
+static inline int probe(int count, int size) noexcept {
     char const *label = "max(count, size)";
     return label ? max_of(count, size) - (std::numeric_limits<int>::max)() - std::numeric_limits<int>::lowest() : 0;
 }
 FIXTURE
 
-assert_rejects "device bit intrinsic" "calls a device bit intrinsic" tools/probe.cu <<'FIXTURE'
+assert_rejects "device bit intrinsic" "calls a device bit intrinsic" test/probe.cu <<'FIXTURE'
 static __device__ unsigned probe_simt_(unsigned word) { return __popc(word); }
 FIXTURE
 
@@ -1775,7 +1849,7 @@ assert_rejects "NOMINMAX in a public header" "defines NOMINMAX or WIN32_LEAN_AND
 int probe();
 FIXTURE
 
-assert_rejects "WIN32_LEAN_AND_MEAN in a tool unit" "defines NOMINMAX or WIN32_LEAN_AND_MEAN" tools/probe.cpp <<FIXTURE
+assert_rejects "WIN32_LEAN_AND_MEAN in a test unit" "defines NOMINMAX or WIN32_LEAN_AND_MEAN" test/probe.cpp <<FIXTURE
 #if ${macro_prefix}_OS_WINDOWS_
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
@@ -1784,7 +1858,7 @@ assert_rejects "WIN32_LEAN_AND_MEAN in a tool unit" "defines NOMINMAX or WIN32_L
 int probe() { return 0; }
 FIXTURE
 
-assert_rejects "windows.h before winsock2.h" "includes <windows.h> before <winsock2.h>" tools/probe.cpp <<FIXTURE
+assert_rejects "windows.h before winsock2.h" "includes <windows.h> before <winsock2.h>" test/probe.cpp <<FIXTURE
 #if ${macro_prefix}_OS_WINDOWS_
 #include <windows.h>
 #include <winsock2.h>
@@ -1848,12 +1922,12 @@ inline int probe(int smaller) noexcept {
 }
 FIXTURE
 
-assert_rejects "_ITERATOR_DEBUG_LEVEL defined" "defines _ITERATOR_DEBUG_LEVEL" tools/probe.cpp <<'FIXTURE'
+assert_rejects "_ITERATOR_DEBUG_LEVEL defined" "defines _ITERATOR_DEBUG_LEVEL" test/probe.cpp <<'FIXTURE'
 #define _ITERATOR_DEBUG_LEVEL 0
 int probe() { return 0; }
 FIXTURE
 
-assert_accepts "_ITERATOR_DEBUG_LEVEL tested" tools/probe.cpp <<'FIXTURE'
+assert_accepts "_ITERATOR_DEBUG_LEVEL tested" test/probe.cpp <<'FIXTURE'
 #if defined(_ITERATOR_DEBUG_LEVEL) && _ITERATOR_DEBUG_LEVEL > 0
 int probe() { return 1; }
 #endif
@@ -2200,37 +2274,37 @@ FIXTURE
 assert_accepts "region marker and arrows beside rulers" include/probe.hpp <<'FIXTURE'
 #pragma region Probes
 
-/** Maps a key → its slot. */
+/** Maps a key → its row. */
 inline int probe(int key) noexcept { return key; }
 
-/** Maps a key → its second slot. */
+/** Maps a key → its second row. */
 inline int second(int key) noexcept { return key; }
 
-/** Maps a key → its third slot. */
+/** Maps a key → its third row. */
 inline int third(int key) noexcept { return key; }
 
-/** Maps a key → its fourth slot. */
+/** Maps a key → its fourth row. */
 inline int fourth(int key) noexcept { return key; }
 
-/** Maps a key → its fifth slot. */
+/** Maps a key → its fifth row. */
 inline int fifth(int key) noexcept { return key; }
 
-/** Maps a key → its sixth slot. */
+/** Maps a key → its sixth row. */
 inline int sixth(int key) noexcept { return key; }
 
-/** Maps a key → its seventh slot. */
+/** Maps a key → its seventh row. */
 inline int seventh(int key) noexcept { return key; }
 
-/** Maps a key → its eighth slot. */
+/** Maps a key → its eighth row. */
 inline int eighth(int key) noexcept { return key; }
 
-/** Maps a key → its ninth slot. */
+/** Maps a key → its ninth row. */
 inline int ninth(int key) noexcept { return key; }
 
-/** Maps a key → its tenth slot. */
+/** Maps a key → its tenth row. */
 inline int tenth(int key) noexcept { return key; }
 
-/** Maps a key → its last slot. */
+/** Maps a key → its last row. */
 inline int last(int key) noexcept { return key; }
 
 #pragma endregion Probes
@@ -2318,6 +2392,12 @@ FIXTURE
 assert_rejects "single-letter algebra glued" "glues a math operator" include/$project_directory/probe.h <<'FIXTURE'
 /** Scores accumulate P×V after the softmax. */
 int probe(void);
+FIXTURE
+
+assert_rejects "trailing comment gluing an operator" "glues a math operator" test/probe.cpp <<'FIXTURE'
+int probe(int value) {
+    return value * 2; // doubles the P×V tile
+}
 FIXTURE
 
 assert_rejects "drifting comments in a code sample" "lets the trailing comments of a @code sample drift" include/$project_directory/probe.h <<'FIXTURE'
@@ -2616,6 +2696,10 @@ assert_accepts "include listing the sibling symbols it uses" include/$project_di
 inline auto probe(string_view text) noexcept { return split(text); }
 FIXTURE
 
+assert_rejects "bool parameter selecting behaviour" "bool parameter" include/$project_directory/probe.h <<'FIXTURE'
+int probe(int key, bool reverse);
+FIXTURE
+
 assert_rejects "discarding through a void cast" "casts a result to void" include/$project_directory/probe.h <<'FIXTURE'
 static inline void probe(void) { (void)compute(); }
 FIXTURE
@@ -2632,12 +2716,27 @@ assert_rejects "filesystem include in the library" "uses std::filesystem in libr
 #include <filesystem>
 FIXTURE
 
+assert_accepts "filesystem include in a test harness" test/probe.cpp <<'FIXTURE'
+#include <filesystem>
+FIXTURE
+
 assert_rejects "vector in the library" "uses a standard container, an owning std::string, std::pair or std::tuple" include/$project_directory/probe.hpp <<'FIXTURE'
 #include <vector>
 FIXTURE
 
 assert_rejects "pair in a binding" "uses a standard container, an owning std::string, std::pair or std::tuple" python/probe.cpp <<'FIXTURE'
 std::pair<int, int> probe_bounds(void);
+FIXTURE
+
+assert_accepts "containers in a test harness" test/probe.cpp <<'FIXTURE'
+#include <vector>
+std::vector<std::pair<int, int>> probe_pairs;
+FIXTURE
+
+assert_accepts "containers in the SDK test unit" cpp/test.cpp <<'FIXTURE'
+#include <string>
+#include <vector>
+std::vector<std::string> probe_names;
 FIXTURE
 
 assert_rejects "owning string in a tool" "an owning std::string" tools/probe.hpp <<'FIXTURE'
@@ -2715,7 +2814,7 @@ FIXTURE
 
 assert_accepts "prose naming thread_local" include/$project_directory/probe.hpp <<'FIXTURE'
 /** Keeps no thread_local counter; the executor owns per-thread state. */
-inline int probe() { return 0; }
+inline int probe() noexcept { return 0; }
 FIXTURE
 
 assert_accepts "void parameter list" include/$project_directory/probe.h <<'FIXTURE'
@@ -3039,7 +3138,7 @@ stage_committed_fixture() { # stage_committed_fixture <relative-path> <sed-expre
 
 stage_committed_fixture include/$project_directory/probe.hpp 's/probe_text =$/probe_text = "first half "/' <<'FIXTURE'
 static char const *const probe_text =
-                                      "second half";
+                                "second half";
 FIXTURE
 run_precommit
 expect_rejection "string split by an added line before an unchanged fragment" "splits a string literal without"
@@ -3265,6 +3364,10 @@ assert_accepts "span of C strings spelled const char" include/$project_directory
 void probe_name(std::span<const char* const> names) noexcept;
 FIXTURE
 
+assert_accepts "span of runs a store merges" include/$project_directory/probe.hpp <<'FIXTURE'
+void probe_merge(std::span<memory_run_t const* const> newer, std::span<run_t const* const> older) noexcept;
+FIXTURE
+
 assert_rejects "executor address comparison" "compares executor addresses" src/probe.cpp <<'FIXTURE'
 std::size_t probe_thread(probe_view_t const& view, probe_state_t const& state) noexcept {
     return view.executor == state.executor ? view.thread_index : 0;
@@ -3275,6 +3378,118 @@ assert_accepts "null executor test and an executor's width" src/probe.cpp <<'FIX
 std::size_t probe_threads(probe_view_t const& view) noexcept {
     return view.executor != nullptr && view.executor->size() != 0 ? view.executor->size() : 1;
 }
+FIXTURE
+
+assert_accepts "one-line refusal of an arena from another executor" src/probe.cpp <<'FIXTURE'
+int probe_check(probe_arena_t const* arena, probe_executor_t const* executor) noexcept {
+    if (arena->executor && arena->executor != executor)
+        return -1;
+    return 0;
+}
+FIXTURE
+
+assert_rejects "pool spawned in make_call_executor" "spawns a pool or probes a topology" src/probe.hpp <<'FIXTURE'
+inline int make_call_probe(fu_pool_t* created) noexcept {
+    return fu_pool_new("probe", 0, created);
+}
+FIXTURE
+
+assert_accepts "pool spawned in the RAM device" include/$project_directory/utilities/ram_device.hpp <<'FIXTURE'
+inline int spawn_probe(fu_pool_t* created) noexcept {
+    return fu_pool_new("probe", 0, created);
+}
+FIXTURE
+
+assert_rejects "function-local static executor" "adds a static object" src/probe.hpp <<'FIXTURE'
+inline int probe_count() noexcept {
+    static int calls = 0;
+    return ++calls;
+}
+FIXTURE
+
+assert_rejects "constinit static counter" "adds a static object" src/probe.hpp <<'FIXTURE'
+static constinit int probe_counter = 0;
+FIXTURE
+
+assert_rejects "static mutable pointer to const characters" "adds a static object" src/probe.hpp <<'FIXTURE'
+static char const* probe_cursor = nullptr;
+FIXTURE
+
+assert_rejects "static object built by a call" "adds a static object" src/probe.hpp <<'FIXTURE'
+static probe_threads_t probe_threads(make_probe_threads());
+FIXTURE
+
+assert_accepts "static constexpr table and a static function" src/probe.hpp <<'FIXTURE'
+struct probe_t {
+    static constexpr int limit_k = 4;
+    static int twice(int value) noexcept { return value * 2; }
+};
+FIXTURE
+
+assert_rejects "per-thread stream handle" "names a per-thread default stream" include/$project_directory/utilities/probe.hpp <<'FIXTURE'
+inline void* probe_stream() noexcept { return cudaStreamPerThread; }
+FIXTURE
+
+assert_accepts "null legacy stream" include/$project_directory/utilities/probe.hpp <<'FIXTURE'
+/** The null legacy stream, which owns nothing. */
+inline void* probe_stream() noexcept { return nullptr; }
+FIXTURE
+
+assert_rejects "per-thread handle spelled outside the vendor API header" "names a per-thread default stream" include/$project_directory/utilities/probe.hpp <<'FIXTURE'
+inline cuda_stream_handle_t const cuda_stream_per_thread_handle_k =
+    reinterpret_cast<cuda_stream_handle_t>(std::uintptr_t {2});
+FIXTURE
+
+assert_accepts "legacy and per-thread handles defined in the vendor API header" include/$project_directory/utilities/vram_nvidia_device.hpp <<'FIXTURE'
+/** The legacy default stream, which a caller may not hand over for adoption. */
+inline cuda_stream_handle_t const cuda_stream_legacy_handle_k = reinterpret_cast<cuda_stream_handle_t>(std::uintptr_t {1});
+
+/** The per-thread default stream, which a caller may not hand over for adoption. */
+inline cuda_stream_handle_t const cuda_stream_per_thread_handle_k =
+    reinterpret_cast<cuda_stream_handle_t>(std::uintptr_t {2});
+FIXTURE
+
+assert_rejects "Arc around an executor" "counts references in a binding" rust/probe.rs <<'FIXTURE'
+/// An executor the probe keeps alive.
+pub struct Probe {
+    executor: std::sync::Arc<u32>,
+}
+FIXTURE
+
+assert_rejects "arena count kept on a C binding handle" "counts references in a binding" python/probe.c <<'FIXTURE'
+typedef struct probe_executor_t {
+    probe_handle_t handle;
+    size_t arenas;
+} probe_executor_t;
+FIXTURE
+
+assert_rejects "atomic hold count on a C binding handle" "counts references in a binding" javascript/probe.c <<'FIXTURE'
+typedef struct probe_arena_t {
+    probe_handle_t handle;
+    atomic_size_t holds;
+} probe_arena_t;
+FIXTURE
+
+assert_accepts "arena referencing its executor object" python/probe.c <<'FIXTURE'
+typedef struct probe_arena_t {
+    probe_handle_t handle;
+    PyObject* executor;
+} probe_arena_t;
+FIXTURE
+
+assert_accepts "lifetime-bound arena" rust/probe.rs <<'FIXTURE'
+/// An arena valid while its executor lives.
+pub struct Probe<'executor> {
+    executor: &'executor u32,
+}
+FIXTURE
+
+assert_rejects "stream opened through NumKong" "through NumKong or StringZilla" src/probe.cpp <<'FIXTURE'
+nk_status_t probe_open(nk_stream_t* stream) noexcept { return nk_stream_init_cuda(stream); }
+FIXTURE
+
+assert_accepts "kernel call taking a StringZilla stream handle" src/probe.cpp <<'FIXTURE'
+sz_status_t probe_scan(sz_stream_t stream) noexcept { return sz_probe_kernel(stream); }
 FIXTURE
 
 assert_rejects "N-API mutex in a binding" "locks in a binding" javascript/probe.c <<'FIXTURE'
@@ -3380,23 +3595,26 @@ FIXTURE
 
 first_library=$(sed -n "s/^library_macro_prefixes='\([A-Z]*\).*/\1/p" "$hooks_directory/pre-commit")
 
-assert_rejects "another library's ARCH flag" "names another library's _ARCH_ flag" include/$project_directory/probe.hpp <<FIXTURE
+# A project that builds on no library names none, and its rule stays off.
+if [ -n "$first_library" ]; then
+    assert_rejects "another library's ARCH flag" "names another library's _ARCH_ flag" include/$project_directory/probe.hpp <<FIXTURE
 inline static constexpr bool compiled_k = ${first_library}_ARCH_CUDA_AMPERE_;
 FIXTURE
 
-assert_accepts "another library's public TARGET switch" include/$project_directory/probe.hpp <<FIXTURE
+    assert_accepts "another library's public TARGET switch" include/$project_directory/probe.hpp <<FIXTURE
 #if ${first_library}_TARGET_HASWELL
 inline static constexpr bool compiled_k = true;
 #endif
 FIXTURE
 
-assert_rejects "another library's GPU generation target raised" "sets a library GPU generation target" CMakeLists.txt <<FIXTURE
+    assert_rejects "another library's GPU generation target raised" "sets a library GPU generation target" CMakeLists.txt <<FIXTURE
 target_compile_definitions(probe PRIVATE ${first_library}_TARGET_CDNA3=1)
 FIXTURE
 
-assert_accepts "another library's GPU floor target lowered" CMakeLists.txt <<FIXTURE
+    assert_accepts "another library's GPU floor target lowered" CMakeLists.txt <<FIXTURE
 target_compile_definitions(probe PRIVATE ${first_library}_TARGET_ROCM=0)
 FIXTURE
+fi
 
 assert_rejects "CMake string surgery" "derives a name or flag by editing a string" CMakeLists.txt <<'FIXTURE'
 string(REPLACE "a" "b" probe_name_ "${probe_source_}")
@@ -3983,6 +4201,38 @@ assert_accepts "a view the callee advances, and prose naming the reference it re
 inline void probe(std::span<char const>& remaining, std::size_t count) noexcept { remaining = remaining.subspan(count); }
 FIXTURE
 
+assert_rejects "SDK and native umbrellas of one library" "mixes a library's SDK umbrella with its native one" bench/probe.cpp <<FIXTURE
+#include <$first_sibling_directory.hpp>
+#include <$first_sibling_directory/$first_sibling_directory.hpp>
+FIXTURE
+
+assert_accepts "native umbrella beside the C header" bench/probe.cpp <<FIXTURE
+#include <$first_sibling_directory/$first_sibling_directory.h>
+#include <$first_sibling_directory.hpp>
+FIXTURE
+
+stage_fixture_with_header include/$project_directory/probe.hpp <<FIXTURE
+#include "$project_directory/probe_sdk.hpp"
+FIXTURE
+stage_sibling_with_header cpp/$project_directory/probe_sdk.hpp <<'FIXTURE'
+inline int probe_sdk() noexcept { return 0; }
+FIXTURE
+run_precommit
+expect_rejection "engine header reaching into cpp/" "reaches from include/ into cpp/"
+
+stage_fixture_with_header include/$project_directory/probe.hpp <<FIXTURE
+#include "$project_directory/probe_engine.hpp"
+FIXTURE
+stage_sibling_with_header include/$project_directory/probe_engine.hpp <<'FIXTURE'
+inline int probe_engine() noexcept { return 0; }
+FIXTURE
+run_precommit
+expect_acceptance "engine header including its own layer"
+
+assert_accepts "engine header including a sibling's SDK header" include/$project_directory/probe.hpp <<FIXTURE
+#include <$first_sibling_directory/tensor.hpp>
+FIXTURE
+
 # endregion Shared Gate Fixtures
 
 # region UStore Fixtures
@@ -4226,46 +4476,6 @@ inline util::status_t probe() noexcept {
 }
 FIXTURE
 
-assert_rejects "pool spawned in make_call_executor" "spawns a pool or probes a topology" src/probe.hpp <<'FIXTURE'
-inline ustore_executor_t make_call_executor(call_executor_t& call_executor) noexcept {
-    fu_pool_t pool = nullptr;
-    if (fu_pool_new("call", fu_capabilities_all_k, &pool) != fu_success_k) return nullptr;
-    return call_executor.adopt(pool);
-}
-FIXTURE
-
-assert_accepts "pool spawned in the RAM device" include/$project_directory/utilities/ram_device.hpp <<'FIXTURE'
-inline fu_status_t spawn_probe(fu_topology_t topology, fu_pool_t pool, std::size_t threads) noexcept {
-    return fu_pool_spawn(topology, pool, threads, fu_caller_inclusive_k);
-}
-FIXTURE
-
-assert_rejects "function-local static executor" "adds a static object" src/probe.hpp <<'FIXTURE'
-inline util::ram_executor_t& probe_executor() noexcept {
-    static util::ram_executor_t executor;
-    return executor;
-}
-FIXTURE
-
-assert_rejects "constinit static counter" "adds a static object" src/probe.hpp <<'FIXTURE'
-static constinit int probe_calls = 0;
-FIXTURE
-
-assert_rejects "static mutable pointer to const characters" "adds a static object" src/probe.hpp <<'FIXTURE'
-static char const* probe_cursor = nullptr;
-FIXTURE
-
-assert_rejects "static object built by a call" "adds a static object" src/probe.hpp <<'FIXTURE'
-static probe_pool_t probe_threads(make_probe_threads());
-FIXTURE
-
-assert_accepts "static constexpr table and a static function" src/probe.hpp <<'FIXTURE'
-struct probe_table_t {
-    static constexpr std::size_t widths_k[2] = {8, 16};
-    static std::size_t width(std::size_t index) noexcept { return widths_k[index]; }
-};
-FIXTURE
-
 assert_rejects "flush inside a free" "does I/O inside a free" src/probe.cpp <<'FIXTURE'
 void probe_free(probe_state_t& state) noexcept {
     [[maybe_unused]] util::status_t const flushed = state.store.flush();
@@ -4284,49 +4494,6 @@ assert_accepts "flush in the flush verb" src/probe.cpp <<'FIXTURE'
 util::status_t probe_flush(probe_state_t& state) noexcept { return state.store.flush(); }
 
 void probe_free(probe_state_t& state) noexcept { state.memory.reset(); }
-FIXTURE
-
-assert_rejects "per-thread stream handle" "names a per-thread default stream" include/$project_directory/utilities/probe.hpp <<'FIXTURE'
-inline cuda_stream_handle_t probe_stream() noexcept { return cuda_stream_per_thread_k; }
-FIXTURE
-
-assert_accepts "null legacy stream" include/$project_directory/utilities/probe.hpp <<'FIXTURE'
-inline cuda_stream_handle_t probe_stream() noexcept { return nullptr; }
-FIXTURE
-
-assert_rejects "Arc around an executor" "counts references in a binding" rust/probe.rs <<'FIXTURE'
-use std::sync::Arc;
-
-struct Probe {
-    executor: Arc<Executor>,
-}
-FIXTURE
-
-assert_rejects "arena count kept on a C binding handle" "counts references in a binding" python/probe.c <<'FIXTURE'
-typedef struct probe_executor_t {
-    ustore_executor_t handle;
-    size_t arenas;
-} probe_executor_t;
-FIXTURE
-
-assert_rejects "atomic hold count on a C binding handle" "counts references in a binding" javascript/probe.c <<'FIXTURE'
-typedef struct probe_arena_t {
-    ustore_arena_t handle;
-    atomic_size_t holds;
-} probe_arena_t;
-FIXTURE
-
-assert_accepts "arena referencing its executor object" python/probe.c <<'FIXTURE'
-typedef struct probe_arena_t {
-    ustore_arena_t handle;
-    PyObject* executor;
-} probe_arena_t;
-FIXTURE
-
-assert_accepts "lifetime-bound arena" rust/probe.rs <<'FIXTURE'
-struct Probe<'executor> {
-    arena: Arena<'executor>,
-}
 FIXTURE
 
 assert_rejects "offset_of! in a Rust test" "asserts a struct's layout" rust/probe.rs <<'FIXTURE'
@@ -4859,9 +5026,14 @@ template <typename kit_>
 inline void probe(kit_ kit) {}
 FIXTURE
 
-# endregion UStore Fixtures
-
-# region Commit Message Fixtures
+assert_rejects "WIN32_LEAN_AND_MEAN in a tool unit" "defines NOMINMAX or WIN32_LEAN_AND_MEAN" tools/probe.cpp <<FIXTURE
+#if ${macro_prefix}_OS_WINDOWS_
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <windows.h>
+#endif
+int probe() { return 0; }
+FIXTURE
 
 # Stages every version site a release stamps at one version, then applies a sed edit to one of them.
 stage_release_fixture() { # stage_release_fixture <version> [<relative-path> <sed-expression>]
@@ -4882,6 +5054,35 @@ stage_release_fixture() { # stage_release_fixture <version> [<relative-path> <se
     ) || exit 1
     release_fixture_staged=1
 }
+
+stage_release_fixture 1.1.0-rc.2
+assert_message_accepts "release with every version site bumped" <<'FIXTURE'
+Release: v1.1.0-rc.2
+FIXTURE
+
+stage_release_fixture 1.1.0-rc.2 Cargo.toml 's/1.1.0-rc.2/1.1.0-rc.1/'
+assert_message_rejects "release with a stale version site" "Cargo.toml" <<'FIXTURE'
+Release: v1.1.0-rc.2
+FIXTURE
+
+stage_release_fixture 1.1.0-rc.2 pixi.toml '$s/1.1.0-rc.2/1.1.0-rc.1/'
+assert_message_rejects "release with a stale package under a current workspace" "pixi.toml" <<'FIXTURE'
+Release: v1.1.0-rc.2
+FIXTURE
+
+stage_release_fixture 1.1.0 c/ustore/types.h 's/MINOR 1/MINOR 0/'
+assert_message_rejects "release missing a version macro" "c/ustore/types.h:MINOR" <<'FIXTURE'
+Release: v1.1.0
+FIXTURE
+
+stage_release_fixture 1.1.0
+assert_message_rejects "version bump outside a release" "VERSION only changes" <<'FIXTURE'
+Make: Bump the version
+FIXTURE
+
+# endregion UStore Fixtures
+
+# region Commit Message Fixtures
 
 assert_message_rejects "unknown verb" "approved verb" <<'FIXTURE'
 Refactor: Split the dispatch table
@@ -4921,33 +5122,8 @@ Improve: Split the dispatch table
 Each generation of the table keeps its own entries.
 FIXTURE
 
-stage_release_fixture 1.1.0-rc.2
-assert_message_accepts "release with every version site bumped" <<'FIXTURE'
-Release: v1.1.0-rc.2
-FIXTURE
-
-stage_release_fixture 1.1.0-rc.2 Cargo.toml 's/1.1.0-rc.2/1.1.0-rc.1/'
-assert_message_rejects "release with a stale version site" "Cargo.toml" <<'FIXTURE'
-Release: v1.1.0-rc.2
-FIXTURE
-
-stage_release_fixture 1.1.0-rc.2 pixi.toml '$s/1.1.0-rc.2/1.1.0-rc.1/'
-assert_message_rejects "release with a stale package under a current workspace" "pixi.toml" <<'FIXTURE'
-Release: v1.1.0-rc.2
-FIXTURE
-
-stage_release_fixture 1.1.0 c/ustore/types.h 's/MINOR 1/MINOR 0/'
-assert_message_rejects "release missing a version macro" "c/ustore/types.h:MINOR" <<'FIXTURE'
-Release: v1.1.0
-FIXTURE
-
-assert_message_rejects "release subject without its tag" "Got: Release: 1.1.0" <<'FIXTURE'
-Release: 1.1.0
-FIXTURE
-
-stage_release_fixture 1.1.0
-assert_message_rejects "version bump outside a release" "VERSION only changes" <<'FIXTURE'
-Make: Bump the version
+assert_message_rejects "release subject without its tag" "Got: Release: 1.0.0" <<'FIXTURE'
+Release: 1.0.0
 FIXTURE
 
 assert_message_accepts "approved verb naming the case" <<'FIXTURE'
