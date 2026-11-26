@@ -9,8 +9,10 @@
  *  memory it remembers, with the device current at the allocation, so pointer queries tell them
  *  apart; copies and fills run at once; each stream is a record of the device current at its
  *  creation, destroyed once, events are tokens, and every wait, stream and memory entry is counted
- *  in @c fake_hip_counters, which a suite reads to count what one call costs. Module loads check
- *  the offload bundle's magic, and launches are refused, as no AMD kernel runs here.
+ *  in @c fake_hip_counters, which a suite reads to count what one call costs. Stream callbacks run
+ *  when queued, or wait for the next synchronize, query or drain while a suite holds them through
+ *  @c fake_hip_hold_callbacks. Module loads check the offload bundle's magic, and launches are
+ *  refused, as no AMD kernel runs here.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 
@@ -82,6 +84,32 @@ static std::vector<fake_stream_t*>::iterator live_stream(void* handle) noexcept 
     return streams.end();
 }
 
+/** A stream callback held until its stream is next synchronized, queried or destroyed. */
+struct held_callback_t {
+    void (*callback)(void*, int, void*);
+    void* stream;
+    void* state;
+};
+
+/** Callbacks held in queue order, while a suite holds them. */
+static std::vector<held_callback_t>& held_callbacks() noexcept {
+    static std::vector<held_callback_t> held;
+    return held;
+}
+
+/** How many suites asked to hold callbacks rather than run them when queued. */
+static int& callbacks_held() noexcept {
+    static int holders = 0;
+    return holders;
+}
+
+/** Runs every held callback in queue order, as a drained stream would, reporting @p result. */
+static void run_held_callbacks(int result = 0) noexcept {
+    std::vector<held_callback_t> held;
+    held.swap(held_callbacks());
+    for (held_callback_t const& pending : held) pending.callback(pending.stream, result, pending.state);
+}
+
 /** Every range allocated or registered and not yet freed, as each call comes from one thread at a time. */
 static std::vector<range_t> ranges;
 
@@ -135,9 +163,23 @@ struct fake_hip_counters_t {
     std::size_t pointer_queries;
     std::size_t stream_creations;
     std::size_t stream_destructions;
+    std::size_t callbacks;
 };
 
 __attribute__((visibility("default"))) fake_hip_counters_t fake_hip_counters;
+
+/** Makes queued stream callbacks wait for the next synchronize, query or drain while @p hold is
+ *  positive, or run when queued again once it is zero, which runs every held one first. A waiter
+ *  touching no stream meanwhile, as a blocking call sleeping on its outcome or a free of an arena
+ *  or executor the held call names, hangs until the suite drains. */
+__attribute__((visibility("default"))) void fake_hip_hold_callbacks(int hold) {
+    callbacks_held() = hold;
+    if (hold <= 0) run_held_callbacks();
+}
+
+/** Runs every held callback, as if each stream drained, each reporting @p result, which a suite
+ *  sets nonzero to fail the queued work. */
+__attribute__((visibility("default"))) void fake_hip_drain(int result) { run_held_callbacks(result); }
 
 /** Ranges allocated or registered and not yet freed, so a suite catches a leak. */
 __attribute__((visibility("default"))) std::size_t fake_hip_live_ranges() { return ranges.size(); }
@@ -216,6 +258,7 @@ __attribute__((visibility("default"))) int hipStreamGetDevice(void* stream, int*
 }
 
 __attribute__((visibility("default"))) int hipStreamDestroy(void* stream) {
+    run_held_callbacks();
     auto const found = live_stream(stream);
     if (found == live_streams().end()) return invalid_value_k;
     ++fake_hip_counters.stream_destructions;
@@ -226,17 +269,24 @@ __attribute__((visibility("default"))) int hipStreamDestroy(void* stream) {
 
 __attribute__((visibility("default"))) int hipStreamSynchronize(void*) {
     ++fake_hip_counters.waits;
+    run_held_callbacks();
     return success_k;
 }
 
-__attribute__((visibility("default"))) int hipStreamQuery(void*) { return success_k; }
+__attribute__((visibility("default"))) int hipStreamQuery(void*) {
+    run_held_callbacks();
+    return success_k;
+}
 
 __attribute__((visibility("default"))) int hipStreamWaitEvent(void*, void*, unsigned) { return success_k; }
 
-/** Runs @p callback at once, as every queued call here ran when it was queued. */
+/** Runs @p callback at once, which is queue order, as every queued call here ran when it was
+ *  queued, or holds it while a suite asks, until a synchronize, query or drain runs it. */
 __attribute__((visibility("default"))) int hipStreamAddCallback(void* stream, void (*callback)(void*, int, void*),
                                                                 void* state, unsigned) {
-    callback(stream, success_k, state);
+    ++fake_hip_counters.callbacks;
+    if (callbacks_held() > 0) held_callbacks().push_back({callback, stream, state});
+    else callback(stream, success_k, state);
     return success_k;
 }
 
@@ -249,6 +299,7 @@ __attribute__((visibility("default"))) int hipEventRecord(void*, void*) { return
 
 __attribute__((visibility("default"))) int hipEventSynchronize(void*) {
     ++fake_hip_counters.waits;
+    run_held_callbacks();
     return success_k;
 }
 

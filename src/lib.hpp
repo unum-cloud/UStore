@@ -1549,8 +1549,13 @@ util::status_t visit_residency(view_t const& view, visitor_type_&& visitor) noex
     return std::visit(
         [&]<typename kind_type_>(kind_type_& kind) noexcept -> util::status_t {
             if constexpr (util::a_gpu_executor<kind_type_>) {
-                auto [claim, claim_status] = kind.claim();
-                if (claim_status.failed()) return claim_status;
+                // The call keeps the claim until its end, and nothing of it outlives this scope, so
+                // the body writes nothing here once its stream may end the call
+                {
+                    auto [claim, claim_status] = kind.claim();
+                    if (claim_status.failed()) return claim_status;
+                    executor->holding_call.device_claim = std::move(claim);
+                }
                 return visitor(kind.stream(0));
             }
             else return visitor();
@@ -1824,6 +1829,7 @@ inline void end_call(ustore_executor_handle_t& executor) noexcept {
     holding_call_t& call = executor.holding_call;
     ustore_outcome_t& outcome = *call.outcome;
     util::status_t const recorded = call.recorded;
+    call.device_claim = std::monostate {};
     release(call.claims);
     lower_named_calls(call.named_calls);
     floor_atomic_ref<std::thread::id> {call.body_thread}.store(std::thread::id {}, std::memory_order_relaxed);
@@ -1831,12 +1837,75 @@ inline void end_call(ustore_executor_handle_t& executor) noexcept {
     finish(outcome, recorded);
 }
 
+/** Ends the call holding @p executor from the driver's thread, once the stream it queued on
+ *  reaches this point: a failure among the queued work is recorded as @c device_k, and the ending
+ *  stores atomics alone, as a stream callback may make no driver call. */
+template <typename handle_type_, typename result_type_, result_type_ success_>
+void end_queued_call(handle_type_, result_type_ result, void* executor) noexcept {
+    ustore_executor_handle_t& holder = *static_cast<ustore_executor_handle_t*>(executor);
+    if (result != success_) {
+        holder.holding_call.recorded = {util::status_code_t::device_k, "The queued device work failed"};
+        // A failed call leaves its outputs null, as the router leaves those of a body failing
+        std::visit(
+            []<typename arguments_type_>(arguments_type_ const& arguments) noexcept {
+                if constexpr (a_call_clearing_outputs<arguments_type_> && !a_call_stamping_commit<arguments_type_>)
+                    clear_outputs(arguments);
+            },
+            holder.holding_call.delegated_arguments);
+    }
+    end_call(holder);
+}
+
+/** Hands the call holding @p executor to the stream that ends it, clearing what the body kept, as
+ *  the callback may end the call before the body returns. The call keeps the GPU executor's claim
+ *  to its end, as an Arrow export takes that claim alone and refills the bounce the copies read. */
+inline void hand_to_stream(ustore_executor_handle_t& executor) noexcept {
+    executor.holding_call.recorded = {};
+    floor_atomic_ref<std::thread::id> {executor.holding_call.body_thread}.store(std::thread::id {},
+                                                                                std::memory_order_relaxed);
+}
+
+/**
+ *  @brief Ends the call holding @p executor in @p stream's order: queues on it, as the body's last
+ *      act, a callback ending the call once the device ran everything queued before, and answers
+ *      @c deferred_k, so the router leaves the ending to it.
+ *
+ *  Nothing may touch the call or @p executor after this answers @c deferred_k, as the callback may
+ *  already have ended the call and another may hold the executor. A stream that refuses the
+ *  callback is waited on instead.
+ */
+inline util::status_t end_in_stream_order(util::cuda_executor_t::stream_t& stream,
+                                          ustore_executor_handle_t& executor) noexcept {
+    hand_to_stream(executor);
+    auto const callback = &end_queued_call<util::cuda_stream_handle_t, util::cuda_result_t, util::cuda_success_k>;
+    if (stream.handle.api().stream_add_callback(stream.handle, callback, &executor, 0) != util::cuda_success_k)
+        return stream.wait();
+    return {util::status_code_t::deferred_k, "The stream ends the call"};
+}
+
+/** @copydoc end_in_stream_order(util::cuda_executor_t::stream_t&, ustore_executor_handle_t&) */
+inline util::status_t end_in_stream_order(util::hip_executor_t::stream_t& stream,
+                                          ustore_executor_handle_t& executor) noexcept {
+    hand_to_stream(executor);
+    auto const callback = &end_queued_call<util::hip_stream_handle_t, util::hip_result_t, util::hip_success_k>;
+    if (stream.handle.api().stream_add_callback(stream.handle, callback, &executor, 0) != util::hip_success_k)
+        return stream.wait();
+    return {util::status_code_t::deferred_k, "The stream ends the call"};
+}
+
+/** Waits for @p stream's queue, as Metal ends no call through a callback yet. */
+inline util::status_t end_in_stream_order(util::metal_executor_t::stream_t& stream,
+                                          ustore_executor_handle_t&) noexcept {
+    return stream.wait();
+}
+
 /** Serves @p arguments in the scratch and on the thread @p runner names, leaving the outputs of a
  *  failed call null or zero, and answers the status their outcome is to finish with, which their
- *  claims are released together with. */
+ *  claims are released together with, or @c deferred_k for a call its stream ends. */
 template <typename arguments_type_>
 util::status_t serve_deferred(arguments_type_& arguments, view_t const& runner) noexcept {
     util::status_t const status = serve(arguments, runner);
+    if (status == util::status_code_t::deferred_k) return status;
     // A landed commit keeps its stamp beside a failed flush; the router zeroed it beforehand
     if constexpr (a_call_clearing_outputs<arguments_type_> && !a_call_stamping_commit<arguments_type_>)
         if (status.failed()) clear_outputs(arguments);
@@ -1922,7 +1991,10 @@ void serve_delegated(void* context, std::size_t thread, std::size_t) noexcept {
     ustore_executor_handle_t& executor = *static_cast<ustore_executor_handle_t*>(context);
     holding_call_t& call = executor.holding_call;
     floor_atomic_ref<std::thread::id> {call.body_thread}.store(std::this_thread::get_id(), std::memory_order_relaxed);
-    call.recorded = serve_(*std::get_if<call_type_>(&call.delegated_arguments), call_view(executor));
+    util::status_t const served = serve_(*std::get_if<call_type_>(&call.delegated_arguments), call_view(executor));
+    // The stream ends a call the body handed to it, which this thread then leaves alone
+    if (served == util::status_code_t::deferred_k) return;
+    call.recorded = served;
     end_call(executor);
 }
 
@@ -1941,10 +2013,22 @@ void dispatch(call_type_* call, std::array<claim_t*, 3> const& claims) noexcept 
     holding.named_calls = raise_named_calls(*call);
     holding.claims = claims;
     host_verbs().publish(call->outcome, ustore_status_deferred_k, std::memory_order_relaxed);
-    if (call->completion == ustore_completion_blocking_k || !delegates(*executor)) {
+    // A deferred call its stream ends may be final, and its structure freed, once the body returns
+    ustore_completion_t const completion = call->completion;
+    ustore_outcome_t* const outcome = call->outcome;
+    if (completion == ustore_completion_blocking_k || !delegates(*executor)) {
+        // A stream ending the call clears its outputs through this copy should its work fail
+        holding.delegated_arguments.template emplace<call_type_>(*call);
         floor_atomic_ref<std::thread::id> {holding.body_thread}.store(std::this_thread::get_id(),
                                                                       std::memory_order_relaxed);
-        holding.recorded = serve_(*call, call_view(*executor));
+        util::status_t const served = serve_(*call, call_view(*executor));
+        // The stream ends a call the body handed to it, which this thread then leaves alone; a
+        // blocking caller sleeps on its own outcome until the stream's callback publishes it
+        if (served == util::status_code_t::deferred_k) {
+            if (completion == ustore_completion_blocking_k) host_verbs().wait(outcome);
+            return;
+        }
+        holding.recorded = served;
         return end_call(*executor);
     }
     holding.delegated_arguments.template emplace<call_type_>(*call);

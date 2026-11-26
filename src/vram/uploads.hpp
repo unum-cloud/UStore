@@ -6,10 +6,10 @@
  *
  *  A call on a VRAM executor runs the engine's host verb with its outputs in the executor's pinned
  *  bounce, then carves every output column off the call's device arena and queues one copy to the
- *  device per column, repointing the caller's outputs there, and waits once. Its inputs reach the
- *  host through @c stage_inputs before the verb runs. Document gathers and field reads run on the
- *  device first, through @c vram/gathers.hpp, and only a call their kernels leave to the host
- *  takes the tower.
+ *  device per column, repointing the caller's outputs there, and lets its stream end the call once
+ *  the copies ran; Metal waits for its queue instead. Its inputs reach the host through
+ *  @c stage_inputs before the verb runs. Document gathers and field reads run on the device first,
+ *  through @c vram/gathers.hpp, and only a call their kernels leave to the host takes the tower.
  */
 
 #pragma once
@@ -24,7 +24,7 @@
 
 #include "engine.hpp"       // `residency_tables`, `residency_stream`, `engine_of`, `database_of`
 #include "lib.hpp"          // `verb_slot`
-#include "vram/columns.hpp" // `upload_output_columns`
+#include "vram/columns.hpp" // `queue_output_columns`
 #include "vram/gathers.hpp" // `gather_documents_on_device`, `read_documents_on_device`, `device_answer_t`
 
 namespace unum::ustore {
@@ -59,7 +59,12 @@ status_t upload_through_host(arguments_type_ const& arguments, rest_types_&... r
         else return verb(hosted, std::get<index_>(tail)..., view);
     }(std::make_index_sequence<ragged_count> {});
     if (served.failed()) return served;
-    return upload_output_columns(hosted, *blocks, executor);
+    // The copies read the pinned bounce and nothing reads after them, so the stream ends the call
+    if (util::status_t const queued = queue_output_columns(hosted, *blocks, executor); queued.failed()) {
+        [[maybe_unused]] util::status_t const waited = executor.wait();
+        return queued;
+    }
+    return end_in_stream_order(executor, *view.executor);
 }
 
 /** Serves a device verb of @p residency_ through @p on_device_, and through the upload tower when

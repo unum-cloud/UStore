@@ -9,14 +9,15 @@
  *  opens, cancels, continues and finishes, and every modality round-trips its values.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
-#define _POSIX_C_SOURCE 200809L
+#define _POSIX_C_SOURCE  200809L
 #define _DARWIN_C_SOURCE 1 // `mkdtemp` on macOS, which strict POSIX mode hides
 
-#include <stdio.h>  // `printf`, `snprintf`, `fflush`, `remove`
-#include <stdlib.h> // `getenv`, `exit`, `strtod`, `strtoull`, `mkdtemp`
-#include <string.h> // `memcmp`, `memset`, `strcmp`, `strncmp`, `strlen`
-#include <time.h>   // `time`, `clock`
-#include <unistd.h> // `rmdir`, `write`, `STDERR_FILENO`
+#include <stdio.h>   // `printf`, `snprintf`, `fflush`, `remove`
+#include <stdlib.h>  // `getenv`, `exit`, `strtod`, `strtoull`, `mkdtemp`
+#include <string.h>  // `memcmp`, `memset`, `strcmp`, `strncmp`, `strlen`
+#include <time.h>    // `time`, `clock`
+#include <pthread.h> // `pthread_create`, `pthread_join`
+#include <unistd.h>  // `rmdir`, `write`, `STDERR_FILENO`
 
 #include <inttypes.h> // `PRIu64`
 #include <stdbool.h>  // `bool`
@@ -534,6 +535,53 @@ static void check_compaction(ustore_database_t database, ustore_executor_t execu
     expect_status_at(outcome, ustore_status_success_k, __FILE__, __LINE__);
 }
 
+/** Strided keys two exports copy dense out of one arena at once, each to its own column. */
+typedef struct racing_export_t {
+    ustore_arena_t arena;
+    ustore_key_t strided[8];
+    size_t mismatches;
+} racing_export_t;
+
+/** Exports the four keys of @c strided again and again, counting columns that hold other keys. */
+static void* export_strided_keys(void* state) {
+    racing_export_t* const racer = (racing_export_t*)state;
+    for (int round = 0; round != 2000; ++round) {
+        struct ArrowSchema schema = {0};
+        struct ArrowDeviceArray column = {0};
+        ustore_status_t const status = ustore_keys_view_to_arrow(
+            (ustore_keys_view_t) {racer->strided, 2 * sizeof(ustore_key_t)}, 4, racer->arena, &schema, &column);
+        if (status == ustore_status_contended_k) continue;
+        if (status != ustore_status_success_k) {
+            ++racer->mismatches;
+            continue;
+        }
+        ustore_key_t const* const dense = (ustore_key_t const*)column.array.buffers[1];
+        for (int index = 0; index != 4; ++index)
+            if (memcmp(&dense[index], &racer->strided[2 * index], sizeof(ustore_key_t)) != 0) ++racer->mismatches;
+        column.array.release(&column.array);
+        schema.release(&schema);
+    }
+    return NULL;
+}
+
+/** Two exports converting out of one arena at once never both hold its claim: one copies while the
+ *  other answers contended, so each column holds its own keys. */
+static void test_racing_exports_hold_the_claim_alone(void) {
+    ustore_outcome_t outcome = {0};
+    ustore_arena_t arena = NULL;
+    ustore_arena_init_t init = {.arena = &arena, .outcome = &outcome};
+    ustore_arena_init(&init);
+    expect_status_at(outcome, ustore_status_success_k, __FILE__, __LINE__);
+    racing_export_t racers[2] = {{.arena = arena}, {.arena = arena}};
+    for (int racer = 0; racer != 2; ++racer)
+        for (int index = 0; index != 8; ++index) racers[racer].strided[index] = key_from((uint8_t)(racer * 8 + index));
+    pthread_t threads[2];
+    for (int racer = 0; racer != 2; ++racer) pthread_create(&threads[racer], NULL, export_strided_keys, &racers[racer]);
+    for (int racer = 0; racer != 2; ++racer) pthread_join(threads[racer], NULL);
+    expect_(racers[0].mismatches == 0 && racers[1].mismatches == 0);
+    expect_(ustore_arena_free(arena) == ustore_status_success_k);
+}
+
 /** Every modality round-trips its values on one RAM database, and the claims refuse
  *  a second call. */
 static void test_every_modality_round_trips(void) {
@@ -975,6 +1023,9 @@ int main(int argc, char** argv) {
     finish_test_case(NULL);
     start_test_case("test_engines_beyond_ram_are_refused");
     test_engines_beyond_ram_are_refused();
+    finish_test_case(NULL);
+    start_test_case("test_racing_exports_hold_the_claim_alone");
+    test_racing_exports_hold_the_claim_alone();
     finish_test_case(NULL);
     start_test_case("test_every_modality_round_trips");
     test_every_modality_round_trips();

@@ -206,17 +206,26 @@ void output_columns(arguments_type_ const& arguments, uploader_type_& uploader) 
     *arguments.batches = uploader.move(batches.data(), batches.size()).data();
 }
 
-/** Moves every output column of @p hosted, which a host verb wrote into @p executor's bounce, into @p blocks, the
- *  call's device arena, one copy per column, and waits once. */
+/** Queues moving every output column of @p hosted, which a host verb wrote into @p executor's
+ *  bounce, into @p blocks, the call's device arena, one copy each, and repoints the outputs. */
 template <typename arguments_type_, util::a_gpu_stream executor_type_>
-util::status_t upload_output_columns(arguments_type_ const& hosted, util::device_blocks_t& blocks,
-                                     executor_type_& executor) noexcept {
+util::status_t queue_output_columns(arguments_type_ const& hosted, util::device_blocks_t& blocks,
+                                    executor_type_& executor) noexcept {
     if (util::status_t const pinned = executor.memory.bounce.pin(); pinned.failed()) return pinned;
     column_uploader<executor_type_> uploader {blocks, executor};
     output_columns(hosted, uploader);
+    return uploader.status();
+}
+
+/** Uploads every output column of @p hosted as @c queue_output_columns does, then waits for the
+ *  copies, as every call does whose stream does not end it. */
+template <typename arguments_type_, util::a_gpu_stream executor_type_>
+util::status_t upload_output_columns(arguments_type_ const& hosted, util::device_blocks_t& blocks,
+                                     executor_type_& executor) noexcept {
+    util::status_t const queued = queue_output_columns(hosted, blocks, executor);
     // Copies already queued read the bounce, which the next call rewinds, so a failure still waits for them
     util::status_t const waited = executor.wait();
-    return uploader.status().failed() ? uploader.status() : waited;
+    return queued.failed() ? queued : waited;
 }
 
 } // namespace unum::ustore

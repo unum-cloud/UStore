@@ -810,7 +810,8 @@ struct holding_call_t {
     /** Free, or held by the call from its claim to its end. */
     claim_t claim = claim_t::free_k;
 
-    /** A delegated call's copy, served on pool thread 0, as the caller's struct may die first. */
+    /** The call's arguments: a delegated call's copy, served on pool thread 0, as the caller's
+     *  struct may die first, and an inline call's, whose outputs a failing stream clears. */
     deferred_arguments_t delegated_arguments;
 
     /** The caller's outcome, which @c end_call finishes last. */
@@ -825,6 +826,11 @@ struct holding_call_t {
 
     /** The arena, cursor and transaction claims the call took, released first at its end. */
     std::array<claim_t*, 3> claims {};
+
+    /** The GPU executor's own claim the call took, released at its end, which its stream may
+     *  run. */
+    std::variant<std::monostate, cuda_executor_t::claim_t, hip_executor_t::claim_t, metal_executor_t::claim_t>
+        device_claim;
 
     /** The thread serving the call, its caller or pool thread 0 for a delegated one, empty while
      *  the executor is free, through the floor class's reference. */

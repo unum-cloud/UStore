@@ -237,8 +237,9 @@ ustore_status_t ustore_keys_view_to_arrow(ustore_keys_view_t keys, ustore_size_t
     void const* data = count ? static_cast<void const*>(keys.data) : no_rows_k;
     if (count > 1 && keys.stride != sizeof(ustore_key_t)) {
         // Strided keys, like the triples of edges, are copied dense behind the call's outputs
-        // under the claim
-        if (!arena->claim.take(arena)) return ustore_arena_export_close(arena), ustore_status_contended_k;
+        // under the claim, taken for this export's column alone, so a second export converting at
+        // once is refused rather than sharing it
+        if (!arena->claim.take(array)) return ustore_arena_export_close(arena), ustore_status_contended_k;
         auto* const dense = reinterpret_cast<ustore_key_t*>(arena->allocate(rows * sizeof(ustore_key_t)));
         for (std::size_t index = 0; dense && index != rows; ++index)
             dense[index] = strided_element(keys.data, keys.stride, index);
@@ -283,7 +284,7 @@ ustore_status_t ustore_strings_view_to_arrow(ustore_strings_view_t strings, usto
     if (!wide || end - first <= 0xFFFFFFFFull) {
         // A tape of the other width has its offsets converted behind the call's outputs, counted
         // from its first byte
-        if (!arena->claim.take(arena)) return ustore_arena_export_close(arena), ustore_status_contended_k;
+        if (!arena->claim.take(array)) return ustore_arena_export_close(arena), ustore_status_contended_k;
         void const* converted =
             wide
                 ? static_cast<void const*>(convert_offsets<std::uint32_t>(*arena, strings.data.u64_tape.offsets, rows))
@@ -312,7 +313,7 @@ ustore_status_t ustore_docs_column_view_to_arrow(ustore_docs_column_view_t const
     // every column takes the claim, as a boolean or text one copies its conversion past the outputs
     if (ustore_status_t const opened = ustore_arena_export_open(arena); opened != ustore_status_success_k)
         return opened;
-    if (!arena->claim.take(arena)) return ustore_arena_export_close(arena), ustore_status_contended_k;
+    if (!arena->claim.take(array)) return ustore_arena_export_close(arena), ustore_status_contended_k;
     std::array<void const*, 3> buffers {column->validities, column->scalars, nullptr};
     ustore_status_t status = ustore_status_success_k;
     if (rows && type == ustore_docs_field_type_bool_k) {

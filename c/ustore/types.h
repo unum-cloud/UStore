@@ -46,7 +46,9 @@
  *  A deferred call on a caller-exclusive executor returns once handed to the executor's thread 0,
  *  which runs it there, forks included, and finishes it, so polling alone sees it final. A deferred
  *  call on a caller-inclusive executor, whose threads need their caller, or on a VRAM executor,
- *  whose caller stages and feeds its devices, runs at submission and is final on return. Submission
+ *  whose caller stages and feeds its devices, runs at submission and is final on return, except
+ *  that a call an NVIDIA or AMD device serves through its host verb returns once its copies are
+ *  queued, and its stream finishes it once they ran, with no thread of the library's. Submission
  *  copies the structure; everything it points to must stay allocated and unchanged until the call
  *  is final, and @c outcome->status reads @c ustore_status_deferred_k until then.
  *

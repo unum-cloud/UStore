@@ -66,7 +66,7 @@ struct tape_t {
 /** What the HIP stand-in counted, read through the library the runtime opened. */
 struct fake_hip_counters_t {
     std::size_t allocations, frees, managed_allocations, fills, uploads, downloads, registrations, unregistrations,
-        waits, pointer_queries, stream_creations, stream_destructions;
+        waits, pointer_queries, stream_creations, stream_destructions, callbacks;
 };
 
 /** The stand-in's counters, or null when the real runtime or none is loaded. */
@@ -800,7 +800,10 @@ fake_hip_counters_t counted_since(fake_hip_counters_t const& before, fake_hip_co
             after.registrations - before.registrations,
             after.unregistrations - before.unregistrations,
             after.waits - before.waits,
-            after.pointer_queries - before.pointer_queries};
+            after.pointer_queries - before.pointer_queries,
+            after.stream_creations - before.stream_creations,
+            after.stream_destructions - before.stream_destructions,
+            after.callbacks - before.callbacks};
 }
 
 void print_counted(char const* label, fake_hip_counters_t const& counted) {
@@ -841,7 +844,8 @@ case_result_t test_vram_warm_calls(std::size_t ordinal, ustore_gpu_device_t list
         if (!counters) continue;
         if (repeat == 0) print_counted("cold blobs.read", cold), print_counted("warm blobs.read", warm);
         expect_true(warm.uploads == 4);
-        expect_true(warm.waits == 1);
+        // The stream ends the call through its callback, so the host waits on no stream
+        expect_true(warm.waits == 0 && warm.callbacks == 1);
         expect_true(warm.allocations == 0);
         expect_true(warm.registrations == 0);
         expect_true(warm.frees == 0);
@@ -849,8 +853,74 @@ case_result_t test_vram_warm_calls(std::size_t ordinal, ustore_gpu_device_t list
     }
     if (!counters) return case_result_t::skipped(needs_hip_stand_in_k);
     expect_true(cold.uploads == 4);
-    expect_true(cold.waits == 1);
+    expect_true(cold.waits == 0 && cold.callbacks == 1);
     expect_true(cold.allocations >= 1);
+    return {};
+}
+
+/** A deferred read served through the host verb is still deferred once submitted, while the
+ *  stream holds the callback ending it, and final once the stream drains: failed with its outputs
+ *  null when the queued work fails, and otherwise holding the values, after which its executor is
+ *  freed at once, as nothing of the call touches it past its end. The stand-in's device memory is
+ *  the host's, so the outputs read in place. */
+case_result_t test_vram_streams_end_deferred_reads(std::size_t ordinal, ustore_gpu_device_t listed, config_t config) {
+    using hold_t = void (*)(int);
+    using drain_t = void (*)(int);
+    hold_t hold = nullptr;
+    drain_t drain = nullptr;
+    util::shared_library_t const runtime = util::shared_library_t::open("libamdhip64.so");
+    if (listed.vendor != ustore_gpu_vendor_amd_k || !runtime.resolve("fake_hip_hold_callbacks", hold) ||
+        !runtime.resolve("fake_hip_drain", drain))
+        return case_result_t::skipped(needs_hip_stand_in_k);
+    fixture_t fixture {config, "streams_end_deferred_reads"};
+    if (!fixture.filled) return {};
+    std::array<std::int32_t, 1> const named {static_cast<std::int32_t>(ordinal)};
+    ustore_executor_t executor = nullptr;
+    ustore_arena_t arena = nullptr;
+    ustore_outcome_t outcome {};
+    ustore_executor_for_vram_t spawn {.executor = &executor,
+                                      .outcome = &outcome,
+                                      .vram = {.devices = named.data(), .devices_count = named.size()}};
+    ustore_executor_for_vram(&spawn);
+    if (!expect_success(outcome)) return {};
+    ustore_arena_init_t init {.arena = &arena, .executor = executor, .outcome = &outcome};
+    ustore_arena_init(&init);
+    if (!expect_success(outcome)) return ustore_executor_free(executor), case_result_t {};
+    ustore_octet_t const* presences = nullptr;
+    ustore_length_t const* lengths = nullptr;
+    ustore_strings_view_t values {};
+    ustore_blobs_read_t read {.database = fixture.database,
+                              .executor = executor,
+                              .outcome = &outcome,
+                              .completion = ustore_completion_deferred_k,
+                              .count = entries_k};
+    read.collections = {&fixture.blobs, 0}, read.keys = {fixture.keys.data(), sizeof(ustore_key_t)};
+    read.presences = &presences, read.lengths = &lengths, read.values = &values, read.arena = arena;
+    constexpr int failed_k = 1;
+    hold(1);
+    ustore_blobs_read(&read);
+    expect_true(ustore_outcome_status(&outcome) == ustore_status_deferred_k);
+    drain(failed_k);
+    expect_true(ustore_outcome_status(&outcome) == ustore_status_device_k);
+    expect_true(presences == nullptr && lengths == nullptr && values.data.u32_tape.offsets == nullptr);
+
+    ustore_blobs_read(&read);
+    expect_true(ustore_outcome_status(&outcome) == ustore_status_deferred_k);
+    drain(0);
+    hold(0);
+    if (expect_success(outcome) && expect_true(presences && lengths))
+        for (std::size_t index = 0; index != entries_k; ++index) {
+            std::string const expected = std::string(index % 7, 'v') + std::to_string(index + 1);
+            bool const wide = values.layout == ustore_strings_u64_tape_k;
+            std::uint64_t const offset = wide ? values.data.u64_tape.offsets[index]
+                                              : values.data.u32_tape.offsets[index];
+            ustore_byte_t const* const data = wide ? values.data.u64_tape.data : values.data.u32_tape.data;
+            expect_true((presences[index / 8] >> (index % 8)) & 1);
+            expect_true(lengths[index] == expected.size());
+            expect_true(std::string_view {reinterpret_cast<char const*>(data + offset), expected.size()} == expected);
+        }
+    expect_true(ustore_arena_free(arena) == ustore_status_success_k);
+    ustore_executor_free(executor);
     return {};
 }
 
@@ -1236,6 +1306,8 @@ int main(int argc, char** argv) {
         run_test_case((prefix + "reads").c_str(), test_vram_reads, ordinal, listed, config);
         run_test_case((prefix + "staging").c_str(), test_vram_staging, ordinal, listed, devices, config);
         run_test_case((prefix + "warm_calls").c_str(), test_vram_warm_calls, ordinal, listed, config);
+        run_test_case((prefix + "streams_end_deferred_reads").c_str(), test_vram_streams_end_deferred_reads, ordinal,
+                      listed, config);
         run_test_case((prefix + "frees_everything").c_str(), test_vram_frees_everything, ordinal, listed, config);
         run_test_case((prefix + "matching").c_str(), test_vram_matching,
                       std::vector<std::int32_t> {static_cast<std::int32_t>(ordinal)}, listed, config);

@@ -385,7 +385,7 @@ ustore_executor_free(executor);
 ### Inclusive and Exclusive Executors
 
 A pool is caller-inclusive when the thread that spawned it counts as one of its threads, and caller-exclusive when it only dispatches and waits.
-An inclusive pool needs its caller to run anything, so a deferred call on it runs at submission and is final when it returns.
+An inclusive pool needs its caller to run anything, so a deferred call on it runs at submission and is final when it returns, except that a VRAM call an NVIDIA or AMD device serves through its host verb returns once its copies are queued, and its stream finishes it.
 An exclusive pool, which every executor UStore spawns is, delegates a deferred call to its own first thread.
 So one manager thread in `int main()` can overlap a USearch RAM executor, a UStore NVMe executor and a UForm VRAM executor, giving each one deferred call and polling the three statuses, with no thread of its own per engine.
 
