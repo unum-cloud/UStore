@@ -42,10 +42,10 @@
 
 #include "ustore/blobs.h"
 #include "ustore/db.h"
+#include "ustore/types.hpp"           // `arena_t`
 #include "ustore/utilities/types.hpp" // `bytes_of`
 
 #include "dataset.h"
-#include "dataset.hpp" // `task_arena_t`
 #include "harness.hpp"
 
 namespace unum::ustore::bench {
@@ -272,14 +272,14 @@ void bench_docs_export(fu::pool_t& executor, tabular_t const& tabular, tabular_g
         sz::string_t output;
         if (!export_path(output, settings, "tabular_graph_docs", thread))
             return loop.skip("no memory for the output path");
+        auto [arena, arena_status] = arena_t::make();
+        if (arena_status.failed()) return loop.skip("no memory for the arena");
         ustore_outcome_t outcome {};
-        tools::task_arena_t const arena {nullptr, &outcome};
-        if (outcome.status != ustore_status_success_k) return loop.skip("no memory for the arena");
         for ([[maybe_unused]] std::size_t call : loop) {
             ustore_docs_export_t exporting {};
             exporting.database = tabular.database;
             exporting.outcome = &outcome;
-            exporting.arena = arena.get();
+            exporting.arena = arena.handle();
             exporting.collection = tabular.docs;
             exporting.path = util::bytes_of(output.view());
             exporting.max_batch_size = settings.memory_limit.value;
@@ -309,14 +309,14 @@ void bench_graph_export(fu::pool_t& executor, tabular_t const& tabular, tabular_
             for (std::size_t index = 0; index != name->size(); ++index)
                 if ((*name)[index] == '/') (*name)[index] = '_';
 
+        auto [arena, arena_status] = arena_t::make();
+        if (arena_status.failed()) return loop.skip("no memory for the arena");
         ustore_outcome_t outcome {};
-        tools::task_arena_t const arena {nullptr, &outcome};
-        if (outcome.status != ustore_status_success_k) return loop.skip("no memory for the arena");
         for ([[maybe_unused]] std::size_t call : loop) {
             ustore_graph_export_t exporting {};
             exporting.database = tabular.database;
             exporting.outcome = &outcome;
-            exporting.arena = arena.get();
+            exporting.arena = arena.handle();
             exporting.collection = tabular.graph;
             exporting.path = util::bytes_of(output.view());
             exporting.max_batch_size = settings.memory_limit.value;

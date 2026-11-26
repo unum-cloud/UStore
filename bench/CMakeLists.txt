@@ -19,7 +19,8 @@ target_link_libraries(ustore_bench_louvain PRIVATE ustore::static ustore::cpp fm
 add_executable(ustore_bench_docs_paths docs_paths.cpp)
 target_link_libraries(
     ustore_bench_docs_paths
-    PRIVATE smashtable::header
+    PRIVATE ustore::header
+            smashtable::header
             forkunion::cpp
             stringzilla::static
             yyjson

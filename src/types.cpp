@@ -330,12 +330,15 @@ nvme_media_shape_t nvme_media_shape(std::span<ustore_bytes_view_t const> paths) 
  *  disk under the paths answers at all. */
 std::size_t nvme_queue_depth(std::span<ustore_bytes_view_t const> paths, std::size_t threads) noexcept {
     // restated: USearch include/usearch/utilities/nvme_device.hpp:1256
+    st::vector<std::uint64_t> counted;
+    if (st::failed(counted.reserve(paths.size()))) return 0;
     std::size_t depth = 0;
-    for (std::size_t position = 0; position != paths.size(); ++position) {
-        nvme_media_shape_t const disk = disk_shape_of(paths[position]);
-        std::size_t earlier = 0;
-        while (earlier != position && disk_shape_of(paths[earlier]).device != disk.device) ++earlier;
-        if (!disk.device || !disk.fewest_queues || earlier != position) continue;
+    for (ustore_bytes_view_t const path : paths) {
+        nvme_media_shape_t const disk = disk_shape_of(path);
+        if (!disk.device || !disk.fewest_queues ||
+            std::find(counted.begin(), counted.end(), disk.device) != counted.end())
+            continue;
+        counted.push_back(st::assume_reserved, std::uint64_t {disk.device});
         depth += disk.tags / util::divide_round_up(threads, disk.fewest_queues);
     }
     return depth;
