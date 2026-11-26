@@ -146,10 +146,15 @@ type PagesInsertConfig struct {
 type Inserted struct {
 	keys  *C.ustore_key_t
 	count uint
+	arena arenaWrite
 }
 
 // Keys views the keys of the inserted elements in the arena, one per fragment.
-func (inserted Inserted) Keys() []Key { return keysAt(inserted.keys, 0, uint64(inserted.count)) }
+func (inserted Inserted) Keys() []Key {
+	inserted.arena.mustOpen()
+	defer inserted.arena.close()
+	return keysAt(inserted.keys, 0, uint64(inserted.count))
+}
 
 // PagesInsert parses one fragment per task into elements of the page keys names, reporting the key
 // every element ended up with into arena.
@@ -174,6 +179,7 @@ func (receiver storeReceiver[Handle]) pagesInsert(call *callWithResult[Inserted]
 		return err
 	}
 	arguments, inputs := stage[C.ustore_pages_insert_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	call.result.count = uint(len(keys))
 	*arguments = C.ustore_pages_insert_t{
 		database:       database,
@@ -467,6 +473,7 @@ func (receiver storeReceiver[Handle]) pagesRead(call *callWithResult[Values], co
 		return err
 	}
 	arguments, inputs := stage[C.ustore_pages_read_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	call.result.count = uint(len(keys))
 	*arguments = C.ustore_pages_read_t{
 		database:         database,
@@ -534,6 +541,7 @@ func (receiver storeReceiver[Handle]) pagesScan(call *callWithResult[Scanned], c
 		return err
 	}
 	arguments, inputs := stage[C.ustore_pages_scan_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	call.result.count = uint(count)
 	progress, state := call.progress(options.Progress)
 	*arguments = C.ustore_pages_scan_t{
@@ -663,6 +671,7 @@ func (on PagesCursorOn) next(call *callWithResult[Page], wanted uint, arena *Are
 		return nil, err
 	}
 	arguments := open[C.ustore_pages_cursor_next_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	*arguments = C.ustore_pages_cursor_next_t{
 		database: database,
 		executor: executor,
@@ -711,6 +720,7 @@ func (receiver storeReceiver[Handle]) pagesSample(call *callWithResult[Scanned],
 	}
 	count := tasks(collections)
 	arguments, inputs := stage[C.ustore_pages_sample_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	call.result.count = uint(count)
 	*arguments = C.ustore_pages_sample_t{
 		database:    database,
@@ -753,6 +763,7 @@ func (receiver storeReceiver[Handle]) pagesMeasure(call *callWithResult[Measurem
 		return err
 	}
 	arguments, inputs := stage[C.ustore_pages_measure_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	call.result.count = uint(count)
 	*arguments = C.ustore_pages_measure_t{
 		database:          database,

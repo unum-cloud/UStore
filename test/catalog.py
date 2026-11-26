@@ -109,6 +109,7 @@ def test_a_deferred_find_answers_once_waited(database, engine: str):
         missing = later.collection_find("nobody", arena)
         with pytest.raises(ustore.NotFoundError):
             missing.wait()
+        del arena, missing
 
 
 def test_a_deferred_list_answers_once_waited(database, engine: str):

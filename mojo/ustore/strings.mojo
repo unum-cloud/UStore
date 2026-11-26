@@ -56,6 +56,8 @@ from ustore.types import (
     _cross,
     _Crossing,
     _in_arena,
+    _close_read,
+    _open_read,
     _readable,
     _slot,
 )
@@ -112,10 +114,11 @@ struct StringRuns[origin: MutOrigin](Deferrable, Sized):
 
     def strings(self) raises Error -> Tape[Self.origin]:
         """Every run's strings end to end; run `i` spans entries `offsets()[i]` up to `offsets()[i + 1]`."""
-        var offsets = self.offsets()
-        return Tape[Self.origin](
-            self.arena, self.generation, self.written.strings, Int(offsets[self.count]) if self.count else 0
-        )
+        _open_read(self.arena, self.generation, "StringRuns.strings")
+        var offsets = _in_arena[UInt64, ImmUntrackedOrigin](self.written.offsets, self.count + 1)
+        var total = Int(offsets[self.count]) if self.count else 0
+        _close_read(self.arena)
+        return Tape[Self.origin](self.arena, self.generation, self.written.strings, total)
 
     def scores(ref self) raises Error -> Span[Float32, origin_of(self)]:
         """One score per listed string, empty unless weighted patterns asked for them."""

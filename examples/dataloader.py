@@ -10,6 +10,10 @@ A `batch_sampler` yields whole batches of keys, so it is mutually exclusive with
 
 Needs `torch` and the `ustore` bindings.
 Run with `python examples/dataloader.py`.
+
+File: examples/dataloader.py
+Author: Ash Vardanian
+Date: September 16, 2026
 """
 
 from collections.abc import Iterator
@@ -51,7 +55,7 @@ class CollectionDataset:
 
     def __len__(self) -> int:
         """How many pairs the collection holds, which the engine measures without listing them."""
-        return self.database.measure(KEY_MIN, KEY_MAX, ustore.Arena(), collection=self.collection).min_cardinality
+        return self.database.measure(KEY_MIN, KEY_MAX, collection=self.collection).min_cardinality
 
 
 class CollectionSampler(Sampler):

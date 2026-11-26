@@ -241,6 +241,7 @@ inline ustore_arena_handle_t* claim_arena(call_t& call, ustore_arena_t arena,
             call.refuse(ustore_status_invalid_argument_k, "Input lies inside the arena the call rewinds");
             return nullptr;
         }
+    arena->generation.fetch_add(1, std::memory_order_relaxed);
     arena->rewind();
     return arena;
 }

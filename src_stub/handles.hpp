@@ -160,6 +160,9 @@ struct ustore_arena_handle_t {
     /** Views of the arena's outputs handed to consumers and not yet closed. */
     named_calls_t exports {0};
 
+    /** Calls that took the arena and found no export open, each advancing it once as it starts. */
+    std::atomic<std::uint64_t> generation {0};
+
     /** The executor the arena was made with, which counts it until its free. */
     ustore_executor_t executor = nullptr;
 

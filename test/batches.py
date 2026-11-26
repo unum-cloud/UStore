@@ -349,6 +349,7 @@ def test_progress_runs_on_the_executors_threads(populated, blobs, unraisable, en
         failing = later.scan_batch(KEYS, 1, arena, progress=lambda finished, total: finished / 0, collection=blobs)
         with pytest.raises(ustore.CancelledError):
             failing.wait()
+        del arena, failing
     assert reporters
     assert threading.get_ident() not in reporters
     assert [report.exc_type for report in unraisable] == [ZeroDivisionError]

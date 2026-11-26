@@ -256,9 +256,7 @@ static PyObject* Collection_sample(Collection* self, PyObject* wanted_object) {
                                    "sample() and then read() on the deferred view") != 0)
         return NULL;
 
-    PyObject* const drawing = ustore_py_arena_new(context.executor);
-    PyObject* const drawn = drawing ? ustore_py_keys_sample(&context, &options, held, wanted, drawing) : NULL;
-    Py_XDECREF(drawing);
+    PyObject* const drawn = ustore_py_keys_sample(&context, &options, held, wanted, Py_None);
     if (!drawn) return NULL;
     // The tape of the draw exports as 16-byte keys, which the read views in place from
     // the other arena
@@ -266,53 +264,56 @@ static PyObject* Collection_sample(Collection* self, PyObject* wanted_object) {
     ustore_py_verb_t const* const verb = documents ? &ustore_py_docs_read_drawn_verb : &ustore_py_read_drawn_verb;
     ustore_py_read_call_t call;
     ustore_py_call_open(&context, verb, &call);
-    PyObject* const reading = ustore_py_arena_new(context.executor);
     PyObject* values = NULL;
-    if (!reading || ustore_py_keys_from_object(drawn, ustore_py_context_executor(&context), &call.keys) != 0)
+    if (ustore_py_keys_from_object(drawn, ustore_py_context_executor(&context), &call.keys) != 0)
         values = ustore_py_call_discard(&context, verb, &call);
     else if (documents)
-        values = ustore_py_docs_read(&context, &options, ustore_docs_field_type_json_k, verb, &call, reading);
-    else values = ustore_py_values_read(&context, &options, verb, &call, reading);
-    Py_XDECREF(reading);
+        values = ustore_py_docs_read(&context, &options, ustore_docs_field_type_json_k, verb, &call, Py_None);
+    else values = ustore_py_values_read(&context, &options, verb, &call, Py_None);
     Py_DECREF(drawn);
     return values;
 }
 
-static char const doc_Collection_sample_keys[] =                                               //
-    "sample_keys(wanted, arena) answers a Keys tape of up to `wanted` keys drawn at random.\n" //
-    "\n"                                                                                       //
-    "Args:\n"                                                                                  //
-    "  wanted (int): Most keys to draw.\n"                                                     //
-    "  arena (Arena): Where the keys land, rewound by this call.\n"                            //
-    "Returns:\n"                                                                               //
+static char const doc_Collection_sample_keys[] =                                                    //
+    "sample_keys(wanted, arena=None) answers a Keys tape of up to `wanted` keys drawn at random.\n" //
+    "\n"                                                                                            //
+    "Args:\n"                                                                                       //
+    "  wanted (int): Most keys to draw.\n"                                                          //
+    "  arena (Arena, optional): Where the keys land, rewound by this call.\n"                       //
+    "Returns:\n"                                                                                    //
     "  Keys: One run of keys, in no particular order.";
 
 static PyObject* Collection_sample_keys(Collection* self, PyObject* const* arguments,
                                         Py_ssize_t positional_arguments_count) {
-    if (ustore_py_keyword_names_count_checked("sample_keys", positional_arguments_count, NULL, 2) < 0) return NULL;
+    if (ustore_py_keyword_names_count_checked("sample_keys", positional_arguments_count, NULL,
+                                              ustore_py_arena_positional(positional_arguments_count, 2)) < 0)
+        return NULL;
     size_t wanted = 0;
     if (ustore_py_size_from_object(arguments[0], "wanted", &wanted) != 0) return NULL;
     ustore_py_context_t context;
     ustore_py_verb_options_t options;
     ustore_modality_t held = ustore_modality_blobs_k;
     if (collection_found(self, &context, &options, &held) != 0) return NULL;
-    return ustore_py_keys_sample(&context, &options, held, wanted, arguments[1]);
+    return ustore_py_keys_sample(&context, &options, held, wanted,
+                                 positional_arguments_count > 1 ? arguments[1] : NULL);
 }
 
-static char const doc_Collection_scan[] =                                                   //
-    "scan(start, wanted, arena) answers a Keys tape of up to `wanted` keys from `start`.\n" //
-    "\n"                                                                                    //
-    "Scans the keys of blobs, the documents or the vertices, as the collection holds.\n"    //
-    "\n"                                                                                    //
-    "Args:\n"                                                                               //
-    "  start (KeyLike): The smallest key the scan may return.\n"                            //
-    "  wanted (int): Most keys the scan returns.\n"                                         //
-    "  arena (Arena): Where the keys land, rewound by this call.\n"                         //
-    "Returns:\n"                                                                            //
+static char const doc_Collection_scan[] =                                                        //
+    "scan(start, wanted, arena=None) answers a Keys tape of up to `wanted` keys from `start`.\n" //
+    "\n"                                                                                         //
+    "Scans the keys of blobs, the documents or the vertices, as the collection holds.\n"         //
+    "\n"                                                                                         //
+    "Args:\n"                                                                                    //
+    "  start (KeyLike): The smallest key the scan may return.\n"                                 //
+    "  wanted (int): Most keys the scan returns.\n"                                              //
+    "  arena (Arena, optional): Where the keys land, rewound by this call.\n"                    //
+    "Returns:\n"                                                                                 //
     "  Keys: One run of keys, in ascending order.";
 
 static PyObject* Collection_scan(Collection* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count) {
-    if (ustore_py_keyword_names_count_checked("scan", positional_arguments_count, NULL, 3) < 0) return NULL;
+    if (ustore_py_keyword_names_count_checked("scan", positional_arguments_count, NULL,
+                                              ustore_py_arena_positional(positional_arguments_count, 3)) < 0)
+        return NULL;
     ustore_key_t start = {0};
     size_t wanted = 0;
     if (ustore_py_key_from_object(arguments[0], &start) != 0) return NULL;
@@ -321,7 +322,8 @@ static PyObject* Collection_scan(Collection* self, PyObject* const* arguments, P
     ustore_py_verb_options_t options;
     ustore_modality_t held = ustore_modality_blobs_k;
     if (collection_found(self, &context, &options, &held) != 0) return NULL;
-    return ustore_py_keys_scan(&context, &options, held, &start, wanted, ustore_scan_ordered_k, NULL, arguments[2]);
+    return ustore_py_keys_scan(&context, &options, held, &start, wanted, ustore_scan_ordered_k, NULL,
+                               positional_arguments_count > 2 ? arguments[2] : NULL);
 }
 
 static char const doc_Collection[] =                                                           //
@@ -466,11 +468,7 @@ static PyObject* BlobsView_subscript(CollectionView* self, PyObject* key) {
     ustore_py_read_call_t* const call = collection_view_read_open(self, key, ustore_modality_blobs_k, verb, &context,
                                                                   &options, &stack);
     if (!call) return NULL;
-    PyObject* const arena = ustore_py_arena_new(context.executor);
-    if (!arena) return ustore_py_call_discard(&context, verb, call);
-    PyObject* const answer = ustore_py_values_read(&context, &options, verb, call, arena);
-    Py_DECREF(arena);
-    return answer;
+    return ustore_py_values_read(&context, &options, verb, call, Py_None);
 }
 
 static int BlobsView_ass_subscript(CollectionView* self, PyObject* key, PyObject* value) {
@@ -514,11 +512,7 @@ static PyObject* docs_view_read(CollectionView* self, PyObject* key, ustore_py_v
     ustore_py_read_call_t* const call = collection_view_read_open(self, key, ustore_modality_docs_k, verb, &context,
                                                                   &options, &stack);
     if (!call) return NULL;
-    PyObject* const arena = ustore_py_arena_new(context.executor);
-    if (!arena) return ustore_py_call_discard(&context, verb, call);
-    PyObject* const answer = ustore_py_docs_read(&context, &options, ustore_docs_field_type_json_k, verb, call, arena);
-    Py_DECREF(arena);
-    return answer;
+    return ustore_py_docs_read(&context, &options, ustore_docs_field_type_json_k, verb, call, Py_None);
 }
 
 /** Writes documents under @p key, spelled as @p spelling says, or removes them when @p documents is NULL. */

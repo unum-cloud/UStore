@@ -3,8 +3,8 @@
 Rows are documents addressed by their keys, which a frame indexes as `uuid.UUID`, and columns are
 fields: top-level keys, or JSON Pointers such as `/user/name` for nested values. A column given a
 dtype is gathered into typed memory and handed to Pandas without a copy where every value is valid,
-while a column without one is decoded from JSON. Every call reads into a one-off `Arena`, which a
-gathered column keeps alive for as long as Pandas holds it. Verbs that change columns, such as
+while a column without one is decoded from JSON. Every call reads into a fresh arena its result
+owns, which a gathered column keeps alive for as long as Pandas holds it. Verbs that change columns, such as
 assignment, `update`, `drop`, `rename` and `merge_from`, write through to the store instead of
 answering a changed copy.
 
@@ -25,7 +25,7 @@ import numpy as np
 import pandas
 
 from ustore.keys import PAGE_KEYS, KeyLike, as_key, scan_keys
-from ustore.lib import Arena, Columns, Database, FieldType, Modality, Modification, On, Transaction
+from ustore.lib import Columns, Database, FieldType, Modality, Modification, On, Transaction
 
 type Receiver = Database | Transaction | On
 
@@ -219,7 +219,7 @@ class Table:
             return list(self.selected_columns)
         found: dict[str, None] = {}
         for page in batched(self.index, PAGE_KEYS):
-            pointers = self.view.docs_gist(page, Arena(), collection=self.collection)
+            pointers = self.view.docs_gist(page, collection=self.collection)
             found.update(dict.fromkeys(column_of(pointer) for pointer in pointers))
         return list(found)
 
@@ -264,7 +264,7 @@ class Table:
 
     def sample(self, count: int) -> Table:
         """A view of up to `count` documents drawn at random by the store."""
-        return self.derive(index=self.view.docs_sample(count, Arena(), collection=self.collection)[0])
+        return self.derive(index=self.view.docs_sample(count, collection=self.collection)[0])
 
     @property
     def loc(self) -> RowSelection:
@@ -282,7 +282,7 @@ class Table:
         typed = [column for column in columns if column in self.dtypes]
         if typed:
             types = [GATHER_TYPES[self.dtypes[column]] for column in typed]
-            gathered = self.view.docs_gather(keys, typed, types, Arena(), collection=self.collection)
+            gathered = self.view.docs_gather(keys, typed, types, collection=self.collection)
             for position, column in enumerate(typed):
                 data[column] = column_values(gathered, position, self.dtypes[column])
 
@@ -290,7 +290,7 @@ class Table:
         if untyped:
             documents = [
                 None if document is None else json.loads(bytes(document))
-                for document in self.view.docs_read(keys, Arena(), collection=self.collection)
+                for document in self.view.docs_read(keys, collection=self.collection)
             ]
             for column in untyped:
                 data[column] = [value_at(document, column) for document in documents]
@@ -371,7 +371,7 @@ class Table:
     def present_rows(self, column: str) -> tuple[list[UUID], list[bytes]]:
         """The keys of the rows holding `column`, and the JSON text of the value each holds."""
         keys = self.index
-        found = self.view.docs_read(keys, Arena(), field=column, collection=self.collection)
+        found = self.view.docs_read(keys, field=column, collection=self.collection)
         pairs = [(key, bytes(value)) for key, value in zip(keys, found, strict=True) if value is not None]
         return [key for key, _ in pairs], [value for _, value in pairs]
 
@@ -397,7 +397,7 @@ class Table:
     def merge_from(self, other: Table) -> None:
         """Merges every document of `other` into the document of the same key here, as RFC 7386 does."""
         keys = other.index
-        documents = other.view.docs_read(keys, Arena(), collection=other.collection)
+        documents = other.view.docs_read(keys, collection=other.collection)
         pairs = [(key, bytes(document)) for key, document in zip(keys, documents, strict=True) if document is not None]
         if pairs:
             merged_keys, merged_documents = zip(*pairs, strict=True)

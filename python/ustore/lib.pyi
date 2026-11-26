@@ -366,7 +366,7 @@ class DeviceError(Error):
 class InternalError(Error):
     """The engine failed in a way no other status names, which points at a defect."""
 
-class ContendedError(Error):
+class ContendedError(Error, BufferError):
     """The call was refused rather than waited for: an executor, an arena or a transaction serving another call, or an
     arena exporting a buffer; retry it once that one finishes or the buffer is released."""
 
@@ -383,15 +383,16 @@ class ReadOnlyError(Error):
 class Arena:
     """The memory every output whose length scales with a call lands in, rewound by the next call handed it.
 
-    Every verb whose outputs scale with the call takes one as its last positional argument and answers results
-    viewing it, valid until the next call naming it rewinds it; a result read after that reads whatever the arena then
-    holds, which nothing detects. A call naming it while another still fills it raises `ContendedError`, so each
-    deferred call in flight needs one of its own.
+    Every verb whose outputs scale with the call takes one as its last positional argument, or makes a fresh one its
+    result owns when given none, and answers results viewing it. The next call naming it rewinds it: an earlier result
+    read after that raises `ValueError`, and while a memoryview, DLPack capsule, Arrow array or CUDA Array Interface
+    read of a result lives, that call raises `ContendedError`, also a `BufferError`. A call naming it while another
+    still fills it raises `ContendedError` too, so each deferred call in flight needs one of its own.
     """
 
     def __init__(self, executor: Executor | None = None, /) -> None:
         """Makes an arena where `executor` computes, or host pages for calls on the calling thread without one; the
-        arena is freed before its executor closes."""
+        arena holds `executor`, whose threads are freed only once the arena and every result over it are gone."""
 
 class Values:
     """The values one batch read or cursor pull wrote into an `Arena`, viewing it until it rewinds, and a tape a write
@@ -518,7 +519,7 @@ class Cursor:
     exhausts the walk for good, whatever is written since."""
 
     def next(
-        self, wanted: int, arena: Arena, /, *, values: bool = False, progress: Progress | None = None
+        self, wanted: int, arena: Arena | None = None, /, *, values: bool = False, progress: Progress | None = None
     ) -> Page | list[tuple[Page, Columns]]:
         """The next page of up to `wanted` keys in `arena`, with their values when asked, pulled on the calling thread,
         or for a walk over documents its batches of up to `wanted` rows in all, each its keys and the columns the
@@ -543,7 +544,7 @@ class CursorOn:
     """A `Cursor` whose pulls block on one executor, answered by `Cursor.on`."""
 
     def next(
-        self, wanted: int, arena: Arena, /, *, values: bool = False, progress: Progress | None = None
+        self, wanted: int, arena: Arena | None = None, /, *, values: bool = False, progress: Progress | None = None
     ) -> Page | list[tuple[Page, Columns]]:
         """What `Cursor.next` answers, pulled on the executor."""
 
@@ -552,7 +553,7 @@ class ChangesCursor:
     """A feed of the changes committed to one collection after a stamp, oldest first, which pins that stamp and
     resumes every pull past the last change the pull before it handed out."""
 
-    def next(self, wanted: int, arena: Arena, /, *, values: bool = False) -> Changes:
+    def next(self, wanted: int, arena: Arena | None = None, /, *, values: bool = False) -> Changes:
         """The next up to `wanted` changes in `arena`, with the bytes every one holds when asked; an empty pull
         reached the newest commit."""
 
@@ -655,10 +656,10 @@ class Collection:
     def sample(self, wanted: int, /) -> dict[UUID, bytes | None]:
         """Up to `wanted` keys drawn at random onto copies of their values, through one-off arenas."""
 
-    def sample_keys(self, wanted: int, arena: Arena, /) -> Keys:
+    def sample_keys(self, wanted: int, arena: Arena | None = None, /) -> Keys:
         """Up to `wanted` keys drawn at random."""
 
-    def scan(self, start: KeyLike, wanted: int, arena: Arena, /) -> Keys:
+    def scan(self, start: KeyLike, wanted: int, arena: Arena | None = None, /) -> Keys:
         """Up to `wanted` keys from `start` upwards."""
 
     def __arrow_c_stream__(self, requested_schema: object | None = None) -> object:
@@ -775,7 +776,9 @@ class Executor:
         """Waits until no call holds the executor, then parks its threads or keeps them spinning."""
 
     def close(self) -> None:
-        """Waits until no call holds the executor, then frees the threads."""
+        """Stops the executor serving verbs, which then raise `UninitializedError`, and never raises; closing twice is
+        safe, as is leaving a `with` block. The threads are freed once the last arena, result and receiver holding
+        the executor is gone, so results stay readable."""
     def __enter__(self) -> Self: ...
     def __exit__(
         self,
@@ -981,7 +984,7 @@ class _Reads:
     def read(
         self,
         keys: KeysLike,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -995,7 +998,7 @@ class _Reads:
         Args:
           keys (Sequence[KeyLike] | buffer): The keys to read, as a sequence, a contiguous
             buffer of 16-byte keys, which is read in place, or one of 64-bit integers.
-          arena (Arena): Where the tape lands, rewound by this call.
+          arena (Arena, optional): Where the tape lands, rewound by this call.
           collection (UUID | str): The collection, by identifier or by name.
           offset (int, optional): Byte of every value the read starts at, where an offset
             past the end reads empty.
@@ -1076,7 +1079,7 @@ class _Reads:
         self,
         start: KeyLike | None,
         wanted: int,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -1097,7 +1100,7 @@ class _Reads:
           start (KeyLike | None): The first key the scan may return, or None for the first
             key in its direction.
           wanted (int): Most keys the scan returns.
-          arena (Arena): Where the keys land, rewound by this call.
+          arena (Arena, optional): Where the keys land, rewound by this call.
           collection (UUID | str): The collection, by identifier or by name.
           end (KeyLike, optional): The key the scan stops before, or None for no bound.
           direction (ScanDirection, optional): `ScanDirection.DESCENDING` walks down from
@@ -1115,7 +1118,7 @@ class _Reads:
         self,
         starts: KeysLike,
         wanted: int,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -1130,24 +1133,26 @@ class _Reads:
         predicate: Predicate | None = None,
     ) -> Keys:
         """One scan per start, reporting the scans finished to `progress`."""
-    def sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Keys:
+    def sample(self, wanted: int, arena: Arena | None = None, /, *, collection: CollectionLike) -> Keys:
         """Draws keys uniformly at random from one collection, which is how a workload picks
         entries it has no list of.
 
         Args:
           wanted (int): Most keys to draw.
-          arena (Arena): Where the keys land, rewound by this call.
+          arena (Arena, optional): Where the keys land, rewound by this call.
           collection (UUID | str): The collection, by identifier or by name.
         Returns:
           Keys: One run of keys, in no particular order.
         """
-    def sample_batch(self, count: int, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Keys:
+    def sample_batch(
+        self, count: int, wanted: int, arena: Arena | None = None, /, *, collection: CollectionLike
+    ) -> Keys:
         """`count` samples of up to `wanted` keys each, all drawn from the one collection named."""
     def measure(
         self,
         start: KeyLike | None,
         end: KeyLike | None,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -1160,7 +1165,7 @@ class _Reads:
           start (KeyLike | None): First key of the range, or None for the first key in the
             direction.
           end (KeyLike | None): The key the range stops before, or None for no bound.
-          arena (Arena): Where the bounds land before they are copied out, rewound by this
+          arena (Arena, optional): Where the bounds land before they are copied out, rewound by this
             call.
           collection (UUID | str): The collection, by identifier or by name.
           direction (ScanDirection, optional): `ScanDirection.DESCENDING` ranges down from
@@ -1172,7 +1177,7 @@ class _Reads:
     def docs_read(
         self,
         keys: KeysLike,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -1184,7 +1189,7 @@ class _Reads:
 
         Args:
           keys (Sequence[KeyLike] | buffer): The keys to read.
-          arena (Arena): Where the tape lands, rewound by this call.
+          arena (Arena, optional): Where the tape lands, rewound by this call.
           collection (UUID | str): The collection, by identifier or by name.
           field (str, optional): A top-level key or a JSON Pointer to read inside every
             document; None reads whole documents.
@@ -1193,13 +1198,15 @@ class _Reads:
         Returns:
           Values: One entry per key, None where the document or the field is absent.
         """
-    def docs_gist(self, keys: KeysLike, arena: Arena, /, *, collection: CollectionLike) -> tuple[str, ...]:
+    def docs_gist(
+        self, keys: KeysLike, arena: Arena | None = None, /, *, collection: CollectionLike
+    ) -> tuple[str, ...]:
         """Lists every distinct path to a leaf across the requested documents, in the order they
         were first met, which is how a table learns the columns its documents hold.
 
         Args:
           keys (Sequence[KeyLike] | buffer): The documents to inspect.
-          arena (Arena): Where the paths land before they are copied out, rewound by this
+          arena (Arena, optional): Where the paths land before they are copied out, rewound by this
             call.
           collection (UUID | str): The collection, by identifier or by name.
         Returns:
@@ -1210,7 +1217,7 @@ class _Reads:
         keys: KeysLike,
         fields: Sequence[str],
         outputs_types: FieldType | Sequence[FieldType],
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -1226,7 +1233,7 @@ class _Reads:
             `FieldType.UUID`, `FieldType.STRING` or `FieldType.BINARY`. A `FieldType.F16`
             column exports as a half-precision view NumPy reads as float16, and a
             `FieldType.UUID` column as sixteen bytes per document.
-          arena (Arena): Where the columns land, rewound by this call.
+          arena (Arena, optional): Where the columns land, rewound by this call.
           collection (UUID | str): The collection, by identifier or by name.
         Returns:
           Columns: One column per field, each holding one entry per document.
@@ -1235,7 +1242,7 @@ class _Reads:
         self,
         start: KeyLike | None,
         wanted: int,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -1253,7 +1260,7 @@ class _Reads:
           start (KeyLike | None): The first key the scan may return, or None for the first
             key in its direction.
           wanted (int): Most keys the scan returns.
-          arena (Arena): Where the keys land, rewound by this call.
+          arena (Arena, optional): Where the keys land, rewound by this call.
           collection (UUID | str): The docs collection, by identifier or by name.
           end (KeyLike, optional): The key the scan stops before, or None for no bound.
           direction (ScanDirection, optional): Which way the scan walks, as `scan` takes it.
@@ -1265,13 +1272,13 @@ class _Reads:
         Raises:
           CancelledError: The progress callable stopped the scan.
         """
-    def docs_sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Keys:
+    def docs_sample(self, wanted: int, arena: Arena | None = None, /, *, collection: CollectionLike) -> Keys:
         """Up to `wanted` document keys drawn at random, which a `docs_read` or a `docs_gather` follows."""
     def docs_measure(
         self,
         start: KeyLike | None,
         end: KeyLike | None,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -1279,14 +1286,14 @@ class _Reads:
     ) -> Measurement:
         """Bounds on what a range of document keys holds, as `measure` reads them for blobs."""
     def strings_read(
-        self, strings: TextsLike, arena: Arena, /, *, collection: CollectionLike
+        self, strings: TextsLike, arena: Arena | None = None, /, *, collection: CollectionLike
     ) -> tuple[UUID | None, ...]:
         """the key of every string, or None for a string the strings collection does not hold."""
     def strings_scan(
         self,
         prefix: str | bytes | None,
         wanted: int,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -1295,13 +1302,15 @@ class _Reads:
         direction: ScanDirection = ScanDirection.ASCENDING,
     ) -> tuple[str, ...]:
         """up to `wanted` strings starting with `prefix`, in the order of their bytes."""
-    def strings_sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> tuple[str, ...]:
+    def strings_sample(
+        self, wanted: int, arena: Arena | None = None, /, *, collection: CollectionLike
+    ) -> tuple[str, ...]:
         """up to `wanted` strings drawn at random."""
     def strings_measure(
         self,
         start: str | bytes | None,
         end: str | bytes | None,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -1311,7 +1320,7 @@ class _Reads:
     def pages_read(
         self,
         keys: KeyLike | KeysLike,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -1324,7 +1333,7 @@ class _Reads:
         self,
         start: KeyLike | None,
         wanted: int,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -1336,13 +1345,13 @@ class _Reads:
         predicate: Predicate | None = None,
     ) -> Keys:
         """Up to `wanted` page keys from `start`, keeping those holding a node of the XPath `filter`."""
-    def pages_sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Keys:
+    def pages_sample(self, wanted: int, arena: Arena | None = None, /, *, collection: CollectionLike) -> Keys:
         """Up to `wanted` page keys drawn at random, which a `pages_read` follows."""
     def pages_measure(
         self,
         start: KeyLike | None,
         end: KeyLike | None,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -1350,14 +1359,14 @@ class _Reads:
     ) -> Measurement:
         """Bounds on what a range of page keys holds, as `measure` reads them for blobs."""
     def graph_read_edges(
-        self, vertices: KeysLike, arena: Arena, /, *, role: Role = Role.ANY, collection: CollectionLike
+        self, vertices: KeysLike, arena: Arena | None = None, /, *, role: Role = Role.ANY, collection: CollectionLike
     ) -> Neighborhoods:
         """Reads every edge a batch of vertices takes part in. The edges of one vertex come sorted
         by neighbour; with both roles the outgoing ones precede the incoming ones.
 
         Args:
           vertices (Sequence[KeyLike] | buffer): The vertices whose edges are read.
-          arena (Arena): Where the degrees and the edges land, rewound by this call.
+          arena (Arena, optional): Where the degrees and the edges land, rewound by this call.
           role (Role, optional): `Role.SOURCE` for the edges a vertex leaves by, `Role.TARGET`
             for those it is entered by, or `Role.ANY` for both, which is how an undirected
             graph asks.
@@ -1367,13 +1376,13 @@ class _Reads:
           absent.
         """
     def graph_degrees(
-        self, vertices: KeysLike, arena: Arena, /, *, role: Role = Role.ANY, collection: CollectionLike
+        self, vertices: KeysLike, arena: Arena | None = None, /, *, role: Role = Role.ANY, collection: CollectionLike
     ) -> tuple[int | None, ...]:
         """Counts the edges of a batch of vertices without exporting them.
 
         Args:
           vertices (Sequence[KeyLike] | buffer): The vertices whose edges are counted.
-          arena (Arena): Where the degrees land before they are copied out, rewound by this
+          arena (Arena, optional): Where the degrees land before they are copied out, rewound by this
             call.
           role (Role, optional): The role of every vertex, as `graph_read_edges` takes it.
           collection (UUID | str): The graph collection, by identifier or by name.
@@ -1386,7 +1395,7 @@ class _Reads:
         self,
         start: KeyLike | None,
         wanted: int,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -1403,7 +1412,7 @@ class _Reads:
           start (KeyLike | None): The first vertex the scan may return, or None for the first
             vertex in its direction.
           wanted (int): Most vertices the scan returns.
-          arena (Arena): Where the vertices land, rewound by this call.
+          arena (Arena, optional): Where the vertices land, rewound by this call.
           collection (UUID | str): The graph collection, by identifier or by name.
           end (KeyLike, optional): The vertex the scan stops before, or None for no bound.
           direction (ScanDirection, optional): Which way the scan walks, as `scan` takes it.
@@ -1415,13 +1424,13 @@ class _Reads:
         Raises:
           CancelledError: The progress callable stopped the scan.
         """
-    def graph_sample_vertices(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Keys:
+    def graph_sample_vertices(self, wanted: int, arena: Arena | None = None, /, *, collection: CollectionLike) -> Keys:
         """Up to `wanted` vertices drawn at random, those without edges included."""
     def graph_measure_vertices(
         self,
         start: KeyLike | None,
         end: KeyLike | None,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -1869,16 +1878,18 @@ class Database(_Writes, _Receivers):
     def collection_create(self, name: str, *, modality: Modality) -> UUID:
         """Creates an empty collection holding `modality` and records the name for it, which may not start with `_`."""
 
-    def collection_find(self, name: str, arena: Arena, /) -> UUID:
+    def collection_find(self, name: str, arena: Arena | None = None, /) -> UUID:
         """The collection ID the name addresses."""
 
     def collection_contains(self, name: str) -> bool:
         """Whether a collection holds the name, read into a one-off arena."""
 
-    def collection_list(self, arena: Arena, /) -> tuple[UUID, ...]:
+    def collection_list(self, arena: Arena | None = None, /) -> tuple[UUID, ...]:
         """The IDs of every collection, never a system one."""
 
-    def collection_names(self, arena: Arena, /, *, after: str | None = None, limit: int = 1024) -> tuple[str, ...]:
+    def collection_names(
+        self, arena: Arena | None = None, /, *, after: str | None = None, limit: int = 1024
+    ) -> tuple[str, ...]:
         """One page of the names recorded for collections, in the order of their text."""
 
     def collection_drop(self, collection: UUID | str, mode: DropMode = DropMode.COLLECTION) -> None:
@@ -1911,10 +1922,10 @@ class Snapshot(_Reads, _Receivers):
         """Writes the snapshot out as a new database of the same engine, holding exactly the collections it records,
         reporting the bytes of keys and values saved; a cancelled save removes what it wrote."""
 
-    def collection_find(self, name: str, arena: Arena, /) -> UUID:
+    def collection_find(self, name: str, arena: Arena | None = None, /) -> UUID:
         """The collection ID the name addresses at this snapshot."""
 
-    def collection_list(self, arena: Arena, /) -> tuple[UUID, ...]:
+    def collection_list(self, arena: Arena | None = None, /) -> tuple[UUID, ...]:
         """The IDs of every collection at this snapshot, never a system one."""
 
     def close(self) -> None:
@@ -2002,10 +2013,10 @@ class On(_Writes, _Receivers):
     def describe(self) -> Description:
         """Describes the database on the executor, refusing a view of a transaction or a snapshot."""
 
-    def collection_find(self, name: str, arena: Arena, /) -> UUID:
+    def collection_find(self, name: str, arena: Arena | None = None, /) -> UUID:
         """The collection ID the name addresses, at the snapshot of a snapshot and at the head otherwise."""
 
-    def collection_list(self, arena: Arena, /) -> tuple[UUID, ...]:
+    def collection_list(self, arena: Arena | None = None, /) -> tuple[UUID, ...]:
         """The IDs of every collection, at the snapshot of a snapshot and at the head otherwise."""
 
 class DeferredOn:
@@ -2048,7 +2059,7 @@ class DeferredOn:
     def read(
         self,
         keys: KeysLike,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -2064,7 +2075,7 @@ class DeferredOn:
         Args:
           keys (Sequence[KeyLike] | buffer): The keys to read, as a sequence, a contiguous
             buffer of 16-byte keys, which is read in place, or one of 64-bit integers.
-          arena (Arena): Where the tape lands, rewound by this call.
+          arena (Arena, optional): Where the tape lands, rewound by this call.
           collection (UUID | str): The collection, by identifier or by name.
           offset (int, optional): Byte of every value the read starts at, where an offset
             past the end reads empty.
@@ -2087,7 +2098,7 @@ class DeferredOn:
         self,
         start: KeyLike | None,
         wanted: int,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -2111,7 +2122,7 @@ class DeferredOn:
           start (KeyLike | None): The first key the scan may return, or None for the first
             key in its direction.
           wanted (int): Most keys the scan returns.
-          arena (Arena): Where the keys land, rewound by this call.
+          arena (Arena, optional): Where the keys land, rewound by this call.
           collection (UUID | str): The collection, by identifier or by name.
           end (KeyLike, optional): The key the scan stops before, or None for no bound.
           direction (ScanDirection, optional): `ScanDirection.DESCENDING` walks down from
@@ -2130,7 +2141,7 @@ class DeferredOn:
         self,
         starts: KeysLike,
         wanted: int,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -2145,7 +2156,7 @@ class DeferredOn:
         predicate: Predicate | None = None,
     ) -> Deferred[Keys]:
         """The `Deferred` of one scan per start, whose `progress` runs on the executor's threads."""
-    def sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Deferred[Keys]:
+    def sample(self, wanted: int, arena: Arena | None = None, /, *, collection: CollectionLike) -> Deferred[Keys]:
         """sample(wanted, arena, *, collection) answers a Keys tape.
 
         Draws keys uniformly at random from one collection, which is how a workload picks
@@ -2153,13 +2164,15 @@ class DeferredOn:
 
         Args:
           wanted (int): Most keys to draw.
-          arena (Arena): Where the keys land, rewound by this call.
+          arena (Arena, optional): Where the keys land, rewound by this call.
           collection (UUID | str): The collection, by identifier or by name.
         Returns:
           Keys: One run of keys, in no particular order.
         """
 
-    def sample_batch(self, count: int, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Deferred[Keys]:
+    def sample_batch(
+        self, count: int, wanted: int, arena: Arena | None = None, /, *, collection: CollectionLike
+    ) -> Deferred[Keys]:
         """sample_batch(count, wanted, arena, *, collection) answers a Keys tape.
 
         Draws `count` independent samples in one call, all from the one collection named,
@@ -2168,7 +2181,7 @@ class DeferredOn:
         Args:
           count (int): Samples to draw.
           wanted (int): Most keys every sample draws.
-          arena (Arena): Where the keys land, rewound by this call.
+          arena (Arena, optional): Where the keys land, rewound by this call.
           collection (UUID | str): The one collection every sample draws from, by
             identifier or by name.
         Returns:
@@ -2179,7 +2192,7 @@ class DeferredOn:
         self,
         start: KeyLike | None,
         end: KeyLike | None,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -2195,7 +2208,7 @@ class DeferredOn:
           start (KeyLike | None): First key of the range, or None for the first key in the
             direction.
           end (KeyLike | None): The key the range stops before, or None for no bound.
-          arena (Arena): Where the bounds land before they are copied out, rewound by this
+          arena (Arena, optional): Where the bounds land before they are copied out, rewound by this
             call.
           collection (UUID | str): The collection, by identifier or by name.
           direction (ScanDirection, optional): `ScanDirection.DESCENDING` ranges down from
@@ -2208,7 +2221,7 @@ class DeferredOn:
     def docs_read(
         self,
         keys: KeysLike,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -2223,7 +2236,7 @@ class DeferredOn:
 
         Args:
           keys (Sequence[KeyLike] | buffer): The keys to read.
-          arena (Arena): Where the tape lands, rewound by this call.
+          arena (Arena, optional): Where the tape lands, rewound by this call.
           collection (UUID | str): The collection, by identifier or by name.
           field (str, optional): A top-level key or a JSON Pointer to read inside every
             document; None reads whole documents.
@@ -2233,7 +2246,9 @@ class DeferredOn:
           Values: One entry per key, None where the document or the field is absent.
         """
 
-    def docs_gist(self, keys: KeysLike, arena: Arena, /, *, collection: CollectionLike) -> Deferred[tuple[str, ...]]:
+    def docs_gist(
+        self, keys: KeysLike, arena: Arena | None = None, /, *, collection: CollectionLike
+    ) -> Deferred[tuple[str, ...]]:
         """docs_gist(keys, arena, *, collection) answers a tuple of JSON Pointers.
 
         Lists every distinct path to a leaf across the requested documents, in the order they
@@ -2241,7 +2256,7 @@ class DeferredOn:
 
         Args:
           keys (Sequence[KeyLike] | buffer): The documents to inspect.
-          arena (Arena): Where the paths land before they are copied out, rewound by this
+          arena (Arena, optional): Where the paths land before they are copied out, rewound by this
             call.
           collection (UUID | str): The collection, by identifier or by name.
         Returns:
@@ -2253,7 +2268,7 @@ class DeferredOn:
         keys: KeysLike,
         fields: Sequence[str],
         outputs_types: FieldType | Sequence[FieldType],
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -2271,7 +2286,7 @@ class DeferredOn:
             `FieldType.UUID`, `FieldType.STRING` or `FieldType.BINARY`. A `FieldType.F16`
             column exports as a half-precision view NumPy reads as float16, and a
             `FieldType.UUID` column as sixteen bytes per document.
-          arena (Arena): Where the columns land, rewound by this call.
+          arena (Arena, optional): Where the columns land, rewound by this call.
           collection (UUID | str): The collection, by identifier or by name.
         Returns:
           Columns: One column per field, each holding one entry per document.
@@ -2281,7 +2296,7 @@ class DeferredOn:
         self,
         start: KeyLike | None,
         wanted: int,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -2303,7 +2318,7 @@ class DeferredOn:
           start (KeyLike | None): The first key the scan may return, or None for the first
             key in its direction.
           wanted (int): Most keys the scan returns.
-          arena (Arena): Where the keys land, rewound by this call.
+          arena (Arena, optional): Where the keys land, rewound by this call.
           collection (UUID | str): The docs collection, by identifier or by name.
           end (KeyLike, optional): The key the scan stops before, or None for no bound.
           direction (ScanDirection, optional): Which way the scan walks, as `scan` takes it.
@@ -2316,7 +2331,7 @@ class DeferredOn:
           CancelledError: The progress callable stopped the scan.
         """
 
-    def docs_sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Deferred[Keys]:
+    def docs_sample(self, wanted: int, arena: Arena | None = None, /, *, collection: CollectionLike) -> Deferred[Keys]:
         """docs_sample(wanted, arena, *, collection) answers a Keys tape.
 
         Draws document keys uniformly at random from one collection, as `sample` draws the keys
@@ -2324,7 +2339,7 @@ class DeferredOn:
 
         Args:
           wanted (int): Most keys to draw.
-          arena (Arena): Where the keys land, rewound by this call.
+          arena (Arena, optional): Where the keys land, rewound by this call.
           collection (UUID | str): The docs collection, by identifier or by name.
         Returns:
           Keys: One run of keys, in no particular order.
@@ -2334,7 +2349,7 @@ class DeferredOn:
         self,
         start: KeyLike | None,
         end: KeyLike | None,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -2342,14 +2357,14 @@ class DeferredOn:
     ) -> Deferred[Measurement]:
         """The `Deferred` of bounds on what a range of document keys holds."""
     def strings_read(
-        self, strings: TextsLike, arena: Arena, /, *, collection: CollectionLike
+        self, strings: TextsLike, arena: Arena | None = None, /, *, collection: CollectionLike
     ) -> Deferred[tuple[UUID | None, ...]]:
         """The `Deferred` of the key of every string, or None for a string the strings collection does not hold."""
     def strings_scan(
         self,
         prefix: str | bytes | None,
         wanted: int,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -2358,13 +2373,15 @@ class DeferredOn:
         direction: ScanDirection = ScanDirection.ASCENDING,
     ) -> Deferred[tuple[str, ...]]:
         """The `Deferred` of up to `wanted` strings starting with `prefix`, in the order of their bytes."""
-    def strings_sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Deferred[tuple[str, ...]]:
+    def strings_sample(
+        self, wanted: int, arena: Arena | None = None, /, *, collection: CollectionLike
+    ) -> Deferred[tuple[str, ...]]:
         """The `Deferred` of up to `wanted` strings drawn at random."""
     def strings_measure(
         self,
         start: str | bytes | None,
         end: str | bytes | None,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -2375,7 +2392,7 @@ class DeferredOn:
     def pages_read(
         self,
         keys: KeyLike | KeysLike,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -2389,7 +2406,7 @@ class DeferredOn:
         self,
         start: KeyLike | None,
         wanted: int,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -2402,14 +2419,14 @@ class DeferredOn:
     ) -> Deferred[Keys]:
         """Up to `wanted` page keys from `start`, keeping those holding a node of the XPath `filter`."""
 
-    def pages_sample(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Deferred[Keys]:
+    def pages_sample(self, wanted: int, arena: Arena | None = None, /, *, collection: CollectionLike) -> Deferred[Keys]:
         """The `Deferred` of up to `wanted` page keys drawn at random."""
 
     def pages_measure(
         self,
         start: KeyLike | None,
         end: KeyLike | None,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -2418,7 +2435,7 @@ class DeferredOn:
         """The `Deferred` of bounds on what a range of page keys holds."""
 
     def graph_read_edges(
-        self, vertices: KeysLike, arena: Arena, /, *, role: Role = Role.ANY, collection: CollectionLike
+        self, vertices: KeysLike, arena: Arena | None = None, /, *, role: Role = Role.ANY, collection: CollectionLike
     ) -> Deferred[Neighborhoods]:
         """graph_read_edges(vertices, arena, *, role=Role.ANY, collection) answers Neighborhoods.
 
@@ -2427,7 +2444,7 @@ class DeferredOn:
 
         Args:
           vertices (Sequence[KeyLike] | buffer): The vertices whose edges are read.
-          arena (Arena): Where the degrees and the edges land, rewound by this call.
+          arena (Arena, optional): Where the degrees and the edges land, rewound by this call.
           role (Role, optional): `Role.SOURCE` for the edges a vertex leaves by, `Role.TARGET`
             for those it is entered by, or `Role.ANY` for both, which is how an undirected
             graph asks.
@@ -2438,7 +2455,7 @@ class DeferredOn:
         """
 
     def graph_degrees(
-        self, vertices: KeysLike, arena: Arena, /, *, role: Role = Role.ANY, collection: CollectionLike
+        self, vertices: KeysLike, arena: Arena | None = None, /, *, role: Role = Role.ANY, collection: CollectionLike
     ) -> Deferred[tuple[int | None, ...]]:
         """graph_degrees(vertices, arena, *, role=Role.ANY, collection) answers a tuple.
 
@@ -2446,7 +2463,7 @@ class DeferredOn:
 
         Args:
           vertices (Sequence[KeyLike] | buffer): The vertices whose edges are counted.
-          arena (Arena): Where the degrees land before they are copied out, rewound by this
+          arena (Arena, optional): Where the degrees land before they are copied out, rewound by this
             call.
           role (Role, optional): The role of every vertex, as `graph_read_edges` takes it.
           collection (UUID | str): The graph collection, by identifier or by name.
@@ -2471,7 +2488,7 @@ class DeferredOn:
         self,
         start: KeyLike | None,
         wanted: int,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -2492,7 +2509,7 @@ class DeferredOn:
           start (KeyLike | None): The first vertex the scan may return, or None for the first
             vertex in its direction.
           wanted (int): Most vertices the scan returns.
-          arena (Arena): Where the vertices land, rewound by this call.
+          arena (Arena, optional): Where the vertices land, rewound by this call.
           collection (UUID | str): The graph collection, by identifier or by name.
           end (KeyLike, optional): The vertex the scan stops before, or None for no bound.
           direction (ScanDirection, optional): Which way the scan walks, as `scan` takes it.
@@ -2505,14 +2522,16 @@ class DeferredOn:
           CancelledError: The progress callable stopped the scan.
         """
 
-    def graph_sample_vertices(self, wanted: int, arena: Arena, /, *, collection: CollectionLike) -> Deferred[Keys]:
+    def graph_sample_vertices(
+        self, wanted: int, arena: Arena | None = None, /, *, collection: CollectionLike
+    ) -> Deferred[Keys]:
         """The `Deferred` of up to `wanted` vertices drawn at random."""
 
     def graph_measure_vertices(
         self,
         start: KeyLike | None,
         end: KeyLike | None,
-        arena: Arena,
+        arena: Arena | None = None,
         /,
         *,
         collection: CollectionLike,
@@ -2520,7 +2539,7 @@ class DeferredOn:
     ) -> Deferred[Measurement]:
         """The `Deferred` of bounds on what a range of vertices holds."""
 
-    def collection_find(self, name: str, arena: Arena, /) -> Deferred[UUID]:
+    def collection_find(self, name: str, arena: Arena | None = None, /) -> Deferred[UUID]:
         """collection_find(name, arena) answers the identifier the name addresses.
 
         Reads the name at the snapshot of a snapshot, and at the head otherwise, since a
@@ -2528,7 +2547,7 @@ class DeferredOn:
 
         Args:
           name (str): The name to resolve.
-          arena (Arena): Where the lookup lands before it is copied out, rewound by this
+          arena (Arena, optional): Where the lookup lands before it is copied out, rewound by this
             call.
         Returns:
           UUID: The identifier addressing the collection.
@@ -2536,14 +2555,14 @@ class DeferredOn:
           NotFoundError: No collection holds the name.
         """
 
-    def collection_list(self, arena: Arena, /) -> Deferred[tuple[UUID, ...]]:
+    def collection_list(self, arena: Arena | None = None, /) -> Deferred[tuple[UUID, ...]]:
         """collection_list(arena) answers the identifiers of every collection.
 
         Lists the collections at the snapshot of a snapshot, and at the head otherwise.
         System collections are never listed, and collection_names answers the names.
 
         Args:
-          arena (Arena): Where the listing lands before it is copied out, rewound by this
+          arena (Arena, optional): Where the listing lands before it is copied out, rewound by this
             call.
         Returns:
           tuple[UUID, ...]: One identifier per collection.

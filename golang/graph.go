@@ -137,6 +137,7 @@ type Neighborhoods struct {
 	offsets *C.ustore_length_t
 	edges   *C.ustore_key_t
 	count   uint
+	arena   arenaWrite
 }
 
 // Len reports how many vertices the call read.
@@ -147,6 +148,8 @@ const vertexDegreeMissing = 0xFFFFFFFF
 
 // Degree reports how many edges vertex index connects to, and false for a missing vertex.
 func (neighborhoods Neighborhoods) Degree(index uint) (uint32, bool) {
+	neighborhoods.arena.mustOpen()
+	defer neighborhoods.arena.close()
 	degree := uint32(at(neighborhoods.degrees, index))
 	return degree, degree != vertexDegreeMissing
 }
@@ -154,6 +157,8 @@ func (neighborhoods Neighborhoods) Degree(index uint) (uint32, bool) {
 // Edges views the edges of vertex index in the arena: with both roles the outgoing ones first,
 // sorted by target, then the incoming ones, sorted by source.
 func (neighborhoods Neighborhoods) Edges(index uint) []Edge {
+	neighborhoods.arena.mustOpen()
+	defer neighborhoods.arena.close()
 	begin, end := at(neighborhoods.offsets, index), at(neighborhoods.offsets, index+1)
 	if neighborhoods.edges == nil || begin == end {
 		return nil
@@ -182,6 +187,7 @@ func (receiver storeReceiver[Handle]) graphReadEdges(call *callWithResult[Neighb
 		return err
 	}
 	arguments, inputs := stage[C.ustore_graph_read_edges_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	call.result.count = uint(len(vertices))
 	*arguments = C.ustore_graph_read_edges_t{
 		database:           database,
@@ -427,6 +433,7 @@ func (receiver storeReceiver[Handle]) graphScanVertices(call *callWithResult[Sca
 		return err
 	}
 	arguments, inputs := stage[C.ustore_graph_scan_vertices_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	call.result.count = uint(count)
 	progress, state := call.progress(options.Progress)
 	*arguments = C.ustore_graph_scan_vertices_t{
@@ -578,6 +585,7 @@ func (receiver storeReceiver[Handle]) graphSampleVertices(call *callWithResult[S
 	}
 	count := tasks(collections)
 	arguments, inputs := stage[C.ustore_graph_sample_vertices_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	call.result.count = uint(count)
 	*arguments = C.ustore_graph_sample_vertices_t{
 		database:    database,
@@ -620,6 +628,7 @@ func (receiver storeReceiver[Handle]) graphMeasureVertices(call *callWithResult[
 		return err
 	}
 	arguments, inputs := stage[C.ustore_graph_measure_vertices_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	call.result.count = uint(count)
 	*arguments = C.ustore_graph_measure_vertices_t{
 		database:          database,

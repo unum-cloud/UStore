@@ -1441,6 +1441,7 @@ type CollectionList struct {
 	modalities  *C.ustore_modality_t
 	names       Strings
 	written     C.ustore_size_t
+	arena       arenaWrite
 }
 
 // Len reports how many collections the call listed.
@@ -1448,14 +1449,22 @@ func (list CollectionList) Len() uint { return uint(list.written) }
 
 // ID reports the identifier of collection index.
 func (list CollectionList) ID(index uint) CollectionID {
+	list.arena.mustOpen()
+	defer list.arena.close()
 	return at((*CollectionID)(unsafe.Pointer(list.collections)), index)
 }
 
 // Modality reports what collection index holds.
-func (list CollectionList) Modality(index uint) Modality { return Modality(at(list.modalities, index)) }
+func (list CollectionList) Modality(index uint) Modality {
+	list.arena.mustOpen()
+	defer list.arena.close()
+	return Modality(at(list.modalities, index))
+}
 
 // Name views the name of collection index in the arena.
 func (list CollectionList) Name(index uint) []byte {
+	list.arena.mustOpen()
+	defer list.arena.close()
 	return list.names.sized(uint(list.written)).Get(index)
 }
 
@@ -1477,6 +1486,7 @@ func (receiver storeReceiver[Handle]) collectionList(call *callWithResult[Collec
 		return err
 	}
 	arguments := open[C.ustore_collection_list_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	*arguments = C.ustore_collection_list_t{
 		database:    database,
 		executor:    executor,
@@ -1500,6 +1510,7 @@ type FoundCollections struct {
 	collections *C.ustore_collection_id_t
 	modalities  *C.ustore_modality_t
 	count       uint
+	arena       arenaWrite
 }
 
 // Len reports how many names the call looked up.
@@ -1508,6 +1519,8 @@ func (found FoundCollections) Len() uint { return found.count }
 // Get reports the collection name index addresses and what it holds, and false when no collection
 // carries the name.
 func (found FoundCollections) Get(index uint) (CollectionID, Modality, bool) {
+	found.arena.mustOpen()
+	defer found.arena.close()
 	if !present(found.presences, index) {
 		return CollectionID{}, 0, false
 	}
@@ -1532,6 +1545,7 @@ func (receiver storeReceiver[Handle]) collectionFind(call *callWithResult[FoundC
 		return err
 	}
 	arguments := open[C.ustore_collection_find_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	call.result.count = names.Len()
 	*arguments = C.ustore_collection_find_t{
 		database:    database,
@@ -1761,16 +1775,25 @@ type Page struct {
 	keys    *C.ustore_key_t
 	values  Strings
 	written C.ustore_size_t
+	arena   arenaWrite
 }
 
 // Len reports how many keys the pull handed out; fewer than wanted exhausts the walk for good.
 func (page Page) Len() uint { return uint(page.written) }
 
 // Keys views the keys of the page in the arena.
-func (page Page) Keys() []Key { return keysAt(page.keys, 0, uint64(page.written)) }
+func (page Page) Keys() []Key {
+	page.arena.mustOpen()
+	defer page.arena.close()
+	return keysAt(page.keys, 0, uint64(page.written))
+}
 
 // Values views the values of the page in the arena, one per key, empty for a keys-only pull.
-func (page Page) Values() Strings { return page.values.sized(uint(page.written)) }
+func (page Page) Values() Strings {
+	page.arena.mustOpen()
+	defer page.arena.close()
+	return page.values.sized(uint(page.written))
+}
 
 // endregion: Cursors
 
@@ -1832,6 +1855,7 @@ type Changes struct {
 	kinds  *C.ustore_change_kind_t
 	values Strings
 	count  C.ustore_size_t
+	arena  arenaWrite
 }
 
 // Len reports how many changes the pull yielded, zero at the newest commit.
@@ -1839,18 +1863,30 @@ func (changes Changes) Len() uint { return uint(changes.count) }
 
 // Key reports the key change index touched.
 func (changes Changes) Key(index uint) Key {
+	changes.arena.mustOpen()
+	defer changes.arena.close()
 	return at((*Key)(unsafe.Pointer(changes.keys)), index)
 }
 
 // Stamp reports the commit change index landed at.
-func (changes Changes) Stamp(index uint) CommitStamp { return CommitStamp(at(changes.stamps, index)) }
+func (changes Changes) Stamp(index uint) CommitStamp {
+	changes.arena.mustOpen()
+	defer changes.arena.close()
+	return CommitStamp(at(changes.stamps, index))
+}
 
 // Kind reports what change index did to its key.
-func (changes Changes) Kind(index uint) ChangeKind { return ChangeKind(at(changes.kinds, index)) }
+func (changes Changes) Kind(index uint) ChangeKind {
+	changes.arena.mustOpen()
+	defer changes.arena.close()
+	return ChangeKind(at(changes.kinds, index))
+}
 
 // Value views the bytes change index carries in the arena, empty for a removal and for a pull
 // through [ChangesCursor.NextKeys].
 func (changes Changes) Value(index uint) []byte {
+	changes.arena.mustOpen()
+	defer changes.arena.close()
 	values := changes.values.sized(uint(changes.count))
 	if values.Len() == 0 {
 		return nil
@@ -1888,6 +1924,7 @@ func (on ChangesCursorOn) next(call *callWithResult[Changes], wanted uint, arena
 		return nil, err
 	}
 	arguments := open[C.ustore_changes_cursor_next_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	*arguments = C.ustore_changes_cursor_next_t{
 		cursor:   cursor,
 		executor: executor,

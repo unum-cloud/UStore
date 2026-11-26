@@ -51,7 +51,7 @@ static struct {
      "The call needs a handle that is closed or was never opened."},
     {ustore_status_config_mismatch_k, "ustore.ConfigMismatchError", &ErrorType, &PyExc_ValueError,
      "The handles or arguments are each well-formed but cannot be joined, like devices of two vendors."},
-    {ustore_status_contended_k, "ustore.ContendedError", &ErrorType, NULL,
+    {ustore_status_contended_k, "ustore.ContendedError", &ErrorType, &PyExc_BufferError,
      "An executor, arena or transaction serving another call refused the call instead of waiting."},
     {ustore_status_cancelled_k, "ustore.CancelledError", &ErrorType, NULL,
      "A progress callback stopped the call, which unwound and published nothing."},
@@ -179,30 +179,34 @@ int ustore_py_register_errors(PyObject* module) {
 
 #pragma region Arenas
 
-static char const doc_Arena[] =                                                                //
-    "Arena(executor=None, /)\n"                                                                //
-    "\n"                                                                                       //
-    "The memory every output whose length scales with a call lands in, from values and keys\n" //
-    "to columns, edges and names. Every such verb takes one as its last positional argument\n" //
-    "and rewinds it, so a steady loop allocates once.\n"                                       //
-    "\n"                                                                                       //
-    "The executor makes it where its calls compute, and none makes host pages for calls on\n"  //
-    "the calling thread. Results are zero-copy views over it, valid until the next call\n"     //
-    "naming it rewinds it; a result read after that reads whatever it then holds, which\n"     //
-    "nothing detects. A call naming it while another still fills it raises ContendedError,\n"  //
-    "so each deferred call in flight needs one of its own. Calls `ustore_arena_init`.\n"       //
-    "\n"                                                                                       //
-    "Args:\n"                                                                                  //
-    "  executor (Executor, optional): The executor whose calls it serves, closed only after\n" //
-    "    the arena is freed; None serves the calling thread.";
+static char const doc_Arena[] =                                                                  //
+    "Arena(executor=None, /)\n"                                                                  //
+    "\n"                                                                                         //
+    "The memory every output whose length scales with a call lands in, from values and keys\n"   //
+    "to columns, edges and names. Every such verb takes one as its last positional argument,\n"  //
+    "or makes a fresh one its result owns when given none; passing one reuses it, so a steady\n" //
+    "loop allocates once.\n"                                                                     //
+    "\n"                                                                                         //
+    "The executor makes it where its calls compute, and none makes host pages for calls on\n"    //
+    "the calling thread. Results are zero-copy views over it until the next call naming it:\n"   //
+    "that call raises ContendedError, a BufferError, while a memoryview, DLPack capsule or\n"    //
+    "Arrow array of a result is alive, and an earlier result read after it raises\n"             //
+    "ValueError. Copy or drop results before reusing the arena. A call naming it while\n"        //
+    "another still fills it raises ContendedError too, so each deferred call in flight needs\n"  //
+    "one of its own. Calls `ustore_arena_init`.\n"                                               //
+    "\n"                                                                                         //
+    "Args:\n"                                                                                    //
+    "  executor (Executor, optional): The executor whose calls it serves, held by the arena,\n"  //
+    "    which frees it only once the arena and every result over it are gone; None serves\n"    //
+    "    the calling thread.";
 
 /** A new arena of @p type made where @p executor computes, or NULL with an exception set. */
 static PyObject* arena_made(PyTypeObject* type, Executor* executor) {
-    if (executor && !executor->handle)
+    if (executor && !atomic_load(&executor->handle))
         return ustore_py_raise(ustore_status_uninitialized_k, "The executor is closed"), NULL;
     ustore_arena_t handle = NULL;
     ustore_outcome_t outcome = {0};
-    ustore_arena_init_t init = {.arena = &handle, .executor = executor ? executor->handle : NULL, .outcome = &outcome};
+    ustore_arena_init_t init = {.arena = &handle, .executor = executor ? executor->owned : NULL, .outcome = &outcome};
     ustore_arena_init(&init);
     if (ustore_py_raise_on_outcome(&outcome) != 0) return NULL;
     Arena* const arena = (Arena*)type->tp_alloc(type, 0);
@@ -214,8 +218,6 @@ static PyObject* arena_made(PyTypeObject* type, Executor* executor) {
     arena->executor = (Executor*)Py_XNewRef((PyObject*)executor);
     return (PyObject*)arena;
 }
-
-PyObject* ustore_py_arena_new(Executor* executor) { return arena_made(&ArenaType, executor); }
 
 static PyObject* Arena_tp_new(PyTypeObject* type, PyObject* arguments, PyObject* keywords) {
     Py_ssize_t const positional_arguments_count = PyTuple_GET_SIZE(arguments);
@@ -267,9 +269,17 @@ static int arena_readable(PyObject* arena) {
                            (int)description.device);
 }
 
-int ustore_py_arena_from_object(PyObject* object, PyObject** arena) {
+int ustore_py_arena_from_object(ustore_py_context_t const* context, PyObject* object, PyObject** arena) {
+    if (!object || object == Py_None) {
+        *arena = arena_made(&ArenaType, context->executor);
+        if (!*arena) return -1;
+        // A fresh arena lives where the executor computes, which a VRAM executor's host can't read.
+        if (arena_readable(*arena) == 0) return 0;
+        Py_CLEAR(*arena);
+        return -1;
+    }
     if (!PyObject_TypeCheck(object, &ArenaType)) {
-        PyErr_Format(PyExc_TypeError, "The arena must be an Arena, got %S", Py_TYPE(object));
+        PyErr_Format(PyExc_TypeError, "The arena must be an Arena or None, got %S", Py_TYPE(object));
         return -1;
     }
     // Every answer reads its outputs on the host, so a device arena is refused before the call.
@@ -315,6 +325,33 @@ static PyObject* view_arena(PyObject* view) {
     return ((Span*)view)->arena;
 }
 
+/** The arena generation @p view was made under. */
+static uint64_t view_generation(PyObject* view) {
+    PyTypeObject const* const type = Py_TYPE(view);
+    if (type == &ValuesType) return ((Values*)view)->generation;
+    if (type == &KeysType) return ((Keys*)view)->generation;
+    if (type == &PageType) return ((Page*)view)->generation;
+    if (type == &NeighborhoodsType) return ((Neighborhoods*)view)->generation;
+    if (type == &ColumnsType) return ((Columns*)view)->generation;
+    return ((Span*)view)->generation;
+}
+
+/** The count of @c __cuda_array_interface__ reads of @p view, or NULL for a view answering none. */
+static atomic_size_t* view_cuda_array_interface_reads(PyObject* view) {
+    PyTypeObject const* const type = Py_TYPE(view);
+    if (type == &ValuesType) return &((Values*)view)->cuda_array_interface_reads;
+    if (type == &KeysType) return &((Keys*)view)->cuda_array_interface_reads;
+    if (type == &PageType) return &((Page*)view)->cuda_array_interface_reads;
+    if (type == &NeighborhoodsType) return &((Neighborhoods*)view)->cuda_array_interface_reads;
+    return NULL;
+}
+
+/** Raises the ValueError of a result a later call made stale; always -1. */
+static int result_stale(void) {
+    PyErr_SetString(PyExc_ValueError, "the arena was reused by a later call");
+    return -1;
+}
+
 /** The DLPack device of the outputs @p view reads, or -1 with an exception set. */
 static int view_device(PyObject* view, DLDevice* device) {
     ustore_arena_description_t description = {0};
@@ -323,16 +360,22 @@ static int view_device(PyObject* view, DLDevice* device) {
     return 0;
 }
 
-/** Opens one export of the arena @p view reads, refusing every call naming it until the export
- *  closes, or -1 raising a ContendedError while a call holds it. */
-static int view_export_open(PyObject* view) {
-    ustore_status_t const status = ustore_arena_export_open(ustore_py_arena_handle(view_arena(view)));
-    if (status == ustore_status_success_k) return 0;
-    return ustore_py_raise(status, "The arena exports nothing while a call holds it");
+int ustore_py_view_export_open(PyObject* view) {
+    ustore_arena_t const arena = ustore_py_arena_handle(view_arena(view));
+    ustore_status_t const status = ustore_arena_export_open(arena);
+    // A call holding the arena has already moved it past every earlier result
+    if (status == ustore_status_contended_k) return result_stale();
+    if (status != ustore_status_success_k) return ustore_py_raise(status, "the arena could not count another export");
+    if (view_generation(view) == ustore_arena_generation(arena)) return 0;
+    ustore_arena_export_close(arena);
+    return result_stale();
 }
 
-/** Closes the export @c view_export_open opened on the arena @p view reads. */
-static void view_export_close(PyObject* view) { ustore_arena_export_close(ustore_py_arena_handle(view_arena(view))); }
+void ustore_py_view_export_close(PyObject* view) {
+    ustore_arena_export_close(ustore_py_arena_handle(view_arena(view)));
+}
+
+void ustore_py_view_releasebuffer(PyObject* view, Py_buffer* Py_UNUSED(buffer)) { ustore_py_view_export_close(view); }
 
 /** What one exported capsule keeps until its consumer deletes it: the buffer pinning the arena and
  *  the geometry. */
@@ -366,7 +409,7 @@ static ustore_status_t arena_follow(Arena* arena, void* stream) {
     if (!stream) return ustore_status_success_k;
     ustore_outcome_t outcome = {0};
     ustore_executor_follow_t follow = {
-        .executor = arena->executor ? arena->executor->handle : NULL,
+        .executor = arena->executor ? arena->executor->owned : NULL,
         .position = 0,
         .stream = stream,
         .outcome = &outcome,
@@ -406,7 +449,7 @@ static void Arena_dealloc(Arena* self) {
     if (followed != ustore_status_success_k) {
         // The consumers' streams can't be followed, so the arena waits for its own work instead
         ustore_outcome_t outcome = {0};
-        ustore_executor_drain_t drain = {.executor = self->executor ? self->executor->handle : NULL,
+        ustore_executor_drain_t drain = {.executor = self->executor ? self->executor->owned : NULL,
                                          .outcome = &outcome,
                                          .mood = ustore_mood_parked_k};
         Py_BEGIN_ALLOW_THREADS;
@@ -445,7 +488,7 @@ static void dlpack_export_free(dlpack_export_t* exported) {
         PyBuffer_Release(&view);
     }
     else {
-        view_export_close(owner);
+        ustore_py_view_export_close(owner);
         PyBuffer_Release(&exported->view);
         PyMem_RawFree(exported);
     }
@@ -507,6 +550,8 @@ static PyObject* integers_pair(long first, long second) {
 }
 
 PyObject* ustore_py_dlpack_device_answer(PyObject* self, PyObject* Py_UNUSED(unused)) {
+    if (view_generation(self) != ustore_arena_generation(ustore_py_arena_handle(view_arena(self))))
+        return result_stale(), NULL;
     DLDevice device;
     if (view_device(self, &device) != 0) return NULL;
     return integers_pair((long)device.device_type, (long)device.device_id);
@@ -563,10 +608,10 @@ static int dlpack_stream_check(PyObject* stream, PyObject* arena, DLDevice devic
     void* const named = PyLong_AsVoidPtr(stream);
     if (!named && PyErr_Occurred()) return -1;
     Executor* const executor = ((Arena*)arena)->executor;
-    if (!executor || !executor->handle) return ustore_py_raise(ustore_status_uninitialized_k, "the executor is closed");
+    if (!executor || !executor->owned) return ustore_py_raise(ustore_status_uninitialized_k, "the executor is closed");
     if (overflowed || (cuda && handle > 2) || (rocm && handle > 0)) { // a handle rather than a default stream
         ustore_outcome_t outcome = {0};
-        ustore_executor_accepts_t accepts = {.executor = executor->handle,
+        ustore_executor_accepts_t accepts = {.executor = executor->owned,
                                              .position = 0,
                                              .stream = named,
                                              .outcome = &outcome};
@@ -636,12 +681,13 @@ PyObject* ustore_py_dlpack(PyObject* self, PyObject* const* arguments, Py_ssize_
 
     dlpack_export_t* const exported = (dlpack_export_t*)PyMem_RawCalloc(1, sizeof(dlpack_export_t));
     if (!exported) return PyErr_NoMemory();
-    if (view_export_open(self) != 0) {
+    // A second export stays open while a contended free leaves the capsule to the arena's next user
+    if (ustore_py_view_export_open(self) != 0) {
         PyMem_RawFree(exported);
         return NULL;
     }
     if (PyObject_GetBuffer(self, &exported->view, PyBUF_RECORDS_RO) != 0) {
-        view_export_close(self);
+        ustore_py_view_export_close(self);
         PyMem_RawFree(exported);
         return NULL;
     }
@@ -1564,6 +1610,11 @@ int ustore_py_buffer_fill(Py_buffer* view, PyObject* owner, void const* data, ch
         PyErr_SetString(PyExc_BufferError, "The outputs a call wrote into an arena are read-only");
         return -1;
     }
+    // The buffer is an export of the arena, which refuses every call naming it until released.
+    if (ustore_py_view_export_open(owner) != 0) {
+        view->obj = NULL;
+        return -1;
+    }
     Py_ssize_t items = 1;
     for (int dimension = 0; dimension != ndim; ++dimension) items *= shape[dimension];
 
@@ -1583,11 +1634,12 @@ int ustore_py_buffer_fill(Py_buffer* view, PyObject* owner, void const* data, ch
     return 0;
 }
 
-PyObject* ustore_py_span_view(PyObject* arena, void const* data, char const* format, Py_ssize_t itemsize, int ndim,
-                              Py_ssize_t const* shape) {
+PyObject* ustore_py_span_view(PyObject* arena, uint64_t generation, void const* data, char const* format,
+                              Py_ssize_t itemsize, int ndim, Py_ssize_t const* shape) {
     Span* const span = PyObject_New(Span, &SpanType);
     if (!span) return NULL;
     span->arena = Py_NewRef(arena);
+    span->generation = generation;
     span->data = data;
     span->format = format;
     span->itemsize = itemsize;
@@ -1621,6 +1673,7 @@ static PyMethodDef Span_methods[] = {
 
 static PyBufferProcs Span_as_buffer = {
     .bf_getbuffer = (getbufferproc)Span_getbuffer,
+    .bf_releasebuffer = (releasebufferproc)ustore_py_view_releasebuffer,
 };
 
 PyTypeObject SpanType = {
@@ -1649,11 +1702,13 @@ static char const doc_Values[] =                                                
     "the arena in place too, and a write takes it back as the tape it is. Read after a later\n" //
     "call rewound the arena, it reads whatever the arena then holds.";
 
-PyObject* ustore_py_values_new(PyObject* arena, ustore_octet_t const* presences, ustore_strings_view_t const* tape,
-                               size_t count) {
+PyObject* ustore_py_values_new(PyObject* arena, uint64_t generation, ustore_octet_t const* presences,
+                               ustore_strings_view_t const* tape, size_t count) {
     Values* const instance = PyObject_New(Values, &ValuesType);
     if (!instance) return NULL;
     instance->arena = Py_NewRef(arena);
+    instance->generation = generation;
+    instance->cuda_array_interface_reads = 0;
     instance->presences = presences;
     instance->tape = *tape;
     instance->count = count;
@@ -1661,6 +1716,9 @@ PyObject* ustore_py_values_new(PyObject* arena, ustore_octet_t const* presences,
 }
 
 static void Values_dealloc(Values* self) {
+    // Each read of the CUDA Array Interface handed a consumer the address, which counts until now.
+    for (; self->cuda_array_interface_reads; --self->cuda_array_interface_reads)
+        ustore_py_view_export_close((PyObject*)self);
     Py_XDECREF(self->arena);
     PyObject_Free(self);
 }
@@ -1688,22 +1746,27 @@ static PyObject* Values_item(Values* self, Py_ssize_t task_index) {
         PyErr_SetString(PyExc_IndexError, "Task index out of range");
         return NULL;
     }
+    if (ustore_py_view_export_open((PyObject*)self) != 0) return NULL;
     PyObject* item = NULL;
     if (!values_present(self, (size_t)task_index)) item = Py_NewRef(Py_None);
     else {
         ustore_bytes_view_t const value = ustore_py_tape_string(&self->tape, (size_t)task_index);
         Py_ssize_t const shape = (Py_ssize_t)value.length;
-        item = ustore_py_span_view(self->arena, value.data, "B", 1, 1, &shape);
+        item = ustore_py_span_view(self->arena, self->generation, value.data, "B", 1, 1, &shape);
     }
+    ustore_py_view_export_close((PyObject*)self);
     return item;
 }
 
 static int Values_getbuffer(Values* self, Py_buffer* view, int flags) {
     view->obj = NULL;
+    if (ustore_py_view_export_open((PyObject*)self) != 0) return -1;
     // A tape of no values still answers a buffer, so a caller need not special-case an empty read.
     void* const data = values_data(self) ? (void*)values_data(self) : (void*)self;
     Py_ssize_t const bytes = (Py_ssize_t)ustore_py_tape_bytes(&self->tape, self->count);
-    return PyBuffer_FillInfo(view, (PyObject*)self, data, bytes, 1, flags);
+    int const filled = PyBuffer_FillInfo(view, (PyObject*)self, data, bytes, 1, flags);
+    if (filled != 0) ustore_py_view_export_close((PyObject*)self);
+    return filled;
 }
 
 static PyObject* Values_repr(Values* self) { return PyUnicode_FromFormat("Values(count=%zu)", self->count); }
@@ -1711,6 +1774,7 @@ static PyObject* Values_repr(Values* self) { return PyUnicode_FromFormat("Values
 static char const doc_Values_lengths[] = "The length of every value, with None where the key was absent, as a tuple.";
 
 static PyObject* Values_get_lengths(Values* self, void* Py_UNUSED(closure)) {
+    if (ustore_py_view_export_open((PyObject*)self) != 0) return NULL;
     PyObject* lengths = PyTuple_New((Py_ssize_t)self->count);
     for (size_t task_index = 0; lengths && task_index != self->count; ++task_index) {
         ustore_size_t const length = ustore_py_tape_string(&self->tape, task_index).length;
@@ -1719,6 +1783,7 @@ static PyObject* Values_get_lengths(Values* self, void* Py_UNUSED(closure)) {
         if (!entry) Py_CLEAR(lengths);
         else PyTuple_SET_ITEM(lengths, (Py_ssize_t)task_index, entry);
     }
+    ustore_py_view_export_close((PyObject*)self);
     return lengths;
 }
 
@@ -1742,7 +1807,7 @@ static void values_schema_release(struct ArrowSchema* schema) { schema->release 
 static void values_array_release(struct ArrowArray* array) {
     values_export_t* const exported = (values_export_t*)array->private_data;
     PyGILState_STATE const state = PyGILState_Ensure();
-    view_export_close((PyObject*)exported->owner);
+    ustore_py_view_export_close((PyObject*)exported->owner);
     Py_DECREF(exported->owner);
     PyGILState_Release(state);
     PyMem_RawFree(exported);
@@ -1792,7 +1857,7 @@ static PyObject* Values_arrow_c_array(Values* self, PyObject* const* Py_UNUSED(a
         PyErr_NoMemory();
         return NULL;
     }
-    if (view_export_open((PyObject*)self) != 0) {
+    if (ustore_py_view_export_open((PyObject*)self) != 0) {
         PyMem_RawFree(exported);
         PyMem_RawFree(array);
         PyMem_RawFree(schema);
@@ -1863,6 +1928,7 @@ static PySequenceMethods Values_as_sequence = {
 
 static PyBufferProcs Values_as_buffer = {
     .bf_getbuffer = (getbufferproc)Values_getbuffer,
+    .bf_releasebuffer = (releasebufferproc)ustore_py_view_releasebuffer,
 };
 
 PyTypeObject ValuesType = {
@@ -1892,11 +1958,13 @@ static char const doc_Keys[] =                                                  
     "`(keys, 16)` bytes, so `np.asarray(keys)` reads it without copying. Read after a later\n" //
     "call rewound the arena, it reads whatever the arena then holds.";
 
-PyObject* ustore_py_keys_new(PyObject* arena, ustore_length_t const* offsets, ustore_key_t const* tape, size_t count,
-                             float const* scores) {
+PyObject* ustore_py_keys_new(PyObject* arena, uint64_t generation, ustore_length_t const* offsets,
+                             ustore_key_t const* tape, size_t count, float const* scores) {
     Keys* const instance = PyObject_New(Keys, &KeysType);
     if (!instance) return NULL;
     instance->arena = Py_NewRef(arena);
+    instance->generation = generation;
+    instance->cuda_array_interface_reads = 0;
     instance->offsets = offsets;
     instance->tape = tape;
     instance->scores = scores;
@@ -1910,6 +1978,9 @@ PyObject* ustore_py_keys_new(PyObject* arena, ustore_length_t const* offsets, us
 }
 
 static void Keys_dealloc(Keys* self) {
+    // Each read of the CUDA Array Interface handed a consumer the address, which counts until now.
+    for (; self->cuda_array_interface_reads; --self->cuda_array_interface_reads)
+        ustore_py_view_export_close((PyObject*)self);
     Py_XDECREF(self->arena);
     PyObject_Free(self);
 }
@@ -1921,6 +1992,7 @@ static PyObject* Keys_item(Keys* self, Py_ssize_t task_index) {
         PyErr_SetString(PyExc_IndexError, "Task index out of range");
         return NULL;
     }
+    if (ustore_py_view_export_open((PyObject*)self) != 0) return NULL;
     ustore_key_t const* const run = self->tape + self->offsets[task_index];
     Py_ssize_t const found = (Py_ssize_t)(self->offsets[task_index + 1] - self->offsets[task_index]);
     PyObject* keys = PyTuple_New(found);
@@ -1929,6 +2001,7 @@ static PyObject* Keys_item(Keys* self, Py_ssize_t task_index) {
         if (!key) Py_CLEAR(keys);
         else PyTuple_SET_ITEM(keys, key_index, key);
     }
+    ustore_py_view_export_close((PyObject*)self);
     return keys;
 }
 
@@ -1944,12 +2017,14 @@ static PyObject* Keys_repr(Keys* self) {
 static char const doc_Keys_counts[] = "The number of keys every task found, as a tuple.";
 
 static PyObject* Keys_get_counts(Keys* self, void* Py_UNUSED(closure)) {
+    if (ustore_py_view_export_open((PyObject*)self) != 0) return NULL;
     PyObject* counts = PyTuple_New((Py_ssize_t)self->count);
     for (size_t task_index = 0; counts && task_index != self->count; ++task_index) {
         PyObject* const entry = PyLong_FromUnsignedLongLong(self->offsets[task_index + 1] - self->offsets[task_index]);
         if (!entry) Py_CLEAR(counts);
         else PyTuple_SET_ITEM(counts, (Py_ssize_t)task_index, entry);
     }
+    ustore_py_view_export_close((PyObject*)self);
     return counts;
 }
 
@@ -1958,12 +2033,14 @@ static char const doc_Keys_scores[] =
 
 static PyObject* Keys_get_scores(Keys* self, void* Py_UNUSED(closure)) {
     if (!self->scores) Py_RETURN_NONE;
+    if (ustore_py_view_export_open((PyObject*)self) != 0) return NULL;
     PyObject* scores = PyTuple_New(self->shape[0]);
     for (Py_ssize_t key_index = 0; scores && key_index != self->shape[0]; ++key_index) {
         PyObject* const score = PyFloat_FromDouble((double)self->scores[key_index]);
         if (!score) Py_CLEAR(scores);
         else PyTuple_SET_ITEM(scores, key_index, score);
     }
+    ustore_py_view_export_close((PyObject*)self);
     return scores;
 }
 
@@ -1992,6 +2069,7 @@ static PySequenceMethods Keys_as_sequence = {
 
 static PyBufferProcs Keys_as_buffer = {
     .bf_getbuffer = (getbufferproc)Keys_getbuffer,
+    .bf_releasebuffer = (releasebufferproc)ustore_py_view_releasebuffer,
 };
 
 PyTypeObject KeysType = {
@@ -2033,7 +2111,6 @@ static void buffer_schema_release(struct ArrowSchema* schema) {
 static void buffer_array_release(struct ArrowArray* array) {
     buffer_export_t* const exported = (buffer_export_t*)array->private_data;
     PyGILState_STATE const state = PyGILState_Ensure();
-    view_export_close(exported->view.obj);
     PyBuffer_Release(&exported->view);
     PyGILState_Release(state);
     PyMem_RawFree(exported);
@@ -2092,9 +2169,7 @@ PyObject* ustore_py_arrow_c_array(PyObject* self, PyObject* const* Py_UNUSED(arg
         PyMem_RawFree(schema);
         return PyErr_NoMemory();
     }
-    int const opened = view_export_open(self) == 0;
-    if (!opened || PyObject_GetBuffer(self, &exported->view, PyBUF_C_CONTIGUOUS) != 0) {
-        if (opened) view_export_close(self);
+    if (PyObject_GetBuffer(self, &exported->view, PyBUF_C_CONTIGUOUS) != 0) {
         PyMem_RawFree(format);
         PyMem_RawFree(exported);
         PyMem_RawFree(array);
@@ -2207,6 +2282,8 @@ PyObject* ustore_py_cuda_array_interface(PyObject* self, void* Py_UNUSED(closure
     Py_XDECREF(data);
     Py_XDECREF(address);
     Py_XDECREF(shape);
+    if (described && ustore_py_view_export_open(self) != 0) Py_CLEAR(described);
+    if (described) atomic_fetch_add(view_cuda_array_interface_reads(self), 1);
     return described;
 }
 
@@ -2297,7 +2374,7 @@ int ustore_py_context_from_object(PyObject* self, ustore_py_context_t* context) 
         return context_from_origin(self, watch, context);
     }
     On const* const view = (On const*)self;
-    if (view->executor && !view->executor->handle)
+    if (view->executor && !atomic_load(&view->executor->handle))
         return ustore_py_raise(ustore_status_uninitialized_k, "The executor is closed");
     context->executor = view->executor;
     context->completion = PyObject_TypeCheck(self, &DeferredOnType) ? ustore_completion_deferred_k
@@ -2306,7 +2383,8 @@ int ustore_py_context_from_object(PyObject* self, ustore_py_context_t* context) 
 }
 
 ustore_executor_t ustore_py_context_executor(ustore_py_context_t const* context) {
-    return context->executor ? context->executor->handle : NULL;
+    // A close racing a verb past its check only stops later verbs, as the executor frees in dealloc
+    return context->executor ? context->executor->owned : NULL;
 }
 
 int ustore_py_context_writable(ustore_py_context_t const* context) {
@@ -2549,7 +2627,18 @@ void* ustore_py_call_open(ustore_py_context_t const* context, ustore_py_verb_t c
 /** Answers @p call once it is final: its outcome's failure, else its answer. */
 static PyObject* call_answer(ustore_py_verb_t const* verb, void* call) {
     ustore_py_call_t* const header = (ustore_py_call_t*)call;
-    return ustore_py_raise_on_outcome(&header->outcome) == 0 ? verb->answer(call) : NULL;
+    if (ustore_py_raise_on_outcome(&header->outcome) != 0) return NULL;
+    if (!header->arena) return verb->answer(call);
+    // An answer may copy out of the arena, so it reads under an export, never after a later rewind
+    ustore_arena_t const arena = ustore_py_arena_handle(header->arena);
+    ustore_status_t const opened = ustore_arena_export_open(arena);
+    if (opened == ustore_status_contended_k) return result_stale(), NULL;
+    if (opened != ustore_status_success_k)
+        return ustore_py_raise(opened, "the arena could not count another export"), NULL;
+    PyObject* const answer = header->generation == ustore_arena_generation(arena) ? verb->answer(call)
+                                                                                  : (result_stale(), NULL);
+    ustore_arena_export_close(arena);
+    return answer;
 }
 
 /** Lets go of what @p call gathered, keeping whatever exception is set. */
@@ -2561,6 +2650,9 @@ static void call_release(ustore_py_verb_t const* verb, void* call) {
 
 PyObject* ustore_py_call_run(ustore_py_context_t const* context, ustore_py_verb_t const* verb, void* call,
                              void* arguments) {
+    // The call's take makes the next generation; a racing take can only make the result read stale
+    ustore_py_call_t* const kept = (ustore_py_call_t*)call;
+    if (kept->arena) kept->generation = ustore_arena_generation(ustore_py_arena_handle(kept->arena)) + 1;
     Py_BEGIN_ALLOW_THREADS;
     verb->submit(arguments);
     Py_END_ALLOW_THREADS;
@@ -3010,7 +3102,8 @@ static char const doc_Executor[] =                                              
     "so polling alone finishes them. It serves one call at a time: a second call while one\n"   //
     "runs raises ContendedError once waited for. Progress callbacks run on its threads.\n"      //
     "\n"                                                                                        //
-    "Used as a context manager, it waits for its calls and frees its threads on exit.";
+    "Used as a context manager, it closes on exit, refusing further verbs; its threads are\n"   //
+    "freed once every arena, result and receiver holding it is gone.";
 
 static PyObject* Executor_tp_new(PyTypeObject* Py_UNUSED(type), PyObject* Py_UNUSED(arguments),
                                  PyObject* Py_UNUSED(keywords)) {
@@ -3099,7 +3192,8 @@ static PyObject* executor_made(PyObject* type, ustore_executor_t handle, ustore_
         ustore_executor_free(handle);
         return NULL;
     }
-    instance->handle = handle;
+    atomic_init(&instance->handle, handle);
+    instance->owned = handle;
     return (PyObject*)instance;
 }
 
@@ -3338,19 +3432,18 @@ static PyObject* Executor_for_vram(PyObject* type, PyObject* const* arguments, P
     return executor_made(type, handle, &outcome);
 }
 
-/** Frees the threads of @p executor once its calls finish, leaving the object to refuse further calls. */
-static void executor_close(Executor* executor) {
-    ustore_executor_t const handle = executor->handle;
-    executor->handle = NULL;
-    if (handle) {
-        Py_BEGIN_ALLOW_THREADS;
-        ustore_executor_free(handle);
-        Py_END_ALLOW_THREADS;
-    }
-}
-
 static void Executor_dealloc(Executor* self) {
-    executor_close(self);
+    ustore_status_t freed = ustore_status_success_k;
+    Py_BEGIN_ALLOW_THREADS;
+    freed = ustore_executor_free(self->owned);
+    Py_END_ALLOW_THREADS;
+    // Every Arena holds its Executor, so the free never refuses; were it to, the threads leak
+    if (freed != ustore_status_success_k) {
+        PyObject* const pending = PyErr_GetRaisedException();
+        ustore_py_raise(freed, "an Executor died while an Arena made with it lived, so its threads leak");
+        PyErr_WriteUnraisable(NULL);
+        PyErr_SetRaisedException(pending);
+    }
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
 
@@ -3374,14 +3467,14 @@ static PyObject* Executor_drain(PyObject* self, PyObject* const* arguments, Py_s
     int mood = ustore_mood_parked_k;
     if (mood_object && ustore_py_enum_from_object(mood_object, "mood", ustore_py_enum_mood_k, &mood) != 0) return NULL;
     Executor* const executor = (Executor*)self;
-    if (!executor->handle) {
+    if (!atomic_load(&executor->handle)) {
         ustore_py_raise(ustore_status_uninitialized_k, "The executor is closed");
         return NULL;
     }
 
     ustore_outcome_t outcome = {0};
     ustore_executor_drain_t drain = {0};
-    drain.executor = executor->handle;
+    drain.executor = executor->owned;
     drain.outcome = &outcome;
     drain.mood = (ustore_mood_t)mood;
     Py_BEGIN_ALLOW_THREADS;
@@ -3391,14 +3484,15 @@ static PyObject* Executor_drain(PyObject* self, PyObject* const* arguments, Py_s
     Py_RETURN_NONE;
 }
 
-static char const doc_Executor_close[] =                                                     //
-    "close() answers None.\n"                                                                //
-    "\n"                                                                                     //
-    "Waits until no call holds the executor, then frees the threads. A receiver naming it\n" //
-    "refuses calls afterwards, and closing twice is safe.";
+static char const doc_Executor_close[] =                                                        //
+    "close() answers None.\n"                                                                   //
+    "\n"                                                                                        //
+    "Stops the executor serving verbs: a receiver naming it refuses calls afterwards, and\n"    //
+    "closing twice is safe. Leaving a `with` block closes it. The threads are freed once the\n" //
+    "last arena, result and receiver holding the executor is gone, so results stay readable.";
 
 static PyObject* Executor_close(PyObject* self, PyObject* Py_UNUSED(ignored)) {
-    executor_close((Executor*)self);
+    atomic_store(&((Executor*)self)->handle, NULL);
     Py_RETURN_NONE;
 }
 
@@ -3407,13 +3501,14 @@ static PyObject* Executor_enter(PyObject* self, PyObject* Py_UNUSED(ignored)) { 
 static PyObject* Executor_exit(PyObject* self, PyObject* const* Py_UNUSED(arguments),
                                Py_ssize_t Py_UNUSED(positional_arguments_count),
                                PyObject* Py_UNUSED(keyword_names_tuple)) {
-    executor_close((Executor*)self);
+    atomic_store(&((Executor*)self)->handle, NULL);
     Py_RETURN_NONE;
 }
 
 static PyObject* Executor_repr(Executor* self) {
-    if (!self->handle) return PyUnicode_FromString("Executor(<closed>)");
-    return PyUnicode_FromFormat("Executor(at=%p)", (void*)self->handle);
+    ustore_executor_t const handle = atomic_load(&self->handle);
+    if (!handle) return PyUnicode_FromString("Executor(<closed>)");
+    return PyUnicode_FromFormat("Executor(at=%p)", (void*)handle);
 }
 
 static PyMethodDef Executor_methods[] = {

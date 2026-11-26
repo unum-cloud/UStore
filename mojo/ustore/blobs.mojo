@@ -55,6 +55,8 @@ from ustore.types import (
     _cross,
     _Crossing,
     _in_arena,
+    _close_read,
+    _open_read,
     _readable,
     _slot,
 )
@@ -169,19 +171,28 @@ struct KeyRuns[origin: MutOrigin](Deferrable, Sized):
 
     def keys(ref self) raises Error -> Span[Key, origin_of(self)]:
         """Every run's keys end to end."""
-        var offsets = self.offsets()
-        return _in_arena[Key, origin_of(self)](self.written.keys, Int(offsets[self.count]) if self.count else 0)
+        _open_read(self.arena, self.generation, "KeyRuns.keys")
+        var offsets = _in_arena[UInt64, ImmUntrackedOrigin](self.written.offsets, self.count + 1)
+        var total = Int(offsets[self.count]) if self.count else 0
+        _close_read(self.arena)
+        return _in_arena[Key, origin_of(self)](self.written.keys, total)
 
     def run(ref self, index: Int) raises Error -> Span[Key, origin_of(self)]:
         """The keys of task `index`."""
-        var offsets = self.offsets()
+        _open_read(self.arena, self.generation, "KeyRuns.run")
+        var offsets = _in_arena[UInt64, ImmUntrackedOrigin](self.written.offsets, self.count + 1)
         var first = Int(offsets[index])
-        return _in_arena[Key, origin_of(self)](self.written.keys + first * 16, Int(offsets[index + 1]) - first)
+        var count = Int(offsets[index + 1]) - first
+        _close_read(self.arena)
+        return _in_arena[Key, origin_of(self)](self.written.keys + first * 16, count)
 
     def scores(ref self) raises Error -> Span[Float32, origin_of(self)]:
         """One score per listed key, empty unless weighted patterns asked for them."""
-        var offsets = self.offsets()
-        return _in_arena[Float32, origin_of(self)](self.written.scores, Int(offsets[self.count]) if self.count else 0)
+        _open_read(self.arena, self.generation, "KeyRuns.scores")
+        var offsets = _in_arena[UInt64, ImmUntrackedOrigin](self.written.offsets, self.count + 1)
+        var total = Int(offsets[self.count]) if self.count else 0
+        _close_read(self.arena)
+        return _in_arena[Float32, origin_of(self)](self.written.scores, total)
 
 
 @fieldwise_init

@@ -920,6 +920,11 @@ void ustore_arena_export_close(ustore_arena_t arena) {
                                      std::memory_order_release);
 }
 
+uint64_t ustore_arena_generation(ustore_arena_t arena) {
+    if (!arena) return 0;
+    return floor_atomic_ref<std::uint64_t const> {arena->generation}.load(std::memory_order_relaxed);
+}
+
 void ustore_arena_describe(ustore_arena_describe_t* arguments) {
     ustore_outcome_t& outcome = *arguments->outcome;
     ustore_arena_t const arena = arguments->arena;

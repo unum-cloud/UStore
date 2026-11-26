@@ -40,6 +40,12 @@ import (
 #cgo nocallback ustore_gpu_devices
 #cgo noescape ustore_arena_init
 #cgo nocallback ustore_arena_init
+#cgo noescape ustore_arena_export_open
+#cgo nocallback ustore_arena_export_open
+#cgo noescape ustore_arena_export_close
+#cgo nocallback ustore_arena_export_close
+#cgo noescape ustore_arena_generation
+#cgo nocallback ustore_arena_generation
 #cgo noescape ustore_arena_describe
 #cgo nocallback ustore_arena_describe
 #cgo noescape ustore_version
@@ -878,11 +884,12 @@ func GPUDevices() ([]GPUDevice, error) {
 // Arena is memory the library writes every output whose length scales with a call into, reused so a
 // steady loop allocates once.
 //
-// Every call given an arena rewinds and refills it, so the views of its previous call and every
-// slice they handed out end there, as they do once it is closed; to keep one call's views past the
-// next, give that call another arena. An arena serves one call at a time, and a second overlapping
-// it fails with [StatusContended]. Deferred verbs view it as blocking ones do, since Close waits
-// for every deferred call naming it.
+// Every call given an arena rewinds and refills it, so the views of its previous call end there,
+// as they do once it is closed: their accessors panic with [StatusContended], as a slice bound
+// does, while a slice already handed out is plain memory the next call overwrites, so it is valid
+// only until then. To keep one call's views past the next, give that call another arena. An arena
+// serves one call at a time, and a second overlapping it fails with [StatusContended]. Deferred
+// verbs view it as blocking ones do, since Close waits for every deferred call naming it.
 type Arena struct {
 	handle C.ustore_arena_t
 }
@@ -1008,6 +1015,22 @@ type call struct {
 type callWithResult[Result any] struct {
 	call
 	result *Result
+	// answer is the result once settled, kept outside the frame so a settled frame holds no Go
+	// pointer.
+	answer Result
+}
+
+// settle settles the call, then moves its result out of the frame, where a Go pointer would
+// outlive the pin that covers it.
+func (request *callWithResult[Result]) settle() error {
+	err := request.call.settle()
+	if request.result != nil {
+		request.answer = *request.result
+		var none Result
+		*request.result = none
+		request.result = nil
+	}
+	return err
 }
 
 // open pins a fresh frame and hands back its argument structure, which a verb fills and passes to
@@ -1055,7 +1078,7 @@ func block[Result any](call *callWithResult[Result], refusal error) (Result, err
 	if err := call.settle(); err != nil {
 		return none, err
 	}
-	return *call.result, nil
+	return call.answer, nil
 }
 
 // configOf reads a nil config as the zero one, by value, so generic verbs allocate nothing for it.
@@ -1197,6 +1220,50 @@ func (executor *Executor) Close() error {
 
 // lower reports the handle a verb hands across: nil for a nil arena, which the call refuses, and a
 // refusal for a closed one.
+// arenaWrite is the arena a result reads, and the generation the call that wrote it brought the
+// arena to; a call without an arena leaves none.
+type arenaWrite struct {
+	arena      *Arena
+	generation uint64
+}
+
+// stamp names the arena a call about to take it writes into, at the generation the call brings it
+// to. The call pins the arena with its other pointers, since its frame holds the result.
+func (call *call) stamp(arena *Arena, handle C.ustore_arena_t) arenaWrite {
+	if arena == nil {
+		return arenaWrite{}
+	}
+	call.pinner.Pin(arena)
+	return arenaWrite{arena: arena, generation: uint64(C.ustore_arena_generation(handle)) + 1}
+}
+
+// mustOpen holds an export of the arena, so no call takes it until close, and panics with
+// [StatusContended], as a slice bound does, when a later call took the arena since the result was
+// written, a call holds it now, or it is closed.
+func (write arenaWrite) mustOpen() {
+	if write.arena == nil {
+		return
+	}
+	handle, err := write.arena.lower()
+	if err != nil {
+		panic(err)
+	}
+	if C.ustore_arena_export_open(handle) != C.ustore_status_success_k {
+		panic(fail(StatusContended, "a call holds the arena"))
+	}
+	if uint64(C.ustore_arena_generation(handle)) != write.generation {
+		C.ustore_arena_export_close(handle)
+		panic(fail(StatusContended, "a later call took the arena since this result was written"))
+	}
+}
+
+// close ends the export mustOpen took.
+func (write arenaWrite) close() {
+	if write.arena != nil {
+		C.ustore_arena_export_close(write.arena.handle)
+	}
+}
+
 func (arena *Arena) lower() (C.ustore_arena_t, error) {
 	if arena == nil {
 		return nil, nil

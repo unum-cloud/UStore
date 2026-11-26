@@ -1089,19 +1089,19 @@ static PyObject* Database_collection_create(PyObject* self, PyObject* const* arg
     return ustore_py_uuid_to_object(&created.uuid);
 }
 
-static char const doc_Database_collection_find[] =                                       //
-    "collection_find(name, arena) answers the identifier the name addresses.\n"          //
-    "\n"                                                                                 //
-    "Reads the name at the snapshot of a snapshot, and at the head otherwise, since a\n" //
-    "transaction never creates or drops collections.\n"                                  //
-    "\n"                                                                                 //
-    "Args:\n"                                                                            //
-    "  name (str): The name to resolve.\n"                                               //
-    "  arena (Arena): Where the lookup lands before it is copied out, rewound by this\n" //
-    "    call.\n"                                                                        //
-    "Returns:\n"                                                                         //
-    "  UUID: The identifier addressing the collection.\n"                                //
-    "Raises:\n"                                                                          //
+static char const doc_Database_collection_find[] =                                                 //
+    "collection_find(name, arena=None) answers the identifier the name addresses.\n"               //
+    "\n"                                                                                           //
+    "Reads the name at the snapshot of a snapshot, and at the head otherwise, since a\n"           //
+    "transaction never creates or drops collections.\n"                                            //
+    "\n"                                                                                           //
+    "Args:\n"                                                                                      //
+    "  name (str): The name to resolve.\n"                                                         //
+    "  arena (Arena, optional): Where the lookup lands before it is copied out, rewound by this\n" //
+    "    call.\n"                                                                                  //
+    "Returns:\n"                                                                                   //
+    "  UUID: The identifier addressing the collection.\n"                                          //
+    "Raises:\n"                                                                                    //
     "  NotFoundError: No collection holds the name.";
 
 /** A lookup of the collection one name addresses, whose identifier lands in the arena its header holds. */
@@ -1123,11 +1123,7 @@ typedef struct find_call_t {
     ustore_collection_id_t const* collections;
 } find_call_t;
 
-// A collection given by ID needs no lookup, so its call is final at once.
-static void find_submit(void* arguments) {
-    ustore_collection_find_t* const find = (ustore_collection_find_t*)arguments;
-    if (find->count) ustore_collection_find(find);
-}
+static void find_submit(void* arguments) { ustore_collection_find((ustore_collection_find_t*)arguments); }
 
 static PyObject* find_answer(void* erased) {
     find_call_t const* const call = (find_call_t const*)erased;
@@ -1149,7 +1145,9 @@ static PyObject* Database_collection_find(PyObject* self, PyObject* const* argum
                                           Py_ssize_t positional_arguments_count) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_keyword_names_count_checked("collection_find", positional_arguments_count, NULL, 2) < 0) return NULL;
+    if (ustore_py_keyword_names_count_checked("collection_find", positional_arguments_count, NULL,
+                                              ustore_py_arena_positional(positional_arguments_count, 2)) < 0)
+        return NULL;
     PyObject* const name_object = arguments[0];
     find_call_t stack;
     find_call_t* const call = ustore_py_call_open(&context, &find_verb, &stack);
@@ -1162,7 +1160,8 @@ static PyObject* Database_collection_find(PyObject* self, PyObject* const* argum
         return ustore_py_call_discard(&context, &find_verb, call);
     call->name = Py_NewRef(name_object);
     call->text.length = (ustore_size_t)length;
-    if (ustore_py_arena_from_object(arguments[1], &call->kept.arena) != 0)
+    if (ustore_py_arena_from_object(&context, positional_arguments_count > 1 ? arguments[1] : NULL,
+                                    &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, &find_verb, call);
     ustore_collection_find_t find = {
         .database = context.database_handle,
@@ -1207,16 +1206,16 @@ static PyObject* Database_collection_contains(PyObject* self, PyObject* name_obj
     Py_RETURN_FALSE;
 }
 
-static char const doc_Database_collection_list[] =                                        //
-    "collection_list(arena) answers the identifiers of every collection.\n"               //
-    "\n"                                                                                  //
-    "Lists the collections at the snapshot of a snapshot, and at the head otherwise.\n"   //
-    "System collections are never listed, and collection_names answers the names.\n"      //
-    "\n"                                                                                  //
-    "Args:\n"                                                                             //
-    "  arena (Arena): Where the listing lands before it is copied out, rewound by this\n" //
-    "    call.\n"                                                                         //
-    "Returns:\n"                                                                          //
+static char const doc_Database_collection_list[] =                                                  //
+    "collection_list(arena=None) answers the identifiers of every collection.\n"                    //
+    "\n"                                                                                            //
+    "Lists the collections at the snapshot of a snapshot, and at the head otherwise.\n"             //
+    "System collections are never listed, and collection_names answers the names.\n"                //
+    "\n"                                                                                            //
+    "Args:\n"                                                                                       //
+    "  arena (Arena, optional): Where the listing lands before it is copied out, rewound by this\n" //
+    "    call.\n"                                                                                   //
+    "Returns:\n"                                                                                    //
     "  tuple[UUID, ...]: One identifier per collection.";
 
 /** A listing of every collection, whose identifiers land in the arena its header holds. */
@@ -1253,13 +1252,20 @@ static void list_release(void* call) { ustore_py_call_release(&((list_call_t*)ca
 
 static ustore_py_verb_t const list_verb = {sizeof(list_call_t), list_submit, list_answer, list_release};
 
-static PyObject* Database_collection_list(PyObject* self, PyObject* arena) {
+static PyObject* Database_collection_list(PyObject* self, PyObject* const* arguments,
+                                          Py_ssize_t positional_arguments_count) {
+    if (positional_arguments_count > 1) {
+        PyErr_Format(PyExc_TypeError, "collection_list() takes at most 1 argument, received %zd",
+                     positional_arguments_count);
+        return NULL;
+    }
+    PyObject* const arena = positional_arguments_count ? arguments[0] : NULL;
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
     list_call_t stack;
     list_call_t* const call = ustore_py_call_open(&context, &list_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_arena_from_object(arena, &call->kept.arena) != 0)
+    if (ustore_py_arena_from_object(&context, arena, &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, &list_verb, call);
     ustore_collection_list_t list = {
         .database = context.database_handle,
@@ -1274,20 +1280,20 @@ static PyObject* Database_collection_list(PyObject* self, PyObject* arena) {
     return ustore_py_call_run(&context, &list_verb, call, &list);
 }
 
-static char const doc_Database_collection_names[] =                                            //
-    "collection_names(arena, *, after=None, limit=1024) answers one page of recorded names.\n" //
-    "\n"                                                                                       //
-    "Names come in the order of their text, and the walk paginates rather than holding an\n"   //
-    "iterator over concurrent state, so a listing longer than one page resumes from the\n"     //
-    "last name it saw.\n"                                                                      //
-    "\n"                                                                                       //
-    "Args:\n"                                                                                  //
-    "  arena (Arena): Where the listing lands before it is copied out, rewound by this\n"      //
-    "    call.\n"                                                                              //
-    "  after (str, optional): The smallest name the page may hold; None starts at the\n"       //
-    "    first one. The name given is itself included, so a resuming caller drops it.\n"       //
-    "  limit (int, optional): Most names the page holds.\n"                                    //
-    "Returns:\n"                                                                               //
+static char const doc_Database_collection_names[] =                                                 //
+    "collection_names(arena=None, *, after=None, limit=1024) answers one page of recorded names.\n" //
+    "\n"                                                                                            //
+    "Names come in the order of their text, and the walk paginates rather than holding an\n"        //
+    "iterator over concurrent state, so a listing longer than one page resumes from the\n"          //
+    "last name it saw.\n"                                                                           //
+    "\n"                                                                                            //
+    "Args:\n"                                                                                       //
+    "  arena (Arena, optional): Where the listing lands before it is copied out, rewound by this\n" //
+    "    call.\n"                                                                                   //
+    "  after (str, optional): The smallest name the page may hold; None starts at the\n"            //
+    "    first one. The name given is itself included, so a resuming caller drops it.\n"            //
+    "  limit (int, optional): Most names the page holds.\n"                                         //
+    "Returns:\n"                                                                                    //
     "  tuple[str, ...]: The names recorded for collections, in order.";
 
 static PyObject* Database_collection_names(PyObject* self, PyObject* const* arguments,
@@ -1296,7 +1302,8 @@ static PyObject* Database_collection_names(PyObject* self, PyObject* const* argu
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
 
     Py_ssize_t const keyword_names_count = ustore_py_keyword_names_count_checked(
-        "collection_names", positional_arguments_count, keyword_names_tuple, 1);
+        "collection_names", positional_arguments_count, keyword_names_tuple,
+        ustore_py_arena_positional(positional_arguments_count, 1));
     if (keyword_names_count < 0) return NULL;
 
     PyObject* after_object = Py_None;
@@ -1325,7 +1332,8 @@ static PyObject* Database_collection_names(PyObject* self, PyObject* const* argu
         after = PyUnicode_AsUTF8AndSize(after_object, &after_length);
         if (!after) return NULL;
     }
-    return ustore_py_collection_names(&context, after, (size_t)after_length, limit, arguments[0]);
+    return ustore_py_collection_names(&context, after, (size_t)after_length, limit,
+                                      positional_arguments_count > 0 ? arguments[0] : NULL);
 }
 
 static char const doc_Database_collection_drop[] =                                           //
@@ -2032,7 +2040,8 @@ static PyMethodDef Database_methods[] = {
      doc_Database_collection_find},
     {"collection_contains", (PyCFunction)(void (*)(void))Database_collection_contains, METH_O,
      doc_Database_collection_contains},
-    {"collection_list", (PyCFunction)(void (*)(void))Database_collection_list, METH_O, doc_Database_collection_list},
+    {"collection_list", (PyCFunction)(void (*)(void))Database_collection_list, METH_FASTCALL,
+     doc_Database_collection_list},
     {"collection_names", (PyCFunction)(void (*)(void))Database_collection_names, ustore_py_method_flags_k,
      doc_Database_collection_names},
     {"collection_drop", (PyCFunction)(void (*)(void))Database_collection_drop, ustore_py_method_flags_k,
@@ -2280,7 +2289,8 @@ static PyMethodDef Snapshot_methods[] = {
     {"deferred", (PyCFunction)(void (*)(void))receiver_deferred, METH_O, doc_deferred},
     {"collection_find", (PyCFunction)(void (*)(void))Database_collection_find, METH_FASTCALL,
      doc_Database_collection_find},
-    {"collection_list", (PyCFunction)(void (*)(void))Database_collection_list, METH_O, doc_Database_collection_list},
+    {"collection_list", (PyCFunction)(void (*)(void))Database_collection_list, METH_FASTCALL,
+     doc_Database_collection_list},
 
     {"read", (PyCFunction)(void (*)(void))ustore_py_api_read, ustore_py_method_flags_k, doc_read},
     {"scan", (PyCFunction)(void (*)(void))ustore_py_api_scan, ustore_py_method_flags_k, doc_scan},
@@ -2370,7 +2380,8 @@ static PyMethodDef On_methods[] = {
      ustore_py_method_flags_k, doc_graph_vertices_cursor},
     {"collection_find", (PyCFunction)(void (*)(void))Database_collection_find, METH_FASTCALL,
      doc_Database_collection_find},
-    {"collection_list", (PyCFunction)(void (*)(void))Database_collection_list, METH_O, doc_Database_collection_list},
+    {"collection_list", (PyCFunction)(void (*)(void))Database_collection_list, METH_FASTCALL,
+     doc_Database_collection_list},
 
     {"read", (PyCFunction)(void (*)(void))ustore_py_api_read, ustore_py_method_flags_k, doc_read},
     {"write", (PyCFunction)(void (*)(void))ustore_py_api_write, ustore_py_method_flags_k, doc_write},
@@ -2483,7 +2494,8 @@ static PyMethodDef DeferredOn_methods[] = {
     {"describe", (PyCFunction)(void (*)(void))Database_describe, METH_NOARGS, doc_Database_describe},
     {"collection_find", (PyCFunction)(void (*)(void))Database_collection_find, METH_FASTCALL,
      doc_Database_collection_find},
-    {"collection_list", (PyCFunction)(void (*)(void))Database_collection_list, METH_O, doc_Database_collection_list},
+    {"collection_list", (PyCFunction)(void (*)(void))Database_collection_list, METH_FASTCALL,
+     doc_Database_collection_list},
 
     {"read", (PyCFunction)(void (*)(void))ustore_py_api_read, ustore_py_method_flags_k, doc_read},
     {"write", (PyCFunction)(void (*)(void))ustore_py_api_write, ustore_py_method_flags_k, doc_write},

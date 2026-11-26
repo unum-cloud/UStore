@@ -1977,6 +1977,10 @@ void run_alone(call_type_* call, std::array<claim_t*, 3> const& claims) noexcept
     util::arena_block_t* const first = new (page)
         util::arena_block_t {nullptr, sizeof(page), sizeof(util::arena_block_t)};
     ustore_arena_handle_t scratch {.memory = util::host_blocks_t {.newest = first}};
+    if constexpr (a_call_filling_arena<call_type_>)
+        // Relaxed, as the arena claim's release and the export handshake order it for readers
+        if (claims[0])
+            floor_atomic_ref<std::uint64_t> {call->arena->generation}.fetch_add(1, std::memory_order_relaxed);
     std::array<std::uint32_t*, 3> const named_calls = raise_named_calls(*call);
     run<call_type_, serve_>(call, claims, view_t {.scratch = &scratch, .queues = &queues});
     lower_named_calls(named_calls);
@@ -2008,6 +2012,10 @@ void dispatch(call_type_* call, std::array<claim_t*, 3> const& claims) noexcept 
     holding_call_t& holding = executor->holding_call;
     if (!take(holding.claim))
         return refuse(*call, claims, {util::status_code_t::contended_k, "Another call holds the executor"});
+    if constexpr (a_call_filling_arena<call_type_>)
+        // Relaxed, as the arena claim's release and the export handshake order it for readers
+        if (claims[0])
+            floor_atomic_ref<std::uint64_t> {call->arena->generation}.fetch_add(1, std::memory_order_relaxed);
     join_delegated(*executor);
     holding.outcome = call->outcome;
     holding.named_calls = raise_named_calls(*call);

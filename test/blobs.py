@@ -230,11 +230,53 @@ def test_an_exported_buffer_outlives_calls_on_other_arenas(view, blobs, arena):
 
 
 @pytest.mark.any_engine
-@pytest.mark.parametrize("refused", [None, b"bytes", 42], ids=["none", "bytes", "integer"])
+@pytest.mark.parametrize("refused", [b"bytes", 42], ids=["bytes", "integer"])
 def test_a_verb_takes_an_arena(view, blobs, refused):
-    """A batch verb given anything but an Arena raises TypeError."""
+    """A batch verb given anything but an Arena or None raises TypeError."""
     with pytest.raises(TypeError):
         view.read([1], refused, collection=blobs)
+
+
+@pytest.mark.any_engine
+def test_a_verb_given_no_arena_makes_one_its_result_owns(view, blobs):
+    """Without an arena, or given None, a batch verb answers into a fresh one, so results of two calls coexist."""
+    view.write([1, 2], [b"first", b"second"], collection=blobs)
+    first = view.read([1], collection=blobs)
+    second = view.read([2], None, collection=blobs)
+    assert [bytes(first[0]), bytes(second[0])] == [b"first", b"second"]
+    assert runs_of(view.scan(1, 2, collection=blobs)) == [[1, 2]]
+
+
+def runs_of(found) -> list[list[int]]:
+    """Every task's run of keys, as lists of the integers they spell."""
+    return [[key.int for key in found[task]] for task in range(len(found))]
+
+
+@pytest.mark.any_engine
+def test_reusing_an_arena_with_a_live_view_raises(view, blobs, arena):
+    """A memoryview over an output is an export of its arena, so a call naming it raises until the view is released."""
+    view.write([1, 2], [b"first", b"second"], collection=blobs)
+    held = view.read([1], arena, collection=blobs)[0]
+    with pytest.raises(BufferError) as refused:
+        view.read([2], arena, collection=blobs)
+    assert isinstance(refused.value, ustore.ContendedError)
+    assert bytes(held) == b"first"
+    held.release()
+    assert bytes(view.read([2], arena, collection=blobs)[0]) == b"second"
+
+
+@pytest.mark.any_engine
+def test_a_result_of_a_reused_arena_goes_stale(view, blobs, arena):
+    """Once a later call names its arena, an earlier result raises ValueError instead of reading rewound memory."""
+    view.write([1, 2], [b"first", b"second"], collection=blobs)
+    earlier = view.read([1], arena, collection=blobs)
+    later = view.read([2], arena, collection=blobs)
+    with pytest.raises(ValueError):
+        earlier[0]
+    with pytest.raises(ValueError):
+        memoryview(earlier)
+    assert len(earlier) == 1
+    assert bytes(later[0]) == b"second"
 
 
 @pytest.mark.parametrize(
@@ -537,6 +579,7 @@ def test_a_deferred_read_answers_once_waited(database, blobs, engine: str):
         assert reading.status in (ustore.Status.DEFERRED, ustore.Status.SUCCESS)
         assert [None if value is None else bytes(value) for value in reading.wait()] == [b"a", b"bb", None]
         assert reading.status is ustore.Status.SUCCESS
+        del reading
 
 
 def test_a_deferred_call_holds_its_arena(database, blobs, engine: str):
@@ -548,6 +591,48 @@ def test_a_deferred_call_holds_its_arena(database, blobs, engine: str):
         values = reading.wait()
         assert [bytes(value) for value in values] == [b"a", b"bb"]
         assert database.on(executor).read([2], arena, collection=blobs).lengths == (2,)
+        del arena, reading, values
+
+
+def test_closing_an_executor_stops_its_verbs_and_keeps_results(database, blobs, engine: str):
+    """Closing an executor, or leaving its block on an exception, stops its verbs, and results over it stay readable."""
+    database.write([1], [b"a"], collection=blobs)
+    executor = executor_for(engine, 1)
+    values = database.on(executor).read([1], collection=blobs)
+    executor.close()
+    assert executor.__exit__(KeyError, KeyError(1), None) is None
+    assert bytes(values[0]) == b"a"
+    with pytest.raises(ustore.UninitializedError):
+        database.on(executor).read([1], collection=blobs)
+
+
+def test_a_deferred_call_naming_the_arena_makes_earlier_results_stale(database, blobs, engine: str):
+    """A deferred call takes its arena as it is submitted, so an earlier result over the arena reads as stale at once."""
+    database.write([1, 2], [b"a", b"bb"], collection=blobs)
+    with executor_for(engine, 1) as executor:
+        arena = ustore.Arena(executor)
+        earlier = database.on(executor).read([1], arena, collection=blobs)
+        pending = database.deferred(executor).read([2], arena, collection=blobs)
+        with pytest.raises(ValueError):
+            earlier[0]
+        assert bytes(pending.wait()[0]) == b"bb"
+
+
+def test_a_deferred_result_answered_after_a_rewind_is_stale(database, blobs, engine: str):
+    """A deferred call answered only after a later call rewound its arena raises ValueError, never reading the rewind."""
+    database.write([1, 2], [b"a", b"bb"], collection=blobs)
+    with executor_for(engine, 1) as executor:
+        later, arena = database.deferred(executor), ustore.Arena(executor)
+        first = later.read([1], arena, collection=blobs)
+        while first.status is ustore.Status.DEFERRED:
+            pass
+        second = later.read([2], arena, collection=blobs)
+        values = second.wait()
+        assert bytes(values[0]) == b"bb"
+        # Answered by the poll already or by the wait now, it never reads the rewound arena
+        with pytest.raises(ValueError):
+            first.wait()[0]
+        del later, arena, first, second, values
 
 
 def test_shorthand_on_a_deferred_view_owns_its_arena(database, blobs, arena, engine: str):
@@ -757,7 +842,7 @@ def test_a_deferred_view_names_the_verb_it_takes_instead(database, blobs, docs, 
         (lambda view: view.get(1.0, collection="blobs"), TypeError),
         (lambda view: view.read(1, ustore.Arena(), collection="blobs"), TypeError),
         (lambda view: view.read(str(key(1)), ustore.Arena(), collection="blobs"), TypeError),
-        (lambda view: view.read([1], collection="blobs"), TypeError),
+        (lambda view: view.read(collection="blobs"), TypeError),
         (lambda view: view.scan(0, -1, ustore.Arena(), collection="blobs"), ValueError),
         (lambda view: view.get(collection="blobs"), TypeError),
     ],
@@ -770,7 +855,7 @@ def test_a_deferred_view_names_the_verb_it_takes_instead(database, blobs, docs, 
         "float-key",
         "bare-key-read",
         "text-key-read",
-        "no-arena",
+        "no-keys-read",
         "negative-count",
         "no-key",
     ],

@@ -66,6 +66,8 @@ from ustore.types import (
     _cross,
     _Crossing,
     _in_arena,
+    _close_read,
+    _open_read,
     _readable,
     _slot,
 )
@@ -279,10 +281,11 @@ struct Columns[origin: MutOrigin](Deferrable, Sized):
 
     def column(self, field: Int) raises Error -> Column[Self.origin]:
         """The column of field `field`."""
-        _readable(self.arena, self.generation, "Columns.column")
+        _open_read(self.arena, self.generation, "Columns.column")
         var view = Pointer[ColumnViewArguments, ImmUntrackedOrigin](
             unsafe_from_address=self.written.columns + field * size_of[ColumnViewArguments]()
         )[]
+        _close_read(self.arena)
         return Column[Self.origin](self.arena, self.generation, view, self.count)
 
 

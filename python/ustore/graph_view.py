@@ -3,9 +3,9 @@
 A graph collection holds every vertex and its edges, while two optional document collections hold
 the attributes of vertices, keyed by vertex, and of edges, keyed by edge identifier. Every read goes
 to the store, so a view holds nothing that could go stale, and every verb works the same over a
-`Database`, a `Transaction` and a blocking `On` of either. Every call reads into a one-off
-`Arena` and copies what it needs into Python objects, which costs an arena per call, while the
-graph verbs of `ustore.lib` take arenas a loop reuses. Over a `DeferredOn`, `has_node` and
+`Database`, a `Transaction` and a blocking `On` of either. Every call reads into a fresh arena
+its result owns and copies what it needs into Python objects, which costs an arena per call, while
+the graph verbs of `ustore.lib` take arenas a loop reuses. Over a `DeferredOn`, `has_node` and
 `read_edges`, which take one call each, answer a `Deferred`, while every method built of several
 calls raises TypeError. Vertices and edges are named by `uuid.UUID`, as every key is, and any
 spelling of a key the binding accepts names them on the way in.
@@ -29,7 +29,6 @@ from uuid import UUID
 
 from ustore.keys import PAGE_KEYS, KeyLike, as_key, is_one_key, scan_keys
 from ustore.lib import (
-    Arena,
     Database,
     Deferred,
     DeferredOn,
@@ -55,7 +54,7 @@ def resolve_collection(view: Receiver, collection: CollectionLike) -> UUID:
     if not isinstance(collection, str):
         return collection
     database = view if isinstance(view, Database) else view.database
-    return database.collection_find(collection, Arena())
+    return database.collection_find(collection)
 
 
 def triples_of(neighborhoods: Neighborhoods, index: int) -> list[Triple]:
@@ -180,14 +179,10 @@ class DegreeView:
 
     def _degrees(self, nodes: list[KeyLike]) -> Iterator[tuple[KeyLike, int | float]]:
         if self.weight is None:
-            counts = self.graph.blocking.graph_degrees(
-                nodes, Arena(), role=self.role, collection=self.graph.graph_collection
-            )
+            counts = self.graph.blocking.graph_degrees(nodes, role=self.role, collection=self.graph.graph_collection)
             yield from ((node, count or 0) for node, count in zip(nodes, counts, strict=True))
             return
-        found = self.graph.blocking.graph_read_edges(
-            nodes, Arena(), role=self.role, collection=self.graph.graph_collection
-        )
+        found = self.graph.blocking.graph_read_edges(nodes, role=self.role, collection=self.graph.graph_collection)
         for index, node in enumerate(nodes):
             identifiers = [edge for _, _, edge in triples_of(found, index)]
             attributes = self.graph.read_attributes(self.graph.edges_collection, identifiers)
@@ -245,7 +240,7 @@ class Graph:
         """The attribute document of every key, an empty one where there is none."""
         if collection is None or len(keys) == 0:
             return [{} for _ in keys]
-        documents = self.blocking.docs_read(keys, Arena(), collection=collection)
+        documents = self.blocking.docs_read(keys, collection=collection)
         return [{} if document is None else json.loads(bytes(document)) for document in documents]
 
     def merge_attributes(self, collection: UUID | None, keys: KeysLike, documents: Sequence[Attributes]) -> None:
@@ -308,7 +303,7 @@ class Graph:
         """Inserts vertices, merging `attributes` into every one of them."""
         keys = nodes if isinstance(nodes, (Buffer, Sequence)) else list(nodes)
         # Only absent vertices are written, since a batch whose every vertex exists is refused by the C ABI.
-        degrees = self.blocking.graph_degrees(keys, Arena(), collection=self.graph_collection)
+        degrees = self.blocking.graph_degrees(keys, collection=self.graph_collection)
         missing = [key for key, degree in zip(keys, degrees, strict=True) if degree is None]
         if missing:
             self.blocking.graph_write_vertices(missing, collection=self.graph_collection)
@@ -325,7 +320,7 @@ class Graph:
         """Removes vertices with every edge they take part in and the attributes of both."""
         keys = list(nodes)
         if self.edges_collection is not None:
-            found = self.blocking.graph_read_edges(keys, Arena(), role=Role.ANY, collection=self.graph_collection)
+            found = self.blocking.graph_read_edges(keys, role=Role.ANY, collection=self.graph_collection)
             identifiers = [edge for index in range(len(keys)) for _, _, edge in triples_of(found, index)]
             self.blocking.docs_remove(identifiers, collection=self.edges_collection)
         self.blocking.graph_remove_vertices(keys, collection=self.graph_collection)
@@ -349,9 +344,7 @@ class Graph:
     def stored_between(self, sources: Sequence[KeyLike]) -> dict[tuple[UUID, UUID], list[Triple]]:
         """Every stored edge leaving `sources`, grouped by canonical pair, in stored order."""
         unique = list(dict.fromkeys(map(as_key, sources)))
-        found = self.blocking.graph_read_edges(
-            unique, Arena(), role=self.outgoing_role, collection=self.graph_collection
-        )
+        found = self.blocking.graph_read_edges(unique, role=self.outgoing_role, collection=self.graph_collection)
         grouped: dict[tuple[UUID, UUID], list[Triple]] = {}
         for index in range(len(unique)):
             for triple in triples_of(found, index):
@@ -487,16 +480,12 @@ class Graph:
         """Every edge once, as stored for the whole graph and oriented away from `nbunch` otherwise."""
         if nbunch is None:
             for page in batched(self, PAGE_KEYS):
-                found = self.blocking.graph_read_edges(
-                    page, Arena(), role=Role.SOURCE, collection=self.graph_collection
-                )
+                found = self.blocking.graph_read_edges(page, role=Role.SOURCE, collection=self.graph_collection)
                 for index in range(len(page)):
                     yield from triples_of(found, index)
             return
         nodes = [as_key(nbunch)] if is_one_key(nbunch) else [as_key(node) for node in nbunch]
-        found = self.blocking.graph_read_edges(
-            nodes, Arena(), role=self.outgoing_role, collection=self.graph_collection
-        )
+        found = self.blocking.graph_read_edges(nodes, role=self.outgoing_role, collection=self.graph_collection)
         seen: set[Triple] = set()
         for index, node in enumerate(nodes):
             for source, target, edge in triples_of(found, index):
@@ -509,9 +498,9 @@ class Graph:
     def read_edges(
         self, vertices: KeyLike | Sequence[KeyLike], role: Role = Role.ANY
     ) -> Neighborhoods | Deferred[Neighborhoods]:
-        """The edges of every vertex in `role`, as the stored (source, target, edge) triples, or the `Deferred` of them over a deferred view, viewing a one-off arena that lives as long as they do."""
+        """The edges of every vertex in `role`, as the stored (source, target, edge) triples, or the `Deferred` of them over a deferred view, viewing a fresh arena that lives as long as they do."""
         batch = [vertices] if is_one_key(vertices) else vertices
-        return self.view.graph_read_edges(batch, Arena(), role=role, collection=self.graph_collection)
+        return self.view.graph_read_edges(batch, role=role, collection=self.graph_collection)
 
     @property
     def edges(self) -> EdgeView:
@@ -554,7 +543,7 @@ class Graph:
     def clear_edges(self) -> None:
         """Removes every edge and its attributes, keeping the vertices."""
         for page in batched(self, PAGE_KEYS):
-            found = self.blocking.graph_read_edges(page, Arena(), role=Role.SOURCE, collection=self.graph_collection)
+            found = self.blocking.graph_read_edges(page, role=Role.SOURCE, collection=self.graph_collection)
             stored = [triple for index in range(len(page)) for triple in triples_of(found, index)]
             if stored:
                 sources, targets, identifiers = zip(*stored, strict=True)
@@ -646,7 +635,7 @@ class DiGraph(Graph):
 
     def predecessors(self, node: KeyLike) -> Iterator[UUID]:
         """The distinct vertices an edge leads from to the vertex, in ascending order."""
-        found = self.blocking.graph_read_edges([node], Arena(), role=Role.TARGET, collection=self.graph_collection)
+        found = self.blocking.graph_read_edges([node], role=Role.TARGET, collection=self.graph_collection)
         return iter(sorted({source for source, _, _ in triples_of(found, 0)}))
 
     @property

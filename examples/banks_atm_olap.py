@@ -204,7 +204,7 @@ def store_batches(database: ustore.Database, collection: UUID, zip_codes: list[i
 def load_measurements(database: ustore.Database, collection: UUID) -> pd.DataFrame:
     """Reads every stored blob back as one batch and concatenates them into one frame."""
     keys = list(scan_keys(database, collection))
-    stored = database.read(keys, ustore.Arena(), collection=collection)
+    stored = database.read(keys, collection=collection)
     return pd.concat([parse_rows(bytes(blob)) for blob in stored], ignore_index=True)
 
 

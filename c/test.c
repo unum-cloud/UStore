@@ -359,6 +359,67 @@ static void test_readme_quickstart(void) {
     ustore_database_free(db);
 }
 
+/** Every successful call naming an arena advances its generation once, a call refused over an open
+ *  export leaves it as it was, and @c NULL answers 0. */
+static void test_arena_generation(void) {
+    ustore_outcome_t outcome = {0};
+    ustore_database_t database = NULL;
+    ustore_arena_t arena = NULL;
+    ustore_database_init_ram(&(ustore_database_init_ram_t) {.database = &database, .outcome = &outcome});
+    expect_success_at(&outcome, __FILE__, __LINE__);
+    ustore_arena_init(&(ustore_arena_init_t) {.arena = &arena, .outcome = &outcome});
+    expect_success_at(&outcome, __FILE__, __LINE__);
+    ustore_collection_id_t blobs = {0};
+    ustore_collection_create(&(ustore_collection_create_t) {.database = database,
+                                                            .outcome = &outcome,
+                                                            .modality = ustore_modality_blobs_k,
+                                                            .collection = &blobs});
+    expect_success_at(&outcome, __FILE__, __LINE__);
+    ustore_key_t const key = {.uuid.bytes[15] = 1};
+    char const value[] = "blob";
+    uint32_t const offsets[2] = {0, sizeof(value) - 1};
+    ustore_blobs_write(&(ustore_blobs_write_t) {
+        .database = database,
+        .outcome = &outcome,
+        .count = 1,
+        .collections = {&blobs, 0},
+        .keys = {&key, 0},
+        .values = {.layout = ustore_strings_u32_tape_k, .data.u32_tape = {(uint8_t const*)value, offsets}}});
+    expect_success_at(&outcome, __FILE__, __LINE__);
+
+    expect_(ustore_arena_generation(NULL) == 0 && ustore_arena_generation(arena) == 0);
+    ustore_strings_view_t read = {0};
+    ustore_blobs_read_t reading = {.database = database,
+                                   .outcome = &outcome,
+                                   .count = 1,
+                                   .collections = {&blobs, 0},
+                                   .keys = {&key, 0},
+                                   .values = &read,
+                                   .arena = arena};
+    ustore_blobs_read(&reading);
+    expect_success_at(&outcome, __FILE__, __LINE__);
+    expect_(ustore_arena_generation(arena) == 1);
+    expect_(ustore_arena_export_open(arena) == ustore_status_success_k);
+    ustore_blobs_read(&reading);
+    expect_(outcome.status == ustore_status_contended_k && ustore_arena_generation(arena) == 1);
+    ustore_arena_export_close(arena);
+    ustore_blobs_read(&reading);
+    expect_success_at(&outcome, __FILE__, __LINE__);
+    expect_(ustore_arena_generation(arena) == 2);
+
+    // A call on an executor advances it once too, when it takes the executor
+    ustore_executor_t executor = NULL;
+    ustore_executor_for_ram(&(ustore_executor_for_ram_t) {.executor = &executor, .outcome = &outcome, .threads = 1});
+    expect_success_at(&outcome, __FILE__, __LINE__);
+    reading.executor = executor;
+    ustore_blobs_read(&reading);
+    expect_(ustore_outcome_wait(&outcome) == ustore_status_success_k && ustore_arena_generation(arena) == 3);
+
+    expect_(ustore_arena_free(arena) == ustore_status_success_k);
+    expect_(ustore_executor_free(executor) == ustore_status_success_k);
+    ustore_database_free(database);
+}
+
 /** An executor refuses to be freed while an arena made with it lives, a RAM one included, and
  *  frees once that arena is gone. */
 static void test_executor_free_with_live_arena(void) {
@@ -845,6 +906,9 @@ int main(int argc, char** argv) {
     finish_test_case(NULL);
     start_test_case("test_every_argument_shape_lands");
     test_every_argument_shape_lands();
+    finish_test_case(NULL);
+    start_test_case("test_arena_generation");
+    test_arena_generation();
     finish_test_case(NULL);
     start_test_case("test_executor_free_with_live_arena");
     test_executor_free_with_live_arena();

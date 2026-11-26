@@ -210,7 +210,7 @@ def test_a_later_call_retires_earlier_results() raises:
         _ = first.present(0)
     except error:
         refused = error.status
-    assert_true(refused == Status.INVALID_ARGUMENT, "a rewound result must refuse reads")
+    assert_true(refused == Status.CONTENDED, "a rewound result must refuse reads")
 
 
 def test_host_reads_of_device_memory_refuse() raises:

@@ -1387,6 +1387,11 @@ USTORE_EXPORT ustore_status_t ustore_arena_export_open(ustore_arena_t arena);
  *  order; @c NULL or an arena with no open export is left as it is. */
 USTORE_EXPORT void ustore_arena_export_close(ustore_arena_t arena);
 
+/** The arena's generation: every successful call naming the arena advances it exactly once, when
+ *  it takes the arena and finds no export open, before it writes. An output made under @c g is
+ *  current while this answers @c g. @c NULL answers 0. */
+USTORE_EXPORT uint64_t ustore_arena_generation(ustore_arena_t arena);
+
 /** Where an arena's outputs live, as @c ustore_arena_describe reports it. */
 typedef enum ustore_residency_t {
 

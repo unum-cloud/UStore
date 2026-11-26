@@ -96,7 +96,7 @@ static int ustore_py_name_view_order(void const* first_pointer, void const* seco
 PyObject* ustore_py_collection_names(ustore_py_context_t const* context, char const* after, size_t after_length,
                                      size_t limit, PyObject* arena) {
     PyObject* claimed = NULL;
-    if (ustore_py_arena_from_object(arena, &claimed) != 0) return NULL;
+    if (ustore_py_arena_from_object(context, arena, &claimed) != 0) return NULL;
     ustore_strings_view_t names = {0};
     ustore_size_t count = 0;
     ustore_outcome_t outcome = {0};
@@ -107,18 +107,27 @@ PyObject* ustore_py_collection_names(ustore_py_context_t const* context, char co
         .written = &count,
         .arena = ustore_py_arena_handle(claimed),
     };
+    uint64_t const generation = ustore_arena_generation(list.arena) + 1;
     Py_BEGIN_ALLOW_THREADS;
     ustore_collection_list(&list);
     Py_END_ALLOW_THREADS;
-
     if (ustore_py_raise_on_outcome(&outcome) != 0) {
         Py_DECREF(claimed);
+        return NULL;
+    }
+    // The names are copied out under an export, so no later call rewinds them first
+    ustore_status_t const opened = ustore_arena_export_open(list.arena);
+    if (opened != ustore_status_success_k || ustore_arena_generation(list.arena) != generation) {
+        if (opened == ustore_status_success_k) ustore_arena_export_close(list.arena);
+        Py_DECREF(claimed);
+        PyErr_SetString(PyExc_ValueError, "the arena was reused by a later call");
         return NULL;
     }
 
     // An engine lists in an order of its own, so the named collections are gathered and sorted here
     ustore_py_name_view_t* const views = PyMem_New(ustore_py_name_view_t, count ? count : 1);
     if (!views) {
+        ustore_arena_export_close(list.arena);
         Py_DECREF(claimed);
         return PyErr_NoMemory();
     }
@@ -151,6 +160,7 @@ PyObject* ustore_py_collection_names(ustore_py_context_t const* context, char co
     }
 
     PyMem_Free(views);
+    ustore_arena_export_close(list.arena);
     Py_DECREF(claimed);
     return listed;
 }
@@ -388,25 +398,26 @@ PyObject* ustore_py_api_strings_remove(PyObject* self, PyObject* const* argument
     return ustore_py_call_run(&context, &strings_remove_verb, call, &remove);
 }
 
-char const doc_strings_read[] =                                                                //
-    "strings_read(strings, arena, *, collection) answers a tuple of keys.\n"                   //
-    "\n"                                                                                       //
-    "Reads the keys a batch of strings map onto.\n"                                            //
-    "\n"                                                                                       //
-    "Args:\n"                                                                                  //
-    "  strings (Sequence[str | bytes-like] | str | bytes-like | tape): The strings to read.\n" //
-    "  arena (Arena): Where the keys land before they are copied out, rewound by this\n"       //
-    "    call.\n"                                                                              //
-    "  collection (UUID | str): The strings collection, by identifier or by name.\n"           //
-    "Returns:\n"                                                                               //
-    "  tuple[UUID | None, ...]: The key of every string, in order, or None for a string\n"     //
+char const doc_strings_read[] =                                                                    //
+    "strings_read(strings, arena=None, *, collection) answers a tuple of keys.\n"                  //
+    "\n"                                                                                           //
+    "Reads the keys a batch of strings map onto.\n"                                                //
+    "\n"                                                                                           //
+    "Args:\n"                                                                                      //
+    "  strings (Sequence[str | bytes-like] | str | bytes-like | tape): The strings to read.\n"     //
+    "  arena (Arena, optional): Where the keys land before they are copied out, rewound by this\n" //
+    "    call.\n"                                                                                  //
+    "  collection (UUID | str): The strings collection, by identifier or by name.\n"               //
+    "Returns:\n"                                                                                   //
+    "  tuple[UUID | None, ...]: The key of every string, in order, or None for a string\n"         //
     "  the collection does not hold.";
 
 PyObject* ustore_py_api_strings_read(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
                                      PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_keyword_names_count_checked("strings_read", positional_arguments_count, keyword_names_tuple, 2) < 0)
+    if (ustore_py_keyword_names_count_checked("strings_read", positional_arguments_count, keyword_names_tuple,
+                                              ustore_py_arena_positional(positional_arguments_count, 2)) < 0)
         return NULL;
     ustore_py_verb_options_t options;
     if (ustore_py_verb_options_from_keywords(&context, arguments, positional_arguments_count, keyword_names_tuple,
@@ -417,7 +428,8 @@ PyObject* ustore_py_api_strings_read(PyObject* self, PyObject* const* arguments,
     strings_call_t* const call = ustore_py_call_open(&context, &strings_read_verb, &stack);
     if (!call) return NULL;
     if (ustore_py_texts_from_object(arguments[0], "strings", NULL, NULL, &call->texts) != 0 ||
-        ustore_py_arena_from_object(arguments[1], &call->kept.arena) != 0)
+        ustore_py_arena_from_object(&context, positional_arguments_count > 1 ? arguments[1] : NULL,
+                                    &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, &strings_read_verb, call);
     call->kept.collection = options.collection;
     ustore_strings_read_t read = {
@@ -436,34 +448,35 @@ PyObject* ustore_py_api_strings_read(PyObject* self, PyObject* const* arguments,
     return ustore_py_call_run(&context, &strings_read_verb, call, &read);
 }
 
-char const doc_strings_scan[] =                                                                  //
-    "strings_scan(prefix, wanted, arena, *, collection, start=None, end=None,\n"                 //
-    "             direction=ScanDirection.ASCENDING) answers a tuple of strings.\n"              //
-    "\n"                                                                                         //
-    "Lists up to `wanted` strings starting with `prefix`, in the order of their bytes. Keys\n"   //
-    "are not exported, so a `strings_read` follows the scan, and a scan resumes from `start`.\n" //
-    "\n"                                                                                         //
-    "Args:\n"                                                                                    //
-    "  prefix (str | bytes | None): What every string starts with, or None for every string.\n"  //
-    "  wanted (int): Most strings the scan returns.\n"                                           //
-    "  arena (Arena): Where the strings land before they are copied out, rewound by this\n"      //
-    "    call.\n"                                                                                //
-    "  collection (UUID | str): The strings collection, by identifier or by name.\n"             //
-    "  start (str | bytes, optional): The first string the scan may return, or None for the\n"   //
-    "    first one in its direction.\n"                                                          //
-    "  end (str | bytes, optional): The string the scan stops before, or None for no bound.\n"   //
-    "  direction (ScanDirection, optional): `ScanDirection.DESCENDING` walks down from\n"        //
-    "    `start`, largest string first.\n"                                                       //
-    "Returns:\n"                                                                                 //
-    "  tuple[str, ...]: The strings, in the order of the direction.\n"                           //
-    "Raises:\n"                                                                                  //
+char const doc_strings_scan[] =                                                                       //
+    "strings_scan(prefix, wanted, arena=None, *, collection, start=None, end=None,\n"                 //
+    "             direction=ScanDirection.ASCENDING) answers a tuple of strings.\n"                   //
+    "\n"                                                                                              //
+    "Lists up to `wanted` strings starting with `prefix`, in the order of their bytes. Keys\n"        //
+    "are not exported, so a `strings_read` follows the scan, and a scan resumes from `start`.\n"      //
+    "\n"                                                                                              //
+    "Args:\n"                                                                                         //
+    "  prefix (str | bytes | None): What every string starts with, or None for every string.\n"       //
+    "  wanted (int): Most strings the scan returns.\n"                                                //
+    "  arena (Arena, optional): Where the strings land before they are copied out, rewound by this\n" //
+    "    call.\n"                                                                                     //
+    "  collection (UUID | str): The strings collection, by identifier or by name.\n"                  //
+    "  start (str | bytes, optional): The first string the scan may return, or None for the\n"        //
+    "    first one in its direction.\n"                                                               //
+    "  end (str | bytes, optional): The string the scan stops before, or None for no bound.\n"        //
+    "  direction (ScanDirection, optional): `ScanDirection.DESCENDING` walks down from\n"             //
+    "    `start`, largest string first.\n"                                                            //
+    "Returns:\n"                                                                                      //
+    "  tuple[str, ...]: The strings, in the order of the direction.\n"                                //
+    "Raises:\n"                                                                                       //
     "  UnicodeDecodeError: A listed string is not UTF-8.";
 
 PyObject* ustore_py_api_strings_scan(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
                                      PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_keyword_names_count_checked("strings_scan", positional_arguments_count, keyword_names_tuple, 3) < 0)
+    if (ustore_py_keyword_names_count_checked("strings_scan", positional_arguments_count, keyword_names_tuple,
+                                              ustore_py_arena_positional(positional_arguments_count, 3)) < 0)
         return NULL;
     static char const* const names[] = {"start", "end", "direction", NULL};
     PyObject* keywords[3] = {NULL, NULL, NULL};
@@ -485,7 +498,8 @@ PyObject* ustore_py_api_strings_scan(PyObject* self, PyObject* const* arguments,
     if (strings_bound_from_object(prefix, "prefix", &call->held[0], &call->bounds[0]) != 0 ||
         strings_bound_from_object(keywords[0], "start", &call->held[1], &call->bounds[1]) != 0 ||
         strings_bound_from_object(keywords[1], "end", &call->held[2], &call->bounds[2]) != 0 ||
-        ustore_py_arena_from_object(arguments[2], &call->kept.arena) != 0)
+        ustore_py_arena_from_object(&context, positional_arguments_count > 2 ? arguments[2] : NULL,
+                                    &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, &strings_scan_verb, call);
     call->kept.collection = options.collection;
     ustore_strings_scan_t scan = {
@@ -508,24 +522,25 @@ PyObject* ustore_py_api_strings_scan(PyObject* self, PyObject* const* arguments,
     return ustore_py_call_run(&context, &strings_scan_verb, call, &scan);
 }
 
-char const doc_strings_sample[] =                                                           //
-    "strings_sample(wanted, arena, *, collection) answers a tuple of strings.\n"            //
-    "\n"                                                                                    //
-    "Draws strings uniformly at random from one collection.\n"                              //
-    "\n"                                                                                    //
-    "Args:\n"                                                                               //
-    "  wanted (int): Most strings to draw.\n"                                               //
-    "  arena (Arena): Where the strings land before they are copied out, rewound by this\n" //
-    "    call.\n"                                                                           //
-    "  collection (UUID | str): The strings collection, by identifier or by name.\n"        //
-    "Returns:\n"                                                                            //
+char const doc_strings_sample[] =                                                                     //
+    "strings_sample(wanted, arena=None, *, collection) answers a tuple of strings.\n"                 //
+    "\n"                                                                                              //
+    "Draws strings uniformly at random from one collection.\n"                                        //
+    "\n"                                                                                              //
+    "Args:\n"                                                                                         //
+    "  wanted (int): Most strings to draw.\n"                                                         //
+    "  arena (Arena, optional): Where the strings land before they are copied out, rewound by this\n" //
+    "    call.\n"                                                                                     //
+    "  collection (UUID | str): The strings collection, by identifier or by name.\n"                  //
+    "Returns:\n"                                                                                      //
     "  tuple[str, ...]: The strings, in no particular order.";
 
 PyObject* ustore_py_api_strings_sample(PyObject* self, PyObject* const* arguments,
                                        Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_keyword_names_count_checked("strings_sample", positional_arguments_count, keyword_names_tuple, 2) < 0)
+    if (ustore_py_keyword_names_count_checked("strings_sample", positional_arguments_count, keyword_names_tuple,
+                                              ustore_py_arena_positional(positional_arguments_count, 2)) < 0)
         return NULL;
     ustore_py_verb_options_t options;
     if (ustore_py_verb_options_from_keywords(&context, arguments, positional_arguments_count, keyword_names_tuple,
@@ -537,7 +552,8 @@ PyObject* ustore_py_api_strings_sample(PyObject* self, PyObject* const* argument
     strings_call_t stack;
     strings_call_t* const call = ustore_py_call_open(&context, &strings_sample_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_arena_from_object(arguments[1], &call->kept.arena) != 0)
+    if (ustore_py_arena_from_object(&context, positional_arguments_count > 1 ? arguments[1] : NULL,
+                                    &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, &strings_sample_verb, call);
     call->kept.collection = options.collection;
     ustore_strings_sample_t sample = {
@@ -556,31 +572,31 @@ PyObject* ustore_py_api_strings_sample(PyObject* self, PyObject* const* argument
     return ustore_py_call_run(&context, &strings_sample_verb, call, &sample);
 }
 
-char const doc_strings_measure[] =                                                            //
-    "strings_measure(start, end, arena, *, collection,\n"                                     //
-    "                direction=ScanDirection.ASCENDING) answers a Measurement.\n"             //
-    "\n"                                                                                      //
-    "Estimates what a range of strings holds without walking it, so the answers are\n"        //
-    "bounds rather than counts.\n"                                                            //
-    "\n"                                                                                      //
-    "Args:\n"                                                                                 //
-    "  start (str | bytes | None): First string of the range, or None for the first one in\n" //
-    "    the direction.\n"                                                                    //
-    "  end (str | bytes | None): The string the range stops before, or None for no bound.\n"  //
-    "  arena (Arena): Where the bounds land before they are copied out, rewound by this\n"    //
-    "    call.\n"                                                                             //
-    "  collection (UUID | str): The strings collection, by identifier or by name.\n"          //
-    "  direction (ScanDirection, optional): The way the range runs from `start`.\n"           //
-    "Returns:\n"                                                                              //
-    "  Measurement: The lower and upper bounds on the strings, the bytes of their values,\n"  //
+char const doc_strings_measure[] =                                                                   //
+    "strings_measure(start, end, arena=None, *, collection,\n"                                       //
+    "                direction=ScanDirection.ASCENDING) answers a Measurement.\n"                    //
+    "\n"                                                                                             //
+    "Estimates what a range of strings holds without walking it, so the answers are\n"               //
+    "bounds rather than counts.\n"                                                                   //
+    "\n"                                                                                             //
+    "Args:\n"                                                                                        //
+    "  start (str | bytes | None): First string of the range, or None for the first one in\n"        //
+    "    the direction.\n"                                                                           //
+    "  end (str | bytes | None): The string the range stops before, or None for no bound.\n"         //
+    "  arena (Arena, optional): Where the bounds land before they are copied out, rewound by this\n" //
+    "    call.\n"                                                                                    //
+    "  collection (UUID | str): The strings collection, by identifier or by name.\n"                 //
+    "  direction (ScanDirection, optional): The way the range runs from `start`.\n"                  //
+    "Returns:\n"                                                                                     //
+    "  Measurement: The lower and upper bounds on the strings, the bytes of their values,\n"         //
     "  and the space they take on disk.";
 
 PyObject* ustore_py_api_strings_measure(PyObject* self, PyObject* const* arguments,
                                         Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_keyword_names_count_checked("strings_measure", positional_arguments_count, keyword_names_tuple, 3) <
-        0)
+    if (ustore_py_keyword_names_count_checked("strings_measure", positional_arguments_count, keyword_names_tuple,
+                                              ustore_py_arena_positional(positional_arguments_count, 3)) < 0)
         return NULL;
     static char const* const names[] = {"direction", NULL};
     PyObject* direction_object = NULL;
@@ -601,7 +617,8 @@ PyObject* ustore_py_api_strings_measure(PyObject* self, PyObject* const* argumen
     Measurement* const bounds = (Measurement*)(call->kept.result = ustore_py_report_new(&MeasurementType));
     if (!bounds || strings_bound_from_object(start, "start", &call->held[1], &call->bounds[1]) != 0 ||
         strings_bound_from_object(end, "end", &call->held[2], &call->bounds[2]) != 0 ||
-        ustore_py_arena_from_object(arguments[2], &call->kept.arena) != 0)
+        ustore_py_arena_from_object(&context, positional_arguments_count > 2 ? arguments[2] : NULL,
+                                    &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, &strings_measure_verb, call);
     call->kept.collection = options.collection;
     ustore_strings_measure_t measure = {

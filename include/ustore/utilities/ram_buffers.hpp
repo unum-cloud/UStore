@@ -135,6 +135,10 @@ struct ustore_arena_handle_t {
     /** Whether a call fills the arena, so a second call naming it finds it contended. */
     claim_t claim = claim_t::free_k;
 
+    /** Calls that took the arena and found no export open, each advancing it once before it
+     *  writes, through the floor class's reference; @c ustore_arena_generation reads it. */
+    std::uint64_t generation = 0;
+
     /** Executor calls naming the arena that have not ended, through the floor class's reference. */
     std::uint32_t named_calls = 0;
 

@@ -27,7 +27,7 @@ pip install --group test . && python -X faulthandler -m pytest -x
 ## Quickstart
 
 The program opens a database in memory, writes a blob, a document and an edge in one transaction, and reads them back.
-The mapping views copy each answer out of a one-off arena, while the batch verbs, such as `read`, answer views into an arena they are handed.
+The mapping views copy each answer out, while the batch verbs, such as `read`, answer views into an arena their result owns.
 
 ```python
 import ustore
@@ -45,8 +45,7 @@ with ustore.Database.open_ram() as database:
     assert database["movies"].docs[1] == {"title": "Avatar", "year": 2009}
     assert database["similar"].graph.has_edge(1, 2)
 
-    arena = ustore.Arena()  # batch verbs answer views into an arena each call reuses
-    posters = database.read([1, 2], arena, collection="posters")
+    posters = database.read([1, 2], collection="posters")  # views into an arena the result owns
     assert bytes(posters[0]) == b"\x89PNG" and posters[1] is None
     print(database.describe().engine.name)
 ```
@@ -61,10 +60,9 @@ Names starting with `_` are reserved for the system collections, which no listin
 
 ```python
 posters = database.collection_create("posters", modality=ustore.Modality.BLOBS)
-arena = ustore.Arena()
-assert database.collection_find("posters", arena) == posters
-database.collection_names(arena, after="p", limit=16)   # ("posters",)
-database.collection_list(arena)                         # every identifier
+assert database.collection_find("posters") == posters
+database.collection_names(after="p", limit=16)          # ("posters",)
+database.collection_list()                              # every identifier
 database.collection_drop("posters", ustore.DropMode.PAIRS)  # empties it, keeping its name
 ```
 
@@ -76,14 +74,14 @@ database.collection_drop("posters", ustore.DropMode.PAIRS)  # empties it, keepin
 A write takes one bytes-like value per key, one value broadcast to every key, or a tape, and views every value for the length of the call rather than copying it.
 A tape is an Arrow `binary`, `large_binary`, `string` or `large_string` array, or a `(data, offsets)` tuple of buffers, and reaches the C ABI as the tape it already is.
 A read answers the tape the engine wrote, with `None` for a missing key.
-`read(keys, arena, offset=16, limit=64)` reads a slice of every value, and `remove(keys, ends=ends)` removes ranges in one atomic call.
+`read(keys, offset=16, limit=64)` reads a slice of every value, and `remove(keys, ends=ends)` removes ranges in one atomic call.
 
 ```python
 keys = [1, 2, 3]
 database.write(keys, [b"a", b"bb", b"ccc"], collection=posters)  # one value per key
 database.write(keys, b"same", collection=posters)       # one value every key repeats
 database.write(keys, pyarrow.array([b"a", b"bb", b"ccc"]), collection=posters)  # an Arrow array, as a u32 tape
-values = database.read(keys, arena, collection=posters)  # memoryviews over the arena
+values = database.read(keys, collection=posters)        # memoryviews over an arena it owns
 database.write([4, 5, 6], values, collection=posters)   # a read writes back as the tape it is
 database.set(7, b"one", collection=posters, durability=ustore.Durability.FLUSHED)
 database.remove([7], collection=posters)
@@ -91,20 +89,20 @@ database.remove([7], collection=posters)
 
 ## Scans
 
-`scan(start, wanted, arena)` lists up to `wanted` keys from `start` upwards, `end=` stops it before a key, and `direction=ScanDirection.DESCENDING` walks down instead.
-`scan_batch` runs one scan per start in one call, `sample` and `sample_batch` draw keys at random, and `measure(start, end, arena)` answers a `Measurement` of bounds on the entries, value bytes and space in a range, without walking it.
+`scan(start, wanted)` lists up to `wanted` keys from `start` upwards, `end=` stops it before a key, and `direction=ScanDirection.DESCENDING` walks down instead.
+`scan_batch` runs one scan per start in one call, `sample` and `sample_batch` draw keys at random, and `measure(start, end)` answers a `Measurement` of bounds on the entries, value bytes and space in a range, without walking it.
 `docs_scan`, `graph_scan_vertices` and `pages_scan` list the other modalities, with `_sample` and `_measure` beside them.
-`cursor(start, collection=...)` opens a walk whose `next(wanted, arena, values=True)` pulls a page with its values, resuming past the last key it handed out, until a short page ends it for good.
+`cursor(start, collection=...)` opens a walk whose `next(wanted, values=True)` pulls a page with its values, resuming past the last key it handed out, until a short page ends it for good.
 The cursor keeps no executor: `next` runs on the calling thread, and `cursor.on(executor).next(...)` blocks one pull on an executor.
 `docs_cursor(fields=..., columns_types=...)` pulls lists of `(Page, Columns)` batches, one per executor task that found rows.
 
 ```python
 from ustore import ScanDirection
 
-database.scan(10, 8, arena, collection=posters, end=30)                          # keys in [10, 30)
-database.scan(None, 8, arena, collection=posters, direction=ScanDirection.DESCENDING)  # the 8 largest keys
+database.scan(10, 8, collection=posters, end=30)                          # keys in [10, 30)
+database.scan(None, 8, collection=posters, direction=ScanDirection.DESCENDING)  # the 8 largest keys
 with database.cursor(collection=posters) as cursor:     # reads nothing until its first pull
-    while page := cursor.next(4096, arena, values=True):
+    while page := cursor.next(4096, values=True):
         for key, poster in zip(page, page.values):       # UUIDs and memoryviews over the arena
             consume(key, poster)
 ```
@@ -118,7 +116,7 @@ A plain callable is asked about one `uuid.UUID` at a time and is cheap, so it ru
 `ustore.Batch(handler)` is asked once per page about the keys patterns and filters kept, for handlers that pay per call, and `cost=PredicateCost.CHEAP` moves it ahead of them.
 
 ```python
-database.scan(None, 100, arena, collection=posters, predicate=lambda key: key.int % 2 == 0)
+database.scan(None, 100, collection=posters, predicate=lambda key: key.int % 2 == 0)
 
 
 def even(keys, admissions):  # a (count, 16) view of key bytes, and a (count,) view to write 1 into
@@ -126,8 +124,8 @@ def even(keys, admissions):  # a (count, 16) view of key bytes, and a (count,) v
         admissions[row] = keys[row, 15] % 2 == 0
 
 
-database.scan(None, 100, arena, collection=posters, predicate=ustore.Batch(even))
-database.scan(None, 100, arena, collection=posters, predicate=ustore.Batch(even, cost=ustore.PredicateCost.CHEAP))
+database.scan(None, 100, collection=posters, predicate=ustore.Batch(even))
+database.scan(None, 100, collection=posters, predicate=ustore.Batch(even, cost=ustore.PredicateCost.CHEAP))
 ```
 
 Both views are valid only for the call, and the admissions start as rejections.
@@ -163,7 +161,7 @@ Indexing a transaction by name answers a `Collection` whose writes stage there.
 ```python
 transaction = database.transaction(ustore.Watch.KEYS)
 transaction.write(keys, [b"a", b"bb", b"ccc"], collection="movies")
-peek = transaction.unwatched().read(keys, arena, collection="movies")  # recorded for no conflict
+peek = transaction.unwatched().read(keys, collection="movies")  # recorded for no conflict
 read_stamp = transaction.stage()
 commit_stamp = transaction.commit(ustore.Durability.FLUSHED)
 transaction.close()
@@ -178,7 +176,7 @@ Its `read_stamp` is the stamp it reads at, so `before.read_stamp < commit_stamp 
 
 ```python
 with database.snapshot() as snapshot:
-    old = snapshot.read(keys, arena, collection="movies")
+    old = snapshot.read(keys, collection="movies")
     old_poster = snapshot["movies"].blobs[1]
     assert snapshot.read_stamp >= commit_stamp
     snapshot.save(directory, progress=report)
@@ -197,10 +195,10 @@ A gather answers `Columns`, each a buffer NumPy reads without a copy beside its 
 people = database.collection_create("people", modality=ustore.Modality.DOCS)
 database.docs_write([10, 11], ['{"name": "Lex", "tweets": 2221}', '{"name": "Joe"}'], collection=people)
 database.docs_write([10, 11], np.array([1.5, 2.5]), field="price", type=ustore.FieldType.F64, collection=people)
-names = database.docs_read([10, 11], arena, field="name", outputs_type=ustore.FieldType.STRING, collection=people)
-database.docs_gist([10, 11], arena, collection=people)  # ("/name", "/tweets", "/price")
+names = database.docs_read([10, 11], field="name", outputs_type=ustore.FieldType.STRING, collection=people)
+database.docs_gist([10, 11], collection=people)  # ("/name", "/tweets", "/price")
 types = [ustore.FieldType.STRING, ustore.FieldType.I64]
-columns = database.docs_gather([10, 11], ["name", "tweets"], types, arena, collection=people)
+columns = database.docs_gather([10, 11], ["name", "tweets"], types, collection=people)
 columns[1], columns.validities(1)                       # memoryview of "q", bitmap bytes
 ```
 
@@ -218,9 +216,9 @@ from ustore.graph_view import DiGraph
 
 follows = database.collection_create("follows", modality=ustore.Modality.GRAPH)
 database.graph_write_edges(np.array([1, 2]), np.array([2, 3]), collection=follows)
-neighborhoods = database.graph_read_edges([1, 2, 3], arena, role=ustore.Role.ANY, collection=follows)
+neighborhoods = database.graph_read_edges([1, 2, 3], role=ustore.Role.ANY, collection=follows)
 np.asarray(neighborhoods)                               # (edges, 3, 16) bytes of source, target, edge
-database.graph_degrees([1, 2, 3], arena, role=ustore.Role.SOURCE, collection=follows)  # (1, 1, 0)
+database.graph_degrees([1, 2, 3], role=ustore.Role.SOURCE, collection=follows)  # (1, 1, 0)
 
 for name, modality in [("graph", ustore.Modality.GRAPH), ("nodes", ustore.Modality.DOCS), ("edges", ustore.Modality.DOCS)]:
     database.collection_create(name, modality=modality)   # a view only finds collections by name
@@ -235,13 +233,13 @@ The receiver a verb is called on chooses where it runs and how it completes, whi
 A `Database`, `Transaction` or `Snapshot` runs its calls on the calling thread, `on(executor)` blocks on that executor, and `deferred(executor)` submits there and answers a `ustore.Deferred`.
 In a coroutine, `await` a deferred call, which polls its status and re-polls on the next turn of the running loop through `loop.call_soon`, never sleeping and parking no thread; anywhere else, `wait()` blocks the thread with its state detached.
 A `Deferred` holds its inputs, output slots and arena until the call finishes, and dropping an unfinished one waits for it.
+Awaiting one whose arena a later call already reused raises `ValueError`, so give each deferred call in flight an arena of its own, as calls given none get.
 
 ```python
 async def main(database, executor, keys, key):
-    arena = ustore.Arena(executor)                       # placed where the executor computes
-    values = database.on(executor).read(keys, arena, collection="movies")  # blocking, on the executor
+    values = database.on(executor).read(keys, collection="movies")  # blocking, on the executor
     later = database.deferred(executor)
-    reading = later.read(keys, arena, collection="movies")  # submitted at once, holding the arena
+    reading = later.read(keys, collection="movies")      # submitted at once, holding a fresh arena
     reading.status                                       # ustore.Status.DEFERRED until final
     values = await reading                               # or: reading.wait()
     poster = await later["movies"].blobs[key]            # a missing key raises KeyError
@@ -251,8 +249,8 @@ Calls on two executors run together, and `asyncio.gather` awaits both:
 
 ```python
 async def fan_out(database, left, right, keys):
-    reading = database.deferred(left).read(keys, ustore.Arena(left), collection="movies")
-    scanning = database.deferred(right).scan(None, 100, ustore.Arena(right), collection="movies")
+    reading = database.deferred(left).read(keys, collection="movies")
+    scanning = database.deferred(right).scan(None, 100, collection="movies")
     return await asyncio.gather(reading, scanning)       # both submitted before either is awaited
 ```
 
@@ -263,42 +261,48 @@ Python's `in`, assignments, `del` and the table view take several calls or must 
 An executor owns threads, and a database owns its data, so one executor serves any number of databases, one call at a time; a second call while one runs raises `ContendedError` once awaited.
 `Executor.for_ram(threads=0, *, memory_domains=None, scratch_limit=0)` spawns threads near the NUMA nodes it names, where zero threads take all but one in eight of their cores, leaving the rest to blocking calls and the engines' background work, and each thread's scratch stops at `scratch_limit` bytes, 16 GiB for zero.
 `Executor.for_nvme` makes the I/O rings of the NVMe engine, and `Executor.for_vram(devices=[...])` drives every named GPU of one vendor, one stream each, or every GPU of the first vendor for none.
-Used as a context manager, an executor waits for its calls and closes on exit, and progress callbacks on its threads take the GIL as they enter Python.
+Used as a context manager, an executor closes on exit, and progress callbacks on its threads take the GIL as they enter Python.
+Closing never raises: it only stops the executor serving verbs, which then raise `UninitializedError`.
+Every `Arena`, result and receiver holds the executor it runs on, so results stay readable after the `with` block ends, and the threads are freed once the last of them is gone.
 
 ```python
 with ustore.Executor.for_ram(8, memory_domains=[0]) as executor:
     database = ustore.Database.open_rocksdb(directory, executor=executor)  # the open blocks on it
-    arena = ustore.Arena(executor)
-    values = database.on(executor).read(keys, arena, collection="movies")
+    values = database.on(executor).read(keys, collection="movies")  # an arena on the executor
     executor.drain(ustore.Mood.SPINNING)                # waits, then keeps idle threads hot
     database.close()
+print(values.lengths)                                   # still readable; the threads go with `values`
+database.on(executor).read(keys, collection="movies")   # raises UninitializedError: the block closed it
 ```
 
 [The C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#executors) state how executors place their threads, scratch and arenas.
 
 ## Batches and Arenas
 
-Every output whose length only the call knows lands in a `ustore.Arena` you pass, and the verb answers a view over it without copying, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#batches-and-arenas) describe.
-Each call rewinds its arena, so the previous call's views read whatever it then holds, undetected, and a steady loop allocates once; to keep a result past the next call, pass that call another arena.
-A `memoryview` over an output pins the arena until released, and the result types export DLPack too; while a DLPack capsule or an Arrow array of an output lives, a call naming its arena raises `ContendedError`.
+Every output whose length only the call knows lands in a `ustore.Arena`, and the verb answers a view over it without copying, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#batches-and-arenas) describe.
+A call given no arena makes a fresh one on its executor, which its result owns, so results of separate calls never interfere.
+Passing one opts into reuse: each call rewinds the arena, so a steady loop allocates once, and every result of an earlier call on it then raises `ValueError` when read.
+A `memoryview`, DLPack capsule, Arrow array or CUDA Array Interface read of an output is an export of its arena, and a call naming the arena raises `ContendedError`, also a `BufferError`, until every export is released; copy or drop results before reusing their arena.
+A long-lived view, such as `np.from_dlpack` of a result kept across calls, belongs on the arena-less path, where its arena is its own.
 A key is a `uuid.UUID`, its text, sixteen raw bytes, or a non-negative integer read as `uuid.UUID(int=n)`, and a batch passes without a copy as a contiguous array of 16-byte records or converts from 64-bit integers.
 
 ```python
+values = database.read(keys, collection="movies")       # a fresh arena, owned by `values`
 arena = ustore.Arena()
 for batch in batches:
-    values = database.read(batch, arena, collection="movies")  # rewinds: the last batch's values are gone
-    total += sum(length or 0 for length in values.lengths)
-held = database.read(keys, arena, collection="movies")[0]  # a memoryview, pinning the arena
-database.read(keys, ustore.Arena(), collection="movies")  # another arena serves the next call meanwhile
-held.release()                                          # and this one serves calls again
+    found = database.read(batch, arena, collection="movies")  # rewinds: the last batch's `found` is stale
+    total += sum(length or 0 for length in found.lengths)
+held = database.read(keys, arena, collection="movies")[0]  # a memoryview, an export of the arena
+database.read(keys, arena, collection="movies")         # raises ContendedError while `held` lives
+held.release()                                          # and the arena serves calls again
 ```
 
-Shorthand such as `get`, `contains` and `view[name].blobs[key]` makes a one-off arena per call and copies out of it, so a loop reaches for the verbs with an arena of its own.
+Shorthand such as `get`, `contains` and `view[name].blobs[key]` copies out of an arena of its own, so a loop reaches for the batch verbs with one arena it reuses.
 
 ## Errors
 
 Every failure raises a subclass of `ustore.Error`, itself a `RuntimeError`, holding the status the C ABI reported as its `status` attribute, a `ustore.Status` member.
-Each status has its own class, which also derives the built-in naming the same fault: `NotFoundError` is a `KeyError`, `InvalidArgumentError` a `ValueError`, `UnsupportedError` a `NotImplementedError`, `InputOutputError` an `OSError`, and both `CapacityExhaustedError` and `CapacityOverflowError` an `OverflowError`.
+Each status has its own class, which also derives the built-in naming the same fault: `NotFoundError` is a `KeyError`, `InvalidArgumentError` a `ValueError`, `UnsupportedError` a `NotImplementedError`, `InputOutputError` an `OSError`, `ContendedError` a `BufferError`, and both `CapacityExhaustedError` and `CapacityOverflowError` an `OverflowError`.
 `WriteConflictError`, `ReadConflictError` and `PhantomConflictError` share `ConflictError`, the one clause a retry loop needs.
 A closed handle raises `UninitializedError`, and an argument of the wrong Python type raises `TypeError`.
 
@@ -317,13 +321,13 @@ Every C enum is an `enum.IntEnum` built at import through the C `_name` function
 
 ## Apache Arrow
 
-Outputs speak the Arrow PyCapsule protocol, exporting in place until their arena rewinds, and `import_arrow` and `ingest_arrow` read any object that speaks it back into a collection:
+Outputs speak the Arrow PyCapsule protocol, exporting in place and holding their arena until released, and `import_arrow` and `ingest_arrow` read any object that speaks it back into a collection:
 
 ```python
-values = database.read([1, 2, 3], arena, collection=posters)
+values = database.read([1, 2, 3], collection=posters)
 pyarrow.array(values)  # `binary`, null where a key is missing
 types = [ustore.FieldType.STRING, ustore.FieldType.I64]
-columns = database.docs_gather([10, 11], ["name", "tweets"], types, arena, collection=people)
+columns = database.docs_gather([10, 11], ["name", "tweets"], types, collection=people)
 pyarrow.array(columns).field("name")  # ["Lex", "Joe"], one struct array of the columns
 
 table = pyarrow.table(database["posters"])  # the whole collection as a stream, keys as `arrow.uuid`
@@ -359,10 +363,10 @@ The extension declares `Py_MOD_GIL_NOT_USED`, so free-threaded builds run withou
 ### Design
 
 - __The receiver chooses, the verb stays.__
-  `db.read(keys, arena)` takes no executor or completion, and `db.on(executor)`, `db.deferred(executor)`, `snapshot` and `txn.unwatched()` choose where it runs and what it sees.
+  `db.read(keys)` takes no executor or completion, and `db.on(executor)`, `db.deferred(executor)`, `snapshot` and `txn.unwatched()` choose where it runs and what it sees.
 - __Ragged inputs keep their layout.__
   An Arrow array or a pair of NumPy buffers passes as the tape it is, and anything else is wrapped in views the call pins at submission.
-- __Arenas are the caller's, never hidden.__
-  No handle keeps an arena of its own, and shorthand pays an allocation and a copy that a verb handed a reused arena never pays.
+- __Results own their memory unless the caller reuses it.__
+  A call given no arena makes one its result owns; a reused arena saves that allocation, and an export or a stale result is refused rather than read after a rewind.
 - __No life of its own.__
   The binding starts no threads and keeps no queues or counts, and `await` polls instead of parking a thread.

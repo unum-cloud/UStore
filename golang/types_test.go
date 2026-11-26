@@ -100,6 +100,36 @@ func TestArenasLiveOnTheHost(t *testing.T) {
 	}
 }
 
+func TestADroppedCallSettlesAfterItsArenaClosed(t *testing.T) {
+	database, people, arena, executor := fixture(t)
+	if _, err := database.Deferred(executor).BlobsRead(people, keys(1), arena, nil); err != nil {
+		t.Fatalf("the deferred read must submit: %v", err)
+	}
+	if err := arena.Close(); err != nil {
+		t.Fatalf("the arena must close: %v", err)
+	}
+	runtime.GC()
+	runtime.GC()
+}
+
+func TestALaterCallEndsEarlierResults(t *testing.T) {
+	database, people, arena, _ := fixture(t)
+	first, err := database.BlobsRead(people, keys(1), arena, nil)
+	if err != nil {
+		t.Fatalf("the first read must run: %v", err)
+	}
+	first.Get(0)
+	if _, err := database.BlobsRead(people, keys(1), arena, nil); err != nil {
+		t.Fatalf("the second read must run: %v", err)
+	}
+	defer func() {
+		if reason, _ := recover().(error); !errors.Is(reason, ustore.StatusContended) {
+			t.Fatalf("a result read after a later call panicked with %v", reason)
+		}
+	}()
+	first.Get(0)
+}
+
 func TestVramExecutorsRefuseWhatNoDeviceServes(t *testing.T) {
 	// A build without CUDA refuses every device, and one with CUDA refuses an ordinal no device holds
 	unknown := []int32{1 << 20}
@@ -131,6 +161,9 @@ func TestClosedHandlesRefuseBeforeCrossing(t *testing.T) {
 	_ = closed.Close()
 	if _, err := ustore.NewArena(closed); !errors.Is(err, ustore.StatusUninitialized) {
 		t.Fatalf("a closed executor answered %v", err)
+	}
+	if err := executor.Close(); !errors.Is(err, ustore.StatusContended) {
+		t.Fatalf("an executor under a live arena closed with %v", err)
 	}
 	_ = database.Close()
 	if _, err := database.BlobsRead(people, keys(1), arena, nil); !errors.Is(err, ustore.StatusUninitialized) {

@@ -464,10 +464,8 @@ PyObject* ustore_py_api_pages_insert(PyObject* self, PyObject* const* arguments,
                                 &call->anchors) != 0)
         return ustore_py_call_discard(&context, &insert_verb, call);
     // The arena only holds the effective keys out, so it dies with the call that named it.
-    PyObject* const arena = ustore_py_arena_new(context.executor);
-    int const claimed = arena ? ustore_py_arena_from_object(arena, &call->kept.arena) : -1;
-    Py_XDECREF(arena);
-    if (claimed != 0) return ustore_py_call_discard(&context, &insert_verb, call);
+    if (ustore_py_arena_from_object(&context, NULL, &call->kept.arena) != 0)
+        return ustore_py_call_discard(&context, &insert_verb, call);
     ustore_pages_insert_t insert = {
         .database = context.database_handle,
         .executor = ustore_py_context_executor(&context),
@@ -793,7 +791,8 @@ static void read_submit(void* arguments) { ustore_pages_read((ustore_pages_read_
 
 static PyObject* read_answer(void* erased) {
     read_call_t const* const call = (read_call_t const*)erased;
-    return ustore_py_values_new(call->kept.arena, call->presences, &call->values, call->tasks.count);
+    return ustore_py_values_new(call->kept.arena, call->kept.generation, call->presences, &call->values,
+                                call->tasks.count);
 }
 
 static void read_release(void* erased) {
@@ -805,23 +804,23 @@ static void read_release(void* erased) {
 
 static ustore_py_verb_t const read_verb = {sizeof(read_call_t), read_submit, read_answer, read_release};
 
-char const doc_pages_read[] =                                                                    //
-    "pages_read(keys, arena, *, collection, elements=None, outputs_encoding=PageEncoding.XML)\n" //
-    "answers a Values tape.\n"                                                                   //
-    "\n"                                                                                         //
-    "Renders whole pages, or the subtrees of elements, as the receiver sees them.\n"             //
-    "\n"                                                                                         //
-    "Args:\n"                                                                                    //
-    "  keys (KeyLike | Sequence[KeyLike] | buffer): The page of every task, or one for all.\n"   //
-    "  arena (Arena): Where the tape lands, rewound by this call.\n"                             //
-    "  collection (UUID | str): The pages collection, by identifier or by name.\n"               //
-    "  elements (KeyLike | Sequence[KeyLike] | buffer, optional): The element every task\n"      //
-    "    renders with its subtree, where Nil or None renders the whole page.\n"                  //
-    "  outputs_encoding (PageEncoding, optional): `PageEncoding.XML` for markup, or\n"           //
-    "    `PageEncoding.TEXT` for the text of every run in document order.\n"                     //
-    "Returns:\n"                                                                                 //
-    "  Values: One rendering per task, None where the page or the element is absent.\n"          //
-    "Raises:\n"                                                                                  //
+char const doc_pages_read[] =                                                                         //
+    "pages_read(keys, arena=None, *, collection, elements=None, outputs_encoding=PageEncoding.XML)\n" //
+    "answers a Values tape.\n"                                                                        //
+    "\n"                                                                                              //
+    "Renders whole pages, or the subtrees of elements, as the receiver sees them.\n"                  //
+    "\n"                                                                                              //
+    "Args:\n"                                                                                         //
+    "  keys (KeyLike | Sequence[KeyLike] | buffer): The page of every task, or one for all.\n"        //
+    "  arena (Arena, optional): Where the tape lands, rewound by this call.\n"                        //
+    "  collection (UUID | str): The pages collection, by identifier or by name.\n"                    //
+    "  elements (KeyLike | Sequence[KeyLike] | buffer, optional): The element every task\n"           //
+    "    renders with its subtree, where Nil or None renders the whole page.\n"                       //
+    "  outputs_encoding (PageEncoding, optional): `PageEncoding.XML` for markup, or\n"                //
+    "    `PageEncoding.TEXT` for the text of every run in document order.\n"                          //
+    "Returns:\n"                                                                                      //
+    "  Values: One rendering per task, None where the page or the element is absent.\n"               //
+    "Raises:\n"                                                                                       //
     "  UnsupportedError: The encoding is HTML, Markdown or JSON.";
 
 PyObject* ustore_py_api_pages_read(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
@@ -830,8 +829,9 @@ PyObject* ustore_py_api_pages_read(PyObject* self, PyObject* const* arguments, P
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
     ustore_py_verb_options_t options;
     page_keywords_t keywords;
-    if (page_keywords_from_args(&context, "pages_read", arguments, positional_arguments_count, keyword_names_tuple, 2,
-                                read_keywords, &options, &keywords) != 0)
+    if (page_keywords_from_args(&context, "pages_read", arguments, positional_arguments_count, keyword_names_tuple,
+                                ustore_py_arena_positional(positional_arguments_count, 2), read_keywords, &options,
+                                &keywords) != 0)
         return NULL;
 
     read_call_t stack;
@@ -842,7 +842,8 @@ PyObject* ustore_py_api_pages_read(PyObject* self, PyObject* const* arguments, P
                                 &call->pages) != 0 ||
         spread_keys_from_object(keywords.elements, ustore_py_context_executor(&context), "elements", &call->tasks,
                                 &call->elements) != 0 ||
-        ustore_py_arena_from_object(arguments[1], &call->kept.arena) != 0)
+        ustore_py_arena_from_object(&context, positional_arguments_count > 1 ? arguments[1] : NULL,
+                                    &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, &read_verb, call);
     call->kept.collection = options.collection;
     ustore_pages_read_t read = {
@@ -864,7 +865,7 @@ PyObject* ustore_py_api_pages_read(PyObject* self, PyObject* const* arguments, P
 }
 
 char const doc_pages_scan[] =                                                                  //
-    "pages_scan(start, wanted, arena, *, collection, end=None,\n"                              //
+    "pages_scan(start, wanted, arena=None, *, collection, end=None,\n"                         //
     "           direction=ScanDirection.ASCENDING, mode=ScanMode.ORDERED, progress=None,\n"    //
     "           filter=None, predicate=None)\n"                                                //
     "answers a Keys tape.\n"                                                                   //
@@ -876,7 +877,7 @@ char const doc_pages_scan[] =                                                   
     "  start (KeyLike | None): The first key the scan may return, or None for the first\n"     //
     "    key in its direction.\n"                                                              //
     "  wanted (int): Most keys the scan returns.\n"                                            //
-    "  arena (Arena): Where the keys land, rewound by this call.\n"                            //
+    "  arena (Arena, optional): Where the keys land, rewound by this call.\n"                  //
     "  collection (UUID | str): The pages collection, by identifier or by name.\n"             //
     "  end (KeyLike, optional): The key the scan stops before, or None for no bound.\n"        //
     "  direction (ScanDirection, optional): Which way the scan walks, as `scan` takes it.\n"   //
@@ -897,7 +898,7 @@ PyObject* ustore_py_api_pages_scan(PyObject* self, PyObject* const* arguments, P
 }
 
 char const doc_pages_sample[] =                                                                //
-    "pages_sample(wanted, arena, *, collection) answers a Keys tape.\n"                        //
+    "pages_sample(wanted, arena=None, *, collection) answers a Keys tape.\n"                   //
     "\n"                                                                                       //
     "Draws page keys uniformly at random from one collection, as `sample` draws the keys of\n" //
     "blobs. Pages are not rendered, so a `pages_read` follows.";
@@ -908,10 +909,10 @@ PyObject* ustore_py_api_pages_sample(PyObject* self, PyObject* const* arguments,
                                    ustore_modality_pages_k);
 }
 
-char const doc_pages_measure[] =                                                           //
-    "pages_measure(start, end, arena, *, collection, direction=ScanDirection.ASCENDING)\n" //
-    "answers a Measurement.\n"                                                             //
-    "\n"                                                                                   //
+char const doc_pages_measure[] =                                                                //
+    "pages_measure(start, end, arena=None, *, collection, direction=ScanDirection.ASCENDING)\n" //
+    "answers a Measurement.\n"                                                                  //
+    "\n"                                                                                        //
     "Estimates what a range of page keys holds without walking it, as `measure` does for blobs.";
 
 PyObject* ustore_py_api_pages_measure(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,

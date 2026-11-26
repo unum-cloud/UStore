@@ -277,11 +277,14 @@ static PyObject* degrees_tuple(ustore_vertex_degree_t const* degrees, size_t cou
 }
 
 /** A new @c Neighborhoods over what a read of @p count vertices wrote into @p arena. */
-static PyObject* neighborhoods_new(PyObject* arena, ustore_key_t const* tape, ustore_length_t const* offsets,
-                                   ustore_vertex_degree_t const* degrees, size_t count) {
+static PyObject* neighborhoods_new(PyObject* arena, uint64_t generation, ustore_key_t const* tape,
+                                   ustore_length_t const* offsets, ustore_vertex_degree_t const* degrees,
+                                   size_t count) {
     Neighborhoods* const instance = PyObject_New(Neighborhoods, &NeighborhoodsType);
     if (!instance) return NULL;
     instance->arena = Py_NewRef(arena);
+    instance->generation = generation;
+    instance->cuda_array_interface_reads = 0;
     instance->tape = tape;
     instance->offsets = offsets;
     instance->degrees = degrees;
@@ -296,21 +299,21 @@ static PyObject* neighborhoods_new(PyObject* arena, ustore_key_t const* tape, us
     return (PyObject*)instance;
 }
 
-char const doc_graph_read_edges[] =                                                             //
-    "graph_read_edges(vertices, arena, *, role=Role.ANY, collection) answers Neighborhoods.\n"  //
-    "\n"                                                                                        //
-    "Reads every edge a batch of vertices takes part in. The edges of one vertex come sorted\n" //
-    "by neighbour; with both roles the outgoing ones precede the incoming ones.\n"              //
-    "\n"                                                                                        //
-    "Args:\n"                                                                                   //
-    "  vertices (Sequence[KeyLike] | buffer): The vertices whose edges are read.\n"             //
-    "  arena (Arena): Where the degrees and the edges land, rewound by this call.\n"            //
-    "  role (Role, optional): `Role.SOURCE` for the edges a vertex leaves by, `Role.TARGET`\n"  //
-    "    for those it is entered by, or `Role.ANY` for both, which is how an undirected\n"      //
-    "    graph asks.\n"                                                                         //
-    "  collection (UUID | str): The graph collection, by identifier or by name.\n"              //
-    "Returns:\n"                                                                                //
-    "  Neighborhoods: One run of (source, target, edge) triples per vertex, None where it is\n" //
+char const doc_graph_read_edges[] =                                                                 //
+    "graph_read_edges(vertices, arena=None, *, role=Role.ANY, collection) answers Neighborhoods.\n" //
+    "\n"                                                                                            //
+    "Reads every edge a batch of vertices takes part in. The edges of one vertex come sorted\n"     //
+    "by neighbour; with both roles the outgoing ones precede the incoming ones.\n"                  //
+    "\n"                                                                                            //
+    "Args:\n"                                                                                       //
+    "  vertices (Sequence[KeyLike] | buffer): The vertices whose edges are read.\n"                 //
+    "  arena (Arena, optional): Where the degrees and the edges land, rewound by this call.\n"      //
+    "  role (Role, optional): `Role.SOURCE` for the edges a vertex leaves by, `Role.TARGET`\n"      //
+    "    for those it is entered by, or `Role.ANY` for both, which is how an undirected\n"          //
+    "    graph asks.\n"                                                                             //
+    "  collection (UUID | str): The graph collection, by identifier or by name.\n"                  //
+    "Returns:\n"                                                                                    //
+    "  Neighborhoods: One run of (source, target, edge) triples per vertex, None where it is\n"     //
     "  absent.";
 
 /** A read of the edges or the degrees of a batch of vertices, which its caller gathers in place. */
@@ -339,7 +342,8 @@ static void edges_read_submit(void* arguments) { ustore_graph_read_edges((ustore
 
 static PyObject* neighborhoods_answer(void* erased) {
     edges_read_call_t const* const call = (edges_read_call_t const*)erased;
-    return neighborhoods_new(call->kept.arena, call->edges, call->edges_offsets, call->degrees, call->vertices.count);
+    return neighborhoods_new(call->kept.arena, call->kept.generation, call->edges, call->edges_offsets, call->degrees,
+                             call->vertices.count);
 }
 
 static PyObject* degrees_answer(void* erased) {
@@ -397,14 +401,15 @@ static PyObject* edges_read(PyObject* self, char const* name, ustore_py_verb_t c
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
     ustore_py_verb_options_t options;
     ustore_vertex_role_t role = ustore_vertex_role_any_k;
-    if (role_options_from_keywords(&context, name, arguments, positional_arguments_count, keyword_names_tuple, 2,
-                                   &options, &role) != 0)
+    if (role_options_from_keywords(&context, name, arguments, positional_arguments_count, keyword_names_tuple,
+                                   ustore_py_arena_positional(positional_arguments_count, 2), &options, &role) != 0)
         return NULL;
     edges_read_call_t stack;
     edges_read_call_t* const call = ustore_py_call_open(&context, verb, &stack);
     if (!call) return NULL;
     if (ustore_py_keys_from_object(arguments[0], ustore_py_context_executor(&context), &call->vertices) != 0 ||
-        ustore_py_arena_from_object(arguments[1], &call->kept.arena) != 0)
+        ustore_py_arena_from_object(&context, positional_arguments_count > 1 ? arguments[1] : NULL,
+                                    &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, verb, call);
     call->role = role;
     call->kept.collection = options.collection;
@@ -417,18 +422,18 @@ PyObject* ustore_py_api_graph_read_edges(PyObject* self, PyObject* const* argume
                       keyword_names_tuple);
 }
 
-char const doc_graph_degrees[] =                                                            //
-    "graph_degrees(vertices, arena, *, role=Role.ANY, collection) answers a tuple.\n"       //
-    "\n"                                                                                    //
-    "Counts the edges of a batch of vertices without exporting them.\n"                     //
-    "\n"                                                                                    //
-    "Args:\n"                                                                               //
-    "  vertices (Sequence[KeyLike] | buffer): The vertices whose edges are counted.\n"      //
-    "  arena (Arena): Where the degrees land before they are copied out, rewound by this\n" //
-    "    call.\n"                                                                           //
-    "  role (Role, optional): The role of every vertex, as `graph_read_edges` takes it.\n"  //
-    "  collection (UUID | str): The graph collection, by identifier or by name.\n"          //
-    "Returns:\n"                                                                            //
+char const doc_graph_degrees[] =                                                                      //
+    "graph_degrees(vertices, arena=None, *, role=Role.ANY, collection) answers a tuple.\n"            //
+    "\n"                                                                                              //
+    "Counts the edges of a batch of vertices without exporting them.\n"                               //
+    "\n"                                                                                              //
+    "Args:\n"                                                                                         //
+    "  vertices (Sequence[KeyLike] | buffer): The vertices whose edges are counted.\n"                //
+    "  arena (Arena, optional): Where the degrees land before they are copied out, rewound by this\n" //
+    "    call.\n"                                                                                     //
+    "  role (Role, optional): The role of every vertex, as `graph_read_edges` takes it.\n"            //
+    "  collection (UUID | str): The graph collection, by identifier or by name.\n"                    //
+    "Returns:\n"                                                                                      //
     "  tuple[int | None, ...]: The degree of every vertex, None where it is absent.";
 
 PyObject* ustore_py_api_graph_degrees(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
@@ -463,13 +468,9 @@ PyObject* ustore_py_api_graph_contains(PyObject* self, PyObject* const* argument
     if (!call) return NULL;
     call->vertices.keys = call->vertices.inline_keys;
     call->vertices.count = 1;
-    PyObject* const arena = ustore_py_arena_new(context.executor);
-    if (!arena || ustore_py_key_from_object(arguments[0], call->vertices.inline_keys) != 0 ||
-        ustore_py_arena_from_object(arena, &call->kept.arena) != 0) {
-        Py_XDECREF(arena);
+    if (ustore_py_key_from_object(arguments[0], call->vertices.inline_keys) != 0 ||
+        ustore_py_arena_from_object(&context, NULL, &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, &contains_verb, call);
-    }
-    Py_DECREF(arena);
     call->role = ustore_vertex_role_any_k;
     call->kept.collection = options.collection;
     return edges_read_run(&context, &contains_verb, call);
@@ -621,7 +622,7 @@ PyObject* ustore_py_api_graph_remove_vertices(PyObject* self, PyObject* const* a
 }
 
 char const doc_graph_scan_vertices[] =                                                          //
-    "graph_scan_vertices(start, wanted, arena, *, collection, end=None,\n"                      //
+    "graph_scan_vertices(start, wanted, arena=None, *, collection, end=None,\n"                 //
     "direction=ScanDirection.ASCENDING, mode=ScanMode.ORDERED, progress=None)\n"                //
     "answers a Keys tape.\n"                                                                    //
     "\n"                                                                                        //
@@ -632,7 +633,7 @@ char const doc_graph_scan_vertices[] =                                          
     "  start (KeyLike | None): The first vertex the scan may return, or None for the first\n"   //
     "    vertex in its direction.\n"                                                            //
     "  wanted (int): Most vertices the scan returns.\n"                                         //
-    "  arena (Arena): Where the vertices land, rewound by this call.\n"                         //
+    "  arena (Arena, optional): Where the vertices land, rewound by this call.\n"               //
     "  collection (UUID | str): The graph collection, by identifier or by name.\n"              //
     "  end (KeyLike, optional): The vertex the scan stops before, or None for no bound.\n"      //
     "  direction (ScanDirection, optional): Which way the scan walks, as `scan` takes it.\n"    //
@@ -651,7 +652,7 @@ PyObject* ustore_py_api_graph_scan_vertices(PyObject* self, PyObject* const* arg
 }
 
 char const doc_graph_sample_vertices[] =                                                  //
-    "graph_sample_vertices(wanted, arena, *, collection) answers a Keys tape.\n"          //
+    "graph_sample_vertices(wanted, arena=None, *, collection) answers a Keys tape.\n"     //
     "\n"                                                                                  //
     "Draws vertices uniformly at random from one graph collection, those without edges\n" //
     "included, as `sample` draws the keys of blobs.";
@@ -662,10 +663,10 @@ PyObject* ustore_py_api_graph_sample_vertices(PyObject* self, PyObject* const* a
                                    "graph_sample_vertices", ustore_modality_graph_k);
 }
 
-char const doc_graph_measure_vertices[] =                                                           //
-    "graph_measure_vertices(start, end, arena, *, collection, direction=ScanDirection.ASCENDING)\n" //
-    "answers a Measurement.\n"                                                                      //
-    "\n"                                                                                            //
+char const doc_graph_measure_vertices[] =                                                                //
+    "graph_measure_vertices(start, end, arena=None, *, collection, direction=ScanDirection.ASCENDING)\n" //
+    "answers a Measurement.\n"                                                                           //
+    "\n"                                                                                                 //
     "Estimates what a range of vertices holds without walking it, as `measure` does for blobs.";
 
 PyObject* ustore_py_api_graph_measure_vertices(PyObject* self, PyObject* const* arguments,
@@ -688,6 +689,9 @@ static char const doc_Neighborhoods[] =                                         
     "arena then holds.";
 
 static void Neighborhoods_dealloc(Neighborhoods* self) {
+    // Each read of the CUDA Array Interface handed a consumer the address, which counts until now.
+    for (; self->cuda_array_interface_reads; --self->cuda_array_interface_reads)
+        ustore_py_view_export_close((PyObject*)self);
     Py_XDECREF(self->arena);
     PyObject_Free(self);
 }
@@ -720,7 +724,9 @@ static PyObject* Neighborhoods_item(Neighborhoods* self, Py_ssize_t vertex_index
         PyErr_SetString(PyExc_IndexError, "Vertex index out of range");
         return NULL;
     }
+    if (ustore_py_view_export_open((PyObject*)self) != 0) return NULL;
     PyObject* const triples = neighborhood_triples(self, (size_t)vertex_index);
+    ustore_py_view_export_close((PyObject*)self);
     return triples;
 }
 
@@ -736,7 +742,9 @@ static PyObject* Neighborhoods_repr(Neighborhoods* self) {
 static char const doc_Neighborhoods_degrees[] = "The degree of every vertex, with None where it is absent, as a tuple.";
 
 static PyObject* Neighborhoods_get_degrees(Neighborhoods* self, void* Py_UNUSED(closure)) {
+    if (ustore_py_view_export_open((PyObject*)self) != 0) return NULL;
     PyObject* const degrees = degrees_tuple(self->degrees, self->count);
+    ustore_py_view_export_close((PyObject*)self);
     return degrees;
 }
 
@@ -764,6 +772,7 @@ static PySequenceMethods Neighborhoods_as_sequence = {
 
 static PyBufferProcs Neighborhoods_as_buffer = {
     .bf_getbuffer = (getbufferproc)Neighborhoods_getbuffer,
+    .bf_releasebuffer = (releasebufferproc)ustore_py_view_releasebuffer,
 };
 
 PyTypeObject NeighborhoodsType = {

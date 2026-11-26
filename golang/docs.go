@@ -258,6 +258,7 @@ func (receiver storeReceiver[Handle]) docsRead(call *callWithResult[Values], com
 		return err
 	}
 	arguments, inputs := stage[C.ustore_docs_read_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	call.result.count = uint(len(keys))
 	*arguments = C.ustore_docs_read_t{
 		database:     database,
@@ -283,13 +284,18 @@ func (receiver storeReceiver[Handle]) docsRead(call *callWithResult[Values], com
 type Paths struct {
 	fields  Strings
 	written C.ustore_size_t
+	arena   arenaWrite
 }
 
 // Len reports how many unique paths the call found.
 func (paths Paths) Len() uint { return uint(paths.written) }
 
 // Get views path index in the arena.
-func (paths Paths) Get(index uint) []byte { return paths.fields.sized(uint(paths.written)).Get(index) }
+func (paths Paths) Get(index uint) []byte {
+	paths.arena.mustOpen()
+	defer paths.arena.close()
+	return paths.fields.sized(uint(paths.written)).Get(index)
+}
 
 // DocsGist lists the unique paths to the leaves of the documents keys name into arena.
 func (on reads[Handle]) DocsGist(collections Collections, keys []Key, arena *Arena) (Paths, error) {
@@ -312,6 +318,7 @@ func (receiver storeReceiver[Handle]) docsGist(call *callWithResult[Paths], comp
 		return err
 	}
 	arguments, inputs := stage[C.ustore_docs_gist_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	*arguments = C.ustore_docs_gist_t{
 		database:    database,
 		executor:    executor,
@@ -339,6 +346,7 @@ type Columns struct {
 	columns *C.ustore_docs_column_view_t
 	fields  uint
 	rows    uint
+	arena   arenaWrite
 }
 
 // Len reports how many columns the call gathered, one per field.
@@ -346,34 +354,51 @@ func (columns Columns) Len() uint { return columns.fields }
 
 // Column reports the column of field index.
 func (columns Columns) Column(index uint) DocsColumn {
+	columns.arena.mustOpen()
+	defer columns.arena.close()
 	column := (*C.ustore_docs_column_view_t)(unsafe.Add(unsafe.Pointer(columns.columns), uintptr(index)*unsafe.Sizeof(*columns.columns)))
-	return DocsColumn{raw: column, rows: columns.rows}
+	return DocsColumn{raw: column, rows: columns.rows, arena: columns.arena}
 }
 
 // DocsColumn is the rows of one field as an Apache Arrow array of its type, beside the bitmaps of
 // the rows found and converted, converted with a change of semantics, and colliding with a value of
 // an inconvertible type.
 type DocsColumn struct {
-	raw  *C.ustore_docs_column_view_t
-	rows uint
+	raw   *C.ustore_docs_column_view_t
+	rows  uint
+	arena arenaWrite
 }
 
 // Len reports how many rows the column holds.
 func (column DocsColumn) Len() uint { return column.rows }
 
 // Valid reports whether row's value was found and converted.
-func (column DocsColumn) Valid(row uint) bool { return present(column.raw.validities, row) }
+func (column DocsColumn) Valid(row uint) bool {
+	column.arena.mustOpen()
+	defer column.arena.close()
+	return present(column.raw.validities, row)
+}
 
 // Converted reports whether row's conversion changed its semantics, such as a string parsed into an
 // integer.
-func (column DocsColumn) Converted(row uint) bool { return present(column.raw.conversions, row) }
+func (column DocsColumn) Converted(row uint) bool {
+	column.arena.mustOpen()
+	defer column.arena.close()
+	return present(column.raw.conversions, row)
+}
 
 // Colliding reports whether a value of an inconvertible type sits under row's field.
-func (column DocsColumn) Colliding(row uint) bool { return present(column.raw.collisions, row) }
+func (column DocsColumn) Colliding(row uint) bool {
+	column.arena.mustOpen()
+	defer column.arena.close()
+	return present(column.raw.collisions, row)
+}
 
 // Strings views the rows of a string, binary or JSON column in the arena, and nothing for a
 // scalar column.
 func (column DocsColumn) Strings() Strings {
+	column.arena.mustOpen()
+	defer column.arena.close()
 	return Strings{raw: column.raw.strings}.sized(column.rows)
 }
 
@@ -386,6 +411,8 @@ type DocsScalar interface {
 // DocsColumnScalars views the scalars of a column gathered as the type Value spells, in place; a
 // Value of another width than the column's type reads garbage, as the column does not record it.
 func DocsColumnScalars[Value DocsScalar](column DocsColumn) []Value {
+	column.arena.mustOpen()
+	defer column.arena.close()
 	if column.raw.scalars == nil || column.rows == 0 {
 		return nil
 	}
@@ -417,6 +444,7 @@ func (receiver storeReceiver[Handle]) docsGather(call *callWithResult[Columns], 
 		return fail(StatusInvalidArgument, "pass one output type per field")
 	}
 	arguments, inputs := stage[C.ustore_docs_gather_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	call.result.fields, call.result.rows = fields.Len(), uint(len(keys))
 	*arguments = C.ustore_docs_gather_t{
 		database:      database,
@@ -484,6 +512,7 @@ func (receiver storeReceiver[Handle]) docsScan(call *callWithResult[Scanned], co
 		return err
 	}
 	arguments, inputs := stage[C.ustore_docs_scan_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	call.result.count = uint(count)
 	progress, state := call.progress(options.Progress)
 	*arguments = C.ustore_docs_scan_t{
@@ -600,6 +629,7 @@ type DocsBatches struct {
 	batches *C.ustore_docs_batch_view_t
 	count   C.ustore_size_t
 	fields  uint
+	arena   arenaWrite
 }
 
 // Len reports how many batches the pull handed out, none once the walk is exhausted.
@@ -607,14 +637,18 @@ func (batches DocsBatches) Len() uint { return uint(batches.count) }
 
 // Keys views the keys of batch index in the arena, one per row.
 func (batches DocsBatches) Keys(index uint) []Key {
+	batches.arena.mustOpen()
+	defer batches.arena.close()
 	batch := batches.at(index)
 	return keysAt(batch.keys, 0, uint64(batch.count))
 }
 
 // Columns views the columns of batch index in the arena, one per field the cursor gathers.
 func (batches DocsBatches) Columns(index uint) Columns {
+	batches.arena.mustOpen()
+	defer batches.arena.close()
 	batch := batches.at(index)
-	return Columns{columns: batch.columns, fields: batches.fields, rows: uint(batch.count)}
+	return Columns{columns: batch.columns, fields: batches.fields, rows: uint(batch.count), arena: batches.arena}
 }
 
 // at addresses batch index of the pull.
@@ -632,6 +666,7 @@ func (on DocsCursorOn) Next(wanted uint, arena *Arena) (DocsBatches, error) {
 	var call callWithResult[DocsBatches]
 	arguments := open[C.ustore_docs_cursor_next_t](&call)
 	call.result.fields = on.fields
+	call.result.arena = call.stamp(arena, outputs)
 	*arguments = C.ustore_docs_cursor_next_t{
 		database:      database,
 		executor:      executor,
@@ -681,6 +716,7 @@ func (receiver storeReceiver[Handle]) docsSample(call *callWithResult[Scanned], 
 	}
 	count := tasks(collections)
 	arguments, inputs := stage[C.ustore_docs_sample_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	call.result.count = uint(count)
 	*arguments = C.ustore_docs_sample_t{
 		database:    database,
@@ -723,6 +759,7 @@ func (receiver storeReceiver[Handle]) docsMeasure(call *callWithResult[Measureme
 		return err
 	}
 	arguments, inputs := stage[C.ustore_docs_measure_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	call.result.count = uint(count)
 	*arguments = C.ustore_docs_measure_t{
 		database:          database,

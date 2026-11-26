@@ -50,6 +50,7 @@ type Values struct {
 	presences *C.ustore_octet_t
 	values    Strings
 	count     uint
+	arena     arenaWrite
 }
 
 // Len reports how many values the call read.
@@ -57,6 +58,8 @@ func (values Values) Len() uint { return values.count }
 
 // Get views value index in the arena, and false for a missing key.
 func (values Values) Get(index uint) ([]byte, bool) {
+	values.arena.mustOpen()
+	defer values.arena.close()
 	if !present(values.presences, index) {
 		return nil, false
 	}
@@ -65,7 +68,11 @@ func (values Values) Get(index uint) ([]byte, bool) {
 
 // Tape passes every value back as an input, a missing key as an empty value, so a read's tape is
 // written again as it is.
-func (values Values) Tape() Tape { return values.values.sized(values.count).Tape() }
+func (read Values) Tape() Tape {
+	read.arena.mustOpen()
+	defer read.arena.close()
+	return read.values.sized(read.count).Tape()
+}
 
 // Scanned is what a batch of scans or samples wrote into its arena, keys scan after scan, readable
 // until the arena serves another call.
@@ -74,6 +81,7 @@ type Scanned struct {
 	keys    *C.ustore_key_t
 	scores  *C.float
 	count   uint
+	arena   arenaWrite
 }
 
 // Len reports how many scans or samples the call ran.
@@ -81,12 +89,16 @@ func (scanned Scanned) Len() uint { return scanned.count }
 
 // Keys views the keys scan task found in the arena.
 func (scanned Scanned) Keys(task uint) []Key {
+	scanned.arena.mustOpen()
+	defer scanned.arena.close()
 	return keysAt(scanned.keys, uint64(at(scanned.offsets, task)), uint64(at(scanned.offsets, task+1)))
 }
 
 // Scores views the BM25 score of every key scan task found, and nothing unless the patterns
 // carried weights.
 func (scanned Scanned) Scores(task uint) []float32 {
+	scanned.arena.mustOpen()
+	defer scanned.arena.close()
 	begin, end := at(scanned.offsets, task), at(scanned.offsets, task+1)
 	if scanned.scores == nil || begin == end {
 		return nil
@@ -115,6 +127,7 @@ type Measurement struct {
 	minSpaceUsages   *C.ustore_size_t
 	maxSpaceUsages   *C.ustore_size_t
 	count            uint
+	arena            arenaWrite
 }
 
 // Measured is the bounds on the entries and the space one range holds.
@@ -129,6 +142,8 @@ func (measurement Measurement) Len() uint { return measurement.count }
 
 // Get reports the bounds of range index.
 func (measurement Measurement) Get(index uint) Measured {
+	measurement.arena.mustOpen()
+	defer measurement.arena.close()
 	return Measured{
 		MinCardinality: uint64(at(measurement.minCardinalities, index)),
 		MaxCardinality: uint64(at(measurement.maxCardinalities, index)),
@@ -258,6 +273,7 @@ func (receiver storeReceiver[Handle]) blobsRead(call *callWithResult[Values], co
 		return err
 	}
 	arguments, inputs := stage[C.ustore_blobs_read_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	call.result.count = uint(len(keys))
 	*arguments = C.ustore_blobs_read_t{
 		database:    database,
@@ -328,6 +344,7 @@ func (receiver storeReceiver[Handle]) blobsScan(call *callWithResult[Scanned], c
 		return err
 	}
 	arguments, inputs := stage[C.ustore_blobs_scan_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	call.result.count = uint(count)
 	progress, state := call.progress(options.Progress)
 	*arguments = C.ustore_blobs_scan_t{
@@ -462,6 +479,7 @@ func (on BlobsCursorOn) next(call *callWithResult[Page], wanted uint, arena *Are
 		return nil, err
 	}
 	arguments := open[C.ustore_blobs_cursor_next_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	*arguments = C.ustore_blobs_cursor_next_t{
 		database: database,
 		executor: executor,
@@ -510,6 +528,7 @@ func (receiver storeReceiver[Handle]) blobsSample(call *callWithResult[Scanned],
 	}
 	count := tasks(collections)
 	arguments, inputs := stage[C.ustore_blobs_sample_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	call.result.count = uint(count)
 	*arguments = C.ustore_blobs_sample_t{
 		database:    database,
@@ -552,6 +571,7 @@ func (receiver storeReceiver[Handle]) blobsMeasure(call *callWithResult[Measurem
 		return err
 	}
 	arguments, inputs := stage[C.ustore_blobs_measure_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	call.result.count = uint(count)
 	*arguments = C.ustore_blobs_measure_t{
 		database:          database,

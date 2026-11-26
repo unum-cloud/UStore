@@ -162,7 +162,7 @@ def recommend(store: Store, user: int) -> tuple[dict[int, list[int]], list[int]]
 def titles(store: Store, movies: list[int]) -> list[str]:
     """The title of every movie, read as one batch out of the documents collection."""
     documents = store.database.docs_read(
-        movies, ustore.Arena(), field="title", outputs_type=ustore.FieldType.STRING, collection=store.movies
+        movies, field="title", outputs_type=ustore.FieldType.STRING, collection=store.movies
     )
     return ["" if document is None else bytes(document).decode() for document in documents]
 

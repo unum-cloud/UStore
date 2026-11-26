@@ -67,7 +67,7 @@ class Store(NamedTuple):
 
 def seeded(database: ustore.Database, collection: int) -> bool:
     """Whether a collection already holds a pair, so a rerun never seeds it twice."""
-    return len(database.scan(KEY_MIN, 1, ustore.Arena(), collection=collection)[0]) > 0
+    return len(database.scan(KEY_MIN, 1, collection=collection)[0]) > 0
 
 
 def seed_documents(store: Store) -> None:
@@ -116,7 +116,7 @@ def open_store() -> Store:
 def landmark_names(store: Store, keys: list[int]) -> list[str]:
     """The name of every landmark, read as one batch out of the documents collection."""
     found = store.database.docs_read(
-        keys, ustore.Arena(), field="name", outputs_type=ustore.FieldType.STRING, collection=store.documents
+        keys, field="name", outputs_type=ustore.FieldType.STRING, collection=store.documents
     )
     return ["" if name is None else bytes(name).decode() for name in found]
 
@@ -124,7 +124,7 @@ def landmark_names(store: Store, keys: list[int]) -> list[str]:
 def render_documents(store: Store) -> None:
     """Renders every stored document as JSON, keyed by the document's own key."""
     keys = list(scan_keys(store.database, store.documents))
-    documents = store.database.docs_read(keys, ustore.Arena(), collection=store.documents)
+    documents = store.database.docs_read(keys, collection=store.documents)
     for key, document in zip(keys, documents, strict=True):
         st.write(f"Document {key}")
         st.json(bytes(document).decode())
@@ -142,7 +142,7 @@ def render_network(store: Store) -> None:
 def render_images(store: Store) -> None:
     """Renders every stored image, decoded by Streamlit from the bytes the collection holds."""
     keys = list(scan_keys(store.database, store.images))
-    for key, image in zip(keys, store.database.read(keys, ustore.Arena(), collection=store.images), strict=True):
+    for key, image in zip(keys, store.database.read(keys, collection=store.images), strict=True):
         st.image(bytes(image), caption=f"Image {key}", width="content")
 
 

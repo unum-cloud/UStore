@@ -334,7 +334,9 @@ err = executor.Drain(ustore.MoodParked)
 
 Every output whose length scales with the call lands in an `Arena`, and the verb answers a view over it.
 `NewArena(executor)` places one where that executor computes, and `NewArena(nil)` on host pages, and a call rewinds it, keeping its high-water mark, so a steady loop allocates once.
-Every view and every slice it hands out end at the arena's next call, so a result kept past the next call needs the next call to take another arena.
+A view read after a later call took its arena fails as `Contended`.
+A slice or segment an accessor returned is valid only until the arena's next call.
+A result kept past the next call needs the next call to take another arena.
 An input lying inside the arena a call rewinds is refused with `StatusInvalidArgument`.
 A `Key` is sixteen bytes ordered as their bytes, and `KeyFromUint64` spells an integer big-endian, so integer keys order as integers.
 

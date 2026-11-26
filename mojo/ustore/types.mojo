@@ -485,6 +485,9 @@ comptime Release = def(Address) thin abi("C") -> None
 comptime StatusRelease = def(Address) thin abi("C") -> c_int
 """The arena and executor `_free`: `contended`, with nothing freed, while an export is open or an arena lives."""
 
+comptime ArenaGeneration = def(Address) thin abi("C") -> UInt64
+"""`ustore_arena_generation`: the calls the engine took on an arena, advanced once by each that names it."""
+
 comptime OutcomeStatus = def(Pointer[Outcome, MutAnyOrigin]) thin abi("C") -> c_int
 """`ustore_outcome_wait` and `ustore_outcome_status`: an outcome's status, the first once it is final."""
 
@@ -811,7 +814,7 @@ struct Tape[origin: MutOrigin](ImplicitlyCopyable, Sized):
         """One string's bytes, viewed from the arena.
 
         Raises:
-            `Error` with `INVALID_ARGUMENT` once a later call rewound the arena, or `DEVICE` over device memory.
+            `Error` with `CONTENDED` once a later call rewound the arena, or `DEVICE` over device memory.
         """
         _readable(self.arena, self.generation, "Tape")
         if self.view.offsets == NULL_ADDRESS:
@@ -1271,8 +1274,6 @@ struct Arena[origin: ImmOrigin]:
     """The `ustore_arena_t`, never null."""
     var _host_access: HostAccess
     """Whether host code may read its memory, as the library described it at init, so a refused read is never made."""
-    var _generation: Int
-    """Calls the engine took on it so far, which every result records to know when a later one rewound it."""
 
     def __init__(out self: Arena[ImmUntrackedOrigin], library: Library) raises Error:
         """Host pages for calls on the calling thread. Calls `ustore_arena_init`."""
@@ -1280,7 +1281,6 @@ struct Arena[origin: ImmOrigin]:
         self._library = library
         self._address = address
         self._host_access = HostAccess.READABLE
-        self._generation = 0
 
     def __init__(out self, ref[Self.origin] executor: Executor) raises Error:
         """Memory where `executor` computes, serving the calls of its kind, and viewing `executor` until
@@ -1289,7 +1289,6 @@ struct Arena[origin: ImmOrigin]:
         self._library = executor.library
         self._address = address
         self._host_access = HostAccess.REFUSED
-        self._generation = 0
         # The executor decided the placement once, so one description holds for every call
         self._host_access = self.describe().host_access
 
@@ -1319,23 +1318,37 @@ struct Arena[origin: ImmOrigin]:
         return description.unsafe_origin_cast[MutAnyOrigin]()[]
 
 
-def _served[origin: MutOrigin](arena: Pointer[Arena[ImmUntrackedOrigin], origin], status: Status) -> Int:
-    """Retires every earlier result once the engine took a call naming the arena; a `CONTENDED` refusal
-    never touched it. Answers the generation the call's result is stamped with."""
-    var served = Pointer[Arena[ImmUntrackedOrigin], MutAnyOrigin](unsafe_from_address=Int(arena))
-    if status != Status.CONTENDED:
-        served[]._generation += 1
-    return served[]._generation
+def _served[origin: MutOrigin](arena: Pointer[Arena[ImmUntrackedOrigin], origin]) -> Int:
+    """The engine's generation of the arena, which every call that took it advanced once, so a result
+    stamped with it reads current until a later call takes the arena."""
+    return Int(arena[]._library.symbols().arena_generation(arena[]._address))
+
+
+def _open_read[
+    origin: MutOrigin
+](arena: Pointer[Arena[ImmUntrackedOrigin], origin], generation: Int, detail: StaticString) raises Error:
+    """Opens an export on the arena, so no call takes it until `_close_read`, after refusing a read of a result
+    over memory the host may not read. An arena a later call rewound, like one a call holds, reads as `CONTENDED`."""
+    if arena[]._host_access != HostAccess.READABLE:
+        raise Error(Status.DEVICE, detail)
+    if arena[]._library.symbols().arena_export_open(arena[]._address) != 0:
+        raise Error(Status.CONTENDED, detail)
+    if Int(arena[]._library.symbols().arena_generation(arena[]._address)) != generation:
+        arena[]._library.symbols().arena_export_close(arena[]._address)
+        raise Error(Status.CONTENDED, detail)
+
+
+def _close_read[origin: MutOrigin](arena: Pointer[Arena[ImmUntrackedOrigin], origin]):
+    """Closes the export `_open_read` opened."""
+    arena[]._library.symbols().arena_export_close(arena[]._address)
 
 
 def _readable[
     origin: MutOrigin
 ](arena: Pointer[Arena[ImmUntrackedOrigin], origin], generation: Int, detail: StaticString) raises Error:
-    """Refuses a host read of a result over memory the host may not read, or over an arena a later call rewound."""
-    if arena[]._host_access != HostAccess.READABLE:
-        raise Error(Status.DEVICE, detail)
-    if arena[]._generation != generation:
-        raise Error(Status.INVALID_ARGUMENT, detail)
+    """Refuses a read as `_open_read` does, for an accessor that copies nothing out of the arena."""
+    _open_read(arena, generation, detail)
+    _close_read(arena)
 
 
 # endregion Arenas
@@ -1430,8 +1443,8 @@ trait Call(Deinitable, Movable):
         """Crosses into the engine."""
         ...
 
-    def served(self, status: Status) -> Int:
-        """Stamps the call's arena once the engine took the call, and answers the stamp."""
+    def served(self) -> Int:
+        """Answers the generation the engine's arena stands at, which stamps the call's result."""
         ...
 
     def conclude(deinit self, outputs: Self.Outputs, generation: Int) -> Self.Result:
@@ -1471,9 +1484,9 @@ struct _Crossing[A: Arguments, R: Deferrable, origin: MutOrigin, inputs: ImmOrig
         self.arguments.bind(scope, completion, outcome, outputs, arena)
         _cross(self.arguments, Self.A.verb(scope.library))
 
-    def served(self, status: Status) -> Int:
+    def served(self) -> Int:
         if case .Some(held_arena) = self.arena:
-            return _served(held_arena, status)
+            return _served(held_arena)
         return 0
 
     def conclude(deinit self, outputs: Self.A.Written, generation: Int) -> Self.R:
@@ -1495,7 +1508,7 @@ def _block[C: Call](scope: Scope, var call: C) raises Error -> C.Result:
         Pointer(to=mutable_slots[unsafe_offset=0].outputs).unsafe_origin_cast[MutUntrackedOrigin](),
     )
     var written = mutable_slots[unsafe_offset=0]
-    var generation = call.served(Status.of(written.outcome.status))
+    var generation = call.served()
     var result = call^.conclude(written.outputs, generation)
     scope.library._check(written.outcome, C.symbol)
     return result^
@@ -1546,7 +1559,7 @@ struct Deferred[C: Call, origin: ImmOrigin]:
             Pointer(to=slots[].outcome).unsafe_origin_cast[MutUntrackedOrigin](),
             Pointer(to=slots[].outputs).unsafe_origin_cast[MutUntrackedOrigin](),
         )
-        self.generation = self.call.value().served(self.status())
+        self.generation = self.call.value().served()
 
     def __deinit__(deinit self):
         """Waits until the call is final, then frees what the call owned. Calls `ustore_outcome_wait`."""

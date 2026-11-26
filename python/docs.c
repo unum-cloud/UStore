@@ -691,7 +691,7 @@ PyObject* ustore_py_api_docs_remove(PyObject* self, PyObject* const* arguments, 
 #pragma region Reads
 
 char const doc_docs_read[] =                                                                   //
-    "docs_read(keys, arena, *, collection, field=None, outputs_type=FieldType.JSON)\n"         //
+    "docs_read(keys, arena=None, *, collection, field=None, outputs_type=FieldType.JSON)\n"    //
     "answers a Values tape.\n"                                                                 //
     "\n"                                                                                       //
     "Reads whole documents, or one field of each, as JSON text or as printed strings. Whole\n" //
@@ -699,7 +699,7 @@ char const doc_docs_read[] =                                                    
     "\n"                                                                                       //
     "Args:\n"                                                                                  //
     "  keys (Sequence[KeyLike] | buffer): The keys to read.\n"                                 //
-    "  arena (Arena): Where the tape lands, rewound by this call.\n"                           //
+    "  arena (Arena, optional): Where the tape lands, rewound by this call.\n"                 //
     "  collection (UUID | str): The collection, by identifier or by name.\n"                   //
     "  field (str, optional): A top-level key or a JSON Pointer to read inside every\n"        //
     "    document; None reads whole documents.\n"                                              //
@@ -761,7 +761,8 @@ ustore_py_verb_t const ustore_py_docs_read_drawn_verb = {sizeof(ustore_py_read_c
 PyObject* ustore_py_docs_read(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
                               ustore_docs_field_type_t type, ustore_py_verb_t const* verb, ustore_py_read_call_t* call,
                               PyObject* arena) {
-    if (ustore_py_arena_from_object(arena, &call->kept.arena) != 0) return ustore_py_call_discard(context, verb, call);
+    if (ustore_py_arena_from_object(context, arena, &call->kept.arena) != 0)
+        return ustore_py_call_discard(context, verb, call);
     call->kept.collection = options->collection;
     call->field_view = cached_bytes(call->field);
     ustore_docs_read_t read = {
@@ -797,12 +798,7 @@ PyObject* ustore_py_document_contains(ustore_py_context_t const* context, ustore
     call->keys.inline_keys[0] = *key;
     call->keys.keys = call->keys.inline_keys;
     call->keys.count = 1;
-    PyObject* const arena = ustore_py_arena_new(context->executor);
-    PyObject* const answer = arena ? ustore_py_docs_read(context, options, ustore_docs_field_type_json_k,
-                                                         &docs_contains_verb, call, arena)
-                                   : ustore_py_call_discard(context, &docs_contains_verb, call);
-    Py_XDECREF(arena);
-    return answer;
+    return ustore_py_docs_read(context, options, ustore_docs_field_type_json_k, &docs_contains_verb, call, Py_None);
 }
 
 PyObject* ustore_py_api_docs_read(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
@@ -810,7 +806,8 @@ PyObject* ustore_py_api_docs_read(PyObject* self, PyObject* const* arguments, Py
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
     Py_ssize_t const keyword_names_count = ustore_py_keyword_names_count_checked(
-        "docs_read", positional_arguments_count, keyword_names_tuple, 2);
+        "docs_read", positional_arguments_count, keyword_names_tuple,
+        ustore_py_arena_positional(positional_arguments_count, 2));
     if (keyword_names_count < 0) return NULL;
 
     ustore_py_verb_options_t options;
@@ -843,21 +840,21 @@ PyObject* ustore_py_api_docs_read(PyObject* self, PyObject* const* arguments, Py
     if (ustore_py_keys_from_object(arguments[0], ustore_py_context_executor(&context), &call->keys) != 0)
         return ustore_py_call_discard(&context, &ustore_py_docs_read_verb, call);
     return ustore_py_docs_read(&context, &options, (ustore_docs_field_type_t)type, &ustore_py_docs_read_verb, call,
-                               arguments[1]);
+                               positional_arguments_count > 1 ? arguments[1] : NULL);
 }
 
-char const doc_docs_gist[] =                                                                  //
-    "docs_gist(keys, arena, *, collection) answers a tuple of JSON Pointers.\n"               //
-    "\n"                                                                                      //
-    "Lists every distinct path to a leaf across the requested documents, in the order they\n" //
-    "were first met, which is how a table learns the columns its documents hold.\n"           //
-    "\n"                                                                                      //
-    "Args:\n"                                                                                 //
-    "  keys (Sequence[KeyLike] | buffer): The documents to inspect.\n"                        //
-    "  arena (Arena): Where the paths land before they are copied out, rewound by this\n"     //
-    "    call.\n"                                                                             //
-    "  collection (UUID | str): The collection, by identifier or by name.\n"                  //
-    "Returns:\n"                                                                              //
+char const doc_docs_gist[] =                                                                        //
+    "docs_gist(keys, arena=None, *, collection) answers a tuple of JSON Pointers.\n"                //
+    "\n"                                                                                            //
+    "Lists every distinct path to a leaf across the requested documents, in the order they\n"       //
+    "were first met, which is how a table learns the columns its documents hold.\n"                 //
+    "\n"                                                                                            //
+    "Args:\n"                                                                                       //
+    "  keys (Sequence[KeyLike] | buffer): The documents to inspect.\n"                              //
+    "  arena (Arena, optional): Where the paths land before they are copied out, rewound by this\n" //
+    "    call.\n"                                                                                   //
+    "  collection (UUID | str): The collection, by identifier or by name.\n"                        //
+    "Returns:\n"                                                                                    //
     "  tuple[str, ...]: One JSON Pointer per leaf, such as '/user/name'.";
 
 /** A gist of a batch of documents, whose paths land in the arena its header holds. */
@@ -906,7 +903,8 @@ PyObject* ustore_py_api_docs_gist(PyObject* self, PyObject* const* arguments, Py
                                   PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_keyword_names_count_checked("docs_gist", positional_arguments_count, keyword_names_tuple, 2) < 0)
+    if (ustore_py_keyword_names_count_checked("docs_gist", positional_arguments_count, keyword_names_tuple,
+                                              ustore_py_arena_positional(positional_arguments_count, 2)) < 0)
         return NULL;
 
     ustore_py_verb_options_t options;
@@ -918,7 +916,8 @@ PyObject* ustore_py_api_docs_gist(PyObject* self, PyObject* const* arguments, Py
     gist_call_t* const call = ustore_py_call_open(&context, &gist_verb, &stack);
     if (!call) return NULL;
     if (ustore_py_keys_from_object(arguments[0], ustore_py_context_executor(&context), &call->keys) != 0 ||
-        ustore_py_arena_from_object(arguments[1], &call->kept.arena) != 0)
+        ustore_py_arena_from_object(&context, positional_arguments_count > 1 ? arguments[1] : NULL,
+                                    &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, &gist_verb, call);
     call->kept.collection = options.collection;
     ustore_docs_gist_t gist = {
@@ -938,7 +937,7 @@ PyObject* ustore_py_api_docs_gist(PyObject* self, PyObject* const* arguments, Py
 }
 
 char const doc_docs_scan[] =                                                                 //
-    "docs_scan(start, wanted, arena, *, collection, end=None,\n"                             //
+    "docs_scan(start, wanted, arena=None, *, collection, end=None,\n"                        //
     "direction=ScanDirection.ASCENDING, mode=ScanMode.ORDERED, progress=None)\n"             //
     "answers a Keys tape.\n"                                                                 //
     "\n"                                                                                     //
@@ -949,7 +948,7 @@ char const doc_docs_scan[] =                                                    
     "  start (KeyLike | None): The first key the scan may return, or None for the first\n"   //
     "    key in its direction.\n"                                                            //
     "  wanted (int): Most keys the scan returns.\n"                                          //
-    "  arena (Arena): Where the keys land, rewound by this call.\n"                          //
+    "  arena (Arena, optional): Where the keys land, rewound by this call.\n"                //
     "  collection (UUID | str): The docs collection, by identifier or by name.\n"            //
     "  end (KeyLike, optional): The key the scan stops before, or None for no bound.\n"      //
     "  direction (ScanDirection, optional): Which way the scan walks, as `scan` takes it.\n" //
@@ -968,14 +967,14 @@ PyObject* ustore_py_api_docs_scan(PyObject* self, PyObject* const* arguments, Py
 }
 
 char const doc_docs_sample[] =                                                                  //
-    "docs_sample(wanted, arena, *, collection) answers a Keys tape.\n"                          //
+    "docs_sample(wanted, arena=None, *, collection) answers a Keys tape.\n"                     //
     "\n"                                                                                        //
     "Draws document keys uniformly at random from one collection, as `sample` draws the keys\n" //
     "of blobs. Documents are not exported, so a `docs_read` or a `docs_gather` follows.\n"      //
     "\n"                                                                                        //
     "Args:\n"                                                                                   //
     "  wanted (int): Most keys to draw.\n"                                                      //
-    "  arena (Arena): Where the keys land, rewound by this call.\n"                             //
+    "  arena (Arena, optional): Where the keys land, rewound by this call.\n"                   //
     "  collection (UUID | str): The docs collection, by identifier or by name.\n"               //
     "Returns:\n"                                                                                //
     "  Keys: One run of keys, in no particular order.";
@@ -987,7 +986,7 @@ PyObject* ustore_py_api_docs_sample(PyObject* self, PyObject* const* arguments, 
 }
 
 char const doc_docs_measure[] =                                                                 //
-    "docs_measure(start, end, arena, *, collection, direction=ScanDirection.ASCENDING)\n"       //
+    "docs_measure(start, end, arena=None, *, collection, direction=ScanDirection.ASCENDING)\n"  //
     "answers a Measurement.\n"                                                                  //
     "\n"                                                                                        //
     "Estimates what a range of document keys holds without walking it, as `measure` does for\n" //
@@ -1057,11 +1056,13 @@ int ustore_py_columns_request(PyObject* fields, PyObject* types, char const* opt
     return failed ? -1 : 0;
 }
 
-PyObject* ustore_py_columns_new(PyObject* arena, ustore_docs_column_view_t const* columns, PyObject* fields,
-                                ustore_docs_field_type_t const* types, size_t fields_count, size_t docs_count) {
+PyObject* ustore_py_columns_new(PyObject* arena, uint64_t generation, ustore_docs_column_view_t const* columns,
+                                PyObject* fields, ustore_docs_field_type_t const* types, size_t fields_count,
+                                size_t docs_count) {
     Columns* const instance = PyObject_NewVar(Columns, &ColumnsType, (Py_ssize_t)fields_count);
     if (!instance) return NULL;
     instance->arena = Py_NewRef(arena);
+    instance->generation = generation;
     instance->fields = Py_NewRef(fields);
     instance->columns = columns;
     instance->fields_count = fields_count;
@@ -1071,7 +1072,7 @@ PyObject* ustore_py_columns_new(PyObject* arena, ustore_docs_column_view_t const
 }
 
 char const doc_docs_gather[] =                                                                //
-    "docs_gather(keys, fields, outputs_types, arena, *, collection) answers Columns.\n"       //
+    "docs_gather(keys, fields, outputs_types, arena=None, *, collection) answers Columns.\n"  //
     "\n"                                                                                      //
     "Reads every field of every document into typed columns, converting each value on a\n"    //
     "best-effort basis and recording what was found, converted, or could not be.\n"           //
@@ -1084,7 +1085,7 @@ char const doc_docs_gather[] =                                                  
     "    `FieldType.UUID`, `FieldType.STRING` or `FieldType.BINARY`. A `FieldType.F16`\n"     //
     "    column exports as a half-precision view NumPy reads as float16, and a\n"             //
     "    `FieldType.UUID` column as sixteen bytes per document.\n"                            //
-    "  arena (Arena): Where the columns land, rewound by this call.\n"                        //
+    "  arena (Arena, optional): Where the columns land, rewound by this call.\n"              //
     "  collection (UUID | str): The collection, by identifier or by name.\n"                  //
     "Returns:\n"                                                                              //
     "  Columns: One column per field, each holding one entry per document.";
@@ -1118,8 +1119,8 @@ static void gather_submit(void* arguments) { ustore_docs_gather((ustore_docs_gat
 
 static PyObject* gather_answer(void* erased) {
     gather_call_t const* const call = (gather_call_t const*)erased;
-    return ustore_py_columns_new(call->kept.arena, call->columns, call->fields_held, call->types, call->fields_count,
-                                 call->keys.count);
+    return ustore_py_columns_new(call->kept.arena, call->kept.generation, call->columns, call->fields_held, call->types,
+                                 call->fields_count, call->keys.count);
 }
 
 static void gather_release(void* erased) {
@@ -1139,7 +1140,8 @@ PyObject* ustore_py_api_docs_gather(PyObject* self, PyObject* const* arguments, 
                                     PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_keyword_names_count_checked("docs_gather", positional_arguments_count, keyword_names_tuple, 4) < 0)
+    if (ustore_py_keyword_names_count_checked("docs_gather", positional_arguments_count, keyword_names_tuple,
+                                              ustore_py_arena_positional(positional_arguments_count, 4)) < 0)
         return NULL;
 
     ustore_py_verb_options_t options;
@@ -1154,7 +1156,8 @@ PyObject* ustore_py_api_docs_gather(PyObject* self, PyObject* const* arguments, 
                                                  &call->field_views, &call->types, &call->fields_count);
     size_t const fields_count = call->fields_count;
     if (failed || ustore_py_keys_from_object(arguments[0], ustore_py_context_executor(&context), &call->keys) != 0 ||
-        ustore_py_arena_from_object(arguments[3], &call->kept.arena) != 0)
+        ustore_py_arena_from_object(&context, positional_arguments_count > 3 ? arguments[3] : NULL,
+                                    &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, &gather_verb, call);
     call->kept.collection = options.collection;
     ustore_docs_gather_t gather = {
@@ -1247,16 +1250,19 @@ static PyObject* Columns_item(Columns* self, Py_ssize_t field_index) {
         PyErr_SetString(PyExc_IndexError, "Field index out of range");
         return NULL;
     }
+    if (ustore_py_view_export_open((PyObject*)self) != 0) return NULL;
     ustore_docs_column_view_t const* const column = columns_column(self, (size_t)field_index);
     ustore_docs_field_type_t const type = self->types[field_index];
     char const* const format = field_type_format(type);
     Py_ssize_t const shape[2] = {(Py_ssize_t)self->docs_count, uuid_bytes_k};
     PyObject* item = NULL;
     if (format)
-        item = ustore_py_span_view(self->arena, column->scalars, format, (Py_ssize_t)field_type_width(type), 1, shape);
+        item = ustore_py_span_view(self->arena, self->generation, column->scalars, format,
+                                   (Py_ssize_t)field_type_width(type), 1, shape);
     else if (type == ustore_docs_field_type_uuid_k)
-        item = ustore_py_span_view(self->arena, column->scalars, "B", 1, 2, shape);
+        item = ustore_py_span_view(self->arena, self->generation, column->scalars, "B", 1, 2, shape);
     else item = column_strings(column, type, self->docs_count);
+    ustore_py_view_export_close((PyObject*)self);
     return item;
 }
 
@@ -1274,7 +1280,7 @@ static PyObject* columns_bitmap(Columns* self, column_bitmap_t bitmap, PyObject*
     ustore_docs_column_view_t const* const column = columns_column(self, field_index);
     ustore_octet_t const* const bitmaps[3] = {column->validities, column->conversions, column->collisions};
     Py_ssize_t const bytes = (Py_ssize_t)((self->docs_count + 7) / 8);
-    PyObject* const view = ustore_py_span_view(self->arena, bitmaps[bitmap], "B", 1, 1, &bytes);
+    PyObject* const view = ustore_py_span_view(self->arena, self->generation, bitmaps[bitmap], "B", 1, 1, &bytes);
     return view;
 }
 
@@ -1282,21 +1288,30 @@ static char const doc_Columns_validities[] =
     "validities(field) answers the bitmap of documents whose value was found and converted, as bytes.";
 
 static PyObject* Columns_validities(Columns* self, PyObject* index_object) {
-    return columns_bitmap(self, column_validities_k, index_object);
+    if (ustore_py_view_export_open((PyObject*)self) != 0) return NULL;
+    PyObject* const bitmap = columns_bitmap(self, column_validities_k, index_object);
+    ustore_py_view_export_close((PyObject*)self);
+    return bitmap;
 }
 
 static char const doc_Columns_conversions[] =
     "conversions(field) answers the bitmap of values whose conversion changed their meaning, as bytes.";
 
 static PyObject* Columns_conversions(Columns* self, PyObject* index_object) {
-    return columns_bitmap(self, column_conversions_k, index_object);
+    if (ustore_py_view_export_open((PyObject*)self) != 0) return NULL;
+    PyObject* const bitmap = columns_bitmap(self, column_conversions_k, index_object);
+    ustore_py_view_export_close((PyObject*)self);
+    return bitmap;
 }
 
 static char const doc_Columns_collisions[] =
     "collisions(field) answers the bitmap of values of a type no conversion reaches, as bytes.";
 
 static PyObject* Columns_collisions(Columns* self, PyObject* index_object) {
-    return columns_bitmap(self, column_collisions_k, index_object);
+    if (ustore_py_view_export_open((PyObject*)self) != 0) return NULL;
+    PyObject* const bitmap = columns_bitmap(self, column_collisions_k, index_object);
+    ustore_py_view_export_close((PyObject*)self);
+    return bitmap;
 }
 
 static char const doc_Columns_types[] = "The type every column was converted into, as a tuple of FieldType.";
@@ -1436,6 +1451,8 @@ static PyObject* Columns_arrow_c_array(Columns* self, PyObject* const* Py_UNUSED
         PyErr_SetString(PyExc_TypeError, "__arrow_c_array__() takes at most the 'requested_schema' argument");
         return NULL;
     }
+    // Each column's export counts itself, and this one keeps the arena from moving on meanwhile
+    if (ustore_py_view_export_open((PyObject*)self) != 0) return NULL;
 
     struct ArrowSchema* const schema = (struct ArrowSchema*)PyMem_RawCalloc(1, sizeof(struct ArrowSchema));
     struct ArrowArray* const array = (struct ArrowArray*)PyMem_RawCalloc(1, sizeof(struct ArrowArray));
@@ -1445,6 +1462,7 @@ static PyObject* Columns_arrow_c_array(Columns* self, PyObject* const* Py_UNUSED
         PyMem_RawFree(array);
         PyMem_RawFree(schema);
         PyErr_NoMemory();
+        ustore_py_view_export_close((PyObject*)self);
         return NULL;
     }
     exported->owner = (Columns*)Py_NewRef((PyObject*)self);
@@ -1452,6 +1470,7 @@ static PyObject* Columns_arrow_c_array(Columns* self, PyObject* const* Py_UNUSED
         columns_export_free(exported);
         PyMem_RawFree(array);
         PyMem_RawFree(schema);
+        ustore_py_view_export_close((PyObject*)self);
         return NULL;
     }
     *schema = (struct ArrowSchema) {.format = "+s",
@@ -1473,6 +1492,7 @@ static PyObject* Columns_arrow_c_array(Columns* self, PyObject* const* Py_UNUSED
         PyMem_RawFree(schema);
         columns_array_release(array);
         PyMem_RawFree(array);
+        ustore_py_view_export_close((PyObject*)self);
         return NULL;
     }
     PyObject* const array_capsule = PyCapsule_New(array, "arrow_array", columns_array_capsule_free);
@@ -1480,11 +1500,13 @@ static PyObject* Columns_arrow_c_array(Columns* self, PyObject* const* Py_UNUSED
         Py_DECREF(schema_capsule);
         columns_array_release(array);
         PyMem_RawFree(array);
+        ustore_py_view_export_close((PyObject*)self);
         return NULL;
     }
     PyObject* const capsules = PyTuple_Pack(2, schema_capsule, array_capsule);
     Py_DECREF(schema_capsule);
     Py_DECREF(array_capsule);
+    ustore_py_view_export_close((PyObject*)self);
     return capsules;
 }
 

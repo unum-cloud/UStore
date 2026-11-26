@@ -16,7 +16,7 @@
 #pragma region Reads
 
 char const doc_read[] =                                                                     //
-    "read(keys, arena, *, collection, offset=0, limit=None) answers a Values tape.\n"       //
+    "read(keys, arena=None, *, collection, offset=0, limit=None) answers a Values tape.\n"  //
     "\n"                                                                                    //
     "Reads a batch of binary values in one call, which no sequence of single reads\n"       //
     "matches for throughput. Nothing is copied: the tape sits in the arena, and indexing\n" //
@@ -25,7 +25,7 @@ char const doc_read[] =                                                         
     "Args:\n"                                                                               //
     "  keys (Sequence[KeyLike] | buffer): The keys to read, as a sequence, a contiguous\n"  //
     "    buffer of 16-byte keys, which is read in place, or one of 64-bit integers.\n"      //
-    "  arena (Arena): Where the tape lands, rewound by this call.\n"                        //
+    "  arena (Arena, optional): Where the tape lands, rewound by this call.\n"              //
     "  collection (UUID | str): The collection, by identifier or by name.\n"                //
     "  offset (int, optional): Byte of every value the read starts at, where an offset\n"   //
     "    past the end reads empty.\n"                                                       //
@@ -41,7 +41,8 @@ static void read_submit(void* arguments) { ustore_blobs_read((ustore_blobs_read_
 
 PyObject* ustore_py_read_answer_values(void* erased) {
     ustore_py_read_call_t const* const call = (ustore_py_read_call_t const*)erased;
-    return ustore_py_values_new(call->kept.arena, call->presences, &call->values, call->keys.count);
+    return ustore_py_values_new(call->kept.arena, call->kept.generation, call->presences, &call->values,
+                                call->keys.count);
 }
 
 /** Copies the value of task @p task_index of @p call into bytes, or answers None where its key is absent. */
@@ -100,7 +101,8 @@ ustore_py_verb_t const ustore_py_read_drawn_verb = {sizeof(ustore_py_read_call_t
 
 PyObject* ustore_py_values_read(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
                                 ustore_py_verb_t const* verb, ustore_py_read_call_t* call, PyObject* arena) {
-    if (ustore_py_arena_from_object(arena, &call->kept.arena) != 0) return ustore_py_call_discard(context, verb, call);
+    if (ustore_py_arena_from_object(context, arena, &call->kept.arena) != 0)
+        return ustore_py_call_discard(context, verb, call);
     call->kept.collection = options->collection;
     ustore_blobs_read_t read = {
         .database = context->database_handle,
@@ -124,7 +126,8 @@ PyObject* ustore_py_api_read(PyObject* self, PyObject* const* arguments, Py_ssiz
                              PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_keyword_names_count_checked("read", positional_arguments_count, keyword_names_tuple, 2) < 0)
+    if (ustore_py_keyword_names_count_checked("read", positional_arguments_count, keyword_names_tuple,
+                                              ustore_py_arena_positional(positional_arguments_count, 2)) < 0)
         return NULL;
 
     static char const* const names[] = {"offset", "limit", NULL};
@@ -147,7 +150,8 @@ PyObject* ustore_py_api_read(PyObject* self, PyObject* const* arguments, Py_ssiz
     call->offset = offset;
     call->limit = limit;
     call->extent = given[1] ? ustore_py_read_limited_k : ustore_py_read_to_end_k;
-    return ustore_py_values_read(&context, &options, &ustore_py_read_verb, call, arguments[1]);
+    return ustore_py_values_read(&context, &options, &ustore_py_read_verb, call,
+                                 positional_arguments_count > 1 ? arguments[1] : NULL);
 }
 
 /**
@@ -156,11 +160,7 @@ PyObject* ustore_py_api_read(PyObject* self, PyObject* const* arguments, Py_ssiz
  */
 static PyObject* values_read_once(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
                                   ustore_py_verb_t const* verb, ustore_py_read_call_t* call) {
-    PyObject* const arena = ustore_py_arena_new(context->executor);
-    if (!arena) return ustore_py_call_discard(context, verb, call);
-    PyObject* const answer = ustore_py_values_read(context, options, verb, call, arena);
-    Py_DECREF(arena);
-    return answer;
+    return ustore_py_values_read(context, options, verb, call, Py_None);
 }
 
 char const doc_get[] =                                                                         //
@@ -234,10 +234,8 @@ PyObject* ustore_py_value_contains(ustore_py_context_t const* context, ustore_py
     ustore_py_read_call_t stack;
     ustore_py_read_call_t* const call = one_key_open(context, &contains_verb, key, &stack);
     if (!call) return NULL;
-    PyObject* const arena = ustore_py_arena_new(context->executor);
-    int const claimed = arena ? ustore_py_arena_from_object(arena, &call->kept.arena) : -1;
-    Py_XDECREF(arena);
-    if (claimed != 0) return ustore_py_call_discard(context, &contains_verb, call);
+    if (ustore_py_arena_from_object(context, NULL, &call->kept.arena) != 0)
+        return ustore_py_call_discard(context, &contains_verb, call);
     call->kept.collection = options->collection;
     // The presence alone is asked for, so no value crosses into the arena.
     ustore_blobs_read_t read = {
@@ -700,7 +698,8 @@ typedef struct keys_call_t {
 
 static PyObject* keys_answer(void* erased) {
     keys_call_t const* const call = (keys_call_t const*)erased;
-    return ustore_py_keys_new(call->kept.arena, call->offsets, call->keys, call->tasks, call->scores);
+    return ustore_py_keys_new(call->kept.arena, call->kept.generation, call->offsets, call->keys, call->tasks,
+                              call->scores);
 }
 
 static void keys_release(void* erased) {
@@ -756,45 +755,24 @@ static int match_fill(keys_call_t* call, scan_match_t const* match, ustore_patte
     return 0;
 }
 
-// A batch of no tasks answers an empty tape, and the ABI takes no starts for no tasks, so it is final at once.
-static void scan_submit(void* arguments) {
-    ustore_blobs_scan_t* const scan = (ustore_blobs_scan_t*)arguments;
-    if (scan->count) ustore_blobs_scan(scan);
-}
+static void scan_submit(void* arguments) { ustore_blobs_scan((ustore_blobs_scan_t*)arguments); }
 
-static void sample_submit(void* arguments) {
-    ustore_blobs_sample_t* const sample = (ustore_blobs_sample_t*)arguments;
-    if (sample->count) ustore_blobs_sample(sample);
-}
+static void sample_submit(void* arguments) { ustore_blobs_sample((ustore_blobs_sample_t*)arguments); }
 
-static void docs_sample_submit(void* arguments) {
-    ustore_docs_sample_t* const sample = (ustore_docs_sample_t*)arguments;
-    if (sample->count) ustore_docs_sample(sample);
-}
+static void docs_sample_submit(void* arguments) { ustore_docs_sample((ustore_docs_sample_t*)arguments); }
 
-static void pages_sample_submit(void* arguments) {
-    ustore_pages_sample_t* const sample = (ustore_pages_sample_t*)arguments;
-    if (sample->count) ustore_pages_sample(sample);
-}
+static void pages_sample_submit(void* arguments) { ustore_pages_sample((ustore_pages_sample_t*)arguments); }
 
 static void vertices_sample_submit(void* arguments) {
-    ustore_graph_sample_vertices_t* const sample = (ustore_graph_sample_vertices_t*)arguments;
-    if (sample->count) ustore_graph_sample_vertices(sample);
+    ustore_graph_sample_vertices((ustore_graph_sample_vertices_t*)arguments);
 }
 
-static void docs_scan_submit(void* arguments) {
-    ustore_docs_scan_t* const scan = (ustore_docs_scan_t*)arguments;
-    if (scan->count) ustore_docs_scan(scan);
-}
+static void docs_scan_submit(void* arguments) { ustore_docs_scan((ustore_docs_scan_t*)arguments); }
 
-static void pages_scan_submit(void* arguments) {
-    ustore_pages_scan_t* const scan = (ustore_pages_scan_t*)arguments;
-    if (scan->count) ustore_pages_scan(scan);
-}
+static void pages_scan_submit(void* arguments) { ustore_pages_scan((ustore_pages_scan_t*)arguments); }
 
 static void vertices_scan_submit(void* arguments) {
-    ustore_graph_scan_vertices_t* const scan = (ustore_graph_scan_vertices_t*)arguments;
-    if (scan->count) ustore_graph_scan_vertices(scan);
+    ustore_graph_scan_vertices((ustore_graph_scan_vertices_t*)arguments);
 }
 
 static ustore_py_verb_t const scan_verb = {sizeof(keys_call_t), scan_submit, keys_answer, keys_release};
@@ -816,7 +794,7 @@ static ustore_py_verb_t const vertices_sample_verb = {sizeof(keys_call_t), verti
 static PyObject* keys_scan(ustore_py_context_t const* context, ustore_py_verb_options_t const* options,
                            ustore_modality_t modality, size_t wanted, ustore_scan_mode_t mode, PyObject* progress,
                            scan_match_t const* match, keys_call_t* call, PyObject* arena) {
-    if (ustore_py_arena_from_object(arena, &call->kept.arena) != 0)
+    if (ustore_py_arena_from_object(context, arena, &call->kept.arena) != 0)
         return ustore_py_call_discard(context, &scan_verb, call);
     call->kept.collection = options->collection;
     call->kept.progress = Py_XNewRef(progress);
@@ -924,29 +902,29 @@ static PyObject* keys_scan(ustore_py_context_t const* context, ustore_py_verb_op
     return ustore_py_call_run(context, &scan_verb, call, &scan);
 }
 
-char const doc_scan[] =                                                                        //
-    "scan(start, wanted, arena, *, collection, end=None, direction=ScanDirection.ASCENDING,\n" //
-    "mode=ScanMode.ORDERED, progress=None) answers a Keys tape.\n"                             //
-    "\n"                                                                                       //
-    "Lists up to `wanted` keys from `start` towards `end`. Values are not exported, so a\n"    //
-    "read follows the scan, or a `cursor()` walks a collection with its values instead.\n"     //
-    "\n"                                                                                       //
-    "Args:\n"                                                                                  //
-    "  start (KeyLike | None): The first key the scan may return, or None for the first\n"     //
-    "    key in its direction.\n"                                                              //
-    "  wanted (int): Most keys the scan returns.\n"                                            //
-    "  arena (Arena): Where the keys land, rewound by this call.\n"                            //
-    "  collection (UUID | str): The collection, by identifier or by name.\n"                   //
-    "  end (KeyLike, optional): The key the scan stops before, or None for no bound.\n"        //
-    "  direction (ScanDirection, optional): `ScanDirection.DESCENDING` walks down from\n"      //
-    "    `start`, largest key first.\n"                                                        //
-    "  mode (ScanMode, optional): `ScanMode.UNORDERED` lets keys come out of order,\n"         //
-    "    removed or repeated, to speed up the read after the scan; no engine uses it yet.\n"   //
-    "  progress (Callable[[int, int], bool | None], optional): Called with the scans\n"        //
-    "    finished and the scans in all; a falsy answer other than None cancels the call.\n"    //
-    "Returns:\n"                                                                               //
-    "  Keys: One run of keys, in the order of the direction.\n"                                //
-    "Raises:\n"                                                                                //
+char const doc_scan[] =                                                                             //
+    "scan(start, wanted, arena=None, *, collection, end=None, direction=ScanDirection.ASCENDING,\n" //
+    "mode=ScanMode.ORDERED, progress=None) answers a Keys tape.\n"                                  //
+    "\n"                                                                                            //
+    "Lists up to `wanted` keys from `start` towards `end`. Values are not exported, so a\n"         //
+    "read follows the scan, or a `cursor()` walks a collection with its values instead.\n"          //
+    "\n"                                                                                            //
+    "Args:\n"                                                                                       //
+    "  start (KeyLike | None): The first key the scan may return, or None for the first\n"          //
+    "    key in its direction.\n"                                                                   //
+    "  wanted (int): Most keys the scan returns.\n"                                                 //
+    "  arena (Arena, optional): Where the keys land, rewound by this call.\n"                       //
+    "  collection (UUID | str): The collection, by identifier or by name.\n"                        //
+    "  end (KeyLike, optional): The key the scan stops before, or None for no bound.\n"             //
+    "  direction (ScanDirection, optional): `ScanDirection.DESCENDING` walks down from\n"           //
+    "    `start`, largest key first.\n"                                                             //
+    "  mode (ScanMode, optional): `ScanMode.UNORDERED` lets keys come out of order,\n"              //
+    "    removed or repeated, to speed up the read after the scan; no engine uses it yet.\n"        //
+    "  progress (Callable[[int, int], bool | None], optional): Called with the scans\n"             //
+    "    finished and the scans in all; a falsy answer other than None cancels the call.\n"         //
+    "Returns:\n"                                                                                    //
+    "  Keys: One run of keys, in the order of the direction.\n"                                     //
+    "Raises:\n"                                                                                     //
     "  CancelledError: The progress callable stopped the scan.";
 
 /** Runs one scan of @p modality from @p start in @p direction, stopping before @p end unless it is
@@ -981,7 +959,8 @@ PyObject* ustore_py_api_scan_of(PyObject* self, PyObject* const* arguments, Py_s
                                 PyObject* keyword_names_tuple, char const* name, ustore_modality_t modality) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_keyword_names_count_checked(name, positional_arguments_count, keyword_names_tuple, 3) < 0)
+    if (ustore_py_keyword_names_count_checked(name, positional_arguments_count, keyword_names_tuple,
+                                              ustore_py_arena_positional(positional_arguments_count, 3)) < 0)
         return NULL;
 
     ustore_py_verb_options_t options;
@@ -1001,7 +980,7 @@ PyObject* ustore_py_api_scan_of(PyObject* self, PyObject* const* arguments, Py_s
     if (end_object && ustore_py_key_from_object(end_object, &end) != 0) return NULL;
     if (ustore_py_size_from_object(arguments[1], "wanted", &wanted) != 0) return NULL;
     return keys_scan_matched(&context, &options, modality, &start, end_object ? &end : NULL, direction, wanted, mode,
-                             progress, &match, arguments[2]);
+                             progress, &match, positional_arguments_count > 2 ? arguments[2] : NULL);
 }
 
 PyObject* ustore_py_api_scan(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
@@ -1011,7 +990,7 @@ PyObject* ustore_py_api_scan(PyObject* self, PyObject* const* arguments, Py_ssiz
 }
 
 char const doc_scan_batch[] =                                                                  //
-    "scan_batch(starts, wanted, arena, *, collection, ends=None,\n"                            //
+    "scan_batch(starts, wanted, arena=None, *, collection, ends=None,\n"                       //
     "direction=ScanDirection.ASCENDING, mode=ScanMode.ORDERED, progress=None)\n"               //
     "answers a Keys tape.\n"                                                                   //
     "\n"                                                                                       //
@@ -1022,7 +1001,7 @@ char const doc_scan_batch[] =                                                   
     "Args:\n"                                                                                  //
     "  starts (Sequence[KeyLike] | buffer): The first key every scan may return.\n"            //
     "  wanted (int): Most keys every scan returns.\n"                                          //
-    "  arena (Arena): Where the keys land, rewound by this call.\n"                            //
+    "  arena (Arena, optional): Where the keys land, rewound by this call.\n"                  //
     "  collection (UUID | str): The collection, by identifier or by name.\n"                   //
     "  ends (Sequence[KeyLike] | buffer, optional): The key every scan stops before, one\n"    //
     "    per start, or None for no bound.\n"                                                   //
@@ -1041,7 +1020,8 @@ PyObject* ustore_py_api_scan_batch(PyObject* self, PyObject* const* arguments, P
                                    PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_keyword_names_count_checked("scan_batch", positional_arguments_count, keyword_names_tuple, 3) < 0)
+    if (ustore_py_keyword_names_count_checked("scan_batch", positional_arguments_count, keyword_names_tuple,
+                                              ustore_py_arena_positional(positional_arguments_count, 3)) < 0)
         return NULL;
 
     ustore_py_verb_options_t options;
@@ -1063,7 +1043,8 @@ PyObject* ustore_py_api_scan_batch(PyObject* self, PyObject* const* arguments, P
         ustore_py_ends_from_object(ends, ustore_py_context_executor(&context), &call->starts, &call->ends) != 0)
         return ustore_py_call_discard(&context, &scan_verb, call);
     call->direction = direction;
-    return keys_scan(&context, &options, ustore_modality_blobs_k, wanted, mode, progress, &match, call, arguments[2]);
+    return keys_scan(&context, &options, ustore_modality_blobs_k, wanted, mode, progress, &match, call,
+                     positional_arguments_count > 2 ? arguments[2] : NULL);
 }
 
 /** Runs @p tasks samples of up to @p wanted keys each through the sample of @p modality, and
@@ -1073,7 +1054,7 @@ static PyObject* keys_sample(ustore_py_context_t const* context, ustore_py_verb_
     keys_call_t stack;
     keys_call_t* const call = ustore_py_call_open(context, &sample_verb, &stack);
     if (!call) return NULL;
-    if (ustore_py_arena_from_object(arena, &call->kept.arena) != 0)
+    if (ustore_py_arena_from_object(context, arena, &call->kept.arena) != 0)
         return ustore_py_call_discard(context, &sample_verb, call);
     call->kept.collection = options->collection;
     call->tasks = tasks;
@@ -1142,14 +1123,14 @@ static PyObject* keys_sample(ustore_py_context_t const* context, ustore_py_verb_
 }
 
 char const doc_sample[] =                                                                 //
-    "sample(wanted, arena, *, collection) answers a Keys tape.\n"                         //
+    "sample(wanted, arena=None, *, collection) answers a Keys tape.\n"                    //
     "\n"                                                                                  //
     "Draws keys uniformly at random from one collection, which is how a workload picks\n" //
     "entries it has no list of.\n"                                                        //
     "\n"                                                                                  //
     "Args:\n"                                                                             //
     "  wanted (int): Most keys to draw.\n"                                                //
-    "  arena (Arena): Where the keys land, rewound by this call.\n"                       //
+    "  arena (Arena, optional): Where the keys land, rewound by this call.\n"             //
     "  collection (UUID | str): The collection, by identifier or by name.\n"              //
     "Returns:\n"                                                                          //
     "  Keys: One run of keys, in no particular order.";
@@ -1163,7 +1144,8 @@ PyObject* ustore_py_api_sample_of(PyObject* self, PyObject* const* arguments, Py
                                   PyObject* keyword_names_tuple, char const* name, ustore_modality_t modality) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_keyword_names_count_checked(name, positional_arguments_count, keyword_names_tuple, 2) < 0)
+    if (ustore_py_keyword_names_count_checked(name, positional_arguments_count, keyword_names_tuple,
+                                              ustore_py_arena_positional(positional_arguments_count, 2)) < 0)
         return NULL;
 
     ustore_py_verb_options_t options;
@@ -1173,7 +1155,7 @@ PyObject* ustore_py_api_sample_of(PyObject* self, PyObject* const* arguments, Py
 
     size_t wanted = 0;
     if (ustore_py_size_from_object(arguments[0], "wanted", &wanted) != 0) return NULL;
-    return keys_sample(&context, &options, modality, 1, wanted, arguments[1]);
+    return keys_sample(&context, &options, modality, 1, wanted, positional_arguments_count > 1 ? arguments[1] : NULL);
 }
 
 PyObject* ustore_py_api_sample(PyObject* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
@@ -1183,7 +1165,7 @@ PyObject* ustore_py_api_sample(PyObject* self, PyObject* const* arguments, Py_ss
 }
 
 char const doc_sample_batch[] =                                                               //
-    "sample_batch(count, wanted, arena, *, collection) answers a Keys tape.\n"                //
+    "sample_batch(count, wanted, arena=None, *, collection) answers a Keys tape.\n"           //
     "\n"                                                                                      //
     "Draws `count` independent samples in one call, all from the one collection named,\n"     //
     "which is how a workload builds several random batches without paying for a call each.\n" //
@@ -1191,7 +1173,7 @@ char const doc_sample_batch[] =                                                 
     "Args:\n"                                                                                 //
     "  count (int): Samples to draw.\n"                                                       //
     "  wanted (int): Most keys every sample draws.\n"                                         //
-    "  arena (Arena): Where the keys land, rewound by this call.\n"                           //
+    "  arena (Arena, optional): Where the keys land, rewound by this call.\n"                 //
     "  collection (UUID | str): The one collection every sample draws from, by\n"             //
     "    identifier or by name.\n"                                                            //
     "Returns:\n"                                                                              //
@@ -1201,7 +1183,8 @@ PyObject* ustore_py_api_sample_batch(PyObject* self, PyObject* const* arguments,
                                      PyObject* keyword_names_tuple) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_keyword_names_count_checked("sample_batch", positional_arguments_count, keyword_names_tuple, 3) < 0)
+    if (ustore_py_keyword_names_count_checked("sample_batch", positional_arguments_count, keyword_names_tuple,
+                                              ustore_py_arena_positional(positional_arguments_count, 3)) < 0)
         return NULL;
 
     ustore_py_verb_options_t options;
@@ -1213,27 +1196,28 @@ PyObject* ustore_py_api_sample_batch(PyObject* self, PyObject* const* arguments,
     size_t wanted = 0;
     if (ustore_py_size_from_object(arguments[0], "count", &tasks) != 0) return NULL;
     if (ustore_py_size_from_object(arguments[1], "wanted", &wanted) != 0) return NULL;
-    return keys_sample(&context, &options, ustore_modality_blobs_k, tasks, wanted, arguments[2]);
+    return keys_sample(&context, &options, ustore_modality_blobs_k, tasks, wanted,
+                       positional_arguments_count > 2 ? arguments[2] : NULL);
 }
 
-char const doc_measure[] =                                                                   //
-    "measure(start, end, arena, *, collection, direction=ScanDirection.ASCENDING)\n"         //
-    "answers a Measurement.\n"                                                               //
-    "\n"                                                                                     //
-    "Estimates what a key range holds without walking it, so the answers are bounds\n"       //
-    "rather than counts.\n"                                                                  //
-    "\n"                                                                                     //
-    "Args:\n"                                                                                //
-    "  start (KeyLike | None): First key of the range, or None for the first key in the\n"   //
-    "    direction.\n"                                                                       //
-    "  end (KeyLike | None): The key the range stops before, or None for no bound.\n"        //
-    "  arena (Arena): Where the bounds land before they are copied out, rewound by this\n"   //
-    "    call.\n"                                                                            //
-    "  collection (UUID | str): The collection, by identifier or by name.\n"                 //
-    "  direction (ScanDirection, optional): `ScanDirection.DESCENDING` ranges down from\n"   //
-    "    `start`.\n"                                                                         //
-    "Returns:\n"                                                                             //
-    "  Measurement: The lower and upper bounds on the entries, the bytes of their values,\n" //
+char const doc_measure[] =                                                                           //
+    "measure(start, end, arena=None, *, collection, direction=ScanDirection.ASCENDING)\n"            //
+    "answers a Measurement.\n"                                                                       //
+    "\n"                                                                                             //
+    "Estimates what a key range holds without walking it, so the answers are bounds\n"               //
+    "rather than counts.\n"                                                                          //
+    "\n"                                                                                             //
+    "Args:\n"                                                                                        //
+    "  start (KeyLike | None): First key of the range, or None for the first key in the\n"           //
+    "    direction.\n"                                                                               //
+    "  end (KeyLike | None): The key the range stops before, or None for no bound.\n"                //
+    "  arena (Arena, optional): Where the bounds land before they are copied out, rewound by this\n" //
+    "    call.\n"                                                                                    //
+    "  collection (UUID | str): The collection, by identifier or by name.\n"                         //
+    "  direction (ScanDirection, optional): `ScanDirection.DESCENDING` ranges down from\n"           //
+    "    `start`.\n"                                                                                 //
+    "Returns:\n"                                                                                     //
+    "  Measurement: The lower and upper bounds on the entries, the bytes of their values,\n"         //
     "  and the space they take on disk.";
 
 /** A measurement of one range, whose bounds land in the arena its header holds. */
@@ -1285,7 +1269,8 @@ PyObject* ustore_py_api_measure_of(PyObject* self, PyObject* const* arguments, P
                                    PyObject* keyword_names_tuple, char const* name, ustore_modality_t modality) {
     ustore_py_context_t context;
     if (ustore_py_context_from_object(self, &context) != 0) return NULL;
-    if (ustore_py_keyword_names_count_checked(name, positional_arguments_count, keyword_names_tuple, 3) < 0)
+    if (ustore_py_keyword_names_count_checked(name, positional_arguments_count, keyword_names_tuple,
+                                              ustore_py_arena_positional(positional_arguments_count, 3)) < 0)
         return NULL;
 
     static char const* const names[] = {"direction", NULL};
@@ -1309,7 +1294,8 @@ PyObject* ustore_py_api_measure_of(PyObject* self, PyObject* const* arguments, P
     measure_call_t* const call = ustore_py_call_open(&context, &measure_verb, &stack);
     if (!call) return NULL;
     Measurement* const bounds = (Measurement*)(call->kept.result = ustore_py_report_new(&MeasurementType));
-    if (!bounds || ustore_py_arena_from_object(arguments[2], &call->kept.arena) != 0)
+    if (!bounds || ustore_py_arena_from_object(&context, positional_arguments_count > 2 ? arguments[2] : NULL,
+                                               &call->kept.arena) != 0)
         return ustore_py_call_discard(&context, &measure_verb, call);
     call->kept.collection = options.collection;
     call->start = start;
@@ -1454,13 +1440,16 @@ static char const doc_Page[] =                                                  
     "it reads whatever the arena then holds.";
 
 /** A new @c Page over the @p count keys a pull wrote into @p arena, taking @p values, their @c Values or None. */
-static PyObject* page_new(PyObject* arena, ustore_key_t const* keys, size_t count, PyObject* values) {
+static PyObject* page_new(PyObject* arena, uint64_t generation, ustore_key_t const* keys, size_t count,
+                          PyObject* values) {
     Page* const page = PyObject_New(Page, &PageType);
     if (!page) {
         Py_DECREF(values);
         return NULL;
     }
     page->arena = Py_NewRef(arena);
+    page->generation = generation;
+    page->cuda_array_interface_reads = 0;
     page->keys = keys;
     page->count = count;
     page->values = values;
@@ -1472,6 +1461,9 @@ static PyObject* page_new(PyObject* arena, ustore_key_t const* keys, size_t coun
 }
 
 static void Page_dealloc(Page* self) {
+    // Each read of the CUDA Array Interface handed a consumer the address, which counts until now.
+    for (; self->cuda_array_interface_reads; --self->cuda_array_interface_reads)
+        ustore_py_view_export_close((PyObject*)self);
     Py_XDECREF(self->values);
     Py_XDECREF(self->arena);
     PyObject_Free(self);
@@ -1484,7 +1476,9 @@ static PyObject* Page_item(Page* self, Py_ssize_t key_index) {
         PyErr_SetString(PyExc_IndexError, "Key index out of range");
         return NULL;
     }
+    if (ustore_py_view_export_open((PyObject*)self) != 0) return NULL;
     PyObject* const key = ustore_py_uuid_to_object(&self->keys[key_index].uuid);
+    ustore_py_view_export_close((PyObject*)self);
     return key;
 }
 
@@ -1523,6 +1517,7 @@ static PySequenceMethods Page_as_sequence = {
 
 static PyBufferProcs Page_as_buffer = {
     .bf_getbuffer = (getbufferproc)Page_getbuffer,
+    .bf_releasebuffer = (releasebufferproc)ustore_py_view_releasebuffer,
 };
 
 PyTypeObject PageType = {
@@ -1565,13 +1560,14 @@ static void vertices_pull_submit(void* arguments) {
 
 static PyObject* pull_answer_keys(void* erased) {
     pull_call_t const* const call = (pull_call_t const*)erased;
-    return page_new(call->kept.arena, call->keys, (size_t)call->written, Py_NewRef(Py_None));
+    return page_new(call->kept.arena, call->kept.generation, call->keys, (size_t)call->written, Py_NewRef(Py_None));
 }
 
 static PyObject* pull_answer_pairs(void* erased) {
     pull_call_t const* const call = (pull_call_t const*)erased;
-    PyObject* const values = ustore_py_values_new(call->kept.arena, NULL, &call->values, (size_t)call->written);
-    return values ? page_new(call->kept.arena, call->keys, (size_t)call->written, values) : NULL;
+    PyObject* const values = ustore_py_values_new(call->kept.arena, call->kept.generation, NULL, &call->values,
+                                                  (size_t)call->written);
+    return values ? page_new(call->kept.arena, call->kept.generation, call->keys, (size_t)call->written, values) : NULL;
 }
 
 static void pull_release(void* call) { ustore_py_call_release(&((pull_call_t*)call)->kept); }
@@ -1601,8 +1597,9 @@ static PyObject* docs_pull_answer(void* erased) {
     size_t const fields_count = cursor->fields ? (size_t)PyTuple_GET_SIZE(cursor->fields) : 0;
     for (size_t index = 0; index != call->batches_count; ++index) {
         ustore_docs_batch_view_t const* const batch = &call->batches[index];
-        PyObject* const keys = page_new(call->kept.arena, batch->keys, (size_t)batch->count, Py_NewRef(Py_None));
-        PyObject* const columns = ustore_py_columns_new(call->kept.arena, batch->columns,
+        PyObject* const keys = page_new(call->kept.arena, call->kept.generation, batch->keys, (size_t)batch->count,
+                                        Py_NewRef(Py_None));
+        PyObject* const columns = ustore_py_columns_new(call->kept.arena, call->kept.generation, batch->columns,
                                                         cursor->fields ? cursor->fields : Py_None, cursor->types,
                                                         fields_count, (size_t)batch->count);
         PyObject* const pair = keys && columns ? PyTuple_Pack(2, keys, columns) : NULL;
@@ -1665,7 +1662,7 @@ static void Cursor_dealloc(Cursor* self) {
  *  @p executor, or on the calling thread for NULL. */
 static PyObject* cursor_pull(Cursor* self, Executor* executor, void* handle, size_t wanted, PyObject* arena, int values,
                              PyObject* progress) {
-    if (executor && !executor->handle) {
+    if (executor && !atomic_load(&executor->handle)) {
         ustore_py_raise(ustore_status_uninitialized_k, "The executor is closed");
         return NULL;
     }
@@ -1681,7 +1678,7 @@ static PyObject* cursor_pull(Cursor* self, Executor* executor, void* handle, siz
     if (self->modality == ustore_modality_docs_k) {
         docs_pull_call_t stack;
         docs_pull_call_t* const call = ustore_py_call_open(&context, &docs_pull_verb, &stack);
-        if (ustore_py_arena_from_object(arena, &call->kept.arena) != 0)
+        if (ustore_py_arena_from_object(&context, arena, &call->kept.arena) != 0)
             return ustore_py_call_discard(&context, &docs_pull_verb, call);
         call->kept.progress = Py_XNewRef(progress);
         call->cursor = self;
@@ -1706,7 +1703,8 @@ static PyObject* cursor_pull(Cursor* self, Executor* executor, void* handle, siz
                                                                                      : &pull_keys_verb;
     pull_call_t stack;
     pull_call_t* const call = ustore_py_call_open(&context, verb, &stack);
-    if (ustore_py_arena_from_object(arena, &call->kept.arena) != 0) return ustore_py_call_discard(&context, verb, call);
+    if (ustore_py_arena_from_object(&context, arena, &call->kept.arena) != 0)
+        return ustore_py_call_discard(&context, verb, call);
     call->kept.progress = Py_XNewRef(progress);
     PyObject* page = NULL;
     if (self->modality == ustore_modality_pages_k) {
@@ -1773,7 +1771,7 @@ static char const doc_Cursor[] =                                                
     "manager, it closes on exit.";
 
 static char const doc_Cursor_next[] =                                                           //
-    "next(wanted, arena, /, *, values=False, progress=None) answers a Page.\n"                  //
+    "next(wanted, arena=None, /, *, values=False, progress=None) answers a Page.\n"             //
     "\n"                                                                                        //
     "Pulls up to `wanted` keys past the last page into `arena`, with their values in the\n"     //
     "same call when asked, on the calling thread, while `on(executor).next` blocks on the\n"    //
@@ -1784,7 +1782,7 @@ static char const doc_Cursor_next[] =                                           
     "\n"                                                                                        //
     "Args:\n"                                                                                   //
     "  wanted (int): Most keys the page holds.\n"                                               //
-    "  arena (Arena): Where the keys and values land, rewound by this pull.\n"                  //
+    "  arena (Arena, optional): Where the keys and values land, rewound by this pull.\n"        //
     "  values (bool, optional): Whether the page holds the values of its keys.\n"               //
     "  progress (Callable[[int, int], bool | None], optional): Called once for the pull,\n"     //
     "    which a falsy answer other than None cancels before the cursor advances.\n"            //
@@ -1799,8 +1797,9 @@ static char const doc_Cursor_next[] =                                           
  *  thread for NULL. */
 static PyObject* cursor_next(Cursor* self, Executor* executor, PyObject* const* arguments,
                              Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
-    Py_ssize_t const keyword_names_count = ustore_py_keyword_names_count_checked("next", positional_arguments_count,
-                                                                                 keyword_names_tuple, 2);
+    Py_ssize_t const keyword_names_count = ustore_py_keyword_names_count_checked(
+        "next", positional_arguments_count, keyword_names_tuple,
+        ustore_py_arena_positional(positional_arguments_count, 2));
     if (keyword_names_count < 0) return NULL;
     int values = 0;
     PyObject* progress = NULL;
@@ -1825,7 +1824,8 @@ static PyObject* cursor_next(Cursor* self, Executor* executor, PyObject* const* 
         ustore_py_raise(ustore_status_uninitialized_k, "The cursor is closed");
         return NULL;
     }
-    return cursor_pull(self, executor, handle, wanted, arguments[1], values, progress);
+    return cursor_pull(self, executor, handle, wanted, positional_arguments_count > 1 ? arguments[1] : NULL, values,
+                       progress);
 }
 
 static PyObject* Cursor_next(Cursor* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
@@ -1913,8 +1913,8 @@ static void CursorOn_dealloc(CursorOn* self) {
     PyObject_Free(self);
 }
 
-static char const doc_CursorOn_next[] =                                                   //
-    "next(wanted, arena, /, *, values=False, progress=None) answers what `Cursor.next`\n" //
+static char const doc_CursorOn_next[] =                                                        //
+    "next(wanted, arena=None, /, *, values=False, progress=None) answers what `Cursor.next`\n" //
     "does, blocking on the executor. Calls `ustore_blobs_cursor_next`.";
 
 static PyObject* CursorOn_next(CursorOn* self, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
@@ -2232,7 +2232,7 @@ static PyObject* changes_answer(changes_pull_call_t const* call, PyObject* value
     Changes* const changes = (Changes*)call->kept.result;
     size_t const count = (size_t)changes->count;
     changes->values_object = values;
-    changes->keys_object = page_new(call->kept.arena, changes->keys, count, Py_NewRef(Py_None));
+    changes->keys_object = page_new(call->kept.arena, call->kept.generation, changes->keys, count, Py_NewRef(Py_None));
     changes->stamps_object = PyTuple_New((Py_ssize_t)count);
     changes->kinds_object = PyTuple_New((Py_ssize_t)count);
     int failed = !values || !changes->keys_object || !changes->stamps_object || !changes->kinds_object;
@@ -2253,7 +2253,8 @@ static PyObject* changes_answer_keys(void* erased) {
 static PyObject* changes_answer_pairs(void* erased) {
     changes_pull_call_t const* const call = (changes_pull_call_t const*)erased;
     Changes const* const changes = (Changes const*)call->kept.result;
-    return changes_answer(call, ustore_py_values_new(call->kept.arena, NULL, &changes->values, (size_t)changes->count));
+    return changes_answer(call, ustore_py_values_new(call->kept.arena, call->kept.generation, NULL, &changes->values,
+                                                     (size_t)changes->count));
 }
 
 static void changes_pull_release(void* call) { ustore_py_call_release(&((changes_pull_call_t*)call)->kept); }
@@ -2287,7 +2288,7 @@ static char const doc_ChangesCursor[] =                                         
     "`close()` waits for a pull in flight. Used as a context manager, it closes on exit.";
 
 static char const doc_ChangesCursor_next[] =                                                   //
-    "next(wanted, arena, /, *, values=False) answers a Changes tuple.\n"                       //
+    "next(wanted, arena=None, /, *, values=False) answers a Changes tuple.\n"                  //
     "\n"                                                                                       //
     "Pulls up to `wanted` changes past the last pull into `arena`, with the bytes every one\n" //
     "holds in the same call when asked, on the calling thread. An empty pull, whose keys\n"    //
@@ -2296,7 +2297,7 @@ static char const doc_ChangesCursor_next[] =                                    
     "\n"                                                                                       //
     "Args:\n"                                                                                  //
     "  wanted (int): Most changes the pull yields.\n"                                          //
-    "  arena (Arena): Where the keys and values land, rewound by this pull.\n"                 //
+    "  arena (Arena, optional): Where the keys and values land, rewound by this pull.\n"       //
     "  values (bool, optional): Whether the pull holds the bytes of every change, empty\n"     //
     "    for a removal.\n"                                                                     //
     "Returns:\n"                                                                               //
@@ -2307,8 +2308,9 @@ static char const doc_ChangesCursor_next[] =                                    
 
 static PyObject* ChangesCursor_next(ChangesCursor* self, PyObject* const* arguments,
                                     Py_ssize_t positional_arguments_count, PyObject* keyword_names_tuple) {
-    Py_ssize_t const keyword_names_count = ustore_py_keyword_names_count_checked("next", positional_arguments_count,
-                                                                                 keyword_names_tuple, 2);
+    Py_ssize_t const keyword_names_count = ustore_py_keyword_names_count_checked(
+        "next", positional_arguments_count, keyword_names_tuple,
+        ustore_py_arena_positional(positional_arguments_count, 2));
     if (keyword_names_count < 0) return NULL;
     int values = 0;
     for (Py_ssize_t names_progress = 0; names_progress != keyword_names_count; ++names_progress) {
@@ -2334,7 +2336,8 @@ static PyObject* ChangesCursor_next(ChangesCursor* self, PyObject* const* argume
     changes_pull_call_t* const call = ustore_py_call_open(&context, verb, &stack);
     Changes* const pulled = (Changes*)(call->kept.result = ustore_py_report_new(&ChangesType));
     PyObject* changes = NULL;
-    if (!pulled || ustore_py_arena_from_object(arguments[1], &call->kept.arena) != 0)
+    if (!pulled || ustore_py_arena_from_object(&context, positional_arguments_count > 1 ? arguments[1] : NULL,
+                                               &call->kept.arena) != 0)
         changes = ustore_py_call_discard(&context, verb, call);
     else {
         ustore_changes_cursor_next_t next = {

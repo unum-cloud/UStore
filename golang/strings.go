@@ -131,6 +131,7 @@ type Mapped struct {
 	presences *C.ustore_octet_t
 	values    *C.ustore_key_t
 	count     uint
+	arena     arenaWrite
 }
 
 // Len reports how many strings the call looked up.
@@ -138,6 +139,8 @@ func (mapped Mapped) Len() uint { return mapped.count }
 
 // Get reports the key string index maps onto, and false for a missing string.
 func (mapped Mapped) Get(index uint) (Key, bool) {
+	mapped.arena.mustOpen()
+	defer mapped.arena.close()
 	if !present(mapped.presences, index) {
 		return Key{}, false
 	}
@@ -166,6 +169,7 @@ func (receiver storeReceiver[Handle]) stringsRead(call *callWithResult[Mapped], 
 		return err
 	}
 	arguments, inputs := stage[C.ustore_strings_read_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	call.result.count = uint(count)
 	*arguments = C.ustore_strings_read_t{
 		database:    database,
@@ -195,6 +199,7 @@ type Listing struct {
 	strings Strings
 	scores  *C.float
 	count   uint
+	arena   arenaWrite
 }
 
 // Len reports how many scans or samples the call ran.
@@ -202,17 +207,23 @@ func (listing Listing) Len() uint { return listing.count }
 
 // Count reports how many strings scan task found.
 func (listing Listing) Count(task uint) uint {
+	listing.arena.mustOpen()
+	defer listing.arena.close()
 	return uint(at(listing.offsets, task+1) - at(listing.offsets, task))
 }
 
 // Get views string index of scan task in the arena; index must be below [Listing.Count].
 func (listing Listing) Get(task, index uint) []byte {
+	listing.arena.mustOpen()
+	defer listing.arena.close()
 	return listing.strings.sized(uint(at(listing.offsets, listing.count))).Get(uint(at(listing.offsets, task)) + index)
 }
 
 // Scores views the BM25 score of every string scan task found, and nothing unless the patterns
 // carried weights.
 func (listing Listing) Scores(task uint) []float32 {
+	listing.arena.mustOpen()
+	defer listing.arena.close()
 	begin, end := at(listing.offsets, task), at(listing.offsets, task+1)
 	if listing.scores == nil || begin == end {
 		return nil
@@ -268,6 +279,7 @@ func (receiver storeReceiver[Handle]) stringsScan(call *callWithResult[Listing],
 		return err
 	}
 	arguments, inputs := stage[C.ustore_strings_scan_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	call.result.count = uint(count)
 	progress, state := call.progress(options.Progress)
 	*arguments = C.ustore_strings_scan_t{
@@ -385,17 +397,26 @@ type StringsPage struct {
 	strings Strings
 	values  *C.ustore_key_t
 	written C.ustore_size_t
+	arena   arenaWrite
 }
 
 // Len reports how many strings the pull handed out; fewer than wanted exhausts the walk for good.
 func (page StringsPage) Len() uint { return uint(page.written) }
 
 // Strings views the strings of the page in the arena.
-func (page StringsPage) Strings() Strings { return page.strings.sized(uint(page.written)) }
+func (page StringsPage) Strings() Strings {
+	page.arena.mustOpen()
+	defer page.arena.close()
+	return page.strings.sized(uint(page.written))
+}
 
 // Values views the key every string maps onto, and is empty after a
 // [StringsCursor.NextStrings] pull.
-func (page StringsPage) Values() []Key { return keysAt(page.values, 0, uint64(page.written)) }
+func (page StringsPage) Values() []Key {
+	page.arena.mustOpen()
+	defer page.arena.close()
+	return keysAt(page.values, 0, uint64(page.written))
+}
 
 // NextStrings pulls up to wanted strings of the walk into arena.
 func (on StringsCursorOn) NextStrings(wanted uint, arena *Arena) (StringsPage, error) {
@@ -427,6 +448,7 @@ func (on StringsCursorOn) next(call *callWithResult[StringsPage], wanted uint, a
 		return nil, err
 	}
 	arguments := open[C.ustore_strings_cursor_next_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	*arguments = C.ustore_strings_cursor_next_t{
 		database: database,
 		executor: executor,
@@ -475,6 +497,7 @@ func (receiver storeReceiver[Handle]) stringsSample(call *callWithResult[Listing
 	}
 	count := tasks(collections)
 	arguments, inputs := stage[C.ustore_strings_sample_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	call.result.count = uint(count)
 	*arguments = C.ustore_strings_sample_t{
 		database:    database,
@@ -528,6 +551,7 @@ func (receiver storeReceiver[Handle]) stringsMeasure(call *callWithResult[Measur
 		return err
 	}
 	arguments, inputs := stage[C.ustore_strings_measure_t](call)
+	call.result.arena = call.stamp(arena, outputs)
 	call.result.count = uint(count)
 	*arguments = C.ustore_strings_measure_t{
 		database:          database,

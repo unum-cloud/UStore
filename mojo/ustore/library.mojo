@@ -114,6 +114,7 @@ from ustore.db import (
 )
 from ustore.types import (
     ArenaDescribe,
+    ArenaGeneration,
     ArenaInit,
     BytesView,
     CaseSensitivity,
@@ -231,6 +232,12 @@ struct Symbols:
     var arena_init: ArenaInit
     var arena_describe: ArenaDescribe
     var arena_free: StatusRelease
+    var arena_export_open: StatusRelease
+    """`ustore_arena_export_open`."""
+    var arena_export_close: Release
+    """`ustore_arena_export_close`."""
+    var arena_generation: ArenaGeneration
+    """`ustore_arena_generation`."""
 
     var predicate_cost_name: NameOf
     var predicate_cost_from_name: FromName
@@ -400,6 +407,9 @@ struct Symbols:
         self.arena_init = _resolve[ArenaInit](handle, "ustore_arena_init")
         self.arena_describe = _resolve[ArenaDescribe](handle, "ustore_arena_describe")
         self.arena_free = _resolve[StatusRelease](handle, "ustore_arena_free")
+        self.arena_export_open = _resolve[StatusRelease](handle, "ustore_arena_export_open")
+        self.arena_export_close = _resolve[Release](handle, "ustore_arena_export_close")
+        self.arena_generation = _resolve[ArenaGeneration](handle, "ustore_arena_generation")
 
         self.predicate_cost_name = _resolve[NameOf](handle, "ustore_predicate_cost_name")
         self.predicate_cost_from_name = _resolve[FromName](handle, "ustore_predicate_cost_from_name")

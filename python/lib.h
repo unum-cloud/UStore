@@ -299,6 +299,20 @@ PyObject* ustore_py_arrow_c_stream(PyObject* self, PyObject* const* arguments, P
  *  waits for it from the host, as the host may read what it writes; 0, or -1 raising. */
 int ustore_py_executor_follow_and_drain(ustore_executor_t executor, void* event, void* stream);
 
+/**
+ *  @brief Opens one export of the arena the output view @p view reads, then checks @p view is of
+ *      its current generation, so no call rewinds the memory until @c ustore_py_view_export_close.
+ *      Every host read of arena memory and every export goes through it.
+ *  @return 0, or -1 raising ValueError for a result a later call made stale.
+ */
+int ustore_py_view_export_open(PyObject* view);
+
+/** Closes one export @c ustore_py_view_export_open opened on the arena @p view reads. */
+void ustore_py_view_export_close(PyObject* view);
+
+/** Closes the export a buffer of the output view @p view opened, as each @c bf_releasebuffer. */
+void ustore_py_view_releasebuffer(PyObject* view, Py_buffer* buffer);
+
 /** Answers @c __cuda_array_interface__ of @p self, raising AttributeError but for NVIDIA memory. */
 PyObject* ustore_py_cuda_array_interface(PyObject* self, void* closure);
 
@@ -313,6 +327,13 @@ extern char const ustore_py_dlpack_doc[];
 
 /** The docstring of every @c __dlpack_device__. */
 extern char const ustore_py_dlpack_device_doc[];
+
+/** How many positional arguments a verb ending in an optional arena takes, of the
+ *  @p positional_arguments_count given: all @p required_positional, or every one but the arena. */
+static inline Py_ssize_t ustore_py_arena_positional(Py_ssize_t positional_arguments_count,
+                                                    Py_ssize_t required_positional) {
+    return positional_arguments_count == required_positional - 1 ? positional_arguments_count : required_positional;
+}
 
 /** The C enums a caller meets, each mirrored as the `enum.IntEnum` of `ustore` named in @c types.c. */
 typedef enum ustore_py_enum_t {
@@ -419,8 +440,12 @@ typedef struct Executor {
     /** The object header every instance holds. */
     PyObject ob_base;
 
-    /** The executor, or NULL once it has been closed. */
-    ustore_executor_t handle;
+    /** The executor every receiver runs calls on, or NULL once it has been closed. */
+    _Atomic(ustore_executor_t) handle;
+
+    /** The executor this object frees as it dies, which no verb, arena or result can race, as each
+     *  holds the object. */
+    ustore_executor_t owned;
 } Executor;
 
 /**
@@ -511,6 +536,9 @@ typedef struct ustore_py_call_t {
 
     /** The @c Arena the call's outputs land in, held, or NULL for a verb with none. */
     PyObject* arena;
+
+    /** The generation the call advances @c arena to as it takes it, stamping its results. */
+    uint64_t generation;
 
     /** The callable the progress trampoline re-enters, held, or NULL when the caller passed none. */
     PyObject* progress;
@@ -686,6 +714,12 @@ typedef struct Values {
     /** The @c Arena the outputs live in, kept alive so they outlive every other name for them. */
     PyObject* arena;
 
+    /** The arena generation this result was made under, stale once a later call names it. */
+    uint64_t generation;
+
+    /** Reads of @c __cuda_array_interface__, each an arena export closed once this object dies. */
+    atomic_size_t cuda_array_interface_reads;
+
     /** One bit per task marking the present keys, or NULL for a read of no tasks. */
     ustore_octet_t const* presences;
 
@@ -709,6 +743,12 @@ typedef struct Keys {
 
     /** The @c Arena the outputs live in, kept alive so they outlive every other name for them. */
     PyObject* arena;
+
+    /** The arena generation this result was made under, stale once a later call names it. */
+    uint64_t generation;
+
+    /** Reads of @c __cuda_array_interface__, each an arena export closed once this object dies. */
+    atomic_size_t cuda_array_interface_reads;
 
     /** One offset into @c tape per task, plus one closing the last run, or NULL for no tasks. */
     ustore_length_t const* offsets;
@@ -737,6 +777,12 @@ typedef struct Page {
 
     /** The @c Arena the keys live in, kept alive so they outlive every other name for them. */
     PyObject* arena;
+
+    /** The arena generation this result was made under, stale once a later call names it. */
+    uint64_t generation;
+
+    /** Reads of @c __cuda_array_interface__, each an arena export closed once this object dies. */
+    atomic_size_t cuda_array_interface_reads;
 
     /** The keys, in ascending order. */
     ustore_key_t const* keys;
@@ -767,6 +813,9 @@ typedef struct Columns {
 
     /** The @c Arena the columns live in, kept alive so they outlive every other name for them. */
     PyObject* arena;
+
+    /** The arena generation this result was made under, stale once a later call names it. */
+    uint64_t generation;
 
     /** One view per field, inside the arena, or NULL for a gather of no fields. */
     ustore_docs_column_view_t const* columns;
@@ -799,6 +848,12 @@ typedef struct Neighborhoods {
     /** The @c Arena the tape, the offsets and the degrees live in, kept alive so they outlive every other name for
      *  them. */
     PyObject* arena;
+
+    /** The arena generation this result was made under, stale once a later call names it. */
+    uint64_t generation;
+
+    /** Reads of @c __cuda_array_interface__, each an arena export closed once this object dies. */
+    atomic_size_t cuda_array_interface_reads;
 
     /** Three keys per edge, laid end to end vertex after vertex. */
     ustore_key_t const* tape;
@@ -833,6 +888,9 @@ typedef struct Span {
 
     /** The @c Arena the window lies in, kept alive for as long as this window is. */
     PyObject* arena;
+
+    /** The arena generation this result was made under, stale once a later call names it. */
+    uint64_t generation;
 
     /** The first byte of the window. */
     void const* data;
@@ -893,24 +951,13 @@ int ustore_py_register_errors(PyObject* module);
 #pragma region Arenas
 
 /**
- *  @brief A new @c Arena made through @c ustore_arena_init where @p executor computes.
- *
- *  Shorthand with no place for an arena passes one of these to its verb and drops its own reference
- *  at once, so the arena dies with the call that named it.
- *
- *  @param[in] executor The executor whose calls it serves, held by the arena, or NULL for calls on
- *      the calling thread.
- *  @return A new reference, or NULL with an exception set.
- */
-PyObject* ustore_py_arena_new(Executor* executor);
-
-/**
  *  @brief Reads the @c Arena @p object a call writes into, which rewinds it: every result over its
- *      previous outputs goes stale.
+ *      previous outputs goes stale, and raises ValueError once read.
+ *  @param[in] context The call, whose executor makes a fresh arena when @p object is NULL or None.
  *  @param[out] arena A new reference to the @c Arena.
  *  @return 0 on success, -1 with an exception set for anything but an @c Arena the host may read.
  */
-int ustore_py_arena_from_object(PyObject* object, PyObject** arena);
+int ustore_py_arena_from_object(ustore_py_context_t const* context, PyObject* object, PyObject** arena);
 
 /** The C handle of the @c Arena @p arena. */
 ustore_arena_t ustore_py_arena_handle(PyObject* arena);
@@ -1123,8 +1170,9 @@ int ustore_py_columns_request(PyObject* fields, PyObject* types, char const* opt
  *  @param[in] types The type of every field, copied into the result.
  *  @return A new reference, or NULL with an exception set.
  */
-PyObject* ustore_py_columns_new(PyObject* arena, ustore_docs_column_view_t const* columns, PyObject* fields,
-                                ustore_docs_field_type_t const* types, size_t fields_count, size_t docs_count);
+PyObject* ustore_py_columns_new(PyObject* arena, uint64_t generation, ustore_docs_column_view_t const* columns,
+                                PyObject* fields, ustore_docs_field_type_t const* types, size_t fields_count,
+                                size_t docs_count);
 
 /** A strings view whose accessor writes @p view for every string, which is how one string reaches every task. */
 ustore_strings_view_t ustore_py_strings_repeated(ustore_bytes_view_t const* view);
@@ -1192,8 +1240,8 @@ void ustore_py_texts_release(ustore_py_texts_t* texts);
  *  @param[in] presences The presence bits, or NULL for a tape whose every value is present, as a cursor writes one.
  *  @return A new reference, or NULL with an exception set.
  */
-PyObject* ustore_py_values_new(PyObject* arena, ustore_octet_t const* presences, ustore_strings_view_t const* tape,
-                               size_t count);
+PyObject* ustore_py_values_new(PyObject* arena, uint64_t generation, ustore_octet_t const* presences,
+                               ustore_strings_view_t const* tape, size_t count);
 
 /** Whether task @p task_index found its key, as Arrow presence bits address it, least significant first. */
 int ustore_py_present(ustore_octet_t const* presences, size_t task_index);
@@ -1202,8 +1250,8 @@ int ustore_py_present(ustore_octet_t const* presences, size_t task_index);
  *  @brief A new @c Keys over the runs a scan or sample of @p count tasks wrote into @p arena.
  *  @return A new reference, or NULL with an exception set.
  */
-PyObject* ustore_py_keys_new(PyObject* arena, ustore_length_t const* offsets, ustore_key_t const* tape, size_t count,
-                             float const* scores);
+PyObject* ustore_py_keys_new(PyObject* arena, uint64_t generation, ustore_length_t const* offsets,
+                             ustore_key_t const* tape, size_t count, float const* scores);
 
 /**
  *  @brief Builds a read-only @c memoryview over memory a call wrote into @p arena, valid until
@@ -1216,8 +1264,8 @@ PyObject* ustore_py_keys_new(PyObject* arena, ustore_length_t const* offsets, us
  *  @param[in] shape Items along every dimension.
  *  @return A new reference, or NULL with an exception set.
  */
-PyObject* ustore_py_span_view(PyObject* arena, void const* data, char const* format, Py_ssize_t itemsize, int ndim,
-                              Py_ssize_t const* shape);
+PyObject* ustore_py_span_view(PyObject* arena, uint64_t generation, void const* data, char const* format,
+                              Py_ssize_t itemsize, int ndim, Py_ssize_t const* shape);
 
 /**
  *  @brief Fills a read-only buffer over memory @p owner keeps alive, honouring what @p flags ask for.

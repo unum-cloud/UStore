@@ -481,6 +481,10 @@ void ustore_arena_export_close(ustore_arena_t arena) {
     while (seen != 0 && !arena->exports.compare_exchange_weak(seen, seen - 1, std::memory_order_release)) {}
 }
 
+uint64_t ustore_arena_generation(ustore_arena_t arena) {
+    return arena ? arena->generation.load(std::memory_order_relaxed) : 0;
+}
+
 void ustore_arena_describe(ustore_arena_describe_t* arguments) {
     call_t call(arguments->outcome);
     if (!arguments->arena || !arguments->description)
