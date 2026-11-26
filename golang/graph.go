@@ -142,10 +142,13 @@ type Neighborhoods struct {
 // Len reports how many vertices the call read.
 func (neighborhoods Neighborhoods) Len() uint { return neighborhoods.count }
 
+// vertexDegreeMissing mirrors ustore_vertex_degree_missing_k, a static constant cgo cannot link.
+const vertexDegreeMissing = 0xFFFFFFFF
+
 // Degree reports how many edges vertex index connects to, and false for a missing vertex.
 func (neighborhoods Neighborhoods) Degree(index uint) (uint32, bool) {
-	degree := at(neighborhoods.degrees, index)
-	return uint32(degree), degree != C.ustore_vertex_degree_missing_k
+	degree := uint32(at(neighborhoods.degrees, index))
+	return degree, degree != vertexDegreeMissing
 }
 
 // Edges views the edges of vertex index in the arena: with both roles the outgoing ones first,
