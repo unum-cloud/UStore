@@ -10,7 +10,7 @@
 
 #include "ustore/utilities/vram_device.hpp" // `vram_kernel_names_k`
 
-#include "vram/classes.hpp" // `kernel_tables`, `pick_gpu_class`
+#include "vram/classes.hpp" // `kernel_tables`, `pick_gpu_class`, `loaded_gpu_classes`
 
 using namespace unum::ustore;
 
@@ -18,9 +18,9 @@ util::kernel_table<util::cuda_module_t> const* suite_kernels(util::gpu_drivers_t
                                                              kernel_tables<util::cuda_module_t>& tables) noexcept {
     util::gpu_device_t device;
     if (!util::list_nvidia_gpu_devices(drivers.cuda, {&device, 1})) return nullptr;
-    gpu_class_t const gpu_class = pick_gpu_class(drivers, device, gpu_class_t::unknown_k);
-    if (tables.load(drivers.cuda, drivers.cuda_contexts[0], 0, gpu_class, util::vram_kernel_names_k).failed())
-        return nullptr;
+    gpu_class_t const gpu_class = pick_gpu_class(device.vendor, loaded_gpu_classes(drivers, device),
+                                                 gpu_class_t::unknown_k);
+    if (tables.load(drivers.cuda, 0, 0, gpu_class, util::vram_kernel_names_k).failed()) return nullptr;
     return tables.table_of(0, gpu_class);
 }
 
@@ -28,7 +28,8 @@ util::kernel_table<util::hip_module_t> const* suite_kernels(util::gpu_drivers_t&
                                                             kernel_tables<util::hip_module_t>& tables) noexcept {
     util::gpu_device_t device;
     if (!util::list_amd_gpu_devices(drivers.hip, {&device, 1})) return nullptr;
-    gpu_class_t const gpu_class = pick_gpu_class(drivers, device, gpu_class_t::unknown_k);
+    gpu_class_t const gpu_class = pick_gpu_class(device.vendor, loaded_gpu_classes(drivers, device),
+                                                 gpu_class_t::unknown_k);
     if (tables.load(drivers.hip, 0, 0, gpu_class, util::vram_kernel_names_k).failed()) return nullptr;
     return tables.table_of(0, gpu_class);
 }

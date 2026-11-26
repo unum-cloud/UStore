@@ -148,9 +148,8 @@ bool gpu_class_serves(gpu_drivers_t& drivers, gpu_class_t gpu_class, gpu_device_
     if (bundle.empty()) return false;
     int const ordinal = static_cast<int>(device.vendor_ordinal);
     switch (device.vendor) {
-    case gpu_vendor_t::nvidia_k:
-        return cuda_module_t::load(drivers.cuda, drivers.retain_context(ordinal), bundle).has_value();
-    case gpu_vendor_t::amd_k: return hip_module_t::load(drivers.hip, ordinal, bundle).has_value();
+    case gpu_vendor_t::nvidia_k: return util::cuda_module_t::load(drivers.cuda, ordinal, bundle).has_value();
+    case gpu_vendor_t::amd_k: return util::hip_module_t::load(drivers.hip, ordinal, bundle).has_value();
     // Metal compiles the source at the class's first spawn, so the family the device lists decides
     case gpu_vendor_t::apple_k: return device.architecture_major >= family_of_apple_class(gpu_class);
     default: return false;

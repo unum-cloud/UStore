@@ -49,6 +49,8 @@ static struct {
      "The engine failed in a way no other status names, which points at a defect."},
     {ustore_status_uninitialized_k, "ustore.UninitializedError", &ErrorType, NULL,
      "The call needs a handle that is closed or was never opened."},
+    {ustore_status_config_mismatch_k, "ustore.ConfigMismatchError", &ErrorType, &PyExc_ValueError,
+     "The handles or arguments are each well-formed but cannot be joined, like devices of two vendors."},
     {ustore_status_contended_k, "ustore.ContendedError", &ErrorType, NULL,
      "An executor, arena or transaction serving another call refused the call instead of waiting."},
     {ustore_status_cancelled_k, "ustore.CancelledError", &ErrorType, NULL,
@@ -2707,61 +2709,55 @@ static PyObject* Executor_for_nvme(PyObject* type, PyObject* const* arguments, P
     return executor_made(type, handle, &outcome);
 }
 
-static char const doc_Executor_for_vram[] =                                                     //
-    "for_vram(device, *, scratch_limit=0, gds=Gds.AUTOMATIC) answers an executor of one GPU,\n" //
-    "NVIDIA or AMD.\n"                                                                          //
-    "\n"                                                                                        //
-    "Every call queues on the one stream the executor creates on the device and destroys\n"     //
-    "with it, so one host thread keeps it fed, and every arena it makes lives there; a\n"       //
-    "multi-GPU caller makes one per device.\n"                                                  //
-    "Database.open_nvme() takes one of an NVIDIA device as its `compactions`. Calls\n"          //
-    "`ustore_executor_for_vram`.\n"                                                             //
-    "\n"                                                                                        //
-    "Args:\n"                                                                                   //
-    "  device (int): The ordinal of the device, its position in `gpu_devices()`.\n"             //
-    "  scratch_limit (int, optional): Bytes of device scratch a call or a merge takes; zero\n"  //
-    "    lets scratch grow as calls ask.\n"                                                     //
-    "  gds (Gds, optional): How bytes move between the drives and the device.\n"                //
-    "Returns:\n"                                                                                //
-    "  Executor: The new executor.\n"                                                           //
-    "Raises:\n"                                                                                 //
-    "  DeviceError: No device holds the ordinal, or its driver refuses a stream.";
+static char const doc_Executor_for_vram[] =                                                       //
+    "for_vram(*, devices=None, scratch_limit=0, gds=Gds.AUTOMATIC) answers an executor of GPUs\n" //
+    "of one vendor.\n"                                                                            //
+    "\n"                                                                                          //
+    "Every named device gets one stream the executor creates and destroys with it, all fed by\n"  //
+    "the one host thread calling the verbs. Arenas it makes live on the first device, where\n"    //
+    "every call computes but a filtered scan, which deals its pages across every device.\n"       //
+    "Database.open_nvme() takes one as its `compactions`. Calls `ustore_executor_for_vram`.\n"    //
+    "\n"                                                                                          //
+    "Args:\n"                                                                                     //
+    "  devices (Sequence[int], optional): Ordinals of the devices, their positions in\n"          //
+    "    `gpu_devices()`; None takes every listed device of the first vendor with a known\n"      //
+    "    class.\n"                                                                                //
+    "  scratch_limit (int, optional): Bytes of device scratch a call or a merge takes on each\n"  //
+    "    device; zero lets scratch grow as calls ask.\n"                                          //
+    "  gds (Gds, optional): How bytes move between the drives and the devices.\n"                 //
+    "Returns:\n"                                                                                  //
+    "  Executor: The new executor.\n"                                                             //
+    "Raises:\n"                                                                                   //
+    "  DeviceError: No device holds an ordinal, or its driver refuses a stream.\n"                //
+    "  ConfigMismatchError: The devices mix vendors.";
 
 static PyObject* Executor_for_vram(PyObject* type, PyObject* const* arguments, Py_ssize_t positional_arguments_count,
                                    PyObject* keyword_names_tuple) {
-    static char const* const names[] = {"device", "scratch_limit", "gds"};
+    static char const* const names[] = {"devices", "scratch_limit", "gds"};
     PyObject* values[3];
-    size_t scratch_limit = 0;
-    long device = 0;
+    size_t scratch_limit = 0, devices_count = 0;
+    int32_t* devices = NULL;
     int gds = ustore_gds_automatic_k;
-    if (factory_arguments("for_vram", arguments, positional_arguments_count, keyword_names_tuple, names, values, 3, 1,
+    if (factory_arguments("for_vram", arguments, positional_arguments_count, keyword_names_tuple, names, values, 3, 0,
                           0) != 0 ||
         (values[1] && ustore_py_size_from_object(values[1], "scratch_limit", &scratch_limit) != 0) ||
-        (values[2] && ustore_py_enum_from_object(values[2], "gds", ustore_py_enum_gds_k, &gds) != 0))
+        (values[2] && ustore_py_enum_from_object(values[2], "gds", ustore_py_enum_gds_k, &gds) != 0) ||
+        identifiers_from_object(values[0], "devices", &devices, &devices_count) != 0)
         return NULL;
-    if (!values[0]) {
-        PyErr_SetString(PyExc_TypeError, "for_vram() needs the ordinal of its device");
-        return NULL;
-    }
-    device = PyLong_AsLong(values[0]);
-    if (device == -1 && PyErr_Occurred()) return NULL;
-    if (device < INT32_MIN || device > INT32_MAX) {
-        PyErr_SetString(PyExc_OverflowError, "The 'device' ordinal does not fit 32 bits");
-        return NULL;
-    }
 
     ustore_executor_t handle = NULL;
     ustore_outcome_t outcome = {0};
     ustore_executor_for_vram_t made = {
         .executor = &handle,
         .outcome = &outcome,
-        .device = (int32_t)device,
+        .vram = {devices, (ustore_size_t)devices_count},
         .scratch_limit = (ustore_size_t)scratch_limit,
         .gds = (ustore_gds_t)gds,
     };
     Py_BEGIN_ALLOW_THREADS;
     ustore_executor_for_vram(&made);
     Py_END_ALLOW_THREADS;
+    PyMem_Free(devices);
     return executor_made(type, handle, &outcome);
 }
 

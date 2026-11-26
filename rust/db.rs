@@ -418,14 +418,20 @@ pub(crate) mod ffi {
     }
 
     #[repr(C)]
+    pub struct ustore_vram_options_t {
+        pub devices: *const i32,
+        pub devices_count: ustore_size_t,
+        pub gpu_class_ceiling: ustore_enum_t,
+    }
+
+    #[repr(C)]
     pub struct ustore_executor_for_vram_t {
         pub executor: *mut ustore_executor_t,
         pub outcome: *mut ustore_outcome_t,
-        pub device: i32,
-        pub stream: *mut c_void,
+        pub vram: ustore_vram_options_t,
+        pub streams: *const *mut c_void,
         pub scratch_limit: ustore_size_t,
         pub gds: ustore_gds_t,
-        pub gpu_class_ceiling: ustore_enum_t,
     }
 
     #[repr(C)]
@@ -868,6 +874,8 @@ pub enum Status {
     Internal = 10,
     /// The call needs a database or transaction that was never opened.
     Uninitialized = 12,
+    /// The handles or arguments are each well-formed but cannot be joined.
+    ConfigMismatch = 13,
     /// The call was refused rather than waited for.
     Contended = 14,
     /// A progress callback stopped the call, which published nothing.
@@ -902,6 +910,7 @@ impl Status {
             8 => Status::Device,
             9 => Status::Malformed,
             12 => Status::Uninitialized,
+            13 => Status::ConfigMismatch,
             14 => Status::Contended,
             15 => Status::Cancelled,
             16 => Status::Unsupported,
@@ -2446,8 +2455,8 @@ pub struct NVMEOptions<'path> {
     /// The database moves bytes as one of [`Executor::for_nvme`] says, read once at the open, and with that call's
     /// defaults for any other executor and for none.
     pub executor: Option<&'path Executor>,
-    /// The executor of [`Executor::for_vram`] whose device and scratch limit every merge takes, read once at the open;
-    /// `None` merges on host threads.
+    /// The executor of [`Executor::for_vram`] whose first device and scratch limit every merge
+    /// takes, read once at the open; `None` merges on host threads.
     pub compactions: Option<&'path Executor>,
     /// Bytes of host memory the engine may pin and cache.
     pub memory_limit: u64,
@@ -4312,30 +4321,69 @@ impl Executor {
         Executor::created(handle, outcome)
     }
 
-    /// Creates an executor on `device`, a [`GPUDevice::ordinal`] of any vendor, owning one
-    /// stream there, created with it and destroyed with it, fed by the calling thread, which
-    /// is why this takes no thread count, moving bytes as `gds` says. Zero `scratch_limit`
-    /// lets scratch grow as calls ask. It fails with [`Status::Device`] for an ordinal no
-    /// device holds. [`NVMEOptions::compactions`] places the merges of an NVMe database on one
-    /// of an NVIDIA device.
+    /// Creates an executor on every one of `devices`, [`GPUDevice::ordinal`]s of one vendor, owning
+    /// one stream on each, created and destroyed with it, all fed by the calling thread, which is
+    /// why this takes no thread count, moving bytes as `gds` says. Empty `devices` take every
+    /// listed device of the first vendor with a known class. Arenas live on the first device, where
+    /// every call computes but a filtered scan, which deals its pages across every device. Zero
+    /// `scratch_limit` lets each device's scratch grow as calls ask. It fails with
+    /// [`Status::Device`] for an ordinal no device holds, and with [`Status::Unsupported`] for a
+    /// `gpu_class_ceiling` some named device loads nothing under. [`NVMEOptions::compactions`]
+    /// places the merges of an NVMe database on its first device.
+    ///
+    /// Calls `ustore_executor_for_vram`.
+    pub fn for_vram(
+        devices: &[i32],
+        gpu_class_ceiling: Option<GPUClass>,
+        scratch_limit: usize,
+        gds: Gds,
+    ) -> Result<Self> {
+        // SAFETY: no streams are named, so the executor opens its own.
+        unsafe { Self::for_vram_on_streams(devices, gpu_class_ceiling, &[], scratch_limit, gds) }
+    }
+
+    /// Adopts the caller's streams, one per device in `devices` order, an `id<MTLCommandQueue>` on
+    /// Apple, in place of the ones [`Executor::for_vram`] opens: on success a CUDA or HIP stream
+    /// becomes the executor's, which synchronizes and destroys it when dropped, while a Metal queue
+    /// is retained, the executor releasing its own reference and the caller keeping theirs; on
+    /// failure every stream stays the caller's. A null or default stream, a device named twice or
+    /// streams beside empty `devices` fail with [`Status::InvalidArgument`], and a stream on
+    /// another device than its entry names with [`Status::ConfigMismatch`].
     ///
     /// Calls `ustore_executor_for_vram`.
     ///
     /// # Safety
-    /// `stream` must be null: a caller's stream answers [`Status::Unsupported`], since the executor
-    /// drives only its own.
-    pub unsafe fn for_vram(device: i32, stream: *mut c_void, scratch_limit: usize, gds: Gds) -> Result<Self> {
+    /// Every stream must be a live stream of the devices' vendor. After a successful call the
+    /// caller neither destroys nor uses a CUDA or HIP stream, which the executor now owns, and
+    /// keeps and releases its own reference to a Metal queue, which the executor retained apart.
+    pub unsafe fn for_vram_on_streams(
+        devices: &[i32],
+        gpu_class_ceiling: Option<GPUClass>,
+        streams: &[*mut c_void],
+        scratch_limit: usize,
+        gds: Gds,
+    ) -> Result<Self> {
         unsafe {
+            if !streams.is_empty() && streams.len() != devices.len() {
+                return Err(fail(Status::InvalidArgument, "pass no streams or one per device"));
+            }
             let mut handle: ffi::ustore_executor_t = ptr::null_mut();
             let mut outcome = ffi::ustore_outcome_t::default();
             let mut arguments = ffi::ustore_executor_for_vram_t {
                 executor: &mut handle,
                 outcome: &mut outcome,
-                device,
-                stream,
+                vram: ffi::ustore_vram_options_t {
+                    devices: devices.as_ptr(),
+                    devices_count: devices.len() as ffi::ustore_size_t,
+                    gpu_class_ceiling: gpu_class_ceiling.map_or(0, |gpu_class| gpu_class as ffi::ustore_enum_t),
+                },
+                // The C side reads one stream per device from any non-null pointer.
+                streams: match streams.is_empty() {
+                    true => ptr::null(),
+                    false => streams.as_ptr(),
+                },
                 scratch_limit: scratch_limit as ffi::ustore_size_t,
                 gds,
-                gpu_class_ceiling: 0,
             };
             // SAFETY: every pointer in `arguments` outlives the call, which is final on return.
             ffi::ustore_executor_for_vram(&mut arguments);
@@ -5304,9 +5352,18 @@ mod tests {
         let directory = std::env::temp_dir();
         drop(Executor::for_nvme(0, &blocking, &[directory.to_str().unwrap(), "/no/such/directory"], &[]).unwrap());
         // A build without CUDA refuses every device, and one with CUDA refuses an ordinal no device
-        // holds. SAFETY: a null stream leaves the executor its own.
-        let devices = unsafe { Executor::for_vram(1 << 20, ptr::null_mut(), 0, Gds::Automatic) }.unwrap_err().status;
+        // holds.
+        let devices = Executor::for_vram(&unknown, None, 0, Gds::Automatic).unwrap_err().status;
         assert!(devices == Status::Unsupported || devices == Status::Device);
+        // Streams pair with the devices named beside them, so none are adopted for every device.
+        // SAFETY: the stream is refused before anything reads it.
+        let mut stream = 0_u8;
+        let streams = [(&raw mut stream).cast::<c_void>()];
+        let unnamed = unsafe { Executor::for_vram_on_streams(&[], None, &streams, 0, Gds::Automatic) };
+        assert_eq!(unnamed.unwrap_err().status, Status::InvalidArgument);
+        if gpu_devices().unwrap().is_empty() {
+            assert_eq!(Executor::for_vram(&[], None, 0, Gds::Automatic).unwrap_err().status, Status::Device);
+        }
 
         // Zero threads derive their count from the cores of every domain.
         let derived = Executor::for_ram(&[], 0).unwrap();
@@ -5861,6 +5918,7 @@ mod tests {
         assert_eq!(check(contended).unwrap_err().status, Status::Contended);
         assert_eq!("cancelled".parse::<Status>(), Ok(Status::Cancelled));
         assert_eq!("read-only".parse::<Status>(), Ok(Status::ReadOnly));
+        assert_eq!("config-mismatch".parse::<Status>(), Ok(Status::ConfigMismatch));
         assert_eq!("deferred".parse::<Status>(), Ok(Status::Deferred));
 
         // Success is left to `Result`, so it parses as no failure, and a status a newer library added reads as an

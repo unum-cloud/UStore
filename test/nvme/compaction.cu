@@ -1200,7 +1200,7 @@ struct options_t {
     std::size_t large_universe = 600'000;
 
     /** The process's drivers, which reach device zero of @c vendor, or none without a device. */
-    util::gpu_drivers_t const* drivers = nullptr;
+    util::gpu_drivers_t* drivers = nullptr;
 
     /** The vendor whose device zero the device cases run on, NVIDIA where both have one. */
     util::gpu_vendor_t vendor = util::gpu_vendor_t::unknown_k;
@@ -1232,11 +1232,13 @@ template <typename executor_type_>
 util::expected<executor_type_> spawn_device_zero(options_t const& options, std::size_t scratch_limit) noexcept {
     if (options.drivers == nullptr || options.vendor != executor_type_::vendor_k)
         return util::status_t {util::status_code_t::device_k, "No device zero of the executor's vendor"};
-    if constexpr (std::is_same_v<executor_type_, util::hip_executor_t>)
-        return util::hip_executor_t::spawn(options.drivers->hip, options.device, scratch_limit, options.hip_kernels);
-    else
-        return util::cuda_executor_t::spawn(options.drivers->cuda, options.drivers->cuda_contexts[0], options.device,
-                                            scratch_limit, ustore_gds_automatic_k, options.cuda_kernels);
+    auto kernels_of = [&]<typename module_type_>(std::type_identity<module_type_>, int) noexcept {
+        if constexpr (std::is_same_v<module_type_, util::hip_module_t>) return options.hip_kernels;
+        else return options.cuda_kernels;
+    };
+    int const zero = 0;
+    return executor_type_::spawn(driver_of(*options.drivers, std::type_identity<executor_type_> {}), {&zero, 1}, {},
+                                 kernels_of, scratch_limit);
 }
 
 /** Runs @p device_case over the executor type of the vendor the device cases run on. */
@@ -2295,7 +2297,7 @@ case_result_t test_gpu_reads_sections_by_extent(options_t const& options, std::s
     using key_slot_t = variable_width_key_slot<st::key128_t>;
     if (directory.empty()) return case_result_t::skipped(needs_directory_k);
     if (options.vendor != util::gpu_vendor_t::nvidia_k) return case_result_t::skipped(no_gpu_device_k);
-    util::linux_cufile_probe_t const probe = linux_cufile_disk_t::probe(options.drivers->cufile);
+    util::linux_cufile_probe_t const probe = linux_cufile_disk_t::probe(options.drivers->extensions.cufile);
     if (probe == util::linux_cufile_probe_t::absent_k || probe == util::linux_cufile_probe_t::refused_k)
         return case_result_t::skipped("needs cuFile in direct or compat mode");
     auto [executor, spawn_status] = spawn_device_zero<util::cuda_executor_t>(options, 0);
@@ -2338,7 +2340,7 @@ case_result_t test_gpu_reads_sections_by_extent(options_t const& options, std::s
 
     util::linux_cufile_disk_config_t config;
     config.gds = probe == util::linux_cufile_probe_t::direct_k ? ustore_gds_direct_k : ustore_gds_compatibility_k;
-    auto [disk, make_disk_status] = linux_cufile_disk_t::make(options.drivers->cufile, config);
+    auto [disk, make_disk_status] = linux_cufile_disk_t::make(options.drivers->extensions.cufile, config);
     if (!expect_status(make_disk_status, util::status_code_t::success_k)) return {};
     util::medium_options_t request;
     request.name = path.c_str();
@@ -2403,7 +2405,7 @@ int main(int argc, char** argv) {
     util::gpu_drivers_t drivers;
     kernel_tables<util::cuda_module_t> cuda_kernels;
     kernel_tables<util::hip_module_t> hip_kernels;
-    if (drivers.retain_context(0) && util::list_nvidia_gpu_devices(drivers.cuda, {&options.device, 1})) {
+    if (util::list_nvidia_gpu_devices(drivers.cuda, {&options.device, 1})) {
         options.drivers = &drivers, options.vendor = util::gpu_vendor_t::nvidia_k;
         options.cuda_kernels = suite_kernels(drivers, cuda_kernels);
     }

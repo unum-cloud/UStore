@@ -247,7 +247,7 @@ Mojo still calls async experimental and reaches its runtime through underscored 
 ## Executors
 
 An executor owns the threads or rings calls run on, and serves one call at a time, so a call on one serving another raises `Status.CONTENDED`.
-`Executor(library)` owns nothing and runs every verb on the calling thread, `Executor.for_ram` spawns host threads near the NUMA nodes its `RamOptions` name, `Executor.for_nvme` spawns the NVMe engine's rings, placed on the memory domains its `RamOptions` name or the one the `paths` of its `NvmeOptions` share, and `Executor.for_vram` drives one GPU through a stream it creates and destroys with itself.
+`Executor(library)` owns nothing and runs every verb on the calling thread, `Executor.for_ram` spawns host threads near the NUMA nodes its `RamOptions` name, `Executor.for_nvme` spawns the NVMe engine's rings, placed on the memory domains its `RamOptions` name or the one the `paths` of its `NvmeOptions` share, and `Executor.for_vram` drives the GPUs its `VramOptions` name, or every GPU of the first vendor for none, one stream each, which it creates or adopts and destroys with itself.
 An executor is freed once it goes out of scope, after every arena it made, since each arena views it, and freeing it waits for the calls naming it, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#executors) describe.
 
 ```mojo

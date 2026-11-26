@@ -659,7 +659,13 @@ def test_an_executor_serves_the_memory_domains_named(database, blobs, tmp_path, 
         ustore.Database.open_nvme(location("nvme", tmp_path), compactions=executor)
     # A build without CUDA refuses every device, and one with CUDA refuses an ordinal no device has
     with pytest.raises((ustore.UnsupportedError, ustore.DeviceError)):
-        ustore.Executor.for_vram(1 << 20, gds=ustore.Gds.COMPATIBILITY)
+        ustore.Executor.for_vram(devices=[1 << 20], gds=ustore.Gds.COMPATIBILITY)
+    # Devices take their ordinals by name alone, and a machine without GPUs has none to take
+    with pytest.raises(TypeError):
+        ustore.Executor.for_vram([0])  # type: ignore[misc]
+    if not ustore.gpu_devices():
+        with pytest.raises(ustore.DeviceError):
+            ustore.Executor.for_vram()
 
 
 def test_a_database_opens_on_an_executor(engine: str, tmp_path):

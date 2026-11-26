@@ -10,6 +10,7 @@ import (
 	"errors"
 	"runtime"
 	"testing"
+	"unsafe"
 
 	ustore "github.com/unum-cloud/ustore/golang"
 )
@@ -57,6 +58,9 @@ func TestStatusesRoundTripAndMatch(t *testing.T) {
 	if err != nil || status != ustore.StatusWriteConflict {
 		t.Fatalf("read back %v, %v", status, err)
 	}
+	if status, err := ustore.StatusFromName("config-mismatch"); err != nil || status != ustore.StatusConfigMismatch {
+		t.Fatalf("read back %v, %v", status, err)
+	}
 	if _, err := ustore.MoodFromName("sleepy"); !errors.Is(err, ustore.StatusInvalidArgument) {
 		t.Fatalf("an unknown spelling answered %v", err)
 	}
@@ -86,6 +90,28 @@ func TestArenasLiveOnTheHost(t *testing.T) {
 	}
 	if description.Residency != ustore.ResidencyRam || description.Device != -1 {
 		t.Fatalf("described %+v", description)
+	}
+}
+
+func TestVramExecutorsRefuseWhatNoDeviceServes(t *testing.T) {
+	// A build without CUDA refuses every device, and one with CUDA refuses an ordinal no device holds
+	unknown := []int32{1 << 20}
+	if _, err := ustore.ExecutorForVram(unknown, ustore.GPUClassUnknown, nil, 0, ustore.GdsAutomatic); !errors.Is(err, ustore.StatusDevice) && !errors.Is(err, ustore.StatusUnsupported) {
+		t.Fatalf("an ordinal no device holds answered %v", err)
+	}
+	// Streams pair with the devices named beside them, so none are adopted for every device
+	stream := new(byte)
+	var pinner runtime.Pinner
+	pinner.Pin(stream)
+	defer pinner.Unpin()
+	streams := []unsafe.Pointer{unsafe.Pointer(stream)}
+	if _, err := ustore.ExecutorForVram(nil, ustore.GPUClassUnknown, streams, 0, ustore.GdsAutomatic); !errors.Is(err, ustore.StatusInvalidArgument) {
+		t.Fatalf("streams beside no device answered %v", err)
+	}
+	if devices, err := ustore.GPUDevices(); err == nil && len(devices) == 0 {
+		if _, err := ustore.ExecutorForVram(nil, ustore.GPUClassUnknown, nil, 0, ustore.GdsAutomatic); !errors.Is(err, ustore.StatusDevice) {
+			t.Fatalf("every device of a machine without GPUs answered %v", err)
+		}
 	}
 }
 

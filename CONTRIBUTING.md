@@ -53,12 +53,13 @@ The `metal` preset builds them on macOS, and off Apple platforms the same switch
 
 `CMakeLists.txt` builds two libraries from the same sources, every engine adding its own:
 
-- __`ustore_static`__, aliased `ustore::static`, takes the objects of ForkUnion, StringZilla, yyjson and fmt, and links the engines' own archives, RocksDB, LevelDB and liburing, which install beside it in the same CMake package, so a change to UStore never rewrites them. The suites, benchmarks and tools inside the tree link it as `ustore::static` and reach the siblings through it.
+- __`ustore_static`__, aliased `ustore::static`, takes the objects of ForkUnion, StringZilla, yyjson and fmt, and links the engines' own archives, RocksDB, LevelDB and liburing, which install beside it in the same CMake package, so a change to UStore never rewrites them. It links the siblings privately and re-exports none of them, so the suites, benchmarks and tools inside the tree reach the siblings and `include/ustore/` through `ustore::header`.
 - __`ustore_shared`__, aliased `ustore::shared`, links the same libraries privately, compiles with `USTORE_EXPORTING`, hands its consumers `USTORE_SHARED`, and exports only the functions `USTORE_EXPORT` marks, as hidden visibility, a `ustore_*` version script on Linux, Android and FreeBSD and `-exported_symbol,_ustore_*` on macOS keep every other symbol inside.
 
 `c/test.c` builds against both, as `ustore_test_c` and `ustore_test_c_shared`, and CTest runs both.
-`USTORE_INSTALL` installs the two libraries, the headers, a `.pc` file and a CMake package under `lib/cmake/ustore`, which `find_package(ustore)` reads as `ustore::abi`, `ustore::header`, `ustore::static`, `ustore::shared` and `ustore::cpp`, the C++ SDK linking the C headers and the archive.
-The install splits into components: `sdk` holds both libraries with the engines' archives, `c/ustore/`, `cpp/ustore/`, the package and the license, and `templates` the header-only `include/ustore/`.
+`USTORE_INSTALL`, on by default when UStore is the top-level project, installs the two libraries, the headers, a `.pc` file and a CMake package under `lib/cmake/ustore`, which `find_package(ustore)` reads as `ustore::abi`, `ustore::static`, `ustore::shared` and `ustore::cpp`, the C++ SDK linking the C headers and the archive.
+The package installs UStore's own targets alone, with no `find_dependency` on a sibling: the archive already holds the siblings' objects, and `ustore::header`, the templates of `include/ustore/` that include them, stays inside the build tree, so a program using the templates vendors UStore through `FetchContent`.
+The install is the one `sdk` component: both libraries with the engines' archives, `c/ustore/`, `cpp/ustore/`, the package and the license.
 `cpack --config build_release/CPackConfig.cmake` archives the `sdk` component alone, stripped, as the preview SDK `ustore-<version>-<platform>-sdk.tar.gz`, a ZIP on Windows.
 A function the headers declare without `USTORE_EXPORT` links against the archive but is missing from the shared library, so every new declaration holds it.
 
@@ -171,6 +172,7 @@ Per-thread scratch belongs to the executor that owns the threads.
 Threads, topology and domain-placed memory come from ForkUnion's C ABI in `forkunion/forkunion.h`, reached through ForkUnion's C++ `fu::pool_t`, which `include/ustore/utilities/ram_device.hpp` spawns, and the arenas of `include/ustore/utilities/ram_buffers.hpp`; nothing else calls `fu_*` directly.
 The executor holds its threads as `threads_t`, a variant of the `fu_pool_t` its factories spawn through `fu_topology_new`, `fu_pool_new` and `fu_pool_spawn` and its destructor deletes, or of `fu::dummy_pool_t`, the calling thread alone, which `on_calling_thread()` builds with no topology probe, pool or spawn; it forwards C++ callables to either through a C callback.
 The arenas place their blocks with `fu_allocate_on_domain_id` and release them with `fu_free_on_domain_id`.
+A try-only claim is an atomic bit or `fu::spin_mutex_t`, anything that waits is `fu::fair_mutex_t` from `<forkunion/locks.hpp>`, and UStore holds no reader-writer gate yet; `.githooks/pre-commit` refuses any other new lock, so ask first.
 
 These principles hold in `include/` and `src/`, and the other three libraries state the same ones:
 
@@ -198,9 +200,11 @@ These principles hold in `include/` and `src/`, and the other three libraries st
 7. Residency is a type of the data handle.
    - An executor of another residency answers `device`: a RAM executor on an NVMe database is refused by the router before it claims the executor.
    - A `NULL` executor on an SPDK database answers `invalid_argument` before any work, since no blocking queue reaches a namespace.
-   - A VRAM executor reads through the blocking queues it owns and queues device work on the stream it owns.
-   - A caller's stream answers `unsupported`.
-   - One call runs per executor; a second answers `contended`.
+   - A VRAM executor reads through the blocking queues it owns and queues device work on the streams it owns, one per device, opened or adopted at its creation.
+   - A caller's stream is adopted and destroyed with the executor; a null or default stream, a device named twice beside streams, or streams beside no named device answer `invalid_argument`, while devices of more than one vendor or a stream on another device than its entry names answer `config_mismatch`.
+   - One call runs per executor; a second answers `contended`. Code that holds a GPU executor and drives its streams takes its `claim()` once at its top, in `include/` or `src/`; code handed only a `stream_t&` takes none, and a verb a claimed verb calls never claims again. Freeing an arena is the one exception: it takes no claim, since it first waits out every call naming the arena, so its chunks belong to no running call, and a stream accepts their frees from any thread.
+   - GPU-scheduling types, the runtime, the vendor stream and event owners, `stream_t`, the vendor executors and their concepts, live in the `Shared VRAM` regions of `include/ustore/utilities/vram_device.hpp`, its vendor headers and `src/lib.hpp`, the same text in USearch, UForm and UStore apart from the project prefix, which `.githooks/selftest --siblings` compares.
+   - A stream queues and a device describes: a `stream_t` holds one listed GPU's queuing state, and every device fact lives once in `gpu_runtime_t`, never copied into an executor.
 8. One word per concept, the same in all four libraries.
    - A name says who owns a thing and until when it is valid, never a hand-over, so `.githooks/pre-commit` refuses `lend`, `borrow`, `loan` and `lease` words in the identifiers of every language, as snake_case or camelCase words, except Rust's `std::borrow` names, and the docs use none of them.
    - "Lane" names only SIMD and warp lanes.
@@ -217,7 +221,7 @@ A ring's registered-file table keeps the descriptors of the last media registere
 - A `NULL` executor runs the call on the calling thread. It creates no pool, thread, ring, SPDK queue pair or stream and probes no topology; its scratch and blocking queues live for that call only. Name an executor for calls that allocate nothing once warm.
 - No static, global, shared or thread-local pool, executor, queue set, stream or handle exists, stateless ones included: whoever needs one creates it and frees it.
 - A `*_free` waits for the calls naming its handle and releases memory; it reads and writes no drive, and durability comes only from the flush verb.
-- An executor owns its streams, created with it; a call without one uses the null legacy stream or is refused, and no second origin sits beside the owner.
+- An executor owns its streams, opened or adopted at its creation, one per device; a call without one uses the null legacy stream or is refused, and no second origin sits beside the owner.
 - An engine creates, synchronizes and frees its own CUDA, HIP and Metal streams and allocates its own device and pinned memory; NumKong and StringZilla only provide kernels, which may still take an `nk_stream_t` or `sz_stream_t` handle.
 - Every arena is freed before its executor; a binding enforces the order by lifetime where its language can and documents it otherwise, never by reference counts.
 - A C struct change lands with every binding that lays the struct out by hand, checked field by field in review.
@@ -697,7 +701,7 @@ The NVMe suites mount every transport the machine offers: without `USTORE_DEVICE
 
 These tests reach past the public surface, each because the surface lacks what it checks:
 
-- `test/abi/fixture.hpp` and `test/abi/executors.cpp` take `engine_t`, `view_t`, `ustore_database_handle_t` and the verb tables from `src/engine.hpp`, which the C ABI keeps behind opaque handles, and `executors.cpp` also takes `tasks_per_word_k` from `src/utilities/slices.hpp`.
+- `test/abi/fixture.hpp` and `test/abi/executors.cpp` take `engine_t`, `view_t`, `ustore_database_handle_t` and the verb tables from `src/engine.hpp`, which the C ABI keeps behind opaque handles, and `executors.cpp` also takes `tasks_per_word_k` from `src/utilities/slices.hpp`, and its arena cases read the blocks of `ustore_arena_handle_t` through `include/ustore/utilities/ram_buffers.hpp`, which the C ABI reports only as a residency.
 - `test/vram/towers.cpp`, `test/nvme/tree.cpp` and the compaction suites of `test/nvme/` take the GPU class tables of `src/vram/classes.hpp`, which no public header exports.
 - `test/vram/fake_amd_bundles.cpp` compiles `src/vram/bundles.cpp` itself, so the bundle loader runs over a fake HIP runtime.
 - `test/tools/*.cpp` take `tools/arrow_ipc.hpp` and `tools/dataset.h`, which the CLI keeps to itself.

@@ -26,7 +26,7 @@
 #include <cstdint> // `std::uint64_t`
 
 #if !defined(__CUDACC__) && !defined(__HIP__)
-#include "ustore/utilities/vram_device.hpp" // `launch`, `metal_executor_t`, `status_t`
+#include "ustore/utilities/vram_device.hpp" // `launch`, `metal_executor_t::stream_t`, `status_t`
 #endif
 
 namespace unum::ustore::utilities {
@@ -104,14 +104,14 @@ inline constexpr std::uint32_t select_byte_flags_k = 8;
  *  @par Statuses:
  *  - @c status_code_t::device_k The bundle holds no select, or the device refused a launch.
  */
-inline status_t count_flagged(metal_executor_t& executor, std::uint8_t const* flags, std::uint64_t count,
+inline status_t count_flagged(metal_executor_t::stream_t& executor, std::uint8_t const* flags, std::uint64_t count,
                               std::uint32_t tile, std::uint32_t tiles, std::uint64_t* counts) noexcept {
     char const* const passes[] = {"ustore_select_count_apple", "ustore_select_scan_apple"};
     unsigned const groups[] = {tiles, 1u};
     // The select's scans assume threadgroups of 256 threads
     for (std::size_t pass = 0; pass != 2; ++pass)
-        if (status_t const launched = launch(executor, executor.kernels()->function(passes[pass]), groups[pass], 256u,
-                                             0u, flags, count, tile, tiles, select_byte_flags_k, counts,
+        if (status_t const launched = launch(executor, executor.kernels->function(passes[pass]), groups[pass], 256u, 0u,
+                                             flags, count, tile, tiles, select_byte_flags_k, counts,
                                              static_cast<std::uint32_t*>(nullptr));
             launched.failed())
             return launched;
@@ -126,12 +126,12 @@ inline status_t count_flagged(metal_executor_t& executor, std::uint8_t const* fl
  *  @par Statuses:
  *  - @c status_code_t::device_k The bundle holds no select, or the device refused a launch.
  */
-inline status_t select_flagged(metal_executor_t& executor, std::uint8_t const* flags, std::uint32_t count,
+inline status_t select_flagged(metal_executor_t::stream_t& executor, std::uint8_t const* flags, std::uint32_t count,
                                std::uint32_t tile, std::uint32_t tiles, std::uint64_t* counts,
                                std::uint32_t* selected) noexcept {
     if (status_t const counted = count_flagged(executor, flags, count, tile, tiles, counts); counted.failed())
         return counted;
-    return launch(executor, executor.kernels()->function("ustore_select_write_apple"), tiles, 256u, 0u, flags,
+    return launch(executor, executor.kernels->function("ustore_select_write_apple"), tiles, 256u, 0u, flags,
                   std::uint64_t {count}, tile, tiles, select_byte_flags_k, counts, selected);
 }
 

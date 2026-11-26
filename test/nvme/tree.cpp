@@ -34,7 +34,7 @@
 
 #include "nvme/allocation_watch.hpp" // `allocation_watch_t`, `allocation_watch_g`
 #include "nvme/fixture.hpp"          // `run_on_transport`, `expectation_t`, `painted`
-#include "vram/classes.hpp"          // `kernel_tables`, `pick_gpu_class`
+#include "vram/classes.hpp"          // `kernel_tables`, `pick_gpu_class`, `loaded_gpu_classes`
 
 namespace unum::ustore::test {
 
@@ -1269,14 +1269,17 @@ struct device_zero_compactor_t {
     device_zero_compactor_t() noexcept {
         util::gpu_device_t device_zero;
         gpu_class_t const gpu_class = util::list_nvidia_gpu_devices(drivers.cuda, {&device_zero, 1})
-                                          ? pick_gpu_class(drivers, device_zero, gpu_class_t::unknown_k)
+                                          ? pick_gpu_class(device_zero.vendor, loaded_gpu_classes(drivers, device_zero),
+                                                           gpu_class_t::unknown_k)
                                           : gpu_class_t::unknown_k;
-        if (!drivers.retain_context(0) ||
-            !kernels.load(drivers.cuda, drivers.cuda_contexts[0], 0, gpu_class, util::vram_kernel_names_k).succeeded())
-            return;
-        auto [spawned, spawn_status] = util::cuda_executor_t::spawn(drivers.cuda, drivers.cuda_contexts[0], device_zero,
-                                                                    0, ustore_gds_automatic_k,
-                                                                    kernels.table_of(0, gpu_class));
+        if (!kernels.load(drivers.cuda, 0, 0, gpu_class, util::vram_kernel_names_k).succeeded()) return;
+        auto kernels_of = [&](std::type_identity<util::cuda_module_t>, int) noexcept {
+            return kernels.table_of(0, gpu_class);
+        };
+        std::size_t scratch_limit = 0;
+        int const zero = 0;
+        auto [spawned, spawn_status] = util::cuda_executor_t::spawn(drivers.cuda, {&zero, 1}, {}, kernels_of,
+                                                                    scratch_limit);
         if (spawn_status.failed()) {
             make_status = spawn_status;
             return;

@@ -70,7 +70,7 @@
 #include "match.hpp"              // `compiled_match`, `compile_match`, `scan_matched`, `exhausted_t`
 #include "utilities/batches.hpp"  // `strings_arg_t`
 #include "utilities/progress.hpp" // `progress_ticks_t`
-#include "vram/classes.hpp"       // `gpu_class_t`, `pick_gpu_class`, `kernel_tables`, `spawn_gpu_executor`
+#include "vram/classes.hpp"       // `gpu_class_t`, `gpu_class_mask_t`, `loaded_gpu_classes`, `kernel_tables`
 #include "vram/matching.hpp"      // `compile_match`, `scan_matched_on_device`
 #include "vram/staging.hpp"       // `stage_inputs`
 
@@ -206,57 +206,23 @@ static_assert(compiled_rungs(apple_ladder_t {}) <= 1);
 /** Vendors one process drives, each listing at most @c gpu_devices_capacity_k devices. */
 inline constexpr std::size_t gpu_vendors_count_k = 3;
 
-/** The GPU side of the process, built at its first VRAM call: every vendor's driver, and every
- *  device, NVIDIA first, then AMD, then Apple, each with the class picked under no ceiling. */
+#pragma region Shared VRAM
+
+/** The GPU side of the process, built at its first VRAM call: every vendor's driver, every device
+ *  they report, NVIDIA first, then AMD, then Apple, a device's position here being its ordinal in
+ *  the C interface, the classes whose bundles loaded on each, and every vendor's kernels, loaded
+ *  once per device and shared by every executor there. A device no class runs on is listed too and
+ *  refuses all work. */
 struct gpu_runtime_t {
     util::gpu_drivers_t drivers;
+    util::gpu_device_t devices[3 * util::gpu_devices_capacity_k];
+    gpu_class_mask_t loaded[3 * util::gpu_devices_capacity_k] = {};
     kernel_tables<util::cuda_module_t> cuda_kernels;
     kernel_tables<util::hip_module_t> hip_kernels;
     kernel_tables<util::metal_module_t> metal_kernels;
-    util::gpu_device_t devices[gpu_vendors_count_k * util::gpu_devices_capacity_k];
     std::size_t devices_count = 0;
 
-    /** The class picked for each of @c devices with no pin, @c unknown_k where none runs. */
-    gpu_class_t classes[gpu_vendors_count_k * util::gpu_devices_capacity_k] = {};
-
-    /** Held by the spawn opening a device for its class, NVIDIA devices by CUDA ordinal, then AMD
-     *  ones by HIP ordinal, then Apple ones by their position in Metal's listing. */
-    claim_t opening[gpu_vendors_count_k * util::gpu_devices_capacity_k] = {};
-
-    gpu_runtime_t() noexcept {
-        std::size_t const reported = util::list_gpu_devices(drivers, devices);
-        for (std::size_t position = 0; position != reported; ++position) {
-            util::gpu_device_t const device = devices[position];
-            if (device.vendor_ordinal >= util::gpu_devices_capacity_k) continue;
-            classes[devices_count] = pick_gpu_class(drivers, device, gpu_class_t::unknown_k);
-            devices[devices_count++] = device;
-        }
-    }
-
-    /** Spawns into @p into an executor of @p gpu_class on @p device as @c spawn_gpu_executor does,
-     *  first opening the device for the class while no other spawn opens it. */
-    template <typename variant_type_>
-    util::status_t spawn(util::gpu_device_t const& device, gpu_class_t gpu_class, std::size_t scratch_limit,
-                         ustore_gds_t gds, variant_type_& into) noexcept {
-        std::size_t vendor_index = gpu_vendors_count_k;
-        switch (device.vendor) {
-        case util::gpu_vendor_t::nvidia_k: vendor_index = 0; break;
-        case util::gpu_vendor_t::amd_k: vendor_index = 1; break;
-        case util::gpu_vendor_t::apple_k: vendor_index = 2; break;
-        default: break;
-        }
-        if (vendor_index == gpu_vendors_count_k || device.vendor_ordinal >= util::gpu_devices_capacity_k)
-            return {util::status_code_t::device_k, "No driver serves the device"};
-        std::size_t const slot = vendor_index * util::gpu_devices_capacity_k + device.vendor_ordinal;
-        class_verbs_t const& verbs = host_verbs();
-        while (!verbs.take(&opening[slot])) verbs.wait_while_claimed(&opening[slot]);
-        util::status_t const opened = open_gpu_device(drivers, device, gpu_class, cuda_kernels, hip_kernels,
-                                                      metal_kernels);
-        verbs.release(&opening[slot]);
-        if (opened.failed()) return opened;
-        return spawn_gpu_executor(drivers, cuda_kernels, hip_kernels, metal_kernels, device, gpu_class, scratch_limit,
-                                  gds, into);
-    }
+    gpu_runtime_t() noexcept;
 };
 
 /** The one runtime every VRAM call passes its drivers down from. */
@@ -265,10 +231,77 @@ inline gpu_runtime_t& gpu_runtime() noexcept {
     return runtime;
 }
 
-/** The devices VRAM executors spawn on, a device's position here being its UStore ordinal. */
+/** Every vendor's driver, loaded at the first VRAM call. */
+inline util::gpu_drivers_t& gpu_drivers() noexcept { return gpu_runtime().drivers; }
+
+/** Every GPU the drivers report, as the ABI numbers them. */
 inline std::span<util::gpu_device_t const> gpu_devices() noexcept {
     gpu_runtime_t const& runtime = gpu_runtime();
     return {runtime.devices, runtime.devices_count};
+}
+
+/** The classes whose bundles load on each device @ref gpu_devices lists, asked once at listing. */
+inline std::span<gpu_class_mask_t const> gpu_classes_loaded() noexcept {
+    gpu_runtime_t const& runtime = gpu_runtime();
+    return {runtime.loaded, runtime.devices_count};
+}
+
+#pragma endregion Shared VRAM
+
+inline gpu_runtime_t::gpu_runtime_t() noexcept {
+    std::size_t const reported = util::list_gpu_devices(drivers, devices);
+    for (std::size_t position = 0; position != reported; ++position) {
+        util::gpu_device_t const device = devices[position];
+        if (device.vendor_ordinal >= util::gpu_devices_capacity_k) continue;
+        loaded[devices_count] = loaded_gpu_classes(drivers, device);
+        devices[devices_count++] = device;
+    }
+}
+
+/**
+ *  @brief Spawns into @p into one executor of @p gpu_class over every entry of @p devices, on
+ *      @p streams when given, as @c util::spawn_gpu_executor does, each stream's scratch capped at
+ *      @p scratch_limit bytes, zero for no ceiling.
+ *
+ *  Each stream launches from the table of its device and class, which the first spawn there loads
+ *  while holding the device's claim, so no other spawn loads onto it; a device the class's bundle
+ *  compiles no code for keeps moving memory and refuses launches alone.
+ */
+template <typename variant_type_>
+util::status_t spawn_vram_executor(gpu_runtime_t& runtime, std::span<util::gpu_device_t const> devices,
+                                   gpu_class_t gpu_class, std::size_t scratch_limit, std::span<void* const> streams,
+                                   variant_type_& into) noexcept {
+    util::gpu_drivers_t& drivers = runtime.drivers;
+    auto const load = [&](auto& tables, auto const& api, auto place, int ordinal, std::span<char const* const> names,
+                          auto... options) noexcept {
+        class_verbs_t const& verbs = host_verbs();
+        claim_t& opening = tables.opening(ordinal);
+        while (!verbs.take(&opening)) verbs.wait_while_claimed(&opening);
+        [[maybe_unused]] util::status_t const loaded = tables.load(api, place, ordinal, gpu_class, names, options...);
+        verbs.release(&opening);
+        return tables.table_of(ordinal, gpu_class);
+    };
+    auto kernels_of = [&]<typename module_type_>(std::type_identity<module_type_>, int ordinal) noexcept {
+        if constexpr (std::is_same_v<module_type_, util::cuda_module_t>)
+            return load(runtime.cuda_kernels, drivers.cuda, ordinal, ordinal, util::vram_kernel_names_k);
+        else if constexpr (std::is_same_v<module_type_, util::hip_module_t>)
+            return load(runtime.hip_kernels, drivers.hip, ordinal, ordinal, util::vram_kernel_names_k);
+        else {
+            // The kernels need MSL 3.2's device-scope atomic fences and `gpuAddress` casts
+            util::metal_context_t const* const context = drivers.metal_contexts.context(ordinal);
+            return load(runtime.metal_kernels, drivers.metal, context ? context->device : nullptr, ordinal,
+                        util::vram_apple_kernel_names_k, util::metal_language_t::msl_3_2_k);
+        }
+    };
+    auto [spawned, spawn_status] = util::spawn_gpu_executor(drivers, devices, streams, kernels_of, scratch_limit);
+    if (spawn_status.failed()) return spawn_status;
+    std::visit(
+        [&]<typename executor_type_>(executor_type_& executor) noexcept {
+            if constexpr (util::a_gpu_executor<executor_type_>)
+                into.template emplace<executor_type_>(std::move(executor));
+        },
+        spawned);
+    return {};
 }
 
 /** Frees every block of @p arena wherever it lives, a device's runs through the process's drivers as the executor that
@@ -276,13 +309,15 @@ inline std::span<util::gpu_device_t const> gpu_devices() noexcept {
 inline void destroy_arena(ustore_arena_t arena) noexcept {
     if (!arena) return;
     if (util::cuda_blocks_t* const memory = std::get_if<util::cuda_blocks_t>(&arena->memory)) {
-        util::gpu_drivers_t const& drivers = gpu_runtime().drivers;
-        util::free_cuda_blocks(drivers.cuda, drivers.cuda_contexts[memory->device], memory->blocks);
+        util::gpu_drivers_t const& drivers = gpu_drivers();
+        util::free_cuda_blocks(drivers.cuda, memory->device, memory->blocks);
     }
     else if (util::hip_blocks_t* const memory = std::get_if<util::hip_blocks_t>(&arena->memory))
-        util::free_hip_blocks(gpu_runtime().drivers.hip, memory->device, memory->blocks);
-    else if (util::metal_blocks_t* const memory = std::get_if<util::metal_blocks_t>(&arena->memory))
-        util::free_metal_blocks(memory->blocks);
+        util::free_hip_blocks(gpu_drivers().hip, memory->device, memory->blocks);
+    else if (util::metal_blocks_t* const memory = std::get_if<util::metal_blocks_t>(&arena->memory)) {
+        if (util::metal_context_t* const context = gpu_drivers().metal_contexts.context(memory->device))
+            util::free_metal_blocks(*context, memory->blocks);
+    }
     else util::arena_free_blocks(*arena);
     delete arena;
 }
@@ -798,7 +833,7 @@ util::status_t pull(engine_t const& engine, ustore_changes_cursor_next_t const& 
                     ustore_changes_cursor_handle_t& cursor, view_t const& view) noexcept;
 
 /** Refuses a feed pulled on a device, as change feeds read host runs alone. */
-template <util::a_gpu_executor executor_type_>
+template <util::a_gpu_stream executor_type_>
 util::status_t pull(engine_t const&, ustore_changes_cursor_next_t const&, ustore_changes_cursor_handle_t&,
                     view_t const&, executor_type_&) noexcept {
     return {util::status_code_t::unsupported_k, "Change feeds run on host executors"};
@@ -814,13 +849,14 @@ auto host_engine_of(cursor_type_& cursor) noexcept {
  *  @brief Pulls the next page of the walk @p cursor computes on @p executor's device, as
  *      @c scan_matched_on_device serves a filtered scan.
  *
- *  The host lists every page into the executor's bounce, the device matches its values, and every
- *  output moves into the call's device arena once. The cursor's engine compiled at its init into
- *  the cursor's own arena, which outlives every call, and each pull rebases it onto a copy of its
- *  tables in the managed runs the call rewinds. A cursor opened on the host walks there alone. The
- *  pull body of every walk, @c pull_through, is defined where its modality's pull is.
+ *  The host lists every page into a device's bounce, dealing pages across the executor's devices,
+ *  each device matches its pages' values, and every output moves into the call's device arena on
+ *  the first device once. The cursor's engine compiled at its init into the cursor's own arena,
+ *  which outlives every call, and each pull rebases it onto a copy of its tables in every device's
+ *  managed runs the call rewinds. A cursor opened on the host walks there alone. The pull body of
+ *  every walk, @c pull_through, is defined where its modality's pull is.
  */
-template <typename arguments_type_, typename cursor_type_, util::a_gpu_executor executor_type_>
+template <typename arguments_type_, typename cursor_type_, util::a_gpu_stream executor_type_>
 util::status_t pull(engine_t const& engine, arguments_type_ const& arguments, cursor_type_& cursor, view_t const& view,
                     executor_type_& executor) noexcept {
     constexpr vendored_residency_t residency_k = vendored_residency_of<executor_type_>;
@@ -831,14 +867,19 @@ util::status_t pull(engine_t const& engine, arguments_type_ const& arguments, cu
     util::device_blocks_t* const blocks = util::device_blocks_of(arguments.arena, executor);
     if (!blocks) return {util::status_code_t::device_k, "The arena lives where another executor computes"};
     compiled_match<residency_k> match = walker->match;
-    if (match.reads_values() && !executor.kernels())
+    if (match.reads_values() && !executor.kernels)
         return {util::status_code_t::unsupported_k, "The device loaded no kernel bundle"};
     if (util::status_t const status = rebase_on_device(match, executor); status.failed()) return status;
-    device_match<residency_k> const matching {match, executor, *blocks};
+    // The pull drives every stream of the executor, whose claim `visit_residency` holds
+    residency_executor<residency_k>& devices = std::get<residency_executor<residency_k>>(view.executor->device);
+    auto [matches, matches_status] = match_on_every_device(match, devices, view.scratch);
+    if (matches_status.failed()) return matches_status;
+    device_match<residency_k> const matching {matches, devices};
     arguments_type_ hosted = arguments;
-    hosted.arena = executor.bounce();
+    hosted.arena = executor.memory.bounce.arena();
     if (util::status_t const status = pull_through(engine, hosted, cursor, matching, view); status.failed())
         return status;
+    if (util::status_t const bound = executor.bind(); bound.failed()) return bound;
     return upload_output_columns(hosted, *blocks, executor);
 }
 
@@ -987,8 +1028,9 @@ inline vendored_residency_t residency_of(ustore_executor_handle_t const* executo
 inline bool arena_serves(ustore_executor_handle_t const* executor, ustore_arena_t arena) noexcept {
     if (!executor) return std::holds_alternative<util::host_blocks_t>(arena->memory);
     return std::visit(
-        [&]<typename device_type_>(device_type_ const& device) noexcept {
-            if constexpr (util::a_gpu_executor<device_type_>) return util::device_blocks_of(arena, device) != nullptr;
+        [&]<typename kind_type_>(kind_type_ const& kind) noexcept {
+            if constexpr (util::a_gpu_executor<kind_type_>)
+                return util::device_blocks_of(arena, kind.stream(0)) != nullptr;
             else return std::holds_alternative<util::host_blocks_t>(arena->memory);
         },
         executor->device);
@@ -1493,28 +1535,31 @@ concept a_residency_call = requires { verb_slot<arguments_type_>::template verb<
 
 #pragma region Serving
 
-/** Hands @p visitor the device executor of @p view, as <tt>visitor(device)</tt> for a VRAM executor
- *  and <tt>visitor()</tt> for every host one, so a verb takes its residency's executor as its last
- *  argument. */
+/** Hands @p visitor the first stream of @p view's executor, as <tt>visitor(stream)</tt> for a VRAM
+ *  executor, whose claim it holds for the whole call, and <tt>visitor()</tt> for every host one, so a
+ *  verb takes its residency's stream as its last argument; a filtered scan reaches the executor's
+ *  other streams through @p view. */
 template <typename visitor_type_>
 util::status_t visit_residency(view_t const& view, visitor_type_&& visitor) noexcept {
     ustore_executor_t const executor = view.executor;
-    if (util::cuda_executor_t* const device = executor ? std::get_if<util::cuda_executor_t>(&executor->device)
-                                                       : nullptr)
-        return visitor(*device);
-    if (util::hip_executor_t* const device = executor ? std::get_if<util::hip_executor_t>(&executor->device) : nullptr)
-        return visitor(*device);
-    if (util::metal_executor_t* const device = executor ? std::get_if<util::metal_executor_t>(&executor->device)
-                                                        : nullptr)
-        return visitor(*device);
-    return visitor();
+    if (!executor) return visitor();
+    return std::visit(
+        [&]<typename kind_type_>(kind_type_& kind) noexcept -> util::status_t {
+            if constexpr (util::a_gpu_executor<kind_type_>) {
+                auto [claim, claim_status] = kind.claim();
+                if (claim_status.failed()) return claim_status;
+                return visitor(kind.stream(0));
+            }
+            else return visitor();
+        },
+        executor->device);
 }
 
 /** Calls @p verb on @p arguments with every ragged input gathered on the host into the scratch
  *  @p view works in, then @p view and the executor of the verb's residency. */
-template <typename verb_type_, typename arguments_type_, typename... executors_types_>
+template <typename verb_type_, typename arguments_type_, typename... streams_types_>
 util::status_t call_gathered(verb_type_ verb, arguments_type_ const& arguments, view_t const& view,
-                             executors_types_&... executor) noexcept {
+                             streams_types_&... executor) noexcept {
     if constexpr (a_call_with_ragged_inputs<arguments_type_>) {
         auto const inputs = ragged_inputs(arguments);
         std::array<strings_arg_t, inputs.size()> strings;
@@ -1529,12 +1574,12 @@ util::status_t call_gathered(verb_type_ verb, arguments_type_ const& arguments, 
 }
 
 /** Calls @p verb on @p arguments as @c call_gathered does, moving the inputs of a device call to the host first. */
-template <typename verb_type_, typename arguments_type_, typename... executors_types_>
+template <typename verb_type_, typename arguments_type_, typename... streams_types_>
 util::status_t call_staged(verb_type_ verb, arguments_type_ const& arguments, view_t const& view,
-                           executors_types_&... executor) noexcept {
-    if constexpr (sizeof...(executors_types_) != 0) {
+                           streams_types_&... executor) noexcept {
+    if constexpr (sizeof...(streams_types_) != 0) {
         arguments_type_ staged = arguments;
-        if (util::status_t const status = stage_inputs(gpu_runtime().drivers, executor..., staged); status.failed())
+        if (util::status_t const status = stage_inputs(gpu_drivers(), executor..., staged); status.failed())
             return status;
         return call_gathered(verb, staged, view, executor...);
     }
@@ -1544,11 +1589,11 @@ util::status_t call_staged(verb_type_ verb, arguments_type_ const& arguments, vi
 /** Readies @p executor for one call of @p arguments: binds its device to the calling thread, rewinds the bounce and
  *  the managed runs, as every call before was waited for, and rewinds the call's arena, freeing its older runs in
  *  stream order. */
-template <typename arguments_type_, util::a_gpu_executor executor_type_>
+template <typename arguments_type_, util::a_gpu_stream executor_type_>
 util::status_t open_device_call(arguments_type_ const& arguments, executor_type_& executor) noexcept {
     if (util::status_t const status = executor.bind(); status.failed()) return status;
-    executor.rewind_bounce();
-    util::rewind(executor.managed(), executor);
+    executor.memory.bounce.rewind();
+    util::rewind(executor.memory.managed, executor);
     if constexpr (a_call_filling_arena<arguments_type_>)
         if (util::device_blocks_t* const blocks = util::device_blocks_of(arguments.arena, executor))
             util::rewind(*blocks, executor);
@@ -1602,9 +1647,9 @@ util::status_t serve_control(engine_t const& engine, arguments_type_ const& argu
 
 /** Serves @p arguments on the verb of their modality's table at @p residency_ in @p view, scanning
  *  through their match in the scratch @p runner names wherever it narrows the keys. */
-template <vendored_residency_t residency_, typename arguments_type_, typename... executors_types_>
+template <vendored_residency_t residency_, typename arguments_type_, typename... streams_types_>
 util::status_t serve_modality(engine_t const& engine, ustore_database_t database, arguments_type_ const& arguments,
-                              view_t const& view, view_t const& runner, executors_types_&... executor) noexcept {
+                              view_t const& view, view_t const& runner, streams_types_&... executor) noexcept {
     auto const* const verbs = engine.template tables<residency_>().*
                               verb_slot<arguments_type_>::template table<residency_>;
     if (!verbs)
@@ -1674,8 +1719,8 @@ util::status_t serve(arguments_type_ const& arguments, view_t const& runner) noe
     if constexpr (a_call_filling_arena<arguments_type_>) util::arena_rewind(arguments.arena);
     if (util::status_t const seeded = reserve_scratches(runner, 0); seeded.failed()) return seeded;
     return visit_residency(
-        view, [&]<typename... executors_types_>(executors_types_&... executor) noexcept -> util::status_t {
-            constexpr vendored_residency_t residency_k = vendored_residency_of<executors_types_...>;
+        view, [&]<typename... streams_types_>(streams_types_&... executor) noexcept -> util::status_t {
+            constexpr vendored_residency_t residency_k = vendored_residency_of<streams_types_...>;
             if constexpr (residency_k != vendored_residency_t::host_k)
                 if (util::status_t const opened = open_device_call(arguments, executor...); opened.failed())
                     return opened;

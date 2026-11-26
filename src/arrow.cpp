@@ -196,15 +196,15 @@ util::expected<converted_offsets_t> convert_on_host(ustore_arena_t arena, ustore
 
 /** Converts the @p rows + 1 offsets at @p offsets on @p executor's device into @p blocks in the
  *  other width, through the executor's bounce. */
-template <typename converted_type_, typename source_type_, a_gpu_executor executor_type_>
+template <typename converted_type_, typename source_type_, a_gpu_stream executor_type_>
 util::expected<converted_offsets_t> convert_through(executor_type_& executor, util::device_blocks_t& blocks,
                                                     source_type_ const* offsets, std::size_t rows) noexcept {
-    ustore_arena_t const bounce = executor.bounce();
+    ustore_arena_t const bounce = executor.memory.bounce.arena();
     auto [source, source_status] = util::arena_allocate<source_type_>(bounce, rows + 1);
     if (source_status.failed()) return source_status;
     auto [target, target_status] = util::arena_allocate<converted_type_>(bounce, rows + 1);
     if (target_status.failed()) return target_status;
-    util::status_t status = executor.pin_bounce();
+    util::status_t status = executor.memory.bounce.pin();
     if (status.succeeded())
         status = executor.download_async(std::as_writable_bytes(source), reinterpret_cast<std::uintptr_t>(offsets));
     if (status.succeeded()) status = executor.wait();
@@ -224,7 +224,7 @@ util::expected<converted_offsets_t> convert_through(executor_type_& executor, ut
 }
 
 /** Spawns an executor on the device @p arena lives on for one export, as the C call names none, and
- *  hands @p visitor the executor and the arena's runs on its device. */
+ *  hands @p visitor that device and the arena's runs on it. */
 template <typename visitor_type_>
 ustore_status_t visit_export_executor(ustore_arena_t arena, visitor_type_&& visitor) noexcept {
     device_arena_t const device = device_arena_of(arena);
@@ -238,21 +238,22 @@ ustore_status_t visit_export_executor(ustore_arena_t arena, visitor_type_&& visi
             runtime.devices[position].vendor_ordinal == static_cast<std::uint32_t>(device.device))
             listed = position;
     if (listed == runtime.devices_count) return ustore_status_device_k;
-    gpu_class_t const gpu_class = runtime.classes[listed];
+    gpu_class_t const gpu_class = pick_gpu_class(vendor, runtime.loaded[listed], gpu_class_t::unknown_k);
     if (gpu_class == gpu_class_t::unknown_k) return ustore_status_unsupported_k;
-    std::variant<std::monostate, cuda_executor_t, hip_executor_t, metal_executor_t> spawned;
-    if (util::status_t const status = spawn_gpu_executor(runtime.drivers, runtime.cuda_kernels, runtime.hip_kernels,
-                                                         runtime.metal_kernels, runtime.devices[listed], gpu_class, 0,
-                                                         ustore_gds_compatibility_k, spawned);
+    util::gpu_executor_t spawned;
+    if (util::status_t const status = spawn_vram_executor(runtime, {&runtime.devices[listed], 1}, gpu_class, 0, {},
+                                                          spawned);
         status.failed())
         return static_cast<ustore_status_t>(status.code);
     return std::visit(
         [&]<typename executor_type_>(executor_type_& executor) noexcept -> ustore_status_t {
             if constexpr (std::is_same_v<executor_type_, std::monostate>) return ustore_status_device_k;
             else {
-                util::device_blocks_t* const blocks = device_blocks_of(arena, executor);
+                auto [claim, claim_status] = executor.claim();
+                if (claim_status.failed()) return static_cast<ustore_status_t>(claim_status.code);
+                util::device_blocks_t* const blocks = device_blocks_of(arena, executor.stream(0));
                 if (!blocks) return ustore_status_device_k;
-                return visitor(executor, *blocks);
+                return visitor(executor.stream(0), *blocks);
             }
         },
         spawned);
@@ -294,12 +295,12 @@ ustore_status_t densify_on_device(ustore_arena_t arena, util::strided_rows_t& ro
     if (!arena_holds(arena, rows.source, spanned)) return ustore_status_invalid_argument_k;
     return visit_export_executor(
         arena, [&]<typename executor_type_>(executor_type_& executor, util::device_blocks_t& blocks) noexcept {
-            if (!executor.kernels()) return ustore_status_device_k;
+            if (!executor.kernels) return ustore_status_device_k;
             auto [dense, carve_status] = carve<ustore_key_t>(blocks, executor, static_cast<std::size_t>(rows.rows));
             if (carve_status.failed()) return static_cast<ustore_status_t>(carve_status.code);
             rows.dense = util::bytes_of(dense.data(), dense.size()).data();
             util::status_t status = launch(
-                executor, executor.kernels()->function("ustore_tape_densify"),
+                executor, executor.kernels->function("ustore_tape_densify"),
                 static_cast<unsigned>(util::divide_round_up<std::size_t>(rows.rows, util::tape_block_threads_k)),
                 util::tape_block_threads_k, 0u, rows);
             if (status.succeeded()) status = executor.wait();
@@ -410,15 +411,15 @@ ustore_status_t drop_on_host(ustore_arena_t arena, offset_type_ const* offsets, 
 }
 
 /** Packs the @p rows booleans at @p bools on @p executor's device into bits cut from @p blocks. */
-template <a_gpu_executor executor_type_>
+template <a_gpu_stream executor_type_>
 util::expected<std::span<ustore_octet_t>> pack_on_device(executor_type_& executor, util::device_blocks_t& blocks,
                                                          ustore_byte_t const* bools, std::size_t rows) noexcept {
-    if (!executor.kernels()) return util::status_code_t::device_k;
+    if (!executor.kernels) return util::status_code_t::device_k;
     std::size_t const bytes = util::divide_round_up(rows, util::bits_in_byte_k);
     auto [bits, bits_status] = carve<ustore_octet_t>(blocks, executor, bytes);
     if (bits_status.failed()) return bits_status;
     util::status_t status = launch(
-        executor, executor.kernels()->function("ustore_docs_pack_bools"),
+        executor, executor.kernels->function("ustore_docs_pack_bools"),
         static_cast<unsigned>(util::divide_round_up<std::size_t>(bytes, docs::gather_block_threads_k)),
         docs::gather_block_threads_k, 0u, bools, std::uint64_t {rows}, bits.data());
     if (status.succeeded()) status = executor.wait();
@@ -429,13 +430,13 @@ util::expected<std::span<ustore_octet_t>> pack_on_device(executor_type_& executo
 /** Copies the device text tape of @p rows rows at @p offsets and @p bytes without the null byte
  *  ending every row, on @p executor's device into @p blocks, learning its length from its first and
  *  last offsets through the bounce. */
-template <typename offset_type_, a_gpu_executor executor_type_>
+template <typename offset_type_, a_gpu_stream executor_type_>
 ustore_status_t drop_on_device(executor_type_& executor, util::device_blocks_t& blocks, offset_type_ const* offsets,
                                ustore_byte_t const* bytes, std::size_t rows, column_buffers_t& buffers) noexcept {
-    if (!executor.kernels()) return ustore_status_device_k;
-    auto [ends, ends_status] = util::arena_allocate<offset_type_>(executor.bounce(), 2);
+    if (!executor.kernels) return ustore_status_device_k;
+    auto [ends, ends_status] = util::arena_allocate<offset_type_>(executor.memory.bounce.arena(), 2);
     if (ends_status.failed()) return static_cast<ustore_status_t>(ends_status.code);
-    util::status_t status = executor.pin_bounce();
+    util::status_t status = executor.memory.bounce.pin();
     if (status.succeeded())
         status = executor.download_async(std::as_writable_bytes(ends.first(1)),
                                          reinterpret_cast<std::uintptr_t>(offsets));
@@ -454,7 +455,7 @@ ustore_status_t drop_on_device(executor_type_& executor, util::device_blocks_t& 
     docs::terminated_texts<offset_type_> const texts {bytes, offsets, bare_bytes.data(), bare_offsets.data(), rows};
     char const* const kernel = sizeof(offset_type_) == sizeof(std::uint64_t) ? "ustore_docs_drop_terminators_u64"
                                                                              : "ustore_docs_drop_terminators_u32";
-    status = launch(executor, executor.kernels()->function(kernel),
+    status = launch(executor, executor.kernels->function(kernel),
                     static_cast<unsigned>(util::divide_round_up<std::size_t>(rows, docs::gather_block_threads_k)),
                     docs::gather_block_threads_k, 0u, texts);
     if (status.succeeded()) status = executor.wait();
@@ -611,11 +612,12 @@ ustore_status_t ustore_docs_column_view_to_arrow(ustore_docs_column_view_t const
         status = visit_export_executor(
             arena, [&]<typename executor_type_>(executor_type_& executor, util::device_blocks_t& blocks) noexcept {
                 // A view the gather left on the device comes down through the bounce first
-                if (executor.device_of(column) < 0) view = *column;
+                if (device_of(executor, column) < 0) view = *column;
                 else {
-                    auto [copy, copy_status] = util::arena_allocate<ustore_docs_column_view_t>(executor.bounce(), 1);
+                    auto [copy, copy_status] = util::arena_allocate<ustore_docs_column_view_t>(
+                        executor.memory.bounce.arena(), 1);
                     util::status_t loaded = copy_status;
-                    if (loaded.succeeded()) loaded = executor.pin_bounce();
+                    if (loaded.succeeded()) loaded = executor.memory.bounce.pin();
                     if (loaded.succeeded())
                         loaded = executor.download_async(std::as_writable_bytes(copy),
                                                          reinterpret_cast<std::uintptr_t>(column));

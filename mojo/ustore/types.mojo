@@ -94,6 +94,8 @@ struct Status(Equatable, ImplicitlyCopyable, TrivialRegisterPassable):
     """The engine failed in a way no other status names, which points at a defect."""
     comptime UNINITIALIZED = Self(12)
     """The call needs a database or transaction that was never opened."""
+    comptime CONFIG_MISMATCH = Self(13)
+    """The handles or arguments are each well-formed but cannot be joined."""
     comptime CONTENDED = Self(14)
     """The call was refused rather than waited for, like a call on an executor serving another one."""
     comptime CANCELLED = Self(15)
@@ -925,16 +927,60 @@ struct ExecutorForNvmeArguments(ImplicitlyCopyable):
 
 
 @fieldwise_init
+struct VramOptionsArguments(ImplicitlyCopyable):
+    """`ustore_vram_options_t`, laid out as the ABI declares it."""
+
+    var devices: Optional[Pointer[Int32, ImmUntrackedOrigin]]
+    var devices_count: c_size_t
+    var gpu_class_ceiling: GPUClass
+
+
+@fieldwise_init
+struct VramOptions[origin: ImmOrigin = ImmUntrackedOrigin](ImplicitlyCopyable):
+    """The GPUs of one vendor a VRAM executor drives, one stream each.
+
+    Parameters:
+        origin: The viewed ordinal array, kept alive for as long as the options are used.
+    """
+
+    var devices: Optional[Pointer[Int32, Self.origin]]
+    """UStore ordinals, positions in `Library.gpu_devices`; absent takes every listed device of the first vendor with a known class."""
+    var devices_count: Int
+    """Entries in `devices`; zero derives."""
+    var gpu_class_ceiling: GPUClass
+    """The newest class dispatch may pick, every device running the newest all of them load under it; `UNKNOWN` sets none."""
+
+    def __init__(out self):
+        """Takes every listed device of the first vendor with a known class."""
+        self.devices = None
+        self.devices_count = 0
+        self.gpu_class_ceiling = GPUClass.UNKNOWN
+
+    @staticmethod
+    def on[devices_origin: ImmOrigin, //](devices: Span[Int32, devices_origin]) -> VramOptions[devices_origin]:
+        """Names the devices explicitly, viewing the caller's array for the call."""
+        return VramOptions[devices_origin](
+            Pointer[Int32, devices_origin](unsafe_from_address=Int(devices.unsafe_ptr())), len(devices), GPUClass.UNKNOWN
+        )
+
+    def arguments(self) -> VramOptionsArguments:
+        """The C layout, erased only inside a verb so the view lives through the call."""
+        var devices: Optional[Pointer[Int32, ImmUntrackedOrigin]] = None
+        if case .Some(named) = self.devices:
+            devices = named.unsafe_origin_cast[ImmUntrackedOrigin]()
+        return VramOptionsArguments(devices, c_size_t(self.devices_count), self.gpu_class_ceiling)
+
+
+@fieldwise_init
 struct ExecutorForVramArguments(ImplicitlyCopyable):
     """`ustore_executor_for_vram_t`, laid out as the ABI declares it."""
 
     var executor: Optional[Pointer[Address, MutUntrackedOrigin]]
     var outcome: Optional[Pointer[Outcome, MutUntrackedOrigin]]
-    var device: Int32
-    var stream: Address
+    var vram: VramOptionsArguments
+    var streams: Address
     var scratch_limit: c_size_t
     var gds: Gds
-    var gpu_class_ceiling: GPUClass
 
 
 @fieldwise_init
@@ -1059,34 +1105,42 @@ struct Executor:
         return Self(library=library, address=_created(library, outcome, created, "ustore_executor_for_nvme"), vram=False)
 
     @staticmethod
-    def for_vram(
+    def for_vram[
+        vram_origin: ImmOrigin, //
+    ](
         library: Library,
-        device: Int = 0,
-        stream: Address = NULL_ADDRESS,
+        vram: VramOptions[vram_origin] = VramOptions(),
+        streams: Address = NULL_ADDRESS,
         scratch_limit: Int = 0,
         gds: Gds = Gds.AUTOMATIC,
     ) raises Error -> Self:
-        """Orders work on one stream on `device`, which the executor creates with itself and destroys with itself,
-        fed by the calling thread. Calls `ustore_executor_for_vram`.
+        """Orders work on one stream on every device `vram` names, which the executor creates or adopts and
+        destroys with itself, all fed by the calling thread. Arenas live on the first device, where every call
+        computes but a filtered scan, which deals its pages across every device. Calls `ustore_executor_for_vram`.
+
+        Parameters:
+            vram_origin: The options' viewed ordinal array, inferred from the argument.
 
         Args:
             library: The loaded engine, kept so the shared object stays mapped.
-            device: The UStore ordinal of the device, its position in `Library.gpu_devices`.
-            stream: Must stay null: a caller's stream answers `UNSUPPORTED`, since the executor drives only its own.
-            scratch_limit: Ceiling on the device scratch a call takes; zero lets it grow.
-            gds: How reads and compactions move bytes between the drives and the device.
+            vram: The devices it drives; copied, not viewed.
+            streams: The caller's streams to adopt, one per device in `vram` order, an `id<MTLCommandQueue>` on
+                Apple. A CUDA or HIP stream becomes the executor's, which destroys it when freed, while
+                a Metal queue is retained, the executor releasing its own reference and the caller
+                keeping theirs; all stay the caller's on failure, and `NULL_ADDRESS` has it open its own.
+            scratch_limit: Ceiling on the device scratch a call takes on each device; zero lets it grow.
+            gds: How reads and compactions move bytes between the drives and the devices.
 
         Raises:
-            `Error` with `DEVICE` if no device holds the ordinal, or `UNSUPPORTED` for a caller's stream.
+            `Error` with `DEVICE` if no device holds an ordinal, `CONFIG_MISMATCH` for devices of several vendors
+            or a stream on another device, or `INVALID_ARGUMENT` for a stream refused as malformed.
         """
         var created = stack_allocation[1, Address]().unsafe_origin_cast[MutUntrackedOrigin]()
         created[] = NULL_ADDRESS
         var outcome = stack_allocation[1, Outcome]().unsafe_origin_cast[MutUntrackedOrigin]()
         outcome[] = Outcome()
         _cross(
-            ExecutorForVramArguments(
-                created, outcome, Int32(device), stream, c_size_t(scratch_limit), gds, GPUClass.UNKNOWN
-            ),
+            ExecutorForVramArguments(created, outcome, vram.arguments(), streams, c_size_t(scratch_limit), gds),
             library.symbols().executor_for_vram,
         )
         return Self(library=library, address=_created(library, outcome, created, "ustore_executor_for_vram"), vram=True)

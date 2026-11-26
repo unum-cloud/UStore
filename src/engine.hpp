@@ -143,41 +143,53 @@ enum class vendored_residency_t : std::uint8_t {
     vram_apple_k,
 };
 
-/** The executor the verbs of one device residency take. */
+/** The stream the verbs of one device residency take, the first of the call's executor, and the
+ *  executor holding every stream. */
 template <vendored_residency_t>
 struct vendored_residency_executor;
 
 template <>
 struct vendored_residency_executor<vendored_residency_t::vram_nvidia_k> {
-    using type = cuda_executor_t;
+    using stream_t = cuda_executor_t::stream_t;
+    using executor_t = cuda_executor_t;
 };
 
 template <>
 struct vendored_residency_executor<vendored_residency_t::vram_amd_k> {
-    using type = hip_executor_t;
+    using stream_t = hip_executor_t::stream_t;
+    using executor_t = hip_executor_t;
 };
 
 template <>
 struct vendored_residency_executor<vendored_residency_t::vram_apple_k> {
-    using type = metal_executor_t;
+    using stream_t = metal_executor_t::stream_t;
+    using executor_t = metal_executor_t;
 };
 
-/** The executor the verbs of device residency @p residency_ take as their last argument. */
+/** The stream the verbs of device residency @p residency_ take as their last argument. */
 template <vendored_residency_t residency_>
-using residency_executor = typename vendored_residency_executor<residency_>::type;
+using residency_stream = typename vendored_residency_executor<residency_>::stream_t;
 
-/** The residency whose verbs take @p executors_types_ last, host threads for none. */
-template <typename... executors_types_>
+/** The executor holding every stream of residency @p residency_, which a filtered scan deals its
+ *  pages across. */
+template <vendored_residency_t residency_>
+using residency_executor = typename vendored_residency_executor<residency_>::executor_t;
+
+/** The residency whose verbs take @p streams_types_ last, host threads for none. */
+template <typename... streams_types_>
 inline constexpr vendored_residency_t vendored_residency_of = vendored_residency_t::host_k;
 
 template <>
-inline constexpr vendored_residency_t vendored_residency_of<cuda_executor_t> = vendored_residency_t::vram_nvidia_k;
+inline constexpr vendored_residency_t vendored_residency_of<cuda_executor_t::stream_t> =
+    vendored_residency_t::vram_nvidia_k;
 
 template <>
-inline constexpr vendored_residency_t vendored_residency_of<hip_executor_t> = vendored_residency_t::vram_amd_k;
+inline constexpr vendored_residency_t vendored_residency_of<hip_executor_t::stream_t> =
+    vendored_residency_t::vram_amd_k;
 
 template <>
-inline constexpr vendored_residency_t vendored_residency_of<metal_executor_t> = vendored_residency_t::vram_apple_k;
+inline constexpr vendored_residency_t vendored_residency_of<metal_executor_t::stream_t> =
+    vendored_residency_t::vram_apple_k;
 
 /** The kind of work a compaction does, valued as the C phases the router publishes. */
 enum class phase_t : std::uint8_t {
@@ -268,9 +280,9 @@ struct blobs_verbs<vendored_residency_t::host_k> {
 template <vendored_residency_t residency_>
     requires(residency_ != vendored_residency_t::host_k)
 struct blobs_verbs<residency_> {
-    util::status_t (*read)(ustore_blobs_read_t const&, view_t const&, residency_executor<residency_>&) noexcept;
-    util::status_t (*scan)(ustore_blobs_scan_t const&, view_t const&, residency_executor<residency_>&) noexcept;
-    util::status_t (*sample)(ustore_blobs_sample_t const&, view_t const&, residency_executor<residency_>&) noexcept;
+    util::status_t (*read)(ustore_blobs_read_t const&, view_t const&, residency_stream<residency_>&) noexcept;
+    util::status_t (*scan)(ustore_blobs_scan_t const&, view_t const&, residency_stream<residency_>&) noexcept;
+    util::status_t (*sample)(ustore_blobs_sample_t const&, view_t const&, residency_stream<residency_>&) noexcept;
 };
 
 /** The verbs of strings collections served at one residency. */
@@ -297,10 +309,10 @@ template <vendored_residency_t residency_>
     requires(residency_ != vendored_residency_t::host_k)
 struct strings_verbs<residency_> {
     util::status_t (*read)(ustore_strings_read_t const&, strings_arg_t const& strings, view_t const&,
-                           residency_executor<residency_>&) noexcept;
+                           residency_stream<residency_>&) noexcept;
     util::status_t (*scan)(ustore_strings_scan_t const&, strings_arg_t const& prefixes,
                            strings_arg_t const& start_strings, strings_arg_t const& end_strings, view_t const&,
-                           residency_executor<residency_>&) noexcept;
+                           residency_stream<residency_>&) noexcept;
 };
 
 /** The verbs of documents collections served at one residency. */
@@ -339,11 +351,11 @@ template <vendored_residency_t residency_>
     requires(residency_ != vendored_residency_t::host_k)
 struct docs_verbs<residency_> {
     util::status_t (*read)(ustore_docs_read_t const&, strings_arg_t const& fields, view_t const&,
-                           residency_executor<residency_>&) noexcept;
+                           residency_stream<residency_>&) noexcept;
     util::status_t (*gather)(ustore_docs_gather_t const&, strings_arg_t const& fields, view_t const&,
-                             residency_executor<residency_>&) noexcept;
-    util::status_t (*scan)(ustore_docs_scan_t const&, view_t const&, residency_executor<residency_>&) noexcept;
-    util::status_t (*sample)(ustore_docs_sample_t const&, view_t const&, residency_executor<residency_>&) noexcept;
+                             residency_stream<residency_>&) noexcept;
+    util::status_t (*scan)(ustore_docs_scan_t const&, view_t const&, residency_stream<residency_>&) noexcept;
+    util::status_t (*sample)(ustore_docs_sample_t const&, view_t const&, residency_stream<residency_>&) noexcept;
 };
 
 /** The verbs of graph collections served at one residency. */
@@ -368,9 +380,9 @@ template <vendored_residency_t residency_>
     requires(residency_ != vendored_residency_t::host_k)
 struct graph_verbs<residency_> {
     util::status_t (*read_edges)(ustore_graph_read_edges_t const&, view_t const&,
-                                 residency_executor<residency_>&) noexcept;
+                                 residency_stream<residency_>&) noexcept;
     util::status_t (*scan_vertices)(ustore_graph_scan_vertices_t const&, view_t const&,
-                                    residency_executor<residency_>&) noexcept;
+                                    residency_stream<residency_>&) noexcept;
 };
 
 /** The verbs of pages collections served at one residency. */
@@ -399,8 +411,8 @@ struct pages_verbs<vendored_residency_t::host_k> {
 template <vendored_residency_t residency_>
     requires(residency_ != vendored_residency_t::host_k)
 struct pages_verbs<residency_> {
-    util::status_t (*read)(ustore_pages_read_t const&, view_t const&, residency_executor<residency_>&) noexcept;
-    util::status_t (*scan)(ustore_pages_scan_t const&, view_t const&, residency_executor<residency_>&) noexcept;
+    util::status_t (*read)(ustore_pages_read_t const&, view_t const&, residency_stream<residency_>&) noexcept;
+    util::status_t (*scan)(ustore_pages_scan_t const&, view_t const&, residency_stream<residency_>&) noexcept;
 };
 
 /** The verbs of every modality an engine serves at one residency; a null table or verb answers
@@ -1475,8 +1487,8 @@ struct ustore_executor_handle_t {
     holding_call_t holding_call;
 
     /** Nothing beyond the pool on RAM, one reading and one writing ring per pool thread and the
-     *  holding call on NVMe, the device's stream on VRAM of any vendor; the variant is the kind
-     *  tag, so no second word can disagree. */
+     *  holding call on NVMe, the devices and their streams on VRAM of any vendor; the variant is
+     *  the kind tag, so no second word can disagree. */
     std::variant<std::monostate, util::nvme_queues_t, cuda_executor_t, hip_executor_t, metal_executor_t> device;
 
     /** The blocking queues a VRAM executor's call and its slices read drives through, one
@@ -1484,9 +1496,13 @@ struct ustore_executor_handle_t {
      *  and NVMe executors. */
     util::nvme_queues_t blocking_queues;
 
-    /** The class a VRAM executor's device was opened for, which every executor an engine spawns
+    /** The class a VRAM executor's devices were opened for, which every executor an engine spawns
      *  there takes too; @c unknown_k on RAM and NVMe. */
     gpu_class_t gpu_class = gpu_class_t::unknown_k;
+
+    /** How bytes move between the drives and a VRAM executor's NVIDIA devices, which the
+     *  compactions on it read sections by. */
+    ustore_gds_t gds = ustore_gds_automatic_k;
 };
 
 /** The queues @p executor holds when @c ustore_executor_for_nvme made it, which the databases it

@@ -163,4 +163,5 @@ from ustore.types import (
     StringsView,
     Tape,
     Transport,
+    VramOptions,
 )

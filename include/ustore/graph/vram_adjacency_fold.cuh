@@ -82,10 +82,10 @@ struct fold_spill_t { // device-boundary
 
 static_assert(sizeof(fold_spill_t) == 32, "A fold's spill is four words");
 
-/** Whether one block of @p device sorts a chain of @p width records in its shared memory, beside
- *  the scan's totals. */
-inline bool fold_sort_fits(utilities::gpu_device_t const& device, std::uint32_t width) noexcept {
-    return std::uint64_t {width} * sizeof(std::uint32_t) + fold_scan_bytes_k <= device.shared_memory_per_block_bytes;
+/** Whether one block holding @p shared_bytes of shared memory sorts a chain of @p width records
+ *  in it, beside the scan's totals. */
+inline bool fold_sort_fits(std::uint32_t shared_bytes, std::uint32_t width) noexcept {
+    return std::uint64_t {width} * sizeof(std::uint32_t) + fold_scan_bytes_k <= shared_bytes;
 }
 
 #if defined(__CUDACC__) || defined(__HIP__)
@@ -341,7 +341,7 @@ st::status_t launch_sort_steps(executor_type_& executor, fold_regions_t const& r
     // The launch of a stride below the block's threads finishes every stride below it
     for (std::uint32_t size = 2; size <= regions.spilled_width; size *= 2)
         for (std::uint32_t stride = size / 2; stride; stride = stride >= fold_block_threads_k ? stride / 2 : 0)
-            if (utilities::launch(executor, executor.kernels()->function("ustore_fold_sort_step"), blocks_count,
+            if (utilities::launch(executor, executor.kernels->function("ustore_fold_sort_step"), blocks_count,
                                   fold_block_threads_k, 0u, regions.records, regions.spill, size, stride)
                     .failed())
                 return st::status_t::unknown_k;
@@ -361,7 +361,7 @@ st::status_t launch_folds(executor_type_& executor, blocks_type_&, fold_regions_
         return status_t::unknown_k;
     if (status_t const sorted = launch_sort_steps(executor, regions); sorted != status_t::success_k) return sorted;
     unsigned const blocks_count = regions.chains_count < 65535 ? regions.chains_count : 65535;
-    if (utilities::launch(executor, executor.kernels()->function("ustore_fold_chains"), blocks_count,
+    if (utilities::launch(executor, executor.kernels->function("ustore_fold_chains"), blocks_count,
                           fold_block_threads_k, static_cast<unsigned>(regions.width * sizeof(std::uint32_t)),
                           regions.records, regions.starts, regions.chains_count, regions.spill, regions.kept,
                           regions.kept_counts)
@@ -370,7 +370,7 @@ st::status_t launch_folds(executor_type_& executor, blocks_type_&, fold_regions_
     std::uint64_t const tickets = fu::min_of(
         utilities::divide_round_up(std::uint64_t {regions.chains_count}, std::uint64_t {fold_block_threads_k}),
         utilities::chain_blocks_max_k);
-    if (utilities::launch(executor, executor.kernels()->function("ustore_fold_write"), static_cast<unsigned>(tickets),
+    if (utilities::launch(executor, executor.kernels->function("ustore_fold_write"), static_cast<unsigned>(tickets),
                           fold_block_threads_k, 0u, regions.records, regions.starts,
                           static_cast<std::uint32_t const*>(regions.kept),
                           static_cast<std::uint32_t const*>(regions.kept_counts), regions.chains_count, tickets,
@@ -384,7 +384,7 @@ st::status_t launch_folds(executor_type_& executor, blocks_type_&, fold_regions_
  *  launch flags the places every chain kept, the select over @p blocks lists them, and the second
  *  writes every one. */
 template <typename blocks_type_>
-st::status_t launch_folds(utilities::metal_executor_t& executor, blocks_type_& blocks,
+st::status_t launch_folds(utilities::metal_executor_t::stream_t& executor, blocks_type_& blocks,
                           fold_regions_t const& regions) noexcept {
     using st::status_t;
     // Few enough tiles that the select's one scanning threadgroup walks them quickly
@@ -402,7 +402,7 @@ st::status_t launch_folds(utilities::metal_executor_t& executor, blocks_type_& b
     unsigned const blocks_count = regions.chains_count < 65535 ? regions.chains_count : 65535;
     // Metal binds threadgroup memory in multiples of 16 bytes
     unsigned const sorted_bytes = utilities::round_up_to_multiple(regions.width * 4u, 16u);
-    if (utilities::launch(executor, executor.kernels()->function("ustore_fold_chains"), blocks_count,
+    if (utilities::launch(executor, executor.kernels->function("ustore_fold_chains"), blocks_count,
                           fold_block_threads_k, sorted_bytes, regions.records, regions.starts, regions.chains_count,
                           regions.spill, regions.kept, regions.kept_counts, flags.data())
             .failed())
@@ -414,7 +414,7 @@ st::status_t launch_folds(utilities::metal_executor_t& executor, blocks_type_& b
     std::uint64_t const groups = fu::min_of(
         utilities::divide_round_up(std::uint64_t {regions.records_count}, std::uint64_t {fold_block_threads_k}),
         std::uint64_t {65535});
-    if (utilities::launch(executor, executor.kernels()->function("ustore_fold_write"), static_cast<unsigned>(groups),
+    if (utilities::launch(executor, executor.kernels->function("ustore_fold_write"), static_cast<unsigned>(groups),
                           fold_block_threads_k, 0u, regions.records, regions.starts,
                           static_cast<std::uint32_t const*>(regions.kept), regions.chains_count, tiles, regions.removal,
                           regions.composed, regions.offsets, static_cast<std::uint32_t const*>(selected.data()),
@@ -441,8 +441,9 @@ st::status_t vram_adjacency_fold_t::compose(executor_type_& executor, blocks_typ
     for (std::uint64_t& offset : composed_offsets) offset = 0;
 
     // The widest chain one block sorts in its shared memory, past which chains spill
+    std::uint32_t const shared_bytes = utilities::shared_memory_per_block_bytes(executor);
     std::uint32_t shared_width = 1;
-    while (fold_sort_fits(executor.device(), shared_width * 2)) shared_width *= 2;
+    while (fold_sort_fits(shared_bytes, shared_width * 2)) shared_width *= 2;
 
     std::uint64_t total = 0;
     std::uint64_t longest = 0;
@@ -467,7 +468,7 @@ st::status_t vram_adjacency_fold_t::compose(executor_type_& executor, blocks_typ
     // A record's index is its place among the gathered ones, the largest left for the padding
     if (total > (std::numeric_limits<std::uint32_t>::max)()) return status_t::capacity_exhausted_k;
     if (total == 0) return status_t::success_k;
-    if (!executor.kernels()) return status_t::invalid_argument_k;
+    if (!executor.kernels) return status_t::invalid_argument_k;
 
     // Every width starts where the wider ones end, so a spilled chain starts at a multiple of it
     std::array<std::uint64_t, 64> spilled_firsts {};
@@ -481,7 +482,7 @@ st::status_t vram_adjacency_fold_t::compose(executor_type_& executor, blocks_typ
     // The chains gather back to back into the pinned bounce, which the device reads at the
     // bus's full speed
     auto const bounce = [&executor]<typename element_type_>(std::size_t count) noexcept {
-        auto [carved, carve_status] = utilities::arena_allocate<element_type_>(executor.bounce(), count);
+        auto [carved, carve_status] = utilities::arena_allocate<element_type_>(executor.memory.bounce.arena(), count);
         return carve_status.failed() ? static_cast<element_type_*>(nullptr) : carved.data();
     };
     std::size_t const records_count = static_cast<std::size_t>(total);
@@ -493,7 +494,7 @@ st::status_t vram_adjacency_fold_t::compose(executor_type_& executor, blocks_typ
     std::uint64_t* const spilled_starts = bounce.template operator()<std::uint64_t>(spilled_chains_count + 1);
     std::uint32_t* const spilled_chains = bounce.template operator()<std::uint32_t>(spilled_chains_count);
     if (!gathered || !gathered_starts || !downloaded || !downloaded_offsets || !spilled_starts ||
-        (spilled_chains_count != 0 && (!spilled_sorted || !spilled_chains)) || executor.pin_bounce().failed())
+        (spilled_chains_count != 0 && (!spilled_sorted || !spilled_chains)) || executor.memory.bounce.pin().failed())
         return status_t::out_of_memory_heap_k;
     constexpr std::uint32_t padding = (std::numeric_limits<std::uint32_t>::max)();
     std::uint32_t count = 0;

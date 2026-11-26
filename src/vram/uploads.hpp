@@ -22,7 +22,7 @@
 #include "ustore/utilities/ram_buffers.hpp" // `device_blocks_t`
 #include "ustore/utilities/vram_device.hpp" // `device_blocks_of`
 
-#include "engine.hpp"       // `residency_tables`, `residency_executor`, `engine_of`, `database_of`
+#include "engine.hpp"       // `residency_tables`, `residency_stream`, `engine_of`, `database_of`
 #include "lib.hpp"          // `verb_slot`
 #include "vram/columns.hpp" // `upload_output_columns`
 #include "vram/gathers.hpp" // `gather_documents_on_device`, `read_documents_on_device`, `device_answer_t`
@@ -41,7 +41,7 @@ status_t upload_through_host(arguments_type_ const& arguments, rest_types_&... r
     constexpr std::size_t ragged_count = sizeof...(rest_types_) - 2;
     std::tuple<rest_types_&...> const tail {rest...};
     view_t const& view = std::get<ragged_count>(tail);
-    residency_executor<residency_>& executor = std::get<ragged_count + 1>(tail);
+    residency_stream<residency_>& executor = std::get<ragged_count + 1>(tail);
 
     engine_t const& engine = engine_of(database_of(arguments));
     auto const* const verbs = engine.host.*verb_slot<arguments_type_>::template table<vendored_residency_t::host_k>;
@@ -52,7 +52,7 @@ status_t upload_through_host(arguments_type_ const& arguments, rest_types_&... r
     if (!blocks) return {status_code_t::device_k, "The arena lives where another executor computes"};
 
     arguments_type_ hosted = arguments;
-    hosted.arena = executor.bounce();
+    hosted.arena = executor.memory.bounce.arena();
     status_t const served = [&]<std::size_t... index_>(std::index_sequence<index_...>) noexcept {
         // A scan of documents uploads its keys alone
         if constexpr (std::is_same_v<arguments_type_, ustore_docs_scan_t>) return verb(hosted, nullptr, view);

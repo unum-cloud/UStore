@@ -58,6 +58,16 @@ constexpr st::status_t status_from_(fu::status_t status) noexcept {
     }
 }
 
+/** The memory domain naming none, where an allocation takes the plain heap. */
+inline constexpr fu_memory_domain_id_t no_memory_domain_k = -1;
+
+/** The memory domain nearest the PCI function at @p bus_id, or @c no_memory_domain_k where the
+ *  topology names none. */
+inline fu_memory_domain_id_t memory_domain_of_pci(char const* bus_id) noexcept {
+    fu_memory_domain_id_t domain = no_memory_domain_k;
+    return fu_memory_domain_id_of_pci(bus_id, &domain) == fu_success_k ? domain : no_memory_domain_k;
+}
+
 /** Harvests the topology of the machine the process runs on. */
 [[nodiscard]] inline st::expected<fu::topology_t> harvest_topology() noexcept {
     fu::topology_t topology;

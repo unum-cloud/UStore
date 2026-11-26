@@ -60,6 +60,7 @@ constexpr spelling<ustore_status_t> status_names_k[] {
     {ustore_status_malformed_k, "malformed"},
     {ustore_status_internal_k, "internal"},
     {ustore_status_uninitialized_k, "uninitialized"},
+    {ustore_status_config_mismatch_k, "config-mismatch"},
     {ustore_status_contended_k, "contended"},
     {ustore_status_cancelled_k, "cancelled"},
     {ustore_status_unsupported_k, "unsupported"},
@@ -356,8 +357,8 @@ void ustore_executor_for_vram(ustore_executor_for_vram_t* arguments) {
         return call.refuse(ustore_status_invalid_argument_k, "The call needs an output for the executor");
     if (std::string_view(ustore_gds_name(arguments->gds)) == "unrecognized")
         return call.refuse(ustore_status_invalid_argument_k, "Unknown GPUDirect Storage mode");
-    if (arguments->gpu_class_ceiling != ustore_gpu_class_unknown_k &&
-        std::string_view(ustore_gpu_class_name(arguments->gpu_class_ceiling)) == "unrecognized")
+    if (arguments->vram.gpu_class_ceiling != ustore_gpu_class_unknown_k &&
+        std::string_view(ustore_gpu_class_name(arguments->vram.gpu_class_ceiling)) == "unrecognized")
         return call.refuse(ustore_status_invalid_argument_k, "Unknown GPU class ceiling");
     // The stand-in drives no GPU, so it lists none and no ordinal names a device
     call.refuse(ustore_status_device_k, "No GPU holds the ordinal");

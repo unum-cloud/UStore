@@ -33,7 +33,7 @@
 #include "ustore/utilities/vram_matching.cuh" // `matching_walkers_t`, `matching_found_t`
 
 #include "docs_layer.hpp"    // `field_of`, `reads_whole_documents`
-#include "engine.hpp"        // `engine_of`, `residency_executor`
+#include "engine.hpp"        // `engine_of`, `residency_stream`
 #include "vram/matching.hpp" // `match_memory`, `rebase_on_device`, `shape_of`, `matching_frames_k`
 
 namespace unum::ustore {
@@ -67,7 +67,7 @@ inline unsigned blocks_for(std::size_t lanes, unsigned threads) noexcept {
  *  one length class share the walkers' memory in stream order. Nothing is waited for: the walks'
  *  refusal lands in the page.
  */
-template <a_gpu_executor executor_type_>
+template <a_gpu_stream executor_type_>
 expected<walked_documents_t> walk_documents(engine_t const& engine, ustore_docs_read_t whole,
                                             std::span<std::string_view const> fields, view_t const& view,
                                             executor_type_& executor, util::device_blocks_t& blocks) noexcept {
@@ -75,7 +75,7 @@ expected<walked_documents_t> walk_documents(engine_t const& engine, ustore_docs_
         return status_t {status_code_t::unsupported_k, "The engine keeps no collections of that modality"};
     ustore_strings_view_t tape {};
     whole.values = &tape;
-    whole.arena = executor.bounce();
+    whole.arena = executor.memory.bounce.arena();
     whole.outputs_type = ustore_docs_field_type_json_k;
     if (status_t const status = engine.host.docs->read(whole, strings_arg_t {}, view); status.failed()) return status;
 
@@ -83,7 +83,7 @@ expected<walked_documents_t> walk_documents(engine_t const& engine, ustore_docs_
     if (compiled_status.failed()) return compiled_status;
     std::size_t const count = static_cast<std::size_t>(whole.count), paths_count = compiled.paths.size();
     walked_documents_t walked {{}, compiled.path_of_field};
-    ustore_arena_t const work = executor.bounce();
+    ustore_arena_t const work = executor.memory.bounce.arena();
 
     // Every document is a row whose cells stay missing until a walk fills them, a missing one empty
     bool const wide = tape.layout == ustore_strings_u64_tape_k;
@@ -103,7 +103,7 @@ expected<walked_documents_t> walk_documents(engine_t const& engine, ustore_docs_
     for (status_t const carved : {offsets_on_device_status, bytes_on_device_status, matches_status, found_status})
         if (carved.failed()) return carved;
     std::uint32_t* const refused = found.data() + count;
-    if (status_t const pinned = executor.pin_bounce(); pinned.failed()) return pinned;
+    if (status_t const pinned = executor.memory.bounce.pin(); pinned.failed()) return pinned;
     for (status_t const copied :
          {executor.upload_async(reinterpret_cast<std::uintptr_t>(offsets_on_device.data()), std::as_bytes(offsets)),
           executor.upload_async(reinterpret_cast<std::uintptr_t>(bytes_on_device.data()), std::as_bytes(bytes)),
@@ -157,7 +157,7 @@ expected<walked_documents_t> walk_documents(engine_t const& engine, ustore_docs_
     for (status_t const carved : {lists_status, stacks_status, keys_status})
         if (carved.failed()) return carved;
     std::span<std::uint32_t const> const listed {shape.per_thread.data(), 3 * count};
-    if (status_t const pinned = executor.pin_bounce(); pinned.failed()) return pinned;
+    if (status_t const pinned = executor.memory.bounce.pin(); pinned.failed()) return pinned;
     if (status_t const copied = executor.upload_async(reinterpret_cast<std::uintptr_t>(lists.data()),
                                                       std::as_bytes(listed));
         copied.failed())
@@ -176,11 +176,11 @@ expected<walked_documents_t> walk_documents(engine_t const& engine, ustore_docs_
     // JSON walks as a group however short the value, as it classifies a window across the lanes
     for (std::span<std::uint32_t> const picked : {shape.per_thread, shape.per_group})
         if (launched.succeeded() && !picked.empty())
-            launched = launch(executor, executor.kernels()->function("ustore_subdocuments_find_per_group"),
+            launched = launch(executor, executor.kernels->function("ustore_subdocuments_find_per_group"),
                               blocks_for(picked.size() * group_lanes, threads), threads, 0u, *on_device, page(picked),
                               walkers, stored);
     if (launched.succeeded() && !shape.per_chunk.empty())
-        launched = launch(executor, executor.kernels()->function("ustore_subdocuments_find_per_chunk"),
+        launched = launch(executor, executor.kernels->function("ustore_subdocuments_find_per_chunk"),
                           blocks_for(shape.per_chunk.size() * group_lanes, threads), threads, 0u, *on_device,
                           page(shape.per_chunk), walkers, stored, matching_chunk_bytes_k);
     if (launched.failed()) return launched;
@@ -197,7 +197,7 @@ struct measured_texts_t {
 
 /** Measures the rows of @p texts on @p executor and scans their lengths into offsets carved off
  *  @p blocks, filling in the scratch the kernels need. */
-template <a_gpu_executor executor_type_>
+template <a_gpu_stream executor_type_>
 expected<measured_texts_t> measure_texts(walked_documents_t const& walked, gather_texts_t texts,
                                          executor_type_& executor, util::device_blocks_t& blocks) noexcept {
     std::size_t const rows = walked.page.rows;
@@ -210,11 +210,11 @@ expected<measured_texts_t> measure_texts(walked_documents_t const& walked, gathe
     texts.measured = measured.data();
     texts.offsets = offsets.data();
     status_t launched = launch(
-        executor, executor.kernels()->function("ustore_docs_measure_texts"),
+        executor, executor.kernels->function("ustore_docs_measure_texts"),
         blocks_for(util::divide_round_up<std::size_t>(rows, gather_lane_rows_k), gather_block_threads_k),
         gather_block_threads_k, 0u, walked.page, texts);
     if (launched.succeeded())
-        launched = launch(executor, executor.kernels()->function("ustore_tape_offsets_u64"), 1u,
+        launched = launch(executor, executor.kernels->function("ustore_tape_offsets_u64"), 1u,
                           util::tape_block_threads_k, 0u, static_cast<util::tape_source_t const*>(measured.data()),
                           std::uint64_t {rows}, util::tape_sources_per_segment_k, offsets.data(), segments.data());
     if (launched.failed()) return launched;
@@ -224,7 +224,7 @@ expected<measured_texts_t> measure_texts(walked_documents_t const& walked, gathe
 /** Carves the @p total bytes of the measured @p texts off @p blocks and writes their rows there,
  *  behind offsets as narrow as their bytes allow, as the host exports a tape: 32-bit ones scanned
  *  again from the same lengths. */
-template <a_gpu_executor executor_type_>
+template <a_gpu_stream executor_type_>
 expected<ustore_strings_view_t> write_texts(walked_documents_t const& walked, measured_texts_t measured,
                                             std::uint64_t total, executor_type_& executor,
                                             util::device_blocks_t& blocks) noexcept {
@@ -233,7 +233,7 @@ expected<ustore_strings_view_t> write_texts(walked_documents_t const& walked, me
     measured.texts.bytes = bytes.data();
     status_t launched;
     if (total)
-        launched = launch(executor, executor.kernels()->function("ustore_docs_write_texts"),
+        launched = launch(executor, executor.kernels->function("ustore_docs_write_texts"),
                           blocks_for(walked.page.rows, gather_block_threads_k), gather_block_threads_k, 0u, walked.page,
                           measured.texts);
     if (launched.failed()) return launched;
@@ -242,7 +242,7 @@ expected<ustore_strings_view_t> write_texts(walked_documents_t const& walked, me
     std::size_t const rows = walked.page.rows;
     auto [narrow, narrow_status] = carve<std::uint32_t>(blocks, executor, rows + 1);
     if (narrow_status.failed()) return narrow_status;
-    launched = launch(executor, executor.kernels()->function("ustore_tape_offsets_u32"), 1u, util::tape_block_threads_k,
+    launched = launch(executor, executor.kernels->function("ustore_tape_offsets_u32"), 1u, util::tape_block_threads_k,
                       0u, static_cast<util::tape_source_t const*>(measured.texts.measured), std::uint64_t {rows},
                       util::tape_sources_per_segment_k, narrow.data(), measured.segments.data());
     if (launched.failed()) return launched;
@@ -252,12 +252,12 @@ expected<ustore_strings_view_t> write_texts(walked_documents_t const& walked, me
 /** Downloads the refusal of @p walked and the last offset of every one of @p measured into
  *  the bounce and waits, answering whether the call is left to the host, with the totals
  *  in @p totals. */
-template <a_gpu_executor executor_type_>
+template <a_gpu_stream executor_type_>
 expected<device_answer_t> settle_measures(walked_documents_t const& walked, std::span<measured_texts_t const> measured,
                                           std::span<std::uint64_t> totals, executor_type_& executor) noexcept {
-    auto [refused, refused_status] = arena_allocate<std::uint32_t>(executor.bounce(), 1);
+    auto [refused, refused_status] = arena_allocate<std::uint32_t>(executor.memory.bounce.arena(), 1);
     if (refused_status.failed()) return refused_status;
-    status_t downloaded = executor.pin_bounce();
+    status_t downloaded = executor.memory.bounce.pin();
     if (downloaded.succeeded())
         downloaded = executor.download_async(std::as_writable_bytes(refused),
                                              reinterpret_cast<std::uintptr_t>(walked.page.refused));
@@ -307,12 +307,12 @@ inline bool converts_on_device(ustore_docs_gather_t const& arguments) noexcept {
 template <vendored_residency_t residency_>
 expected<device_answer_t> gather_documents_on_device(ustore_docs_gather_t const& arguments, strings_arg_t const& fields,
                                                      view_t const& view,
-                                                     residency_executor<residency_>& executor) noexcept {
+                                                     residency_stream<residency_>& executor) noexcept {
     if (!arguments.count || !arguments.fields_count) return device_answer_t::served_k;
     if (!arguments.columns) return status_t {status_code_t::invalid_argument_k, "Need an output for the columns"};
     if (!fields || !arguments.outputs_types)
         return status_t {status_code_t::invalid_argument_k, "Needs the gathered fields and column types"};
-    if (!executor.kernels() || !converts_on_device(arguments) || arguments.count > no_cell_path_k)
+    if (!executor.kernels || !converts_on_device(arguments) || arguments.count > no_cell_path_k)
         return device_answer_t::left_to_host_k;
     util::device_blocks_t* const blocks = device_blocks_of(arguments.arena, executor);
     if (!blocks) return status_t {status_code_t::device_k, "The arena lives where another executor computes"};
@@ -325,7 +325,8 @@ expected<device_answer_t> gather_documents_on_device(ustore_docs_gather_t const&
                                                   view, executor, *blocks);
     if (walked_status.failed()) return walked_status;
 
-    auto [views, views_status] = arena_allocate<ustore_docs_column_view_t>(executor.bounce(), fields_count);
+    auto [views, views_status] = arena_allocate<ustore_docs_column_view_t>(executor.memory.bounce.arena(),
+                                                                           fields_count);
     if (views_status.failed()) return views_status;
     auto [measured, measured_status] = arena_allocate<measured_texts_t>(view.scratch, fields_count);
     if (measured_status.failed()) return measured_status;
@@ -355,7 +356,7 @@ expected<device_answer_t> gather_documents_on_device(ustore_docs_gather_t const&
             if (scalars_status.failed()) return scalars_status;
             views[field].scalars = scalars.data();
             gather_scalars_t const column {bitmaps.data(), scalars.data(), bitmap_stride, type, path};
-            if (status_t const launched = launch(executor, executor.kernels()->function("ustore_docs_gather_scalars"),
+            if (status_t const launched = launch(executor, executor.kernels->function("ustore_docs_gather_scalars"),
                                                  scalar_blocks, gather_block_threads_k, 0u, walked.page, column);
                 launched.failed())
                 return launched;
@@ -373,7 +374,7 @@ expected<device_answer_t> gather_documents_on_device(ustore_docs_gather_t const&
         texts_of_fields[texts_count++] = field;
     }
 
-    auto [totals, totals_status] = arena_allocate<std::uint64_t>(executor.bounce(), texts_count);
+    auto [totals, totals_status] = arena_allocate<std::uint64_t>(executor.memory.bounce.arena(), texts_count);
     if (totals_status.failed()) return totals_status;
     auto [answer, answer_status] = settle_measures(walked, measured.first(texts_count), totals, executor);
     if (answer_status.failed()) return answer_status;
@@ -407,9 +408,9 @@ expected<device_answer_t> gather_documents_on_device(ustore_docs_gather_t const&
 template <vendored_residency_t residency_>
 expected<device_answer_t> read_documents_on_device(ustore_docs_read_t const& arguments, strings_arg_t const& fields,
                                                    view_t const& view,
-                                                   residency_executor<residency_>& executor) noexcept {
+                                                   residency_stream<residency_>& executor) noexcept {
     if (!arguments.count) return device_answer_t::served_k;
-    if (reads_whole_documents(arguments, fields) || !executor.kernels() || arguments.count > no_cell_path_k)
+    if (reads_whole_documents(arguments, fields) || !executor.kernels || arguments.count > no_cell_path_k)
         return device_answer_t::left_to_host_k;
     if (arguments.outputs_type != ustore_docs_field_type_json_k &&
         arguments.outputs_type != ustore_docs_field_type_string_k)
@@ -426,7 +427,7 @@ expected<device_answer_t> read_documents_on_device(ustore_docs_read_t const& arg
     if (walked_status.failed()) return walked_status;
 
     // Every task reads its own path, which the kernels look up per row
-    auto [paths, paths_status] = arena_allocate<std::uint32_t>(executor.bounce(), rows);
+    auto [paths, paths_status] = arena_allocate<std::uint32_t>(executor.memory.bounce.arena(), rows);
     if (paths_status.failed()) return paths_status;
     for (std::size_t task = 0; task != rows; ++task) paths[task] = cell_path_of(walked, task);
     auto [paths_on_device, paths_on_device_status] = carve<std::uint32_t>(*blocks, executor, rows);
@@ -435,7 +436,7 @@ expected<device_answer_t> read_documents_on_device(ustore_docs_read_t const& arg
     auto [lengths, lengths_status] = carve<ustore_length_t>(*blocks, executor, arguments.lengths ? rows : 0);
     for (status_t const carved : {paths_on_device_status, presences_status, lengths_status})
         if (carved.failed()) return carved;
-    if (status_t const pinned = executor.pin_bounce(); pinned.failed()) return pinned;
+    if (status_t const pinned = executor.memory.bounce.pin(); pinned.failed()) return pinned;
     if (status_t const copied = executor.upload_async(reinterpret_cast<std::uintptr_t>(paths_on_device.data()),
                                                       std::as_bytes(paths));
         copied.failed())
@@ -449,7 +450,7 @@ expected<device_answer_t> read_documents_on_device(ustore_docs_read_t const& arg
     auto [measured, measure_status] = measure_texts(walked, texts, executor, *blocks);
     if (measure_status.failed()) return measure_status;
 
-    auto [totals, totals_status] = arena_allocate<std::uint64_t>(executor.bounce(), 1);
+    auto [totals, totals_status] = arena_allocate<std::uint64_t>(executor.memory.bounce.arena(), 1);
     if (totals_status.failed()) return totals_status;
     auto [answer, answer_status] = settle_measures(walked, {&measured, 1}, totals, executor);
     if (answer_status.failed()) return answer_status;

@@ -570,7 +570,7 @@ typedef struct ustore_database_open_nvme_t {
     /** Entries of @c data_directories. */
     ustore_size_t data_directories_count;
 
-    /** Executor of @c ustore_executor_for_vram on an NVIDIA, AMD or Apple device, whose device,
+    /** Executor of @c ustore_executor_for_vram on NVIDIA, AMD or Apple devices, whose first device,
      *  scratch budget and, on NVIDIA, GPUDirect Storage mode every merge of the database takes,
      *  read once here, so it may be freed afterwards; @c NULL merges on host threads. */
     ustore_executor_t compactions;

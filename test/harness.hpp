@@ -693,6 +693,7 @@ template <typename code_type_>
     case ustore_status_malformed_k: return "malformed";
     case ustore_status_internal_k: return "internal";
     case ustore_status_uninitialized_k: return "uninitialized";
+    case ustore_status_config_mismatch_k: return "config-mismatch";
     case ustore_status_contended_k: return "contended";
     case ustore_status_cancelled_k: return "cancelled";
     case ustore_status_unsupported_k: return "unsupported";

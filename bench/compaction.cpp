@@ -29,7 +29,7 @@
  *  --write-limit     8GiB      Bytes the process may write before it stops
  *  @endverbatim
  */
-#include <cstdint> // `std::uintmax_t`
+#include <cstdint> // `std::int32_t`, `std::uintmax_t`
 #include <cstdio>  // `std::fopen`, `std::fscanf`, `std::fread`, `std::fwrite`, `std::fclose`
 #include <cstring> // `std::memcpy`, `std::memcmp`
 
@@ -378,9 +378,10 @@ std::uint64_t drop_cached(std::string_view directory) noexcept {
     }
     ustore_executor_t compactions = nullptr;
     if (settings.on_gpu()) {
+        std::int32_t const device = 0;
         ustore_executor_for_vram_t spawn {.executor = &compactions,
                                           .outcome = &outcome,
-                                          .device = 0,
+                                          .vram = {.devices = &device, .devices_count = 1},
                                           .gds = ustore_gds_compatibility_k};
         ustore_executor_for_vram(&spawn);
         if (outcome.status != ustore_status_success_k) {

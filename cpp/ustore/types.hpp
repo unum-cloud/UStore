@@ -75,6 +75,7 @@ enum class status_code_t : int {
     malformed_k = ustore_status_malformed_k,
     internal_k = ustore_status_internal_k,
     uninitialized_k = ustore_status_uninitialized_k,
+    config_mismatch_k = ustore_status_config_mismatch_k,
     contended_k = ustore_status_contended_k,
     cancelled_k = ustore_status_cancelled_k,
     unsupported_k = ustore_status_unsupported_k,
@@ -1655,10 +1656,10 @@ class executor_t {
         return opened_<executor_t>(ustore_executor_for_nvme, arguments, &ustore_executor_for_nvme_t::executor);
     }
 
-    /** Opens a stream of its own on the device @p arguments name by its UStore ordinal, created
-     *  and destroyed with the executor and fed by the calling thread; a caller's stream answers
-     *  @c status_code_t::unsupported_k, since the executor drives only its own. An NVMe database
-     *  compacts on it on NVIDIA. */
+    /** Orders work on one stream on every device @p arguments name by their UStore ordinals, or on
+     *  every device of the first vendor with a known class for none, each opened or adopted from
+     *  the caller and destroyed with the executor, all fed by the calling thread. An NVMe database
+     *  compacts on its first device. */
     static expected<executor_t> for_vram(ustore_executor_for_vram_t arguments = {}) noexcept {
         return opened_<executor_t>(ustore_executor_for_vram, arguments, &ustore_executor_for_vram_t::executor);
     }

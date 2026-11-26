@@ -366,7 +366,7 @@ A blocking call on an executor runs on the calling thread, a deferred one is del
 
 - `ustore_executor_for_ram` spawns caller-exclusive threads near the NUMA nodes its `ram` options name, every node the process may allocate on for `NULL`, where zero threads take all but one in eight of the cores those nodes hold.
 - `ustore_executor_for_nvme` spawns the threads of the NVMe engine near its `ram` domains or the drives its `nvme` paths name, and its `nvme` options tell every database opened on it how to move bytes; an NVMe database refuses a RAM executor with `ustore_status_device_k`.
-- `ustore_executor_for_vram` queues every call on one stream of a CUDA device, and serves the reads and scans an engine computes there, refusing changes with `ustore_status_unsupported_k`.
+- `ustore_executor_for_vram` queues every call on one stream per GPU it names, all of one vendor, or on every GPU of the first vendor with a known class for none, each stream opened or adopted from the caller and destroyed with it, and serves the reads and scans an engine computes there, refusing changes with `ustore_status_unsupported_k`; arenas live on its first device, and a filtered scan deals its pages across every device.
 
 ```c
 int32_t const memory_domains[1] = {0};

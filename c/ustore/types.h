@@ -346,11 +346,11 @@ typedef struct ustore_strings_view_t {
 /**
  *  @brief What went wrong, in one vocabulary shared by every engine and binding.
  *
- *  Shared statuses hold USearch's numbers, leaving 3, 4, 5, 11 and 13 unused, and UStore's own
- *  start at 18. Statuses fall into five categories: resources, input, state, interruptions and
- *  defects. Any verb that allocates, binds a device or touches a file may also return a resources
- *  status; any verb taking a progress callback may return an interruption. A verb's own block lists
- *  only what its contract adds.
+ *  Shared statuses hold USearch's numbers, leaving 3, 4, 5 and 11 unused, and UStore's own start
+ *  at 18. Statuses fall into five categories: resources, input, state, interruptions and defects.
+ *  Any verb that allocates, binds a device or touches a file may also return a resources status;
+ *  any verb taking a progress callback may return an interruption. A verb's own block lists only
+ *  what its contract adds.
  */
 typedef enum ustore_status_t {
 
@@ -382,6 +382,10 @@ typedef enum ustore_status_t {
 
     /** The call needs a database or transaction that was never opened. */
     ustore_status_uninitialized_k = 12,
+
+    /** The handles or arguments are each well-formed but cannot be joined, like devices of more
+     *  than one vendor, or a stream on another device than its entry names. */
+    ustore_status_config_mismatch_k = 13,
 
     /** The call was refused rather than waited for: another call holds its executor, arena, cursor
      *  or transaction, or a drain came from inside a callback of the call it would wait on. */
@@ -1023,7 +1027,7 @@ USTORE_EXPORT char const* ustore_gpu_class_name(ustore_gpu_class_t gpu_class);
 USTORE_EXPORT ustore_status_t ustore_gpu_class_from_name(ustore_bytes_view_t name, ustore_gpu_class_t* gpu_class);
 
 /** One GPU as UStore numbers it: its position in the listing of @c ustore_gpu_devices is the ordinal
- *  @c ustore_executor_for_vram_t::device names it by. */
+ *  @c ustore_vram_options_t::devices names it by. */
 typedef struct ustore_gpu_device_t {
 
     /** The vendor whose runtime drives the device. */
@@ -1065,7 +1069,7 @@ typedef struct ustore_gpu_devices_t {
 
 /**
  *  @brief Lists every GPU this process can drive, NVIDIA devices first, then AMD, then Apple, so
- *      the position of a device is the ordinal @c ustore_executor_for_vram_t::device names it by.
+ *      the position of a device is the ordinal @c ustore_vram_options_t::devices names it by.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  Each vendor's runtime opens on the first call, and a vendor whose runtime is absent lists no
@@ -1074,6 +1078,24 @@ typedef struct ustore_gpu_devices_t {
  *  where none does. The listing is taken once per process and never changes after.
  */
 USTORE_EXPORT void ustore_gpu_devices(ustore_gpu_devices_t* arguments);
+
+/** The GPUs a VRAM executor drives, one stream each, all of one vendor. */
+typedef struct ustore_vram_options_t {
+
+    /** The UStore ordinals of @c ustore_gpu_devices the executor drives, copied by the call,
+     *  where a repeated ordinal is driven once; @c NULL takes every listed device of the first
+     *  vendor with a known class, each of a known class itself. */
+    int32_t const* devices;
+
+    /** Entries of @c devices, where zero derives as @c NULL does. */
+    ustore_size_t devices_count;
+
+    /** The @b optional newest class dispatch may pick: every device runs the newest class all of
+     *  them load at or under it, so an H100 beside an L4 runs Ada code; a ceiling under which some
+     *  device loads none is refused, and zero sets no ceiling. */
+    ustore_gpu_class_t gpu_class_ceiling;
+
+} ustore_vram_options_t;
 
 /** The arguments of @c ustore_executor_for_vram. */
 typedef struct ustore_executor_for_vram_t {
@@ -1084,52 +1106,59 @@ typedef struct ustore_executor_for_vram_t {
     /** Output for the outcome, final on return. */
     ustore_outcome_t* outcome;
 
-    /** The UStore ordinal of the device every call and arena of this executor uses, its
-     *  position in the listing of @c ustore_gpu_devices; an ordinal no device holds is
-     *  refused with @c ustore_status_device_k. */
-    int32_t device;
+    /** The devices the executor drives, read only during the call. */
+    ustore_vram_options_t vram;
 
-    /** A stream of the caller's on @c device, declared and answering
-     *  @c ustore_status_unsupported_k, since the executor drives only its own: @c NULL, the one
-     *  value served, has it create a stream on @c device, an @c id<MTLCommandQueue> on Apple, and
-     *  destroy it when freed. */
-    void* stream;
+    /** The @b optional streams to adopt, one per entry of @c vram.devices and on that device, an
+     *  @c id<MTLCommandQueue> on Apple. On success a CUDA or HIP stream becomes the executor's,
+     *  which synchronizes and destroys it in @c ustore_executor_free; a Metal queue is retained,
+     *  the executor releasing its own reference there while the caller keeps and releases theirs.
+     *  On failure every stream stays the caller's as it was. @c NULL has the executor open its
+     *  own; default streams are refused. */
+    void* const* streams;
 
-    /** The @b optional ceiling on the device scratch a call or a merge takes; zero lets scratch grow as calls ask. */
+    /** The @b optional ceiling on the device scratch a call or a merge takes, per device, so N
+     *  devices hold up to N times it; zero lets scratch grow as calls ask. */
     ustore_size_t scratch_limit;
 
-    /** How reads and compactions move bytes between the drives and the device. */
+    /** How reads and compactions move bytes between the drives and the devices. */
     ustore_gds_t gds;
-
-    /** The @b optional newest class dispatch may pick, capping the best class @c device loads; a
-     *  ceiling under which the device loads none is refused, and zero sets no ceiling. */
-    ustore_gpu_class_t gpu_class_ceiling;
 
 } ustore_executor_for_vram_t;
 
 /**
- *  @brief Orders work on one stream on @c device, created with the executor and destroyed with it,
- *      fed by its caller.
+ *  @brief Orders work on one stream per device of @c vram, opened or adopted with the executor and
+ *      destroyed with it, every device fed by the one calling thread.
  *  @param[in] arguments Named arguments, whose outputs are written through their pointers.
  *
  *  The executor spawns no pool: its caller is its one host thread, reading drives through blocking
- *  queues the executor owns, so a warm call allocates nothing.
- *  Every call queues on that stream from the calling thread, which waits on it there, so a deferred
- *  call is final when it returns, as a blocking one is, and a multi-GPU caller makes one executor
- *  per device. Its calls read through an engine's device verbs, which refuse changes, the control
- *  plane and every call no device tower serves yet with @c ustore_status_unsupported_k, and arenas
- *  it makes live on its device. @c ustore_database_open_nvme takes one of an NVIDIA device as its
- *  @c compactions, reading its device and scratch limit once. Every build makes one, as the
+ *  queues the executor owns, so a warm call allocates nothing. Every call queues from the calling
+ *  thread, which enters each device in turn and waits on it there, so a deferred call is final when
+ *  it returns, as a blocking one is, and no thread is pinned to a device. Arenas the executor makes
+ *  live on its first device, where every call computes, except a filtered scan, which deals its
+ *  pages across every device and narrows each on the host. Its calls read through an engine's
+ *  device verbs, which refuse changes, the control plane and every call no device tower serves yet
+ *  with @c ustore_status_unsupported_k. @c ustore_database_open_nvme takes one as its
+ *  @c compactions, reading its first device and scratch limit once. Every build makes one, as the
  *  vendor's runtime opens at the first call and the library links none.
+ *
+ *  A CUDA stream must sit on its device's primary context, which the runtime API creates streams
+ *  on. A stream under CUDA graph capture can't be waited on from the host, so a call on it fails
+ *  with @c ustore_status_device_k. Each call leaves the primary context of the last device it drove
+ *  current on the calling thread, as @c cuCtxSetCurrent does.
  *
  *  @par Statuses:
  *  - @c ustore_status_invalid_argument_k The @c executor output is @c NULL, the @c gds mode or the
- *    @c gpu_class_ceiling is unknown, or ForkUnion refuses an argument.
- *  - @c ustore_status_unsupported_k A @c stream of the caller's, no class this build compiled
- *    serves the device at or under the @c gpu_class_ceiling, the process may allocate on no memory
- *    domain, or the operating system denies ForkUnion an operation.
- *  - @c ustore_status_device_k No device holds the ordinal, its driver refuses a stream or an
- *    event, or @c ustore_gds_direct_k names a device other than NVIDIA.
+ *    @c gpu_class_ceiling is unknown, ForkUnion refuses an argument, a device named twice beside
+ *    @c streams, @c streams beside no named device at all, or a null or default stream, which no
+ *    executor can destroy.
+ *  - @c ustore_status_config_mismatch_k Devices of more than one vendor, or a stream on another
+ *    device than its entry names.
+ *  - @c ustore_status_unsupported_k No class this build compiled serves every device at or under
+ *    the @c gpu_class_ceiling, the process may allocate on no memory domain, or the operating
+ *    system denies ForkUnion an operation.
+ *  - @c ustore_status_device_k No device holds an ordinal, none has a known class, a driver
+ *    refuses a stream or an event, or @c ustore_gds_direct_k names a device other than NVIDIA.
  */
 USTORE_EXPORT void ustore_executor_for_vram(ustore_executor_for_vram_t* arguments);
 

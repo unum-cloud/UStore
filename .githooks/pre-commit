@@ -5151,16 +5151,6 @@ check_inheritance() {
     [ -z "$hits" ] || reject_with_reason "$hits" "$staged_path derives a type - hold the shared part as a member, or share a free function:"
 }
 
-# A lock added to make something work is a redesign postponed: partition the ownership, publish through an atomic
-# protocol on a ForkUnion reference, or wait through the class's waiter.
-check_new_mutexes() {
-    local hits
-    hits=$(printf '%s\n' "$staged_added_text" | grep -vE '^\+[[:space:]]*(//|/\*|\*( |/|$))' |
-        grep -E '\bstd::(recursive_|timed_|recursive_timed_|shared_|shared_timed_)?mutex\b|\bfu::spin_mutex_t\b|#[[:space:]]*include[[:space:]]*<(shared_)?mutex>' || true)
-    [ -z "$hits" ] || reject_with_reason "$hits" \
-        "$staged_path adds a mutex - ask first, or protect the state by ownership or an atomic protocol:"
-}
-
 # A verification model, client or note cites a symbol and its file, never `<file>.<ext>:<line>`, since a
 # line number drifts with every edit above it.
 check_verification_cites_symbols() {
@@ -5456,7 +5446,32 @@ run_tree_checks() {
 }
 
 # Routes one staged file through the checks only UStore has.
+# Rejects a new lock other than `fu::fair_mutex_t` from `<forkunion/locks.hpp>`, because the engines share one fair,
+# parking lock; ask first for anything else. `fu::fair_mutex<waiter, ref>` passes, and so does `<mutex>` beside it for
+# `std::lock_guard`; a binding source the binding lock check reads is left to that check.
+check_new_mutexes() {
+    local locks='\bstd::(recursive_|timed_|recursive_timed_|shared_|shared_timed_)?mutex\b|#[[:space:]]*include[[:space:]]*<shared_mutex>|\bfu::spin_mutex_t\b|\bspin_shared_mutex|\bos_unfair_lock|\bpthread_mutex|\bPyMutex'
+    local hits
+    case "$staged_path" in
+    *[Tt]est*) ;;
+    python/* | cpp/*) ! declare -F check_binding_locks_absent > /dev/null || return 0 ;;
+    esac
+    grep -qE '\bfair_mutex(_t\b|<)' "$staged_text_path" || locks="$locks|#[[:space:]]*include[[:space:]]*<mutex>"
+    hits=$(if speaks_c_comments "$staged_path"; then cat "$staged_added_code_path"; else
+        printf '%s\n' "$staged_added_text" | grep -vE "$added_comment_line_pattern"; fi | grep -E "$locks" || true)
+    [ -z "$hits" ] || reject_with_reason "$hits" \
+        "$staged_path adds a lock other than fu::fair_mutex_t from <forkunion/locks.hpp>; ask first, or protect" \
+        "            the state by ownership, an atomic protocol or fu::fair_mutex_t:"
+}
+
 run_project_checks() {
+    case "$staged_path" in
+    include/* | src/* | cpp/* | c/* | python/*)
+        case "$staged_path" in
+        *.h | *.hpp | *.c | *.cpp | *.cc | *.cxx | *.cu | *.cuh | *.hip | *.m | *.mm) check_new_mutexes ;;
+        esac
+        ;;
+    esac
     run_binding_checks
     case "$staged_path" in
     src/*.h | src/*.hpp | src/*.c | src/*.cpp | src/*.cu | src/*.cuh | src/*.hip) check_free_io_absent ;;
@@ -5544,7 +5559,6 @@ run_project_checks() {
         case "$staged_path" in
         *.h | *.cpp | *.hpp | *.cu | *.cuh | *.hip | *.cc | *.cxx)
             check_inheritance
-            check_new_mutexes
             ;;
         esac
         ;;

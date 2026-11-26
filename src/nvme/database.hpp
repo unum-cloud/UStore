@@ -324,8 +324,9 @@ class device_compaction {
     device_compaction& operator=(device_compaction const&) = delete;
 
     /**
-     *  @brief Spawns the executor on the device @p compactions computes on and binds the compactor
-     *      over it, refusing with @c unsupported_k where the device loaded no bundle of kernels.
+     *  @brief Spawns the executor on the first device @p compactions computes on and binds the
+     *      compactor over it, refusing with @c unsupported_k where that device loaded no bundle
+     *      of kernels at all.
      *
      *  On an NVIDIA device the compactor reads run sections through the reader over @p volume,
      *  mounted over the data directories of @p resources, and on an AMD or an Apple one it uploads
@@ -338,11 +339,11 @@ class device_compaction {
         util::gpu_device_t twin {};
         std::size_t scratch_limit = 0;
         bool const on_device = std::visit(
-            [&]<typename device_type_>(device_type_ const& device) noexcept {
-                if constexpr (!util::a_gpu_executor<device_type_>) return false;
+            [&]<typename kind_type_>(kind_type_ const& kind) noexcept {
+                if constexpr (!util::a_gpu_executor<kind_type_>) return false;
                 else {
-                    twin = device.device();
-                    scratch_limit = device.scratch_limit();
+                    twin = {kind_type_::vendor_k, static_cast<std::uint32_t>(kind.stream(0).ordinal)};
+                    scratch_limit = kind.stream(0).memory.limit;
                     return true;
                 }
             },
@@ -350,31 +351,31 @@ class device_compaction {
         if (!on_device)
             return util::status_t {util::status_code_t::device_k,
                                    "The compactions need an executor of ustore_executor_for_vram"};
-        util::cuda_executor_t const* const nvidia = std::get_if<util::cuda_executor_t>(&compactions.device);
         gpu_runtime_t& runtime = gpu_runtime();
         util::gpu_drivers_t const& drivers = runtime.drivers;
-        if (util::status_t const spawned = runtime.spawn(twin, compactions.gpu_class, scratch_limit,
-                                                         nvidia ? nvidia->gds() : ustore_gds_compatibility_k,
-                                                         executor_);
+        if (util::status_t const spawned = spawn_vram_executor(runtime, {&twin, 1}, compactions.gpu_class,
+                                                               scratch_limit, {}, executor_);
             spawned.failed())
             return spawned;
-        return std::visit([&](auto& executor) noexcept { return bind_(executor, drivers, resources, volume); },
-                          executor_);
+        return std::visit(
+            [&](auto& executor) noexcept { return bind_(executor, drivers, compactions.gds, resources, volume); },
+            executor_);
     }
 
   private:
 
     /** Refuses an executor slot no spawn filled, which a successful spawn never leaves. */
-    util::expected<compactor_ref_t> bind_(std::monostate&, util::gpu_drivers_t const&, util::resources_config_t const&,
-                                          volume_t const&) noexcept {
+    util::expected<compactor_ref_t> bind_(std::monostate&, util::gpu_drivers_t const&, ustore_gds_t,
+                                          util::resources_config_t const&, volume_t const&) noexcept {
         return util::status_t {util::status_code_t::internal_k, "The compactions spawned no executor"};
     }
 
     /** Binds the compactor over @p executor, reading run sections over @p volume where cuFile
-     *  reaches the NVIDIA device. */
+     *  reaches the NVIDIA device and @p gds lets bytes move by DMA. */
     util::expected<compactor_ref_t> bind_(util::cuda_executor_t& executor, util::gpu_drivers_t const& drivers,
-                                          util::resources_config_t const& resources, volume_t const& volume) noexcept {
-        if (util::status_t const opened = open_sections(drivers.cufile, executor.gds(), resources, volume);
+                                          ustore_gds_t gds, util::resources_config_t const& resources,
+                                          volume_t const& volume) noexcept {
+        if (util::status_t const opened = open_sections(drivers.extensions.cufile, gds, resources, volume);
             opened.failed())
             return opened;
         auto [compactor, status] = cuda_compactor_t::make(
@@ -385,7 +386,7 @@ class device_compaction {
 
     /** Binds the compactor over @p executor, uploading run sections from memory, as no AMD device
      *  reads them by DMA. */
-    util::expected<compactor_ref_t> bind_(util::hip_executor_t& executor, util::gpu_drivers_t const&,
+    util::expected<compactor_ref_t> bind_(util::hip_executor_t& executor, util::gpu_drivers_t const&, ustore_gds_t,
                                           util::resources_config_t const&, volume_t const&) noexcept {
         auto [compactor, status] = hip_compactor_t::make(executor);
         if (status.failed()) return status;
@@ -394,7 +395,7 @@ class device_compaction {
 
     /** Binds the compactor over @p executor, uploading run sections from memory, as no Apple device
      *  reads them by DMA. */
-    util::expected<compactor_ref_t> bind_(util::metal_executor_t& executor, util::gpu_drivers_t const&,
+    util::expected<compactor_ref_t> bind_(util::metal_executor_t& executor, util::gpu_drivers_t const&, ustore_gds_t,
                                           util::resources_config_t const&, volume_t const&) noexcept {
         auto [compactor, status] = metal_compactor_t::make(executor);
         if (status.failed()) return status;

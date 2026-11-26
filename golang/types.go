@@ -100,6 +100,8 @@ const (
 	StatusInternal Status = C.ustore_status_internal_k
 	// StatusUninitialized means the call needs a handle that was never opened or is closed.
 	StatusUninitialized Status = C.ustore_status_uninitialized_k
+	// StatusConfigMismatch means the handles or arguments are each well-formed but cannot be joined.
+	StatusConfigMismatch Status = C.ustore_status_config_mismatch_k
 	// StatusContended means the call was refused rather than waited for: another call holds its
 	// executor, arena, cursor or transaction.
 	StatusContended Status = C.ustore_status_contended_k
@@ -734,35 +736,39 @@ func ExecutorForNvme(memoryDomains []int32, nvme NvmeOptions, threads uint, cpuC
 	return executorOf(block(&call, nil))
 }
 
-// ExecutorForVramConfig carries the optional arguments of [ExecutorForVram].
-type ExecutorForVramConfig struct {
-	// Stream stays nil: the executor creates and destroys a stream of its own, and a caller's
-	// cudaStream_t, hipStream_t or id<MTLCommandQueue> answers [StatusUnsupported], since the
-	// executor drives only its own.
-	Stream unsafe.Pointer
-	// ScratchLimit caps the device scratch a call or a merge takes; zero lets scratch grow.
-	ScratchLimit uint64
-	// Gds is how reads and compactions move bytes between the drives and the device.
-	Gds Gds
-	// GPUClassCeiling caps the class dispatch may pick; zero sets no ceiling.
-	GPUClassCeiling GPUClass
-}
-
-// ExecutorForVram opens a stream of its own on device, its position in the listing of [GPUDevices],
-// created and destroyed with the executor and fed by the goroutine that calls the verbs, so that a
-// deferred call on it is final once it returns.
-func ExecutorForVram(device int32, config *ExecutorForVramConfig) (*Executor, error) {
-	options := configOf(config)
+// ExecutorForVram opens one non-blocking stream on every named device, its position in the listing
+// of [GPUDevices], all of one vendor, created with the executor and destroyed when it closes, all
+// of them driven by the one goroutine that calls the verbs, so that a deferred call on it is final
+// once it returns. Empty devices take every listed device of the first vendor with a known class.
+// Arenas live on the first device, where every call computes but a filtered scan, which deals its
+// pages across every device.
+//
+// Streams are empty, or one per device in devices order, a cudaStream_t, hipStream_t or
+// id<MTLCommandQueue> on that device, which the executor adopts: on success a CUDA or HIP stream
+// becomes the executor's, which synchronizes and destroys it when it closes, while a Metal queue
+// is retained, the executor releasing its own reference and the caller keeping theirs; on failure
+// every stream stays the caller's. A nil or default stream, a device named twice beside streams,
+// or streams beside empty devices answer [StatusInvalidArgument], and a stream on another device
+// than its entry names answers [StatusConfigMismatch]. Zero scratchLimit lets each device's
+// scratch grow, gds is how reads and compactions move bytes between the drives and the devices,
+// and a gpuClassCeiling some named device loads nothing under answers [StatusUnsupported].
+func ExecutorForVram(
+	devices []int32, gpuClassCeiling GPUClass, streams []unsafe.Pointer, scratchLimit uint64, gds Gds,
+) (*Executor, error) {
+	// The library reads one stream per device from any non-nil pointer, so only this side sees a
+	// short list.
+	if len(streams) != 0 && len(streams) != len(devices) {
+		return nil, fail(StatusInvalidArgument, "pass no streams or one per device")
+	}
 	var call callWithResult[C.ustore_executor_t]
 	arguments := open[C.ustore_executor_for_vram_t](&call)
 	*arguments = C.ustore_executor_for_vram_t{
-		executor:          call.result,
-		outcome:           call.outcome(),
-		device:            C.int32_t(device),
-		stream:            options.Stream,
-		scratch_limit:     C.ustore_size_t(options.ScratchLimit),
-		gds:               C.ustore_gds_t(options.Gds),
-		gpu_class_ceiling: C.ustore_gpu_class_t(options.GPUClassCeiling),
+		executor:      call.result,
+		outcome:       call.outcome(),
+		vram:          call.vram(devices, gpuClassCeiling),
+		streams:       (*unsafe.Pointer)(call.pinSlice(unsafe.Pointer(unsafe.SliceData(streams)), len(streams))),
+		scratch_limit: C.ustore_size_t(scratchLimit),
+		gds:           C.ustore_gds_t(gds),
 	}
 	C.ustore_executor_for_vram(arguments)
 	return executorOf(block(&call, nil))
@@ -1198,6 +1204,15 @@ func (call *call) ram(memoryDomains []int32) C.ustore_ram_options_t {
 	return C.ustore_ram_options_t{
 		memory_domains:       (*C.int32_t)(call.pinSlice(unsafe.Pointer(unsafe.SliceData(memoryDomains)), len(memoryDomains))),
 		memory_domains_count: C.ustore_size_t(len(memoryDomains)),
+	}
+}
+
+// vram pins the devices a VRAM executor drives for the call, with the class ceiling they share.
+func (call *call) vram(devices []int32, gpuClassCeiling GPUClass) C.ustore_vram_options_t {
+	return C.ustore_vram_options_t{
+		devices:           (*C.int32_t)(call.pinSlice(unsafe.Pointer(unsafe.SliceData(devices)), len(devices))),
+		devices_count:     C.ustore_size_t(len(devices)),
+		gpu_class_ceiling: C.ustore_gpu_class_t(gpuClassCeiling),
 	}
 }
 

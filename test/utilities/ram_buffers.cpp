@@ -3,7 +3,8 @@
  *  @author Ash Vardanian
  *  @date October 16, 2026
  *  @brief Unit tests of the arenas in `ustore/utilities/ram_buffers.hpp`: block growth, alignment, rewinding, the
- *      allocator SmashTable's containers take, and the column of strings exported as a tape.
+ *      allocator SmashTable's containers take, the column of strings exported as a tape, and the
+ *      @c expected of a move-only value the GPU executors answer.
  *
  *  The suite links no engine, only the header target and ForkUnion's allocator, so it checks the templates apart from
  *  any call routed through the C ABI.
@@ -18,11 +19,12 @@
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
+#include <utility>     // `std::exchange`, `std::swap`
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`, `arena_grow`, `arena_allocator`, `growing_strings`
-#include "ustore/utilities/types.hpp"       // `bytes_of`, `chars_of`
+#include "ustore/utilities/types.hpp"       // `bytes_of`, `chars_of`, `expected`, `status_t`
 #include "ustore/utilities/tapes.hpp"       // `assemble_tape`, `tape_source_t`
 
 #include "harness.hpp" // `run_test_case`, `expect_true`, `expect_equal`, `expect_status`
@@ -227,6 +229,44 @@ void test_assemble_tape_lays_out_both_widths() {
     expect_equal(none[0], 0u);
 }
 
+/** A move-only value with no state but whether it holds anything, as a claim on an executor is. */
+class move_only_hold_t {
+  public:
+    move_only_hold_t() noexcept = default;
+    explicit move_only_hold_t(std::uint32_t word) noexcept : word_(word) {}
+    move_only_hold_t(move_only_hold_t&& other) noexcept : word_(std::exchange(other.word_, 0u)) {}
+    move_only_hold_t& operator=(move_only_hold_t&& other) noexcept {
+        std::swap(word_, other.word_);
+        return *this;
+    }
+    move_only_hold_t(move_only_hold_t const&) = delete;
+    move_only_hold_t& operator=(move_only_hold_t const&) = delete;
+    std::uint32_t word() const noexcept { return word_; }
+
+  private:
+    std::uint32_t word_ = 0;
+};
+
+/** Answers a hold on success or a refusal, in the two forms the shared VRAM text returns. */
+util::expected<move_only_hold_t> hold_or_refuse(std::uint32_t word) noexcept {
+    if (!word) return {{}, {util::status_code_t::contended_k, "Another call holds the word"}};
+    return {move_only_hold_t {word}, util::status_code_t::success_k};
+}
+
+/** An expected of a move-only value builds from a value and a status, keeps the value only on
+ *  success, and binds as @c auto @c [value, status]. */
+void test_expected_binds_move_only_values() {
+    auto [held, held_status] = hold_or_refuse(7);
+    expect_true(held_status.succeeded());
+    expect_equal(held.word(), 7u);
+    auto [refused, refused_status] = hold_or_refuse(0);
+    expect_true(refused_status == util::status_code_t::contended_k);
+    expect_equal(refused.word(), 0u);
+    util::status_t const forwarded {util::status_code_t::device_k, "A device refused"};
+    util::expected<move_only_hold_t> const failure {{}, forwarded};
+    expect_true(failure.code() == util::status_code_t::device_k);
+}
+
 } // namespace unum::ustore::test
 
 int main(int argc, char** argv) {
@@ -238,6 +278,7 @@ int main(int argc, char** argv) {
     run_test_case("test_arena_allocator_vector", test_arena_allocator_vector);
     run_test_case("test_growing_strings_export", test_growing_strings_export);
     run_test_case("test_assemble_tape_lays_out_both_widths", test_assemble_tape_lays_out_both_widths);
+    run_test_case("test_expected_binds_move_only_values", test_expected_binds_move_only_values);
 
     return finish_test_run();
 }

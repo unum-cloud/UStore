@@ -27,7 +27,8 @@ using util::bytes_of;
 
 expected<cuda_compactor_t> cuda_compactor_t::make(util::cuda_executor_t& executor,
                                                   device_sections_reader_t sections) noexcept {
-    if (!executor.kernels()) return status_t {status_code_t::unsupported_k, "The device loaded no kernel bundle"};
+    if (!executor.stream(0).kernels)
+        return status_t {status_code_t::unsupported_k, "The device loaded no kernel bundle"};
     return cuda_compactor_t(executor, sections);
 }
 
@@ -35,8 +36,11 @@ st::status_t cuda_compactor_t::merge_strings(compaction_kind_t kind, std::span<s
                                              std::uint32_t upper_runs, compaction_stamps_t const& stamps,
                                              st::vector<strings_version_t>& survivors) noexcept {
     using st::status_t;
-    if (!executor_->kernels() || views.size() > (std::numeric_limits<std::uint32_t>::max)() ||
-        upper_runs > views.size())
+    // The executor serializes its callers: a second merge on it answers would-block, which
+    // `compaction_status` reports as contended
+    auto [claim, claim_status] = executor_->claim();
+    if (claim_status.failed()) return status_t::operation_would_block_k;
+    if (!stream_().kernels || views.size() > (std::numeric_limits<std::uint32_t>::max)() || upper_runs > views.size())
         return status_t::invalid_argument_k;
     std::size_t const runs_count = views.size();
     std::size_t records = 0, keys_bytes = 0, saved_count = 0, ranges_count = 0, ranges_bytes = 0;
@@ -52,10 +56,10 @@ st::status_t cuda_compactor_t::merge_strings(compaction_kind_t kind, std::span<s
     }
     if (ranges_bytes > (std::numeric_limits<std::uint32_t>::max)()) return status_t::invalid_argument_k;
 
-    if (executor_->bind().failed()) return status_t::unknown_k;
-    executor_->rewind_bounce();
+    if (stream_().bind().failed()) return status_t::unknown_k;
+    stream_().memory.bounce.rewind();
     if (blocks_.count > 1) sections_.release();
-    util::rewind(blocks_, *executor_);
+    util::rewind(blocks_, stream_());
 
     strings_merge_run* const runs = carve_<strings_merge_run>(runs_count);
     st::key128_t* const heads = carve_<st::key128_t>(records);
@@ -75,15 +79,16 @@ st::status_t cuda_compactor_t::merge_strings(compaction_kind_t kind, std::span<s
         (ranges_count && (!range_stamps || !range_offsets)) || (ranges_bytes && !range_tape))
         return status_t::out_of_memory_heap_k;
 
-    strings_merge_run* const host_runs = carve_bounce<strings_merge_run>(*executor_, runs_count);
-    st::key128_t* const host_heads = carve_bounce<st::key128_t>(*executor_, records);
-    std::uint64_t* const host_saved = carve_bounce<std::uint64_t>(*executor_, saved_count);
-    std::uint64_t* const host_count = carve_bounce<std::uint64_t>(*executor_, 1);
+    strings_merge_run* const host_runs = carve_bounce<strings_merge_run>(stream_(), runs_count);
+    st::key128_t* const host_heads = carve_bounce<st::key128_t>(stream_(), records);
+    std::uint64_t* const host_saved = carve_bounce<std::uint64_t>(stream_(), saved_count);
+    std::uint64_t* const host_count = carve_bounce<std::uint64_t>(stream_(), 1);
     std::uint32_t* const host_range_offsets = carve_bounce<std::uint32_t>(
-        *executor_, ranges_count ? 2 * ranges_count + runs_count : 0);
-    byte_t* const host_range_tape = carve_bounce<byte_t>(*executor_, ranges_bytes);
+        stream_(), ranges_count ? 2 * ranges_count + runs_count : 0);
+    byte_t* const host_range_tape = carve_bounce<byte_t>(stream_(), ranges_bytes);
     if ((runs_count && !host_runs) || (records && !host_heads) || !host_count || (saved_count && !host_saved) ||
-        (ranges_count && !host_range_offsets) || (ranges_bytes && !host_range_tape) || executor_->pin_bounce().failed())
+        (ranges_count && !host_range_offsets) || (ranges_bytes && !host_range_tape) ||
+        stream_().memory.bounce.pin().failed())
         return status_t::out_of_memory_heap_k;
 
     // The heads leave the trees as one flat column, so adjacent threads load adjacent heads.
@@ -110,9 +115,9 @@ st::status_t cuda_compactor_t::merge_strings(compaction_kind_t kind, std::span<s
             return status_t::invalid_argument_k;
         described.saved_kinds = saved + saved_at;
         saved_at += kinds_bytes / sizeof(std::uint64_t);
-        if ((status = upload(*executor_, offsets + offsets_at, view.key_offsets.data(), count + 1)) !=
+        if ((status = upload(stream_(), offsets + offsets_at, view.key_offsets.data(), count + 1)) !=
                 status_t::success_k ||
-            (status = upload(*executor_, keys + keys_at, view.keys.data(), view.keys.size())) != status_t::success_k)
+            (status = upload(stream_(), keys + keys_at, view.keys.data(), view.keys.size())) != status_t::success_k)
             return status;
         first += count, offsets_at += count + 1, keys_at += view.keys.size();
         // The bounds of a run's range tombstones leave as a tape, start then end, as on disk
@@ -134,56 +139,56 @@ st::status_t cuda_compactor_t::merge_strings(compaction_kind_t kind, std::span<s
             written += static_cast<std::uint32_t>(bounded.start.size() + bounded.end.size());
         }
         bounds[2 * ranges] = written;
-        status = upload(*executor_, range_stamps + ranges_before, view.range_tombstones->stamps().data(), ranges);
+        status = upload(stream_(), range_stamps + ranges_before, view.range_tombstones->stamps().data(), ranges);
         if (status != status_t::success_k) return status;
         ranges_before += ranges, range_offsets_before += 2 * ranges + 1, range_tape_before += written;
     }
-    if ((status = upload(*executor_, heads, host_heads, records)) != status_t::success_k ||
-        (status = upload(*executor_, saved, host_saved, saved_count)) != status_t::success_k ||
-        (status = upload(*executor_, runs, host_runs, runs_count)) != status_t::success_k ||
-        (status = upload(*executor_, range_offsets, host_range_offsets, range_offsets_before)) != status_t::success_k ||
-        (status = upload(*executor_, range_tape, host_range_tape, range_tape_before)) != status_t::success_k)
+    if ((status = upload(stream_(), heads, host_heads, records)) != status_t::success_k ||
+        (status = upload(stream_(), saved, host_saved, saved_count)) != status_t::success_k ||
+        (status = upload(stream_(), runs, host_runs, runs_count)) != status_t::success_k ||
+        (status = upload(stream_(), range_offsets, host_range_offsets, range_offsets_before)) != status_t::success_k ||
+        (status = upload(stream_(), range_tape, host_range_tape, range_tape_before)) != status_t::success_k)
         return status;
     compaction_stamps_t device_stamps = stamps;
     if (stamps.pinned_count != 0) {
-        status = upload(*executor_, pinned, stamps.pinned, static_cast<std::size_t>(stamps.pinned_count));
+        status = upload(stream_(), pinned, stamps.pinned, static_cast<std::size_t>(stamps.pinned_count));
         if (status != status_t::success_k) return status;
         device_stamps.pinned = pinned;
     }
 
     // Every version lands at its merged position with its verdict, and only survivors return
     survivors.clear();
-    if (records == 0) return executor_status(executor_->wait());
-    status = launch_over(*executor_, merge_strings_rank_name_k, records, std::uint64_t {1} << 20,
+    if (records == 0) return executor_status(stream_().wait());
+    status = launch_over(stream_(), merge_strings_rank_name_k, records, std::uint64_t {1} << 20,
                          static_cast<strings_merge_run const*>(runs), static_cast<std::uint32_t>(runs_count),
                          upper_runs, std::uint64_t {records}, kind, device_stamps, merged, flags);
     if (status != status_t::success_k) return status;
     status = executor_status(
-        executor_->fill_async(reinterpret_cast<std::uintptr_t>(chain), byte_t {0}, sizeof(std::uint64_t)));
+        stream_().fill_async(reinterpret_cast<std::uintptr_t>(chain), byte_t {0}, sizeof(std::uint64_t)));
     if (status != status_t::success_k) return status;
     std::uint64_t const tickets = fu::min_of(
         divide_round_up(std::uint64_t {records}, std::uint64_t {merge_block_threads_k}), util::chain_blocks_max_k);
-    status = launch_over(*executor_, merge_strings_pack_name_k, tickets * merge_block_threads_k, tickets,
+    status = launch_over(stream_(), merge_strings_pack_name_k, tickets * merge_block_threads_k, tickets,
                          static_cast<strings_version_t const*>(merged), static_cast<std::uint8_t const*>(flags),
                          std::uint64_t {records}, tickets, packed, chain);
     if (status != status_t::success_k) return status;
-    if ((status = download(*executor_, host_count, chain, 1)) != status_t::success_k) return status;
-    if ((status = executor_status(executor_->wait())) != status_t::success_k) return status;
+    if ((status = download(stream_(), host_count, chain, 1)) != status_t::success_k) return status;
+    if ((status = executor_status(stream_().wait())) != status_t::success_k) return status;
 
     std::size_t const survivors_count = static_cast<std::size_t>(*host_count);
     if (survivors.resize(st::assume_uninitialized_t {}, survivors_count) != status_t::success_k)
         return status_t::out_of_memory_heap_k;
-    status = download(*executor_, survivors.data(), packed, survivors_count);
+    status = download(stream_(), survivors.data(), packed, survivors_count);
     if (status != status_t::success_k) return status;
-    return executor_status(executor_->wait());
+    return executor_status(stream_().wait());
 }
 
 cuda_compactor_t::~cuda_compactor_t() noexcept {
     if (!blocks_.count) return;
     sections_.release();
-    if (executor_->bind().failed()) return;
-    util::rewind(blocks_, *executor_);
-    executor_->free_async(blocks_.blocks[0].address);
+    if (stream_().bind().failed()) return;
+    util::rewind(blocks_, stream_());
+    stream_().free_async(blocks_.blocks[0].address);
 }
 
 #pragma endregion NVIDIA
@@ -192,7 +197,8 @@ cuda_compactor_t::~cuda_compactor_t() noexcept {
 
 expected<hip_compactor_t> hip_compactor_t::make(util::hip_executor_t& executor,
                                                 device_sections_reader_t sections) noexcept {
-    if (!executor.kernels()) return status_t {status_code_t::unsupported_k, "The device loaded no kernel bundle"};
+    if (!executor.stream(0).kernels)
+        return status_t {status_code_t::unsupported_k, "The device loaded no kernel bundle"};
     return hip_compactor_t(executor, sections);
 }
 
@@ -200,8 +206,11 @@ st::status_t hip_compactor_t::merge_strings(compaction_kind_t kind, std::span<st
                                             std::uint32_t upper_runs, compaction_stamps_t const& stamps,
                                             st::vector<strings_version_t>& survivors) noexcept {
     using st::status_t;
-    if (!executor_->kernels() || views.size() > (std::numeric_limits<std::uint32_t>::max)() ||
-        upper_runs > views.size())
+    // The executor serializes its callers: a second merge on it answers would-block, which
+    // `compaction_status` reports as contended
+    auto [claim, claim_status] = executor_->claim();
+    if (claim_status.failed()) return status_t::operation_would_block_k;
+    if (!stream_().kernels || views.size() > (std::numeric_limits<std::uint32_t>::max)() || upper_runs > views.size())
         return status_t::invalid_argument_k;
     std::size_t const runs_count = views.size();
     std::size_t records = 0, keys_bytes = 0, saved_count = 0, ranges_count = 0, ranges_bytes = 0;
@@ -217,10 +226,10 @@ st::status_t hip_compactor_t::merge_strings(compaction_kind_t kind, std::span<st
     }
     if (ranges_bytes > (std::numeric_limits<std::uint32_t>::max)()) return status_t::invalid_argument_k;
 
-    if (executor_->bind().failed()) return status_t::unknown_k;
-    executor_->rewind_bounce();
+    if (stream_().bind().failed()) return status_t::unknown_k;
+    stream_().memory.bounce.rewind();
     if (blocks_.count > 1) sections_.release();
-    util::rewind(blocks_, *executor_);
+    util::rewind(blocks_, stream_());
 
     strings_merge_run* const runs = carve_<strings_merge_run>(runs_count);
     st::key128_t* const heads = carve_<st::key128_t>(records);
@@ -240,15 +249,16 @@ st::status_t hip_compactor_t::merge_strings(compaction_kind_t kind, std::span<st
         (ranges_count && (!range_stamps || !range_offsets)) || (ranges_bytes && !range_tape))
         return status_t::out_of_memory_heap_k;
 
-    strings_merge_run* const host_runs = carve_bounce<strings_merge_run>(*executor_, runs_count);
-    st::key128_t* const host_heads = carve_bounce<st::key128_t>(*executor_, records);
-    std::uint64_t* const host_saved = carve_bounce<std::uint64_t>(*executor_, saved_count);
-    std::uint64_t* const host_count = carve_bounce<std::uint64_t>(*executor_, 1);
+    strings_merge_run* const host_runs = carve_bounce<strings_merge_run>(stream_(), runs_count);
+    st::key128_t* const host_heads = carve_bounce<st::key128_t>(stream_(), records);
+    std::uint64_t* const host_saved = carve_bounce<std::uint64_t>(stream_(), saved_count);
+    std::uint64_t* const host_count = carve_bounce<std::uint64_t>(stream_(), 1);
     std::uint32_t* const host_range_offsets = carve_bounce<std::uint32_t>(
-        *executor_, ranges_count ? 2 * ranges_count + runs_count : 0);
-    byte_t* const host_range_tape = carve_bounce<byte_t>(*executor_, ranges_bytes);
+        stream_(), ranges_count ? 2 * ranges_count + runs_count : 0);
+    byte_t* const host_range_tape = carve_bounce<byte_t>(stream_(), ranges_bytes);
     if ((runs_count && !host_runs) || (records && !host_heads) || !host_count || (saved_count && !host_saved) ||
-        (ranges_count && !host_range_offsets) || (ranges_bytes && !host_range_tape) || executor_->pin_bounce().failed())
+        (ranges_count && !host_range_offsets) || (ranges_bytes && !host_range_tape) ||
+        stream_().memory.bounce.pin().failed())
         return status_t::out_of_memory_heap_k;
 
     // The heads leave the trees as one flat column, so adjacent threads load adjacent heads.
@@ -275,9 +285,9 @@ st::status_t hip_compactor_t::merge_strings(compaction_kind_t kind, std::span<st
             return status_t::invalid_argument_k;
         described.saved_kinds = saved + saved_at;
         saved_at += kinds_bytes / sizeof(std::uint64_t);
-        if ((status = upload(*executor_, offsets + offsets_at, view.key_offsets.data(), count + 1)) !=
+        if ((status = upload(stream_(), offsets + offsets_at, view.key_offsets.data(), count + 1)) !=
                 status_t::success_k ||
-            (status = upload(*executor_, keys + keys_at, view.keys.data(), view.keys.size())) != status_t::success_k)
+            (status = upload(stream_(), keys + keys_at, view.keys.data(), view.keys.size())) != status_t::success_k)
             return status;
         first += count, offsets_at += count + 1, keys_at += view.keys.size();
         // The bounds of a run's range tombstones leave as a tape, start then end, as on disk
@@ -299,56 +309,56 @@ st::status_t hip_compactor_t::merge_strings(compaction_kind_t kind, std::span<st
             written += static_cast<std::uint32_t>(bounded.start.size() + bounded.end.size());
         }
         bounds[2 * ranges] = written;
-        status = upload(*executor_, range_stamps + ranges_before, view.range_tombstones->stamps().data(), ranges);
+        status = upload(stream_(), range_stamps + ranges_before, view.range_tombstones->stamps().data(), ranges);
         if (status != status_t::success_k) return status;
         ranges_before += ranges, range_offsets_before += 2 * ranges + 1, range_tape_before += written;
     }
-    if ((status = upload(*executor_, heads, host_heads, records)) != status_t::success_k ||
-        (status = upload(*executor_, saved, host_saved, saved_count)) != status_t::success_k ||
-        (status = upload(*executor_, runs, host_runs, runs_count)) != status_t::success_k ||
-        (status = upload(*executor_, range_offsets, host_range_offsets, range_offsets_before)) != status_t::success_k ||
-        (status = upload(*executor_, range_tape, host_range_tape, range_tape_before)) != status_t::success_k)
+    if ((status = upload(stream_(), heads, host_heads, records)) != status_t::success_k ||
+        (status = upload(stream_(), saved, host_saved, saved_count)) != status_t::success_k ||
+        (status = upload(stream_(), runs, host_runs, runs_count)) != status_t::success_k ||
+        (status = upload(stream_(), range_offsets, host_range_offsets, range_offsets_before)) != status_t::success_k ||
+        (status = upload(stream_(), range_tape, host_range_tape, range_tape_before)) != status_t::success_k)
         return status;
     compaction_stamps_t device_stamps = stamps;
     if (stamps.pinned_count != 0) {
-        status = upload(*executor_, pinned, stamps.pinned, static_cast<std::size_t>(stamps.pinned_count));
+        status = upload(stream_(), pinned, stamps.pinned, static_cast<std::size_t>(stamps.pinned_count));
         if (status != status_t::success_k) return status;
         device_stamps.pinned = pinned;
     }
 
     // Every version lands at its merged position with its verdict, and only survivors return
     survivors.clear();
-    if (records == 0) return executor_status(executor_->wait());
-    status = launch_over(*executor_, merge_strings_rank_name_k, records, std::uint64_t {1} << 20,
+    if (records == 0) return executor_status(stream_().wait());
+    status = launch_over(stream_(), merge_strings_rank_name_k, records, std::uint64_t {1} << 20,
                          static_cast<strings_merge_run const*>(runs), static_cast<std::uint32_t>(runs_count),
                          upper_runs, std::uint64_t {records}, kind, device_stamps, merged, flags);
     if (status != status_t::success_k) return status;
     status = executor_status(
-        executor_->fill_async(reinterpret_cast<std::uintptr_t>(chain), byte_t {0}, sizeof(std::uint64_t)));
+        stream_().fill_async(reinterpret_cast<std::uintptr_t>(chain), byte_t {0}, sizeof(std::uint64_t)));
     if (status != status_t::success_k) return status;
     std::uint64_t const tickets = fu::min_of(
         divide_round_up(std::uint64_t {records}, std::uint64_t {merge_block_threads_k}), util::chain_blocks_max_k);
-    status = launch_over(*executor_, merge_strings_pack_name_k, tickets * merge_block_threads_k, tickets,
+    status = launch_over(stream_(), merge_strings_pack_name_k, tickets * merge_block_threads_k, tickets,
                          static_cast<strings_version_t const*>(merged), static_cast<std::uint8_t const*>(flags),
                          std::uint64_t {records}, tickets, packed, chain);
     if (status != status_t::success_k) return status;
-    if ((status = download(*executor_, host_count, chain, 1)) != status_t::success_k) return status;
-    if ((status = executor_status(executor_->wait())) != status_t::success_k) return status;
+    if ((status = download(stream_(), host_count, chain, 1)) != status_t::success_k) return status;
+    if ((status = executor_status(stream_().wait())) != status_t::success_k) return status;
 
     std::size_t const survivors_count = static_cast<std::size_t>(*host_count);
     if (survivors.resize(st::assume_uninitialized_t {}, survivors_count) != status_t::success_k)
         return status_t::out_of_memory_heap_k;
-    status = download(*executor_, survivors.data(), packed, survivors_count);
+    status = download(stream_(), survivors.data(), packed, survivors_count);
     if (status != status_t::success_k) return status;
-    return executor_status(executor_->wait());
+    return executor_status(stream_().wait());
 }
 
 hip_compactor_t::~hip_compactor_t() noexcept {
     if (!blocks_.count) return;
     sections_.release();
-    if (executor_->bind().failed()) return;
-    util::rewind(blocks_, *executor_);
-    executor_->free_async(blocks_.blocks[0].address);
+    if (stream_().bind().failed()) return;
+    util::rewind(blocks_, stream_());
+    stream_().free_async(blocks_.blocks[0].address);
 }
 
 #pragma endregion AMD
@@ -357,7 +367,8 @@ hip_compactor_t::~hip_compactor_t() noexcept {
 
 expected<metal_compactor_t> metal_compactor_t::make(util::metal_executor_t& executor,
                                                     device_sections_reader_t sections) noexcept {
-    if (!executor.kernels()) return status_t {status_code_t::unsupported_k, "The device loaded no kernel bundle"};
+    if (!executor.stream(0).kernels)
+        return status_t {status_code_t::unsupported_k, "The device loaded no kernel bundle"};
     return metal_compactor_t(executor, sections);
 }
 
@@ -365,8 +376,11 @@ st::status_t metal_compactor_t::merge_strings(compaction_kind_t kind, std::span<
                                               std::uint32_t upper_runs, compaction_stamps_t const& stamps,
                                               st::vector<strings_version_t>& survivors) noexcept {
     using st::status_t;
-    if (!executor_->kernels() || views.size() > (std::numeric_limits<std::uint32_t>::max)() ||
-        upper_runs > views.size())
+    // The executor serializes its callers: a second merge on it answers would-block, which
+    // `compaction_status` reports as contended
+    auto [claim, claim_status] = executor_->claim();
+    if (claim_status.failed()) return status_t::operation_would_block_k;
+    if (!stream_().kernels || views.size() > (std::numeric_limits<std::uint32_t>::max)() || upper_runs > views.size())
         return status_t::invalid_argument_k;
     std::size_t const runs_count = views.size();
     std::size_t records = 0, keys_bytes = 0, saved_count = 0, ranges_count = 0, ranges_bytes = 0;
@@ -385,10 +399,10 @@ st::status_t metal_compactor_t::merge_strings(compaction_kind_t kind, std::span<
         records > (std::numeric_limits<std::uint32_t>::max)())
         return status_t::invalid_argument_k;
 
-    if (executor_->bind().failed()) return status_t::unknown_k;
-    executor_->rewind_bounce();
+    if (stream_().bind().failed()) return status_t::unknown_k;
+    stream_().memory.bounce.rewind();
     if (blocks_.count > 1) sections_.release();
-    util::rewind(blocks_, *executor_);
+    util::rewind(blocks_, stream_());
 
     strings_merge_run* const runs = carve_<strings_merge_run>(runs_count);
     st::key128_t* const heads = carve_<st::key128_t>(records);
@@ -407,18 +421,18 @@ st::status_t metal_compactor_t::merge_strings(compaction_kind_t kind, std::span<
         (ranges_count && (!range_stamps || !range_offsets)) || (ranges_bytes && !range_tape))
         return status_t::out_of_memory_heap_k;
 
-    strings_merge_run* const host_runs = carve_bounce<strings_merge_run>(*executor_, runs_count);
-    st::key128_t* const host_heads = carve_bounce<st::key128_t>(*executor_, records);
-    std::uint64_t* const host_saved = carve_bounce<std::uint64_t>(*executor_, saved_count);
-    strings_version_t* const host_merged = carve_bounce<strings_version_t>(*executor_, records);
-    std::uint32_t* const host_selected = carve_bounce<std::uint32_t>(*executor_, records);
-    std::uint64_t* const host_count = carve_bounce<std::uint64_t>(*executor_, 1);
+    strings_merge_run* const host_runs = carve_bounce<strings_merge_run>(stream_(), runs_count);
+    st::key128_t* const host_heads = carve_bounce<st::key128_t>(stream_(), records);
+    std::uint64_t* const host_saved = carve_bounce<std::uint64_t>(stream_(), saved_count);
+    strings_version_t* const host_merged = carve_bounce<strings_version_t>(stream_(), records);
+    std::uint32_t* const host_selected = carve_bounce<std::uint32_t>(stream_(), records);
+    std::uint64_t* const host_count = carve_bounce<std::uint64_t>(stream_(), 1);
     std::uint32_t* const host_range_offsets = carve_bounce<std::uint32_t>(
-        *executor_, ranges_count ? 2 * ranges_count + runs_count : 0);
-    byte_t* const host_range_tape = carve_bounce<byte_t>(*executor_, ranges_bytes);
+        stream_(), ranges_count ? 2 * ranges_count + runs_count : 0);
+    byte_t* const host_range_tape = carve_bounce<byte_t>(stream_(), ranges_bytes);
     if ((runs_count && !host_runs) || (records && (!host_heads || !host_merged || !host_selected)) || !host_count ||
         (saved_count && !host_saved) || (ranges_count && !host_range_offsets) || (ranges_bytes && !host_range_tape) ||
-        executor_->pin_bounce().failed())
+        stream_().memory.bounce.pin().failed())
         return status_t::out_of_memory_heap_k;
 
     // The heads leave the trees as one flat column, so adjacent threads load adjacent heads.
@@ -445,9 +459,9 @@ st::status_t metal_compactor_t::merge_strings(compaction_kind_t kind, std::span<
             return status_t::invalid_argument_k;
         described.saved_kinds = saved + saved_at;
         saved_at += kinds_bytes / sizeof(std::uint64_t);
-        if ((status = upload(*executor_, offsets + offsets_at, view.key_offsets.data(), count + 1)) !=
+        if ((status = upload(stream_(), offsets + offsets_at, view.key_offsets.data(), count + 1)) !=
                 status_t::success_k ||
-            (status = upload(*executor_, keys + keys_at, view.keys.data(), view.keys.size())) != status_t::success_k)
+            (status = upload(stream_(), keys + keys_at, view.keys.data(), view.keys.size())) != status_t::success_k)
             return status;
         first += count, offsets_at += count + 1, keys_at += view.keys.size();
         // The bounds of a run's range tombstones leave as a tape, start then end, as on disk
@@ -469,19 +483,19 @@ st::status_t metal_compactor_t::merge_strings(compaction_kind_t kind, std::span<
             written += static_cast<std::uint32_t>(bounded.start.size() + bounded.end.size());
         }
         bounds[2 * ranges] = written;
-        status = upload(*executor_, range_stamps + ranges_before, view.range_tombstones->stamps().data(), ranges);
+        status = upload(stream_(), range_stamps + ranges_before, view.range_tombstones->stamps().data(), ranges);
         if (status != status_t::success_k) return status;
         ranges_before += ranges, range_offsets_before += 2 * ranges + 1, range_tape_before += written;
     }
-    if ((status = upload(*executor_, heads, host_heads, records)) != status_t::success_k ||
-        (status = upload(*executor_, saved, host_saved, saved_count)) != status_t::success_k ||
-        (status = upload(*executor_, runs, host_runs, runs_count)) != status_t::success_k ||
-        (status = upload(*executor_, range_offsets, host_range_offsets, range_offsets_before)) != status_t::success_k ||
-        (status = upload(*executor_, range_tape, host_range_tape, range_tape_before)) != status_t::success_k)
+    if ((status = upload(stream_(), heads, host_heads, records)) != status_t::success_k ||
+        (status = upload(stream_(), saved, host_saved, saved_count)) != status_t::success_k ||
+        (status = upload(stream_(), runs, host_runs, runs_count)) != status_t::success_k ||
+        (status = upload(stream_(), range_offsets, host_range_offsets, range_offsets_before)) != status_t::success_k ||
+        (status = upload(stream_(), range_tape, host_range_tape, range_tape_before)) != status_t::success_k)
         return status;
     compaction_stamps_t device_stamps = stamps;
     if (stamps.pinned_count != 0) {
-        status = upload(*executor_, pinned, stamps.pinned, static_cast<std::size_t>(stamps.pinned_count));
+        status = upload(stream_(), pinned, stamps.pinned, static_cast<std::size_t>(stamps.pinned_count));
         if (status != status_t::success_k) return status;
         device_stamps.pinned = pinned;
     }
@@ -489,8 +503,8 @@ st::status_t metal_compactor_t::merge_strings(compaction_kind_t kind, std::span<
     // Every version lands at its merged position with its verdict, then the select lists where the
     // survivors landed, as an Apple device has no 64-bit atomics to chain a pack with
     survivors.clear();
-    if (records == 0) return executor_status(executor_->wait());
-    status = launch_over(*executor_, merge_strings_rank_name_k, records, std::uint64_t {1} << 20,
+    if (records == 0) return executor_status(stream_().wait());
+    status = launch_over(stream_(), merge_strings_rank_name_k, records, std::uint64_t {1} << 20,
                          static_cast<strings_merge_run const*>(runs), static_cast<std::uint32_t>(runs_count),
                          upper_runs, std::uint64_t {records}, kind, device_stamps, merged, flags);
     if (status != status_t::success_k) return status;
@@ -499,18 +513,18 @@ st::status_t metal_compactor_t::merge_strings(compaction_kind_t kind, std::span<
     std::uint32_t const tiles = static_cast<std::uint32_t>(divide_round_up(std::uint64_t {records}, tile));
     std::uint64_t* const counts = carve_<std::uint64_t>(std::size_t {tiles} + 1);
     if (!counts) return status_t::out_of_memory_heap_k;
-    status = executor_status(util::select_flagged(*executor_, flags, static_cast<std::uint32_t>(records),
+    status = executor_status(util::select_flagged(stream_(), flags, static_cast<std::uint32_t>(records),
                                                   static_cast<std::uint32_t>(tile), tiles, counts, selected));
     if (status != status_t::success_k) return status;
-    if ((status = download(*executor_, host_count, counts + tiles, 1)) != status_t::success_k ||
-        (status = download(*executor_, host_merged, merged, records)) != status_t::success_k)
+    if ((status = download(stream_(), host_count, counts + tiles, 1)) != status_t::success_k ||
+        (status = download(stream_(), host_merged, merged, records)) != status_t::success_k)
         return status;
-    if ((status = executor_status(executor_->wait())) != status_t::success_k) return status;
+    if ((status = executor_status(stream_().wait())) != status_t::success_k) return status;
 
     std::size_t const survivors_count = static_cast<std::size_t>(*host_count);
-    status = download(*executor_, host_selected, selected, survivors_count);
+    status = download(stream_(), host_selected, selected, survivors_count);
     if (status != status_t::success_k) return status;
-    if ((status = executor_status(executor_->wait())) != status_t::success_k) return status;
+    if ((status = executor_status(stream_().wait())) != status_t::success_k) return status;
     if (survivors.resize(st::assume_uninitialized_t {}, survivors_count) != status_t::success_k)
         return status_t::out_of_memory_heap_k;
     for (std::size_t index = 0; index != survivors_count; ++index) survivors[index] = host_merged[host_selected[index]];
@@ -520,9 +534,9 @@ st::status_t metal_compactor_t::merge_strings(compaction_kind_t kind, std::span<
 metal_compactor_t::~metal_compactor_t() noexcept {
     if (!blocks_.count) return;
     sections_.release();
-    if (executor_->bind().failed()) return;
-    util::rewind(blocks_, *executor_);
-    executor_->free_async(blocks_.blocks[0].address);
+    if (stream_().bind().failed()) return;
+    util::rewind(blocks_, stream_());
+    stream_().free_async(blocks_.blocks[0].address);
 }
 
 #pragma endregion Apple

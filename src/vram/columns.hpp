@@ -19,14 +19,14 @@
 
 #include "ustore/docs/json_cells.hpp"       // `field_size_bytes`
 #include "ustore/utilities/ram_buffers.hpp" // `arena_copy`, `device_blocks_t`, `divide_round_up`
-#include "ustore/utilities/vram_device.hpp" // `carve`, `a_gpu_executor`
+#include "ustore/utilities/vram_device.hpp" // `carve`, `a_gpu_stream`
 
 #include "utilities/arguments.hpp" // `a_call_answering_scores`, `a_call_holding_keys`, `a_call_holding_values`
 
 namespace unum::ustore {
 
 /** Moves output columns from the bounce into one device arena: each is carved there, copied once and repointed. */
-template <util::a_gpu_executor executor_type_>
+template <util::a_gpu_stream executor_type_>
 class column_uploader {
   public:
     column_uploader(util::device_blocks_t& blocks, executor_type_& executor) noexcept
@@ -61,9 +61,9 @@ class column_uploader {
     template <typename element_type_>
     std::span<element_type_> copy_into_bounce(element_type_ const* column, std::size_t count) noexcept {
         if (status_.failed()) return {};
-        auto [copy, copy_status] = util::arena_copy<element_type_>(executor_.bounce(), {column, count});
+        auto [copy, copy_status] = util::arena_copy<element_type_>(executor_.memory.bounce.arena(), {column, count});
         if ((status_ = copy_status).failed()) return {};
-        status_ = executor_.pin_bounce();
+        status_ = executor_.memory.bounce.pin();
         return copy;
     }
 
@@ -208,10 +208,10 @@ void output_columns(arguments_type_ const& arguments, uploader_type_& uploader) 
 
 /** Moves every output column of @p hosted, which a host verb wrote into @p executor's bounce, into @p blocks, the
  *  call's device arena, one copy per column, and waits once. */
-template <typename arguments_type_, util::a_gpu_executor executor_type_>
+template <typename arguments_type_, util::a_gpu_stream executor_type_>
 util::status_t upload_output_columns(arguments_type_ const& hosted, util::device_blocks_t& blocks,
                                      executor_type_& executor) noexcept {
-    if (util::status_t const pinned = executor.pin_bounce(); pinned.failed()) return pinned;
+    if (util::status_t const pinned = executor.memory.bounce.pin(); pinned.failed()) return pinned;
     column_uploader<executor_type_> uploader {blocks, executor};
     output_columns(hosted, uploader);
     // Copies already queued read the bounce, which the next call rewinds, so a failure still waits for them

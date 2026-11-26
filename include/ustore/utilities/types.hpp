@@ -141,14 +141,8 @@ using byte_t = std::byte;
 
 #pragma region Status Codes
 
-/** What went wrong, with one enumerator per @c ustore_status_t that the C header documents.
- *  Statuses fall into five categories. Resources: @c out_of_memory_k, @c io_k and @c device_k.
- *  Input: @c invalid_argument_k and @c malformed_k. State: @c uninitialized_k, @c read_only_k,
- *  @c unsupported_k, @c not_found_k, @c already_exists_k, @c write_conflict_k, @c read_conflict_k,
- *  @c phantom_conflict_k, @c capacity_exhausted_k and @c contended_k. Interruptions: @c cancelled_k
- *  and @c deferred_k. Defects: @c internal_k. Any verb that allocates, binds a device or touches a
- *  file may also return a Resources status; any verb taking a progress callback may return
- *  @c cancelled_k. A verb's own block lists only what its contract adds. */
+/** What went wrong, with one enumerator per @c ustore_status_t, which the C header documents and
+ *  sorts into resources, input, state, interruptions and defects. */
 enum class status_code_t : int {
     success_k = ustore_status_success_k,
     deferred_k = ustore_status_deferred_k,
@@ -159,6 +153,7 @@ enum class status_code_t : int {
     malformed_k = ustore_status_malformed_k,
     internal_k = ustore_status_internal_k,
     uninitialized_k = ustore_status_uninitialized_k,
+    config_mismatch_k = ustore_status_config_mismatch_k,
     contended_k = ustore_status_contended_k,
     cancelled_k = ustore_status_cancelled_k,
     unsupported_k = ustore_status_unsupported_k,
@@ -223,6 +218,12 @@ class [[nodiscard]] expected {
     constexpr expected(status_code_t code) noexcept : expected(status_t {code}) {}
 
     expected(value_t&& value) noexcept { new (&value_) value_t(std::move(value)); }
+
+    /** The value beside the @p status explaining it, kept only on success, so a failure reads as
+     *  @c return @c {{},status} with a value-initialized placeholder that dies here. */
+    expected(value_t&& value, status_t status) noexcept : status_(status) {
+        if (status_.succeeded()) new (&value_) value_t(std::move(value));
+    }
 
     expected(value_t const& value) noexcept
         requires std::is_nothrow_copy_constructible_v<value_t>

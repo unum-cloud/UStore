@@ -51,6 +51,7 @@ from ustore import (
     UUID,
     VertexRole,
     VertexRolesView,
+    VramOptions,
 )
 
 
@@ -738,6 +739,28 @@ def test_a_cpu_class_ceiling_the_machine_lacks_narrows_the_pick() raises:
     assert_false(narrowed == CPUClass.UNKNOWN)
 
 
+def test_vram_executors_refuse_what_no_device_serves() raises:
+    """An ordinal no device holds is refused, and streams name the devices they sit on, so none are adopted for every device."""
+    if not _library_is_present():
+        _skipped(library_missing_k)
+        return
+    var library = Library()
+    var unknown: List[Int32] = [Int32(1 << 20)]
+    var refused = Status.SUCCESS
+    try:
+        _ = Executor.for_vram(library, VramOptions.on(unknown))
+    except error:
+        refused = error.status
+    assert_true(refused == Status.DEVICE or refused == Status.UNSUPPORTED, "an ordinal no device holds must be refused")
+    # The library refuses the streams before reading them, so any address stands for them
+    refused = Status.SUCCESS
+    try:
+        _ = Executor.for_vram(library, streams=1 << 12)
+    except error:
+        refused = error.status
+    assert_true(refused == Status.INVALID_ARGUMENT, "streams beside no named device must be refused")
+
+
 # endregion Engine
 
 
@@ -758,6 +781,7 @@ def main() raises:
     suite.test[test_a_drain_frees_the_executor_in_either_mood]()
     suite.test[test_progress_reports_and_cancels]()
     suite.test[test_compact_plans_stay_live_until_finished]()
+    suite.test[test_vram_executors_refuse_what_no_device_serves]()
     suite.test[test_predicate_filters_a_scan]()
     suite.test[test_transactions_commit_their_writes]()
     suite.test[test_databases_open_at_a_directory_and_keep_what_they_held]()

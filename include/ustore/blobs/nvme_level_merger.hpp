@@ -208,6 +208,8 @@ inline status_t compaction_status(st::status_t status) noexcept {
     case st::status_t::capacity_exhausted_k:
         return {status_code_t::capacity_exhausted_k, "A compaction ran out of room"};
     case st::status_t::input_output_k: return {status_code_t::io_k, "A compaction could not move its key slots"};
+    case st::status_t::operation_would_block_k:
+        return {status_code_t::contended_k, "Another merge holds the device executor"};
     default: return {status_code_t::device_k, "The compaction failed on the device"};
     }
 }

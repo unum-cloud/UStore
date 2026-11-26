@@ -11,7 +11,7 @@
 #include <cstdio>  // `std::snprintf`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm>   // `std::find`, `std::reverse`
+#include <algorithm>   // `std::any_of`, `std::find`
 #include <array>       // `std::array`
 #include <new>         // `std::nothrow`
 #include <span>        // `std::span`
@@ -49,6 +49,7 @@ constexpr enumerator_spelling<ustore_status_t> status_names_k[] {
     {ustore_status_malformed_k, "malformed"},
     {ustore_status_internal_k, "internal"},
     {ustore_status_uninitialized_k, "uninitialized"},
+    {ustore_status_config_mismatch_k, "config-mismatch"},
     {ustore_status_contended_k, "contended"},
     {ustore_status_cancelled_k, "cancelled"},
     {ustore_status_unsupported_k, "unsupported"},
@@ -570,25 +571,66 @@ void ustore_executor_for_vram(ustore_executor_for_vram_t* arguments) {
     if (!arguments->executor)
         return finish(outcome, {util::status_code_t::invalid_argument_k, "The call needs an output for the executor"});
     *arguments->executor = nullptr;
+    ustore_vram_options_t const& vram = arguments->vram;
+    bool const named = vram.devices && vram.devices_count;
+    if (arguments->streams && !named)
+        return finish(outcome,
+                      {util::status_code_t::invalid_argument_k, "Streams pair with the devices named beside them"});
     if (arguments->gds > ustore_gds_compatibility_k)
         return finish(outcome, {util::status_code_t::invalid_argument_k, "Unknown GPUDirect Storage mode"});
-    std::span<gpu_device_t const> const devices = gpu_devices();
-    if (arguments->device < 0 || static_cast<std::size_t>(arguments->device) >= devices.size())
-        return finish(outcome, {util::status_code_t::device_k, "No GPU holds the ordinal"});
-    gpu_device_t const& device = devices[static_cast<std::size_t>(arguments->device)];
-    if (device.vendor != gpu_vendor_t::nvidia_k && arguments->gds == ustore_gds_direct_k)
-        return finish(outcome, {util::status_code_t::device_k, "GPUDirect Storage reaches NVIDIA devices alone"});
-    if (arguments->gpu_class_ceiling != ustore_gpu_class_unknown_k &&
-        std::string_view {ustore_gpu_class_name(arguments->gpu_class_ceiling)} == "unrecognized")
+    if (vram.gpu_class_ceiling != ustore_gpu_class_unknown_k &&
+        std::string_view {ustore_gpu_class_name(vram.gpu_class_ceiling)} == "unrecognized")
         return finish(outcome, {util::status_code_t::invalid_argument_k, "Unknown GPU class ceiling"});
+    std::span<gpu_device_t const> const devices = gpu_devices();
     gpu_runtime_t& runtime = gpu_runtime();
-    gpu_class_t const gpu_class = pick_gpu_class(runtime.drivers, device,
-                                                 static_cast<gpu_class_t>(arguments->gpu_class_ceiling));
+    // The devices the executor drives, each once: the named ones, or every listed device of the
+    // first vendor whose class is known, each of a known class itself
+    gpu_device_t picked[gpu_vendors_count_k * util::gpu_devices_capacity_k];
+    std::size_t picked_count = 0;
+    auto const holds = [&](gpu_device_t const& device) noexcept {
+        for (std::size_t index = 0; index != picked_count; ++index)
+            if (picked[index].vendor == device.vendor && picked[index].vendor_ordinal == device.vendor_ordinal)
+                return true;
+        return false;
+    };
+    // The classes every picked device loaded, from which one class serving them all is picked
+    std::span<gpu_class_mask_t const> const loaded = gpu_classes_loaded();
+    gpu_class_mask_t loaded_by_all = ~gpu_class_mask_t {0};
+    // With none named, the first device with a class under the ceiling leads, and each later one
+    // of its vendor joins while the classes they all loaded still hold one under it
+    gpu_class_t const ceiling = static_cast<gpu_class_t>(vram.gpu_class_ceiling);
+    for (std::size_t position = 0; !named && position != devices.size(); ++position) {
+        gpu_class_mask_t const shared = loaded_by_all & loaded[position];
+        if ((!picked_count || devices[position].vendor == picked[0].vendor) &&
+            pick_gpu_class(devices[position].vendor, shared, ceiling) != gpu_class_t::unknown_k)
+            picked[picked_count++] = devices[position], loaded_by_all = shared;
+    }
+    for (std::size_t index = 0; named && index != vram.devices_count; ++index) {
+        std::int32_t const ordinal = vram.devices[index];
+        if (ordinal < 0 || static_cast<std::size_t>(ordinal) >= devices.size())
+            return finish(outcome, {util::status_code_t::device_k, "No GPU holds the ordinal"});
+        gpu_device_t const& device = devices[static_cast<std::size_t>(ordinal)];
+        if (picked_count && device.vendor != picked[0].vendor)
+            return finish(outcome, {util::status_code_t::config_mismatch_k, "The devices mix vendors"});
+        loaded_by_all &= loaded[static_cast<std::size_t>(ordinal)];
+        if (!holds(device)) picked[picked_count++] = device;
+        else if (arguments->streams)
+            return finish(outcome,
+                          {util::status_code_t::invalid_argument_k, "Each adopted stream needs its own device"});
+    }
+    if (!picked_count) {
+        bool const any_known = std::any_of(loaded.begin(), loaded.end(),
+                                           [](gpu_class_mask_t mask) { return mask != 0; });
+        if (any_known)
+            return finish(outcome, {util::status_code_t::unsupported_k, "No GPU runs a class under the ceiling"});
+        return finish(outcome, {util::status_code_t::device_k, "No GPU holds a known class"});
+    }
+    if (picked[0].vendor != gpu_vendor_t::nvidia_k && arguments->gds == ustore_gds_direct_k)
+        return finish(outcome, {util::status_code_t::device_k, "GPUDirect Storage reaches NVIDIA devices alone"});
+    gpu_class_t const gpu_class = pick_gpu_class(picked[0].vendor, loaded_by_all, ceiling);
     if (gpu_class == gpu_class_t::unknown_k)
-        return finish(outcome, {util::status_code_t::unsupported_k, "No compiled class fits the device ceiling"});
-    if (arguments->stream)
-        return finish(outcome, {util::status_code_t::unsupported_k, "The executor drives only its own streams"});
-    // The caller is the one host thread: it stages, feeds the device and waits on it,
+        return finish(outcome, {util::status_code_t::unsupported_k, "No compiled class fits every device"});
+    // The caller is the one host thread: it stages, feeds every device and waits on them,
     // spawning no pool
     auto [topology, topology_status] = util::harvest_topology();
     if (st::failed(topology_status)) return finish(outcome, pool_failure(topology_status));
@@ -606,30 +648,34 @@ void ustore_executor_for_vram(ustore_executor_for_vram_t* arguments) {
                                                              util::blocking_queues_config_k, staging_domains);
     if (queues_status.failed()) return ustore_executor_free(made), finish(outcome, queues_status);
     made->blocking_queues = std::move(queues);
-    if (util::status_t const status = runtime.spawn(device, gpu_class, arguments->scratch_limit, arguments->gds,
-                                                    made->device);
+    std::span<void* const> const streams {arguments->streams, arguments->streams ? picked_count : 0};
+    if (util::status_t const status = spawn_vram_executor(runtime, {picked, picked_count}, gpu_class,
+                                                          arguments->scratch_limit, streams, made->device);
         status.failed()) {
         ustore_executor_free(made);
         return finish(outcome, status);
     }
     made->gpu_class = gpu_class;
+    made->gds = arguments->gds;
     *arguments->executor = made;
     finish(outcome, {});
 }
 
 void ustore_gpu_devices(ustore_gpu_devices_t* arguments) {
     std::span<gpu_device_t const> const devices = gpu_devices();
+    std::span<gpu_class_mask_t const> const loaded = gpu_classes_loaded();
     std::size_t const copied = arguments->devices ? fu::min_of<std::size_t>(devices.size(), arguments->devices_capacity)
                                                   : 0;
     for (std::size_t position = 0; position != copied; ++position) {
         gpu_device_t const& device = devices[position];
         ustore_gpu_device_t& listed = arguments->devices[position];
-        listed = {static_cast<ustore_gpu_vendor_t>(device.vendor),
-                  device.vendor_ordinal,
-                  static_cast<ustore_gpu_class_t>(gpu_runtime().classes[position]),
-                  device.compute_units,
-                  device.memory_bytes,
-                  {}};
+        listed = {
+            static_cast<ustore_gpu_vendor_t>(device.vendor),
+            device.vendor_ordinal,
+            static_cast<ustore_gpu_class_t>(pick_gpu_class(device.vendor, loaded[position], gpu_class_t::unknown_k)),
+            device.compute_units,
+            device.memory_bytes,
+            {}};
         std::memcpy(listed.name, device.name, sizeof(listed.name));
     }
     if (arguments->devices_count) *arguments->devices_count = devices.size();
@@ -666,13 +712,14 @@ void ustore_arena_init(ustore_arena_init_t* arguments) {
     *arguments->arena = nullptr;
     ustore_arena_t const arena = new (std::nothrow) ustore_arena_handle_t {};
     if (!arena) return finish(outcome, {util::status_code_t::out_of_memory_k, "No room for the arena"});
-    // Nothing is allocated until the first call writes, on the memory domain or the device its executor names
+    // Nothing is allocated until the first call writes, on the memory domain or the first device
+    // its executor names
     if (ustore_executor_t const executor = arguments->executor)
         std::visit(
-            [&]<typename device_type_>(device_type_ const& device) noexcept {
-                if constexpr (a_gpu_executor<device_type_>)
-                    arena->memory = typename device_type_::arena_blocks_t {
-                        .device = static_cast<int>(device.device().vendor_ordinal)};
+            [&]<typename kind_type_>(kind_type_ const& kind) noexcept {
+                if constexpr (util::a_gpu_executor<kind_type_>)
+                    arena->memory = typename kind_type_::scratch_t::arena_blocks_t {
+                        .device = static_cast<int>(kind.stream(0).ordinal)};
                 else
                     arena->memory = host_blocks_t {
                         .memory_domain = util::host_blocks_of(&executor->scratches.back())->memory_domain};

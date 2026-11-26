@@ -509,8 +509,9 @@ static char const doc_Database_open_nvme[] =                                    
     "    the calling thread.\n"                                                                  //
     "  data_directories (Sequence): Further data directories runs land on, each a path or a\n"   //
     "    (path, max_bytes) pair, where zero bytes take the whole medium.\n"                      //
-    "  compactions (Executor, optional): An executor of Executor.for_vram() whose device and\n"  //
-    "    scratch limit every merge takes, read once here; None merges on host threads.\n"        //
+    "  compactions (Executor, optional): An executor of Executor.for_vram() whose first\n"       //
+    "    device and scratch limit every merge takes, read once here; None merges on host\n"      //
+    "    threads.\n"                                                                             //
     "  cpu_class_ceiling (CPUClass): The newest CPU class the database may confine its\n"        //
     "    waits, atomics and string kernels to, narrowed to what the CPU runs, so a class\n"      //
     "    the CPU lacks is never refused; UNKNOWN sets none.\n"                                   //

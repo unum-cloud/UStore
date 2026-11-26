@@ -315,7 +315,7 @@ committing, err := transaction.Deferred(executor).Commit(ustore.DurabilityBuffer
 
 An `Executor` is the threads that run calls, shared by any number of databases and receivers, serving one call at a time, so a call submitted while another holds it answers `StatusContended`.
 `ExecutorForRam` spawns threads near the NUMA nodes it names, every node for an empty list, where zero threads take seven eighths of their cores, and a nonzero scratch limit caps each thread's scratch.
-`ExecutorForNvme` spawns the NVMe engine's rings near the memory domains it names or the media under its `Paths`, and `ExecutorForVram` drives one GPU, its position in `GPUDevices`, on a stream it creates and destroys, a caller's stream answering `StatusUnsupported` since the executor drives only its own.
+`ExecutorForNvme` spawns the NVMe engine's rings near the memory domains it names or the media under its `Paths`, and `ExecutorForVram` drives the GPUs of one vendor, their positions in `GPUDevices` or every one for none, one stream each, which it creates and destroys or adopts from the caller and destroys.
 Opening a database blocks, on the executor its config names or the calling goroutine, and closing an executor waits for the call holding it.
 An arena never outlives the executor that made it, so `defer executor.Close()` comes before `defer arena.Close()`, and an arena from `NewArena(nil)` lives until it is closed.
 

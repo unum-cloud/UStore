@@ -94,6 +94,21 @@ struct compiled_match<vendored_residency_t::host_k> {
     /** Rewinds @p page, which a listing lays every page out in. */
     void rewind_page(ustore_arena_t page) const noexcept { util::arena_rewind(page); }
 
+    /** Pages a listing keeps in flight: one, as the host narrows each before listing the next. */
+    std::size_t lanes() const noexcept { return 1; }
+
+    /** Rewinds @p page for the next page, answering it as where that page lays out. */
+    ustore_arena_t open_page(std::size_t, ustore_arena_t page) const noexcept {
+        util::arena_rewind(page);
+        return page;
+    }
+
+    /** Nothing is left to finish, as @c select narrows at once. */
+    util::status_t finish(std::size_t, candidates_t&) const noexcept { return {}; }
+
+    /** Nothing is in flight, as @c select narrows at once. */
+    void drain() const noexcept {}
+
     /** Keeps among @p candidates of the page listing @p keys those the predicate admits, when its cost places it at
      *  @p phase, gathering the asked keys and their admissions into @p work. */
     util::status_t ask(ustore_predicate_cost_t phase, std::span<ustore_key_t const> keys, candidates_t& candidates,
@@ -120,7 +135,8 @@ struct compiled_match<vendored_residency_t::host_k> {
 
     /** Keeps among @p candidates those whose @p values, one per candidate in their order, the engine contains a match
      *  in, laying out their views and the bitmap of matches in @p work. */
-    util::status_t select(strings_arg_t const& values, candidates_t& candidates, ustore_arena_t work) const noexcept {
+    util::status_t select(strings_arg_t const& values, candidates_t& candidates, ustore_arena_t work,
+                          std::size_t) const noexcept {
         if (!reads_values() || !candidates.count) return {};
         auto [views, views_status] = util::arena_allocate<sz_string_view_t>(work, candidates.count);
         if (views_status.failed()) return views_status;
@@ -442,13 +458,26 @@ using scores_sink_t = st::vector<float, util::arena_allocator<float>>;
 /** The keys a keyed listing kept, grown in scratch until they reach the call's arena. */
 using keyed_survivors_t = st::vector<ustore_key_t, util::arena_allocator<ustore_key_t>>;
 
+/** One page a keyed listing listed into one lane of its match and awaits there: its keys, the
+ *  candidates still in the running, where it lays out, and where the page after it starts. */
+struct listed_keys_t {
+    std::span<ustore_key_t const> keys;
+    candidates_t candidates;
+    ustore_arena_t work = nullptr;
+    std::variant<ustore_key_t, exhausted_t> next;
+};
+
 /**
  *  @brief Appends to @p survivors up to @p wanted keys of @p collection from @p start on in
  *      @p direction, stopping before @p end where given, that @p match keeps, listing pages through
- *      the host scan verb of @p scan_type_ in @p page, which every page rewinds.
+ *      the host scan verb of @p scan_type_ in @p page, or in the lanes of @p match.
  *
- *  The pages are ordered, whatever the scan's mode, as each resumes past the last key of the one before. Answers the
- *  key the next listing resumes at, or nothing once the range ends.
+ *  Page i lists into lane i modulo the lanes of @p match and is finished, narrowed, asked and
+ *  taken, when that lane comes round again, so a device matches one page while the host lists the
+ *  next; one lane, as a host match has, finishes every page before listing the next. Pages finish
+ *  in listing order, and those listed past the one filling @p wanted are dropped unread. The pages
+ *  are ordered, whatever the scan's mode, as each resumes past the last key of the one before.
+ *  Answers the key the next listing resumes at, or nothing once the range ends.
  */
 template <typename scan_type_, typename match_type_>
 util::status_t list_matched_keys(residency_tables<vendored_residency_t::host_k> const& engine,
@@ -459,62 +488,84 @@ util::status_t list_matched_keys(residency_tables<vendored_residency_t::host_k> 
                                  scores_sink_t* scores = nullptr) noexcept {
     auto const* const verbs = engine.*verb_slot<scan_type_>::template table<vendored_residency_t::host_k>;
     auto const scan_verb = verbs->*verb_slot<scan_type_>::template verb<vendored_residency_t::host_k>;
-    view_t page_view = view;
-    page_view.scratch = page;
+    bool const descending = direction == ustore_scan_descending_k;
     std::size_t const first = survivors.size();
+    std::size_t const lanes = match.lanes();
+    std::array<listed_keys_t, util::gpu_devices_capacity_k> pages;
+    std::size_t listed_count = 0, finished_count = 0;
+    std::variant<ustore_key_t, exhausted_t> next = start;
     resume = start;
-    while (survivors.size() - first < wanted) {
-        match.rewind_page(page);
+
+    // Lists the next page into its lane, asks the cheap predicate and queues the values' match
+    auto const list = [&](listed_keys_t& listing, std::size_t lane) noexcept -> util::status_t {
+        ustore_arena_t const work = match.open_page(lane, page);
+        view_t page_view = view;
+        page_view.scratch = work;
+        ustore_key_t const from = std::get<ustore_key_t>(next);
         ustore_length_t const* offsets = nullptr;
         ustore_key_t const* listed = nullptr;
         scan_type_ const scan {.database = database,
                                .count = 1,
                                .collections = {&collection, 0},
-                               .start_keys = {&start, 0},
+                               .start_keys = {&from, 0},
                                .end_keys = {end, 0},
                                .direction = direction,
                                .offsets = &offsets,
                                .keys = &listed,
-                               .arena = page,
+                               .arena = work,
                                .wanted = wanted};
         util::status_t scanned;
         if constexpr (std::is_same_v<scan_type_, ustore_docs_scan_t>) scanned = scan_verb(scan, nullptr, page_view);
         else scanned = scan_verb(scan, page_view);
         if (scanned.failed()) return scanned;
-        std::size_t const listed_count = offsets ? offsets[1] : 0;
-        std::span<ustore_key_t const> const keys {listed, listed_count};
+        std::size_t const keys_count = offsets ? offsets[1] : 0;
+        std::span<ustore_key_t const> const keys {listed, keys_count};
 
-        auto [indices, indices_status] = util::arena_allocate<std::uint32_t>(page, listed_count);
+        auto [indices, indices_status] = util::arena_allocate<std::uint32_t>(work, keys_count);
         if (indices_status.failed()) return indices_status;
-        candidates_t candidates {indices, {}, listed_count};
+        candidates_t candidates {indices, {}, keys_count};
         if (scores && match.scores()) {
-            auto [scored, scored_status] = util::arena_allocate<float>(page, listed_count);
+            auto [scored, scored_status] = util::arena_allocate<float>(work, keys_count);
             if (scored_status.failed()) return scored_status;
             candidates.scores = scored;
         }
-        for (std::size_t index = 0; index != listed_count; ++index) indices[index] = static_cast<std::uint32_t>(index);
-        if (util::status_t const status = match.ask(ustore_predicate_cost_cheap_k, keys, candidates, page);
+        for (std::size_t index = 0; index != keys_count; ++index) indices[index] = static_cast<std::uint32_t>(index);
+        if (util::status_t const status = match.ask(ustore_predicate_cost_cheap_k, keys, candidates, work);
             status.failed())
             return status;
         if (match.reads_values() && candidates.count) {
             std::span<std::uint32_t const> const picked {indices.data(), candidates.count};
             strings_arg_t candidate_values;
             if (util::status_t const gathered = read_page_values<scan_type_>(engine, database, collection, keys, picked,
-                                                                             page, page_view, candidate_values);
+                                                                             work, page_view, candidate_values);
                 gathered.failed())
                 return gathered;
-            if (util::status_t const status = match.select(candidate_values, candidates, page); status.failed())
+            if (util::status_t const status = match.select(candidate_values, candidates, work, lane); status.failed())
                 return status;
         }
-        if (util::status_t const status = match.ask(ustore_predicate_cost_expensive_k, keys, candidates, page);
+        // A page short of what it wanted reached the range's end, as did one ending at the last key
+        ustore_key_t const& edge = descending ? util::smallest_key_k : util::largest_key_k;
+        ustore_key_t const* const last = keys_count ? listed + keys_count - 1 : nullptr;
+        if (keys_count < wanted || (last && *last == edge)) next = exhausted_t {};
+        else next = descending ? util::key_before(*last) : util::key_after(*last);
+        listing = {keys, candidates, work, next};
+        return {};
+    };
+
+    // Narrows the oldest page on the host once the device of its lane matched it, then takes the
+    // survivors it keeps
+    auto const finish = [&](listed_keys_t& listing, std::size_t lane) noexcept -> util::status_t {
+        candidates_t& candidates = listing.candidates;
+        if (util::status_t const status = match.finish(lane, candidates); status.failed()) return status;
+        if (util::status_t const status = match.ask(ustore_predicate_cost_expensive_k, listing.keys, candidates,
+                                                    listing.work);
             status.failed())
             return status;
-
         std::size_t const room = wanted - (survivors.size() - first);
         std::size_t const taken = candidates.count < room ? candidates.count : room;
         for (std::size_t index = 0; index != taken; ++index) {
             if (util::status_t const status = util::growth_status(
-                    survivors.push_back(ustore_key_t {keys[indices[index]]}));
+                    survivors.push_back(ustore_key_t {listing.keys[candidates.indices[index]]}));
                 status.failed())
                 return status;
             if (!candidates.scores.empty())
@@ -523,21 +574,30 @@ util::status_t list_matched_keys(residency_tables<vendored_residency_t::host_k> 
                     status.failed())
                     return status;
         }
-
-        // A page short of what it wanted reached the range's end, as did one ending at the last key
-        bool const descending = direction == ustore_scan_descending_k;
-        ustore_key_t const& edge = descending ? util::smallest_key_k : util::largest_key_k;
-        ustore_key_t const* const last = listed_count ? listed + listed_count - 1 : nullptr;
-        if (listed_count < wanted || (last && *last == edge)) {
-            resume = exhausted_t {};
-            break;
-        }
         // A page cut short by the room left resumes past the last key it handed out, not the page
-        ustore_key_t const& consumed = taken < candidates.count ? keys[indices[taken - 1]] : *last;
-        start = descending ? util::key_before(consumed) : util::key_after(consumed);
-        resume = start;
+        if (taken < candidates.count) {
+            ustore_key_t const& consumed = listing.keys[candidates.indices[taken - 1]];
+            resume = descending ? util::key_before(consumed) : util::key_after(consumed);
+        }
+        else resume = listing.next;
+        return {};
+    };
+
+    util::status_t status;
+    while (status.succeeded() && survivors.size() - first < wanted) {
+        bool const listing_ended = std::holds_alternative<exhausted_t>(next);
+        if (listing_ended && listed_count == finished_count) break;
+        if (listing_ended || listed_count - finished_count == lanes) {
+            std::size_t const lane = finished_count++ % lanes;
+            status = finish(pages[lane], lane);
+            if (std::holds_alternative<exhausted_t>(resume)) break;
+            continue;
+        }
+        std::size_t const lane = listed_count++ % lanes;
+        status = list(pages[lane], lane);
     }
-    return {};
+    match.drain();
+    return status;
 }
 
 /** A filtered scan of keys as a plan of one phase, one step per task, each listing its task's survivors after those of
@@ -628,11 +688,23 @@ constexpr start_bound_t resume_bound_of(ustore_scan_direction_t direction) noexc
     return direction == ustore_scan_descending_k ? start_bound_t::exclusive_k : start_bound_t::inclusive_k;
 }
 
+/** One page a strings listing listed into one lane of its match and awaits there: its strings,
+ *  their keys, the candidates still in the running, where it lays out, and where the page that
+ *  follows it starts. */
+struct listed_strings_t {
+    strings_arg_t strings;
+    std::size_t strings_count = 0;
+    std::span<ustore_key_t const> keys;
+    candidates_t candidates;
+    ustore_arena_t work = nullptr;
+    std::variant<ustore_bytes_view_t, exhausted_t> next;
+};
+
 /**
  *  @brief Appends to @p survivors up to @p wanted strings of @p collection under @p prefix
  *      from @p start on in @p direction, stopping before @p end where it is not empty, that
- *      @p match keeps, listing pages through the host strings scan of @p engine in @p page,
- *      which every page rewinds.
+ *      @p match keeps, listing pages through the host strings scan of @p engine in @p page, or in
+ *      the lanes of @p match, as @c list_matched_keys deals them.
  *
  *  The predicate sees the keys the strings map onto, which a read of every page's strings finds.
  *  Answers the string the next listing resumes at in @p resume, kept in @p resume_bytes, or nothing
@@ -648,12 +720,32 @@ util::status_t list_matched_strings(residency_tables<vendored_residency_t::host_
                                     std::variant<ustore_bytes_view_t, exhausted_t>& resume,
                                     scores_sink_t* scores = nullptr) noexcept {
     strings_verbs<vendored_residency_t::host_k> const& verbs = *engine.strings;
-    view_t page_view = view;
-    page_view.scratch = page;
     std::size_t const first = survivors.size();
+    std::size_t const lanes = match.lanes();
+    std::array<listed_strings_t, util::gpu_devices_capacity_k> pages;
+    std::size_t listed_count = 0, finished_count = 0;
+    std::variant<ustore_bytes_view_t, exhausted_t> next = start;
     resume = start;
-    while (survivors.size() - first < wanted) {
-        match.rewind_page(page);
+
+    // Copies @p last, a string of a page, into the resume bytes as the start past it, which
+    // outlives every lane the page sits in
+    auto const resume_past = [&](ustore_bytes_view_t last) noexcept -> util::expected<ustore_bytes_view_t> {
+        start_bound_t const bound = resume_bound_of(direction);
+        std::size_t const resume_length = last.length + (bound == start_bound_t::inclusive_k);
+        if (util::status_t const status = util::growth_status(resume_bytes.resize(resume_length)); status.failed())
+            return status;
+        if (last.length) std::memmove(resume_bytes.data(), last.data, last.length);
+        if (bound == start_bound_t::inclusive_k) resume_bytes[last.length] = util::byte_t {0};
+        return ustore_bytes_view_t {reinterpret_cast<ustore_byte_t const*>(resume_bytes.data()), resume_length};
+    };
+
+    // Lists the next page into its lane, reads its keys, asks the cheap predicate and queues the
+    // match of its values
+    auto const list = [&](listed_strings_t& listing, std::size_t lane) noexcept -> util::status_t {
+        ustore_arena_t const work = match.open_page(lane, page);
+        view_t page_view = view;
+        page_view.scratch = work;
+        ustore_bytes_view_t const from = std::get<ustore_bytes_view_t>(next);
         ustore_length_t const* offsets = nullptr;
         ustore_strings_view_t listed_view {};
         std::size_t const page_wanted = wanted + (start_bound == start_bound_t::exclusive_k);
@@ -663,58 +755,78 @@ util::status_t list_matched_strings(residency_tables<vendored_residency_t::host_
                                           .direction = direction,
                                           .offsets = &offsets,
                                           .strings = &listed_view,
-                                          .arena = page,
+                                          .arena = work,
                                           .wanted = page_wanted};
         if (util::status_t const status = verbs.scan(scan, strings_arg_t::from_views(&prefix),
-                                                     strings_arg_t::from_views(&start), strings_arg_t::from_views(&end),
+                                                     strings_arg_t::from_views(&from), strings_arg_t::from_views(&end),
                                                      page_view);
             status.failed())
             return status;
-        std::size_t const listed_count = offsets ? offsets[1] : 0;
+        std::size_t const strings_count = offsets ? offsets[1] : 0;
         strings_arg_t const listed {listed_view};
-        std::size_t const skipped = start_bound == start_bound_t::exclusive_k && listed_count &&
-                                    util::chars_of(listed[0]) == util::chars_of(start);
+        std::size_t const skipped = start_bound == start_bound_t::exclusive_k && strings_count &&
+                                    util::chars_of(listed[0]) == util::chars_of(from);
 
         ustore_key_t const* keys = nullptr;
-        if (match.asks() && listed_count) {
+        if (match.asks() && strings_count) {
             ustore_strings_read_t const read {.database = database,
-                                              .count = listed_count,
+                                              .count = strings_count,
                                               .collections = {&collection, 0},
                                               .values = &keys,
-                                              .arena = page};
+                                              .arena = work};
             if (util::status_t const status = verbs.read(read, listed, page_view); status.failed()) return status;
         }
-        std::span<ustore_key_t const> const listed_keys {keys, keys ? listed_count : 0};
+        std::span<ustore_key_t const> const listed_keys {keys, keys ? strings_count : 0};
 
-        auto [indices, indices_status] = util::arena_allocate<std::uint32_t>(page, listed_count - skipped);
+        auto [indices, indices_status] = util::arena_allocate<std::uint32_t>(work, strings_count - skipped);
         if (indices_status.failed()) return indices_status;
-        candidates_t candidates {indices, {}, listed_count - skipped};
+        candidates_t candidates {indices, {}, strings_count - skipped};
         if (scores && match.scores()) {
-            auto [scored, scored_status] = util::arena_allocate<float>(page, listed_count - skipped);
+            auto [scored, scored_status] = util::arena_allocate<float>(work, strings_count - skipped);
             if (scored_status.failed()) return scored_status;
             candidates.scores = scored;
         }
-        for (std::size_t index = skipped; index != listed_count; ++index)
+        for (std::size_t index = skipped; index != strings_count; ++index)
             indices[index - skipped] = static_cast<std::uint32_t>(index);
-        if (util::status_t const status = match.ask(ustore_predicate_cost_cheap_k, listed_keys, candidates, page);
+        if (util::status_t const status = match.ask(ustore_predicate_cost_cheap_k, listed_keys, candidates, work);
             status.failed())
             return status;
         if (match.reads_values() && candidates.count) {
-            auto [views, views_status] = util::arena_allocate<ustore_bytes_view_t>(page, candidates.count);
+            auto [views, views_status] = util::arena_allocate<ustore_bytes_view_t>(work, candidates.count);
             if (views_status.failed()) return views_status;
             for (std::size_t index = 0; index != candidates.count; ++index) views[index] = listed[indices[index]];
-            if (util::status_t const status = match.select(strings_arg_t::from_views(views.data()), candidates, page);
+            if (util::status_t const status = match.select(strings_arg_t::from_views(views.data()), candidates, work,
+                                                           lane);
                 status.failed())
                 return status;
         }
-        if (util::status_t const status = match.ask(ustore_predicate_cost_expensive_k, listed_keys, candidates, page);
+        // The page after this one starts past its last string, which its lane keeps until it is
+        // reopened, so the start is copied out first
+        if (strings_count < page_wanted || strings_count == skipped) next = exhausted_t {};
+        else {
+            auto [past, past_status] = resume_past(listed[strings_count - 1]);
+            if (past_status.failed()) return past_status;
+            next = past;
+            start_bound = resume_bound_of(direction);
+        }
+        listing = {listed, strings_count, listed_keys, candidates, work, next};
+        return {};
+    };
+
+    // Narrows the oldest page on the host once the device of its lane matched it, then takes the
+    // survivors it keeps
+    auto const finish = [&](listed_strings_t& listing, std::size_t lane) noexcept -> util::status_t {
+        candidates_t& candidates = listing.candidates;
+        if (util::status_t const status = match.finish(lane, candidates); status.failed()) return status;
+        if (util::status_t const status = match.ask(ustore_predicate_cost_expensive_k, listing.keys, candidates,
+                                                    listing.work);
             status.failed())
             return status;
-
         std::size_t const room = wanted - (survivors.size() - first);
         std::size_t const taken = candidates.count < room ? candidates.count : room;
         for (std::size_t index = 0; index != taken; ++index) {
-            if (util::status_t const status = survivors.push_back(listed[indices[index]]); status.failed())
+            if (util::status_t const status = survivors.push_back(listing.strings[candidates.indices[index]]);
+                status.failed())
                 return status;
             if (!candidates.scores.empty())
                 if (util::status_t const status = util::growth_status(
@@ -722,23 +834,36 @@ util::status_t list_matched_strings(residency_tables<vendored_residency_t::host_
                     status.failed())
                     return status;
         }
-
-        if (listed_count < page_wanted || listed_count == skipped) {
+        if (std::holds_alternative<exhausted_t>(listing.next)) {
             resume = exhausted_t {};
-            break;
+            return {};
         }
-        ustore_bytes_view_t const last = taken < candidates.count ? listed[indices[taken - 1]]
-                                                                  : listed[listed_count - 1];
-        start_bound = resume_bound_of(direction);
-        std::size_t const resume_length = last.length + (start_bound == start_bound_t::inclusive_k);
-        if (util::status_t const status = util::growth_status(resume_bytes.resize(resume_length)); status.failed())
-            return status;
-        if (last.length) std::memcpy(resume_bytes.data(), last.data, last.length);
-        if (start_bound == start_bound_t::inclusive_k) resume_bytes[last.length] = util::byte_t {0};
-        start = {reinterpret_cast<ustore_byte_t const*>(resume_bytes.data()), resume_length};
-        resume = start;
+        // The listing ends here once full, so the resume bytes, which only started later pages,
+        // take this page's last string, still in its lane
+        if (survivors.size() - first < wanted) return {};
+        ustore_bytes_view_t const last = taken < candidates.count ? listing.strings[candidates.indices[taken - 1]]
+                                                                  : listing.strings[listing.strings_count - 1];
+        auto [past, past_status] = resume_past(last);
+        if (past_status.failed()) return past_status;
+        resume = past;
+        return {};
+    };
+
+    util::status_t status;
+    while (status.succeeded() && survivors.size() - first < wanted) {
+        bool const listing_ended = std::holds_alternative<exhausted_t>(next);
+        if (listing_ended && listed_count == finished_count) break;
+        if (listing_ended || listed_count - finished_count == lanes) {
+            std::size_t const lane = finished_count++ % lanes;
+            status = finish(pages[lane], lane);
+            if (std::holds_alternative<exhausted_t>(resume)) break;
+            continue;
+        }
+        std::size_t const lane = listed_count++ % lanes;
+        status = list(pages[lane], lane);
     }
-    return {};
+    match.drain();
+    return status;
 }
 
 /** Serves the strings scan @p arguments with @p match through the host verbs of @p engine, one filtered listing per

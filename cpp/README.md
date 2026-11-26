@@ -338,7 +338,7 @@ The deferred database also finds, creates, drops and lists collections, and desc
 ## Executors
 
 An executor owns the threads that run calls, serves one call at a time, and is shared by any number of databases, as [the C rules](https://github.com/unum-cloud/UStore/blob/main/c/README.md#executors) describe.
-`executor_t::for_ram` spawns host threads, `for_nvme` the NVMe engine's rings, and `for_vram` one device stream it owns, a caller's stream answering `status_code_t::unsupported_k` since the executor drives only its own, and the owner frees the executor on destruction, waiting for the calls naming it.
+`executor_t::for_ram` spawns host threads, `for_nvme` the NVMe engine's rings, and `for_vram` one stream per GPU it names, opened or adopted from the caller and destroyed with it, and the owner frees the executor on destruction, waiting for the calls naming it.
 Closing a database or dropping its handle writes nothing to disk, so `flush` on an executor makes commits with `ustore_durability_buffered_k` durable first.
 Every arena is freed before the executor that made it, so declare the executor first and its arenas after it, and their destructors run in that order.
 Opening blocks, as every constructor does: `init_ram`, `open_ram`, `open_rocksdb`, `view_rocksdb`, `open_leveldb`, `open_nvme` and `view_nvme` take the executor to block on as their last argument, and an NVMe database moves bytes as the placement of an NVMe executor names.

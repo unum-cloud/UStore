@@ -16,6 +16,7 @@
 #include <cstdint> // `std::uint32_t`, `std::uintptr_t`
 #include <cstring> // `std::memcmp`
 
+#include <algorithm>       // `std::find_if`
 #include <array>           // `std::array`
 #include <span>            // `std::span`, `std::as_bytes`, `std::as_writable_bytes`
 #include <string>          // `std::string`, `std::to_string`
@@ -33,7 +34,7 @@
 #include "ustore/utilities/vram_device.hpp"    // `gpu_drivers_t`, `assemble_tape`
 
 #include "harness.hpp"      // `run_test_case`, `expect_true`, `expect_success`, `scratch_directory_t`
-#include "vram/classes.hpp" // `kernel_tables`, `open_gpu_device`, `spawn_gpu_executor`, `gpu_class_bundle`
+#include "vram/classes.hpp" // `gpu_class_bundle`
 
 using namespace unum::ustore;
 using namespace unum::ustore::test;
@@ -65,7 +66,7 @@ struct tape_t {
 /** What the HIP stand-in counted, read through the library the runtime opened. */
 struct fake_hip_counters_t {
     std::size_t allocations, frees, managed_allocations, fills, uploads, downloads, registrations, unregistrations,
-        waits, pointer_queries;
+        waits, pointer_queries, stream_creations, stream_destructions;
 };
 
 /** The stand-in's counters, or null when the real runtime or none is loaded. */
@@ -75,14 +76,15 @@ fake_hip_counters_t const* fake_hip_counters() noexcept {
     return counters;
 }
 
-/** Hands @p body the executor a mover holds, of any vendor, and nothing for none. */
+/** Hands @p body the one device of the executor a mover holds, of any vendor, and nothing for
+ *  none. */
 template <typename body_type_>
 struct device_visitor {
     body_type_& body;
     void operator()(std::monostate) const noexcept {}
-    void operator()(util::cuda_executor_t& executor) const noexcept { body(executor); }
-    void operator()(util::hip_executor_t& executor) const noexcept { body(executor); }
-    void operator()(util::metal_executor_t& executor) const noexcept { body(executor); }
+    void operator()(util::cuda_executor_t& executor) const noexcept { body(executor.stream(0)); }
+    void operator()(util::hip_executor_t& executor) const noexcept { body(executor.stream(0)); }
+    void operator()(util::metal_executor_t& executor) const noexcept { body(executor.stream(0)); }
 };
 
 /** The suite's own executor on one listed device, which places inputs there and fetches outputs back. */
@@ -92,13 +94,14 @@ class mover_t {
         util::gpu_device_t device;
         device.vendor = static_cast<util::gpu_vendor_t>(listed.vendor);
         device.vendor_ordinal = listed.vendor_ordinal;
-        gpu_class_t const gpu_class = static_cast<gpu_class_t>(listed.gpu_class);
-        if (util::status_t const opened = open_gpu_device(drivers_, device, gpu_class, cuda_kernels_, hip_kernels_,
-                                                          metal_kernels_);
-            opened.failed())
-            return opened;
-        return spawn_gpu_executor(drivers_, cuda_kernels_, hip_kernels_, metal_kernels_, device, gpu_class, 0,
-                                  ustore_gds_automatic_k, executor_);
+        // The mover only moves bytes, so its streams launch no kernels
+        auto no_kernels = []<typename module_type_>(std::type_identity<module_type_>, int) noexcept {
+            return static_cast<util::kernel_table<module_type_> const*>(nullptr);
+        };
+        std::size_t no_ceiling = 0;
+        auto [spawned, spawn_status] = util::spawn_gpu_executor(drivers_, {&device, 1}, {}, no_kernels, no_ceiling);
+        if (spawn_status.succeeded()) executor_ = std::move(spawned);
+        return spawn_status;
     }
 
     ~mover_t() noexcept {
@@ -126,8 +129,8 @@ class mover_t {
     element_type_* place(std::span<element_type_ const> host) noexcept {
         std::uintptr_t address = 0;
         copy([&](auto& executor) noexcept {
-            auto [allocated, allocated_status] = executor.allocate_async(host.size_bytes());
-            if (allocated_status.failed()) return allocated_status;
+            auto [allocated, allocate_status] = executor.allocate_async(host.size_bytes());
+            if (allocate_status.failed()) return allocate_status;
             address = allocated;
             placed_.push_back(address);
             return executor.upload_async(address, std::as_bytes(host));
@@ -167,7 +170,7 @@ class mover_t {
     /** Whether the device loaded the library's kernels. */
     bool launches() noexcept {
         bool loaded = false;
-        visit([&](auto& executor) noexcept { loaded = executor.kernels() != nullptr; });
+        visit([&](auto& executor) noexcept { loaded = executor.kernels != nullptr; });
         return loaded;
     }
 
@@ -180,10 +183,7 @@ class mover_t {
     util::gpu_drivers_t drivers_;
     ustore_arena_t outputs_arena_ = nullptr;
     std::int32_t outputs_device_ = -1;
-    kernel_tables<util::cuda_module_t> cuda_kernels_;
-    kernel_tables<util::hip_module_t> hip_kernels_;
-    kernel_tables<util::metal_module_t> metal_kernels_;
-    std::variant<std::monostate, util::cuda_executor_t, util::hip_executor_t, util::metal_executor_t> executor_;
+    util::gpu_executor_t executor_;
     std::vector<std::uintptr_t> placed_;
     util::status_t status_;
 };
@@ -202,23 +202,25 @@ std::vector<ustore_gpu_device_t> listed_devices() noexcept {
     return devices;
 }
 
-/** A VRAM executor on UStore ordinal @p ordinal and an arena on its device, freed together. */
+/** A VRAM executor on the UStore @p ordinals and an arena on the first, freed together. */
 struct device_call_t {
     ustore_executor_t executor = nullptr;
     ustore_arena_t arena = nullptr;
     util::status_t status;
 
-    explicit device_call_t(std::size_t ordinal) noexcept {
+    explicit device_call_t(std::span<std::int32_t const> ordinals) noexcept {
         ustore_outcome_t outcome {};
         ustore_executor_for_vram_t spawn {.executor = &executor,
                                           .outcome = &outcome,
-                                          .device = static_cast<std::int32_t>(ordinal)};
+                                          .vram = {.devices = ordinals.data(), .devices_count = ordinals.size()}};
         ustore_executor_for_vram(&spawn);
         if ((status = status_of(outcome)).failed()) return;
         ustore_arena_init_t init {.arena = &arena, .executor = executor, .outcome = &outcome};
         ustore_arena_init(&init);
         status = status_of(outcome);
     }
+    explicit device_call_t(std::size_t ordinal) noexcept
+        : device_call_t(std::array {static_cast<std::int32_t>(ordinal)}) {}
     ~device_call_t() noexcept {
         ustore_arena_free(arena);
         ustore_executor_free(executor);
@@ -377,10 +379,11 @@ void test_vram_class_ceiling(std::size_t ordinal, ustore_gpu_device_t listed) {
     auto spawned_under = [ordinal](ustore_gpu_class_t gpu_class_ceiling) noexcept {
         ustore_outcome_t outcome {};
         ustore_executor_t executor = nullptr;
-        ustore_executor_for_vram_t spawn {.executor = &executor,
-                                          .outcome = &outcome,
-                                          .device = static_cast<std::int32_t>(ordinal),
-                                          .gpu_class_ceiling = gpu_class_ceiling};
+        std::int32_t const device = static_cast<std::int32_t>(ordinal);
+        ustore_executor_for_vram_t spawn {
+            .executor = &executor,
+            .outcome = &outcome,
+            .vram = {.devices = &device, .devices_count = 1, .gpu_class_ceiling = gpu_class_ceiling}};
         ustore_executor_for_vram(&spawn);
         ustore_executor_free(executor);
         return outcome.status;
@@ -881,6 +884,99 @@ case_result_t test_vram_frees_everything(std::size_t ordinal, ustore_gpu_device_
     return {};
 }
 
+/** An executor naming no device drives every listed device of the first vendor with a known class,
+ *  @p ordinals here, and its arenas live on the first of them. */
+case_result_t test_vram_every_device(std::vector<std::int32_t> ordinals) {
+    ustore_outcome_t outcome {};
+    ustore_executor_t executor = nullptr;
+    ustore_executor_for_vram_t spawn {.executor = &executor, .outcome = &outcome};
+    ustore_executor_for_vram(&spawn);
+    if (!expect_success(outcome)) return {};
+    ustore_arena_t arena = nullptr;
+    ustore_arena_init_t init {.arena = &arena, .executor = executor, .outcome = &outcome};
+    ustore_arena_init(&init);
+    ustore_arena_description_t description {};
+    ustore_arena_describe_t describe {.arena = arena, .outcome = &outcome, .description = &description};
+    if (expect_success(outcome)) ustore_arena_describe(&describe);
+    expect_success(outcome);
+    expect_true(description.residency == ustore_residency_vram_k && description.device == ordinals.front());
+    ustore_arena_free(arena);
+    ustore_executor_free(executor);
+    return {};
+}
+
+/** The executor adopts a HIP stream per named device and destroys it when freed, and refuses a
+ *  null or default stream, a device named twice beside streams, and streams beside no named device
+ *  as malformed, and a stream on another device than its entry names as mismatched, each leaving
+ *  the streams the caller's. */
+case_result_t test_vram_adopted_streams(std::vector<std::int32_t> ordinals, std::vector<ustore_gpu_device_t> devices) {
+    using set_device_t = int (*)(int);
+    using create_stream_t = int (*)(void**, unsigned);
+    using destroy_stream_t = int (*)(void*);
+    util::shared_library_t const runtime = util::shared_library_t::open("libamdhip64.so");
+    set_device_t set_device = nullptr;
+    create_stream_t create_stream = nullptr;
+    destroy_stream_t destroy_stream = nullptr;
+    if (!expect_true(runtime.resolve("hipSetDevice", set_device) &&
+                     runtime.resolve("hipStreamCreateWithFlags", create_stream) &&
+                     runtime.resolve("hipStreamDestroy", destroy_stream)))
+        return {};
+    auto const stream_on = [&](std::int32_t ordinal) noexcept {
+        void* stream = nullptr;
+        if (set_device(static_cast<int>(devices[static_cast<std::size_t>(ordinal)].vendor_ordinal)) != 0 ||
+            create_stream(&stream, 1) != 0)
+            return static_cast<void*>(nullptr);
+        return stream;
+    };
+    auto const spawned = [](std::span<std::int32_t const> named, std::span<void* const> streams) noexcept {
+        ustore_outcome_t outcome {};
+        ustore_executor_t executor = nullptr;
+        ustore_executor_for_vram_t spawn {.executor = &executor,
+                                          .outcome = &outcome,
+                                          .vram = {.devices = named.data(), .devices_count = named.size()},
+                                          .streams = streams.empty() ? nullptr : streams.data()};
+        ustore_executor_for_vram(&spawn);
+        ustore_executor_free(executor);
+        return outcome.status;
+    };
+    std::int32_t const first = ordinals[0], second = ordinals[1];
+    std::array<std::int32_t, 1> const alone {first};
+    std::array<std::int32_t, 2> const both {first, second}, twice {first, first};
+
+    // The stand-in counts streams, so each adopted one is seen destroyed exactly once, by the
+    // executor's free, and each refused one never by the library
+    fake_hip_counters_t const* const counters = fake_hip_counters();
+    auto const destroyed = [counters]() noexcept { return counters ? counters->stream_destructions : 0; };
+    std::size_t const created_before = counters ? counters->stream_creations : 0;
+    std::size_t const destroyed_before = destroyed();
+
+    // Adopted streams are the executor's from then on, destroyed when it is freed
+    std::array<void*, 1> const adopted {stream_on(first)};
+    expect_true(spawned(alone, adopted) == ustore_status_success_k);
+    std::array<void*, 2> const adopted_both {stream_on(first), stream_on(second)};
+    expect_true(spawned(both, adopted_both) == ustore_status_success_k);
+    if (counters) expect_equal(destroyed() - destroyed_before, std::size_t {3});
+
+    // Default streams no executor can destroy
+    for (std::uintptr_t const handle : {std::uintptr_t {0}, std::uintptr_t {1}, std::uintptr_t {2}}) {
+        std::array<void*, 1> const default_stream {reinterpret_cast<void*>(handle)};
+        expect_true(spawned(alone, default_stream) == ustore_status_invalid_argument_k);
+    }
+    // A refused stream stays the caller's, which destroys it
+    std::array<void*, 1> const elsewhere {stream_on(second)};
+    expect_true(spawned(alone, elsewhere) == ustore_status_config_mismatch_k);
+    std::array<void*, 2> const repeated {stream_on(first), stream_on(first)};
+    expect_true(spawned(twice, repeated) == ustore_status_invalid_argument_k);
+    std::array<void*, 1> const unnamed {stream_on(first)};
+    expect_true(spawned({}, unnamed) == ustore_status_invalid_argument_k);
+    if (counters) expect_equal(destroyed() - destroyed_before, std::size_t {3});
+    for (void* const stream : {elsewhere[0], repeated[0], repeated[1], unnamed[0]})
+        expect_true(destroy_stream(stream) == 0);
+    // Every stream the case made is gone, the caller's refused ones by the caller alone
+    if (counters) expect_equal(counters->stream_creations - created_before, destroyed() - destroyed_before);
+    return {};
+}
+
 /** Admits the keys spelling even integers, at either predicate cost. */
 void admit_even_keys(ustore_key_t const* keys, ustore_admission_t* admissions, ustore_size_t count, void*) {
     for (std::size_t index = 0; index != count; ++index)
@@ -892,12 +988,14 @@ bool embeds_kernels(ustore_gpu_device_t const& listed) {
     return !gpu_class_bundle(static_cast<gpu_class_t>(listed.gpu_class)).empty();
 }
 
-case_result_t test_vram_matching(std::size_t ordinal, ustore_gpu_device_t listed, config_t config) {
+/** Filtered scans on an executor over the UStore @p ordinals, @p listed the first, keep what the
+ *  host keeps, however many devices the pages are dealt across. */
+case_result_t test_vram_matching(std::vector<std::int32_t> ordinals, ustore_gpu_device_t listed, config_t config) {
     mover_t mover;
     if (!expect_true(mover.open(listed).succeeded())) return {};
-    device_call_t call {ordinal};
+    device_call_t call {ordinals};
     if (!expect_true(call.status.succeeded())) return {};
-    mover.lands_in(call.arena, ordinal);
+    mover.lands_in(call.arena, static_cast<std::size_t>(ordinals.front()));
     fixture_t fixture {config, "matching"};
     if (!fixture.filled) return {};
     // Every device matches values through the library's kernels, but the stand-in HIP driver
@@ -1134,10 +1232,31 @@ int main(int argc, char** argv) {
         run_test_case((prefix + "staging").c_str(), test_vram_staging, ordinal, listed, devices, config);
         run_test_case((prefix + "warm_calls").c_str(), test_vram_warm_calls, ordinal, listed, config);
         run_test_case((prefix + "frees_everything").c_str(), test_vram_frees_everything, ordinal, listed, config);
-        run_test_case((prefix + "matching").c_str(), test_vram_matching, ordinal, listed, config);
+        run_test_case((prefix + "matching").c_str(), test_vram_matching,
+                      std::vector<std::int32_t> {static_cast<std::int32_t>(ordinal)}, listed, config);
         // Tapes launch kernels, which neither a build embedding none nor the HIP stand-in can run
         if (embeds_kernels(listed) && (listed.vendor != ustore_gpu_vendor_amd_k || !fake_hip_counters()))
             run_test_case((prefix + "tapes").c_str(), test_vram_tapes, listed);
+    }
+    // Every vendor listing several devices of a known class has one executor drive them all
+    std::size_t const first_known = static_cast<std::size_t>(
+        std::find_if(devices.begin(), devices.end(),
+                     [](ustore_gpu_device_t const& listed) { return listed.gpu_class != ustore_gpu_class_unknown_k; }) -
+        devices.begin());
+    for (ustore_gpu_vendor_t const vendor :
+         {ustore_gpu_vendor_nvidia_k, ustore_gpu_vendor_amd_k, ustore_gpu_vendor_apple_k}) {
+        std::vector<std::int32_t> ordinals;
+        for (std::size_t ordinal = 0; ordinal != devices.size(); ++ordinal)
+            if (devices[ordinal].vendor == vendor && devices[ordinal].gpu_class != ustore_gpu_class_unknown_k)
+                ordinals.push_back(static_cast<std::int32_t>(ordinal));
+        if (ordinals.size() < 2) continue;
+        std::string const prefix = fmt::format("test_vram_{}_", ustore_gpu_vendor_name(vendor));
+        ustore_gpu_device_t const& first = devices[static_cast<std::size_t>(ordinals.front())];
+        if (static_cast<std::size_t>(ordinals.front()) == first_known)
+            run_test_case((prefix + "every_device").c_str(), test_vram_every_device, ordinals);
+        if (vendor == ustore_gpu_vendor_amd_k)
+            run_test_case((prefix + "adopted_streams").c_str(), test_vram_adopted_streams, ordinals, devices);
+        run_test_case((prefix + "matching_across_devices").c_str(), test_vram_matching, ordinals, first, config);
     }
     return finish_test_run();
 }

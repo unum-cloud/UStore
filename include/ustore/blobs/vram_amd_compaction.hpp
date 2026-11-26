@@ -126,6 +126,9 @@ class hip_compactor_t {
     hip_compactor_t(utilities::hip_executor_t& executor, device_sections_reader_t sections) noexcept
         : executor_(&executor), sections_(sections) {}
 
+    /** The stream every merge queues on, the executor's first. */
+    utilities::hip_executor_t::stream_t& stream_() const noexcept { return executor_->stream(0); }
+
     /** Carves @p count elements off the compactor's device blocks, counting the runs it opens, null
      *  when it cannot. */
     template <typename element_type_>

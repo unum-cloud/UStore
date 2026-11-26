@@ -8,7 +8,9 @@
  *  One binary drives NVIDIA, AMD and Apple devices at once, each vendor through a runtime its
  *  caller loads once and declared without its SDK, so every unit names all three: NVIDIA devices
  *  are listed first, then AMD, then Apple, and a vendor whose runtime is absent lists no devices.
- *  Every vendor's device header provides the surface @c a_gpu_executor names.
+ *  Every vendor's device header provides the surfaces @c a_gpu_stream and @c a_gpu_executor name.
+ *  Code that holds an executor and drives its streams takes its @c claim once at its top, which a
+ *  second caller finds held; code handed only a stream, or called by a claimed verb, takes none.
  *
  *  The library embeds bundles of kernels, which a device loads into a @c kernel_table the process
  *  keeps, and every executor spawned over that table launches through it, finding each kernel by
@@ -24,9 +26,9 @@
 #include <concepts>    // `std::same_as`, `std::convertible_to`
 #include <span>        // `std::span`
 #include <string_view> // `std::string_view`
-#include <type_traits> // `std::is_trivially_copyable_v`, `std::is_same_v`
+#include <type_traits> // `std::is_trivially_copyable_v`, `std::is_same_v`, `std::type_identity`
 #include <utility>     // `std::move`
-#include <variant>     // `std::get_if`
+#include <variant>     // `std::get_if`, `std::variant`, `std::monostate`
 
 #include "ustore/utilities/nvme_linux_cufile_disk.hpp" // `cufile_api_t`
 #include "ustore/utilities/ram_buffers.hpp"            // `device_blocks_t`, `managed_blocks_t`, `bump`
@@ -38,79 +40,139 @@
 
 namespace unum::ustore::utilities {
 
-/** What every vendor's executor answers: its vendor and the arena memory it carves, one device,
- *  one stream it waits on, the ceiling on its scratch, the memory entries arenas and towers queue
- *  on its stream, and its pinned bounce and managed runs. */
-template <typename executor_type_>
-concept a_gpu_executor = requires(executor_type_& executor, executor_type_ const& spawned, std::size_t bytes,
-                                  std::uintptr_t address, std::span<byte_t> target,
-                                  typename executor_type_::arena_blocks_t& arena) {
-    { executor_type_::vendor_k } -> std::convertible_to<gpu_vendor_t>;
-    { arena.blocks } -> std::convertible_to<device_blocks_t&>;
-    { executor.wait() } -> std::same_as<status_t>;
-    { executor.bind() } -> std::same_as<status_t>;
-    { spawned.device() } -> std::same_as<gpu_device_t const&>;
-    { spawned.device_of(target.data()) } -> std::same_as<int>;
-    { spawned.scratch_limit() } -> std::same_as<std::size_t>;
-    { executor.allocate_async(bytes) } -> std::same_as<expected<std::uintptr_t>>;
-    { executor.allocate_managed(bytes) } -> std::same_as<expected<std::uintptr_t>>;
-    { executor.free_async(address) };
-    { executor.free_managed(address) };
-    { executor.fill_async(address, byte_t {}, bytes) } -> std::same_as<status_t>;
-    { executor.upload_async(address, std::span<byte_t const> {target}) } -> std::same_as<status_t>;
-    { executor.download_async(target, address) } -> std::same_as<status_t>;
-    { executor.copy_async(address, address, bytes) } -> std::same_as<status_t>;
-    { executor.bounce() } -> std::same_as<ustore_arena_t>;
-    { executor.rewind_bounce() };
-    { executor.pin_bounce() } -> std::same_as<status_t>;
-    { executor.managed() } -> std::same_as<managed_blocks_t&>;
+/** UStore's optional driver entries beside the vendor tables: cuFile's, which reads drives straight
+ *  into NVIDIA device memory. */
+struct gpu_driver_extensions_t {
+    cufile_api_t cufile;
+
+    gpu_driver_extensions_t() noexcept : cufile(cufile_api_t::load()) {}
 };
 
-static_assert(a_gpu_executor<cuda_executor_t>);
-static_assert(a_gpu_executor<hip_executor_t>);
-static_assert(a_gpu_executor<metal_executor_t>);
+#pragma region Shared VRAM
 
-/** Every vendor's driver table and cuFile's, which a process builds once and hands to every GPU call; a library that
- *  is absent keeps an empty table. */
+/** Every vendor's driver table, Apple's device contexts and the engine's optional entries, which a
+ *  caller builds once per process and hands to every GPU call; a vendor whose runtime is absent
+ *  keeps an empty table. */
 struct gpu_drivers_t {
     cuda_api_t cuda;
     hip_api_t hip;
     metal_api_t metal;
-    cufile_api_t cufile;
+    metal_contexts_t metal_contexts;
 
-    /** The primary context of every NVIDIA device by CUDA ordinal, null until @c retain_context
-     *  retains it, and never released, as the driver releases them at exit. */
-    cuda_context_handle_t cuda_contexts[gpu_devices_capacity_k] = {};
-
-    /** Every Apple device Metal lists, retained for the process. */
-    metal_devices_t metal_devices;
+    /** The engine's optional entries, resolved apart from the tables above. */
+    gpu_driver_extensions_t extensions;
 
     gpu_drivers_t() noexcept
-        : cuda(cuda_api_t::load()), hip(hip_api_t::load()), metal(metal_api_t::load()), cufile(cufile_api_t::load()),
-          metal_devices(metal) {}
+        : cuda(cuda_api_t::load()), hip(hip_api_t::load()), metal(metal_api_t::load()), metal_contexts(metal) {}
     gpu_drivers_t(gpu_drivers_t const&) = delete;
     gpu_drivers_t& operator=(gpu_drivers_t const&) = delete;
-
-    /** The primary context of CUDA ordinal @p ordinal, retained by the first call, which runs
-     *  alone, or null where the driver refuses it. */
-    cuda_context_handle_t retain_context(int ordinal) noexcept {
-        if (!cuda || ordinal < 0 || ordinal >= static_cast<int>(gpu_devices_capacity_k)) return nullptr;
-        cuda_context_handle_t& context = cuda_contexts[ordinal];
-        int handle = 0;
-        if (!context && (cuda.get_device(&handle, ordinal) != cuda_success_k ||
-                         cuda.retain_primary_context(&context, handle) != cuda_success_k))
-            context = nullptr;
-        return context;
-    }
 };
+
+/** The driver each vendor's executor spawns over: its runtime's table, or Apple's contexts. */
+inline cuda_api_t const& driver_of(gpu_drivers_t& drivers, std::type_identity<cuda_executor_t>) noexcept {
+    return drivers.cuda;
+}
+inline hip_api_t const& driver_of(gpu_drivers_t& drivers, std::type_identity<hip_executor_t>) noexcept {
+    return drivers.hip;
+}
+inline metal_contexts_t& driver_of(gpu_drivers_t& drivers, std::type_identity<metal_executor_t>) noexcept {
+    return drivers.metal_contexts;
+}
 
 /** Writes into @p into every device @p drivers reach, NVIDIA first, then AMD, then Apple, as each
  *  driver reports it, and answers how many it wrote. */
 inline std::size_t list_gpu_devices(gpu_drivers_t const& drivers, std::span<gpu_device_t> into) noexcept {
     std::size_t count = list_nvidia_gpu_devices(drivers.cuda, into);
     count += list_amd_gpu_devices(drivers.hip, into.subspan(count));
-    return count + list_apple_gpu_devices(drivers.metal_devices, into.subspan(count));
+    count += list_apple_gpu_devices(drivers.metal_contexts, into.subspan(count));
+    return count;
 }
+
+/** What one vendor's stream answers: its device, binding it, waiting for everything queued, and
+ *  the memory operations queued in its order, each with that device bound. */
+template <typename stream_type_>
+concept a_gpu_stream = requires(stream_type_& stream, stream_type_ const& spawned, std::size_t bytes,
+                                std::uintptr_t address, bytes_span_t target) {
+    { spawned.ordinal } -> std::convertible_to<std::size_t>;
+    { spawned.bind() } -> std::same_as<status_t>;
+    { stream.wait() } -> std::same_as<status_t>;
+    { stream.allocate_async(bytes) } -> std::same_as<expected<std::uintptr_t>>;
+    { stream.free_async(address) };
+    { stream.copy_async(address, address, bytes) } -> std::same_as<status_t>;
+    { stream.upload_async(address, bytes_view_t {target}) } -> std::same_as<status_t>;
+    { stream.download_async(target, address) } -> std::same_as<status_t>;
+    { stream.fill_async(address, byte_t {}, bytes) } -> std::same_as<status_t>;
+};
+
+/** What every vendor's executor answers: its vendor, and its streams, one per device in the order
+ *  the caller named them, and the wait for all of them. */
+template <typename executor_type_>
+concept a_gpu_executor = a_gpu_stream<typename executor_type_::stream_t> &&
+                         requires(executor_type_& executor, executor_type_ const& spawned, std::size_t index) {
+                             { executor_type_::vendor_k } -> std::convertible_to<gpu_vendor_t>;
+                             { spawned.size() } -> std::same_as<std::size_t>;
+                             { executor.stream(index) } -> std::same_as<typename executor_type_::stream_t&>;
+                             { executor.wait() } -> std::same_as<status_t>;
+                         };
+
+static_assert(a_gpu_executor<cuda_executor_t>);
+static_assert(a_gpu_executor<hip_executor_t>);
+static_assert(a_gpu_executor<metal_executor_t>);
+
+/** Whichever vendor's executor a VRAM call runs on, or none. */
+using gpu_executor_t = std::variant<std::monostate, cuda_executor_t, hip_executor_t, metal_executor_t>;
+
+/**
+ *  @brief Spawns the executor of the one vendor every device in @p devices belongs to, over that
+ *      vendor's driver in @p drivers, opening each stream's memory and kernels with
+ *      @p memory_arguments.
+ *
+ *  One stream per distinct device over their vendor ordinals, which every shard there shares: the
+ *  executor opens it, or adopts the entry of @p streams beside the device, a refused spawn leaving
+ *  every one of them the caller's.
+ *
+ *  @par Statuses:
+ *  - @c invalid_argument_k No device is named, one repeats beside @p streams, or a stream is null
+ *    or a default one.
+ *  - @c config_mismatch_k The @p devices span vendors, or a stream sits on another device than
+ *    its entry names.
+ *  - @c device_k The build drives no executor of their vendor, or a device refused its stream.
+ */
+template <typename... memory_arguments_>
+expected<gpu_executor_t> spawn_gpu_executor(gpu_drivers_t& drivers, std::span<gpu_device_t const> devices,
+                                            std::span<void* const> streams,
+                                            memory_arguments_&... memory_arguments) noexcept {
+    if (devices.empty() || devices.size() > gpu_devices_capacity_k)
+        return {{}, {status_code_t::invalid_argument_k, "An executor names one to a listing's devices"}};
+    int ordinals[gpu_devices_capacity_k] = {};
+    std::size_t ordinals_count = 0;
+    for (gpu_device_t const& device : devices) {
+        if (device.vendor != devices[0].vendor)
+            return {{}, {status_code_t::config_mismatch_k, "One executor drives one GPU vendor"}};
+        int const ordinal = static_cast<int>(device.vendor_ordinal);
+        std::size_t earlier = 0;
+        while (earlier != ordinals_count && ordinals[earlier] != ordinal) ++earlier;
+        // Two adopted streams on one device would leave one of them unowned.
+        if (earlier != ordinals_count && !streams.empty())
+            return {{}, {status_code_t::invalid_argument_k, "Each adopted stream needs its own device"}};
+        if (earlier == ordinals_count) ordinals[ordinals_count++] = ordinal;
+    }
+    gpu_executor_t executor;
+    status_t spawning {status_code_t::device_k, "The build drives no executor of the vendor"};
+    auto const spawn = [&]<typename executor_type_>(std::type_identity<executor_type_> vendor) noexcept {
+        if (executor_type_::vendor_k != devices[0].vendor) return false;
+        auto [spawned, status] = executor_type_::spawn(
+            driver_of(drivers, vendor), std::span<int const> {ordinals, ordinals_count}, streams, memory_arguments...);
+        if (status.succeeded()) executor.template emplace<executor_type_>(std::move(spawned));
+        spawning = status;
+        return true;
+    };
+    spawn(std::type_identity<cuda_executor_t> {}) || spawn(std::type_identity<hip_executor_t> {}) ||
+        spawn(std::type_identity<metal_executor_t> {});
+    return {std::move(executor), spawning};
+}
+
+#pragma endregion Shared VRAM
 
 #pragma region Kernels
 
@@ -231,20 +293,19 @@ struct kernel_table {
 };
 
 /**
- *  @brief Queues @p function on @p executor's stream as @p blocks blocks of @p threads
- *      threads each, granting it @p shared_bytes of dynamic shared memory, with @p arguments
- *      copied at the launch.
+ *  @brief Queues @p function on @p stream as @p blocks blocks of @p threads threads each, granting
+ *      it @p shared_bytes of dynamic shared memory, with @p arguments copied when it launches.
  *
  *  @par Statuses:
  *  - @c status_code_t::device_k The bundle holds no such kernel, or the device refused the window
  *    or the launch.
  */
 template <typename... argument_types_>
-status_t launch(cuda_executor_t& executor, cuda_function_handle_t function, unsigned blocks, unsigned threads,
+status_t launch(cuda_executor_t::stream_t& stream, cuda_function_handle_t function, unsigned blocks, unsigned threads,
                 unsigned shared_bytes, argument_types_... arguments) noexcept {
     static_assert((std::is_trivially_copyable_v<argument_types_> && ...), "Kernels take their arguments by bytes");
     if (!function) return {status_code_t::device_k, "The bundle holds no such kernel"};
-    cuda_api_t const& api = executor.api();
+    cuda_api_t const& api = stream.handle.api();
     int granted = 0;
     if (shared_bytes &&
         api.function_get_attribute(&granted, cuda_function_dynamic_shared_bytes_k, function) != cuda_success_k)
@@ -254,20 +315,23 @@ status_t launch(cuda_executor_t& executor, cuda_function_handle_t function, unsi
             cuda_success_k)
         return {status_code_t::device_k, "The kernel refused the shared window"};
     void* addresses[] = {static_cast<void*>(&arguments)...};
-    if (api.launch_kernel(function, blocks, 1, 1, threads, 1, 1, shared_bytes, executor.stream(), addresses, nullptr) !=
-        cuda_success_k)
+    cuda_launch_config_t const config {.grid_x = blocks,
+                                       .block_x = threads,
+                                       .shared_bytes = shared_bytes,
+                                       .stream = stream.handle};
+    if (api.launch_kernel(&config, function, addresses, nullptr) != cuda_success_k)
         return {status_code_t::device_k, "The device refused the launch"};
     return {};
 }
 
-/** @copydoc launch(cuda_executor_t&, cuda_function_handle_t, unsigned, unsigned,
+/** @copydoc launch(cuda_executor_t::stream_t&, cuda_function_handle_t, unsigned, unsigned,
  *  unsigned, argument_types_...) */
 template <typename... argument_types_>
-status_t launch(hip_executor_t& executor, hip_function_handle_t function, unsigned blocks, unsigned threads,
+status_t launch(hip_executor_t::stream_t& stream, hip_function_handle_t function, unsigned blocks, unsigned threads,
                 unsigned shared_bytes, argument_types_... arguments) noexcept {
     static_assert((std::is_trivially_copyable_v<argument_types_> && ...), "Kernels take their arguments by bytes");
     if (!function) return {status_code_t::device_k, "The bundle holds no such kernel"};
-    hip_api_t const& api = executor.api();
+    hip_api_t const& api = stream.handle.api();
     int granted = 0;
     if (shared_bytes &&
         api.function_get_attribute(&granted, hip_function_dynamic_shared_bytes_k, function) != hip_success_k)
@@ -277,7 +341,7 @@ status_t launch(hip_executor_t& executor, hip_function_handle_t function, unsign
                                    static_cast<int>(shared_bytes)) != hip_success_k)
         return {status_code_t::device_k, "The kernel refused the shared window"};
     void* addresses[] = {static_cast<void*>(&arguments)...};
-    if (api.module_launch_kernel(function, blocks, 1, 1, threads, 1, 1, shared_bytes, executor.stream(), addresses,
+    if (api.module_launch_kernel(function, blocks, 1, 1, threads, 1, 1, shared_bytes, stream.handle, addresses,
                                  nullptr) != hip_success_k)
         return {status_code_t::device_k, "The device refused the launch"};
     return {};
@@ -292,7 +356,7 @@ consteval std::size_t packed_arguments_bytes() noexcept {
 }
 
 /**
- *  @brief Commits @p function on @p executor's queue as @p blocks threadgroups of @p threads
+ *  @brief Commits @p function to @p stream's queue as @p blocks threadgroups of @p threads
  *      threads each, with @p shared_bytes of threadgroup memory and @p arguments packed as one.
  *
  *  The arguments sit in order as one struct, each at its own alignment, and every pointer among
@@ -303,7 +367,7 @@ consteval std::size_t packed_arguments_bytes() noexcept {
  *    encoder, the block table or the commit.
  */
 template <typename... argument_types_>
-status_t launch(metal_executor_t& executor, metal_function_handle_t function, unsigned blocks, unsigned threads,
+status_t launch(metal_executor_t::stream_t& stream, void* function, unsigned blocks, unsigned threads,
                 unsigned shared_bytes, argument_types_... arguments) noexcept {
     static_assert((std::is_trivially_copyable_v<argument_types_> && ...), "Kernels take their arguments by bytes");
     constexpr std::size_t packed_bytes_k = packed_arguments_bytes<argument_types_...>();
@@ -314,14 +378,15 @@ status_t launch(metal_executor_t& executor, metal_function_handle_t function, un
     ((used = round_up_to_multiple(used, alignof(argument_types_)),
       std::memcpy(packed + used, &arguments, sizeof(argument_types_)), used += sizeof(argument_types_)),
      ...);
-    return metal_dispatch(executor.stream(), function, {packed, packed_bytes_k}, blocks, threads, shared_bytes);
+    return metal_dispatch(*stream.handle.context(), stream.handle.queue(), function, {packed, packed_bytes_k}, blocks,
+                          threads, shared_bytes);
 }
 
 /**
- *  @brief Lays the strings @p sources name out as a tape on @p executor's device, as the
- *      host's @c assemble_tape does, in two launches on its stream: the offsets and segments
- *      on one block, then one block per segment.
- *  @param[in] executor The executor whose device holds every span.
+ *  @brief Lays the strings @p sources name out as a tape on @p stream's device, as the host's
+ *      @c assemble_tape does, in two launches on it: the offsets and segments on one block, then
+ *      one block per segment.
+ *  @param[in] stream The stream of the device holding every span.
  *  @param[in] sources The strings in tape order, in the device's memory.
  *  @param[out] offsets One offset per string and one past the last, the first zero, in
  *      the device's memory.
@@ -331,31 +396,32 @@ status_t launch(metal_executor_t& executor, metal_function_handle_t function, un
  *  @par Statuses:
  *  - @c status_code_t::device_k The device holds no kernels of the library, or refused a launch.
  */
-template <typename offset_type_, a_gpu_executor executor_type_>
-status_t assemble_tape(executor_type_& executor, std::span<tape_source_t const> sources,
-                       std::span<offset_type_> offsets, std::span<byte_t> bytes) noexcept {
+template <typename offset_type_, a_gpu_stream stream_type_>
+status_t assemble_tape(stream_type_& stream, std::span<tape_source_t const> sources, std::span<offset_type_> offsets,
+                       std::span<byte_t> bytes) noexcept {
     static_assert(std::is_same_v<offset_type_, std::uint32_t> || std::is_same_v<offset_type_, std::uint64_t>,
                   "A tape's offsets take 32 or 64 bits");
     if (offsets.size() != sources.size() + 1)
         return {status_code_t::invalid_argument_k, "A tape needs offsets, one past strings"};
-    if (!executor.kernels()) return {status_code_t::device_k, "The device holds no kernels of the library"};
+    auto const* const kernels = stream.kernels;
+    if (!kernels) return {status_code_t::device_k, "The device holds no kernels of the library"};
     std::size_t const segments_count = divide_round_up(sources.size(), std::size_t {tape_sources_per_segment_k});
-    tape_segment_t* segments = nullptr;
+    std::uintptr_t segments = 0;
     if (segments_count) {
-        auto const [allocated, allocate_status] = executor.allocate_async(segments_count * sizeof(tape_segment_t));
+        auto [allocated, allocate_status] = stream.allocate_async(segments_count * sizeof(tape_segment_t));
         if (allocate_status.failed()) return allocate_status;
-        segments = reinterpret_cast<tape_segment_t*>(allocated);
+        segments = allocated;
     }
     char const* const offsets_kernel = std::is_same_v<offset_type_, std::uint32_t> ? "ustore_tape_offsets_u32"
                                                                                    : "ustore_tape_offsets_u64";
-    status_t status = launch(executor, executor.kernels()->function(offsets_kernel), 1u, tape_block_threads_k, 0u,
-                             sources.data(), std::uint64_t {sources.size()}, tape_sources_per_segment_k, offsets.data(),
-                             segments);
+    status_t status = launch(stream, kernels->function(offsets_kernel), 1u, tape_block_threads_k, 0u, sources.data(),
+                             std::uint64_t {sources.size()}, tape_sources_per_segment_k, offsets.data(),
+                             reinterpret_cast<tape_segment_t*>(segments));
     if (status.succeeded() && segments_count)
-        status = launch(executor, executor.kernels()->function("ustore_tape_gather"),
-                        static_cast<unsigned>(segments_count), tape_block_threads_k, 0u, sources.data(),
-                        static_cast<tape_segment_t const*>(segments), bytes.data());
-    if (segments) executor.free_async(reinterpret_cast<std::uintptr_t>(segments));
+        status = launch(stream, kernels->function("ustore_tape_gather"), static_cast<unsigned>(segments_count),
+                        tape_block_threads_k, 0u, sources.data(), reinterpret_cast<tape_segment_t const*>(segments),
+                        bytes.data());
+    if (segments) stream.free_async(segments);
     return status;
 }
 
@@ -363,11 +429,12 @@ status_t assemble_tape(executor_type_& executor, std::span<tape_source_t const> 
 
 #pragma region Device Arenas
 
-/** Bumps @p count elements off @p blocks, opening a run through @p allocate_ when the newest is full, each carve
- *  padded to @c arena_alignment_k with its tail zeroed on @p executor's stream, so a column's bitmap reads whole. A
- *  run opened under the executor's scratch limit shrinks to fit what the listed runs leave of it, or is refused. */
-template <typename element_type_, a_gpu_executor executor_type_, typename allocate_type_>
-expected<std::span<element_type_>> carve_runs(device_blocks_t& blocks, executor_type_& executor, std::size_t count,
+/** Bumps @p count elements off @p blocks, opening a run through @p allocate when the newest is
+ *  full, each carve padded to @c arena_alignment_k with its tail zeroed on @p stream, so a column's
+ *  bitmap reads whole. A run opened under the stream's scratch limit shrinks to fit what the listed
+ *  runs leave of it, or is refused. */
+template <typename element_type_, a_gpu_stream stream_type_, typename allocate_type_>
+expected<std::span<element_type_>> carve_runs(device_blocks_t& blocks, stream_type_& stream, std::size_t count,
                                               allocate_type_&& allocate) noexcept {
     if (!count) return std::span<element_type_> {};
     std::size_t const length = sizeof(element_type_) * count;
@@ -377,12 +444,12 @@ expected<std::span<element_type_>> carve_runs(device_blocks_t& blocks, executor_
         if (blocks.count == blocks.blocks.size())
             return status_t {status_code_t::out_of_memory_k, "The device arena lists every run it holds"};
         std::size_t capacity = grown_capacity(blocks, padded);
-        if (std::size_t const limit = executor.scratch_limit(); limit) {
+        if (std::size_t const limit = stream.memory.limit; limit) {
             std::size_t held = 0;
             for (std::uint32_t block = 0; block != blocks.count; ++block) held += blocks.blocks[block].capacity;
             std::size_t const left = held < limit ? limit - held : 0;
             if (left < padded)
-                return status_t {status_code_t::out_of_memory_k, "The carve passes the executor's scratch limit"};
+                return status_t {status_code_t::out_of_memory_k, "The carve passes the device's scratch limit"};
             capacity = fu::min_of(capacity, left);
         }
         auto const [opened, allocate_status] = allocate(capacity);
@@ -392,69 +459,76 @@ expected<std::span<element_type_>> carve_runs(device_blocks_t& blocks, executor_
         address = bump(blocks, padded);
     }
     if (padded != length)
-        if (status_t const status = executor.fill_async(address + length, byte_t {0}, padded - length); status.failed())
+        if (status_t const status = stream.fill_async(address + length, byte_t {0}, padded - length); status.failed())
             return status;
     return std::span<element_type_> {reinterpret_cast<element_type_*>(address), count};
 }
 
-/** Carves @p count elements of device memory off @p blocks on @p executor's stream: a warm carve is a host bump and at
- *  most one fill, and a cold one adds one stream-ordered allocation at least doubling the newest run. */
-template <typename element_type_, a_gpu_executor executor_type_>
-expected<std::span<element_type_>> carve(device_blocks_t& blocks, executor_type_& executor,
-                                         std::size_t count) noexcept {
-    return carve_runs<element_type_>(blocks, executor, count,
-                                     [&](std::size_t bytes) noexcept { return executor.allocate_async(bytes); });
+/** Carves @p count elements of device memory off @p blocks on @p stream: a warm carve is a host
+ *  bump and at most one fill, and a cold one adds one stream-ordered allocation at least doubling
+ *  the newest run. */
+template <typename element_type_, a_gpu_stream stream_type_>
+expected<std::span<element_type_>> carve(device_blocks_t& blocks, stream_type_& stream, std::size_t count) noexcept {
+    return carve_runs<element_type_>(blocks, stream, count,
+                                     [&](std::size_t bytes) noexcept { return stream.allocate_async(bytes); });
 }
 
-/** Carves @p count elements of managed memory off @p blocks, which the host and @p executor's device both reach. */
-template <typename element_type_, a_gpu_executor executor_type_>
-expected<std::span<element_type_>> carve(managed_blocks_t& blocks, executor_type_& executor,
-                                         std::size_t count) noexcept {
-    return carve_runs<element_type_>(blocks.blocks, executor, count,
-                                     [&](std::size_t bytes) noexcept { return executor.allocate_managed(bytes); });
+/** Carves @p count elements of managed memory off @p managed, which the host and @p stream's
+ *  device both reach. */
+template <typename element_type_, a_gpu_stream stream_type_>
+expected<std::span<element_type_>> carve(managed_blocks_t& managed, stream_type_& stream, std::size_t count) noexcept {
+    return carve_runs<element_type_>(managed.blocks, stream, count, [&](std::size_t bytes) noexcept {
+        return stream.memory.allocate_managed(stream, bytes);
+    });
 }
 
-/** Rewinds @p blocks to their newest run, the largest, freeing every older one in stream order on @p executor. */
-template <a_gpu_executor executor_type_>
-void rewind(device_blocks_t& blocks, executor_type_& executor) noexcept {
-    if (blocks.count > 1) {
-        for (std::uint32_t block = 0; block + 1 != blocks.count; ++block)
-            executor.free_async(blocks.blocks[block].address);
-        blocks.blocks[0] = blocks.blocks[blocks.count - 1];
-        blocks.count = 1;
-    }
-    blocks.used = 0;
-}
-
-/** Rewinds managed @p blocks to their newest run, freeing every older one once @p executor's device is done. */
-template <a_gpu_executor executor_type_>
-void rewind(managed_blocks_t& blocks, executor_type_& executor) noexcept {
-    device_blocks_t& runs = blocks.blocks;
+/** Rewinds @p runs to their newest run, the largest, freeing every older one in @p stream's
+ *  order. */
+template <a_gpu_stream stream_type_>
+void rewind(device_blocks_t& runs, stream_type_& stream) noexcept {
     if (runs.count > 1) {
-        for (std::uint32_t block = 0; block + 1 != runs.count; ++block)
-            executor.free_managed(runs.blocks[block].address);
+        for (std::uint32_t block = 0; block + 1 != runs.count; ++block) stream.free_async(runs.blocks[block].address);
         runs.blocks[0] = runs.blocks[runs.count - 1];
         runs.count = 1;
     }
     runs.used = 0;
 }
 
-/** The device runs of @p arena when they live on @p executor's device, or null for any other arena. */
-template <a_gpu_executor executor_type_>
-device_blocks_t* device_blocks_of(ustore_arena_t arena, executor_type_ const& executor) noexcept {
-    using arena_blocks_t = typename executor_type_::arena_blocks_t;
-    arena_blocks_t* const memory = arena ? std::get_if<arena_blocks_t>(&arena->memory) : nullptr;
-    return memory && memory->device == static_cast<int>(executor.device().vendor_ordinal) ? &memory->blocks : nullptr;
+/** Rewinds @p managed to their newest run, freeing every older one once @p stream's device is
+ *  done. */
+template <a_gpu_stream stream_type_>
+void rewind(managed_blocks_t& managed, stream_type_& stream) noexcept {
+    device_blocks_t& runs = managed.blocks;
+    if (runs.count > 1) {
+        for (std::uint32_t block = 0; block + 1 != runs.count; ++block)
+            stream.memory.free_managed(stream, runs.blocks[block].address);
+        runs.blocks[0] = runs.blocks[runs.count - 1];
+        runs.count = 1;
+    }
+    runs.used = 0;
 }
 
-/** Whether @p pointer lies on a device of a vendor other than @p executor_type_'s, which
- *  @p drivers answer; Apple's unified memory reads as host memory to every vendor. */
-template <a_gpu_executor executor_type_>
-bool on_another_vendor(gpu_drivers_t const& drivers, void const* pointer) noexcept {
-    if constexpr (executor_type_::vendor_k == gpu_vendor_t::nvidia_k) return hip_device_of(drivers.hip, pointer) >= 0;
-    else if constexpr (executor_type_::vendor_k == gpu_vendor_t::amd_k)
-        return cuda_device_of(drivers.cuda, pointer) >= 0;
-    else return cuda_device_of(drivers.cuda, pointer) >= 0 || hip_device_of(drivers.hip, pointer) >= 0;
+/** The device runs of @p arena when they live on @p stream's device, or null for any other. */
+template <a_gpu_stream stream_type_>
+device_blocks_t* device_blocks_of(ustore_arena_t arena, stream_type_ const& stream) noexcept {
+    using arena_blocks_t = typename decltype(stream.memory)::arena_blocks_t;
+    arena_blocks_t* const memory = arena ? std::get_if<arena_blocks_t>(&arena->memory) : nullptr;
+    return memory && memory->device == static_cast<int>(stream.ordinal) ? &memory->blocks : nullptr;
+}
+
+/** Whether @p pointer lies on a device of a vendor other than the stream's, which @p drivers
+ *  answer; Apple's unified memory reads as host memory to every vendor. */
+inline bool on_another_vendor(gpu_drivers_t const& drivers, cuda_executor_t::stream_t const&,
+                              void const* pointer) noexcept {
+    return hip_device_of(drivers.hip, pointer) >= 0;
+}
+inline bool on_another_vendor(gpu_drivers_t const& drivers, hip_executor_t::stream_t const&,
+                              void const* pointer) noexcept {
+    return cuda_device_of(drivers.cuda, pointer) >= 0;
+}
+inline bool on_another_vendor(gpu_drivers_t const& drivers, metal_executor_t::stream_t const&,
+                              void const* pointer) noexcept {
+    return cuda_device_of(drivers.cuda, pointer) >= 0 || hip_device_of(drivers.hip, pointer) >= 0;
 }
 
 #pragma endregion Device Arenas

@@ -1064,7 +1064,7 @@ struct docs_batches_t {
                 status.failed())
                 return status;
             if (reads_values())
-                if (util::status_t const selected = match->select(strings_arg_t {documents.tape}, kept, scratch);
+                if (util::status_t const selected = match->select(strings_arg_t {documents.tape}, kept, scratch, 0);
                     selected.failed())
                     return selected;
         }

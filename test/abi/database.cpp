@@ -1395,8 +1395,9 @@ void expect_spellings(char const* (*name_of)(enum_type_),
 
 /** Every status spelling reads back as its status, while a name no status holds is refused. */
 void test_status_names(config_t const&) {
-    expect_spellings(ustore_status_name, ustore_status_from_name, 19);
+    expect_spellings(ustore_status_name, ustore_status_from_name, 20);
     expect_true(std::string_view {ustore_status_name(ustore_status_deferred_k)} == "deferred");
+    expect_true(std::string_view {ustore_status_name(ustore_status_config_mismatch_k)} == "config-mismatch");
     expect_true(std::string_view {ustore_status_name(ustore_status_read_only_k)} == "read-only");
 }
 

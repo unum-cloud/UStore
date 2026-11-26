@@ -41,9 +41,9 @@ struct vram_adjacency_fold_t {
      *  The compose runs on the device of @p executor, in device memory carved off @p blocks; a
      *  chain sorts in one block's shared memory where it fits, and across blocks otherwise.
      *
-     *  @tparam executor_type_ The executor whose stream the device work queues on, as
-     *      in @c utilities::cuda_executor_t, @c utilities::hip_executor_t or
-     *      @c utilities::metal_executor_t.
+     *  @tparam executor_type_ The stream the work queues on, as in
+     *      @c utilities::cuda_executor_t::stream_t, @c utilities::hip_executor_t::stream_t or
+     *      @c utilities::metal_executor_t::stream_t.
      *  @tparam blocks_type_ The device runs the compose carves from, as
      *      in @c utilities::device_blocks_t.
      *

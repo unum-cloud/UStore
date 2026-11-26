@@ -17,13 +17,13 @@
 #include <cstdint> // `std::uint8_t`, `std::uintptr_t`
 
 #include "ustore/utilities/ram_buffers.hpp" // `arena_allocate`
-#include "ustore/utilities/vram_device.hpp" // `gpu_drivers_t`, `a_gpu_executor`, `on_another_vendor`
+#include "ustore/utilities/vram_device.hpp" // `gpu_drivers_t`, `a_gpu_stream`, `on_another_vendor`
 
 #include "utilities/arguments.hpp" // `a_call_taking_keys`, `a_call_taking_strings`, `a_call_taking_fields`
 
 namespace unum::ustore {
 
-using util::a_gpu_executor;
+using util::a_gpu_stream;
 using util::gpu_drivers_t;
 
 /** Where one input of a device call lives. */
@@ -41,20 +41,19 @@ enum class residence_t : std::uint8_t {
 
 /** Where @p pointer lives as calls on @p executor see it, asking the executor's vendor first and @p drivers' other
  *  vendor next; null reads as host memory. */
-template <a_gpu_executor executor_type_>
+template <a_gpu_stream executor_type_>
 residence_t residence_of(gpu_drivers_t const& drivers, executor_type_ const& executor, void const* pointer) noexcept {
     if (!pointer) return residence_t::host_k;
-    int const device = executor.device_of(pointer);
+    int const device = device_of(executor, pointer);
     if (device >= 0)
-        return device == static_cast<int>(executor.device().vendor_ordinal) ? residence_t::executor_device_k
-                                                                            : residence_t::other_device_k;
-    return util::on_another_vendor<executor_type_>(drivers, pointer) ? residence_t::other_device_k
-                                                                     : residence_t::host_k;
+        return device == static_cast<int>(executor.ordinal) ? residence_t::executor_device_k
+                                                            : residence_t::other_device_k;
+    return util::on_another_vendor(drivers, executor, pointer) ? residence_t::other_device_k : residence_t::host_k;
 }
 
 /** Moves the inputs of one call on @p executor_type_ to the host: each is classified once, and one on the executor's
  *  device is downloaded into the bounce and repointed there, every download waited on once by @c finish. */
-template <a_gpu_executor executor_type_>
+template <a_gpu_stream executor_type_>
 class input_stager {
   public:
     input_stager(gpu_drivers_t const& drivers, executor_type_& executor) noexcept
@@ -71,12 +70,12 @@ class input_stager {
             status_ = {util::status_code_t::device_k, "An input lives off the executor's device"};
             return data;
         }
-        auto [copy, copy_status] = util::arena_allocate<byte_t>(executor_.bounce(), bytes);
+        auto [copy, copy_status] = util::arena_allocate<byte_t>(executor_.memory.bounce.arena(), bytes);
         if (copy_status.failed()) {
             status_ = copy_status;
             return data;
         }
-        if ((status_ = executor_.pin_bounce()).failed()) return data;
+        if ((status_ = executor_.memory.bounce.pin()).failed()) return data;
         status_ = executor_.download_async(copy, reinterpret_cast<std::uintptr_t>(data));
         ++pending_;
         return util::elements_of<element_type_>(copy).data();
@@ -125,7 +124,7 @@ class input_stager {
 
 /** Moves every input of @p arguments, a call on @p executor, to the host as @c input_stager does, finding them by the
  *  names the argument structures give them, and waits once for what it downloaded. */
-template <a_gpu_executor executor_type_, typename arguments_type_>
+template <a_gpu_stream executor_type_, typename arguments_type_>
 util::status_t stage_inputs(gpu_drivers_t const& drivers, executor_type_& executor,
                             arguments_type_& arguments) noexcept {
     input_stager<executor_type_> stager {drivers, executor};

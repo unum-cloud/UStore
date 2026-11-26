@@ -362,8 +362,8 @@ inline void arena_free_blocks(ustore_arena_handle_t& arena, arena_block_t const*
  *  @brief The host arena a device executor's copies leave from and land in, whose blocks are pinned through the
  *      driver table @p api_type_ as they grow, so those copies run asynchronously.
  *
- *  The driver must answer zero for a pin it took and keep the context or device the pins were taken under current
- *  until the bounce dies.
+ *  The vendor's @c pin_host and @c unpin_host take and drop each pin, and the context or device the
+ *  pins were taken under stays current until the bounce dies.
  */
 template <typename api_type_>
 class pinned_bounce {
@@ -401,9 +401,9 @@ class pinned_bounce {
     status_t pin() noexcept {
         host_blocks_t& blocks = std::get<host_blocks_t>(arena_.memory);
         for (arena_block_t* block = blocks.newest; block != pinned_; block = block->previous)
-            if (api_->register_host(block, block->capacity, 0) != 0) {
+            if (!pin_host(*api_, block, block->capacity)) {
                 for (arena_block_t* pinned = blocks.newest; pinned != block; pinned = pinned->previous)
-                    api_->unregister_host(pinned);
+                    unpin_host(*api_, pinned);
                 return {status_code_t::device_k, "The driver refused to pin the bounce"};
             }
         pinned_ = blocks.newest;
@@ -415,7 +415,7 @@ class pinned_bounce {
     /** Unpins every pinned block but @p kept, which stays pinned if it was. */
     void unpin(arena_block_t const* kept) noexcept {
         for (arena_block_t* block = pinned_; block; block = block->previous)
-            if (block != kept) api_->unregister_host(block);
+            if (block != kept) unpin_host(*api_, block);
         if (pinned_ != kept) pinned_ = nullptr;
     }
 

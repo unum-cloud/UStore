@@ -92,6 +92,7 @@ class Status(IntEnum):
     MALFORMED = 9
     INTERNAL = 10
     UNINITIALIZED = 12
+    CONFIG_MISMATCH = 13
     CONTENDED = 14
     CANCELLED = 15
     UNSUPPORTED = 16
@@ -321,6 +322,9 @@ class InvalidArgumentError(Error, ValueError):
 
 class UninitializedError(Error):
     """The call needs a handle that was never opened or is closed."""
+
+class ConfigMismatchError(Error, ValueError):
+    """The handles or arguments are each well-formed but cannot be joined, like devices of two vendors."""
 
 class UnsupportedError(Error, NotImplementedError):
     """The engine or this build does not implement what the call asks for."""
@@ -692,15 +696,17 @@ class Executor:
     @classmethod
     def for_vram(
         cls,
-        device: int,
         *,
+        devices: Sequence[int] | None = None,
         scratch_limit: int = 0,
         gds: Gds = Gds.AUTOMATIC,
     ) -> Self:
-        """One stream the executor creates on `device`, a `GPUDevice.ordinal` of any vendor, and destroys with it, which
-        every call queues on, fed by one host thread, and which `Database.open_nvme` takes as its `compactions` on an
-        NVIDIA device, refused with `DeviceError` for an ordinal no device holds; zero `scratch_limit` lets scratch grow
-        as calls ask. Calls `ustore_executor_for_vram`."""
+        """One stream the executor creates on each of `devices`, `GPUDevice.ordinal`s of one vendor, and destroys with
+        it, all fed by one host thread, where None takes every listed device of the first vendor with a known class.
+        Arenas live on the first device, where every call computes but a filtered scan, which deals its pages across
+        every device, and `Database.open_nvme` takes it as its `compactions`. An ordinal no device holds is refused
+        with `DeviceError`, and devices of several vendors with `ConfigMismatchError`; zero `scratch_limit` lets each
+        device's scratch grow as calls ask. Calls `ustore_executor_for_vram`."""
 
     def drain(self, mood: Mood = Mood.PARKED) -> None:
         """Waits until no call holds the executor, then parks its threads or keeps them spinning."""
