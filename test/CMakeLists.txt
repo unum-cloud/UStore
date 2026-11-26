@@ -1,6 +1,8 @@
-# Every suite reads the harness, which parses its settings through `tools/arguments.hpp`, and the C ABI suites reach
-# the engine's verb tables in `src/`; the suites over the C++ SDK link `ustore::cpp`, which carries the library.
+# Every suite reads the harness, which parses its settings through `tools/arguments.hpp` and reads the templates of
+# `include/ustore/`, and the C ABI suites reach the engine's verb tables in `src/`, so every suite links `ustore_header`;
+# the suites over the C++ SDK link `ustore::cpp`, which carries the library.
 include_directories(${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/tools)
+link_libraries(ustore_header)
 
 # The suites, each over every engine this build compiles; `enable_testing()` stays in the root, before this directory.
 set(ustore_abi_names_

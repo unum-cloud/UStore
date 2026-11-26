@@ -22,11 +22,10 @@
 
 #include <fmt/format.h>
 
+#include <forkunion/forkunion.hpp> // `fu::topology_t`, `fu::pool_t`
 #include <smashtable/basic_vector.hpp>
 
 #include "ustore/ustore.hpp"
-
-#include "ustore/utilities/ram_device.hpp" // `spawn_pool`, `harvest_topology`
 
 #include "harness.hpp" // `run_test_case`, `expect_true`, `expect_equal`, `split_mix_generator_t`
 
@@ -381,9 +380,12 @@ void test_linear_writes(linearizability_run_t& run, linearizability_options_t co
 /** Runs every transaction count on one pool of @p threads threads, each as a case of its own. */
 void linear_writes_on_threads(linearizability_run_t& run, linearizability_options_t const& options, std::size_t threads,
                               std::chrono::nanoseconds slice) {
-    auto [topology, topology_status] = util::harvest_topology();
-    auto [pool, pool_status] = util::spawn_pool(topology, threads, fu::caller_inclusive_k, fu_capabilities_all_k);
-    fu::pool_t* const executor = !st::failed(pool_status) ? std::addressof(pool) : nullptr;
+    fu::topology_t topology;
+    fu::pool_t pool;
+    fu::status_t const pool_status = fu::failed(topology.harvest())
+                                         ? fu::status_t::topology_unavailable_k
+                                         : pool.spawn(topology, threads, fu::caller_inclusive_k);
+    fu::pool_t* const executor = !fu::failed(pool_status) ? std::addressof(pool) : nullptr;
     for (std::size_t const transactions : options.transactions.view()) {
         char label[96];
         auto const written = fmt::format_to_n(label, sizeof(label) - 1, "test_linear_writes({}, {})", threads,

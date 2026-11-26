@@ -30,7 +30,7 @@
  */
 
 #include <cstddef> // `std::size_t`
-#include <cstdio>  // `stderr`
+#include <cstdio>  // `stderr`, `std::fopen`, `std::fread`, `std::fclose`
 
 #include <algorithm>   // `std::sort`, `std::unique`, `std::remove_if`, `std::lower_bound`, `std::copy`
 #include <array>       // `std::array`
@@ -43,12 +43,11 @@
 
 #include <fmt/format.h>
 
+#include <forkunion/forkunion.hpp> // `fu::topology_t`, `fu::pool_t`
 #include <smashtable/basic_vector.hpp>
 #include <stringzilla/stringzilla.hpp>
 
 #include "ustore/ustore.hpp"
-
-#include "ustore/utilities/blocking_files.hpp" // `mapped_file_t`
 
 #include "harness.hpp"
 
@@ -147,10 +146,22 @@ struct input_edge_t {
  *  @param[out] edges Receives one entry per kept pair.
  */
 status_t read_edge_list(char const* path, std::size_t max_edges, st::vector<input_edge_t>& edges) noexcept {
-    auto [file, map_status] = util::mapped_file_t::map(path);
-    if (map_status.failed()) return {static_cast<status_code_t>(map_status.code), map_status.note};
+    // The list is read whole through C stdio, a chunk at a time, so no file size is asked of the OS
+    constexpr std::size_t chunk_bytes_k = std::size_t {1} << 20;
+    std::FILE* const file = std::fopen(path, "rb");
+    if (!file) return {status_code_t::not_found_k, "The edge list would not open"};
+    st::vector<char> text;
+    std::size_t length = 0;
+    for (std::size_t read = chunk_bytes_k; read == chunk_bytes_k; length += read) {
+        if (st::failed(text.resize(length + chunk_bytes_k))) {
+            std::fclose(file);
+            return status_code_t::out_of_memory_k;
+        }
+        read = std::fread(text.begin() + length, 1, chunk_bytes_k, file);
+    }
+    std::fclose(file);
 
-    for (sz::string_view_t line : sz::split(file.view(), "\n")) {
+    for (sz::string_view_t line : sz::split(sz::string_view_t {text.begin(), length}, "\n")) {
         if (edges.size() == max_edges) break;
         std::string_view trimmed = line;
         while (!trimmed.empty() && (trimmed.back() == '\r' || trimmed.back() == ' ')) trimmed.remove_suffix(1);
@@ -649,9 +660,12 @@ int run_louvain(int argc, char** argv) {
                                                  "USTORE_MAX_LEVELS"};
 
     read_bench_settings(argc, argv, settings, flags, variables);
-    auto [topology, topology_status] = util::harvest_topology();
-    auto [executor, executor_status] = util::spawn_pool(topology, 1, fu::caller_inclusive_k, fu_capabilities_all_k);
-    if (st::failed(executor_status)) {
+    fu::topology_t topology;
+    fu::pool_t executor;
+    fu::status_t const executor_status = fu::failed(topology.harvest())
+                                             ? fu::status_t::topology_unavailable_k
+                                             : executor.spawn(topology, 1, fu::caller_inclusive_k);
+    if (fu::failed(executor_status)) {
         fmt::println(stderr, "Failed to pin the calling thread");
         return 1;
     }
@@ -715,7 +729,7 @@ int run_louvain(int argc, char** argv) {
         std::size_t const batch_size = settings.batch_size_upsert.value;
         std::span<edge_t const> const batches {staged.begin(), staged.end()};
         row_t const upserted = run_pass(
-            executor, "graph_upsert", util::divide_round_up(batches.size(), batch_size),
+            executor, "graph_upsert", (batches.size() + batch_size - 1) / batch_size,
             [&](loop_t& loop, std::size_t) noexcept {
                 for (std::size_t call : loop) {
                     std::span<edge_t const> const batch = batches.subspan(

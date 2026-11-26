@@ -1,6 +1,8 @@
-# Every benchmark reads the harness, which parses its settings through `tools/arguments.hpp`; those over the C++ SDK
-# link `ustore::cpp`, which carries the library.
+# Every benchmark reads the harness, which parses its settings through `tools/arguments.hpp` and reads the templates of
+# `include/ustore/`, so every benchmark links `ustore_header`; those over the C++ SDK link `ustore::cpp`, which carries
+# the library.
 include_directories(${PROJECT_SOURCE_DIR}/tools)
+link_libraries(ustore_header)
 
 # Benchmarks, each picking its engine with `--engine`
 add_executable(ustore_bench_twitter twitter.cpp)

@@ -21,11 +21,10 @@
 
 #include <fmt/format.h>
 
-#include <forkunion/atomics.hpp> // `fu::standard_atomic_ref`
+#include <forkunion/atomics.hpp>   // `fu::standard_atomic_ref`
+#include <forkunion/forkunion.hpp> // `fu::topology_t`, `fu::pool_t`
 
 #include "ustore/ustore.hpp"
-
-#include "ustore/utilities/ram_device.hpp" // `spawn_pool`, `harvest_topology`
 
 #include "abi/fixture.hpp" // `write_text`, `held_scan_t`, `wait_held`, `open_cursor`, `pull_of`, `expect_page`
 #include "harness.hpp"     // `finish_test_run`, `expect_true`, `expect_equal`, `expect_near`, `expect_status`
@@ -216,10 +215,13 @@ case_result_t test_cursor_free_waits(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     if (!expect_true(!open_status.failed())) return {};
     auto [executor, spawn_status] = spawn_executor();
-    auto [topology, topology_status] = util::harvest_topology();
-    auto [freeing_thread, thread_status] = util::spawn_pool(topology, 1, fu::caller_exclusive_k, fu_capabilities_all_k);
+    fu::topology_t topology;
+    fu::pool_t freeing_thread;
+    fu::status_t const thread_status = fu::failed(topology.harvest())
+                                           ? fu::status_t::topology_unavailable_k
+                                           : freeing_thread.spawn(topology, 1, fu::caller_exclusive_k);
     auto [collection, create_status] = create_collection(database.handle(), "cursor.free", ustore_modality_blobs_k);
-    if (!expect_true(!spawn_status.failed() && !st::failed(thread_status) && !create_status.failed())) return {};
+    if (!expect_true(!spawn_status.failed() && !fu::failed(thread_status) && !create_status.failed())) return {};
     auto [arena, arena_status] = arena_t::make({.executor = executor});
     std::array<ustore_key_t, 2> const keys {key_from_integer(1), key_from_integer(2)};
     write_text(database.handle(), collection, keys, "held");

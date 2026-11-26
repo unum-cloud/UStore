@@ -19,11 +19,10 @@
 
 #include <fmt/format.h>
 
-#include <forkunion/atomics.hpp> // `fu::standard_atomic_ref`
+#include <forkunion/atomics.hpp>   // `fu::standard_atomic_ref`
+#include <forkunion/forkunion.hpp> // `fu::topology_t`, `fu::pool_t`
 
 #include "ustore/ustore.hpp"
-
-#include "ustore/utilities/ram_device.hpp" // `spawn_pool`, `harvest_topology`
 
 #include "abi/fixture.hpp" // `check_length`, `check_equalities`, `round_trip`, `triplet_t`
 #include "harness.hpp"     // `run_test_case`, `expect_true`, `expect_equal`, `expect_status`, `spin_until`
@@ -310,11 +309,13 @@ case_result_t test_database_named_collections_race(config_t const& config) {
         else if (create_status == status_code_t::already_exists_k)
             fu::standard_atomic_ref<std::size_t> {refused}.store_add(1, std::memory_order_relaxed);
     };
-    auto [topology, topology_status] = util::harvest_topology();
-    auto [executor, executor_status] = util::spawn_pool(topology, threads_count, fu::caller_inclusive_k,
-                                                        fu_capabilities_all_k);
-    expect_true(!st::failed(executor_status));
-    if (st::failed(executor_status)) return {};
+    fu::topology_t topology;
+    fu::pool_t executor;
+    fu::status_t const executor_status = fu::failed(topology.harvest())
+                                             ? fu::status_t::topology_unavailable_k
+                                             : executor.spawn(topology, threads_count, fu::caller_inclusive_k);
+    expect_true(!fu::failed(executor_status));
+    if (fu::failed(executor_status)) return {};
     expect_true(!fu::failed(executor.for_threads(task)));
 
     expect_equal(created, 1u);
@@ -974,9 +975,12 @@ case_result_t test_database_snapshot_with_threads(config_t const& config) {
         }
     };
 
-    auto [topology, topology_status] = util::harvest_topology();
-    auto [executor, executor_status] = util::spawn_pool(topology, 2, fu::caller_inclusive_k, fu_capabilities_all_k);
-    if (!expect_true(!st::failed(executor_status))) return {};
+    fu::topology_t topology;
+    fu::pool_t executor;
+    fu::status_t const executor_status = fu::failed(topology.harvest())
+                                             ? fu::status_t::topology_unavailable_k
+                                             : executor.spawn(topology, 2, fu::caller_inclusive_k);
+    if (!expect_true(!fu::failed(executor_status))) return {};
     expect_true(!fu::failed(executor.for_threads(task)));
     return {};
 }
@@ -1231,10 +1235,13 @@ void resize_values(resizing_writer_t& writer) noexcept {
  *  one stamp, so all of one result come from one commit. */
 void test_blobs_read_one_stamp_under_resizes(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    auto [topology, topology_status] = util::harvest_topology();
-    auto [writing_thread, thread_status] = util::spawn_pool(topology, 1, fu::caller_exclusive_k, fu_capabilities_all_k);
+    fu::topology_t topology;
+    fu::pool_t writing_thread;
+    fu::status_t const thread_status = fu::failed(topology.harvest())
+                                           ? fu::status_t::topology_unavailable_k
+                                           : writing_thread.spawn(topology, 1, fu::caller_exclusive_k);
     auto [arena, arena_status] = arena_t::make();
-    if (!expect_true(!open_status.failed() && !st::failed(thread_status) && !arena_status.failed())) return;
+    if (!expect_true(!open_status.failed() && !fu::failed(thread_status) && !arena_status.failed())) return;
     auto [collection, collection_status] = create_collection(database.handle(), "one_stamp.blobs",
                                                              ustore_modality_blobs_k);
     if (!expect_true(!collection_status.failed())) return;
@@ -1307,10 +1314,13 @@ void swap_halves(swapping_writer_t& writer) noexcept {
  *  halves of the keys in each commit, lists and reads at one stamp, so it keeps one half. */
 case_result_t test_blobs_filtered_scan_one_stamp_under_swaps(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
-    auto [topology, topology_status] = util::harvest_topology();
-    auto [writing_thread, thread_status] = util::spawn_pool(topology, 1, fu::caller_exclusive_k, fu_capabilities_all_k);
+    fu::topology_t topology;
+    fu::pool_t writing_thread;
+    fu::status_t const thread_status = fu::failed(topology.harvest())
+                                           ? fu::status_t::topology_unavailable_k
+                                           : writing_thread.spawn(topology, 1, fu::caller_exclusive_k);
     auto [arena, arena_status] = arena_t::make();
-    if (!expect_true(!open_status.failed() && !st::failed(thread_status) && !arena_status.failed())) return {};
+    if (!expect_true(!open_status.failed() && !fu::failed(thread_status) && !arena_status.failed())) return {};
     if (!probed(database.supports_transactions())) return case_result_t::skipped(needs_transactions_k);
     auto [collection, collection_status] = create_collection(database.handle(), "swaps.blobs", ustore_modality_blobs_k);
     if (!expect_true(!collection_status.failed())) return {};

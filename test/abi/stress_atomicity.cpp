@@ -17,11 +17,10 @@
 
 #include <fmt/format.h>
 
+#include <forkunion/forkunion.hpp> // `fu::topology_t`, `fu::pool_t`
 #include <smashtable/basic_vector.hpp>
 
 #include "ustore/ustore.hpp"
-
-#include "ustore/utilities/ram_device.hpp" // `spawn_pool`, `harvest_topology`
 
 #include "harness.hpp" // `run_test_case`, `expect_true`, `split_mix_generator_t`
 
@@ -229,10 +228,12 @@ void insert_atomic_isolated(atomicity_run_t& run, fu::pool_t& executor, batches_
 /** Runs every batch size on one pool of @p threads threads. */
 void inserts_on_threads(atomicity_run_t& run, atomicity_options_t const& options, std::size_t threads,
                         round_deletes_t deletes, std::chrono::nanoseconds slice) {
-    auto [topology, topology_status] = util::harvest_topology();
-    auto [executor, executor_status] = util::spawn_pool(topology, threads, fu::caller_inclusive_k,
-                                                        fu_capabilities_all_k);
-    if (!expect_true(!st::failed(executor_status))) return;
+    fu::topology_t topology;
+    fu::pool_t executor;
+    fu::status_t const executor_status = fu::failed(topology.harvest())
+                                             ? fu::status_t::topology_unavailable_k
+                                             : executor.spawn(topology, threads, fu::caller_inclusive_k);
+    if (!expect_true(!fu::failed(executor_status))) return;
     for (std::size_t const batch_size : options.batch_sizes.view()) {
         std::span<ustore_key_t const> const keys {run.keys.data(), run.keys.size() / batch_size * batch_size};
         batches_t const batches {keys, batch_size, threads, deletes, options.deletes_periodicity.value};

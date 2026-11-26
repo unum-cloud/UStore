@@ -27,7 +27,7 @@ if (PROJECT_IS_TOP_LEVEL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
 endif ()
 
 # Options
-option(USTORE_INSTALL "Install CMake targets" OFF)
+option(USTORE_INSTALL "Install CMake targets" ${PROJECT_IS_TOP_LEVEL})
 
 option(USTORE_WITH_ROCKSDB "Use RocksDB for a persistent engine" OFF)
 option(USTORE_WITH_LEVELDB "Use LevelDB for a persistent engine" OFF)
@@ -147,29 +147,21 @@ target_include_directories(
 # The C++ SDK of `cpp/ustore/`, over the C ABI and the archive.
 add_subdirectory(cpp)
 
-# The reusable templates of `include/ustore/`, header-only, with the include paths of the siblings and the third-party
-# headers they reach into. The package installs UStore's own headers alone, so a consumer brings each sibling's.
+# The templates of `include/ustore/`, header-only, with the siblings and the third-party headers they reach into. Only
+# the targets compiling the engine link it, privately, so it stays inside the build tree and no package installs it.
 add_library(ustore_header INTERFACE)
 add_library(ustore::header ALIAS ustore_header)
-set_target_properties(ustore_header PROPERTIES EXPORT_NAME header)
 # MSVC reads BOM-less UTF-8 in the system code page, so consumers of these Unicode-commented headers need `/utf-8`.
 target_compile_options(
     ustore_header INTERFACE "$<$<OR:$<COMPILE_LANG_AND_ID:C,MSVC>,$<COMPILE_LANG_AND_ID:CXX,MSVC>>:/utf-8>"
 )
 target_compile_features(ustore_header INTERFACE cxx_std_20)
-target_include_directories(
-    ustore_header INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-                            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-)
-target_include_directories(
-    ustore_header SYSTEM INTERFACE $<BUILD_INTERFACE:${yyjson_SOURCE_DIR}/src>
-                                   $<BUILD_INTERFACE:${fmt_SOURCE_DIR}/include>
-)
-# The executor's pool is ForkUnion's C++ SDK, `fu::pool_t`, and the strings are StringZilla's, each bringing its archive
+target_include_directories(ustore_header INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_include_directories(ustore_header SYSTEM INTERFACE ${yyjson_SOURCE_DIR}/src ${fmt_SOURCE_DIR}/include)
+# The executor's pool is ForkUnion's C++ SDK, `fu::pool_t`, and the strings are StringZilla's, each bringing its archive;
+# StringZilla's header target would compile its kernels header-only, which the engine and its suites never do
 target_link_libraries(
-    ustore_header INTERFACE ustore_abi $<BUILD_INTERFACE:forkunion::cpp> $<BUILD_INTERFACE:smashtable::header>
-                            $<BUILD_INTERFACE:stringzilla::header> $<BUILD_INTERFACE:stringzilla::cpp>
-                            $<BUILD_INTERFACE:ustore_sanitizers>
+    ustore_header INTERFACE ustore_abi forkunion::cpp smashtable::header stringzilla::cpp ustore_sanitizers
 )
 
 include(cmake/ustore_gpu.cmake)
@@ -341,7 +333,7 @@ endforeach ()
 # Both libraries link one copy of every CPU class's engine, compiled position-independent once
 add_library(ustore_ram_variants OBJECT ${ustore_library_exclusion_} ${ustore_ram_variants_})
 set_target_properties(ustore_ram_variants PROPERTIES POSITION_INDEPENDENT_CODE ON)
-target_link_libraries(ustore_ram_variants PRIVATE Threads::Threads smashtable::header ${ustore_dependencies_})
+target_link_libraries(ustore_ram_variants PRIVATE Threads::Threads ustore_header ${ustore_dependencies_})
 list(APPEND ustore_sources_ $<TARGET_OBJECTS:ustore_ram_variants>)
 list(APPEND ustore_compiled_objects_ ustore_ram_variants)
 
@@ -358,7 +350,7 @@ if (${USTORE_WITH_NVME})
     set_target_properties(ustore_nvme_variants PROPERTIES POSITION_INDEPENDENT_CODE ON)
     # SPDK's archives exist only in a build configured with `USTORE_WITH_LINUX_SPDK`
     target_link_libraries(
-        ustore_nvme_variants PRIVATE Threads::Threads smashtable::header ${ustore_dependencies_}
+        ustore_nvme_variants PRIVATE Threads::Threads ustore_header ${ustore_dependencies_}
                                      $<TARGET_NAME_IF_EXISTS:ustore_spdk>
     )
     list(APPEND ustore_sources_ $<TARGET_OBJECTS:ustore_nvme_variants>)
@@ -368,11 +360,7 @@ if (${USTORE_WITH_NVME})
     # The engine's compaction on the device, whose objects both libraries take: host C++ launching the bundles' kernels
     # through the driver, so it builds everywhere and a device whose bundle holds no kernels makes no compactor
     add_library(ustore_nvme_compaction OBJECT "${CMAKE_CURRENT_SOURCE_DIR}/src/nvme/compaction.cpp")
-    target_link_libraries(
-        ustore_nvme_compaction
-        PUBLIC $<BUILD_INTERFACE:smashtable::header>
-        PRIVATE $<BUILD_INTERFACE:ustore_header>
-    )
+    target_link_libraries(ustore_nvme_compaction PRIVATE ustore_header)
     target_include_directories(ustore_nvme_compaction PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     set_target_properties(ustore_nvme_compaction PROPERTIES POSITION_INDEPENDENT_CODE ON)
     if (ustore_cuda_codes_ OR ustore_rocm_codes_)
@@ -401,7 +389,7 @@ endif ()
 
 # An archive links nothing, so it takes the objects of every library it builds on, while the shared library links them
 # and exports only what `USTORE_EXPORT` marks, which its consumers import on Windows. Inside this tree the archive also
-# links them, since the suites and tools reach the siblings through it.
+# links them privately, which covers the siblings `USTORE_BUNDLE_SIBLINGS` leaves out, and exports none of them.
 set(ustore_dependency_objects_)
 set(ustore_dependency_links_)
 foreach (dependency_ IN LISTS ustore_dependencies_)
@@ -491,13 +479,18 @@ target_compile_definitions(
     PRIVATE USTORE_EXPORTING=1
     INTERFACE USTORE_SHARED=1
 )
+# An archive's private links export as link-only, so the engine's own targets stay local to this build
 target_link_libraries(
-    ustore_static PUBLIC Threads::Threads $<BUILD_INTERFACE:smashtable::header> ${ustore_dependency_links_}
-                         ${ustore_engine_archives_} $<BUILD_INTERFACE:$<TARGET_NAME_IF_EXISTS:ustore_spdk>>
+    ustore_static
+    PUBLIC Threads::Threads ustore_abi ${ustore_engine_archives_}
+    PRIVATE $<BUILD_LOCAL_INTERFACE:ustore_header> ${ustore_dependency_links_}
+            $<BUILD_LOCAL_INTERFACE:$<TARGET_NAME_IF_EXISTS:ustore_spdk>>
 )
 target_link_libraries(
-    ustore_shared PRIVATE Threads::Threads smashtable::header ${ustore_dependencies_} ${ustore_engine_archives_}
-                          $<TARGET_NAME_IF_EXISTS:ustore_spdk>
+    ustore_shared
+    PUBLIC ustore_abi
+    PRIVATE Threads::Threads ustore_header ${ustore_dependencies_} ${ustore_engine_archives_}
+            $<TARGET_NAME_IF_EXISTS:ustore_spdk>
 )
 # Every GPU runtime and cuFile open through `dlopen` at first use, which glibc before 2.34 keeps in `libdl`
 target_link_libraries(ustore_static PUBLIC ${CMAKE_DL_LIBS})
@@ -538,19 +531,15 @@ foreach (library_ IN ITEMS ustore_static ustore_shared ${ustore_compiled_objects
         ${library_} PRIVATE $<BUILD_INTERFACE:forkunion::cpu_capabilities_compiled>
                             $<BUILD_INTERFACE:stringzilla::cpu_capabilities_compiled>
     )
-    target_link_libraries(${library_} PUBLIC $<BUILD_INTERFACE:forkunion::cpp> $<BUILD_INTERFACE:ustore_sanitizers>)
-    # The engine sees the C ABI and its templates; a consumer of the C++ SDK links `ustore::cpp`, which carries it.
-    target_include_directories(
-        ${library_}
-        PUBLIC $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/c> $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
-               $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
-        PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
-    )
+    target_link_libraries(${library_} PUBLIC $<BUILD_INTERFACE:ustore_sanitizers>)
+    # The engine sees the C ABI, its templates through `ustore_header` and its sources; a consumer sees the C ABI alone,
+    # and a consumer of the C++ SDK links `ustore::cpp`, which carries it.
+    target_include_directories(${library_} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 endforeach ()
 
 if (${USTORE_BUILD_TOOLS})
     add_executable(ustore_cli tools/cli.cpp tools/dataset.cpp tools/dataset_arrow.cpp)
-    target_link_libraries(ustore_cli PRIVATE ustore::static fmt::fmt ustore_warnings)
+    target_link_libraries(ustore_cli PRIVATE ustore::static ustore::header fmt::fmt ustore_warnings)
 endif ()
 
 if (${USTORE_BUILD_TEST})
@@ -570,23 +559,14 @@ if (${USTORE_BUILD_PYTHON})
     add_subdirectory(python)
 endif ()
 
-# `find_package(ustore)` names the C headers `ustore::abi`, the C++ SDK carrying them and the archive `ustore::cpp`, the
-# header-only templates `ustore::header`, and the libraries `ustore::shared`, which links every engine inside, and
-# `ustore::static`, beside the engine archives it links, `ustore::rocksdb`, `ustore::leveldb` and `ustore::uring`. The
+# `find_package(ustore)` names the C headers `ustore::abi`, the C++ SDK carrying them and the archive `ustore::cpp`, and
+# the libraries `ustore::shared`, which links every engine inside, and `ustore::static`, which holds the siblings'
+# objects, beside the engine archives it links, `ustore::rocksdb`, `ustore::leveldb` and `ustore::uring`. No sibling is
+# exported or found, and the templates of `include/ustore/`, which include the siblings, stay in the build tree. The
 # archive holds the device merger, whose consumers also link the static CUDA runtime it calls where it has one.
-set(ustore_install_sdk_targets_ ustore_abi ustore_cpp ustore_header ustore_static ustore_shared
-                                ${ustore_engine_archives_}
-)
+set(ustore_install_sdk_targets_ ustore_abi ustore_cpp ustore_static ustore_shared ${ustore_engine_archives_})
 set(ustore_static_dependencies_)
 if (ustore_device_compaction_ AND ustore_cuda_codes_)
     set(ustore_static_dependencies_ "find_dependency(CUDAToolkit)")
 endif ()
 include(cmake/ustore_install.cmake)
-# The header-only templates install as their own `templates` component.
-if (USTORE_INSTALL)
-    install(
-        DIRECTORY include/ustore
-        DESTINATION ${CMAKE_INSTALL_INCLUDEDIR}
-        COMPONENT templates
-    )
-endif ()

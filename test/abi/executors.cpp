@@ -23,12 +23,12 @@
 
 #include <fmt/format.h>
 
-#include <forkunion/atomics.hpp> // `fu::standard_atomic_ref`
+#include <forkunion/atomics.hpp>   // `fu::standard_atomic_ref`
+#include <forkunion/forkunion.hpp> // `fu::topology_t`, `fu::pool_t`
 
 #include "ustore/ustore.hpp"
 
 #include "ustore/utilities/ram_buffers.hpp" // `arena_block_t`, `arena_alignment_k`
-#include "ustore/utilities/ram_device.hpp"  // `spawn_pool`, `harvest_topology`
 
 #include "abi/fixture.hpp" // `held_scan_t`, `submit_held`, `release_held`, `spawn_executor`, `round_trip`, `edge_of`
 #include "engine.hpp"      // `ustore_database_handle_t`
@@ -854,9 +854,12 @@ void free_arena(arena_freeing_t& freeing) noexcept {
  *  counts before it stores the status. */
 void test_arena_free_waits(config_t const&) {
     auto [executor, spawn_status] = spawn_executor();
-    auto [topology, topology_status] = util::harvest_topology();
-    auto [freeing_thread, thread_status] = util::spawn_pool(topology, 1, fu::caller_exclusive_k, fu_capabilities_all_k);
-    if (!expect_true(!spawn_status.failed() && !st::failed(thread_status))) return;
+    fu::topology_t topology;
+    fu::pool_t freeing_thread;
+    fu::status_t const thread_status = fu::failed(topology.harvest())
+                                           ? fu::status_t::topology_unavailable_k
+                                           : freeing_thread.spawn(topology, 1, fu::caller_exclusive_k);
+    if (!expect_true(!spawn_status.failed() && !fu::failed(thread_status))) return;
 
     held_scan_t held;
     submit_held(held, executor);
@@ -914,9 +917,12 @@ void test_executor_contended_from_another_thread(config_t const& config) {
     auto [blobs, blobs_status] = create_collection(database.handle(), "executor_contended_from_another_thread.blobs",
                                                    ustore_modality_blobs_k);
     auto [executor, spawn_status] = spawn_executor();
-    auto [topology, topology_status] = util::harvest_topology();
-    auto [holding_thread, thread_status] = util::spawn_pool(topology, 1, fu::caller_exclusive_k, fu_capabilities_all_k);
-    if (!expect_true(!blobs_status.failed() && !spawn_status.failed() && !st::failed(thread_status))) return;
+    fu::topology_t topology;
+    fu::pool_t holding_thread;
+    fu::status_t const thread_status = fu::failed(topology.harvest())
+                                           ? fu::status_t::topology_unavailable_k
+                                           : holding_thread.spawn(topology, 1, fu::caller_exclusive_k);
+    if (!expect_true(!blobs_status.failed() && !spawn_status.failed() && !fu::failed(thread_status))) return;
 
     held_scan_t held;
     arm_held(held, executor, nullptr, ustore_completion_blocking_k);
@@ -1141,9 +1147,12 @@ void test_database_free_waits(config_t const&) {
 /** Freeing a database waits for a call naming it on no executor, held inside its callback on
  *  another thread, as such a call counts on its handles as an executor call does. */
 void test_database_free_waits_without_executor(config_t const&) {
-    auto [topology, topology_status] = util::harvest_topology();
-    auto [holding_thread, thread_status] = util::spawn_pool(topology, 1, fu::caller_exclusive_k, fu_capabilities_all_k);
-    if (!expect_true(!st::failed(thread_status))) return;
+    fu::topology_t topology;
+    fu::pool_t holding_thread;
+    fu::status_t const thread_status = fu::failed(topology.harvest())
+                                           ? fu::status_t::topology_unavailable_k
+                                           : holding_thread.spawn(topology, 1, fu::caller_exclusive_k);
+    if (!expect_true(!fu::failed(thread_status))) return;
 
     held_scan_t held;
     arm_held(held, nullptr, nullptr, ustore_completion_blocking_k);
@@ -1676,8 +1685,8 @@ case_result_t test_executor_sliced_strings(config_t const& config) {
 /** A RAM executor refuses a memory domain the machine lacks, leaving its output null, and keeps
  *  every arena it makes on the domain of its thread 0. */
 void test_executor_memory_domains(config_t const&) {
-    auto [topology, topology_status] = util::harvest_topology();
-    if (!expect_true(!st::failed(topology_status))) return;
+    fu::topology_t topology;
+    if (!expect_true(!fu::failed(topology.harvest()))) return;
     std::int32_t const known = topology.memory_domain(0);
     std::int32_t const unknown = 1 << 20;
 

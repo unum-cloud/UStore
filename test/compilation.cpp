@@ -662,14 +662,17 @@ case_result_t test_wrappers_ingest(config_t const& config) {
     auto [landed, landed_status] = blobs[keys[1]].value();
     expect_true(!landed_status.failed() && landed == "one");
 
-    // Edges ingest as edges, and a sorted ingest refuses a key that does not ascend
+    // Edges ingest as edges where the engine ingests graphs, which RocksDB refuses, as
+    // `ingest_expectations_k` of `test/abi/arrow.cpp` pins per engine, and a sorted ingest
+    // refuses a key that does not ascend
     auto [edges_ingest, edges_ingest_status] = head.ingest(graph.handle());
-    if (!expect_true(!edges_ingest_status.failed())) return {};
-    std::array<edge_t, 1> const edges {edge_t {keys[1], keys[0]}};
-    expect_true(!edges_ingest.append(edges_view_t {edges}).failed());
-    expect_true(!edges_ingest.finish().status.failed());
-    auto [ingested_degree, ingested_degree_status] = graph.degree(keys[1], ustore_vertex_role_source_k);
-    expect_true(!ingested_degree_status.failed() && ingested_degree == 1u);
+    if (edges_ingest_status != status_code_t::unsupported_k && expect_true(!edges_ingest_status.failed())) {
+        std::array<edge_t, 1> const edges {edge_t {keys[1], keys[0]}};
+        expect_true(!edges_ingest.append(edges_view_t {edges}).failed());
+        expect_true(!edges_ingest.finish().status.failed());
+        auto [ingested_degree, ingested_degree_status] = graph.degree(keys[1], ustore_vertex_role_source_k);
+        expect_true(!ingested_degree_status.failed() && ingested_degree == 1u);
+    }
     {
         // An unfinished ingest holds NVMe's maintenance claim, so it goes before the drop below
         auto [sorted_ingest, sorted_ingest_status] = head.ingest(blobs.handle(), ustore_ingest_sorted_k);

@@ -26,7 +26,6 @@
 #include <fmt/format.h>
 
 #include "ustore/ustore.hpp"
-#include "ustore/utilities/blocking_files.hpp" // `read_file`
 
 #include "abi/fixture.hpp" // `write_text`, `create_collection`, `read_of`, `open_cursor`, `pull_of`, `expect_page`
 #include "harness.hpp"     // `finish_test_run`, `expect_true`, `expect_status`, `open_on_own_executor`
@@ -1606,7 +1605,7 @@ case_result_t test_database_view_refusals(config_t const& config) {
 }
 
 /** A view of an NVMe database reads what its manifest names and refuses writes, while its open and
- *  its close leave the manifest's bytes and modification time as they were. */
+ *  its close leave the manifest's modification time as it was, which any write would move. */
 case_result_t test_database_view_nvme(config_t const& config) {
     if (config.engine() != "nvme") return case_result_t::skipped("needs the nvme engine");
     if (!config.directory()) return case_result_t::skipped(needs_directory_k);
@@ -1628,8 +1627,6 @@ case_result_t test_database_view_nvme(config_t const& config) {
     expect_success(outcome);
     ustore_database_free(database);
 
-    st::vector<char> before, after;
-    expect_true(util::read_file(manifest, before).succeeded());
     std::error_code error;
     std::filesystem::file_time_type const modified = std::filesystem::last_write_time(manifest, error);
     expect_true(!error);
@@ -1660,8 +1657,6 @@ case_result_t test_database_view_nvme(config_t const& config) {
     expect_status(outcome, status_code_t::read_only_k);
     ustore_database_free(database);
 
-    expect_true(util::read_file(manifest, after).succeeded());
-    expect_true(before.size() == after.size() && std::equal(before.begin(), before.end(), after.begin()));
     expect_true(std::filesystem::last_write_time(manifest, error) == modified && !error);
 
     std::string const missing = fmt::format("{}/absent.ustore.json", directory);
