@@ -816,10 +816,8 @@ static void test_every_argument_shape_lands(void) {
             ustore_status_success_k);
     expect_(read_phase == ustore_phase_reclaim_k);
     expect_(strcmp(ustore_phase_name((ustore_phase_t)99), "unrecognized") == 0);
-    ustore_gpu_vendor_t read_vendor = ustore_gpu_vendor_unknown_k;
     expect_(strcmp(ustore_gpu_vendor_name(ustore_gpu_vendor_apple_k), "apple") == 0);
-    expect_(ustore_gpu_vendor_from_name(bytes_of("apple"), &read_vendor) == ustore_status_success_k &&
-            read_vendor == ustore_gpu_vendor_apple_k);
+    expect_(strcmp(ustore_residency_name(ustore_residency_vram_k), "vram") == 0);
     expect_(strcmp(ustore_host_access_name(ustore_host_access_readable_k), "readable") == 0);
     expect_(strcmp(ustore_host_access_name(ustore_host_access_refused_k), "refused") == 0);
     ustore_gpu_class_t const apple_classes[] = {ustore_gpu_class_apple_metal7_k, ustore_gpu_class_apple_metal9_k,

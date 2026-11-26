@@ -975,10 +975,6 @@ typedef enum ustore_gpu_vendor_t {
 /** The canonical spelling of a GPU vendor, as @c ustore_gpu_vendor_amd_k spells "amd", or "unrecognized". */
 USTORE_EXPORT char const* ustore_gpu_vendor_name(ustore_gpu_vendor_t vendor);
 
-/** Reads a GPU vendor back from its canonical spelling, or fails with
- *  @c ustore_status_invalid_argument_k. */
-USTORE_EXPORT ustore_status_t ustore_gpu_vendor_from_name(ustore_bytes_view_t name, ustore_gpu_vendor_t* vendor);
-
 /** The GPU generations UStore tells apart, the device twin of @c ustore_cpu_class_t: a class implies its vendor, and
  *  a device takes its vendor's newest class whose code it runs. */
 typedef enum ustore_gpu_class_t {
@@ -1302,6 +1298,10 @@ typedef enum ustore_residency_t {
     ustore_residency_vram_k = 2,
 
 } ustore_residency_t;
+
+/** The canonical spelling of a residency, as @c ustore_residency_vram_k spells "vram", or
+ *  "unrecognized". */
+USTORE_EXPORT char const* ustore_residency_name(ustore_residency_t residency);
 
 /** Whether host code may read an arena's pages in place. */
 typedef enum ustore_host_access_t {

@@ -790,7 +790,6 @@ pub(crate) mod ffi {
         pub fn ustore_gds_name(gds: ustore_enum_t) -> *const c_char;
         pub fn ustore_gds_from_name(name: ustore_bytes_view_t, gds: *mut ustore_enum_t) -> ustore_status_t;
         pub fn ustore_gpu_vendor_name(vendor: ustore_enum_t) -> *const c_char;
-        pub fn ustore_gpu_vendor_from_name(name: ustore_bytes_view_t, vendor: *mut ustore_enum_t) -> ustore_status_t;
         pub fn ustore_host_access_name(host_access: ustore_enum_t) -> *const c_char;
         pub fn ustore_gpu_class_name(gpu_class: ustore_enum_t) -> *const c_char;
         pub fn ustore_gpu_class_from_name(name: ustore_bytes_view_t, gpu_class: *mut ustore_enum_t) -> ustore_status_t;
@@ -2132,15 +2131,6 @@ impl fmt::Display for GPUVendor {
     /// Calls `ustore_gpu_vendor_name`.
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(spelling(ffi::ustore_gpu_vendor_name, *self as ffi::ustore_enum_t))
-    }
-}
-
-impl FromStr for GPUVendor {
-    type Err = Error;
-
-    /// Calls `ustore_gpu_vendor_from_name`.
-    fn from_str(text: &str) -> Result<Self> {
-        read_spelling(text, ffi::ustore_gpu_vendor_from_name, GPUVendor::from_raw)
     }
 }
 
@@ -5466,7 +5456,6 @@ mod tests {
         assert_eq!("merge".parse::<Modification>(), Ok(Modification::Merge));
         assert_eq!(Engine::NVME.to_string().parse::<Engine>(), Ok(Engine::NVME));
         assert_eq!(GPUVendor::Apple.to_string(), "apple");
-        assert_eq!("unknown".parse::<GPUVendor>(), Ok(GPUVendor::Unknown));
         assert_eq!(HostAccess::Refused.to_string(), "refused");
         assert_eq!(HostAccess::Readable.to_string(), "readable");
         assert_eq!(GPUClass::AppleMetal10.to_string(), "apple-metal10");

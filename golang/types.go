@@ -60,8 +60,6 @@ import (
 #cgo nocallback ustore_transport_from_name
 #cgo noescape ustore_gds_from_name
 #cgo nocallback ustore_gds_from_name
-#cgo noescape ustore_gpu_vendor_from_name
-#cgo nocallback ustore_gpu_vendor_from_name
 #cgo noescape ustore_gpu_class_from_name
 #cgo nocallback ustore_gpu_class_from_name
 
@@ -405,13 +403,6 @@ const (
 // String renders the vendor as the library spells it.
 func (vendor GPUVendor) String() string {
 	return C.GoString(C.ustore_gpu_vendor_name(C.ustore_gpu_vendor_t(vendor)))
-}
-
-// GPUVendorFromName reads a GPU vendor back from the spelling [GPUVendor.String] renders.
-func GPUVendorFromName(name string) (GPUVendor, error) {
-	var vendor C.ustore_gpu_vendor_t
-	err := named(C.ustore_gpu_vendor_from_name(view(name), &vendor))
-	return GPUVendor(vendor), err
 }
 
 // GPUClass is a GPU generation UStore tells apart; a class implies its vendor, and the zero value

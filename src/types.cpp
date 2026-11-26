@@ -84,6 +84,13 @@ constexpr enumerator_spelling<ustore_host_access_t> host_access_names_k[] {
     {ustore_host_access_readable_k, "readable"},
 };
 
+/** The canonical spelling of every residency. */
+constexpr enumerator_spelling<ustore_residency_t> residency_names_k[] {
+    {ustore_residency_unknown_k, "unknown"},
+    {ustore_residency_ram_k, "ram"},
+    {ustore_residency_vram_k, "vram"},
+};
+
 /** The canonical spelling of every GPU vendor. */
 constexpr enumerator_spelling<ustore_gpu_vendor_t> gpu_vendor_names_k[] {
     {ustore_gpu_vendor_unknown_k, "unknown"},
@@ -462,10 +469,8 @@ char const* ustore_host_access_name(ustore_host_access_t host_access) {
     return name_in(host_access_names_k, host_access);
 }
 
+char const* ustore_residency_name(ustore_residency_t residency) { return name_in(residency_names_k, residency); }
 char const* ustore_gpu_vendor_name(ustore_gpu_vendor_t vendor) { return name_in(gpu_vendor_names_k, vendor); }
-ustore_status_t ustore_gpu_vendor_from_name(ustore_bytes_view_t name, ustore_gpu_vendor_t* vendor) {
-    return value_in(gpu_vendor_names_k, name, vendor);
-}
 char const* ustore_gpu_class_name(ustore_gpu_class_t gpu_class) { return name_in(gpu_class_names_k, gpu_class); }
 ustore_status_t ustore_gpu_class_from_name(ustore_bytes_view_t name, ustore_gpu_class_t* gpu_class) {
     return value_in(gpu_class_names_k, name, gpu_class);

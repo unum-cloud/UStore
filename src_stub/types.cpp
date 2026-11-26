@@ -96,6 +96,12 @@ constexpr spelling<ustore_host_access_t> host_access_names_k[] {
     {ustore_host_access_readable_k, "readable"},
 };
 
+constexpr spelling<ustore_residency_t> residency_names_k[] {
+    {ustore_residency_unknown_k, "unknown"},
+    {ustore_residency_ram_k, "ram"},
+    {ustore_residency_vram_k, "vram"},
+};
+
 constexpr spelling<ustore_gpu_vendor_t> gpu_vendor_names_k[] {
     {ustore_gpu_vendor_unknown_k, "unknown"},
     {ustore_gpu_vendor_nvidia_k, "nvidia"},
@@ -275,8 +281,11 @@ ustore_status_t ustore_outcome_wait(ustore_outcome_t* outcome) {
 
 ustore_status_t ustore_outcome_status(ustore_outcome_t* outcome) { return load_status(outcome); }
 
-/** Spells a host access, which a caller is only ever answered, so no name reads it back. */
+/** Spells a host access, a residency and a GPU vendor, which a caller is only ever answered, so no
+ *  name reads them back. */
 char const* ustore_host_access_name(ustore_host_access_t value) { return name_in(host_access_names_k, value); }
+char const* ustore_residency_name(ustore_residency_t value) { return name_in(residency_names_k, value); }
+char const* ustore_gpu_vendor_name(ustore_gpu_vendor_t value) { return name_in(gpu_vendor_names_k, value); }
 
 #define spell_names_(type_, prefix_, table_)                                               \
     char const* ustore_##prefix_##_name(type_ value) { return name_in(table_, value); }    \
@@ -286,25 +295,23 @@ char const* ustore_host_access_name(ustore_host_access_t value) { return name_in
 
 spell_names_(ustore_status_t, status, status_names_k) spell_names_(ustore_phase_t, phase, phase_names_k)
     spell_names_(ustore_mood_t, mood, mood_names_k) spell_names_(ustore_cpu_class_t, cpu_class, cpu_class_names_k)
-        spell_names_(ustore_pattern_kind_t, pattern_kind, pattern_kind_names_k) spell_names_(ustore_case_sensitivity_t,
-                                                                                             case_sensitivity,
-                                                                                             case_sensitivity_names_k)
-            spell_names_(ustore_predicate_cost_t, predicate_cost, predicate_cost_names_k) spell_names_(ustore_gds_t,
-                                                                                                       gds, gds_names_k)
-                spell_names_(ustore_gpu_vendor_t, gpu_vendor,
-                             gpu_vendor_names_k) spell_names_(ustore_gpu_class_t, gpu_class, gpu_class_names_k)
-                    spell_names_(ustore_transport_t, transport,
-                                 transport_names_k) spell_names_(ustore_durability_t, durability, durability_names_k)
-                        spell_names_(ustore_watch_t, watch, watch_names_k) spell_names_(ustore_scan_mode_t, scan_mode,
-                                                                                        scan_mode_names_k)
-                            spell_names_(ustore_change_kind_t, change_kind, change_kind_names_k)
-                                spell_names_(ustore_scan_direction_t, scan_direction, scan_direction_names_k)
-                                    spell_names_(ustore_ingest_order_t, ingest_order, ingest_order_names_k)
-                                        spell_names_(ustore_drop_mode_t, drop_mode, drop_mode_names_k)
-                                            spell_names_(ustore_isolation_t, isolation, isolation_names_k)
-                                                spell_names_(ustore_engine_t, engine,
-                                                             engine_names_k) spell_names_(ustore_modality_t, modality,
-                                                                                          modality_names_k)
+        spell_names_(ustore_pattern_kind_t, pattern_kind,
+                     pattern_kind_names_k) spell_names_(ustore_case_sensitivity_t, case_sensitivity,
+                                                        case_sensitivity_names_k) spell_names_(ustore_predicate_cost_t,
+                                                                                               predicate_cost,
+                                                                                               predicate_cost_names_k)
+            spell_names_(ustore_gds_t, gds, gds_names_k) spell_names_(ustore_gpu_class_t, gpu_class, gpu_class_names_k)
+                spell_names_(ustore_transport_t, transport,
+                             transport_names_k) spell_names_(ustore_durability_t, durability, durability_names_k)
+                    spell_names_(ustore_watch_t, watch, watch_names_k) spell_names_(ustore_scan_mode_t, scan_mode,
+                                                                                    scan_mode_names_k)
+                        spell_names_(ustore_change_kind_t, change_kind, change_kind_names_k)
+                            spell_names_(ustore_scan_direction_t, scan_direction, scan_direction_names_k)
+                                spell_names_(ustore_ingest_order_t, ingest_order, ingest_order_names_k)
+                                    spell_names_(ustore_drop_mode_t, drop_mode, drop_mode_names_k)
+                                        spell_names_(ustore_isolation_t, isolation, isolation_names_k)
+                                            spell_names_(ustore_engine_t, engine, engine_names_k)
+                                                spell_names_(ustore_modality_t, modality, modality_names_k)
                                                     spell_names_(ustore_vertex_role_t, vertex_role, vertex_role_names_k)
                                                         spell_names_(ustore_docs_field_type_t, docs_field_type,
                                                                      docs_field_type_names_k)

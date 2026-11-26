@@ -331,10 +331,8 @@ static void test_enums_spell_and_parse_as_the_library_names_them(void) {
     }
     expect_(ustore_phase_from_name(bytes_of("merging"), &phase) == ustore_status_invalid_argument_k);
     expect_(strcmp(ustore_cpu_class_name(ustore_cpu_class_aws_g5_k), "aws-g5") == 0);
-    ustore_gpu_vendor_t vendor = ustore_gpu_vendor_unknown_k;
     expect_(strcmp(ustore_gpu_vendor_name(ustore_gpu_vendor_apple_k), "apple") == 0);
-    expect_(ustore_gpu_vendor_from_name(bytes_of("apple"), &vendor) == ustore_status_success_k &&
-            vendor == ustore_gpu_vendor_apple_k);
+    expect_(strcmp(ustore_residency_name(ustore_residency_ram_k), "ram") == 0);
     expect_(strcmp(ustore_host_access_name(ustore_host_access_readable_k), "readable") == 0);
     expect_(strcmp(ustore_host_access_name((ustore_host_access_t)7), "unrecognized") == 0);
     ustore_gpu_class_t gpu_class = ustore_gpu_class_unknown_k;

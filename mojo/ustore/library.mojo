@@ -219,7 +219,6 @@ struct Symbols:
     var gds_name: NameOf
     var gds_from_name: FromName
     var gpu_vendor_name: NameOf
-    var gpu_vendor_from_name: FromName
     var host_access_name: NameOf
     var gpu_class_name: NameOf
     var gpu_class_from_name: FromName
@@ -389,7 +388,6 @@ struct Symbols:
         self.gds_name = _resolve[NameOf](handle, "ustore_gds_name")
         self.gds_from_name = _resolve[FromName](handle, "ustore_gds_from_name")
         self.gpu_vendor_name = _resolve[NameOf](handle, "ustore_gpu_vendor_name")
-        self.gpu_vendor_from_name = _resolve[FromName](handle, "ustore_gpu_vendor_from_name")
         self.host_access_name = _resolve[NameOf](handle, "ustore_host_access_name")
         self.gpu_class_name = _resolve[NameOf](handle, "ustore_gpu_class_name")
         self.gpu_class_from_name = _resolve[FromName](handle, "ustore_gpu_class_from_name")
@@ -697,10 +695,6 @@ struct Library(ImplicitlyCopyable):
     def gpu_vendor_name(self, vendor: GPUVendor) -> String:
         """The engine's spelling of a GPU vendor. Calls `ustore_gpu_vendor_name`."""
         return text_at(self.symbols().gpu_vendor_name(vendor.code))
-
-    def gpu_vendor_from_name(self, name: StringSlice) raises Error -> GPUVendor:
-        """Reads a spelling back or raises `INVALID_ARGUMENT`. Calls `ustore_gpu_vendor_from_name`."""
-        return GPUVendor(self._read_name(self.symbols().gpu_vendor_from_name, name, "ustore_gpu_vendor_from_name"))
 
     def host_access_name(self, host_access: HostAccess) -> String:
         """The engine's spelling of a host access. Calls `ustore_host_access_name`."""

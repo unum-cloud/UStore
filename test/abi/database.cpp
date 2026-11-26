@@ -1405,7 +1405,14 @@ void test_status_names(config_t const&) {
  *  rest. */
 void test_closed_set_names(config_t const&) {
     expect_spellings(ustore_cpu_class_name, ustore_cpu_class_from_name, 12);
-    expect_spellings(ustore_gpu_vendor_name, ustore_gpu_vendor_from_name, 4);
+    expect_true(std::string_view {ustore_gpu_vendor_name(ustore_gpu_vendor_unknown_k)} == "unknown");
+    expect_true(std::string_view {ustore_gpu_vendor_name(ustore_gpu_vendor_nvidia_k)} == "nvidia");
+    expect_true(std::string_view {ustore_gpu_vendor_name(ustore_gpu_vendor_amd_k)} == "amd");
+    expect_true(std::string_view {ustore_gpu_vendor_name(ustore_gpu_vendor_apple_k)} == "apple");
+    expect_true(std::string_view {ustore_residency_name(ustore_residency_unknown_k)} == "unknown");
+    expect_true(std::string_view {ustore_residency_name(ustore_residency_ram_k)} == "ram");
+    expect_true(std::string_view {ustore_residency_name(ustore_residency_vram_k)} == "vram");
+    expect_true(std::string_view {ustore_residency_name(static_cast<ustore_residency_t>(3))} == "unrecognized");
     expect_true(std::string_view {ustore_host_access_name(ustore_host_access_refused_k)} == "refused");
     expect_true(std::string_view {ustore_host_access_name(ustore_host_access_readable_k)} == "readable");
     expect_spellings(ustore_gpu_class_name, ustore_gpu_class_from_name, 12);
