@@ -52,7 +52,7 @@ jsontape = "0.1.4"
 serde = { version = "1", optional = true }
 smashtable = { version = "1.0.0-rc.1", git = "https://github.com/ashvardanian/SmashTable", rev = "36ec681da1874d63ef4b57114405df00e426728a" }
 stringtape = "2.5.0"
-stringzilla = { version = "6.0.0-rc.1", git = "https://github.com/ashvardanian/StringZilla", rev = "930a52c38505d37165194b72009da2df15a4dcfa", default-features = false }
+stringzilla = { version = "6.0.0-rc.1", git = "https://github.com/ashvardanian/StringZilla", rev = "b501226d84c4991131d3d9d8020157f3c1d42ccb", default-features = false }
 
 [build-dependencies]
 cmake = "0.1"

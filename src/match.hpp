@@ -184,7 +184,7 @@ struct compiled_match<vendored_residency_t::host_k> {
                                                .length_normalization = 0.0f,
                                                .average_document_length = 0.0f};
         sz_status_t const scoring = sz_substrings_bm25_scores(scorer, &scored, nullptr, &parameters, weights,
-                                                              candidates.scores.data(), 1, nullptr);
+                                                              candidates.scores.data(), sizeof(sz_f32_t), nullptr);
         if (scoring != sz_success_k)
             return util::stringzilla_refusal(scoring, util::status_code_t::invalid_argument_k,
                                              "The scorer rejected the values");

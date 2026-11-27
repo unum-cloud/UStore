@@ -76,5 +76,5 @@ ustore_sibling(
 # numkong::header link, once something includes its headers.
 ustore_sibling(
     stringzilla FETCHCONTENT_SOURCE_DIR_STRINGZILLA https://github.com/ashvardanian/StringZilla.git
-    930a52c38505d37165194b72009da2df15a4dcfa
+    b501226d84c4991131d3d9d8020157f3c1d42ccb
 )
