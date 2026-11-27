@@ -57,7 +57,7 @@
 #include <fmt/format.h>
 #include <fmt/ranges.h> // `fmt::join`
 
-#include <stringzilla/stringzilla.hpp> // `sz::string_t`
+#include <stringzilla/string.hpp> // `sz::string_t`
 
 #include "ustore/db.h"                         // the init call of every engine and the spellings flags name
 #include "ustore/utilities/blocking_files.hpp" // `read_file`, `path_max_bytes_k`

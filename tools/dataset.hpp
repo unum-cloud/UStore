@@ -14,7 +14,7 @@
 
 #include <yyjson.h> // `yyjson_mut_doc`, `yyjson_mut_val`, `yyjson_val`
 
-#include <stringzilla/stringzilla.hpp> // `sz::string_t`
+#include <stringzilla/string.hpp> // `sz::string_t`
 
 #include "ustore/db.h"                         // `ustore_outcome_t`, `ustore_bytes_view_t`
 #include "ustore/utilities/blocking_files.hpp" // `temporary_path_of`, `rename_file`, `sync_directory`

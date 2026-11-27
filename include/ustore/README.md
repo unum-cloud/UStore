@@ -16,7 +16,7 @@ Pin a commit, not a version, when building on them.
   - `types.hpp`: `status_t`, `status_code_t` and `expected`, UUIDs, keys and collection IDs with their orders, hashes and text, edges, value views, byte views and the serialization over them, owned text and integer rounding.
     `cpp/ustore/types.hpp` keeps an identical copy of `status_t` and `expected`, so a status reads the same on both sides of the C layer.
   - `ram_buffers.hpp`: the growing arena behind `ustore_arena_t` and every call's scratch, the `arena_allocator` SmashTable's containers take, the aligned and budgeted allocators of unbuffered I/O with the buffers they grow, and `growing_strings`, a column of strings exported as a tape.
-  - `ram_device.hpp`: `harvest_topology` and `spawn_pool`, which fill ForkUnion's `fu::topology_t` and `fu::pool_t`.
+  - `ram_device.hpp`: the claim and residency words, the translation of ForkUnion's statuses, and the memory domain nearest a PCI function.
   - `vram_device.hpp`: the vendor-neutral face of the GPU residency, every vendor's driver, the device listing, and the kernels every vendor's executor launches.
   - `vram_nvidia_device.hpp`: CUDA devices, streams, events and buffers from the host.
   - `vram_amd_device.hpp`: AMD devices from the host, the HIP runtime opened at first use, the device listing, modules, events and the executor.

@@ -23,13 +23,13 @@
 #include <utility> // `std::move`
 
 #include <forkunion/capabilities.hpp>     // `fu::preferred_yield_t`
+#include <forkunion/forkunion.hpp>        // `fu::topology_t`, `fu::pool_t`
 #include <smashtable/basic_vector.hpp>    // `st::vector`
 #include <smashtable/reference_store.hpp> // `st::reference_store`
 
 #include "ustore/blobs/nvme_key_slot.hpp"          // `key_slot`
 #include "ustore/blobs/nvme_tree.hpp"              // `lsm_level`, `lsm_level_order_t`, `lsm_level_depth_t`
 #include "ustore/blobs/vram_nvidia_compaction.cuh" // `cuda_compactor_t`, `strings_merge_verdict`
-#include "ustore/utilities/ram_device.hpp"         // `spawn_pool`, `harvest_topology`
 #include "ustore/utilities/vram_device.hpp"        // `gpu_drivers_t`
 
 #include "nvme/allocation_watch.hpp" // `allocation_watch_t`, `allocation_watch_g`
@@ -749,12 +749,14 @@ void test_intermediate_merge_keeps_remove_deltas(mount_type_ const& mount) {
 
     // And again with every slice on its own thread of a pool, side by side.
     // Without memory placement ForkUnion spawns a flat pool of plain threads, which pins nothing
-    auto [topology, topology_status] = util::harvest_topology();
-    auto [pool, make_pool_status] = util::spawn_pool(
-        topology, threads_k, fu::caller_inclusive_k,
-        static_cast<fu_capabilities_t>(fu_capabilities_all_k & ~fu_capability_place_memory_on_domain_k));
-    expect_true(st::succeeded(make_pool_status));
-    if (st::failed(make_pool_status)) return;
+    fu::topology_t topology;
+    fu::pool_t pool;
+    bool const spawned =
+        fu::succeeded(topology.harvest()) &&
+        fu::succeeded(pool.spawn(
+            topology, threads_k, fu::caller_inclusive_k,
+            static_cast<fu_capabilities_t>(fu_capabilities_all_k & ~fu_capability_place_memory_on_domain_k)));
+    if (!expect_true(spawned)) return;
     pooled_fan_out<typename fixture_t::disk_t> pooled {pool, &fixture->queues, &fixture->disk, 2};
     expect_equal(pooled.slices(), threads_k);
     request.buffers = buffers;

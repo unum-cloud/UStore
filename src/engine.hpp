@@ -46,6 +46,7 @@
 #include "ustore/utilities/ram_device.hpp"  // `claim_t`
 #include "ustore/utilities/vram_device.hpp" // `cuda_executor_t`, `hip_executor_t`, `metal_executor_t`
 
+#include "ram_spawn.hpp"           // `fu::pool_t`
 #include "utilities/arguments.hpp" // `a_call_naming_database`, `a_cursor_walker`, `a_call_feeding_ingest`
 #include "utilities/batches.hpp"   // `strings_arg_t`
 #include "vram/classes.hpp"        // `gpu_class_t`
@@ -924,7 +925,7 @@ template <cpu_class_t cpu_class_>
 struct waiter_for_cpu_class {
     using type = fu::standard_yield_t;
 };
-#if FORKUNION_TARGET_X86_PAUSE
+#if FORKUNION_TARGET_X8664_PAUSE
 template <>
 struct waiter_for_cpu_class<cpu_class_t::serial_k> {
     using type = fu::x86_pause_t;
@@ -942,7 +943,7 @@ struct waiter_for_cpu_class<cpu_class_t::intel_icelake_k> {
     using type = fu::x86_pause_t;
 };
 #endif
-#if FORKUNION_TARGET_X86_TPAUSE
+#if FORKUNION_TARGET_X8664_TPAUSE
 template <>
 struct waiter_for_cpu_class<cpu_class_t::intel_sierra_k> {
     using type = fu::x86_tpause_t;
@@ -1000,7 +1001,7 @@ struct atomic_ref_for_cpu_class {
     template <typename value_type_>
     using type = fu::standard_atomic_ref<value_type_>;
 };
-#if FORKUNION_TARGET_X86_CMPCCXADD
+#if FORKUNION_TARGET_X8664_CMPCCXADD
 template <>
 struct atomic_ref_for_cpu_class<cpu_class_t::intel_sierra_k> {
     template <typename value_type_>

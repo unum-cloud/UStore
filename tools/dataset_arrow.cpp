@@ -38,7 +38,7 @@
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
 #include <smashtable/shared.hpp>       // `st::assume_uninitialized`
-#include <stringzilla/stringzilla.hpp> // `sz::string_t`
+#include <stringzilla/string.hpp>      // `sz::string_t`
 
 #include "ustore/arrow.h"              // `ustore_keys_view_from_arrow`, `ustore_strings_view_to_arrow`
 #include "ustore/docs.h"               // `ustore_docs_write_t`

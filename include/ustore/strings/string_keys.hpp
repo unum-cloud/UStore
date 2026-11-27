@@ -19,7 +19,7 @@
 
 #include <smashtable/row_layout.hpp>   // `st::key128_t`
 #include <smashtable/shared.hpp>       // `st::expected`
-#include <stringzilla/stringzilla.hpp> // `sz::string_view_t`
+#include <stringzilla/string.hpp>      // `sz::string_view_t`
 
 #include "ustore/utilities/ram_buffers.hpp" // `a_strings_kit`
 #include "ustore/utilities/types.hpp"       // `blob_t`, `byte_t`

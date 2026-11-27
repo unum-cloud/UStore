@@ -22,7 +22,7 @@
 #include <yyjson.h> // `yyjson_read_opts`, `yyjson_mut_doc`, `yyjson_mut_write_opts`
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
-#include <stringzilla/stringzilla.hpp> // `sz::string_t`, `sz::string_view_t`, `sz::split`
+#include <stringzilla/find.hpp>        // `sz::split`, `sz::find_first_of`
 
 #include "ustore/docs.h"               // `ustore_docs_write_t`, `ustore_docs_read_t`, `ustore_docs_scan_t`
 #include "ustore/graph.h"              // `ustore_graph_write_edges_t`, `ustore_graph_scan_vertices_t`
@@ -328,7 +328,7 @@ class csv_reader_t {
             unquoted_.clear();
             std::size_t cursor = position_ + 1;
             while (true) {
-                std::size_t const quote = text_.find('"', cursor);
+                std::size_t const quote = sz::find(text_, '"', cursor);
                 if (quote >= size) return csv_boundary_t::malformed_k;
                 if (unquoted_.append(data + cursor, quote - cursor) != sz::status_t::success_k)
                     return csv_boundary_t::malformed_k;
@@ -342,7 +342,7 @@ class csv_reader_t {
             field = unquoted_;
             return consume_delimiter();
         }
-        std::size_t end = text_.find_first_of(sz::string_view_t {",\r\n"}, position_);
+        std::size_t end = sz::find_first_of(text_, sz::string_view_t {",\r\n"}, position_);
         if (end > size) end = size;
         field = {data + position_, end - position_};
         position_ = end;

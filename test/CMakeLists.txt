@@ -1,8 +1,9 @@
-# Every suite reads the harness, which parses its settings through `tools/arguments.hpp` and reads the templates of
-# `include/ustore/`, and the C ABI suites reach the engine's verb tables in `src/`, so every suite links `ustore_header`;
-# the suites over the C++ SDK link `ustore::cpp`, which carries the library.
+# Every suite reads the harness, which parses its settings through `tools/arguments.hpp`, reads the templates of
+# `include/ustore/` and gathers through StringZilla's verbs, and the C ABI suites reach the engine's verb tables in
+# `src/`, so every suite links `ustore_header` and `stringzilla::cpp`; the suites over the C++ SDK link `ustore::cpp`,
+# which carries the library.
 include_directories(${PROJECT_SOURCE_DIR}/src ${PROJECT_SOURCE_DIR}/tools)
-link_libraries(ustore_header)
+link_libraries(ustore_header stringzilla::cpp)
 
 # The suites, each over every engine this build compiles; `enable_testing()` stays in the root, before this directory.
 set(ustore_abi_names_
@@ -57,7 +58,6 @@ if (${USTORE_WITH_NVME})
             PRIVATE ustore::header
                     forkunion::static
                     smashtable::header
-                    stringzilla::static
                     yyjson
                     fmt::fmt
                     Threads::Threads
@@ -113,7 +113,6 @@ if (${USTORE_WITH_NVME})
             PRIVATE ustore_header
                     forkunion::static
                     smashtable::header
-                    stringzilla::static
                     yyjson
                     fmt::fmt
                     Threads::Threads
@@ -154,14 +153,8 @@ target_compile_features(ustore_test_nvme_compaction_host PRIVATE cxx_std_20)
 # A fold's scratch arena allocates on ForkUnion's memory domains, which the host compactor reaches, and the docs fold
 # parses through yyjson
 target_link_libraries(
-    ustore_test_nvme_compaction_host
-    PRIVATE ustore_header
-            smashtable::header
-            forkunion::static
-            stringzilla::header
-            yyjson
-            fmt::fmt
-            ustore_warnings
+    ustore_test_nvme_compaction_host PRIVATE ustore_header smashtable::header forkunion::static yyjson fmt::fmt
+                                             ustore_warnings
 )
 add_test(NAME ustore_test_nvme_compaction_host COMMAND ustore_test_nvme_compaction_host)
 
@@ -180,9 +173,9 @@ if (ustore_device_compaction_)
 endif ()
 
 # The shared library opens every GPU runtime at first use, so it names none as needed. It builds by default only
-# with `USTORE_BUILD_SHARED` and CTest builds nothing, so the test requires its file, failing on a missing one
+# with `USTORE_BUILD_LIBRARIES` and CTest builds nothing, so the test requires its file, failing on a missing one
 # instead of passing the `grep`
-if (USTORE_BUILD_SHARED AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
+if (USTORE_BUILD_LIBRARIES AND CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_test(NAME ustore_test_links_no_gpu_runtime
              COMMAND sh -c "! readelf -d \"$0\" | grep -E 'NEEDED.*(libcudart|libcuda\\.|libamdhip64|libcufile)'"
                      $<TARGET_FILE:ustore_shared>
@@ -282,17 +275,13 @@ set(ustore_templates_test_paths_ "pages/element_tree" "pages/page_fold" "docs/js
 foreach (test_path_ IN ITEMS ${ustore_templates_test_paths_})
     string(REPLACE "/" "_" test_name_ ${test_path_})
     add_executable(ustore_test_${test_name_} ${test_path_}.cpp)
-    target_include_directories(ustore_test_${test_name_} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/c
-                                                                 ${PROJECT_SOURCE_DIR}/include)
+    target_include_directories(
+        ustore_test_${test_name_} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${PROJECT_SOURCE_DIR}/c
+                                          ${PROJECT_SOURCE_DIR}/include
+    )
     target_link_libraries(
-        ustore_test_${test_name_}
-        PRIVATE smashtable::header
-                forkunion::cpp
-                stringzilla::static
-                yyjson
-                fmt::fmt
-                ustore_warnings
-                ustore_sanitizers
+        ustore_test_${test_name_} PRIVATE smashtable::header forkunion::cpp yyjson fmt::fmt ustore_warnings
+                                          ustore_sanitizers
     )
     add_test(NAME ustore_test_${test_name_} COMMAND ustore_test_${test_name_})
 endforeach ()
@@ -330,10 +319,15 @@ endforeach ()
 # The C ABI compiles as plain C11, so a header that only a C++ compiler accepts fails to build. It links against
 # both libraries, and the shared one exports only what `USTORE_EXPORT` marks.
 add_executable(ustore_test_c ${PROJECT_SOURCE_DIR}/c/test.c)
-add_executable(ustore_test_c_shared ${PROJECT_SOURCE_DIR}/c/test.c)
 target_link_libraries(ustore_test_c PRIVATE ustore::static)
-target_link_libraries(ustore_test_c_shared PRIVATE ustore::shared)
-foreach (c_test_ IN ITEMS ustore_test_c ustore_test_c_shared)
+if (TARGET ustore_shared)
+    add_executable(ustore_test_c_shared ${PROJECT_SOURCE_DIR}/c/test.c)
+    target_link_libraries(ustore_test_c_shared PRIVATE ustore::shared)
+    set(ustore_c_tests_ ustore_test_c ustore_test_c_shared)
+else ()
+    set(ustore_c_tests_ ustore_test_c)
+endif ()
+foreach (c_test_ IN LISTS ustore_c_tests_)
     set_target_properties(${c_test_} PROPERTIES C_STANDARD 11 C_STANDARD_REQUIRED ON)
     # The shared library's C++ reaches the sanitizers' guard and allocation interceptors only when the program
     # exports them, which the C++ driver alone does
@@ -370,9 +364,7 @@ endforeach ()
 if (${USTORE_BUILD_TOOLS})
     add_executable(ustore_test_tools_arrow_ipc tools/arrow_ipc.cpp)
     target_include_directories(ustore_test_tools_arrow_ipc PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
-    target_link_libraries(
-        ustore_test_tools_arrow_ipc PRIVATE ustore::header forkunion::static fmt::fmt ustore_warnings
-    )
+    target_link_libraries(ustore_test_tools_arrow_ipc PRIVATE ustore::header forkunion::static fmt::fmt ustore_warnings)
     add_test(NAME ustore_test_tools_arrow_ipc COMMAND ustore_test_tools_arrow_ipc)
     add_executable(
         ustore_test_tools tools/dataset.cpp ${PROJECT_SOURCE_DIR}/tools/dataset.cpp

@@ -12,7 +12,7 @@
 #include <string_view> // `std::string_view`
 #include <variant>     // `std::get`, `std::get_if`
 
-#include <stringzilla/stringzilla.hpp> // `sz::string_t`, `sz::string_view_t`
+#include <stringzilla/string.hpp> // `sz::string_t`, `sz::string_view_t`
 
 #include "ustore/strings.h" // `ustore_strings_write_t`, `ustore_strings_cursor_next_t`
 

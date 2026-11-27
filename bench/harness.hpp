@@ -46,7 +46,7 @@
 
 #include <smashtable/basic_vector.hpp>
 
-#include "ustore/utilities/ram_device.hpp" // `fu::pool_t`
+#include <forkunion/forkunion.hpp> // `fu::pool_t`
 
 #include "arguments.hpp"
 

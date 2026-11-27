@@ -86,7 +86,7 @@ fn main() -> Result<(), Box<dyn Error>> {
 fn build_library(manifest: &Path) -> Result<PathBuf, Box<dyn Error>> {
     let mut build = cmake::Config::new(manifest);
     build
-        .define("USTORE_BUILD_SHARED", "ON")
+        .define("USTORE_BUILD_LIBRARIES", "ON")
         .define("USTORE_INSTALL", "ON")
         .define("CMAKE_INSTALL_LIBDIR", "lib")
         .define("USTORE_BUNDLE_SIBLINGS", "OFF")

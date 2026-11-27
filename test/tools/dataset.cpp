@@ -32,7 +32,7 @@
 #include <yyjson.h>
 
 #include <smashtable/basic_vector.hpp>
-#include <stringzilla/stringzilla.hpp>
+#include <stringzilla/find.hpp>
 
 #include "ustore/db.h"
 #include "ustore/utilities/ranges.hpp" // `strided_strings`, `strided`
@@ -397,8 +397,8 @@ void check_edges(char const* path) noexcept {
         edge_row_t edge {};
         bool parsed = false;
         if (is_csv(path)) {
-            std::size_t const first = line.find(',');
-            std::size_t const second = first >= line.size() ? line.size() : line.find(',', first + 1);
+            std::size_t const first = sz::find(line, ',');
+            std::size_t const second = first >= line.size() ? line.size() : sz::find(line, ',', first + 1);
             std::string_view const row = line;
             parsed = second < line.size() && parse_key(row.substr(0, first), edge.source) &&
                      parse_key(row.substr(first + 1, second - first - 1), edge.target) &&
@@ -1143,7 +1143,7 @@ void test_arrow_stdout_only_arrow(fixture_paths_t const& paths, config_t const& 
     read_arrow_file(output.c_str(), read);
     expect_same_rows(read.rows, table.rows);
     sz::string_t status;
-    expect_true(read_file(errors.c_str(), status) && status.view().find("Exported") != sz::string_view_t::npos);
+    expect_true(read_file(errors.c_str(), status) && sz::contains(status, "Exported"));
     for (std::string const* path : {&input, &output, &errors}) {
         [[maybe_unused]] int const removed = std::remove(path->c_str());
     }

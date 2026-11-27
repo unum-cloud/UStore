@@ -169,8 +169,8 @@ Per-thread scratch belongs to the executor that owns the threads.
 
 ### Threads and Placement
 
-Threads, topology and domain-placed memory come from ForkUnion's C ABI in `forkunion/forkunion.h`, reached through ForkUnion's C++ `fu::pool_t`, which `include/ustore/utilities/ram_device.hpp` spawns, and the arenas of `include/ustore/utilities/ram_buffers.hpp`; nothing else calls `fu_*` directly.
-The executor holds its threads as `threads_t`, a variant of the `fu_pool_t` its factories spawn through `fu_topology_new`, `fu_pool_new` and `fu_pool_spawn` and its destructor deletes, or of `fu::dummy_pool_t`, the calling thread alone, which `on_calling_thread()` builds with no topology probe, pool or spawn; it forwards C++ callables to either through a C callback.
+Threads, topology and domain-placed memory come from ForkUnion's C ABI in `forkunion/forkunion.h`, reached through ForkUnion's C++ `fu::pool_t`, which the library spawns only in `src/ram_spawn.hpp`, and the arenas of `include/ustore/utilities/ram_buffers.hpp`; tests and benchmarks spawn their own pools, and nothing else calls `fu_*` directly.
+The engine holds its threads as one `fu::pool_t`, which `spawn_pool` in `src/ram_spawn.hpp` fills over a harvested `fu::topology_t`, and tests and benchmarks spawn their own pools the same way.
 The arenas place their blocks with `fu_allocate_on_domain_id` and release them with `fu_free_on_domain_id`.
 A try-only claim is an atomic bit or `fu::spin_mutex_t`, anything that waits is `fu::fair_mutex_t` from `<forkunion/locks.hpp>`, and UStore holds no reader-writer gate yet; `.githooks/pre-commit` refuses any other new lock, so ask first.
 
@@ -425,6 +425,7 @@ The first rows are shared by every U* project, and UStore's own follow.
 - A closing `@par Statuses:` block lists only the statuses a verb's contract adds, while resource failures, cancellation, deferral and defects are covered once by the categories in the `ustore_status_t` docblock.
 - A code span inside a docblock is `@c token`, a shape or a range is `@b [minimum,maximum]` with the whitespace inside the brackets squeezed out, and a span too long for either becomes plain prose; backticks stay in `//` line comments and in the trailing comments of `#include` lines.
 - Backticks mark code, identifiers and literal values, never notation such as a mapping written with an arrow.
+- Markdown and Rust doc comments never set two code spans side by side; name one in prose and keep one span, as `.githooks/pre-commit` checks.
 - Prose arrows in comments and Markdown are → with a space on each side, never the ASCII `->`.
 - Document all fields of a type or none of them, each with its own line.
 - Comments stay to one line, two at most, state what the code cannot, and never narrate history.
@@ -438,6 +439,13 @@ Sibling projects are reached through the aliases `fu`, `st` and `sz`, declared o
 C++ prints through `fmt::println` — no iostreams, no `printf`.
 Discard a result through `[[maybe_unused]] T const result = call();`, never `(void)call();`, and declare return types before the name, never after an arrow.
 A file never includes both a library's SDK umbrella `<X/X.hpp>` and its native umbrella `<X.hpp>`, for this library and every sibling, and nothing under `include/` includes a header that resolves under `cpp/`; C headers are the ABI every SDK sits on, so they are free everywhere. `.githooks/pre-commit` refuses both.
+
+Each library keeps its containers in `include/<lib>/*.hpp` behind its `::types` target, which links only the C ABI, carries no define, includes no kernel and calls nothing the library exports.
+ForkUnion and SmashTable define nothing for header-only builds, so their `::header` is also their container layer.
+Every operation one of a library's kernels backs is a verb under `cpp/`, which links the library, calls only `_best` exports and includes only C and `::types` headers.
+No relative header path sits in two of `c/`, `include/` and `cpp/`.
+A product's `include/` takes a sibling's `::types` and C headers, never its `cpp/` verbs, and no binding calls a `_serial` kernel.
+`.githooks/pre-commit` refuses each of these.
 
 ## Lean State
 
@@ -513,6 +521,7 @@ The pinned C++ regions print with `std::printf`, the one exception to `fmt::prin
 
 Tests reach the library through its public surface: the C ABI in `c/ustore/`, the C++ wrappers in `cpp/ustore/`, the Python, Rust and Mojo bindings, and the templates of `include/ustore/` that the component suites check below the C ABI.
 The calls past that surface are listed under [Private Surface Waivers](#private-surface-waivers), each with what the public surface lacks.
+Tests never read a library's internal layouts, and each family's oracle is the `<verb>_reference` beside it, never a serial kernel or a helper named `_oracle`, `_naive` or `_golden`.
 Oracles never compile out: a test checks with `expect_true` and its siblings, never `assert`, and every C and C++ test unit opens with `#undef NDEBUG // ! A test's oracle must stay live in every build`.
 Benchmarks never include `test/`, and each tree keeps its own harness.
 
@@ -794,7 +803,7 @@ An engine is left out through `CMAKE_ARGS` or `--config-settings=cmake.define.US
 
 `Cargo.toml` and `build.rs` at the root build the crate from `rust/lib.rs`, and `build.rs` compiles no C or C++ itself.
 The crate's own usage is described in [`rust/README.md`](rust/README.md).
-It configures CMake with `USTORE_BUILD_SHARED=ON` and `USTORE_INSTALL=ON`, installs into `OUT_DIR`, and links the `ustore_static` archive with the archives of the engines its features enable, and the target's C++ standard library.
+It configures CMake with `USTORE_BUILD_LIBRARIES=ON` and `USTORE_INSTALL=ON`, installs into `OUT_DIR`, and links the `ustore_static` archive with the archives of the engines its features enable, and the target's C++ standard library.
 `USTORE_LIBRARY_DIR` names a directory already holding those archives, such as the `lib/` of a prefix installed with `USTORE_BUNDLE_SIBLINGS=OFF`, and skips the CMake build.
 
 - __RAM__ always builds, in the `ustore_static` archive the crate links.

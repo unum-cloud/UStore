@@ -42,7 +42,7 @@
 #include <smashtable/row_layout.hpp>             // `st::key128_t`
 #include <smashtable/shared.hpp>                 // `st::default_allocator`, `st::expected`
 #include <stringzilla/sort.h>                    // `sz_kernel_sort_order_t`
-#include <stringzilla/stringzilla.hpp>           // `sz::string_view_t`
+#include <stringzilla/string.hpp>                // `sz::string_view_t`
 
 #include "ustore/blobs/nvme_memory_run.hpp" // `keyed_delta`, `stamped_delta`, `kept_versions`
 #include "ustore/blobs/nvme_compaction.hpp" // `compaction_stamps_t`

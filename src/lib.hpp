@@ -60,7 +60,7 @@
 #include <type_traits> // `std::underlying_type_t`, `std::is_same_v`
 #include <variant>     // `std::variant`, `std::visit`, `std::get_if`
 
-#include <stringzilla/stringzilla.hpp> // `sz::string_t`
+#include <stringzilla/string.hpp> // `sz::string_t`
 
 #include "ustore/utilities/blocking_files.hpp" // `absolute_path_of`, `path_max_bytes_k`
 #include "ustore/utilities/ram_buffers.hpp"    // `arena_rewind`, `arena_page_bytes_k`

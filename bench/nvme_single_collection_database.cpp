@@ -199,10 +199,11 @@ status_t run_rows(mount_type_& mount, resources_t& resources, util::nvme_queues_
     auto [database, open_status] = database_t::open(volume, *held.writing, *held.reading, database_config(workload),
                                                     resources);
     if (open_status.failed()) return open_status;
-    auto [topology, topology_status] = util::harvest_topology();
-    auto [executor, executor_status] = util::spawn_pool(topology, workload.threads, fu::caller_inclusive_k,
-                                                        fu_capabilities_all_k);
-    if (st::failed(executor_status)) return {status_code_t::out_of_memory_k, "The executor did not start"};
+    fu::topology_t topology;
+    fu::pool_t executor;
+    if (fu::failed(topology.harvest()) ||
+        fu::failed(executor.spawn(topology, workload.threads, fu::caller_inclusive_k)))
+        return {status_code_t::out_of_memory_k, "The executor did not start"};
 
     // Inline and fixed layouts write values of their whole width, and the variable one draws a
     // width per key

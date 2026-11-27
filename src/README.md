@@ -111,7 +111,7 @@ See [`nvme/README.md`](nvme/README.md) for its layers.
 
 ## Executors
 
-`include/ustore/utilities/ram_device.hpp` spawns the one kind of pool, ForkUnion's `fu::pool_t`, parked when idle and deleted with its owner, an empty one running every dispatch on the calling thread.
+`src/ram_spawn.hpp` spawns the one kind of pool, ForkUnion's `fu::pool_t`, parked when idle and deleted with its owner, an empty one running every dispatch on the calling thread.
 Every `ustore_executor_t` that `src/types.cpp` builds holds one of them, one scratch per pool thread plus one for the call holding it, and that `holding_call_t`.
 Its `device` variant is the kind tag: nothing beyond the pool on RAM, the rings' options on NVMe, and on VRAM a `cuda_executor_t`, `hip_executor_t` or `metal_executor_t` holding one record per device it drives, each with the one stream calls there queue on, opened or adopted at creation and destroyed with the executor, its event, bounce, managed runs, page scratch and scratch limit.
 A VRAM executor is caller-inclusive with one thread, its caller, which stages, feeds the device and waits on it, and a device verb table an engine leaves null answers `ustore_status_unsupported_k`.

@@ -39,7 +39,7 @@
 #include <fmt/format.h>
 
 #include <smashtable/shared.hpp>
-#include <stringzilla/stringzilla.hpp> // `sz::status_t`, `sz::strings_view_t`
+#include <stringzilla/strings_verbs.hpp> // `sz::status_t`, `sz::strings_view_t`, `sz::gather`
 
 #include "ustore/db.h"
 #include "ustore/utilities/types.hpp" // `status_t`, `expected`, `uuid_to_integer`, `uuid_to_text`
@@ -807,7 +807,7 @@ void under_bisected_budget(std::size_t ceiling, body_type_&& body) {
 /** Fills @p tape with @p texts in order, as a deferred call owns its strings, values or fields. */
 template <typename tape_type_>
 bool fill_tape(tape_type_& tape, std::initializer_list<sz::string_view_t> texts) {
-    auto gathered = sz::strings_view_t({texts.begin(), texts.size()}).gather();
+    auto gathered = sz::gather(sz::strings_view_t({texts.begin(), texts.size()}));
     if (gathered.status == sz::status_t::success_k) tape = std::move(gathered.value);
     return expect_true(gathered.status == sz::status_t::success_k);
 }

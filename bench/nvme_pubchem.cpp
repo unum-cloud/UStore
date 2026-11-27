@@ -341,10 +341,13 @@ int main(int argc, char** argv) {
     fmt::println("- loaded {} rows, {:.2f} GB of keys, SMILES and fingerprints", rows,
                  static_cast<double>(ingested_bytes) / 1e9);
 
-    auto [topology, topology_status] = util::harvest_topology();
-    auto [executor, executor_status] = util::spawn_pool(topology, static_cast<std::size_t>(settings.threads.value),
-                                                        fu::caller_inclusive_k, fu_capabilities_all_k);
-    if (st::failed(executor_status)) {
+    fu::topology_t topology;
+    fu::pool_t executor;
+    fu::status_t const executor_status =
+        fu::failed(topology.harvest())
+            ? fu::status_t::topology_unavailable_k
+            : executor.spawn(topology, static_cast<std::size_t>(settings.threads.value), fu::caller_inclusive_k);
+    if (fu::failed(executor_status)) {
         fmt::println(stderr, "Failed to spawn {} threads", settings.threads.value);
         return 1;
     }
@@ -523,8 +526,9 @@ int main(int argc, char** argv) {
     };
     for (std::size_t const batch : {std::size_t {32}, std::size_t {1024}})
         blobs_reads(executor, fmt::format("pubchem_blobs_read_batch{}", batch), batch);
-    auto [readers, readers_status] = util::spawn_pool(topology, 32, fu::caller_inclusive_k, fu_capabilities_all_k);
-    if (!st::failed(readers_status)) blobs_reads(readers, "pubchem_blobs_read_single_32_threads", 1);
+    fu::pool_t readers;
+    if (fu::succeeded(readers.spawn(topology, 32, fu::caller_inclusive_k)))
+        blobs_reads(readers, "pubchem_blobs_read_single_32_threads", 1);
     for (std::size_t const depth : {std::size_t {32}, std::size_t {1024}}) {
         std::string const strings_name = fmt::format("pubchem_strings_read_batch{}", depth);
         if (settings.regex_filter.selects(strings_name))

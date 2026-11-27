@@ -43,7 +43,8 @@
 #include <fmt/format.h> // `fmt::println`, `fmt::format_to_n`
 
 #include <smashtable/basic_vector.hpp> // `st::vector`
-#include <stringzilla/stringzilla.hpp> // `sz::string_t`, `sz::argsort`
+#include <stringzilla/find.hpp>        // `sz::split`
+#include <stringzilla/sort.hpp>        // `sz::argsort`
 
 #include "ustore/blobs/nvme_key_slot.hpp"      // `key_slot`, `value_layout_t`
 #include "ustore/blobs/nvme_sorted_run.hpp"    // `sorted_run_header_t`, `sorted_run_layout`, `sorted_run_magic_k`

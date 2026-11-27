@@ -6,16 +6,18 @@ link_libraries(ustore_header)
 
 # Benchmarks, each picking its engine with `--engine`
 add_executable(ustore_bench_twitter twitter.cpp)
-target_link_libraries(ustore_bench_twitter PRIVATE ustore::static ustore::cpp fmt::fmt ustore_warnings)
+target_link_libraries(ustore_bench_twitter PRIVATE ustore::static ustore::cpp stringzilla::cpp fmt::fmt ustore_warnings)
 
 add_executable(
     ustore_bench_tabular_graph tabular_graph.cpp ${PROJECT_SOURCE_DIR}/tools/dataset.cpp
                                ${PROJECT_SOURCE_DIR}/tools/dataset_arrow.cpp
 )
-target_link_libraries(ustore_bench_tabular_graph PRIVATE ustore::static ustore::cpp fmt::fmt ustore_warnings)
+target_link_libraries(
+    ustore_bench_tabular_graph PRIVATE ustore::static ustore::cpp stringzilla::cpp fmt::fmt ustore_warnings
+)
 
 add_executable(ustore_bench_louvain louvain.cpp)
-target_link_libraries(ustore_bench_louvain PRIVATE ustore::static ustore::cpp fmt::fmt ustore_warnings)
+target_link_libraries(ustore_bench_louvain PRIVATE ustore::static ustore::cpp stringzilla::cpp fmt::fmt ustore_warnings)
 
 # The docs paths benchmark times the templates alone, so it links StringZilla's compiled library and no engine
 add_executable(ustore_bench_docs_paths docs_paths.cpp)
@@ -24,7 +26,7 @@ target_link_libraries(
     PRIVATE ustore::header
             smashtable::header
             forkunion::cpp
-            stringzilla::static
+            stringzilla::cpp
             yyjson
             fmt::fmt
             ustore_warnings
@@ -47,7 +49,7 @@ if (${USTORE_WITH_NVME})
         PRIVATE ustore::header
                 forkunion::static
                 smashtable::header
-                stringzilla::static
+                stringzilla::cpp
                 yyjson
                 fmt::fmt
                 Threads::Threads

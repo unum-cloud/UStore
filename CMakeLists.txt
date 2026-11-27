@@ -37,7 +37,7 @@ option(USTORE_WITH_NVME "Compile the in-tree NVMe engine" OFF)
 option(USTORE_BUILD_TEST "Compile the C++ suites in test/" OFF)
 option(USTORE_BUILD_BENCH "Compile the C++ benchmarks in bench/" OFF)
 option(USTORE_BUILD_TOOLS "Compile the CLI and the dataset tools in tools/" OFF)
-option(USTORE_BUILD_SHARED "Compile the static and shared C libraries in the default build" OFF)
+option(USTORE_BUILD_LIBRARIES "Compile the static and shared C libraries in the default build" OFF)
 option(USTORE_BUILD_STUB "Compile a brute-force stand-in for the C 99 interface" OFF)
 option(USTORE_BUILD_PYTHON "Compile the CPython extension; `scikit-build-core` switches it on" OFF)
 set(USTORE_CUDA_ARCH
@@ -158,10 +158,10 @@ target_compile_options(
 target_compile_features(ustore_header INTERFACE cxx_std_20)
 target_include_directories(ustore_header INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_include_directories(ustore_header SYSTEM INTERFACE ${yyjson_SOURCE_DIR}/src ${fmt_SOURCE_DIR}/include)
-# The executor's pool is ForkUnion's C++ SDK, `fu::pool_t`, and the strings are StringZilla's, each bringing its archive;
-# StringZilla's header target would compile its kernels header-only, which the engine and its suites never do
+# The executor's pool is ForkUnion's C++ SDK, `fu::pool_t`, bringing its archive, and the strings are StringZilla's
+# containers, whose kernels each consumer links from StringZilla's archive
 target_link_libraries(
-    ustore_header INTERFACE ustore_abi forkunion::cpp smashtable::header stringzilla::cpp ustore_sanitizers
+    ustore_header INTERFACE ustore_abi forkunion::cpp smashtable::header stringzilla::types ustore_sanitizers
 )
 
 include(cmake/ustore_gpu.cmake)
@@ -295,8 +295,8 @@ else ()
     message(STATUS "UStore: monoversioned for ${ustore_floor_}:${ustore_monoversioned_capabilities_}")
 endif ()
 
-# Without `USTORE_BUILD_SHARED`, the libraries build only for the targets that link them
-if (NOT USTORE_BUILD_SHARED AND NOT USTORE_INSTALL)
+# Without `USTORE_BUILD_LIBRARIES`, the libraries build only for the targets that link them
+if (NOT USTORE_BUILD_LIBRARIES)
     set(ustore_library_exclusion_ EXCLUDE_FROM_ALL)
 endif ()
 
@@ -439,9 +439,7 @@ foreach (class_ IN LISTS ustore_nvidia_classes_ ustore_amd_classes_ ustore_apple
                 $<TARGET_PROPERTY:forkunion::header,INTERFACE_INCLUDE_DIRECTORIES>
                 $<TARGET_PROPERTY:forkunion::abi,INTERFACE_INCLUDE_DIRECTORIES>
                 $<TARGET_PROPERTY:forkunion::cpp,INTERFACE_INCLUDE_DIRECTORIES>
-                $<TARGET_PROPERTY:stringzilla::header,INTERFACE_INCLUDE_DIRECTORIES>
-                $<TARGET_PROPERTY:stringzilla::abi,INTERFACE_INCLUDE_DIRECTORIES>
-                $<TARGET_PROPERTY:stringzilla::cpp,INTERFACE_INCLUDE_DIRECTORIES>
+                $<TARGET_PROPERTY:stringzilla::types,INTERFACE_INCLUDE_DIRECTORIES>
     )
     target_compile_definitions(
         ustore_vram_${class_} PRIVATE ${ustore_class_${class_}_gates_} ${ustore_class_${class_}_floor_off_}
@@ -462,23 +460,10 @@ add_library(
                          ${ustore_dependency_objects_}
 )
 add_library(ustore::static ALIAS ustore_static)
-add_library(ustore_shared SHARED ${ustore_library_exclusion_} ${ustore_sources_} ${ustore_vram_objects_})
-add_library(ustore::shared ALIAS ustore_shared)
 target_compile_options(
     ustore_static INTERFACE "$<$<OR:$<COMPILE_LANG_AND_ID:C,MSVC>,$<COMPILE_LANG_AND_ID:CXX,MSVC>>:/utf-8>"
 )
-target_compile_options(
-    ustore_shared INTERFACE "$<$<OR:$<COMPILE_LANG_AND_ID:C,MSVC>,$<COMPILE_LANG_AND_ID:CXX,MSVC>>:/utf-8>"
-)
 set_target_properties(ustore_static PROPERTIES EXPORT_NAME static)
-set_target_properties(ustore_shared PROPERTIES EXPORT_NAME shared)
-# `SOVERSION` holds the major alone, the only break the C ABI admits
-set_target_properties(ustore_shared PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR})
-target_compile_definitions(
-    ustore_shared
-    PRIVATE USTORE_EXPORTING=1
-    INTERFACE USTORE_SHARED=1
-)
 # An archive's private links export as link-only, so the engine's own targets stay local to this build
 target_link_libraries(
     ustore_static
@@ -486,31 +471,53 @@ target_link_libraries(
     PRIVATE $<BUILD_LOCAL_INTERFACE:ustore_header> ${ustore_dependency_links_}
             $<BUILD_LOCAL_INTERFACE:$<TARGET_NAME_IF_EXISTS:ustore_spdk>>
 )
-target_link_libraries(
-    ustore_shared
-    PUBLIC ustore_abi
-    PRIVATE Threads::Threads ustore_header ${ustore_dependencies_} ${ustore_engine_archives_}
-            $<TARGET_NAME_IF_EXISTS:ustore_spdk>
-)
 # Every GPU runtime and cuFile open through `dlopen` at first use, which glibc before 2.34 keeps in `libdl`
 target_link_libraries(ustore_static PUBLIC ${CMAKE_DL_LIBS})
 # On Apple platforms the Metal layer calls Metal and the Objective-C runtime directly, which every Mac holds
 if (USTORE_METAL_ARCH AND APPLE)
     target_link_libraries(ustore_static PUBLIC "-framework Metal" "-framework Foundation" objc)
-    target_link_libraries(ustore_shared PRIVATE "-framework Metal" "-framework Foundation" objc)
 endif ()
-target_link_libraries(ustore_shared PRIVATE ${CMAKE_DL_LIBS})
-# The shared library exports the C ABI alone. On ELF a version script does it, since the standard library's inline
-# definitions, like `std::bad_variant_access`, keep default visibility under any preset, as do the archives linked
-# inside
-file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ustore_shared.map" "{ global: ustore_*; local: *; };\n")
-target_link_options(
-    ustore_shared PRIVATE
-    $<$<PLATFORM_ID:Linux,Android,FreeBSD>:LINKER:--version-script=${CMAKE_CURRENT_BINARY_DIR}/ustore_shared.map>
-    $<$<PLATFORM_ID:Darwin>:LINKER:-exported_symbol,_ustore_*>
-)
 
-foreach (library_ IN ITEMS ustore_static ustore_shared ${ustore_compiled_objects_})
+# WASI SDK's `libc++.a` is not position-independent, so WASI builds the static library alone
+if (CMAKE_SYSTEM_NAME STREQUAL "WASI")
+    set(ustore_libraries_ ustore_static)
+else ()
+    add_library(ustore_shared SHARED ${ustore_library_exclusion_} ${ustore_sources_} ${ustore_vram_objects_})
+    add_library(ustore::shared ALIAS ustore_shared)
+    target_compile_options(
+        ustore_shared INTERFACE "$<$<OR:$<COMPILE_LANG_AND_ID:C,MSVC>,$<COMPILE_LANG_AND_ID:CXX,MSVC>>:/utf-8>"
+    )
+    set_target_properties(ustore_shared PROPERTIES EXPORT_NAME shared)
+    # `SOVERSION` holds the major alone, the only break the C ABI admits
+    set_target_properties(ustore_shared PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR})
+    target_compile_definitions(
+        ustore_shared
+        PRIVATE USTORE_EXPORTING=1
+        INTERFACE USTORE_SHARED=1
+    )
+    target_link_libraries(
+        ustore_shared
+        PUBLIC ustore_abi
+        PRIVATE Threads::Threads ustore_header ${ustore_dependencies_} ${ustore_engine_archives_}
+                $<TARGET_NAME_IF_EXISTS:ustore_spdk>
+    )
+    if (USTORE_METAL_ARCH AND APPLE)
+        target_link_libraries(ustore_shared PRIVATE "-framework Metal" "-framework Foundation" objc)
+    endif ()
+    target_link_libraries(ustore_shared PRIVATE ${CMAKE_DL_LIBS})
+    # The shared library exports the C ABI alone. On ELF a version script does it, since the standard library's inline
+    # definitions, like `std::bad_variant_access`, keep default visibility under any preset, as do the archives linked
+    # inside
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ustore_shared.map" "{ global: ustore_*; local: *; };\n")
+    target_link_options(
+        ustore_shared PRIVATE
+        $<$<PLATFORM_ID:Linux,Android,FreeBSD>:LINKER:--version-script=${CMAKE_CURRENT_BINARY_DIR}/ustore_shared.map>
+        $<$<PLATFORM_ID:Darwin>:LINKER:-exported_symbol,_ustore_*>
+    )
+    set(ustore_libraries_ ustore_static ustore_shared)
+endif ()
+
+foreach (library_ IN ITEMS ${ustore_libraries_} ${ustore_compiled_objects_})
     target_compile_features(${library_} PUBLIC cxx_std_20)
     target_compile_definitions(
         ${library_}
@@ -539,7 +546,7 @@ endforeach ()
 
 if (${USTORE_BUILD_TOOLS})
     add_executable(ustore_cli tools/cli.cpp tools/dataset.cpp tools/dataset_arrow.cpp)
-    target_link_libraries(ustore_cli PRIVATE ustore::static ustore::header fmt::fmt ustore_warnings)
+    target_link_libraries(ustore_cli PRIVATE ustore::static ustore::header stringzilla::cpp fmt::fmt ustore_warnings)
 endif ()
 
 if (${USTORE_BUILD_TEST})
@@ -563,8 +570,13 @@ endif ()
 # the libraries `ustore::shared`, which links every engine inside, and `ustore::static`, which holds the siblings'
 # objects, beside the engine archives it links, `ustore::rocksdb`, `ustore::leveldb` and `ustore::uring`. No sibling is
 # exported or found, and the templates of `include/ustore/`, which include the siblings, stay in the build tree. The
-# archive holds the device merger, whose consumers also link the static CUDA runtime it calls where it has one.
-set(ustore_install_sdk_targets_ ustore_abi ustore_cpp ustore_static ustore_shared ${ustore_engine_archives_})
+# archive holds the device merger, whose consumers also link the static CUDA runtime it calls where it has one. The SDK
+# links the archive, so it installs only beside the libraries.
+if (USTORE_BUILD_LIBRARIES)
+    set(ustore_install_sdk_targets_ ustore_abi ustore_cpp ${ustore_libraries_} ${ustore_engine_archives_})
+else ()
+    set(ustore_install_sdk_targets_ ustore_abi)
+endif ()
 set(ustore_static_dependencies_)
 if (ustore_device_compaction_ AND ustore_cuda_codes_)
     set(ustore_static_dependencies_ "find_dependency(CUDAToolkit)")

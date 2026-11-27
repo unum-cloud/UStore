@@ -23,7 +23,7 @@
 
 #include <smashtable/basic_avl_tree.hpp>
 #include <smashtable/basic_vector.hpp>
-#include <stringzilla/stringzilla.hpp>
+#include <stringzilla/string.hpp>
 
 #include "ustore/blobs.h"
 #include "ustore/db.h"

@@ -25,11 +25,11 @@
 #include <thread>    // `std::thread`
 #include <utility>   // `std::move`
 
+#include <forkunion/forkunion.hpp>     // `fu::topology_t`, `fu::pool_t`
 #include <smashtable/basic_vector.hpp> // `st::vector`
 
 #include "ustore/utilities/nvme_ring.hpp"   // `a_disk`, `queue_ref_t`, `countdown`, `notifier`, `completion_t`
 #include "ustore/utilities/ram_buffers.hpp" // `aligned_allocator`
-#include "ustore/utilities/ram_device.hpp"  // `spawn_pool`, `harvest_topology`
 
 #include "nvme/fixture.hpp" // `case_label_t`, `same_bytes`
 
@@ -938,12 +938,14 @@ case_result_t test_countdown_keeps_one_failure_whole() {
     if (!(fu_comptime_capabilities() & fu_capability_os_threads_k))
         return case_result_t::skipped("needs fu_capability_os_threads_k");
     // Without memory placement ForkUnion spawns a flat pool of plain threads, which pins nothing
-    auto [topology, topology_status] = util::harvest_topology();
-    auto [pool, make_pool_status] = util::spawn_pool(
-        topology, failures.size() + 1, fu::caller_inclusive_k,
-        static_cast<fu_capabilities_t>(fu_capabilities_all_k & ~fu_capability_place_memory_on_domain_k));
-    expect_true(st::succeeded(make_pool_status));
-    if (st::failed(make_pool_status)) return {};
+    fu::topology_t topology;
+    fu::pool_t pool;
+    bool const spawned =
+        fu::succeeded(topology.harvest()) &&
+        fu::succeeded(pool.spawn(
+            topology, failures.size() + 1, fu::caller_inclusive_k,
+            static_cast<fu_capabilities_t>(fu_capabilities_all_k & ~fu_capability_place_memory_on_domain_k)));
+    if (!expect_true(spawned)) return {};
 
     // Thread zero waits while every other thread fails with its own pair, rotated each round
     countdown_t counter;

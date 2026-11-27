@@ -45,7 +45,7 @@
 
 #include <forkunion/forkunion.hpp> // `fu::topology_t`, `fu::pool_t`
 #include <smashtable/basic_vector.hpp>
-#include <stringzilla/stringzilla.hpp>
+#include <stringzilla/find.hpp>
 
 #include "ustore/ustore.hpp"
 

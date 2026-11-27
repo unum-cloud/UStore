@@ -41,7 +41,7 @@
 
 #include <forkunion/atomics.hpp> // `fu::standard_atomic_ref`
 #include <smashtable/basic_vector.hpp>
-#include <stringzilla/stringzilla.hpp>
+#include <stringzilla/find.hpp>
 
 #include "ustore/blobs.h"
 #include "ustore/db.h"
@@ -59,8 +59,8 @@ namespace unum::ustore::bench {
 
 /** Half the logical cores this process may run on, at least one. */
 [[nodiscard]] std::size_t half_the_cores() noexcept {
-    auto [topology, topology_status] = util::harvest_topology();
-    std::size_t const cores = st::failed(topology_status) ? 0 : topology.logical_cores_count();
+    fu::topology_t topology;
+    std::size_t const cores = fu::failed(topology.harvest()) ? 0 : topology.logical_cores_count();
     return cores > 1 ? cores / 2 : 1;
 }
 
@@ -750,10 +750,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    auto [topology, topology_status] = util::harvest_topology();
-    auto [executor, executor_status] = util::spawn_pool(topology, settings.threads.value, fu::caller_inclusive_k,
-                                                        fu_capabilities_all_k);
-    if (st::failed(executor_status)) {
+    fu::topology_t topology;
+    fu::pool_t executor;
+    if (fu::failed(topology.harvest()) ||
+        fu::failed(executor.spawn(topology, settings.threads.value, fu::caller_inclusive_k))) {
         fmt::println(stderr, "Failed to spawn {} threads", settings.threads.value);
         return 1;
     }

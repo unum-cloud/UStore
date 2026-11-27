@@ -27,7 +27,7 @@
 #include <type_traits> // `std::remove_cv_t`, `std::conditional_t`, `std::remove_reference_t`
 
 #include <forkunion/types.hpp>         // `fu::min_of`
-#include <stringzilla/stringzilla.hpp> // `sz::strings_view_t`, `sz::indexed_container_iterator`
+#include <stringzilla/strings.hpp>     // `sz::strings_view_t`, `sz::indexed_container_iterator`
 
 #include "ustore/ustore.h"
 #include "ustore/utilities/types.hpp" // `value_view_t`, `collection_key_t`, `edge_t`

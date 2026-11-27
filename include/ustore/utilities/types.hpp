@@ -45,7 +45,7 @@
 #include <forkunion/types.hpp>         // `ashvardanian::forkunion`, which `fu` names
 #include <smashtable/basic_vector.hpp> // `st::vector`
 #include <smashtable/shared.hpp>       // `st::hash`, `st::status_t`
-#include <stringzilla/stringzilla.hpp> // `sz::string_t`, `sz::string_view_t`, `sz::failed`
+#include <stringzilla/string.hpp>      // `sz::string_t`, `sz::string_view_t`, `sz::failed`
 #include <stringzilla/types.h>         // `sz_string_view_t`, `sz_strings_span_t`, `sz_status_t`
 
 #include "ustore/ustore.h"

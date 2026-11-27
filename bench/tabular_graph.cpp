@@ -38,7 +38,7 @@
 #include <fmt/format.h>
 
 #include <smashtable/basic_vector.hpp>
-#include <stringzilla/stringzilla.hpp>
+#include <stringzilla/string.hpp>
 
 #include "ustore/blobs.h"
 #include "ustore/db.h"
@@ -397,10 +397,10 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    auto [topology, topology_status] = util::harvest_topology();
-    auto [executor, executor_status] = util::spawn_pool(topology, settings.threads.value, fu::caller_inclusive_k,
-                                                        fu_capabilities_all_k);
-    if (st::failed(executor_status)) {
+    fu::topology_t topology;
+    fu::pool_t executor;
+    if (fu::failed(topology.harvest()) ||
+        fu::failed(executor.spawn(topology, settings.threads.value, fu::caller_inclusive_k))) {
         fmt::println(stderr, "Failed to spawn {} threads", settings.threads.value);
         ustore_database_free(tabular.database);
         return 1;
