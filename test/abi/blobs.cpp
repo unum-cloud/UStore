@@ -310,12 +310,9 @@ case_result_t test_database_named_collections_race(config_t const& config) {
             fu::standard_atomic_ref<std::size_t> {refused}.store_add(1, std::memory_order_relaxed);
     };
     fu::topology_t topology;
-    fu::pool_t executor;
-    fu::status_t const executor_status = fu::failed(topology.harvest())
-                                             ? fu::status_t::topology_unavailable_k
-                                             : executor.spawn(topology, threads_count, fu::caller_inclusive_k);
-    expect_true(!fu::failed(executor_status));
-    if (fu::failed(executor_status)) return {};
+    if (!expect_true(fu::succeeded(topology.harvest()))) return {};
+    auto [executor, executor_status] = util::spawn_pool<fu::pool_t>(topology, threads_count, fu::caller_inclusive_k);
+    if (!expect_true(st::succeeded(executor_status))) return {};
     expect_true(!fu::failed(executor.for_threads(task)));
 
     expect_equal(created, 1u);
@@ -976,11 +973,9 @@ case_result_t test_database_snapshot_with_threads(config_t const& config) {
     };
 
     fu::topology_t topology;
-    fu::pool_t executor;
-    fu::status_t const executor_status = fu::failed(topology.harvest())
-                                             ? fu::status_t::topology_unavailable_k
-                                             : executor.spawn(topology, 2, fu::caller_inclusive_k);
-    if (!expect_true(!fu::failed(executor_status))) return {};
+    if (!expect_true(fu::succeeded(topology.harvest()))) return {};
+    auto [executor, executor_status] = util::spawn_pool<fu::pool_t>(topology, 2, fu::caller_inclusive_k);
+    if (!expect_true(st::succeeded(executor_status))) return {};
     expect_true(!fu::failed(executor.for_threads(task)));
     return {};
 }
@@ -1236,12 +1231,10 @@ void resize_values(resizing_writer_t& writer) noexcept {
 void test_blobs_read_one_stamp_under_resizes(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     fu::topology_t topology;
-    fu::pool_t writing_thread;
-    fu::status_t const thread_status = fu::failed(topology.harvest())
-                                           ? fu::status_t::topology_unavailable_k
-                                           : writing_thread.spawn(topology, 1, fu::caller_exclusive_k);
+    if (!expect_true(fu::succeeded(topology.harvest()))) return;
+    auto [writing_thread, thread_status] = util::spawn_pool<fu::pool_t>(topology, 1, fu::caller_exclusive_k);
     auto [arena, arena_status] = arena_t::make();
-    if (!expect_true(!open_status.failed() && !fu::failed(thread_status) && !arena_status.failed())) return;
+    if (!expect_true(!open_status.failed() && st::succeeded(thread_status) && !arena_status.failed())) return;
     auto [collection, collection_status] = create_collection(database.handle(), "one_stamp.blobs",
                                                              ustore_modality_blobs_k);
     if (!expect_true(!collection_status.failed())) return;
@@ -1315,12 +1308,10 @@ void swap_halves(swapping_writer_t& writer) noexcept {
 case_result_t test_blobs_filtered_scan_one_stamp_under_swaps(config_t const& config) {
     auto [database, open_status] = open_database<database_t>(config);
     fu::topology_t topology;
-    fu::pool_t writing_thread;
-    fu::status_t const thread_status = fu::failed(topology.harvest())
-                                           ? fu::status_t::topology_unavailable_k
-                                           : writing_thread.spawn(topology, 1, fu::caller_exclusive_k);
+    if (!expect_true(fu::succeeded(topology.harvest()))) return {};
+    auto [writing_thread, thread_status] = util::spawn_pool<fu::pool_t>(topology, 1, fu::caller_exclusive_k);
     auto [arena, arena_status] = arena_t::make();
-    if (!expect_true(!open_status.failed() && !fu::failed(thread_status) && !arena_status.failed())) return {};
+    if (!expect_true(!open_status.failed() && st::succeeded(thread_status) && !arena_status.failed())) return {};
     if (!probed(database.supports_transactions())) return case_result_t::skipped(needs_transactions_k);
     auto [collection, collection_status] = create_collection(database.handle(), "swaps.blobs", ustore_modality_blobs_k);
     if (!expect_true(!collection_status.failed())) return {};

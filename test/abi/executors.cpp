@@ -857,11 +857,9 @@ void free_arena(arena_freeing_t& freeing) noexcept {
 void test_arena_free_waits(config_t const&) {
     auto [executor, spawn_status] = spawn_executor();
     fu::topology_t topology;
-    fu::pool_t freeing_thread;
-    fu::status_t const thread_status = fu::failed(topology.harvest())
-                                           ? fu::status_t::topology_unavailable_k
-                                           : freeing_thread.spawn(topology, 1, fu::caller_exclusive_k);
-    if (!expect_true(!spawn_status.failed() && !fu::failed(thread_status))) return;
+    if (!expect_true(fu::succeeded(topology.harvest()))) return;
+    auto [freeing_thread, thread_status] = util::spawn_pool<fu::pool_t>(topology, 1, fu::caller_exclusive_k);
+    if (!expect_true(!spawn_status.failed() && st::succeeded(thread_status))) return;
 
     held_scan_t held;
     submit_held(held, executor);
@@ -920,11 +918,9 @@ void test_executor_contended_from_another_thread(config_t const& config) {
                                                    ustore_modality_blobs_k);
     auto [executor, spawn_status] = spawn_executor();
     fu::topology_t topology;
-    fu::pool_t holding_thread;
-    fu::status_t const thread_status = fu::failed(topology.harvest())
-                                           ? fu::status_t::topology_unavailable_k
-                                           : holding_thread.spawn(topology, 1, fu::caller_exclusive_k);
-    if (!expect_true(!blobs_status.failed() && !spawn_status.failed() && !fu::failed(thread_status))) return;
+    if (!expect_true(fu::succeeded(topology.harvest()))) return;
+    auto [holding_thread, thread_status] = util::spawn_pool<fu::pool_t>(topology, 1, fu::caller_exclusive_k);
+    if (!expect_true(!blobs_status.failed() && !spawn_status.failed() && st::succeeded(thread_status))) return;
 
     held_scan_t held;
     arm_held(held, executor, nullptr, ustore_completion_blocking_k);
@@ -1178,11 +1174,9 @@ void test_database_free_waits(config_t const&) {
  *  another thread, as such a call counts on its handles as an executor call does. */
 void test_database_free_waits_without_executor(config_t const&) {
     fu::topology_t topology;
-    fu::pool_t holding_thread;
-    fu::status_t const thread_status = fu::failed(topology.harvest())
-                                           ? fu::status_t::topology_unavailable_k
-                                           : holding_thread.spawn(topology, 1, fu::caller_exclusive_k);
-    if (!expect_true(!fu::failed(thread_status))) return;
+    if (!expect_true(fu::succeeded(topology.harvest()))) return;
+    auto [holding_thread, thread_status] = util::spawn_pool<fu::pool_t>(topology, 1, fu::caller_exclusive_k);
+    if (!expect_true(st::succeeded(thread_status))) return;
 
     held_scan_t held;
     arm_held(held, nullptr, nullptr, ustore_completion_blocking_k);

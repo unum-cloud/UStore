@@ -42,8 +42,9 @@
 
 #include "ustore/blobs.h"
 #include "ustore/db.h"
-#include "ustore/types.hpp"           // `arena_t`
-#include "ustore/utilities/types.hpp" // `bytes_of`
+#include "ustore/types.hpp"                // `arena_t`
+#include "ustore/utilities/ram_device.hpp" // `spawn_pool`
+#include "ustore/utilities/types.hpp"      // `bytes_of`
 
 #include "dataset.h"
 #include "harness.hpp"
@@ -398,9 +399,10 @@ int main(int argc, char** argv) {
     }
 
     fu::topology_t topology;
-    fu::pool_t executor;
-    if (fu::failed(topology.harvest()) ||
-        fu::failed(executor.spawn(topology, settings.threads.value, fu::caller_inclusive_k))) {
+    bool const harvested = fu::succeeded(topology.harvest());
+    auto [executor, executor_status] = util::spawn_pool<fu::pool_t>(topology, settings.threads.value,
+                                                                    fu::caller_inclusive_k);
+    if (!harvested || st::failed(executor_status)) {
         fmt::println(stderr, "Failed to spawn {} threads", settings.threads.value);
         ustore_database_free(tabular.database);
         return 1;

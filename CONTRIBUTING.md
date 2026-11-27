@@ -169,8 +169,8 @@ Per-thread scratch belongs to the executor that owns the threads.
 
 ### Threads and Placement
 
-Threads, topology and domain-placed memory come from ForkUnion's C ABI in `forkunion/forkunion.h`, reached through ForkUnion's C++ `fu::pool_t`, which the library spawns only in `src/ram_spawn.hpp`, and the arenas of `include/ustore/utilities/ram_buffers.hpp`; tests and benchmarks spawn their own pools, and nothing else calls `fu_*` directly.
-The engine holds its threads as one `fu::pool_t`, which `spawn_pool` in `src/ram_spawn.hpp` fills over a harvested `fu::topology_t`, and tests and benchmarks spawn their own pools the same way.
+Threads, topology and domain-placed memory come from ForkUnion's C ABI in `forkunion/forkunion.h`, reached through ForkUnion's C++ `fu::pool_t`, which `spawn_pool` in `include/ustore/utilities/ram_device.hpp` spawns, and the arenas of `include/ustore/utilities/ram_buffers.hpp`; nothing else calls `fu_*` directly.
+The engine holds its threads as one `fu::pool_t`, which `spawn_pool` fills over a harvested `fu::topology_t`, and tests and benchmarks spawn their own pools the same way; its ForkUnion calls are dependent, so it instantiates only in units that include ForkUnion's SDK and `include/` needs only `<forkunion/types.hpp>`.
 The arenas place their blocks with `fu_allocate_on_domain_id` and release them with `fu_free_on_domain_id`.
 A try-only claim is an atomic bit or `fu::spin_mutex_t`, anything that waits is `fu::fair_mutex_t` from `<forkunion/locks.hpp>`, and UStore holds no reader-writer gate yet; `.githooks/pre-commit` refuses any other new lock, so ask first.
 

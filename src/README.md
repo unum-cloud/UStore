@@ -111,11 +111,11 @@ See [`nvme/README.md`](nvme/README.md) for its layers.
 
 ## Executors
 
-`src/ram_spawn.hpp` spawns the one kind of pool, ForkUnion's `fu::pool_t`, parked when idle and deleted with its owner, an empty one running every dispatch on the calling thread.
+`spawn_pool` in `ram_device.hpp` spawns the one kind of pool, ForkUnion's `fu::pool_t`, parked when idle and deleted with its owner, an empty one running every dispatch on the calling thread.
 Every `ustore_executor_t` that `src/types.cpp` builds holds one of them, one scratch per pool thread plus one for the call holding it, and that `holding_call_t`.
 Its `device` variant is the kind tag: nothing beyond the pool on RAM, the rings' options on NVMe, and on VRAM a `cuda_executor_t`, `hip_executor_t` or `metal_executor_t` holding one record per device it drives, each with the one stream calls there queue on, opened or adopted at creation and destroyed with the executor, its event, bounce, managed runs, page scratch and scratch limit.
 A VRAM executor is caller-inclusive with one thread, its caller, which stages, feeds the device and waits on it, and a device verb table an engine leaves null answers `ustore_status_unsupported_k`.
-`ustore_executor_for_ram` spawns its `fu::pool_t` through `spawn_pool` over the `fu::topology_t` that `harvest_topology` fills: `fu_pool_spawn` over every memory domain, `fu_pool_spawn_near_memory_domain` near one of several, and the whole machine for several but not all, since ForkUnion has no spawn over a subset.
+`ustore_executor_for_ram` spawns its `fu::pool_t` through `spawn_pool` over the `fu::topology_t` that `harvest_topology` in `src/ram_spawn.hpp` fills: `fu_pool_spawn` over every memory domain, `fu_pool_spawn_near_memory_domain` near one of several, and the whole machine for several but not all, since ForkUnion has no spawn over a subset.
 Zero threads take `fu::default_threads_count` of the cores of the compute domains local to the named memory domains: all but one in eight, and at least one.
 At creation, a `for_threads` dispatch places each pool thread's scratch on its local memory domain when the options name it, and on the first named domain otherwise, and the call's scratch and every arena the executor makes live where thread 0's does, read back from that scratch rather than kept twice.
 

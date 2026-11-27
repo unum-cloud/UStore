@@ -4,9 +4,9 @@
  *  @date September 15, 2026
  *  @brief The host vocabulary of threads and topology, over ForkUnion's C ABI.
  *
- *  Engines, tools, tests and benchmarks dispatch through a ForkUnion pool, which runs on the
- *  calling thread while empty; besides the library's spawning only the arenas of
- *  @c utilities/ram_buffers.hpp call @c fu_* directly.
+ *  Engines, tools, tests and benchmarks dispatch through a ForkUnion pool, which @c spawn_pool
+ *  fills in units that include ForkUnion's SDK and which runs on the calling thread while empty;
+ *  besides it only the arenas of @c utilities/ram_buffers.hpp call @c fu_* directly.
  */
 #pragma once
 
@@ -66,6 +66,29 @@ inline constexpr fu_memory_domain_id_t no_memory_domain_k = -1;
 inline fu_memory_domain_id_t memory_domain_of_pci(char const* bus_id) noexcept {
     fu_memory_domain_id_t domain = no_memory_domain_k;
     return fu_memory_domain_id_of_pci(bus_id, &domain) == fu_success_k ? domain : no_memory_domain_k;
+}
+
+/** The label the threads of every pool UStore spawns hold in the OS. */
+inline constexpr char const pool_name_k[] = "ustore";
+
+/**
+ *  @brief Spawns @p threads threads of a @p threads_type_ pool over @p topology, the caller among
+ *      them when inclusive, using only the ForkUnion capabilities in @p allowed.
+ *  @param[in] near_domain The memory domain whose local compute domains run the threads, or
+ *      @c no_memory_domain_k for every one.
+ */
+template <typename threads_type_, typename topology_type_>
+[[nodiscard]] st::expected<threads_type_> spawn_pool(topology_type_ const& topology, std::size_t threads,
+                                                     fu::caller_exclusivity_t exclusivity,
+                                                     fu_capabilities_t allowed = fu_capabilities_all_k,
+                                                     fu_memory_domain_id_t near_domain = no_memory_domain_k) noexcept {
+    threads_type_ pool;
+    fu::status_t const spawned = near_domain == no_memory_domain_k
+                                     ? pool.spawn(topology, threads, exclusivity, allowed, pool_name_k)
+                                     : pool.spawn_near(topology, near_domain, threads, exclusivity, allowed,
+                                                       pool_name_k);
+    if (fu::failed(spawned)) return status_from_(spawned);
+    return pool;
 }
 
 #pragma endregion Executor

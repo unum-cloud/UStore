@@ -200,9 +200,9 @@ status_t run_rows(mount_type_& mount, resources_t& resources, util::nvme_queues_
                                                     resources);
     if (open_status.failed()) return open_status;
     fu::topology_t topology;
-    fu::pool_t executor;
-    if (fu::failed(topology.harvest()) ||
-        fu::failed(executor.spawn(topology, workload.threads, fu::caller_inclusive_k)))
+    bool const harvested = fu::succeeded(topology.harvest());
+    auto [executor, executor_status] = util::spawn_pool<fu::pool_t>(topology, workload.threads, fu::caller_inclusive_k);
+    if (!harvested || st::failed(executor_status))
         return {status_code_t::out_of_memory_k, "The executor did not start"};
 
     // Inline and fixed layouts write values of their whole width, and the variable one draws a

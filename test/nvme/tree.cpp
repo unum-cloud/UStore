@@ -750,13 +750,11 @@ void test_intermediate_merge_keeps_remove_deltas(mount_type_ const& mount) {
     // And again with every slice on its own thread of a pool, side by side.
     // Without memory placement ForkUnion spawns a flat pool of plain threads, which pins nothing
     fu::topology_t topology;
-    fu::pool_t pool;
-    bool const spawned =
-        fu::succeeded(topology.harvest()) &&
-        fu::succeeded(pool.spawn(
-            topology, threads_k, fu::caller_inclusive_k,
-            static_cast<fu_capabilities_t>(fu_capabilities_all_k & ~fu_capability_place_memory_on_domain_k)));
-    if (!expect_true(spawned)) return;
+    if (!expect_true(fu::succeeded(topology.harvest()))) return;
+    auto [pool, pool_status] = util::spawn_pool<fu::pool_t>(
+        topology, threads_k, fu::caller_inclusive_k,
+        static_cast<fu_capabilities_t>(fu_capabilities_all_k & ~fu_capability_place_memory_on_domain_k));
+    if (!expect_true(st::succeeded(pool_status))) return;
     pooled_fan_out<typename fixture_t::disk_t> pooled {pool, &fixture->queues, &fixture->disk, 2};
     expect_equal(pooled.slices(), threads_k);
     request.buffers = buffers;

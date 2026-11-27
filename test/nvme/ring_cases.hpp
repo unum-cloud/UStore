@@ -939,13 +939,11 @@ case_result_t test_countdown_keeps_one_failure_whole() {
         return case_result_t::skipped("needs fu_capability_os_threads_k");
     // Without memory placement ForkUnion spawns a flat pool of plain threads, which pins nothing
     fu::topology_t topology;
-    fu::pool_t pool;
-    bool const spawned =
-        fu::succeeded(topology.harvest()) &&
-        fu::succeeded(pool.spawn(
-            topology, failures.size() + 1, fu::caller_inclusive_k,
-            static_cast<fu_capabilities_t>(fu_capabilities_all_k & ~fu_capability_place_memory_on_domain_k)));
-    if (!expect_true(spawned)) return {};
+    if (!expect_true(fu::succeeded(topology.harvest()))) return {};
+    auto [pool, pool_status] = util::spawn_pool<fu::pool_t>(
+        topology, failures.size() + 1, fu::caller_inclusive_k,
+        static_cast<fu_capabilities_t>(fu_capabilities_all_k & ~fu_capability_place_memory_on_domain_k));
+    if (!expect_true(st::succeeded(pool_status))) return {};
 
     // Thread zero waits while every other thread fails with its own pair, rotated each round
     countdown_t counter;

@@ -513,8 +513,8 @@ void ustore_executor_for_ram(ustore_executor_for_ram_t* arguments) {
     if (!threads) threads = spawns_threads() ? fu::default_threads_count(cores_near(topology, domains)) : 1;
     // ForkUnion spawns near one memory domain or across every one, so naming several but not all takes the machine
     bool const near_one = domains.size() == 1 && topology.memory_domains_count() > 1;
-    auto [pool, pool_status] = util::spawn_pool(topology, threads, exclusivity, allowed,
-                                                near_one ? domains[0] : fu_memory_domain_id_t {-1});
+    auto [pool, pool_status] = util::spawn_pool<fu::pool_t>(topology, threads, exclusivity, allowed,
+                                                            near_one ? domains[0] : fu_memory_domain_id_t {-1});
     if (st::failed(pool_status)) return finish(outcome, pool_failure(pool_status));
     finish(outcome, make_executor(std::move(pool), topology, domains, arguments->scratch_limit, *arguments->executor));
 }
@@ -567,7 +567,7 @@ void ustore_executor_for_nvme(ustore_executor_for_nvme_t* arguments) {
         threads = fu::max_of<std::size_t>(threads, 1);
     }
     fu_capabilities_t const allowed = forkunion_allowed_of(ceiling);
-    auto [pool, pool_status] = util::spawn_pool(topology, threads, exclusivity, allowed, near_domain);
+    auto [pool, pool_status] = util::spawn_pool<fu::pool_t>(topology, threads, exclusivity, allowed, near_domain);
     if (st::failed(pool_status)) return finish(outcome, pool_failure(pool_status));
     ustore_executor_t made = nullptr;
     if (util::status_t const status = make_executor(std::move(pool), topology, domains, arguments->scratch_limit, made);
